@@ -74,17 +74,33 @@ Ces cinq verrous ont été éprouvés par 42 attaques réelles, en TCP, dans
 
 ---
 
-## Ce que le portefeuille ne fait pas encore
+## Ce qu'un premier utilisateur a trouvé
 
-Dit franchement, parce qu'un portefeuille qui cache ses limites est un
-portefeuille qui trompe son porteur.
+Le portefeuille a été mis entre les mains de quelqu'un qui ne l'avait pas écrit.
+En une heure, sept défauts sont sortis. Aucun n'aurait été trouvé autrement.
 
-- **Il ne persiste pas le réservoir de transactions.** Une transaction envoyée
-  puis non minée avant l'arrêt du logiciel est perdue. Sur un réseau avec des
-  pairs elle aura été relayée ; sur un nœud isolé, non. Bitcoin Core écrit un
-  `mempool.dat` pour cette raison, et Q21 devra le faire.
+| # | Ce qui clochait | Correction |
+|---|---|---|
+| 1 | Une transaction envoyée disparaissait à l'arrêt | Le réservoir est écrit sur disque (`mempool.dat`) et revalidé à la reprise |
+| 2 | **Aucun gestionnaire de Ctrl-C** : le processus était tué sans rien écrire | `src/arret.rs` — le chemin d'arrêt testé n'était pas le chemin emprunté |
+| 3 | `q21 mine` ignorait le réservoir et minait des blocs vides | Les transactions en attente entrent dans les blocs minés |
+| 4 | Il fallait une fenêtre de commande | *Portefeuille Q21* se double-clique |
+| 5 | Rafraîchir la page cassait la session | Le jeton survit dans `sessionStorage`, cloisonné par port |
+| 6 | Les lignes d'état noyaient l'adresse à ouvrir | Mode silencieux dans le portefeuille |
+| 7 | L'historique n'affichait pas la somme sortie | Colonne **Sorti**, et la page ne contredit plus le nœud |
+
+Le deuxième est le plus instructif. La persistance du réservoir avait été écrite
+**et testée** — mais uniquement sur le chemin d'arrêt des épreuves, l'expiration
+de `--seconds`. Personne n'arrête un logiciel ainsi : on fait Ctrl-C. Sur ce
+chemin-là, rien n'était écrit, et la correction n'aurait servi à rien.
+
+## Ce que le portefeuille ne fait toujours pas
+
 - **L'historique est borné.** Sans index par adresse, il remonte 5 000 blocs.
   La réponse le dit, et l'écran l'affiche.
+- **Le portefeuille et le minage ne cohabitent qu'avec `--mine`.** Sans cette
+  option, une transaction attend qu'on mine, et miner demande d'arrêter le
+  portefeuille. `q21 wallet --mine` fait les deux à la fois.
 - **Il n'y a pas de code QR** pour l'adresse de réception. La politique de
   sécurité du contenu interdit les images externes, et le dessiner en SVG reste
   à faire.

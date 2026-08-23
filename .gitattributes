@@ -20,6 +20,16 @@
 # Les sources vendorisees : aucune conversion, jamais. Leur empreinte en depend.
 vendor/** -text
 
+# Les fichiers de commandes Windows veulent des fins de ligne Windows.
+# Un `.bat` en LF fonctionne souvent, et echoue de facon deroutante des qu'il
+# contient une etiquette ou un bloc `if (...)`.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Et le lanceur macOS veut l'inverse, sans quoi le shell lit un caractere de
+# trop a chaque ligne.
+*.command text eol=lf
+
 # Les fichiers binaires, pour memoire.
 *.png binary
 *.gz binary

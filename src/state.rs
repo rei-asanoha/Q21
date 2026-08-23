@@ -556,6 +556,143 @@ impl AddressCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reservoir de transactions
+// ---------------------------------------------------------------------------
+
+const MAGIE_RESERVOIR: &[u8; 8] = b"Q21MEMPL";
+
+/// Borne de securite a la lecture.
+const MAX_TX_RESERVOIR: u64 = 200_000;
+
+/// Le reservoir de transactions, conserve entre deux executions.
+///
+/// # La transaction qui disparaissait
+///
+/// Une transaction envoyee entre dans le reservoir — une salle d'attente en
+/// memoire — et y patiente qu'un mineur la prenne. Le reservoir n'etait ecrit
+/// nulle part : arreter le logiciel avant qu'elle soit minee l'effacait.
+///
+/// Ce n'est pas une hypothese. Un premier utilisateur a envoye une transaction,
+/// arrete le portefeuille pour lancer le minage, et l'a vue disparaitre. Rien
+/// n'etait perdu — les fonds n'avaient pas bouge — mais le paiement n'avait
+/// jamais eu lieu, sans un mot d'explication.
+///
+/// Sur un reseau peuple, un pair aurait relaye la transaction et l'aurait
+/// gardee. C'est donc surtout le noeud isole — celui d'un portefeuille de
+/// bureau, precisement — qui payait ce defaut. Bitcoin Core ecrit son
+/// `mempool.dat` a l'arret pour cette raison exacte.
+///
+/// # Ce qui est ecrit, et ce qui ne l'est pas
+///
+/// **Les transactions, rien d'autre.** Tout le reste de l'etat du reservoir —
+/// sorties engagees, liens de parente, comptabilite memoire — se rededuit en
+/// les rejouant. Ecrire un etat derive, c'est se donner deux sources de verite
+/// pour une seule chose.
+///
+/// **Et le rejeu revalide.** La chaine a pu avancer pendant l'arret : une
+/// transaction peut avoir ete confirmee entre-temps, ou etre devenue
+/// impossible. Chacune repasse par `accept`, qui la refuse le cas echeant. Un
+/// reservoir relu n'est jamais cru sur parole.
+pub struct MempoolStore {
+    chemin: PathBuf,
+    clef: [u8; 32],
+}
+
+impl MempoolStore {
+    pub fn new<P: AsRef<Path>>(chemin: P, clef: [u8; 32]) -> MempoolStore {
+        MempoolStore {
+            chemin: chemin.as_ref().to_path_buf(),
+            clef,
+        }
+    }
+
+    pub fn exists(&self) -> bool {
+        self.chemin.exists()
+    }
+
+    /// Ecrit les transactions en attente, parents avant enfants.
+    pub fn save(&self, transactions: &[crate::tx::Transaction]) -> Result<(), StateError> {
+        let mut w = Writer::with_capacity(64 + transactions.len() * 256);
+        w.bytes(MAGIE_RESERVOIR);
+        w.u32(VERSION);
+        w.varint(transactions.len() as u64);
+        for tx in transactions {
+            let brut = tx.encode();
+            w.varint(brut.len() as u64);
+            w.bytes(&brut);
+        }
+        let mut donnees = w.finish();
+        donnees.extend_from_slice(&crate::kdf::hmac_sha256(&self.clef, &donnees));
+
+        let tmp = self.chemin.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&donnees)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.chemin)?;
+        Ok(())
+    }
+
+    /// Relit les transactions en attente.
+    ///
+    /// Elles ne sont pas validees ici : c'est a l'appelant de les repasser par
+    /// `Mempool::accept`, seul endroit qui connaisse l'etat de la chaine.
+    pub fn load(&self) -> Result<Vec<crate::tx::Transaction>, StateError> {
+        let donnees = std::fs::read(&self.chemin)?;
+        if donnees.len() < 32 {
+            return Err(StateError::Illisible);
+        }
+        let (charge, sceau) = donnees.split_at(donnees.len() - 32);
+        let attendu = crate::kdf::hmac_sha256(&self.clef, charge);
+        if !crate::kdf::egal_temps_constant(&attendu, sceau) {
+            return Err(StateError::SceauInvalide);
+        }
+
+        let mut r = Reader::new(charge);
+        let mut magie = [0u8; 8];
+        for o in &mut magie {
+            *o = r.u8().map_err(|_| StateError::Illisible)?;
+        }
+        if &magie != MAGIE_RESERVOIR {
+            return Err(StateError::MagieInvalide);
+        }
+        let version = r.u32().map_err(|_| StateError::Illisible)?;
+        if version != VERSION {
+            return Err(StateError::VersionInconnue(version));
+        }
+        let n = r.varint().map_err(|_| StateError::Illisible)?;
+        if n > MAX_TX_RESERVOIR {
+            return Err(StateError::TropDEntrees(n));
+        }
+
+        let mut v = Vec::with_capacity(n.min(10_000) as usize);
+        for _ in 0..n {
+            let taille = r.varint().map_err(|_| StateError::Illisible)? as usize;
+            if taille > crate::consensus::MAX_BLOCK_SIZE {
+                return Err(StateError::Illisible);
+            }
+            let mut brut = vec![0u8; taille];
+            for o in brut.iter_mut() {
+                *o = r.u8().map_err(|_| StateError::Illisible)?;
+            }
+            let tx = crate::tx::Transaction::decode(&brut).map_err(|_| StateError::Illisible)?;
+            v.push(tx);
+        }
+        r.expect_end().map_err(|_| StateError::Illisible)?;
+        Ok(v)
+    }
+
+    pub fn remove(&self) -> Result<(), StateError> {
+        if self.exists() {
+            std::fs::remove_file(&self.chemin)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
