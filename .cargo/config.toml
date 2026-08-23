@@ -1,0 +1,11 @@
+# Sources vendorisees.
+#
+# Cet environnement n'a pas acces a index.crates.io. Les sources de `ml-dsa` et
+# de ses dependances transitives ont ete apportees par `cargo vendor` depuis une
+# machine connectee, puis verifiees par les `.cargo-checksum.json` que cargo
+# controle a chaque compilation.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

@@ -1,0 +1,165 @@
+# Livraison — construit le portefeuille pour macOS, Windows et Linux.
+#
+# Se declenche sur une etiquette de version (`v0.2.0`, par exemple) ou a la
+# demande. Chaque plateforme compile sur sa propre machine : rien n'est
+# compile de facon croisee, donc rien n'est suppose.
+#
+# # Ce que ces fichiers ne sont pas
+#
+# Ils ne sont **ni signes ni notaries**. macOS affichera « impossible d'ouvrir,
+# le developpeur ne peut pas etre verifie », et Windows affichera un
+# avertissement SmartScreen. C'est le comportement normal pour un logiciel sans
+# certificat d'editeur, et le contourner demande un compte Apple Developer
+# payant et un certificat Authenticode. Tant que ce n'est pas fait, la marche a
+# suivre est documentee dans le fichier joint a chaque livraison.
+#
+# Un logiciel qui garde des clefs privees ne devrait pas etre installe sans
+# verification. Le condensat SHA-256 de chaque fichier est publie avec lui :
+# c'est ce qui permet de verifier qu'on a bien recu ce qui a ete construit ici.
+
+name: Livraison
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  construire:
+    name: ${{ matrix.nom }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nom: macOS (Apple Silicon)
+            os: macos-latest
+            cible: aarch64-apple-darwin
+            binaire: q21
+            archive: q21-macos-arm64.tar.gz
+          - nom: macOS (Intel)
+            os: macos-latest
+            cible: x86_64-apple-darwin
+            binaire: q21
+            archive: q21-macos-x86_64.tar.gz
+          - nom: Windows
+            os: windows-latest
+            cible: x86_64-pc-windows-msvc
+            binaire: q21.exe
+            archive: q21-windows-x86_64.zip
+          - nom: Linux
+            os: ubuntu-latest
+            cible: x86_64-unknown-linux-gnu
+            binaire: q21
+            archive: q21-linux-x86_64.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chaine Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cible }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # On ne livre pas un binaire dont les epreuves n'ont pas ete passees sur
+      # cette plateforme. Un portefeuille qui perd des fonds sous Windows
+      # seulement est un portefeuille qui perd des fonds.
+      - name: Epreuves
+        run: |
+          cargo test --locked --features mldsa,audit --lib
+          cargo test --locked --features mldsa,audit --test regression_securite
+          cargo test --locked --features mldsa,audit --test regression_reseau
+          cargo test --locked --features mldsa,audit --test regression_phase8b
+          cargo test --locked --features mldsa,audit --test audit_persistance
+          cargo test --locked --features mldsa,audit --test audit_rpc
+          cargo test --locked --features mldsa,audit --test integration
+
+      - name: Compilation
+        run: cargo build --locked --release --features mldsa --target ${{ matrix.cible }}
+
+      - name: Assemblage
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p livraison
+          cp "target/${{ matrix.cible }}/release/${{ matrix.binaire }}" livraison/
+          cp README.md AUDIT.md livraison/ 2>/dev/null || true
+          cd livraison
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "../${{ matrix.archive }}" ./*
+          else
+            tar czf "../${{ matrix.archive }}" ./*
+          fi
+
+      - name: Condensat SHA-256
+        shell: bash
+        run: |
+          set -eu
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          fi
+          cat "${{ matrix.archive }}.sha256"
+
+      - name: Depot du resultat
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+
+  publier:
+    name: Publication
+    needs: construire
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: livraisons
+          merge-multiple: true
+
+      - name: Publier la version
+        uses: softprops/action-gh-release@v2
+        with:
+          files: livraisons/*
+          body: |
+            ## Portefeuille Q21
+
+            Telechargez l'archive de votre systeme, decompressez-la, puis :
+
+                ./q21 init testnet        # cree le portefeuille, affiche le code de sauvegarde
+                ./q21 wallet              # ouvre le portefeuille dans le navigateur
+
+            **Recopiez le code de sauvegarde sur papier avant tout.** Il est le
+            seul moyen de retrouver vos fonds si le fichier disparait.
+
+            ### Ces fichiers ne sont pas signes
+
+            macOS dira « impossible d'ouvrir, le developpeur ne peut pas etre
+            verifie ». Clic droit sur le fichier, puis « Ouvrir », puis
+            « Ouvrir » a nouveau dans la fenetre qui s'affiche.
+
+            Windows affichera un avertissement SmartScreen. « Informations
+            complementaires », puis « Executer quand meme ».
+
+            Signer ces fichiers demande un compte Apple Developer payant et un
+            certificat Authenticode. Tant que ce n'est pas fait, verifiez le
+            condensat SHA-256 joint : il vous dit que vous avez bien recu ce qui
+            a ete construit ici.
+
+            ### Avertissement
+
+            Code de recherche. La preuve de travail n'a recu aucune cryptanalyse
+            externe, et l'audit a ete mene par ses propres auteurs. Ne confiez a
+            ce logiciel aucune valeur reelle.

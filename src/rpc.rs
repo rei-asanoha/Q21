@@ -1,0 +1,1636 @@
+//! API JSON-RPC 2.0.
+//!
+//! # Pourquoi cette API existe, et pourquoi elle est locale
+//!
+//! Pour consulter une chaine, presque tout le monde ouvre aujourd'hui le site
+//! d'un tiers. C'est-a-dire qu'on **fait confiance a quelqu'un** pour savoir ce
+//! que contient un systeme concu precisement pour ne faire confiance a personne.
+//! L'explorateur de Q21 est servi par le noeud lui-meme, sur le bouclage local.
+//! Ce que vous lisez, votre machine l'a valide.
+//!
+//! # Deux familles de methodes, separees exprès
+//!
+//! - **Lecture** : etat de la chaine, blocs, transactions, mempool, emission.
+//!   Elles ne peuvent rien deplacer.
+//! - **Portefeuille** : solde, adresse neuve, envoi. Elles peuvent perdre des
+//!   fonds, et sont donc **desactivees par defaut** — il faut les demander
+//!   explicitement. Un port RPC de consultation ne doit jamais devenir un port
+//!   de depense par inadvertance.
+//!
+//! # Montants
+//!
+//! Chaque montant sort deux fois : en entier d'unites indivisibles, et en
+//! chaine formatee. Jamais en flottant. Un client qui relit un solde en `double`
+//! perd des unites, et personne ne s'en apercoit avant qu'il soit trop tard.
+
+use crate::address::{Address, Network};
+use crate::amount::Amount;
+use crate::block::Block;
+use crate::consensus::*;
+use crate::emission;
+use crate::hash::Hash256;
+use crate::json::{parse, Json};
+use crate::memhard;
+use crate::net::Node;
+use crate::sig::SchemeId;
+use crate::tx::Transaction;
+use crate::wallet::Wallet;
+use std::sync::{Arc, Mutex};
+
+/// Codes d'erreur JSON-RPC 2.0.
+pub const ERR_PARSE: i64 = -32700;
+
+/// Message rendu a l'appelant pour une erreur de portefeuille.
+///
+/// # Ce qui fuyait
+///
+/// L'erreur etait rendue par `format!("{e:?}")`, donc avec son contenu :
+/// `FondsInsuffisants { disponible: 43120000, demande: ... }`. Le solde exact
+/// partait ainsi vers un appelant qui n'avait qu'a demander une somme absurde
+/// pour l'obtenir. Un refus n'a pas a etre un relevé de compte.
+///
+/// Les autres variantes ne portent rien de sensible et gardent un message
+/// precis : un utilisateur qui se trompe doit comprendre pourquoi.
+/// Message rendu a l'appelant pour un refus du reservoir.
+///
+/// # Ce qui etait rendu avant
+///
+/// `format!("{e:?}")`, donc la structure Rust brute :
+/// `ConflitDeDepense(OutPoint { txid: Hash256(3f2a...), index: 0 })`.
+/// Illisible pour qui n'a pas la definition sous les yeux, et sans la moindre
+/// indication de ce qu'il faut faire. Un essai reel de l'interface a bute
+/// dessus deux fois de suite.
+///
+/// Chaque refus dit maintenant **ce qui s'est passe** et **ce qui peut y
+/// remedier**. Les valeurs numeriques restent, elles sont utiles ; c'est la
+/// syntaxe de debogage qui disparait.
+fn message_reservoir(e: &crate::mempool::MempoolError) -> String {
+    use crate::mempool::MempoolError as M;
+    match e {
+        M::DejaPresent => "cette transaction est deja en attente".to_string(),
+        M::ConflitDeDepense(_) => "une transaction deja en attente depense les memes fonds. \
+             Attendez qu'elle soit confirmee avant d'en envoyer une autre."
+            .to_string(),
+        M::DependanceNonConfirmee(_) => {
+            "cette depense s'appuie sur des fonds recus dans une transaction \
+             encore non confirmee. Attendez un bloc."
+                .to_string()
+        }
+        M::TauxDeFraisTropBas { recu, minimum } => format!(
+            "frais trop bas pour etre relayee : {recu} par millier d'unites de poids, \
+             minimum {minimum}. Demandez une nouvelle estimation."
+        ),
+        M::Inminable { poids, size } => format!(
+            "transaction trop lourde pour tenir dans un bloc : {size} octets, \
+             poids {poids}. Envoyez un montant qui demande moins d'entrees."
+        ),
+        M::PleinEtTropPeuPayee => "le reservoir est plein et cette transaction paie moins \
+             que la moins-disante. Augmentez les frais."
+            .to_string(),
+        M::Validation(v) => format!("refusee par la validation : {v:?}"),
+    }
+}
+
+fn message_portefeuille(e: &crate::wallet::WalletError) -> &'static str {
+    use crate::wallet::WalletError as W;
+    match e {
+        W::FondsInsuffisants { .. } => "fonds insuffisants",
+        W::ClefDejaUtilisee(_) => {
+            "cette clef a deja signe : sur un schema a usage unique, resigner \
+             revelerait la clef privee"
+        }
+        W::ClefInconnue => "clef inconnue de ce portefeuille",
+        W::MontantNul => "montant nul",
+        W::MontantHorsBornes => "montant ou frais au-dela de ce qui peut exister",
+        W::SchemaNonSupporte(_) => "schema de signature non disponible dans ce binaire",
+        W::AleaIndisponible => "generateur d'alea du systeme inaccessible",
+        W::SauvegardeInvalide => "code de sauvegarde illisible",
+        W::SauvegardeAutreReseau => "code de sauvegarde d'un autre reseau",
+        W::VerrouIncoherent { .. } => {
+            "incoherence entre la clef derivee et la sortie a depenser : rien \
+             n'a ete signe"
+        }
+    }
+}
+
+/// Appels acceptes dans un seul lot JSON-RPC.
+///
+/// Un lot n'existe que pour epargner des allers-retours reseau. Cent suffisent
+/// a cela ; dix mille ne servent qu'a multiplier le travail du noeud par dix
+/// mille pour le prix d'une requete.
+pub const MAX_LOT: usize = 100;
+
+/// Taille cumulee des reponses d'un lot, en octets.
+///
+/// La reponse etait assemblee entierement en memoire avant emission, sans
+/// aucune borne : une requete d'un mebioctet produisait des dizaines de
+/// mebioctets de tas.
+pub const MAX_REPONSE_LOT: usize = 8 * 1024 * 1024;
+
+/// Blocs remontes au maximum par `gettransaction` sans index.
+///
+/// Le balayage arriere de toute la chaine, sous le verrou global du noeud, est
+/// une amplification en travail : le cout croit avec la hauteur, et un lot le
+/// multipliait. En attendant un index par identifiant de transaction, on borne
+/// la recherche et on **le dit** dans la reponse plutot que de mentir par
+/// omission.
+pub const MAX_BLOCS_BALAYES: u64 = 2_000;
+
+/// Frais retenus quand l'appelant n'en propose aucun, en unites.
+///
+/// Volontairement modeste : sur une chaine peu chargee, payer davantage
+/// n'accelere rien. `estimatefee` propose une valeur mesuree sur l'etat reel du
+/// reservoir ; celle-ci n'est qu'un repli.
+pub const FRAIS_DEFAUT: u64 = 1_000;
+
+/// Blocs remontes par `listtransactions`.
+///
+/// Sans index par adresse, retrouver l'historique demande de relire les corps.
+/// La fenetre est bornee et **annoncee dans la reponse** : un portefeuille qui
+/// affiche un historique tronque sans le dire ment a son porteur.
+pub const FENETRE_HISTORIQUE: u64 = 5_000;
+
+/// Duree de deverrouillage par defaut, en secondes.
+pub const DEVERROUILLAGE_DEFAUT: u64 = 300;
+pub const ERR_REQUETE: i64 = -32600;
+pub const ERR_METHODE: i64 = -32601;
+pub const ERR_PARAMS: i64 = -32602;
+pub const ERR_INTERNE: i64 = -32603;
+/// Erreurs applicatives.
+pub const ERR_INTROUVABLE: i64 = -1;
+pub const ERR_PORTEFEUILLE_DESACTIVE: i64 = -2;
+pub const ERR_PORTEFEUILLE: i64 = -3;
+
+/// Ce qui est appele apres toute operation ayant modifie le portefeuille.
+///
+/// # Le defaut que ce rappel repare
+///
+/// `sendtoaddress` et `getnewaddress` mutent le portefeuille : la premiere
+/// marque une clef comme consommee, la seconde avance le compteur d'indices.
+/// **Rien n'ecrivait ces changements sur disque.** Ils vivaient dans la memoire
+/// du processus et mouraient avec lui.
+///
+/// Pour ML-DSA la consequence se limite a une adresse reemployee — un defaut de
+/// confidentialite. Pour un schema a usage unique, c'est une clef Lamport qui
+/// resservirait, donc une clef privee publiee. Le balayage de la chaine au
+/// demarrage rattrape ce cas precis, mais un filet de securite n'est pas une
+/// excuse pour laisser le trou.
+///
+/// Le rappel est fourni par l'appelant, qui seul sait ou vit le fichier.
+pub type SurChangement = Arc<dyn Fn(&Wallet) + Send + Sync>;
+
+pub struct RpcContext {
+    pub node: Arc<Node>,
+    /// Absent si les methodes de portefeuille sont desactivees.
+    pub wallet: Option<Arc<Mutex<Wallet>>>,
+    pub network: Network,
+    /// Appele apres chaque operation qui modifie le portefeuille.
+    ///
+    /// Absent en memoire pure (epreuves). En production il **doit** etre
+    /// fourni : sans lui, une depense n'est pas enregistree.
+    pub sur_changement: Option<SurChangement>,
+}
+
+impl RpcContext {
+    /// Contexte de lecture seule : aucune methode de portefeuille.
+    pub fn lecture_seule(node: Arc<Node>, network: Network) -> RpcContext {
+        RpcContext {
+            node,
+            wallet: None,
+            network,
+            sur_changement: None,
+        }
+    }
+}
+
+fn erreur(code: i64, message: &str) -> Json {
+    Json::obj()
+        .set("code", Json::Int(code))
+        .set("message", Json::str(message))
+        .build()
+}
+
+fn montant(a: Amount) -> Json {
+    Json::obj()
+        .set("unites", Json::u64(a.units()))
+        .set("q21", Json::str(a.to_string()))
+        .build()
+}
+
+fn entete_json(h: &crate::block::BlockHeader) -> Json {
+    Json::obj()
+        .set("id", Json::str(h.block_id().to_hex()))
+        .set("hauteur", Json::u64(h.height))
+        .set("parent", Json::str(h.prev_block.to_hex()))
+        .set("merkle", Json::str(h.merkle_root.to_hex()))
+        .set("oncles_racine", Json::str(h.uncles_root.to_hex()))
+        .set("mineur", Json::str(h.miner.to_hex()))
+        .set("horodatage", Json::u64(h.time))
+        .set("bits", Json::str(format!("{:#010x}", h.bits)))
+        .set("nonce", Json::u64(h.nonce))
+        .build()
+}
+
+fn tx_json(t: &Transaction) -> Json {
+    let entrees: Vec<Json> = t
+        .inputs
+        .iter()
+        .map(|e| {
+            Json::obj()
+                .set("txid", Json::str(e.prev_out.txid.to_hex()))
+                .set("index", Json::u64(e.prev_out.index as u64))
+                .set(
+                    "temoin_octets",
+                    Json::u64((e.witness.pubkey.len() + e.witness.signature.len()) as u64),
+                )
+                .build()
+        })
+        .collect();
+    let sorties: Vec<Json> = t
+        .outputs
+        .iter()
+        .map(|o| {
+            Json::obj()
+                .set("valeur", montant(o.value))
+                .set("schema", Json::str(o.scheme.name()))
+                .set("empreinte_clef", Json::str(o.pubkey_hash.to_hex()))
+                .build()
+        })
+        .collect();
+
+    let complet = t.encode().len();
+    let corps = t.encode_without_witness().len();
+    Json::obj()
+        .set("txid", Json::str(t.txid().to_hex()))
+        .set("wtxid", Json::str(t.wtxid().to_hex()))
+        .set("coinbase", Json::Bool(t.is_coinbase()))
+        .set("entrees", Json::array(entrees))
+        .set("sorties", Json::array(sorties))
+        .set("taille_octets", Json::u64(complet as u64))
+        .set("temoin_octets", Json::u64((complet - corps) as u64))
+        .set(
+            "temoin_pourcent",
+            Json::u64(((complet - corps) * 100).checked_div(complet).unwrap_or(0) as u64),
+        )
+        .set("poids", Json::u64(t.weight(WITNESS_DISCOUNT)))
+        .build()
+}
+
+fn bloc_json(b: &Block) -> Json {
+    let txs: Vec<Json> = b.transactions.iter().map(tx_json).collect();
+    let oncles: Vec<Json> = b.uncles.iter().map(entete_json).collect();
+    Json::obj()
+        .set("entete", entete_json(&b.header))
+        .set("taille_octets", Json::u64(b.encode().len() as u64))
+        .set(
+            "subvention",
+            montant(emission::block_subsidy(b.header.height)),
+        )
+        .set("nb_transactions", Json::u64(b.transactions.len() as u64))
+        .set("transactions", Json::array(txs))
+        .set("oncles", Json::array(oncles))
+        .build()
+}
+
+impl RpcContext {
+    /// Traite un document JSON-RPC et rend la reponse encodee.
+    pub fn handle(&self, corps: &str) -> String {
+        let requete = match parse(corps) {
+            Ok(v) => v,
+            Err(_) => {
+                return Json::obj()
+                    .set("jsonrpc", Json::str("2.0"))
+                    .set("id", Json::Null)
+                    .set("error", erreur(ERR_PARSE, "document JSON illisible"))
+                    .build()
+                    .encode()
+            }
+        };
+
+        // --- Lot de requetes : chacune traitee independamment, mais pas
+        //     gratuitement.
+        //
+        // Un audit a mesure l'amplification : une requete d'un mebioctet — la
+        // taille maximale d'un corps — contient des dizaines de milliers
+        // d'appels, chacun produisant sa reponse, le tout assemble **en
+        // memoire** avant emission. Certains appels coutent bien plus que leur
+        // taille : un `gettransaction` balaie toute la chaine, sous le verrou
+        // global du noeud.
+        //
+        // Le lot reste utile — il epargne des allers-retours — mais il est
+        // borne, et la reponse aussi.
+        if let Some(lot) = requete.as_array() {
+            if lot.len() > MAX_LOT {
+                return Json::obj()
+                    .set("jsonrpc", Json::str("2.0"))
+                    .set("id", Json::Null)
+                    .set(
+                        "error",
+                        erreur(
+                            ERR_REQUETE,
+                            &format!("lot de {} appels : maximum {MAX_LOT}", lot.len()),
+                        ),
+                    )
+                    .build()
+                    .encode();
+            }
+            let mut reponses: Vec<Json> = Vec::with_capacity(lot.len());
+            let mut octets = 0usize;
+            for r in lot {
+                let rep = self.une(r);
+                octets += rep.encode().len();
+                if octets > MAX_REPONSE_LOT {
+                    reponses.push(
+                        Json::obj()
+                            .set("jsonrpc", Json::str("2.0"))
+                            .set("id", Json::Null)
+                            .set(
+                                "error",
+                                erreur(ERR_REQUETE, "reponse de lot trop volumineuse : tronquee"),
+                            )
+                            .build(),
+                    );
+                    break;
+                }
+                reponses.push(rep);
+            }
+            return Json::array(reponses).encode();
+        }
+        self.une(&requete).encode()
+    }
+
+    fn une(&self, requete: &Json) -> Json {
+        let id = requete.get("id").cloned().unwrap_or(Json::Null);
+        let methode = match requete.get("method").and_then(|m| m.as_str()) {
+            Some(m) => m.to_string(),
+            None => {
+                return Json::obj()
+                    .set("jsonrpc", Json::str("2.0"))
+                    .set("id", id)
+                    .set("error", erreur(ERR_REQUETE, "champ 'method' absent"))
+                    .build()
+            }
+        };
+        let params = requete.get("params").cloned().unwrap_or(Json::Null);
+
+        match self.dispatch(&methode, &params) {
+            Ok(r) => Json::obj()
+                .set("jsonrpc", Json::str("2.0"))
+                .set("id", id)
+                .set("result", r)
+                .build(),
+            Err(e) => Json::obj()
+                .set("jsonrpc", Json::str("2.0"))
+                .set("id", id)
+                .set("error", e)
+                .build(),
+        }
+    }
+
+    /// Liste des methodes exposees.
+    pub fn methodes() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("getinfo", "Etat de la chaine, du reseau et du mempool"),
+            ("getblock", "Bloc complet, par hauteur ou par identifiant"),
+            ("getblockheader", "En-tete seul"),
+            ("gettransaction", "Transaction, dans un bloc ou au mempool"),
+            ("getmempool", "Contenu du reservoir de transactions"),
+            ("getpeers", "Pairs connectes"),
+            ("getemission", "Courbe d'emission a une hauteur donnee"),
+            ("getpow", "Parametres de la preuve de travail memory-hard"),
+            (
+                "getsecurity",
+                "Ce qui est protege face a une attaque a 51 %",
+            ),
+            ("getsupply", "Masse monetaire emise et plafond"),
+            ("listmethods", "Cette liste"),
+            ("getbalance", "[portefeuille] Solde depensable"),
+            ("getnewaddress", "[portefeuille] Adresse de reception neuve"),
+            ("sendtoaddress", "[portefeuille] Envoi de fonds"),
+            (
+                "getwalletinfo",
+                "[portefeuille] Schema, reseau, adresses, clefs consommees",
+            ),
+            (
+                "listaddresses",
+                "[portefeuille] Adresses connues du portefeuille",
+            ),
+            (
+                "listtransactions",
+                "[portefeuille] Historique des mouvements",
+            ),
+            (
+                "estimatefee",
+                "[portefeuille] Frais suggeres, a nombre d'entrees suppose",
+            ),
+            (
+                "preparersend",
+                "[portefeuille] Chiffres exacts d'un envoi, pieces reellement selectionnees",
+            ),
+            ("getsyncstatus", "Etat de la synchronisation avec le reseau"),
+        ]
+    }
+
+    fn dispatch(&self, methode: &str, params: &Json) -> Result<Json, Json> {
+        match methode {
+            "getinfo" => Ok(self.getinfo()),
+            "getblock" => self.getblock(params, true),
+            "getblockheader" => self.getblock(params, false),
+            "gettransaction" => self.gettransaction(params),
+            "getmempool" => Ok(self.getmempool()),
+            "getpeers" => Ok(self.getpeers()),
+            "getemission" => self.getemission(params),
+            "getpow" => Ok(self.getpow()),
+            "getsecurity" => Ok(Self::getsecurity()),
+            "getsupply" => Ok(self.getsupply()),
+            "listmethods" => Ok(Json::array(
+                Self::methodes()
+                    .into_iter()
+                    .map(|(n, d)| {
+                        Json::obj()
+                            .set("nom", Json::str(n))
+                            .set("description", Json::str(d))
+                            .build()
+                    })
+                    .collect(),
+            )),
+            "getbalance" => self.getbalance(),
+            "getnewaddress" => self.getnewaddress(),
+            "sendtoaddress" => self.sendtoaddress(params),
+            "getwalletinfo" => self.getwalletinfo(),
+            "listaddresses" => self.listaddresses(),
+            "listtransactions" => self.listtransactions(params),
+            "estimatefee" => self.estimatefee(params),
+            "preparersend" => self.preparersend(params),
+            "getsyncstatus" => Ok(self.getsyncstatus()),
+            autre => Err(erreur(
+                ERR_METHODE,
+                &format!("methode inconnue : {autre}. Essayez listmethods."),
+            )),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Lecture
+    // -----------------------------------------------------------------------
+
+    fn getinfo(&self) -> Json {
+        use std::sync::atomic::Ordering;
+        let (hauteur, tete, travail, connus, emis, utxo, bits) = self.node.with_chain(|c| {
+            (
+                c.height(),
+                c.tip_id().to_hex(),
+                c.total_work().bits(),
+                c.known_blocks(),
+                c.total_issued(),
+                c.utxo.len(),
+                c.tip().bits,
+            )
+        });
+        let s = &self.node.stats;
+
+        Json::obj()
+            .set("reseau", Json::str(format!("{:?}", self.network)))
+            .set("hauteur", Json::u64(hauteur))
+            .set("tete", Json::str(tete))
+            .set("travail_cumule_bits", Json::u64(travail as u64))
+            .set("blocs_connus", Json::u64(connus as u64))
+            .set("difficulte_bits", Json::str(format!("{bits:#010x}")))
+            .set("emis", montant(emis))
+            .set("utxo_total", Json::u64(utxo as u64))
+            .set("pairs", Json::u64(self.node.peer_count() as u64))
+            .set("mempool", Json::u64(self.node.mempool_len() as u64))
+            .set("portefeuille_actif", Json::Bool(self.wallet.is_some()))
+            .set(
+                "reseau_stats",
+                Json::obj()
+                    .set(
+                        "blocs_recus",
+                        Json::u64(s.blocs_recus.load(Ordering::Relaxed)),
+                    )
+                    .set(
+                        "blocs_acceptes",
+                        Json::u64(s.blocs_acceptes.load(Ordering::Relaxed)),
+                    )
+                    .set(
+                        "compacts_recus",
+                        Json::u64(s.compacts_recus.load(Ordering::Relaxed)),
+                    )
+                    .set(
+                        "compacts_sans_aller_retour",
+                        Json::u64(s.compacts_sans_aller_retour.load(Ordering::Relaxed)),
+                    )
+                    .set("tx_recues", Json::u64(s.tx_recues.load(Ordering::Relaxed)))
+                    .set(
+                        "pairs_bannis",
+                        Json::u64(s.pairs_bannis.load(Ordering::Relaxed)),
+                    )
+                    .build(),
+            )
+            .build()
+    }
+
+    fn getblock(&self, params: &Json, complet: bool) -> Result<Json, Json> {
+        let bloc = self.node.with_chain(|c| {
+            if let Some(h) = params.get("hauteur").and_then(|v| v.as_u64()) {
+                return c.block_at(h);
+            }
+            if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
+                if let Some(h) = Hash256::from_hex(id) {
+                    return c.block_by_id(&h);
+                }
+            }
+            // Sans parametre : le bloc de tete.
+            c.block_at(c.height())
+        });
+
+        match bloc {
+            Some(b) if complet => Ok(bloc_json(&b)),
+            Some(b) => Ok(entete_json(&b.header)),
+            None => Err(erreur(ERR_INTROUVABLE, "bloc introuvable")),
+        }
+    }
+
+    fn gettransaction(&self, params: &Json) -> Result<Json, Json> {
+        let txid = params
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .and_then(Hash256::from_hex)
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'txid' attendu, en hexadecimal"))?;
+
+        // Au mempool d'abord : c'est la que regarde celui qui vient d'envoyer.
+        if let Some(t) = self.node.with_mempool(|m| m.get(&txid).cloned()) {
+            return Ok(Json::obj()
+                .set("confirmee", Json::Bool(false))
+                .set("transaction", tx_json(&t))
+                .build());
+        }
+
+        // Puis dans la chaine. Balayage arriere : une transaction cherchee est
+        // presque toujours recente. Un index par txid viendra avec le stockage
+        // de la phase 6 ; ici on reste honnete sur le cout.
+        let mut fond_atteint = false;
+        let trouve = self.node.with_chain(|c| {
+            let mut h = c.height() as i64;
+            let plancher = (c.height().saturating_sub(MAX_BLOCS_BALAYES)) as i64;
+            while h >= 0 {
+                if h < plancher {
+                    fond_atteint = true;
+                    return None;
+                }
+                if let Some(b) = c.block_at(h as u64) {
+                    if let Some(t) = b.transactions.iter().find(|t| t.txid() == txid) {
+                        return Some((t.clone(), b.header.height, b.header.block_id()));
+                    }
+                }
+                h -= 1;
+            }
+            None
+        });
+
+        if trouve.is_none() && fond_atteint {
+            return Err(erreur(
+                ERR_REQUETE,
+                &format!(
+                    "transaction introuvable dans les {MAX_BLOCS_BALAYES} derniers \
+                     blocs. Ce noeud n'a pas d'index par identifiant : au-dela, \
+                     la recherche n'est pas rendue."
+                ),
+            ));
+        }
+
+        match trouve {
+            Some((t, hauteur, bloc)) => Ok(Json::obj()
+                .set("confirmee", Json::Bool(true))
+                .set("hauteur", Json::u64(hauteur))
+                .set("bloc", Json::str(bloc.to_hex()))
+                .set("transaction", tx_json(&t))
+                .build()),
+            None => Err(erreur(ERR_INTROUVABLE, "transaction introuvable")),
+        }
+    }
+
+    fn getmempool(&self) -> Json {
+        let (n, octets, ids) = self.node.with_mempool(|m| (m.len(), m.bytes(), m.txids()));
+        Json::obj()
+            .set("nb_transactions", Json::u64(n as u64))
+            .set("octets", Json::u64(octets as u64))
+            .set(
+                "txids",
+                Json::array(
+                    ids.iter()
+                        .take(200)
+                        .map(|h| Json::str(h.to_hex()))
+                        .collect(),
+                ),
+            )
+            .build()
+    }
+
+    fn getpeers(&self) -> Json {
+        Json::obj()
+            .set("nb_pairs", Json::u64(self.node.peer_count() as u64))
+            .set("maximum", Json::u64(crate::net::MAX_PEERS as u64))
+            .build()
+    }
+
+    fn getemission(&self, params: &Json) -> Result<Json, Json> {
+        let hauteur = match params.get("hauteur").and_then(|v| v.as_u64()) {
+            Some(h) => h,
+            None => self.node.with_chain(|c| c.height()),
+        };
+        let cumul = emission::total_supply_at(hauteur);
+        Ok(Json::obj()
+            .set("hauteur", Json::u64(hauteur))
+            .set("annee_approx", Json::u64(hauteur / BLOCKS_PER_YEAR))
+            .set("subvention", montant(emission::block_subsidy(hauteur)))
+            .set("emis_cumule", montant(cumul))
+            .set("plafond", montant(Amount::from_units(MAX_SUPPLY)))
+            .set(
+                "pourcent_du_plafond_millieme",
+                Json::u64(cumul.units().saturating_mul(100_000) / MAX_SUPPLY),
+            )
+            .build())
+    }
+
+    fn getpow(&self) -> Json {
+        let params = self.node.with_chain(|c| c.pow_params());
+        let hauteur = self.node.with_chain(|c| c.height());
+        let epoque = memhard::epoch_of(hauteur);
+        let n = memhard::table_size(params, epoque);
+        let c = memhard::cache_size(params, epoque);
+        Json::obj()
+            .set(
+                "algorithme",
+                Json::str("Q21 memory-hard a deux niveaux, table croissante"),
+            )
+            .set("epoque", Json::u64(epoque))
+            .set("elements_table", Json::u64(n as u64))
+            .set("elements_cache", Json::u64(c as u64))
+            .set(
+                "memoire_mineur_octets",
+                Json::u64(n as u64 * POW_ELEMENT_SIZE as u64),
+            )
+            .set(
+                "memoire_noeud_octets",
+                Json::u64(c as u64 * POW_ELEMENT_SIZE as u64),
+            )
+            .set("acces_par_tentative", Json::u64(POW_K as u64))
+            .set("acces_cache_par_element", Json::u64(POW_J as u64))
+            .set("croissance_pourcent", Json::u64(POW_TABLE_GROWTH_PCT))
+            .set("blocs_par_epoque", Json::u64(POW_EPOCH_BLOCKS))
+            .set(
+                "note",
+                Json::str(
+                    "Un noeud detient le cache (niveau 1), pas la table (niveau 2). \
+                     C'est le prix de la correction de la phase 6 : sans elle, se \
+                     passer de memoire ne coutait que 2,86 x.",
+                ),
+            )
+            .build()
+    }
+
+    fn getsupply(&self) -> Json {
+        let (emis, utxo) = self
+            .node
+            .with_chain(|c| (c.total_issued(), c.utxo.total_value()));
+        Json::obj()
+            .set("emis", montant(emis))
+            .set("dans_les_utxo", montant(utxo))
+            .set("plafond", montant(Amount::from_units(MAX_SUPPLY)))
+            .set("plafond_q21", Json::u64(MAX_SUPPLY_COINS))
+            .set("sous_le_plafond", Json::Bool(emis.units() <= MAX_SUPPLY))
+            .build()
+    }
+
+    /// Expose la position du projet sur l'attaque a 51 %, en donnees.
+    ///
+    /// Une API qui ne dit que ce qui rassure ment par omission.
+    fn getsecurity() -> Json {
+        Json::obj()
+            .set("protection_100_pourcent_possible", Json::Bool(false))
+            .set(
+                "pourquoi",
+                Json::str(
+                    "Le consensus definit la chaine valide comme celle qui porte le plus \
+                     de travail. Un majoritaire en produit plus que tous les autres, par \
+                     definition. Refuser sa chaine supposerait de savoir que c'est lui : \
+                     une identite, donc une autorite, donc la fin du caractere sans \
+                     permission. C'est un theoreme, pas une lacune d'implementation.",
+                ),
+            )
+            .set(
+                "un_attaquant_peut",
+                Json::array(vec![
+                    Json::str("reorganiser les blocs recents, donc annuler ses propres paiements"),
+                    Json::str("refuser d'inclure certaines transactions"),
+                ]),
+            )
+            .set(
+                "un_attaquant_ne_peut_pas",
+                Json::array(vec![
+                    Json::str("voler une piece dont il n'a pas la clef"),
+                    Json::str("fabriquer une unite au-dela de la subvention"),
+                    Json::str("relever le plafond de 21 000 001"),
+                    Json::str("changer une regle : ses blocs sont simplement rejetes"),
+                ]),
+            )
+            .set(
+                "defenses",
+                Json::obj()
+                    .set("choix_par_travail_cumule", Json::Bool(true))
+                    .set("finalite_glissante_blocs", Json::u64(MAX_REORG_DEPTH))
+                    .set(
+                        "finalite_glissante_heures",
+                        Json::u64(MAX_REORG_DEPTH * TARGET_BLOCK_SECS / 3600),
+                    )
+                    .set(
+                        "penalite_a_partir_de_blocs",
+                        Json::u64(REORG_PENALTY_FROM_DEPTH),
+                    )
+                    .set(
+                        "penalite_pourcent_par_bloc",
+                        Json::u64(REORG_PENALTY_PCT_PER_BLOCK),
+                    )
+                    .set("recompenses_oncles", Json::Bool(true))
+                    .set("pow_memory_hard", Json::Bool(true))
+                    .build(),
+            )
+            .set(
+                "cout_de_la_finalite_glissante",
+                Json::str(
+                    "Elle ne supprime pas l'attaque, elle en change la nature. Une \
+                     partition reseau prolongee produit deux chaines qui ne se \
+                     reconcilieront pas seules. On echange une reecriture silencieuse \
+                     contre une scission visible.",
+                ),
+            )
+            .build()
+    }
+
+    // -----------------------------------------------------------------------
+    // Portefeuille
+    // -----------------------------------------------------------------------
+
+    /// Ecrit le portefeuille sur disque apres une modification.
+    ///
+    /// Silencieux si aucun rappel n'est fourni — le cas des epreuves en
+    /// memoire. En production l'absence de rappel serait un defaut, et le
+    /// lanceur en fournit toujours un.
+    fn enregistrer(&self, w: &Wallet) {
+        if let Some(f) = &self.sur_changement {
+            f(w);
+        }
+    }
+
+    fn portefeuille(&self) -> Result<&Arc<Mutex<Wallet>>, Json> {
+        self.wallet.as_ref().ok_or_else(|| {
+            erreur(
+                ERR_PORTEFEUILLE_DESACTIVE,
+                "methodes de portefeuille desactivees. Elles peuvent deplacer des \
+                 fonds et doivent etre demandees explicitement au demarrage.",
+            )
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Portefeuille : ce qu'un logiciel de bureau doit pouvoir demander
+    // -----------------------------------------------------------------------
+
+    /// Etat du portefeuille, sans rien reveler de secret.
+    ///
+    /// Tout ce qu'un porteur a besoin de voir en ouvrant son logiciel : quel
+    /// schema de signature, quel reseau, combien d'adresses distribuees,
+    /// combien de clefs a usage unique deja brulees.
+    fn getwalletinfo(&self) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        let g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+        let schema = g.scheme();
+        let consommees = g.indices_consommes().len() as u64;
+        Ok(Json::obj()
+            .set("reseau", Json::str(format!("{:?}", self.network)))
+            .set("schema", Json::str(schema.name()))
+            .set("schema_id", Json::u64(u64::from(schema.as_u8())))
+            .set("usage_unique", Json::Bool(schema.est_a_usage_unique()))
+            .set("adresses_derivees", Json::u64(u64::from(g.next_index())))
+            .set("clefs_consommees", Json::u64(consommees))
+            .set(
+                "clef_publique_octets",
+                Json::u64(schema.pubkey_len() as u64),
+            )
+            .set("signature_octets", Json::u64(schema.sig_len() as u64))
+            .build())
+    }
+
+    /// Toutes les adresses que ce portefeuille reconnait comme siennes.
+    ///
+    /// Une empreinte de clef publique est publique par construction : la rendre
+    /// ne revele rien. Ce qui serait grave serait de rendre la graine, et
+    /// aucune methode ne le fait.
+    fn listaddresses(&self) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        let g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+        let schema = g.scheme();
+        let consommees = g.indices_consommes();
+        let v: Vec<Json> = g
+            .known_hashes()
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let a = crate::address::Address {
+                    network: self.network,
+                    scheme: schema,
+                    hash: *h,
+                };
+                Json::obj()
+                    .set("indice", Json::u64(i as u64))
+                    .set("adresse", Json::str(a.to_string_bech32()))
+                    .set("consommee", Json::Bool(consommees.contains(&(i as u32))))
+                    .build()
+            })
+            .collect();
+        Ok(Json::array(v))
+    }
+
+    /// Historique des mouvements de ce portefeuille.
+    ///
+    /// # Le cout, et pourquoi il est annonce
+    ///
+    /// Q21 n'a pas d'index par adresse. Retrouver l'historique demande de relire
+    /// les corps des blocs et d'y chercher nos empreintes. La fenetre est donc
+    /// bornee a [`FENETRE_HISTORIQUE`] blocs, et la reponse **dit jusqu'ou elle
+    /// a regarde**. Un portefeuille qui affiche un historique tronque sans le
+    /// signaler ment a son porteur — et c'est le genre de mensonge qui fait
+    /// croire a des fonds disparus.
+    fn listtransactions(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        let limite = params
+            .get("limite")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 500);
+
+        let g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+        let schema = g.scheme();
+
+        let (mouvements, depuis, hauteur, tout_resolu) = self.node.with_chain(|c| {
+            let hauteur = c.height();
+            let depuis = hauteur.saturating_sub(FENETRE_HISTORIQUE);
+
+            // --- Retrouver ce qui est SORTI, pas seulement ce qui est entre.
+            //
+            // Une entree ne porte pas son montant : elle designe une sortie
+            // anterieure. Sans resolution, l'historique affichait « envoi » sans
+            // jamais dire combien — le chiffre qui interesse justement celui qui
+            // a envoye.
+            //
+            // On construit donc, au fil du balayage, une table des sorties
+            // rencontrees. Elle ne couvre que la fenetre : une depense dont la
+            // piece d'origine est plus ancienne reste non resolue, et c'est dit
+            // dans la reponse plutot que compte comme zero.
+            let mut sorties_vues: std::collections::HashMap<(Hash256, u32), u64> =
+                std::collections::HashMap::new();
+            let mut blocs: Vec<Block> = Vec::new();
+            let mut h = hauteur;
+            loop {
+                if h < depuis {
+                    break;
+                }
+                if let Some(b) = c.block_at(h) {
+                    for tx in &b.transactions {
+                        let id = tx.txid();
+                        for (i, o) in tx.outputs.iter().enumerate() {
+                            sorties_vues.insert((id, i as u32), o.value.units());
+                        }
+                    }
+                    blocs.push(b);
+                }
+                if h == 0 {
+                    break;
+                }
+                h -= 1;
+            }
+
+            let mut v: Vec<Json> = Vec::new();
+            let mut tout_resolu = true;
+            for b in &blocs {
+                if v.len() as u64 >= limite {
+                    break;
+                }
+                for tx in &b.transactions {
+                    let recu: u64 = tx
+                        .outputs
+                        .iter()
+                        .filter(|o| g.owns(&o.pubkey_hash))
+                        .map(|o| o.value.units())
+                        .sum();
+
+                    // Ce que ce portefeuille a engage : la somme des sorties
+                    // anterieures que ses propres clefs ont deverrouillees.
+                    let mut engage: u64 = 0;
+                    let mut engage_complet = true;
+                    let mut emis = false;
+                    for e in &tx.inputs {
+                        if e.witness.pubkey.is_empty() {
+                            continue; // coinbase
+                        }
+                        if !g.owns(&crate::sig::pubkey_hash(schema, &e.witness.pubkey)) {
+                            continue;
+                        }
+                        emis = true;
+                        match sorties_vues.get(&(e.prev_out.txid, e.prev_out.index)) {
+                            Some(m) => engage += m,
+                            None => engage_complet = false,
+                        }
+                    }
+                    if recu == 0 && !emis {
+                        continue;
+                    }
+                    if emis && !engage_complet {
+                        tout_resolu = false;
+                    }
+
+                    let coinbase =
+                        tx.inputs.len() == 1 && tx.inputs[0].prev_out.txid == Hash256::ZERO;
+                    // Sorti pour de bon : ce qui a ete engage, moins ce qui est
+                    // revenu en monnaie.
+                    let sorti = engage.saturating_sub(recu);
+                    let mut ligne = Json::obj()
+                        .set("txid", Json::str(tx.txid().to_hex()))
+                        .set("hauteur", Json::u64(b.header.height))
+                        .set("horodatage", Json::u64(b.header.time))
+                        .set("confirmations", Json::u64(hauteur - b.header.height + 1))
+                        .set(
+                            "genre",
+                            Json::str(if coinbase {
+                                "minage"
+                            } else if emis {
+                                "envoi"
+                            } else {
+                                "reception"
+                            }),
+                        )
+                        .set("recu", montant(Amount::from_units(recu)))
+                        .set(
+                            "mature",
+                            Json::Bool(!coinbase || hauteur >= b.header.height + COINBASE_MATURITY),
+                        );
+                    if emis {
+                        ligne = ligne
+                            .set("engage", montant(Amount::from_units(engage)))
+                            .set("sorti", montant(Amount::from_units(sorti)))
+                            .set("montant_sortant_connu", Json::Bool(engage_complet));
+                    }
+                    v.push(ligne.build());
+                    if v.len() as u64 >= limite {
+                        break;
+                    }
+                }
+            }
+            (v, depuis, hauteur, tout_resolu)
+        });
+
+        let complet = depuis == 0;
+        Ok(Json::obj()
+            .set("mouvements", Json::array(mouvements))
+            .set("regarde_depuis_hauteur", Json::u64(depuis))
+            .set("hauteur", Json::u64(hauteur))
+            .set("historique_complet", Json::Bool(complet))
+            .set("montants_sortants_tous_resolus", Json::Bool(tout_resolu))
+            .set(
+                "note",
+                Json::str(if complet {
+                    "Historique complet : la recherche est remontee jusqu'a la genese."
+                } else {
+                    "Historique partiel. Ce noeud n'a pas d'index par adresse : \
+                     la recherche s'arrete a la hauteur indiquee."
+                }),
+            )
+            .build())
+    }
+
+    /// Prepare un envoi : selectionne les pieces, et rend les chiffres exacts.
+    ///
+    /// # Pourquoi cette methode existe
+    ///
+    /// `estimatefee` demandait a l'appelant de **supposer** un nombre
+    /// d'entrees. C'est une supposition impossible a faire juste : les pieces
+    /// ne sont choisies qu'au moment de construire la transaction, et avec
+    /// ML-DSA-87 chaque entree ajoute 7 219 octets de temoin.
+    ///
+    /// Un essai reel de l'interface l'a montre sans appel : une estimation
+    /// faite pour une entree a propose huit unites de frais, la transaction
+    /// reelle en a consomme deux, et le reservoir l'a refusee pour taux de
+    /// frais trop bas. L'utilisateur voyait un refus incomprehensible sur une
+    /// transaction qu'il venait de confirmer.
+    ///
+    /// Cette methode fait la **vraie** selection, sans rien signer ni depenser,
+    /// et rend les chiffres de la transaction qui sera effectivement
+    /// construite. L'ecran de confirmation peut alors dire la verite.
+    ///
+    /// Elle ne modifie rien : aucun indice n'est consomme, aucun compteur
+    /// n'avance.
+    fn preparersend(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        let adresse = params
+            .get("adresse")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'adresse' attendu"))?;
+        let unites = params
+            .get("unites")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'unites' attendu (entier)"))?;
+        if unites == 0 {
+            return Err(erreur(ERR_PARAMS, "montant nul"));
+        }
+        let dest = Address::parse_on(adresse, self.network)
+            .map_err(|e| erreur(ERR_PARAMS, &format!("adresse invalide : {e:?}")))?;
+
+        let g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+        let schema = g.scheme();
+
+        let (taux_median, en_attente) = self
+            .node
+            .with_mempool(|m| (m.taux_median().unwrap_or(0), m.len() as u64));
+        let taux = taux_median.max(crate::mempool::MIN_FEE_RATE);
+
+        // Deux passes : la premiere pour connaitre le nombre d'entrees, la
+        // seconde parce que des frais plus eleves peuvent en demander une de
+        // plus. Deux suffisent en pratique ; on ne boucle pas indefiniment.
+        let mut frais = FRAIS_DEFAUT;
+        let mut resultat = None;
+        for _ in 0..2 {
+            let besoin = unites
+                .checked_add(frais)
+                .ok_or_else(|| erreur(ERR_PARAMS, "montant et frais debordent"))?;
+            let (choisies, total) = self
+                .node
+                .with_chain(|c| g.selectionner(&c.utxo, c.height(), besoin))
+                .map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
+
+            let n = choisies.len() as u64;
+            let monnaie = total - besoin;
+            // Une sortie pour le destinataire, une pour la monnaie s'il y en a.
+            let sorties = if monnaie > 0 { 2 } else { 1 };
+            let ossature = 8 + n * 48 + sorties * 41;
+            let temoin = n * (schema.pubkey_len() as u64 + schema.sig_len() as u64);
+            let poids = ossature * WITNESS_DISCOUNT + temoin;
+            // Arrondi vers le haut : sous le plancher, la transaction n'est pas
+            // relayee du tout.
+            let calcules = poids.saturating_mul(taux).div_ceil(1000).max(1);
+
+            resultat = Some((n, ossature + temoin, poids, monnaie, total));
+            if calcules <= frais {
+                break;
+            }
+            frais = calcules;
+        }
+
+        let (entrees, taille, poids, monnaie, total) =
+            resultat.ok_or_else(|| erreur(ERR_INTERNE, "selection impossible"))?;
+
+        Ok(Json::obj()
+            .set("adresse", Json::str(dest.to_string_bech32()))
+            .set("montant", montant(Amount::from_units(unites)))
+            .set("frais", montant(Amount::from_units(frais)))
+            .set("total_debite", montant(Amount::from_units(unites + frais)))
+            .set("monnaie_rendue", montant(Amount::from_units(monnaie)))
+            .set("pieces_engagees", montant(Amount::from_units(total)))
+            .set("entrees", Json::u64(entrees))
+            .set("taille_octets", Json::u64(taille))
+            .set("poids", Json::u64(poids))
+            .set("taux_par_millier_de_poids", Json::u64(taux))
+            .set("transactions_en_attente", Json::u64(en_attente))
+            .set(
+                "note",
+                Json::str(
+                    "Chiffres exacts : les pieces ont ete reellement selectionnees. \
+                     Rien n'a ete signe ni consomme. Passez ces frais tels quels a \
+                     sendtoaddress.",
+                ),
+            )
+            .build())
+    }
+
+    /// Frais suggeres pour une transaction de ce portefeuille.
+    ///
+    /// **Preferez [`Self::preparersend`]** : cette methode-ci demande un nombre
+    /// d'entrees que l'appelant ne peut pas connaitre, et se trompe donc des
+    /// que la selection en retient un autre. Elle reste pour repondre a la
+    /// question generale « combien coute une transaction ici ».
+    ///
+    /// La suggestion se fonde sur la taille reelle qu'aura la transaction — avec
+    /// ML-DSA-87 le temoin pese 99 % du total — et sur ce que paient les
+    /// transactions deja en attente.
+    fn estimatefee(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        let entrees = params
+            .get("entrees")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .clamp(1, 100);
+        let sorties = params
+            .get("sorties")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2)
+            .clamp(1, 100);
+
+        let schema = {
+            let g = w
+                .lock()
+                .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+            g.scheme()
+        };
+        // --- Taille, poids, et taux : trois grandeurs a ne pas confondre.
+        //
+        // Le reservoir ordonne par **taux de frais au poids ponderé**, exprime
+        // en unites par millier d'unites de poids. Le poids n'est pas la
+        // taille : l'ossature compte pour `WITNESS_DISCOUNT` fois sa taille, le
+        // temoin pour une seule.
+        //
+        // Multiplier la taille par ce taux — ce que faisait la premiere version
+        // de cette methode — surestimait les frais d'un facteur mille. Personne
+        // n'aurait perdu de fonds, mais chacun aurait paye mille fois trop.
+        let ossature = 8 + entrees * 48 + sorties * 41;
+        let temoin = entrees * (schema.pubkey_len() as u64 + schema.sig_len() as u64);
+        let taille = ossature + temoin;
+        let poids = ossature * WITNESS_DISCOUNT + temoin;
+
+        let (taux_reservoir, en_attente) = self.node.with_mempool(|m| {
+            let n = m.len() as u64;
+            let taux = m.taux_median().unwrap_or(0);
+            (taux, n)
+        });
+        // Le plancher du reseau, ou le taux constate s'il est plus eleve.
+        let taux = taux_reservoir.max(crate::mempool::MIN_FEE_RATE);
+        // Arrondi vers le haut : une transaction sous le plancher n'est pas
+        // relayee du tout, et un arrondi vers le bas la ferait tomber dessus.
+        let suggere = poids.saturating_mul(taux).div_ceil(1000).max(1);
+
+        Ok(Json::obj()
+            .set("taille_estimee_octets", Json::u64(taille))
+            .set("poids_estime", Json::u64(poids))
+            .set("entrees", Json::u64(entrees))
+            .set("sorties", Json::u64(sorties))
+            .set("taux_par_millier_de_poids", Json::u64(taux))
+            .set("transactions_en_attente", Json::u64(en_attente))
+            .set("frais_suggeres", montant(Amount::from_units(suggere)))
+            .build())
+    }
+
+    /// Ou en est la synchronisation avec le reseau.
+    ///
+    /// Un portefeuille qui affiche un solde sans dire qu'il est en retard de
+    /// mille blocs affiche un chiffre faux. Cette methode existe pour que
+    /// l'interface puisse le dire.
+    fn getsyncstatus(&self) -> Json {
+        let hauteur = self.node.height();
+        let pairs = self.node.peer_count() as u64;
+        let cible = self.node.hauteur_annoncee_max().max(hauteur);
+        let restant = cible.saturating_sub(hauteur);
+        Json::obj()
+            .set("hauteur", Json::u64(hauteur))
+            .set("hauteur_reseau", Json::u64(cible))
+            .set("blocs_restants", Json::u64(restant))
+            .set("pairs", Json::u64(pairs))
+            .set("synchronise", Json::Bool(restant == 0 && pairs > 0))
+            .set(
+                "note",
+                Json::str(if pairs == 0 {
+                    "Aucun pair connecte : ce noeud ne peut pas savoir s'il est a jour."
+                } else if restant == 0 {
+                    "A jour avec les pairs connus."
+                } else {
+                    "Synchronisation en cours. Les soldes affiches sont incomplets."
+                }),
+            )
+            .build()
+    }
+
+    fn getbalance(&self) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        // --- Ne pas recopier l'ensemble des UTXO a chaque appel.
+        //
+        // `c.utxo.clone()` dupliquait tout le jeu d'UTXO — des centaines de
+        // mebioctets sur une chaine reelle — pour lire un solde, et un lot en
+        // demandait autant de copies. On travaille sous le verrou, sur une
+        // reference : le calcul est identique, l'allocation disparait.
+        let g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+        let (solde, sorties, immature, hauteur) = self.node.with_chain(|c| {
+            let hauteur = c.height();
+            let solde = g.balance(&c.utxo, hauteur);
+            let sorties = g.spendable(&c.utxo, hauteur).len();
+            let mut immature = 0u64;
+            for (_, e) in c.utxo.iter() {
+                if e.is_coinbase
+                    && hauteur < e.height + COINBASE_MATURITY
+                    && g.owns(&e.output.pubkey_hash)
+                {
+                    immature += e.output.value.units();
+                }
+            }
+            (solde, sorties, immature, hauteur)
+        });
+        let _ = hauteur;
+
+        Ok(Json::obj()
+            .set("depensable", montant(solde))
+            .set("immature", montant(Amount::from_units(immature)))
+            .set("sorties_depensables", Json::u64(sorties as u64))
+            .set("adresses_derivees", Json::u64(g.next_index() as u64))
+            .build())
+    }
+
+    fn getnewaddress(&self) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        let mut g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+        let a = g.new_address();
+        // Le compteur d'indices vient d'avancer : sans ecriture, un redemarrage
+        // redistribuerait la meme adresse.
+        self.enregistrer(&g);
+        Ok(Json::obj()
+            .set("adresse", Json::str(a.to_string_bech32()))
+            .set("schema", Json::str(a.scheme.name()))
+            .set("usage_unique", Json::Bool(a.scheme.est_a_usage_unique()))
+            .set(
+                "avertissement",
+                Json::str(if a.scheme.est_a_usage_unique() {
+                    "Adresse a usage unique : Lamport revele la clef privee si elle \
+                     signe deux fois. Ne la reutilisez jamais."
+                } else {
+                    "Adresse reutilisable sans affaiblir la clef. Une adresse neuve \
+                     par paiement reste conseillee, par confidentialite."
+                }),
+            )
+            .build())
+    }
+
+    fn sendtoaddress(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+
+        let adresse = params
+            .get("adresse")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'adresse' attendu"))?;
+        let unites = params
+            .get("unites")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'unites' attendu (entier)"))?;
+        // --- Des frais mal typés ne doivent pas devenir les frais par defaut.
+        //
+        // `.and_then(as_u64).unwrap_or(1_000)` remplacait silencieusement toute
+        // valeur illisible par la valeur par defaut : la transaction construite
+        // n'etait pas celle que le client avait ecrite. Un champ present et
+        // invalide est une erreur, pas une invitation a deviner.
+        let frais = match params.get("frais") {
+            None | Some(Json::Null) => FRAIS_DEFAUT,
+            Some(v) => v.as_u64().ok_or_else(|| {
+                erreur(
+                    ERR_PARAMS,
+                    "parametre 'frais' present mais illisible : un entier d'unites est attendu",
+                )
+            })?,
+        };
+
+        let dest = Address::parse_on(adresse, self.network)
+            .map_err(|e| erreur(ERR_PARAMS, &format!("adresse invalide : {e:?}")))?;
+
+        // Construction et acceptation sous **un seul** verrou : la chaine et le
+        // reservoir vivent sous le meme, et les prendre l'un dans l'autre
+        // figerait le noeud.
+        //
+        // Sur une reference, jamais sur une copie : recopier le jeu d'UTXO pour
+        // construire une transaction coutait des centaines de mebioctets sur
+        // une chaine reelle, et un lot en demandait autant de copies.
+        let (tx, txid) = {
+            let mut g = w
+                .lock()
+                .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+            let resultat = self.node.with_chain_and_mempool(|c, m| {
+                let tx = g.create_transaction(
+                    &c.utxo,
+                    c.height(),
+                    &dest,
+                    Amount::from_units(unites),
+                    Amount::from_units(frais),
+                );
+                match tx {
+                    Ok(tx) => {
+                        let r = m.accept(&tx, &c.utxo, self.network, c.height());
+                        Ok((tx, r))
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+            // La clef vient peut-etre d'etre consommee : cela doit atteindre le
+            // disque, que la suite reussisse ou non.
+            self.enregistrer(&g);
+            let (tx, accepte) =
+                resultat.map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
+            let txid = accepte.map_err(|e| erreur(ERR_PORTEFEUILLE, &message_reservoir(&e)))?;
+            (tx, txid)
+        };
+
+        self.node.announce_tx(txid);
+
+        Ok(Json::obj()
+            .set("txid", Json::str(txid.to_hex()))
+            .set("transaction", tx_json(&tx))
+            .build())
+    }
+}
+
+/// Schema par defaut du portefeuille, expose pour la documentation.
+///
+/// Depend de la compilation : ML-DSA-87 des que la feature `mldsa` est active,
+/// Lamport sinon. Un noeud sans ML-DSA n'a pas sa place sur le reseau principal.
+///
+/// Cette constante annoncait ML-DSA-65 alors que le binaire creait des
+/// portefeuilles ML-DSA-87 depuis le passage au niveau NIST 5. Une constante
+/// qui contredit le comportement reel est pire qu'absente : elle sert de
+/// reference a qui lit le code, et elle ment.
+pub const SCHEMA_PORTEFEUILLE: SchemeId = if cfg!(feature = "mldsa") {
+    SchemeId::MlDsa87
+} else {
+    SchemeId::LamportOts
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::{genesis_block, Chain};
+    use crate::json::parse as jparse;
+
+    const RESEAU: Network = Network::Regtest;
+
+    fn contexte(avec_portefeuille: bool) -> RpcContext {
+        let g = genesis_block(RESEAU);
+        let node = Arc::new(Node::new(RESEAU, Chain::new(RESEAU, g)));
+        RpcContext {
+            sur_changement: None,
+            node,
+            wallet: if avec_portefeuille {
+                Some(Arc::new(Mutex::new(Wallet::from_seed([9u8; 32], RESEAU))))
+            } else {
+                None
+            },
+            network: RESEAU,
+        }
+    }
+
+    fn appel(c: &RpcContext, methode: &str, params: &str) -> Json {
+        let corps = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{methode}","params":{params}}}"#);
+        jparse(&c.handle(&corps)).expect("reponse JSON valide")
+    }
+
+    fn resultat(c: &RpcContext, methode: &str, params: &str) -> Json {
+        let r = appel(c, methode, params);
+        assert!(
+            r.get("error").is_none(),
+            "{methode} a renvoye une erreur : {}",
+            r.encode()
+        );
+        r.get("result").cloned().expect("champ result")
+    }
+
+    #[test]
+    fn getinfo_decrit_la_chaine() {
+        let c = contexte(false);
+        let r = resultat(&c, "getinfo", "{}");
+        assert_eq!(r.get("hauteur").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(r.get("reseau").and_then(|v| v.as_str()), Some("Regtest"));
+        assert_eq!(
+            r.get("portefeuille_actif"),
+            Some(&Json::Bool(false)),
+            "le portefeuille doit etre annonce inactif"
+        );
+    }
+
+    #[test]
+    fn getblock_rend_la_genese() {
+        let c = contexte(false);
+        let r = resultat(&c, "getblock", r#"{"hauteur":0}"#);
+        let e = r.get("entete").expect("entete");
+        assert_eq!(e.get("hauteur").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(r.get("nb_transactions").and_then(|v| v.as_u64()), Some(1));
+        // La coinbase de genese emet exactement la piece.
+        let txs = r.get("transactions").and_then(|v| v.as_array()).unwrap();
+        assert!(txs[0].get("coinbase") == Some(&Json::Bool(true)));
+    }
+
+    #[test]
+    fn getblock_sans_parametre_rend_la_tete() {
+        let c = contexte(false);
+        let r = resultat(&c, "getblock", "{}");
+        assert!(r.get("entete").is_some());
+    }
+
+    #[test]
+    fn une_hauteur_inexistante_est_une_erreur_propre() {
+        let c = contexte(false);
+        let r = appel(&c, "getblock", r#"{"hauteur":9999}"#);
+        assert_eq!(
+            r.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
+            Some(ERR_INTROUVABLE)
+        );
+    }
+
+    #[test]
+    fn une_methode_inconnue_est_signalee() {
+        let c = contexte(false);
+        let r = appel(&c, "nexistepas", "{}");
+        assert_eq!(
+            r.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
+            Some(ERR_METHODE)
+        );
+    }
+
+    #[test]
+    fn un_document_illisible_rend_une_erreur_d_analyse() {
+        let c = contexte(false);
+        let r = jparse(&c.handle("{ceci n'est pas du json")).unwrap();
+        assert_eq!(
+            r.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
+            Some(ERR_PARSE)
+        );
+    }
+
+    /// La separation qui evite qu'un port de consultation devienne un port de
+    /// depense.
+    #[test]
+    fn les_methodes_de_portefeuille_sont_refusees_par_defaut() {
+        let c = contexte(false);
+        for m in ["getbalance", "getnewaddress", "sendtoaddress"] {
+            let r = appel(&c, m, "{}");
+            assert_eq!(
+                r.get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|v| v.as_i64()),
+                Some(ERR_PORTEFEUILLE_DESACTIVE),
+                "{m} aurait du etre refusee"
+            );
+        }
+    }
+
+    #[test]
+    fn les_methodes_de_portefeuille_repondent_quand_il_est_actif() {
+        let c = contexte(true);
+        let r = resultat(&c, "getbalance", "{}");
+        assert_eq!(
+            r.get("depensable")
+                .and_then(|m| m.get("unites"))
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+
+        let a = resultat(&c, "getnewaddress", "{}");
+        let adr = a.get("adresse").and_then(|v| v.as_str()).unwrap();
+        assert!(adr.starts_with("rq21"), "adresse inattendue : {adr}");
+        assert!(
+            a.get("avertissement").is_some(),
+            "l'usage unique doit etre rappele"
+        );
+    }
+
+    /// Aucun montant ne doit transiter en flottant.
+    ///
+    /// La verification est indirecte mais forte : l'analyseur de `crate::json`
+    /// **refuse** les flottants. Si l'encodeur en produisait un, relire la
+    /// reponse echouerait. Chaque methode est donc passee au retour.
+    #[test]
+    fn aucune_reponse_ne_contient_de_flottant() {
+        let c = contexte(true);
+        for (m, p) in [
+            ("getinfo", "{}"),
+            ("getsupply", "{}"),
+            ("getemission", r#"{"hauteur":1051200}"#),
+            ("getblock", r#"{"hauteur":0}"#),
+            ("getpow", "{}"),
+            ("getsecurity", "{}"),
+            ("getbalance", "{}"),
+            ("getmempool", "{}"),
+        ] {
+            let brut = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{m}","params":{p}}}"#);
+            let sortie = c.handle(&brut);
+            assert!(
+                jparse(&sortie).is_ok(),
+                "{m} produit un document que notre propre analyseur refuse —                  signe qu'un flottant s'y est glisse : {sortie}"
+            );
+        }
+
+        // Et la forme des montants reste celle promise : entier plus texte.
+        let r = resultat(&c, "getsupply", "{}");
+        let emis = r.get("emis").unwrap();
+        assert!(emis.get("unites").and_then(|v| v.as_u64()).is_some());
+        assert_eq!(emis.get("q21").and_then(|v| v.as_str()), Some("1.00000000"));
+    }
+
+    #[test]
+    fn getsecurity_ne_dit_pas_que_ce_qui_rassure() {
+        let c = contexte(false);
+        let r = resultat(&c, "getsecurity", "{}");
+        assert_eq!(
+            r.get("protection_100_pourcent_possible"),
+            Some(&Json::Bool(false)),
+            "l'API ne doit pas laisser croire a une immunite"
+        );
+        assert!(
+            r.get("un_attaquant_peut")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len()
+                >= 2
+        );
+        assert!(r.get("cout_de_la_finalite_glissante").is_some());
+    }
+
+    #[test]
+    fn getpow_expose_l_asymetrie_entre_noeud_et_mineur() {
+        let c = contexte(false);
+        let r = resultat(&c, "getpow", "{}");
+        let noeud = r
+            .get("memoire_noeud_octets")
+            .and_then(|v| v.as_u64())
+            .expect("memoire_noeud_octets");
+        let mineur = r
+            .get("memoire_mineur_octets")
+            .and_then(|v| v.as_u64())
+            .expect("memoire_mineur_octets");
+
+        // Ce test affirmait auparavant `noeud == 0`. La phase 6 a montre que
+        // cette gratuite etait precisement ce qui rendait la preuve de travail
+        // contournable : un element de table se recalculait pour un condensat.
+        // L'asymetrie subsiste, elle n'est simplement plus infinie.
+        assert!(noeud > 0, "un noeud detient desormais le cache");
+        assert!(mineur > noeud, "et un mineur detient bien davantage");
+        assert_eq!(
+            mineur / noeud,
+            u64::from(POW_CACHE_RATIO),
+            "le rapport entre les deux niveaux est une constante de consensus"
+        );
+    }
+
+    #[test]
+    fn un_lot_de_requetes_est_traite() {
+        let c = contexte(false);
+        let corps = r#"[{"jsonrpc":"2.0","id":1,"method":"getinfo"},
+                        {"jsonrpc":"2.0","id":2,"method":"getsupply"}]"#;
+        let r = jparse(&c.handle(corps)).expect("reponse");
+        let v = r.as_array().expect("un tableau de reponses");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].get("id").and_then(|x| x.as_u64()), Some(1));
+        assert_eq!(v[1].get("id").and_then(|x| x.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn listmethods_documente_l_api() {
+        let c = contexte(false);
+        let r = resultat(&c, "listmethods", "{}");
+        let v = r.as_array().expect("tableau");
+        assert!(v.len() >= 10);
+        assert!(v
+            .iter()
+            .all(|m| m.get("nom").is_some() && m.get("description").is_some()));
+    }
+
+    #[test]
+    fn une_transaction_inconnue_est_signalee() {
+        let c = contexte(false);
+        let r = appel(&c, "gettransaction", r#"{"txid":"00"}"#);
+        assert!(r.get("error").is_some());
+    }
+
+    #[test]
+    fn getemission_suit_la_courbe() {
+        let c = contexte(false);
+        let r = resultat(&c, "getemission", r#"{"hauteur":1051200}"#);
+        assert_eq!(r.get("annee_approx").and_then(|v| v.as_u64()), Some(4));
+        let cumul = r
+            .get("emis_cumule")
+            .and_then(|m| m.get("unites"))
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert!(
+            cumul <= MAX_SUPPLY,
+            "le plafond ne doit jamais etre franchi"
+        );
+    }
+}

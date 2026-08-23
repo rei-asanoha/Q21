@@ -1,0 +1,903 @@
+//! Serveur HTTP/1.1 minimal.
+//!
+//! Juste assez pour servir une API JSON-RPC et une page d'exploration. Ecrit
+//! ici, sans dependance, pour la meme raison que le reste.
+//!
+//! # La decision de securite qui compte
+//!
+//! Un port RPC ouvert est un acces au noeud. Un port RPC ouvert **sur une
+//! interface publique** est une perte de fonds : il suffit d'un scan pour le
+//! trouver. Cette histoire s'est deja jouee — des milliers de noeuds Ethereum et
+//! Docker ont ete vides parce qu'un port d'administration ecoutait sur
+//! `0.0.0.0` par defaut.
+//!
+//! Deux garde-fous, appliques a la liaison et non au premier appel :
+//!
+//! - **le bouclage local est le defaut.** `127.0.0.1` sert le noeud a la machine
+//!   qui l'heberge, et a personne d'autre ;
+//! - **ecouter ailleurs exige un jeton.** Sans jeton, [`serve`] refuse de se
+//!   lier a une adresse non locale, et le refus arrive au demarrage, pas en
+//!   pleine nuit quand le port a deja ete trouve.
+//!
+//! Le jeton est compare en **temps constant** : une comparaison naive laisse
+//! fuir sa longueur et son prefixe par le temps de reponse.
+
+use std::collections::BTreeMap;
+use std::io::{BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Taille maximale d'un corps de requete.
+pub const MAX_BODY: usize = 1024 * 1024;
+/// Longueur maximale d'une ligne d'en-tete.
+pub const MAX_LINE: usize = 8 * 1024;
+/// Nombre maximal d'en-tetes.
+pub const MAX_HEADERS: usize = 64;
+
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Duree maximale d'une requete complete, lecture comprise.
+///
+/// `READ_TIMEOUT` porte sur **chaque** lecture : un octet toutes les vingt
+/// secondes maintenait donc une connexion — et son fil — indefiniment. C'est
+/// l'attaque Slowloris, vieille de quinze ans et toujours efficace contre qui
+/// ne borne que les lectures individuelles.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Connexions traitees simultanement.
+///
+/// `serve` lancait un fil systeme par connexion, sans compteur ni file. Quelques
+/// milliers de connexions ouvertes suffisaient a epuiser la memoire du
+/// processus. Au-dela de ce plafond, la connexion est refusee immediatement :
+/// un refus franc vaut mieux qu'un fil de plus.
+pub const MAX_CONNEXIONS: usize = 64;
+
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub query: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Response {
+    pub status: u16,
+    pub content_type: String,
+    pub body: String,
+}
+
+impl Response {
+    pub fn json(body: String) -> Response {
+        Response {
+            status: 200,
+            content_type: "application/json; charset=utf-8".into(),
+            body,
+        }
+    }
+    pub fn html(body: String) -> Response {
+        Response {
+            status: 200,
+            content_type: "text/html; charset=utf-8".into(),
+            body,
+        }
+    }
+    pub fn text(status: u16, body: &str) -> Response {
+        Response {
+            status,
+            content_type: "text/plain; charset=utf-8".into(),
+            body: body.into(),
+        }
+    }
+    pub fn not_found() -> Response {
+        Response::text(404, "introuvable")
+    }
+}
+
+#[derive(Debug)]
+pub enum HttpError {
+    Io(std::io::Error),
+    /// Liaison a une interface non locale sans jeton d'acces.
+    ExpositionSansJeton(SocketAddr),
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Io(e) => write!(f, "erreur reseau : {e}"),
+            HttpError::ExpositionSansJeton(a) => write!(
+                f,
+                "refus d'ecouter sur {a} sans jeton : un port RPC accessible depuis \
+                 l'exterieur donne acces au noeud. Utilisez 127.0.0.1, ou fournissez \
+                 un jeton d'acces."
+            ),
+        }
+    }
+}
+
+impl From<std::io::Error> for HttpError {
+    fn from(e: std::io::Error) -> Self {
+        HttpError::Io(e)
+    }
+}
+
+/// Comparaison en temps constant.
+///
+/// Une comparaison naive s'arrete au premier octet different : le temps de
+/// reponse revele alors le prefixe correct, et un jeton se devine octet par
+/// octet. Ici le temps ne depend que des longueurs.
+fn egal_temps_constant(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+pub struct ServerHandle {
+    pub addr: SocketAddr,
+    arret: Arc<AtomicBool>,
+}
+
+impl ServerHandle {
+    pub fn shutdown(&self) {
+        self.arret.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Demarre le serveur en tache de fond.
+///
+/// `token` protege l'acces. Il est **obligatoire** pour toute adresse d'ecoute
+/// qui n'est pas une adresse de bouclage.
+pub fn serve<F>(adresse: &str, token: Option<String>, handler: F) -> Result<ServerHandle, HttpError>
+where
+    F: Fn(Request) -> Response + Send + Sync + 'static,
+{
+    serve_avec_public(adresse, token, &[], handler)
+}
+
+/// Comme [`serve`], mais avec une liste de chemins servis **sans jeton**.
+///
+/// # Pourquoi cette liste existe, et pourquoi elle est explicite
+///
+/// L'explorateur demande son jeton a l'utilisateur puis l'envoie en
+/// `Authorization`. Encore faut-il que la page ait pu se charger : exiger le
+/// jeton pour la page elle-meme donnait un `401` en texte brut, sans moyen de
+/// le saisir. Le noeud etait protege et inutilisable.
+///
+/// Cette liste ne doit contenir que des ressources **statiques**, qui ne
+/// portent aucune donnee : la coquille HTML de l'explorateur, rien d'autre.
+/// Elle est passee par l'appelant, nommee chemin par chemin, et vide par
+/// defaut — la valeur sure est celle qu'on obtient en ne faisant rien.
+pub fn serve_avec_public<F>(
+    adresse: &str,
+    token: Option<String>,
+    chemins_publics: &'static [&'static str],
+    handler: F,
+) -> Result<ServerHandle, HttpError>
+where
+    F: Fn(Request) -> Response + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind(adresse)?;
+    let local = listener.local_addr()?;
+
+    let bouclage = match local.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    };
+    if !bouclage && token.is_none() {
+        return Err(HttpError::ExpositionSansJeton(local));
+    }
+
+    let arret = Arc::new(AtomicBool::new(false));
+    let arret_fil = arret.clone();
+    let handler = Arc::new(handler);
+    let token = Arc::new(token);
+    // Compteur de connexions en cours : sans lui, une connexion valait un fil
+    // systeme, sans plafond.
+    let en_cours = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    std::thread::spawn(move || {
+        for flux in listener.incoming() {
+            if arret_fil.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut flux = match flux {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            if en_cours.load(Ordering::Relaxed) >= MAX_CONNEXIONS {
+                // Refus franc, sans fil : le client sait a quoi s'en tenir et le
+                // noeud ne paie rien.
+                let _ = flux.set_write_timeout(Some(Duration::from_secs(2)));
+                let _ = ecrire_reponse(
+                    &mut flux,
+                    &Response::text(503, "trop de connexions simultanees"),
+                );
+                let _ = flux.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+            let h = handler.clone();
+            let t = token.clone();
+            let c = en_cours.clone();
+            let pubs = chemins_publics;
+            c.fetch_add(1, Ordering::Relaxed);
+            let lance = std::thread::Builder::new().spawn(move || {
+                // Le delai de lecture ne doit pas pouvoir survivre a l'echeance
+                // globale : sinon une seule lecture bloquee la depasserait avant
+                // meme qu'on la consulte.
+                let _ = flux.set_read_timeout(Some(REQUEST_TIMEOUT));
+                let _ = flux.set_write_timeout(Some(READ_TIMEOUT));
+                traiter_connexion(flux, &*h, t.as_ref().as_deref(), pubs);
+                c.fetch_sub(1, Ordering::Relaxed);
+            });
+            if lance.is_err() {
+                en_cours.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    Ok(ServerHandle { addr: local, arret })
+}
+
+fn traiter_connexion<F>(
+    mut flux: TcpStream,
+    handler: &F,
+    token: Option<&str>,
+    chemins_publics: &[&str],
+) where
+    F: Fn(Request) -> Response,
+{
+    // Echeance globale : la somme des lectures d'une requete est bornee, pas
+    // seulement chaque lecture prise a part.
+    let echeance = std::time::Instant::now() + REQUEST_TIMEOUT;
+    let reponse = match lire_requete(&flux, echeance) {
+        Ok(req) => match garde_navigateur(&req) {
+            Some(raison) => Response::text(403, raison),
+            None => {
+                let libre = chemins_publics.contains(&req.path.as_str());
+                if let Some(attendu) = token.filter(|_| !libre) {
+                    if !autorise(&req, attendu) {
+                        Response::text(401, "jeton d'acces manquant ou invalide")
+                    } else {
+                        handler(req)
+                    }
+                } else {
+                    handler(req)
+                }
+            }
+        },
+        Err(msg) => Response::text(400, msg),
+    };
+    let _ = ecrire_reponse(&mut flux, &reponse);
+    let _ = flux.shutdown(std::net::Shutdown::Both);
+}
+
+/// Refuse ce qu'un navigateur ne devrait jamais pouvoir envoyer ici.
+///
+/// # L'attaque
+///
+/// Le RPC ecoute sur la boucle locale, ce qui donne un faux sentiment de
+/// securite : **le navigateur de l'utilisateur, lui, est sur la boucle
+/// locale**. Une page hostile ouverte dans un onglet quelconque peut donc
+/// emettre une requete vers `http://127.0.0.1:PORT/rpc`.
+///
+/// Un audit l'a demontre de trois facons :
+///
+/// - en JavaScript, une requete « simple » au sens CORS — donc sans pre-vol —
+///   atteignait le portefeuille ;
+/// - **sans aucun JavaScript** : un `<form enctype="text/plain">` produit un
+///   corps `nom=valeur`, et en placant le JSON dans le *nom* on obtient un
+///   document JSON-RPC valide. Un clic suffisait ;
+/// - par reliaison DNS : un nom qui resout d'abord vers l'attaquant puis vers
+///   127.0.0.1 rend la page hostile **de meme origine**. Elle lit alors les
+///   reponses, et pas seulement les emet a l'aveugle.
+///
+/// # Les quatre verrous
+///
+/// Chacun ferme une des voies. Ils sont independants : aucun ne rattrape la
+/// defaillance d'un autre, et c'est voulu.
+fn garde_navigateur(req: &Request) -> Option<&'static str> {
+    // 1. `Host` : seule la boucle locale est un hote legitime. Un nom de domaine
+    //    quelconque signale une reliaison DNS.
+    if let Some(host) = req.headers.get("host") {
+        if !hote_local(host) {
+            return Some(
+                "en-tete Host inattendue : ce service ne repond qu'a 127.0.0.1,                  [::1] ou localhost",
+            );
+        }
+    }
+
+    // 2. `Origin` / `Referer` : une page web n'a rien a faire ici. Presents et
+    //    non locaux, ils designent une origine tierce.
+    for cle in ["origin", "referer"] {
+        if let Some(v) = req.headers.get(cle) {
+            if !origine_locale(v) {
+                return Some("requete emise depuis une autre origine : refusee");
+            }
+        }
+    }
+
+    // 3. `Sec-Fetch-Site` : les navigateurs recents l'ajoutent d'office et une
+    //    page ne peut pas le falsifier — c'est un en-tete interdit au script.
+    if let Some(v) = req.headers.get("sec-fetch-site") {
+        if v != "same-origin" && v != "none" {
+            return Some("requete inter-sites : refusee");
+        }
+    }
+
+    // 4. `Content-Type` : exiger `application/json` interdit la requete
+    //    « simple ». Le navigateur devra faire un pre-vol, que ce service ne
+    //    satisfait pas — donc la requete ne partira jamais.
+    if req.method == "POST" {
+        let ct = req
+            .headers
+            .get("content-type")
+            .map(|s| {
+                s.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        if ct != "application/json" {
+            return Some("content-type: application/json requis");
+        }
+    }
+    None
+}
+
+/// Un hote qui designe cette machine, et rien d'autre.
+fn hote_local(host: &str) -> bool {
+    // Isoler l'hote du port. Trois formes possibles, et une seule facon de ne
+    // pas se tromper : traiter la forme entre crochets a part, puis ne couper
+    // sur `:` que s'il n'y en a qu'un — au-dela, c'est une adresse IPv6 nue.
+    let nu = if let Some(reste) = host.strip_prefix('[') {
+        match reste.split_once(']') {
+            // Apres le crochet fermant, seul un port est admis. `[::1].evil.example`
+            // n'est pas une adresse entre crochets, c'est un nom qui en porte le
+            // costume.
+            Some((interieur, apres)) if apres.is_empty() || apres.starts_with(':') => interieur,
+            _ => return false,
+        }
+    } else if host.matches(':').count() == 1 {
+        host.split_once(':').map(|(h, _)| h).unwrap_or(host)
+    } else {
+        host
+    };
+
+    // --- Une adresse, pas un prefixe de texte.
+    //
+    // La premiere version de ce controle testait `nu.starts_with("127.")`.
+    // C'etait faux, et faux de la pire maniere : `127.0.0.1.evil.example` est un
+    // nom de domaine qu'on enregistre en cinq minutes, et il satisfaisait le
+    // test. Il franchissait alors les **quatre** verrous d'un coup — apres
+    // reliaison, l'origine de la page hostile devient
+    // `http://127.0.0.1.evil.example:PORT`, donc `origine_locale` l'accepte pour
+    // la meme raison, `Sec-Fetch-Site` vaut `same-origin`, et une requete de
+    // meme origine n'a pas de pre-vol, donc elle pose le bon `Content-Type`.
+    // La reliaison DNS etait entierement rouverte.
+    //
+    // Un nom d'hote n'est du bouclage que s'il **est** une adresse de bouclage,
+    // ou le mot `localhost`. On analyse, on ne compare plus des prefixes.
+    if nu.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = nu.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    if let Ok(v6) = nu.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback();
+    }
+    false
+}
+
+/// Une origine `http://127.0.0.1:PORT` ou equivalente.
+fn origine_locale(v: &str) -> bool {
+    let sans_schema = v
+        .strip_prefix("http://")
+        .or_else(|| v.strip_prefix("https://"))
+        .unwrap_or(v);
+    // Un `Referer` porte un chemin : on ne garde que l'autorite.
+    let autorite = sans_schema.split('/').next().unwrap_or("");
+    hote_local(autorite)
+}
+
+fn autorise(req: &Request, attendu: &str) -> bool {
+    if let Some(a) = req.headers.get("authorization") {
+        if let Some(v) = a.strip_prefix("Bearer ") {
+            if egal_temps_constant(v.trim(), attendu) {
+                return true;
+            }
+        }
+    }
+    // Le jeton ne voyage plus dans l'URL.
+    //
+    // Il y etait accepte, et l'explorateur le recommandait. Une URL finit dans
+    // l'historique du navigateur, dans les journaux de tout mandataire, et dans
+    // l'en-tete `Referer` de la premiere ressource externe chargee. Un secret
+    // qui voyage dans une URL n'est plus un secret.
+    false
+}
+
+fn lire_requete(flux: &TcpStream, echeance: std::time::Instant) -> Result<Request, &'static str> {
+    let mut lecteur = BufReader::new(flux);
+    let expire = |e: std::time::Instant| -> Result<(), &'static str> {
+        if std::time::Instant::now() >= e {
+            Err("requete trop lente")
+        } else {
+            Ok(())
+        }
+    };
+
+    let mut ligne = String::new();
+    lire_ligne(&mut lecteur, &mut ligne, echeance)?;
+    let mut morceaux = ligne.split_whitespace();
+    let method = morceaux.next().ok_or("ligne de requete vide")?.to_string();
+    let cible = morceaux.next().ok_or("cible absente")?.to_string();
+
+    let (chemin, requete) = match cible.split_once('?') {
+        Some((c, q)) => (c.to_string(), q.to_string()),
+        None => (cible, String::new()),
+    };
+
+    let mut query = BTreeMap::new();
+    for paire in requete.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = paire.split_once('=').unwrap_or((paire, ""));
+        query.insert(decoder_url(k), decoder_url(v));
+    }
+
+    let mut headers = BTreeMap::new();
+    for _ in 0..MAX_HEADERS {
+        let mut l = String::new();
+        lire_ligne(&mut lecteur, &mut l, echeance)?;
+        let l = l.trim_end();
+        if l.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+        expire(echeance)?;
+    }
+
+    let taille: usize = headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if taille > MAX_BODY {
+        return Err("corps de requete trop grand");
+    }
+
+    // --- Le tampon est rempli, pas pre-alloue.
+    //
+    // `vec![0u8; taille]` reservait un mebioctet sur la seule foi d'un
+    // `Content-Length` que l'attaquant ecrit, puis attendait des octets qui ne
+    // venaient jamais. Chaque connexion coutait donc un mebioctet de tas et un
+    // fil, pour zero octet envoye. On lit par morceaux : ce qui est alloue est
+    // ce qui est arrive.
+    let mut brut: Vec<u8> = Vec::new();
+    if taille > 0 {
+        let mut tampon = [0u8; 16 * 1024];
+        while brut.len() < taille {
+            expire(echeance)?;
+            let voulu = (taille - brut.len()).min(tampon.len());
+            match lecteur.read(&mut tampon[..voulu]) {
+                Ok(0) => return Err("corps de requete incomplet"),
+                Ok(n) => brut.extend_from_slice(&tampon[..n]),
+                Err(_) => return Err("corps de requete incomplet"),
+            }
+        }
+    }
+    let body = String::from_utf8_lossy(&brut).into_owned();
+
+    Ok(Request {
+        method,
+        path: chemin,
+        query,
+        headers,
+        body,
+    })
+}
+
+/// Lit une ligne, sans jamais depasser l'echeance.
+///
+/// # Pourquoi l'echeance descend jusqu'ici
+///
+/// L'echeance globale etait verifiee **entre** les lignes seulement. Or cette
+/// boucle lit octet par octet, et seul le delai de lecture de trente secondes
+/// s'appliquait a chacun. Un octet toutes les vingt-cinq secondes a l'interieur
+/// d'une **seule** en-tete — jusqu'a `MAX_LINE`, soit 8 Kio — tenait donc une
+/// connexion, et son fil, pendant des dizaines d'heures. Avec le plafond de
+/// soixante-quatre connexions, autant de connexions de ce type suffisaient a
+/// fermer le service pour un cout derisoire.
+///
+/// C'est Slowloris, et une echeance qui ne descend pas jusqu'a la lecture n'est
+/// pas une echeance.
+fn lire_ligne(
+    lecteur: &mut BufReader<&TcpStream>,
+    sortie: &mut String,
+    echeance: std::time::Instant,
+) -> Result<(), &'static str> {
+    sortie.clear();
+    let mut total = 0usize;
+    loop {
+        if std::time::Instant::now() >= echeance {
+            return Err("requete trop lente");
+        }
+        let mut octet = [0u8; 1];
+        match lecteur.read(&mut octet) {
+            Ok(0) => return Err("connexion fermee"),
+            Ok(_) => {}
+            Err(_) => return Err("lecture impossible"),
+        }
+        total += 1;
+        if total > MAX_LINE {
+            return Err("ligne d'en-tete trop longue");
+        }
+        if octet[0] == b'\n' {
+            return Ok(());
+        }
+        sortie.push(octet[0] as char);
+    }
+}
+
+fn decoder_url(s: &str) -> String {
+    let octets: Vec<u8> = s.bytes().collect();
+    let mut out = Vec::with_capacity(octets.len());
+    let mut i = 0;
+    while i < octets.len() {
+        match octets[i] {
+            b'%' if i + 2 < octets.len() => {
+                let h = |c: u8| (c as char).to_digit(16);
+                match (h(octets[i + 1]), h(octets[i + 2])) {
+                    (Some(a), Some(b)) => {
+                        out.push((a * 16 + b) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(octets[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn ecrire_reponse(flux: &mut TcpStream, r: &Response) -> std::io::Result<()> {
+    let texte = match r.status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    };
+    let entete = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Referrer-Policy: no-referrer\r\n\
+         Cache-Control: no-store\r\n\
+         Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; \
+style-src 'unsafe-inline'; connect-src 'self'\r\n\
+         \r\n",
+        r.status,
+        texte,
+        r.content_type,
+        r.body.len()
+    );
+    flux.write_all(entete.as_bytes())?;
+    flux.write_all(r.body.as_bytes())?;
+    flux.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Client HTTP minimal, uniquement pour les tests.
+    ///
+    /// Ferme le sens ecriture apres l'envoi. Sans cela, une requete tronquee
+    /// laisse le serveur attendre la suite jusqu'au delai de lecture, et la
+    /// suite de tests met des minutes la ou elle devrait mettre des
+    /// millisecondes — defaut constate a la premiere execution.
+    fn requete(addr: SocketAddr, brut: &str) -> String {
+        let mut s = TcpStream::connect(addr).expect("connexion");
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(brut.as_bytes()).expect("envoi");
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut reponse = String::new();
+        let _ = s.read_to_string(&mut reponse);
+        reponse
+    }
+
+    fn get(addr: SocketAddr, chemin: &str) -> String {
+        requete(
+            addr,
+            &format!("GET {chemin} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"),
+        )
+    }
+
+    fn post(addr: SocketAddr, chemin: &str, corps: &str) -> String {
+        requete(
+            addr,
+            &format!(
+                "POST {chemin} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{corps}",
+                corps.len()
+            ),
+        )
+    }
+
+    fn echo() -> impl Fn(Request) -> Response + Send + Sync + 'static {
+        |r: Request| {
+            Response::text(
+                200,
+                &format!("{} {} q={:?} body={}", r.method, r.path, r.query, r.body),
+            )
+        }
+    }
+
+    #[test]
+    fn une_requete_get_est_servie() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let r = get(h.addr, "/etat");
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "{r}");
+        assert!(r.contains("GET /etat"), "{r}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn les_parametres_de_requete_sont_decodes() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let r = get(h.addr, "/x?a=1&b=deux%20mots&c=a+b");
+        assert!(r.contains("deux mots"), "{r}");
+        assert!(r.contains("a b"), "{r}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn un_corps_post_est_lu_entierement() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let corps = r#"{"jsonrpc":"2.0","method":"getinfo","id":1}"#;
+        let r = post(h.addr, "/rpc", corps);
+        assert!(r.contains("getinfo"), "{r}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn une_page_hostile_n_atteint_pas_le_rpc() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let corps = r#"{"jsonrpc":"2.0","method":"getinfo","id":1}"#;
+
+        // 1. Le formulaire sans JavaScript : `enctype="text/plain"`.
+        let r = requete(
+            h.addr,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Content-Type: text/plain\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{corps}",
+                corps.len()
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+
+        // 2. Une origine tierce.
+        let r = requete(
+            h.addr,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Origin: http://mechant.example\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{corps}",
+                corps.len()
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+
+        // 3. La marque que le navigateur pose lui-meme.
+        let r = requete(
+            h.addr,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Sec-Fetch-Site: cross-site\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{corps}",
+                corps.len()
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        h.shutdown();
+    }
+
+    /// Un nom d'hote n'est du bouclage que s'il **est** une adresse de bouclage.
+    ///
+    /// Le controle a d'abord teste `starts_with("127.")`. Un audit a montre que
+    /// `127.0.0.1.evil.example` — un nom de domaine, pas une adresse — passait,
+    /// et rouvrait entierement la reliaison DNS.
+    #[test]
+    fn un_nom_qui_ressemble_a_du_bouclage_n_en_est_pas() {
+        for bon in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "127.1.2.3",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            assert!(hote_local(bon), "{bon} devrait etre reconnu local");
+        }
+        for mauvais in [
+            "127.0.0.1.evil.example",
+            "127.0.0.1.evil.example:8080",
+            "localhost.evil.example",
+            "127-0-0-1.evil.example",
+            "evil.example",
+            "1270.0.0.1",
+            "127.0.0.1x",
+            "[::1].evil.example",
+        ] {
+            assert!(
+                !hote_local(mauvais),
+                "{mauvais} ne doit pas passer pour local"
+            );
+            assert!(
+                !origine_locale(&format!("http://{mauvais}")),
+                "origine http://{mauvais} ne doit pas passer pour locale"
+            );
+        }
+    }
+
+    /// Reliaison DNS : un nom qui finit par pointer vers 127.0.0.1 rend la page
+    /// hostile de meme origine. L'en-tete `Host` le trahit.
+    #[test]
+    fn un_host_etranger_est_refuse() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let r = requete(
+            h.addr,
+            "GET /etat HTTP/1.1\r\nHost: rebind.mechant.example\r\nConnection: close\r\n\r\n",
+        );
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        h.shutdown();
+    }
+
+    /// Le jeton ne doit plus ouvrir quoi que ce soit depuis l'URL.
+    #[test]
+    fn le_jeton_ne_passe_plus_par_l_url() {
+        let h = serve("127.0.0.1:0", Some("secret".into()), echo()).expect("demarrage");
+        let r = get(h.addr, "/etat?token=secret");
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+
+        let r = requete(
+            h.addr,
+            "GET /etat HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Authorization: Bearer secret\r\nConnection: close\r\n\r\n",
+        );
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        h.shutdown();
+    }
+
+    /// Le garde-fou le plus important de ce fichier.
+    #[test]
+    fn ecouter_hors_bouclage_sans_jeton_est_refuse() {
+        let r = serve("0.0.0.0:0", None, echo());
+        assert!(
+            matches!(r, Err(HttpError::ExpositionSansJeton(_))),
+            "un port RPC public sans jeton doit etre refuse au demarrage"
+        );
+    }
+
+    #[test]
+    fn ecouter_hors_bouclage_avec_jeton_est_permis() {
+        let h = serve("0.0.0.0:0", Some("secret".into()), echo());
+        assert!(h.is_ok());
+        if let Ok(h) = h {
+            h.shutdown();
+        }
+    }
+
+    #[test]
+    fn le_jeton_est_exige_quand_il_est_configure() {
+        let h = serve("127.0.0.1:0", Some("s3cret".into()), echo()).expect("demarrage");
+
+        assert!(get(h.addr, "/x").starts_with("HTTP/1.1 401"));
+        assert!(get(h.addr, "/x?token=faux").starts_with("HTTP/1.1 401"));
+        // Le jeton dans l'URL n'ouvre plus rien, meme juste : voir
+        // `le_jeton_ne_passe_plus_par_l_url`.
+        assert!(get(h.addr, "/x?token=s3cret").starts_with("HTTP/1.1 401"));
+
+        let avec_entete = requete(
+            h.addr,
+            "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Authorization: Bearer s3cret\r\nConnection: close\r\n\r\n",
+        );
+        assert!(avec_entete.starts_with("HTTP/1.1 200"), "{avec_entete}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn la_comparaison_de_jeton_est_a_temps_constant() {
+        assert!(egal_temps_constant("abc", "abc"));
+        assert!(!egal_temps_constant("abc", "abd"));
+        assert!(!egal_temps_constant("abc", "abcd"));
+        assert!(!egal_temps_constant("", "a"));
+        assert!(egal_temps_constant("", ""));
+    }
+
+    #[test]
+    fn un_corps_trop_grand_est_refuse() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let r = requete(
+            h.addr,
+            &format!(
+                "POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_BODY + 1
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn une_ligne_d_entete_interminable_est_coupee() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let mut brut = String::from("GET /x HTTP/1.1\r\nX: ");
+        brut.push_str(&"a".repeat(MAX_LINE + 100));
+        brut.push_str("\r\n\r\n");
+        let r = requete(h.addr, &brut);
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn des_octets_aleatoires_ne_font_pas_tomber_le_serveur() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let mut g = 0x1234_5678u64;
+        for _ in 0..20 {
+            g = g.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let mut s = String::new();
+            for i in 0..((g % 100) as usize) {
+                s.push((((g >> (i % 40)) % 94) as u8 + 33) as char);
+            }
+            let _ = requete(h.addr, &s);
+        }
+        // Le serveur doit encore repondre normalement.
+        assert!(get(h.addr, "/vivant").starts_with("HTTP/1.1 200"));
+        h.shutdown();
+    }
+
+    #[test]
+    fn l_entete_anti_sniffing_est_present() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let r = get(h.addr, "/x");
+        assert!(r.contains("X-Content-Type-Options: nosniff"), "{r}");
+        h.shutdown();
+    }
+}

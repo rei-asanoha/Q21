@@ -1,0 +1,104 @@
+# Epreuves — a chaque poussee et a chaque proposition de fusion.
+#
+# Le but n'est pas de decorer le depot d'une pastille verte : c'est d'empecher
+# qu'une correction de securite soit annulee sans que personne ne s'en apercoive.
+# Les fichiers `tests/audit_*.rs` sont d'anciens exploits devenus epreuves de
+# non-regression ; s'ils tombent, une faille est revenue.
+
+name: Epreuves
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Le code monetaire ne tolere aucun debordement silencieux, y compris pendant
+  # les epreuves.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  epreuves:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chaine Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # Les sources de `ml-dsa` sont dans `vendor/`, et `.cargo/config.toml` y
+      # redirige crates.io. La compilation ne depend donc d'aucun reseau, et
+      # deux compilations a deux mois d'intervalle emploient exactement le meme
+      # code de signature.
+      - name: Verifier que les sources vendorisees sont la
+        shell: bash
+        run: |
+          test -d vendor/ml-dsa || { echo "vendor/ml-dsa absent"; exit 1; }
+          test -f .cargo/config.toml || { echo ".cargo/config.toml absent"; exit 1; }
+
+      - name: Compilation
+        run: cargo build --locked --features mldsa
+
+      - name: Epreuves de la bibliotheque
+        run: cargo test --locked --features mldsa,audit --lib
+
+      # Les epreuves qui doivent passer : chacune verrouille une correction.
+      - name: Non-regression
+        run: |
+          cargo test --locked --features mldsa,audit --test regression_securite
+          cargo test --locked --features mldsa,audit --test regression_reseau
+          cargo test --locked --features mldsa,audit --test regression_phase8b
+          cargo test --locked --features mldsa,audit --test audit_persistance
+          cargo test --locked --features mldsa,audit --test audit_rpc
+          cargo test --locked --features mldsa,audit --test integration
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features mldsa,audit
+
+      - name: Format
+        run: cargo fmt --check
+        if: matrix.os == 'ubuntu-latest'
+
+  # ---------------------------------------------------------------------------
+  # Les constats encore ouverts
+  # ---------------------------------------------------------------------------
+  #
+  # Trois fichiers d'audit — arithmetique, difficulte, reservoir — signalent
+  # leurs trouvailles **en echouant**. C'est leur convention : un test qui tombe
+  # y decrit un defaut vivant, pas une regression.
+  #
+  # Les faire bloquer la livraison reviendrait a les supprimer, et les supprimer
+  # reviendrait a oublier ce qu'ils disent. Ils tournent donc a part, sans
+  # bloquer, et leur sortie est publiee : quiconque ouvre cette execution voit
+  # exactement ce qui reste ouvert.
+  #
+  # Ils rejoindront les epreuves bloquantes au fur et a mesure des corrections,
+  # comme l'ont fait `audit_persistance` et `audit_rpc`.
+  constats:
+    name: Constats encore ouverts
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Audits diagnostiques
+        continue-on-error: true
+        run: |
+          for f in audit_arith audit_difficulte audit_mempool; do
+            echo "::group::$f"
+            cargo test --locked --features mldsa,audit --no-fail-fast --test "$f" || true
+            echo "::endgroup::"
+          done

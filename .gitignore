@@ -1,0 +1,21 @@
+# Produits de compilation
+/target/
+**/*.rs.bk
+
+# Donnees de noeud et de portefeuille — jamais dans un depot.
+#
+# `wallet.dat` contient la graine. Meme chiffre, il n'a rien a faire dans un
+# historique public : un chiffrement se casse avec le temps, un depot ne
+# s'oublie jamais.
+*.dat
+*.seq
+*.key
+/portefeuille/
+/alice/
+/bob/
+/regtest/
+/testnet/
+
+# Archives de travail
+*.tar.gz
+*.zip
