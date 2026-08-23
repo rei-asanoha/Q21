@@ -73,6 +73,7 @@ pub mod tx;
 pub mod uint;
 pub mod utxo;
 pub mod validate;
+pub mod verrou;
 pub mod wallet;
 pub mod wallet_ui;
 pub mod wire;
