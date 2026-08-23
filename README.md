@@ -65,6 +65,17 @@ vérifie l'absence de toute URL externe dans la page.
 Il affiche aussi, en clair, ce que le protocole **ne** protège **pas**. Un
 explorateur qui ne montre que ce qui rassure ment par omission.
 
+Un seul champ de recherche, qui reconnaît une hauteur, un identifiant de bloc,
+un identifiant de transaction ou une adresse&nbsp;; quatre vues reliées entre
+elles. La recherche d'adresse est complète quand l'index est actif, bornée
+sinon — **et la page dit toujours laquelle des deux a servi**. Voir
+[EXPLORATEUR.md](EXPLORATEUR.md).
+
+```bash
+./q21 explorateur      # consultation seule, index d'adresses actif
+./q21 wallet           # le portefeuille sert le meme explorateur, meme port
+```
+
 ### Trois décisions de sécurité, prises à la liaison et pas au premier appel
 
 | Décision | Pourquoi |
@@ -332,7 +343,12 @@ src/
   json.rs        JSON minimal. Aucun flottant, par choix.
   http.rs        HTTP/1.1. Bouclage local par défaut, jeton en temps constant.
   rpc.rs         API JSON-RPC. Lecture et portefeuille strictement séparés.
-  explorer.rs    Page d'exploration, sans aucune ressource externe
+  explorer.rs    Explorateur : recherche, bloc, transaction, adresse.
+                 Aucune ressource externe, routage dans le fragment.
+  index.rs       Index d'adresses et de transactions, facultatif.
+                 Journal par bloc, chaque enregistrement contrôlé.
+  verrou.rs      Un seul q21 par dossier de données (flock, LockFileEx)
+  arret.rs       Arrêt propre sur Ctrl-C, fermeture de fenêtre, SIGTERM
   bin/q21.rs     Nœud, portefeuille, explorateur et bancs en ligne de commande
 
 PHASE6.md        Le verdict anti-ASIC : la mesure, ce qu'elle a détruit,
@@ -341,6 +357,10 @@ PHASE7.md        Ce qui permet à une chaîne de durer : les cinq murs du
                  démarrage, de la mémoire, du minage et de la découverte
 AUDIT.md         L'audit adverse : onze failles réelles, dont le plafond
                  de 21 000 001 qui n'en était pas un — et la fabrique de clés
+PORTEFEUILLE.md  Le portefeuille, et les treize défauts qu'un premier
+                 utilisateur a trouvés en s'en servant vraiment
+EXPLORATEUR.md   L'explorateur, l'index d'adresses, et pourquoi il est
+                 facultatif
 
 outils/
   verif-mldsa/   Programme jetable pour découvrir l'API réelle du crate ml-dsa
