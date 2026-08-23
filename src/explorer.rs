@@ -73,7 +73,7 @@ h2:first-child{margin-top:0}
 .tuile .k{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--tenu)}
 .tuile .v{font-size:1.3rem;font-family:ui-monospace,monospace;margin-top:.2rem;
   font-variant-numeric:tabular-nums;word-break:break-all}
-.tuile .n{font-size:.76rem;color:var(--doux);margin-top:.2rem}
+.tuile .n{font-size:.76rem;color:var(--doux);margin-top:.2rem;word-break:break-all}
 table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:.82rem}
 th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--bord);
   font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -368,6 +368,22 @@ const lienBloc = h => lien("bloc/"+h, h);
 const lienTx = (id,n) => lien("tx/"+id, (id||"").slice(0,n||16)+"…");
 const lienAdresse = (a,n) => a ? lien("adresse/"+a, n ? a.slice(0,n)+"…" : a) : "—";
 
+// Etiquette. Rend directement du balisage marque `brut`, parce que c'est la
+// seule facon de ne pas se tromper.
+//
+// Le defaut repare ici : la tuile « Etat » recevait sa chaine `<span
+// class="badge">confirmee</span>` telle quelle. `tuile` echappe par defaut —
+// c'est la bonne direction, celle qui protege — et la page affichait donc son
+// propre balisage en clair, a l'ecran, sous les yeux du premier utilisateur qui
+// a ouvert une transaction.
+//
+// Ecrire du balisage a la main dans un argument est l'erreur ; on ne la corrige
+// pas en ajoutant `brut` a cet endroit-la, mais en donnant une fonction qui
+// fabrique l'etiquette et se charge du marquage. Une epreuve verifie qu'aucun
+// appel a `tuile` ne contient de balisage sans passer par `brut`.
+const badge = (texte, gris) =>
+  brut(`<span class="badge${gris ? " gris" : ""}">${ech(texte)}</span>`);
+
 function tuile(k,v,n){
   return `<div class="tuile"><div class="k">${ech(k)}</div>
           <div class="v">${rendu(v)}</div>${n?`<div class="n">${rendu(n)}</div>`:""}</div>`;
@@ -620,9 +636,7 @@ async function voirTx(txid){
 
   document.getElementById("tx-tuiles").innerHTML =
     tuile("Identifiant", brut(`<span class="coupe">${ech(t.txid.slice(0,20))}…</span>`), t.txid) +
-    tuile("État", r.confirmee
-        ? '<span class="badge">confirmée</span>'
-        : '<span class="badge gris">en attente</span>',
+    tuile("État", badge(r.confirmee ? "confirmée" : "en attente", !r.confirmee),
       r.confirmee ? (info.hauteur - r.hauteur + 1) + " confirmation(s)" : "dans le réservoir") +
     tuile("Bloc", brut(r.confirmee ? lienBloc(r.hauteur) : "—")) +
     tuile("Valeur sortante", q21(sortant) + " Q21") +
@@ -730,6 +744,13 @@ routeur();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extrait le contenu du bloc `<script>` de la page.
+    fn script() -> &'static str {
+        let debut = PAGE.find("<script>").expect("bloc script") + "<script>".len();
+        let fin = PAGE.find("</script>").expect("fin du bloc script");
+        &PAGE[debut..fin]
+    }
 
     #[test]
     fn la_page_ne_charge_aucune_ressource_externe() {
@@ -887,6 +908,76 @@ mod tests {
     fn seul_l_accueil_se_rafraichit() {
         assert!(PAGE.contains("clearInterval(battement)"));
         assert!(PAGE.contains(r#"if (vue === "accueil") battement = setInterval"#));
+    }
+
+    /// Aucun appel a `tuile` ne porte de balisage sans passer par `brut`.
+    ///
+    /// # Le defaut que cette epreuve verrouille
+    ///
+    /// La tuile « Etat » d'une transaction recevait sa chaine telle quelle :
+    ///
+    /// ```text
+    ///     tuile("Etat", r.confirmee ? '<span class="badge">confirmee</span>' : ...)
+    /// ```
+    ///
+    /// `tuile` echappe par defaut — c'est la bonne direction, celle qui protege
+    /// contre l'injection — et la page affichait donc son propre balisage en
+    /// clair, a l'ecran. Le premier utilisateur a ouvrir une transaction l'a vu.
+    ///
+    /// Aucune epreuve ne pouvait l'attraper : celles qui existaient cherchaient
+    /// le defaut inverse, du balisage insere **sans** echappement. Il fallait
+    /// regarder dans l'autre sens.
+    ///
+    /// La correction n'est pas d'ajouter `brut` a cet endroit-la, mais de
+    /// donner une fonction — `badge` — qui fabrique l'etiquette et se charge du
+    /// marquage. Cette epreuve verifie qu'on n'y revient pas.
+    #[test]
+    fn aucune_tuile_ne_porte_de_balisage_non_marque() {
+        let s = script();
+        let mut reste = s;
+        let mut examines = 0;
+        while let Some(i) = reste.find("tuile(") {
+            reste = &reste[i + "tuile(".len()..];
+            // Parenthese fermante equilibree : les arguments contiennent
+            // eux-memes des appels de fonction.
+            let mut profondeur = 1usize;
+            let mut fin = reste.len();
+            for (j, c) in reste.char_indices() {
+                match c {
+                    '(' => profondeur += 1,
+                    ')' => {
+                        profondeur -= 1;
+                        if profondeur == 0 {
+                            fin = j;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let args = &reste[..fin];
+            examines += 1;
+
+            // Du balisage, c'est un chevron suivi d'une lettre ou d'une barre
+            // oblique. Une comparaison — `a.length < b` — porte un espace, et
+            // ne doit pas etre confondue avec une balise.
+            let octets = args.as_bytes();
+            let balisage = octets
+                .windows(2)
+                .any(|f| f[0] == b'<' && (f[1].is_ascii_alphabetic() || f[1] == b'/'));
+            assert!(
+                !balisage || args.contains("brut("),
+                "une tuile porte du balisage sans le marquer : il sera echappe \
+                 et affiche en clair a l'ecran.\n\n    tuile({})\n\n\
+                 Employez badge(), ou enveloppez la valeur dans brut().",
+                args.trim()
+            );
+        }
+        assert!(
+            examines >= 10,
+            "le balayage n'a trouve que {examines} tuiles : la page a change de \
+             forme et l'epreuve ne verifie plus rien"
+        );
     }
 
     /// Les points d'insertion `innerHTML` echappent par defaut.

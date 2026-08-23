@@ -2001,7 +2001,7 @@ fn faille_latente_points_d_insertion_non_echappes_dans_l_explorateur() {
         "q21(",
     ];
     // Insertions crues admises, et la raison de chacune.
-    const CRUES_ADMISES: [&str; 12] = [
+    const CRUES_ADMISES: [&str; 13] = [
         // Condition d'un ternaire : jamais inseree, seulement testee.
         "n",
         // Champs numeriques du noeud (`Json::u64`), donc jamais des chaines.
@@ -2018,6 +2018,10 @@ fn faille_latente_points_d_insertion_non_echappes_dans_l_explorateur() {
         // insere ensuite est un litteral choisi dans la page elle-meme.
         "t.coinbase",
         "m.coinbase",
+        // Booleen de `badge(texte, gris)` : condition d'un ternaire dont les
+        // deux branches sont des litteraux de la page. Le texte, lui, passe
+        // par ech() juste apres.
+        "gris",
         "BigInt(m.recu.unites) > 0n",
         "!m.montant_sortant_connu",
     ];

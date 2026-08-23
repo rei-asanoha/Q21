@@ -133,6 +133,31 @@ unique, servi tel quel.
 
 ---
 
+## Un défaut trouvé par le premier utilisateur
+
+La tuile **État** d'une transaction affichait ceci, en clair, à l'écran :
+
+```
+<span class="badge">confirmée</span>
+```
+
+Le balisage était passé à la fonction d'affichage sans être marqué comme tel.
+Cette fonction échappe par défaut — **c'est la bonne direction**, celle qui
+protège contre l'injection — et elle a donc fait exactement ce qu'on lui
+demandait.
+
+Aucune épreuve ne pouvait l'attraper : celles qui existaient cherchaient le
+défaut inverse, du balisage inséré *sans* échappement. Il fallait regarder dans
+l'autre sens.
+
+La correction n'est pas d'ajouter le marquage à cet endroit-là, mais de donner
+une fonction — `badge()` — qui fabrique l'étiquette et se charge du marquage.
+Une épreuve parcourt désormais chaque appel des deux pages, en équilibrant les
+parenthèses, et refuse tout argument portant un chevron suivi d'une lettre sans
+passer par `brut()`. Elle a été vérifiée en réintroduisant le défaut.
+
+---
+
 ## Ce que l'explorateur ne fait pas
 
 - **Les frais d'une transaction ne sont pas affichés.** Il faudrait résoudre
