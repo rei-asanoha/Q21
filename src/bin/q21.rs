@@ -64,6 +64,13 @@ COMMANDES
                             Banc de mesure de la preuve de travail.
                             `mainnet` construit la vraie table de 2 Gio et
                             trace la courbe du compromis temps-memoire.
+    explorateur              Explorateur de chaine dans le navigateur.
+                            Recherche par hauteur, bloc, transaction ou adresse.
+                            L'index d'adresses est actif : la recherche
+                            d'adresse est alors complete, et non bornee.
+                            --sans-index         s'en passer
+                            --port <n>           imposer le port
+                            --sans-navigateur    ne rien ouvrir
     securite                 Ce qui est protege, et ce qui ne l'est pas
     help                     Cette aide
 
@@ -219,6 +226,7 @@ fn main() {
         "emission" => cmd_emission(reste.get(1).map(|s| s.as_str())),
         "node" => cmd_node(&datadir, &reste[1..]),
         "wallet" | "portefeuille" => cmd_wallet(&datadir, &reste[1..]),
+        "explorateur" | "explorer" => cmd_explorateur(&datadir, &reste[1..]),
         "pow" => cmd_pow(
             &datadir,
             reste.get(1).map(|s| s.as_str()),
@@ -330,6 +338,9 @@ fn chemin_reservoir(d: &Path) -> PathBuf {
 
 fn chemin_serie(d: &Path) -> PathBuf {
     d.join("wallet.seq")
+}
+fn chemin_index(d: &Path) -> PathBuf {
+    d.join("index.dat")
 }
 
 fn serie_connue(d: &Path) -> u64 {
@@ -1670,6 +1681,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut fils: usize = 0;
     let mut cible_pairs: usize = 8;
     let mut silencieux = false;
+    let mut index_adresses = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1718,6 +1730,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 cible_pairs = args[i + 1].parse().unwrap_or(8);
                 i += 2;
             }
+            // L'index d'adresses se paie en disque et en ecriture a chaque
+            // bloc. Un noeud qui valide la chaine et garde un portefeuille n'en
+            // a aucun besoin : il ne cherche que ses propres adresses, et il
+            // sait lesquelles. Voir `q21_core::index`.
+            "--index-adresses" => {
+                index_adresses = true;
+                i += 1;
+            }
             autre => return Err(format!("option inconnue : {autre}")),
         }
     }
@@ -1742,6 +1762,59 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // accepte — y compris ceux recus du reseau, et ceux des branches laterales —
     // est ecrit sur disque au moment ou il est accepte.
     node.set_journal(archive.clone());
+
+    // --- L'index d'adresses, si on l'a demande.
+    //
+    // Invariant tenu ici, et il est volontairement grossier : **l'index colle
+    // exactement au sommet de la chaine, ou bien il est reconstruit depuis
+    // zero**. Rien entre les deux.
+    //
+    // La raison tient a la table des proprietaires de sorties, qui repond a
+    // « a qui appartenait la sortie que cette entree depense ». Elle se reprend
+    // de l'ensemble UTXO du noeud, lequel ne connait que les sorties **encore
+    // vivantes**. Si l'index accusait un retard de quelques blocs, les sorties
+    // creees avant ce retard et depensees pendant lui auraient disparu de
+    // l'UTXO : les depenses correspondantes seraient attribuees a personne, et
+    // l'ecran d'une adresse montrerait ses receptions sans ses envois.
+    //
+    // Tenir une table qui survive au retard demanderait de journaliser aussi
+    // les sorties consommees, donc plus de disque et une nouvelle facon de se
+    // tromper. Reconstruire coute le prix d'un balayage — celui que le
+    // portefeuille paie deja — et ne peut pas mentir.
+    let index = if index_adresses {
+        let mut i = q21_core::index::Index::ouvrir(&chemin_index(datadir));
+        let (hauteur, id_sommet) = node.with_chain(|c| (c.height(), c.active_at(c.height())));
+        let colle = !i.est_vide() && i.hauteur() == hauteur && i.identifiant(hauteur) == id_sommet;
+        if colle {
+            node.with_chain(|c| i.amorcer(&c.utxo));
+            println!("  index d'adresses : {} bloc(s) repris", i.blocs_indexes());
+        } else {
+            if !i.est_vide() {
+                println!("  index d'adresses : desynchronise, reconstruction");
+            }
+            i.effacer();
+            let debut = std::time::Instant::now();
+            node.with_chain(|c| {
+                for h in 0..=c.height() {
+                    if let Some(b) = c.block_at(h) {
+                        if let Err(e) = i.indexer(&b) {
+                            eprintln!("avertissement : {e}");
+                            break;
+                        }
+                    }
+                }
+            });
+            println!(
+                "  index d'adresses : {} bloc(s), {} adresse(s), en {:.2} s",
+                i.blocs_indexes(),
+                i.adresses_connues(),
+                debut.elapsed().as_secs_f64()
+            );
+        }
+        Some(std::sync::Arc::new(std::sync::Mutex::new(i)))
+    } else {
+        None
+    };
 
     // --- Le reservoir de la session precedente.
     //
@@ -1822,6 +1895,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 None
             },
             network: reseau,
+            index: index.clone(),
             sur_changement: Some(std::sync::Arc::new(move |w: &Wallet| {
                 if let Err(e) = ecrire_portefeuille(&dossier, w) {
                     eprintln!("ALERTE : portefeuille non enregistre apres modification : {e}");
@@ -1941,6 +2015,18 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // --- L'index suit la chaine.
+        //
+        // Il n'est pas branche dans le noeud lui-meme : un index est un
+        // confort, et le chemin d'acceptation des blocs est ce qu'il y a de
+        // plus sensible dans ce programme. On l'observe de l'exterieur, au
+        // rythme de la boucle, sans rien pouvoir casser du consensus.
+        if let Some(index) = &index {
+            if let Ok(mut i) = index.lock() {
+                suivre_index(&mut i, &node);
+            }
         }
 
         if !silencieux && dernier_rapport.elapsed().as_secs() >= 2 {
@@ -2204,6 +2290,9 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
             eprintln!("  Le serveur n'a pas repondu. Ouvrez l'adresse ci-dessus a la main.");
         });
     }
+    println!("  Le meme nœud sert aussi l'explorateur de la chaine, sur le meme");
+    println!("  port : lien en bas de la page, ou http://{adresse}/");
+    println!();
     println!("  Cette fenetre fait tourner le portefeuille. Laissez-la ouverte.");
     println!();
 
@@ -2265,4 +2354,173 @@ fn ouvrir_navigateur(url: &str) -> std::io::Result<()> {
     };
     c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     Ok(())
+}
+
+/// Amene l'index au niveau de la chaine.
+///
+/// Trois cas, et un seul comportement pour les deux mauvais :
+///
+/// - **rien a faire** : l'index est deja au sommet, et sur le meme bloc ;
+/// - **extension** : la chaine a avance, l'index suit bloc par bloc. Les
+///   sorties que ces blocs depensent sont soit anterieures et encore vivantes —
+///   donc connues de la table des proprietaires — soit creees par eux-memes ;
+/// - **divergence** : une reorganisation a change le passe. L'index est
+///   reconstruit depuis zero.
+///
+/// Reconstruire sur reorganisation est plus brutal que necessaire : on
+/// pourrait ne retirer que la branche abandonnee. Mais la table des
+/// proprietaires devrait alors etre ramenee a son etat d'avant la fourche, ce
+/// qui demande de journaliser les sorties consommees. Une reorganisation est
+/// rare ; une attribution d'adresse fausse ne se voit pas. Entre les deux, on
+/// choisit ce qui ne peut pas mentir.
+fn suivre_index(index: &mut q21_core::index::Index, node: &std::sync::Arc<q21_core::net::Node>) {
+    let hauteur = node.height();
+    if !index.est_vide() && index.hauteur() == hauteur {
+        return;
+    }
+    let divergence = !index.est_vide() && {
+        let h = index.hauteur();
+        node.with_chain(|c| c.active_at(h)) != index.identifiant(h)
+    };
+    if divergence {
+        eprintln!("  index d'adresses : reorganisation detectee, reconstruction");
+        index.effacer();
+    }
+    let depart = if index.est_vide() {
+        0
+    } else {
+        index.hauteur() + 1
+    };
+    node.with_chain(|c| {
+        for h in depart..=c.height() {
+            if let Some(b) = c.block_at(h) {
+                if let Err(e) = index.indexer(&b) {
+                    eprintln!("avertissement : {e}");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Ouvre l'explorateur de chaine dans le navigateur.
+///
+/// # Pourquoi une commande a part
+///
+/// L'explorateur est deja servi par `q21 wallet` : meme processus, meme port,
+/// meme jeton, a la racine plutot que sur `/portefeuille`. Qui a un
+/// portefeuille ouvert n'a rien a lancer de plus, et le verrou de repertoire
+/// interdirait de toute facon un second programme sur le meme dossier.
+///
+/// Cette commande sert l'autre cas : consulter la chaine **sans** ouvrir de
+/// portefeuille. Les methodes qui deplacent des fonds ne sont alors pas
+/// exposees du tout — pas desactivees par un reglage, absentes.
+///
+/// # L'index est actif par defaut, ici seulement
+///
+/// Un explorateur sans index d'adresses ne repond qu'a moitie : la recherche
+/// d'adresse s'arrete au bout de deux mille blocs et l'annonce. Le noeud, lui,
+/// garde son defaut — voir `q21_core::index` pour la raison.
+fn cmd_explorateur(datadir: &Path, args: &[String]) -> Result<(), String> {
+    let mut port: u16 = 0;
+    let mut sans_navigateur = false;
+    let mut index = true;
+    let mut reste: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" if i + 1 < args.len() => {
+                port = args[i + 1]
+                    .parse()
+                    .map_err(|_| "port illisible".to_string())?;
+                i += 2;
+            }
+            "--sans-navigateur" => {
+                sans_navigateur = true;
+                i += 1;
+            }
+            "--sans-index" => {
+                index = false;
+                i += 1;
+            }
+            autre => {
+                reste.push(autre.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    println!("Explorateur Q21");
+    println!();
+
+    // Le reseau se lit dans le portefeuille : c'est lui qui dit quelle chaine
+    // ce repertoire contient. Un explorateur n'a pas besoin de son contenu,
+    // mais il a besoin de cette reponse — et le fichier est scelle d'un seul
+    // tenant. D'ou la phrase secrete, meme ici.
+    if q21_core::kdf::est_scelle(&std::fs::read(chemin_portefeuille(datadir)).unwrap_or_default())
+        && !std::env::var("Q21_PASSPHRASE").is_ok_and(|p| !p.is_empty())
+    {
+        println!("  Ce dossier contient un portefeuille protege par une phrase secrete.");
+        println!("  L'explorateur n'y touche pas : il a seulement besoin d'y lire");
+        println!("  de quel reseau il s'agit. Tapez la phrase, puis Entree.");
+        println!();
+    }
+    lire_portefeuille(datadir)?;
+
+    let port = if port != 0 {
+        port
+    } else {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("aucun port disponible : {e}"))?
+            .local_addr()
+            .map_err(|e| e.to_string())?
+            .port()
+    };
+
+    let brut: [u8; 32] = q21_core::rng::octets()
+        .map_err(|_| "generateur d'alea du systeme inaccessible".to_string())?;
+    let jeton: String = brut.iter().map(|o| format!("{o:02x}")).collect();
+    let adresse = format!("127.0.0.1:{port}");
+    let url = format!("http://{adresse}/#{jeton}");
+
+    println!();
+    println!("  Si le navigateur ne s'ouvre pas, ouvrez cette adresse :");
+    println!();
+    println!("      {url}");
+    println!();
+    println!("  Aucune methode de portefeuille n'est servie par ce processus.");
+    println!();
+
+    if !sans_navigateur {
+        let a = adresse.clone();
+        let u = url.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                if std::net::TcpStream::connect(&a).is_ok() {
+                    if let Err(e) = ouvrir_navigateur(&u) {
+                        eprintln!("  Le navigateur n'a pas pu etre ouvert ({e}).");
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+    println!("  Cette fenetre fait tourner l'explorateur. Laissez-la ouverte.");
+    println!("  Fermez-la pour arreter.");
+    println!();
+
+    let mut arguments = vec![
+        "--rpc".to_string(),
+        adresse,
+        "--rpc-token".to_string(),
+        jeton,
+    ];
+    if index {
+        arguments.push("--index-adresses".to_string());
+    }
+    arguments.push("--silencieux".to_string());
+    arguments.extend(reste);
+    cmd_node(datadir, &arguments)
 }

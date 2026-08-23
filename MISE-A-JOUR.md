@@ -45,7 +45,7 @@ Retourne dans GitHub Desktop : il affiche les fichiers modifiés dans l'onglet
 En bas à gauche, dans le champ **Summary**, écris :
 
 ```
-Un verrou de dossier, et un bouton pour fermer
+Explorateur : recherche, blocs, transactions, adresses
 ```
 
 Clique sur **Commit to main**, puis sur **Push origin** en haut.
@@ -63,6 +63,51 @@ Dix à vingt minutes. Puis télécharge `q21-windows-x86_64.zip` en bas de la pa
 ---
 
 # Ce qui change pour toi
+
+## L'explorateur : la phase 3
+
+Un seul champ de recherche, en haut de la page. Colle-lui n'importe quoi :
+
+| Ce que tu colles | Ce que tu obtiens |
+|---|---|
+| `276` | Le bloc à cette hauteur |
+| Un identifiant de 64 caractères | Le bloc, ou la transaction |
+| Une adresse `tq211q…` | Son solde et tous ses mouvements |
+
+Quatre pages reliées entre elles : d'un bloc tu cliques sur une transaction, de
+cette transaction tu cliques sur une adresse, et le bouton « page précédente »
+du navigateur te ramène en arrière.
+
+**Tu n'as rien à lancer de plus.** Ton portefeuille sert déjà l'explorateur, au
+même endroit et sur le même port : le lien est en bas de la page.
+
+Et si tu veux consulter la chaîne *sans* ouvrir de portefeuille :
+
+```
+q21 explorateur
+```
+
+Aucune méthode capable de déplacer des fonds n'est alors servie — pas
+désactivée par un réglage, absente.
+
+## La recherche d'adresse, et son honnêteté
+
+Retrouver toutes les transactions d'une adresse coûte cher : rien, dans une
+chaîne de blocs, ne relie une adresse à ses transactions. Il faut les parcourir
+toutes.
+
+`q21 explorateur` construit donc un **index** au démarrage, et la recherche est
+alors complète. Ton portefeuille, lui, ne le fait pas par défaut — ce serait te
+faire payer en disque et en écriture un confort dont il n'a pas besoin. Ajoute
+`--index-adresses` si tu le veux là aussi.
+
+Dans les deux cas **la page dit toujours laquelle des deux voies a servi** :
+
+> **Historique borné.** Recherche remontée jusqu'au bloc 12 400 sur 14 400.
+> Le solde affiché reste exact.
+
+Le solde, lui, ne dépend d'aucun index : il vient des sorties non dépensées que
+ton nœud tient à jour de toute façon. Il est exact dans tous les cas.
 
 ## Deux Q21 ne peuvent plus abîmer le même dossier
 

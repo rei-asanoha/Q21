@@ -376,6 +376,10 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
 </section>
 
 <footer>
+  <p style="margin:0 0 .6rem">
+    <a class="plat" id="lien-explorateur" href="/">Explorateur de la chaîne</a> —
+    blocs, transactions et adresses, servis par le même nœud, sur le même port.
+  </p>
   API JSON-RPC sur <code>POST /rpc</code> — <code>listmethods</code> énumère les
   méthodes disponibles. Le jeton d'accès ne quitte pas cette page&nbsp;: rien
   n'est écrit dans le navigateur. Code de recherche, non audité&nbsp;: ne protège
@@ -958,6 +962,16 @@ async function infos(){
 // oblige a relancer. La confirmation coute une seconde et se retire toute
 // seule au bout de cinq.
 // ---------------------------------------------------------------------------
+
+// Le lien vers l'explorateur emporte le jeton dans le **fragment**, jamais
+// dans la requete : c'est la meme regle que pour l'ouverture du portefeuille,
+// et pour la meme raison — une adresse finit dans un historique, un fragment
+// non. Sans jeton connu, le lien pointe quand meme : l'explorateur le demandera
+// lui-meme.
+(function relierExplorateur(){
+  const a = document.getElementById("lien-explorateur");
+  if (a && jeton) a.href = "/#" + encodeURIComponent(jeton);
+})();
 
 let battement = setInterval(rafraichir, 6000);
 let confirmeFermeture = false;

@@ -184,6 +184,14 @@ pub struct RpcContext {
     /// Absent si les methodes de portefeuille sont desactivees.
     pub wallet: Option<Arc<Mutex<Wallet>>>,
     pub network: Network,
+    /// Index d'adresses, si le noeud a ete lance avec `--index-adresses`.
+    ///
+    /// Absent, les recherches d'adresse et de transaction retombent sur le
+    /// balayage borne. La difference se voit a l'ecran : la reponse porte un
+    /// champ qui dit laquelle des deux voies a servi, et jusqu'ou elle a
+    /// cherche. Une reponse incomplete qui se presente comme complete est pire
+    /// qu'une absence de reponse.
+    pub index: Option<Arc<Mutex<crate::index::Index>>>,
     /// Appele apres chaque operation qui modifie le portefeuille.
     ///
     /// Absent en memoire pure (epreuves). En production il **doit** etre
@@ -198,6 +206,7 @@ impl RpcContext {
             node,
             wallet: None,
             network,
+            index: None,
             sur_changement: None,
         }
     }
@@ -231,7 +240,16 @@ fn entete_json(h: &crate::block::BlockHeader) -> Json {
         .build()
 }
 
-fn tx_json(t: &Transaction) -> Json {
+/// Rendu d'une transaction.
+///
+/// Le reseau est exige parce qu'une sortie doit montrer une **adresse**, pas
+/// seulement l'empreinte de clef qu'elle porte. L'empreinte est ce que le
+/// protocole manipule ; l'adresse est ce qu'un humain copie, colle et
+/// reconnait — et une adresse ne se forme pas sans savoir de quel reseau elle
+/// releve. Un explorateur qui n'afficherait que des empreintes obligerait a
+/// faire la conversion de tete pour retrouver une adresse dans son
+/// portefeuille.
+fn tx_json(t: &Transaction, reseau: Network) -> Json {
     let entrees: Vec<Json> = t
         .inputs
         .iter()
@@ -254,6 +272,17 @@ fn tx_json(t: &Transaction) -> Json {
                 .set("valeur", montant(o.value))
                 .set("schema", Json::str(o.scheme.name()))
                 .set("empreinte_clef", Json::str(o.pubkey_hash.to_hex()))
+                .set(
+                    "adresse",
+                    Json::str(
+                        crate::address::Address {
+                            network: reseau,
+                            scheme: o.scheme,
+                            hash: o.pubkey_hash,
+                        }
+                        .to_string_bech32(),
+                    ),
+                )
                 .build()
         })
         .collect();
@@ -276,8 +305,8 @@ fn tx_json(t: &Transaction) -> Json {
         .build()
 }
 
-fn bloc_json(b: &Block) -> Json {
-    let txs: Vec<Json> = b.transactions.iter().map(tx_json).collect();
+fn bloc_json(b: &Block, reseau: Network) -> Json {
+    let txs: Vec<Json> = b.transactions.iter().map(|t| tx_json(t, reseau)).collect();
     let oncles: Vec<Json> = b.uncles.iter().map(entete_json).collect();
     Json::obj()
         .set("entete", entete_json(&b.header))
@@ -432,6 +461,14 @@ impl RpcContext {
                 "arreter",
                 "[portefeuille] Demande l'arret propre du noeud qui sert cette page",
             ),
+            (
+                "rechercher",
+                "Devine ce qu'on lui donne : hauteur, bloc, transaction ou adresse",
+            ),
+            (
+                "getadresse",
+                "Mouvements et solde d'une adresse, sans qu'elle appartienne au portefeuille",
+            ),
         ]
     }
 
@@ -468,6 +505,8 @@ impl RpcContext {
             "preparersend" => self.preparersend(params),
             "getsyncstatus" => Ok(self.getsyncstatus()),
             "arreter" => self.arreter(),
+            "rechercher" => self.rechercher(params),
+            "getadresse" => self.getadresse(params),
             autre => Err(erreur(
                 ERR_METHODE,
                 &format!("methode inconnue : {autre}. Essayez listmethods."),
@@ -550,7 +589,7 @@ impl RpcContext {
         });
 
         match bloc {
-            Some(b) if complet => Ok(bloc_json(&b)),
+            Some(b) if complet => Ok(bloc_json(&b, self.network)),
             Some(b) => Ok(entete_json(&b.header)),
             None => Err(erreur(ERR_INTROUVABLE, "bloc introuvable")),
         }
@@ -567,13 +606,30 @@ impl RpcContext {
         if let Some(t) = self.node.with_mempool(|m| m.get(&txid).cloned()) {
             return Ok(Json::obj()
                 .set("confirmee", Json::Bool(false))
-                .set("transaction", tx_json(&t))
+                .set("transaction", tx_json(&t, self.network))
                 .build());
         }
 
-        // Puis dans la chaine. Balayage arriere : une transaction cherchee est
-        // presque toujours recente. Un index par txid viendra avec le stockage
-        // de la phase 6 ; ici on reste honnete sur le cout.
+        // L'index, s'il existe : une lecture de table plutot qu'un balayage.
+        if let Some((hauteur, rang)) = self.situer_transaction(&txid) {
+            let trouve = self.node.with_chain(|c| {
+                let b = c.block_at(hauteur)?;
+                let t = b.transactions.get(rang as usize)?.clone();
+                Some((t, b.header.block_id()))
+            });
+            if let Some((t, bloc)) = trouve {
+                return Ok(Json::obj()
+                    .set("confirmee", Json::Bool(true))
+                    .set("hauteur", Json::u64(hauteur))
+                    .set("bloc", Json::str(bloc.to_hex()))
+                    .set("transaction", tx_json(&t, self.network))
+                    .build());
+            }
+        }
+
+        // Sinon, dans la chaine. Balayage arriere : une transaction cherchee
+        // est presque toujours recente. Sans index, on reste honnete sur le
+        // cout — et sur la borne.
         let mut fond_atteint = false;
         let trouve = self.node.with_chain(|c| {
             let mut h = c.height() as i64;
@@ -609,7 +665,7 @@ impl RpcContext {
                 .set("confirmee", Json::Bool(true))
                 .set("hauteur", Json::u64(hauteur))
                 .set("bloc", Json::str(bloc.to_hex()))
-                .set("transaction", tx_json(&t))
+                .set("transaction", tx_json(&t, self.network))
                 .build()),
             None => Err(erreur(ERR_INTROUVABLE, "transaction introuvable")),
         }
@@ -832,6 +888,292 @@ impl RpcContext {
                     "arret demande : le noeud ecrit son etat puis rend la main, \
                      en general en moins d'une seconde",
                 ),
+            )
+            .build())
+    }
+
+    // -----------------------------------------------------------------------
+    // Exploration
+    // -----------------------------------------------------------------------
+
+    /// Ou se trouve cette transaction, sans balayer si l'index est la.
+    fn situer_transaction(&self, txid: &Hash256) -> Option<(u64, u32)> {
+        if let Some(index) = &self.index {
+            if let Ok(i) = index.lock() {
+                if let Some(p) = i.position(txid) {
+                    return Some((p.hauteur, p.rang));
+                }
+            }
+        }
+        None
+    }
+
+    /// Retrouve une sortie designee par un point d'entree.
+    ///
+    /// Sert a dire ce qu'une transaction a **depense** : une entree ne porte
+    /// que la reference de la sortie qu'elle consomme, pas son montant ni son
+    /// proprietaire. Sans index, on ne cherche pas : une reponse qui coute un
+    /// balayage complet par entree n'est pas une reponse, et la page dit alors
+    /// simplement qu'elle ne sait pas.
+    fn resoudre_sortie(&self, point: &crate::tx::OutPoint) -> Option<crate::tx::TxOut> {
+        let (hauteur, rang) = self.situer_transaction(&point.txid)?;
+        self.node.with_chain(|c| {
+            let b = c.block_at(hauteur)?;
+            let t = b.transactions.get(rang as usize)?;
+            t.outputs.get(point.index as usize).cloned()
+        })
+    }
+
+    /// Devine ce qu'on lui donne, et dit ou aller.
+    ///
+    /// Un explorateur n'a qu'un champ de saisie. C'est a lui de reconnaitre
+    /// une hauteur, un identifiant de bloc, un identifiant de transaction ou
+    /// une adresse — pas a l'utilisateur de choisir dans un menu ce qu'il tient
+    /// deja dans le presse-papier.
+    fn rechercher(&self, params: &Json) -> Result<Json, Json> {
+        let brut = params
+            .get("q")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'q' attendu"))?
+            .trim()
+            .to_string();
+        if brut.is_empty() {
+            return Err(erreur(ERR_PARAMS, "recherche vide"));
+        }
+        // Trop long pour etre quoi que ce soit : on refuse avant de travailler.
+        if brut.len() > 200 {
+            return Err(erreur(ERR_PARAMS, "recherche trop longue"));
+        }
+
+        let trouve = |genre: &str, valeur: String| {
+            Ok(Json::obj()
+                .set("genre", Json::str(genre))
+                .set("valeur", Json::str(&valeur))
+                .build())
+        };
+
+        // Une suite de chiffres : une hauteur.
+        if brut.chars().all(|c| c.is_ascii_digit()) {
+            let h: u64 = brut
+                .parse()
+                .map_err(|_| erreur(ERR_PARAMS, "hauteur illisible"))?;
+            let existe = self.node.with_chain(|c| h <= c.height());
+            if !existe {
+                return Err(erreur(
+                    ERR_INTROUVABLE,
+                    &format!("aucun bloc a la hauteur {h} : la chaine s'arrete plus bas"),
+                ));
+            }
+            return trouve("bloc", h.to_string());
+        }
+
+        // Une adresse : elle porte sa propre somme de controle, donc une faute
+        // de frappe se detecte au lieu de mener ailleurs.
+        if let Ok(a) = crate::address::Address::parse(&brut) {
+            if a.network != self.network {
+                return Err(erreur(
+                    ERR_PARAMS,
+                    &format!(
+                        "cette adresse appartient au reseau {:?}, ce noeud suit {:?}",
+                        a.network, self.network
+                    ),
+                ));
+            }
+            return trouve("adresse", brut);
+        }
+
+        // Soixante-quatre caracteres hexadecimaux : un bloc ou une transaction.
+        // On regarde d'abord les blocs, dont la table est immediate.
+        if let Some(h) = Hash256::from_hex(&brut) {
+            if self.node.with_chain(|c| c.block_by_id(&h).is_some()) {
+                return trouve("bloc-id", h.to_hex());
+            }
+            if self.node.with_mempool(|m| m.get(&h).is_some()) {
+                return trouve("transaction", h.to_hex());
+            }
+            if self.situer_transaction(&h).is_some() {
+                return trouve("transaction", h.to_hex());
+            }
+            // Sans index, on ne peut pas conclure a l'absence : on renvoie tout
+            // de meme vers la page de transaction, qui balaiera et dira ce
+            // qu'elle a pu voir.
+            if self.index.is_none() {
+                return trouve("transaction", h.to_hex());
+            }
+            return Err(erreur(
+                ERR_INTROUVABLE,
+                "ni bloc, ni transaction connue de ce noeud",
+            ));
+        }
+
+        Err(erreur(
+            ERR_PARAMS,
+            "ni une hauteur, ni un identifiant de 64 caracteres hexadecimaux, \
+             ni une adresse valide",
+        ))
+    }
+
+    /// Mouvements et solde d'une adresse quelconque.
+    ///
+    /// « Quelconque » est le mot important : cette methode ne demande pas que
+    /// l'adresse appartienne au portefeuille. C'est ce qui distingue un
+    /// explorateur d'un portefeuille.
+    ///
+    /// Elle dit toujours **comment** elle a repondu — par l'index ou par un
+    /// balayage borne — et jusqu'ou elle a cherche. Une reponse incomplete qui
+    /// se presenterait comme complete serait pire qu'une absence de reponse :
+    /// elle ferait conclure a tort qu'une adresse est vide.
+    fn getadresse(&self, params: &Json) -> Result<Json, Json> {
+        let brut = params
+            .get("adresse")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'adresse' attendu"))?;
+        let adresse = crate::address::Address::parse(brut)
+            .map_err(|e| erreur(ERR_PARAMS, &format!("adresse illisible : {e:?}")))?;
+        if adresse.network != self.network {
+            return Err(erreur(
+                ERR_PARAMS,
+                &format!(
+                    "cette adresse appartient au reseau {:?}, ce noeud suit {:?}",
+                    adresse.network, self.network
+                ),
+            ));
+        }
+        let empreinte = adresse.hash;
+        let maximum = params
+            .get("max")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as usize;
+
+        let hauteur = self.node.with_chain(|c| c.height());
+
+        // --- Ou apparait cette adresse.
+        let (mut positions, via_index, plancher) = match &self.index {
+            Some(index) => {
+                let i = index
+                    .lock()
+                    .map_err(|_| erreur(ERR_REQUETE, "index indisponible"))?;
+                let v: Vec<(u64, u32)> = i
+                    .positions(&empreinte)
+                    .iter()
+                    .map(|p| (p.hauteur, p.rang))
+                    .collect();
+                (v, true, 0u64)
+            }
+            None => {
+                // Balayage arriere borne. La reponse le dira.
+                let plancher = hauteur.saturating_sub(MAX_BLOCS_BALAYES);
+                let v = self.node.with_chain(|c| {
+                    let mut v: Vec<(u64, u32)> = Vec::new();
+                    for h in plancher..=hauteur {
+                        if let Some(b) = c.block_at(h) {
+                            for (rang, t) in b.transactions.iter().enumerate() {
+                                if t.outputs.iter().any(|o| o.pubkey_hash == empreinte) {
+                                    v.push((h, rang as u32));
+                                }
+                            }
+                        }
+                    }
+                    v
+                });
+                (v, false, plancher)
+            }
+        };
+        positions.sort_unstable();
+        positions.dedup();
+        let total_mouvements = positions.len();
+        // Du plus recent au plus ancien : c'est ce qu'on veut voir en premier.
+        positions.reverse();
+        positions.truncate(maximum);
+
+        // --- Le detail de chaque mouvement.
+        let mut mouvements = Vec::with_capacity(positions.len());
+        let mut sortants_tous_resolus = true;
+        for (h, rang) in positions {
+            let Some(bloc) = self.node.with_chain(|c| c.block_at(h)) else {
+                continue;
+            };
+            let Some(tx) = bloc.transactions.get(rang as usize).cloned() else {
+                continue;
+            };
+            let recu: u64 = tx
+                .outputs
+                .iter()
+                .filter(|o| o.pubkey_hash == empreinte)
+                .map(|o| o.value.units())
+                .sum();
+            let mut envoye: u64 = 0;
+            let mut connu = true;
+            for entree in &tx.inputs {
+                if entree.prev_out.is_coinbase() {
+                    continue;
+                }
+                match self.resoudre_sortie(&entree.prev_out) {
+                    Some(o) if o.pubkey_hash == empreinte => envoye += o.value.units(),
+                    Some(_) => {}
+                    None => connu = false,
+                }
+            }
+            if !connu {
+                sortants_tous_resolus = false;
+            }
+            mouvements.push(
+                Json::obj()
+                    .set("txid", Json::str(tx.txid().to_hex()))
+                    .set("hauteur", Json::u64(h))
+                    .set("horodatage", Json::u64(bloc.header.time))
+                    .set("confirmations", Json::u64(hauteur.saturating_sub(h) + 1))
+                    .set("coinbase", Json::Bool(tx.is_coinbase()))
+                    .set("recu", montant(Amount::from_units(recu)))
+                    .set("envoye", montant(Amount::from_units(envoye)))
+                    .set("montant_sortant_connu", Json::Bool(connu))
+                    .build(),
+            );
+        }
+
+        // --- Le solde : ce que l'ensemble UTXO garde pour cette empreinte.
+        //
+        // Il ne depend ni de l'index ni du balayage : c'est l'etat que ce noeud
+        // a valide lui-meme, et il est donc toujours exact, meme quand
+        // l'historique affiche est borne.
+        let (solde, sorties) = self.node.with_chain(|c| {
+            let mut somme = 0u64;
+            let mut n = 0u64;
+            for (_, e) in c.utxo.iter() {
+                if e.output.pubkey_hash == empreinte {
+                    somme = somme.saturating_add(e.output.value.units());
+                    n += 1;
+                }
+            }
+            (somme, n)
+        });
+
+        Ok(Json::obj()
+            .set("adresse", Json::str(brut))
+            .set("empreinte", Json::str(empreinte.to_hex()))
+            .set("solde", montant(Amount::from_units(solde)))
+            .set("sorties_non_depensees", Json::u64(sorties))
+            .set("mouvements", Json::array(mouvements))
+            .set("mouvements_total", Json::u64(total_mouvements as u64))
+            .set("via_index", Json::Bool(via_index))
+            .set(
+                "montants_sortants_tous_resolus",
+                Json::Bool(sortants_tous_resolus),
+            )
+            .set("historique_complet", Json::Bool(via_index || plancher == 0))
+            .set("plancher", Json::u64(plancher))
+            .set("hauteur", Json::u64(hauteur))
+            .set(
+                "note",
+                Json::str(if via_index {
+                    "Historique complet : l'index d'adresses couvre toute la chaine."
+                } else {
+                    "Historique borne : ce noeud tourne sans index d'adresses. Les \
+                     envois ne sont pas resolus, et la recherche s'arrete au plancher \
+                     indique. Relancez-le avec --index-adresses pour une reponse \
+                     complete."
+                }),
             )
             .build())
     }
@@ -1390,7 +1732,7 @@ impl RpcContext {
 
         Ok(Json::obj()
             .set("txid", Json::str(txid.to_hex()))
-            .set("transaction", tx_json(&tx))
+            .set("transaction", tx_json(&tx, self.network))
             .build())
     }
 }
@@ -1423,6 +1765,7 @@ mod tests {
         let node = Arc::new(Node::new(RESEAU, Chain::new(RESEAU, g)));
         RpcContext {
             sur_changement: None,
+            index: None,
             node,
             wallet: if avec_portefeuille {
                 Some(Arc::new(Mutex::new(Wallet::from_seed([9u8; 32], RESEAU))))
@@ -1674,6 +2017,130 @@ mod tests {
         assert!(
             cumul <= MAX_SUPPLY,
             "le plafond ne doit jamais etre franchi"
+        );
+    }
+
+    /// La recherche reconnait une hauteur.
+    #[test]
+    fn rechercher_reconnait_une_hauteur() {
+        let c = contexte(false);
+        let r = resultat(&c, "rechercher", r#"{"q":"0"}"#);
+        assert_eq!(r.get("genre").and_then(|v| v.as_str()), Some("bloc"));
+        assert_eq!(r.get("valeur").and_then(|v| v.as_str()), Some("0"));
+    }
+
+    /// Une hauteur au-dela du sommet est refusee, et le dit.
+    #[test]
+    fn rechercher_refuse_une_hauteur_absente() {
+        let c = contexte(false);
+        let r = appel(&c, "rechercher", r#"{"q":"999999"}"#);
+        assert_eq!(
+            r.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
+            Some(ERR_INTROUVABLE)
+        );
+    }
+
+    /// La recherche reconnait un identifiant de bloc.
+    #[test]
+    fn rechercher_reconnait_un_identifiant_de_bloc() {
+        let c = contexte(false);
+        let id = c
+            .node
+            .with_chain(|ch| ch.block_at(0).unwrap().header.block_id());
+        let r = resultat(&c, "rechercher", &format!(r#"{{"q":"{}"}}"#, id.to_hex()));
+        assert_eq!(r.get("genre").and_then(|v| v.as_str()), Some("bloc-id"));
+    }
+
+    /// La recherche reconnait une adresse, et refuse celle d'un autre reseau.
+    ///
+    /// Une adresse porte sa propre somme de controle **et** son reseau. Laisser
+    /// passer une adresse de reseau principal sur un noeud d'essai ferait
+    /// chercher une chaine dans une autre : la reponse serait « rien trouve »,
+    /// ce qui est vrai et parfaitement trompeur.
+    #[test]
+    fn rechercher_reconnait_une_adresse_et_refuse_un_autre_reseau() {
+        let c = contexte(true);
+        let a = {
+            let mut w = c.wallet.as_ref().unwrap().lock().unwrap();
+            w.new_address()
+        };
+        let r = resultat(
+            &c,
+            "rechercher",
+            &format!(r#"{{"q":"{}"}}"#, a.to_string_bech32()),
+        );
+        assert_eq!(r.get("genre").and_then(|v| v.as_str()), Some("adresse"));
+
+        let etrangere = crate::address::Address {
+            network: Network::Mainnet,
+            scheme: a.scheme,
+            hash: a.hash,
+        };
+        let r = appel(
+            &c,
+            "rechercher",
+            &format!(r#"{{"q":"{}"}}"#, etrangere.to_string_bech32()),
+        );
+        assert!(
+            r.get("error").is_some(),
+            "une adresse d'un autre reseau a ete acceptee"
+        );
+    }
+
+    /// Une saisie qui n'est rien du tout est refusee sans travail.
+    #[test]
+    fn rechercher_refuse_ce_qui_n_est_rien() {
+        let c = contexte(false);
+        for q in ["bonjour", "", "0x1234", &"a".repeat(300)] {
+            let r = appel(&c, "rechercher", &format!(r#"{{"q":"{q}"}}"#));
+            assert!(r.get("error").is_some(), "accepte a tort : {q}");
+        }
+    }
+
+    /// Une adresse quelconque a un solde et un historique, sans appartenir au
+    /// portefeuille.
+    ///
+    /// C'est ce qui separe un explorateur d'un portefeuille : il repond sur des
+    /// adresses qui ne sont pas les siennes.
+    #[test]
+    fn getadresse_repond_sur_une_adresse_quelconque() {
+        let c = contexte(true);
+        let a = {
+            let mut w = c.wallet.as_ref().unwrap().lock().unwrap();
+            w.new_address()
+        };
+        let r = resultat(
+            &c,
+            "getadresse",
+            &format!(r#"{{"adresse":"{}"}}"#, a.to_string_bech32()),
+        );
+        assert_eq!(
+            r.get("solde")
+                .and_then(|m| m.get("unites"))
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        // Sans index, la reponse doit l'avouer.
+        assert_eq!(r.get("via_index"), Some(&Json::Bool(false)));
+        assert!(r
+            .get("note")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .contains("borne"));
+    }
+
+    /// Une adresse illisible ne fait pas travailler le noeud.
+    #[test]
+    fn getadresse_refuse_une_adresse_illisible() {
+        let c = contexte(false);
+        let r = appel(&c, "getadresse", r#"{"adresse":"tq21pasunevraieadresse"}"#);
+        assert_eq!(
+            r.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
+            Some(ERR_PARAMS)
         );
     }
 

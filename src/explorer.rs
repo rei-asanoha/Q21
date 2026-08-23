@@ -17,6 +17,23 @@
 //! Un explorateur qui ne montre que ce qui rassure ment par omission.
 
 /// Page complete. Aucune ressource externe, par construction.
+///
+/// # Ce qui a change avec la phase 3
+///
+/// La page ne montrait qu'un tableau de bord : l'etat de la chaine, la monnaie
+/// emise, les derniers blocs. On pouvait la regarder ; on ne pouvait rien y
+/// chercher.
+///
+/// Elle porte maintenant quatre vues — accueil, bloc, transaction, adresse — et
+/// un champ de recherche unique. Le routage se fait dans le **fragment**, ce
+/// qui suit le `#` : il ne quitte jamais le navigateur, aucune requete n'est
+/// faite au serveur pour changer de page, et la page reste un fichier unique
+/// servi tel quel.
+///
+/// Le jeton employait deja ce fragment. Les deux cohabitent sans ambiguite :
+/// une route commence toujours par une barre oblique, un jeton jamais. Le jeton
+/// est lu une fois, range dans `sessionStorage` — cloisonne par port, efface a
+/// la fermeture de l'onglet — et le fragment rendu au routage.
 pub const PAGE: &str = r##"<!doctype html>
 <html lang="fr">
 <head>
@@ -44,11 +61,13 @@ body{
 .enveloppe{max-width:1080px;margin:0 auto;padding:2rem 1.2rem 4rem}
 header{border-bottom:2px solid var(--texte);padding-bottom:1rem;margin-bottom:1.6rem}
 h1{margin:0;font-size:1.7rem;letter-spacing:-.02em}
+h1 a{color:inherit;text-decoration:none}
 .sous{color:var(--doux);font-size:.9rem;margin-top:.35rem}
 .etat{display:inline-block;padding:.12rem .5rem;border-radius:3px;font-size:.75rem;
   font-family:ui-monospace,monospace;background:var(--accent-fond);color:var(--accent);margin-left:.5rem}
 h2{font-size:1rem;text-transform:uppercase;letter-spacing:.08em;color:var(--doux);
   margin:2rem 0 .8rem;font-weight:600}
+h2:first-child{margin-top:0}
 .grille{display:grid;gap:.9rem;grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
 .tuile{background:var(--carte);border:1px solid var(--bord);border-radius:6px;padding:.85rem 1rem}
 .tuile .k{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--tenu)}
@@ -68,7 +87,10 @@ tbody tr:hover{background:var(--accent-fond)}
   border-radius:5px;padding:1rem 1.1rem;margin:.9rem 0}
 .avert h3{margin:0 0 .5rem;font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--alerte)}
 .avert p{margin:0 0 .6rem;font-size:.9rem;color:var(--doux)}
+.avert p:last-child{margin-bottom:0}
 .avert ul{margin:.3rem 0 .6rem;padding-left:1.2rem;font-size:.88rem;color:var(--doux)}
+.info{border-left-color:var(--accent)}
+.info h3{color:var(--accent)}
 .deux{display:grid;gap:.9rem;grid-template-columns:1fr 1fr}
 @media(max-width:720px){.deux{grid-template-columns:1fr}}
 footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--bord);
@@ -76,58 +98,165 @@ footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--bord);
 code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border-radius:3px;
   font-size:.85em}
 .err{color:var(--alerte)}
+a{color:var(--accent)}
+a.plat{text-decoration:none}
+a.plat:hover{text-decoration:underline}
+
+/* Recherche : un seul champ, qui devine ce qu'on lui donne. */
+.chercher{display:flex;gap:.5rem;margin-top:.9rem;flex-direction:column}
+@media(min-width:560px){.chercher{flex-direction:row}}
+.chercher input{
+  flex:1;background:var(--carte);color:var(--texte);border:1px solid var(--bord-fort);
+  border-radius:5px;padding:.55rem .7rem;font:inherit;font-family:ui-monospace,monospace;
+  font-size:.88rem;min-width:0;
+}
+.chercher input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+.chercher button{
+  background:var(--accent);color:var(--fond);border:1px solid var(--accent);border-radius:5px;
+  padding:.55rem 1.1rem;font:inherit;font-size:.88rem;font-weight:600;cursor:pointer;
+}
+.chercher button:hover{filter:brightness(1.08)}
+.aide{font-size:.78rem;color:var(--tenu);margin-top:.35rem}
+
+/* Fil d'Ariane */
+.fil{font-size:.82rem;color:var(--tenu);margin-bottom:.9rem}
+.fil a{color:var(--doux)}
+
+/* Flux d'une transaction : ce qui entre a gauche, ce qui sort a droite. */
+.flux{display:grid;gap:.9rem;grid-template-columns:1fr 1fr;margin-top:.5rem}
+@media(max-width:720px){.flux{grid-template-columns:1fr}}
+.pile{background:var(--carte);border:1px solid var(--bord);border-radius:6px;padding:.3rem .9rem}
+.pile .l{padding:.55rem 0;border-bottom:1px solid var(--bord);font-size:.84rem;
+  display:flex;justify-content:space-between;gap:.8rem;align-items:baseline}
+.pile .l:last-child{border-bottom:none}
+.pile .l .g{font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis}
+.pile .l .d{font-family:ui-monospace,monospace;white-space:nowrap;font-variant-numeric:tabular-nums}
+.pile .t{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--tenu);
+  padding:.6rem 0 .2rem}
+.badge{display:inline-block;padding:.05rem .4rem;border-radius:3px;font-size:.72rem;
+  background:var(--accent-fond);color:var(--accent)}
+.badge.gris{background:var(--bord);color:var(--doux)}
 </style>
 </head>
 <body>
 <div class="enveloppe">
 
 <header>
-  <h1>Q21 <span class="etat" id="reseau">…</span></h1>
+  <h1><a href="#/">Q21</a> <span class="etat" id="reseau">…</span></h1>
   <div class="sous">
     Explorateur servi par <strong>votre nœud</strong>, en local. Aucune ressource
     externe n'est chargée&nbsp;: ce que vous lisez, votre machine l'a validé.
   </div>
+  <form class="chercher" id="forme-chercher" autocomplete="off">
+    <input id="saisie-chercher" placeholder="hauteur, identifiant de bloc, transaction ou adresse" spellcheck="false">
+    <button type="submit">Chercher</button>
+  </form>
+  <div class="aide" id="aide-chercher">Un seul champ&nbsp;: le nœud reconnaît ce que vous collez.</div>
 </header>
 
-<div id="erreur" class="avert" style="display:none">
+<div id="panneau-jeton" class="avert" hidden>
+  <h3>Jeton d'accès requis</h3>
+  <p>
+    Le nœud exige un jeton. Il est normalement transmis par le lanceur dans le
+    fragment de l'adresse&nbsp;; si vous avez ouvert cette page à la main,
+    saisissez ici le jeton passé à <code>--rpc-token</code>.
+  </p>
+  <form id="forme-jeton" class="chercher" autocomplete="off">
+    <input type="password" id="saisie-jeton" placeholder="jeton d'accès" autocomplete="off" spellcheck="false">
+    <button type="submit">Déverrouiller</button>
+  </form>
+</div>
+
+<div id="erreur" class="avert" hidden>
   <h3>Nœud injoignable</h3>
   <p id="erreur-detail"></p>
 </div>
 
-<h2>Chaîne</h2>
-<div class="grille" id="tuiles"></div>
+<section class="vue" id="vue-accueil">
+  <h2>Chaîne</h2>
+  <div class="grille" id="tuiles"></div>
 
-<h2>Monnaie</h2>
-<div class="grille" id="monnaie"></div>
+  <h2>Monnaie</h2>
+  <div class="grille" id="monnaie"></div>
 
-<div class="deux">
-  <div>
-    <h2>Preuve de travail</h2>
-    <div class="defile"><table id="pow"></table></div>
+  <div class="deux">
+    <div>
+      <h2>Preuve de travail</h2>
+      <div class="defile"><table id="pow"></table></div>
+    </div>
+    <div>
+      <h2>Réseau</h2>
+      <div class="defile"><table id="reseau-stats"></table></div>
+    </div>
   </div>
-  <div>
-    <h2>Réseau</h2>
-    <div class="defile"><table id="reseau-stats"></table></div>
+
+  <h2>Derniers blocs</h2>
+  <div class="defile">
+    <table>
+      <thead><tr><th>Hauteur</th><th>Identifiant</th><th>Tx</th><th>Taille</th><th>Subvention</th><th>Horodatage</th></tr></thead>
+      <tbody id="blocs"></tbody>
+    </table>
   </div>
-</div>
 
-<h2>Derniers blocs</h2>
-<div class="defile">
-  <table>
-    <thead><tr><th>Hauteur</th><th>Identifiant</th><th>Tx</th><th>Taille</th><th>Subvention</th><th>Horodatage</th></tr></thead>
-    <tbody id="blocs"></tbody>
-  </table>
-</div>
+  <h2>Réservoir de transactions</h2>
+  <div class="defile"><table id="mempool"></table></div>
 
-<h2>Réservoir de transactions</h2>
-<div class="defile"><table id="mempool"></table></div>
+  <h2>Ce que le protocole ne protège pas</h2>
+  <div class="avert" id="securite">
+    <h3>Chargement…</h3>
+  </div>
+</section>
 
-<h2>Ce que le protocole ne protège pas</h2>
-<div class="avert" id="securite">
-  <h3>Chargement…</h3>
-</div>
+<section class="vue" id="vue-bloc" hidden>
+  <div class="fil"><a href="#/">Accueil</a> → bloc</div>
+  <h2 id="bloc-titre">Bloc</h2>
+  <div class="grille" id="bloc-tuiles"></div>
+  <div class="defile" style="margin-top:.9rem"><table id="bloc-entete"></table></div>
+  <h2>Transactions</h2>
+  <div class="defile">
+    <table>
+      <thead><tr><th>#</th><th>Identifiant</th><th>Genre</th><th>Entrées</th><th>Sorties</th><th>Valeur sortante</th><th>Poids</th></tr></thead>
+      <tbody id="bloc-transactions"></tbody>
+    </table>
+  </div>
+  <div id="bloc-oncles"></div>
+</section>
+
+<section class="vue" id="vue-tx" hidden>
+  <div class="fil"><a href="#/">Accueil</a> → transaction</div>
+  <h2>Transaction</h2>
+  <div class="grille" id="tx-tuiles"></div>
+  <div class="flux">
+    <div>
+      <div class="pile" id="tx-entrees"></div>
+    </div>
+    <div>
+      <div class="pile" id="tx-sorties"></div>
+    </div>
+  </div>
+  <div id="tx-note"></div>
+</section>
+
+<section class="vue" id="vue-adresse" hidden>
+  <div class="fil"><a href="#/">Accueil</a> → adresse</div>
+  <h2>Adresse</h2>
+  <div class="defile" style="margin-bottom:.9rem"><table id="adresse-identite"></table></div>
+  <div class="grille" id="adresse-tuiles"></div>
+  <div id="adresse-note"></div>
+  <h2>Mouvements</h2>
+  <div class="defile">
+    <table>
+      <thead><tr><th>Genre</th><th>Reçu</th><th>Envoyé</th><th>Conf.</th><th>Hauteur</th><th>Horodatage</th><th>Identifiant</th></tr></thead>
+      <tbody id="adresse-mouvements"></tbody>
+    </table>
+  </div>
+</section>
 
 <footer>
+  <p style="margin:0 0 .6rem" id="pied-portefeuille" hidden>
+    <a class="plat" id="lien-portefeuille" href="/portefeuille">Portefeuille</a> —
+    servi par le même nœud, sur le même port.
+  </p>
   API JSON-RPC sur <code>POST /rpc</code> — <code>listmethods</code> énumère les
   méthodes disponibles. Code de recherche, non audité&nbsp;: ne protège aucune
   valeur réelle.
@@ -135,17 +264,65 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
 
 </div>
 <script>
-// Le jeton ne voyage plus dans l'URL : une adresse finit dans l'historique du
-// navigateur, dans les journaux de tout mandataire, et dans l'en-tete Referer.
-// Il est demande une fois et garde en memoire, le temps de l'onglet.
+// ---------------------------------------------------------------------------
+// Le jeton, et le fragment qu'il partage avec le routage
+//
+// Le jeton ne voyage pas dans la requete : une adresse finit dans l'historique
+// du navigateur, dans les journaux de tout mandataire, et dans l'en-tete
+// Referer de la premiere ressource externe chargee. Il arrive dans le
+// **fragment**, que le navigateur ne transmet jamais au serveur.
+//
+// Ce fragment sert aussi au routage. Les deux ne se confondent pas : une route
+// commence toujours par une barre oblique, un jeton jamais. Le jeton est lu une
+// fois, range pour la duree de l'onglet, et le fragment rendu au routage.
+// ---------------------------------------------------------------------------
 const RPC = "/rpc";
+const CLEF_SESSION = "q21-jeton-explorateur";
 let jeton = null;
 let compteur = 0;
+
+function retenirJeton(v){
+  jeton = v;
+  try { if (v) sessionStorage.setItem(CLEF_SESSION, v); } catch (e) {}
+}
+
+(function lireJeton(){
+  const f = location.hash.slice(1);
+  if (f && !f.startsWith("/")){
+    // On efface aussitot : une capture d'ecran ou un partage d'onglet ne
+    // doivent pas emporter le secret.
+    history.replaceState(null, "", location.pathname + "#/");
+    retenirJeton(decodeURIComponent(f));
+    return;
+  }
+  try { const g = sessionStorage.getItem(CLEF_SESSION); if (g) jeton = g; } catch (e) {}
+})();
 
 function entetes(){
   const h = {"Content-Type":"application/json"};
   if (jeton) h["Authorization"] = "Bearer " + jeton;
   return h;
+}
+
+let attenteJeton = null;
+function demanderJeton(){
+  if (attenteJeton) return attenteJeton;
+  const panneau = document.getElementById("panneau-jeton");
+  panneau.hidden = false;
+  document.getElementById("saisie-jeton").focus();
+  attenteJeton = new Promise(resoudre => {
+    document.getElementById("forme-jeton").addEventListener("submit", ev => {
+      ev.preventDefault();
+      const v = document.getElementById("saisie-jeton").value.trim();
+      if (!v) return;
+      retenirJeton(v);
+      panneau.hidden = true;
+      document.getElementById("saisie-jeton").value = "";
+      attenteJeton = null;
+      resoudre();
+    }, {once:true});
+  });
+  return attenteJeton;
 }
 
 async function appel(methode, params){
@@ -155,28 +332,41 @@ async function appel(methode, params){
     body: JSON.stringify({jsonrpc:"2.0", id:++compteur, method:methode, params:params||{}})
   });
   if (r.status === 401){
-    const saisi = window.prompt("Jeton d'acces du noeud (--rpc-token) :");
-    if (saisi){ jeton = saisi; return appel(methode, params); }
-    throw new Error("jeton d'acces requis");
+    await demanderJeton();
+    return appel(methode, params);
   }
   const j = await r.json();
   if (j.error) throw new Error(j.error.message);
   return j.result;
 }
 
+// ---------------------------------------------------------------------------
+// Rendu
+//
+// `v` et `n` etaient inseres bruts : l'invariant ne tenait qu'a la discipline de
+// chaque appelant. Un champ que l'explorateur croit numerique peut arriver en
+// chaine — `Json::u64` bascule en chaine au-dela de i64::MAX — et devenir une
+// injection. On echappe par defaut ; le fragment de balisage voulu se declare.
+// ---------------------------------------------------------------------------
 const ech = s => String(s).replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const court = (h,n)=> h ? ech(h.slice(0,n||16))+"…" : "—";
 const octets = n => n>=1048576 ? (n/1048576).toFixed(2)+" Mio"
                  : n>=1024 ? (n/1024).toFixed(1)+" Kio" : n+" o";
 const date = t => new Date(t*1000).toISOString().replace("T"," ").slice(0,19);
-
-// `v` et `n` etaient inseres bruts : l'invariant ne tenait qu'a la discipline de
-// chaque appelant. Un champ que l'explorateur croit numerique peut arriver en
-// chaine — `Json::u64` bascule en chaine au-dela de i64::MAX — et devenir une
-// injection. On echappe par defaut ; le fragment de balisage voulu se declare.
 const brut = h => ({__html: h});
 const rendu = x => (x && x.__html !== undefined) ? x.__html : ech(x);
+
+// Un lien de navigation. La cible est echappee comme le reste : une adresse ou
+// un identifiant venus du noeud restent des donnees.
+// Les deux moities sont echappees : la route comme le texte. Un identifiant ou
+// une adresse viennent du noeud, mais rien n'oblige un noeud a etre honnete —
+// et cette page est aussi celle qu'on ouvrira un jour sur la chaine d'un autre.
+const lien = (route, texte) =>
+  `<a class="plat" href="#/${ech(route)}">${ech(texte)}</a>`;
+const lienBloc = h => lien("bloc/"+h, h);
+const lienTx = (id,n) => lien("tx/"+id, (id||"").slice(0,n||16)+"…");
+const lienAdresse = (a,n) => a ? lien("adresse/"+a, n ? a.slice(0,n)+"…" : a) : "—";
 
 function tuile(k,v,n){
   return `<div class="tuile"><div class="k">${ech(k)}</div>
@@ -186,19 +376,97 @@ function lignes(cible, paires){
   document.getElementById(cible).innerHTML =
     paires.map(([k,v])=>`<tr><th>${ech(k)}</th><td>${rendu(v)}</td></tr>`).join("");
 }
+function signalerErreur(message){
+  document.getElementById("erreur").hidden = false;
+  document.getElementById("erreur-detail").textContent = message;
+}
+function effacerErreur(){ document.getElementById("erreur").hidden = true; }
 
-async function rafraichir(){
+// ---------------------------------------------------------------------------
+// Routage
+//
+// Tout se joue dans le fragment : aucune requete au serveur pour changer de
+// page, et la page reste un fichier unique servi tel quel. Le bouton « page
+// precedente » du navigateur fonctionne sans qu'on ait rien a ecrire.
+// ---------------------------------------------------------------------------
+let battement = null;
+
+function montrer(vue){
+  for (const s of document.querySelectorAll(".vue")) s.hidden = true;
+  document.getElementById("vue-" + vue).hidden = false;
+  // L'accueil se rafraichit ; les pages de detail sont figees, parce qu'un
+  // bloc passe ne change plus et qu'une page qui se recharge sous les yeux
+  // pendant qu'on la lit est une nuisance.
+  if (battement){ clearInterval(battement); battement = null; }
+  if (vue === "accueil") battement = setInterval(accueil, 4000);
+}
+
+async function routeur(){
+  const f = location.hash.slice(1);
+  if (f && !f.startsWith("/")) return; // un jeton, pas une route
+  const bouts = f.replace(/^\//, "").split("/").filter(x => x.length);
+  try{
+    if (!bouts.length){ montrer("accueil"); await accueil(); return; }
+    switch (bouts[0]){
+      case "bloc":    montrer("bloc");    await voirBloc(decodeURIComponent(bouts[1]||"")); break;
+      case "tx":      montrer("tx");      await voirTx(decodeURIComponent(bouts[1]||"")); break;
+      case "adresse": montrer("adresse"); await voirAdresse(decodeURIComponent(bouts[1]||"")); break;
+      default:        location.hash = "#/";
+    }
+  }catch(e){
+    signalerErreur(e.message);
+  }
+}
+
+window.addEventListener("hashchange", routeur);
+
+document.getElementById("forme-chercher").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const q = document.getElementById("saisie-chercher").value.trim();
+  if (!q) return;
+  const aide = document.getElementById("aide-chercher");
+  aide.textContent = "Recherche…";
+  try{
+    const r = await appel("rechercher", {q});
+    aide.textContent = "Un seul champ : le nœud reconnaît ce que vous collez.";
+    document.getElementById("saisie-chercher").value = "";
+    if (r.genre === "bloc")            location.hash = "#/bloc/" + encodeURIComponent(r.valeur);
+    else if (r.genre === "bloc-id")    location.hash = "#/bloc/" + encodeURIComponent(r.valeur);
+    else if (r.genre === "transaction")location.hash = "#/tx/" + encodeURIComponent(r.valeur);
+    else if (r.genre === "adresse")    location.hash = "#/adresse/" + encodeURIComponent(r.valeur);
+  }catch(e){
+    aide.innerHTML = `<span class="err">${ech(e.message)}</span>`;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Accueil
+// ---------------------------------------------------------------------------
+
+async function accueil(){
   try{
     const [info, supply, pow, sec, mem] = await Promise.all([
       appel("getinfo"), appel("getsupply"), appel("getpow"),
       appel("getsecurity"), appel("getmempool")
     ]);
-    document.getElementById("erreur").style.display = "none";
+    effacerErreur();
     document.getElementById("reseau").textContent = info.reseau;
 
+    // Le lien vers le portefeuille n'apparait que si ce noeud le sert
+    // reellement. `q21 explorateur` n'expose aucune methode de portefeuille :
+    // afficher le lien y menerait a une page qui ne pourrait rien demander, et
+    // qui aurait l'air cassee alors qu'elle serait simplement au mauvais
+    // endroit.
+    const pied = document.getElementById("pied-portefeuille");
+    if (info.portefeuille_actif){
+      pied.hidden = false;
+      if (jeton) document.getElementById("lien-portefeuille").href =
+        "/portefeuille#" + encodeURIComponent(jeton);
+    }
+
     document.getElementById("tuiles").innerHTML =
-      tuile("Hauteur", info.hauteur) +
-      tuile("Tête", brut(`<span class="coupe">${court(info.tete,20)}</span>`)) +
+      tuile("Hauteur", brut(lienBloc(info.hauteur))) +
+      tuile("Tête", brut(`<span class="coupe">${lien("bloc/"+info.tete, info.tete.slice(0,20)+"…")}</span>`)) +
       tuile("Travail cumulé", "2^" + info.travail_cumule_bits, "tentatives espérées") +
       tuile("Difficulté", ech(info.difficulte_bits)) +
       tuile("Pairs", info.pairs) +
@@ -235,7 +503,9 @@ async function rafraichir(){
     lignes("mempool", [
       ["Transactions", mem.nb_transactions],
       ["Octets", octets(mem.octets)],
-      ["Identifiants", mem.txids.length ? mem.txids.map(t=>court(t,12)).join(" ") : "—"]
+      ["Identifiants", brut(mem.txids.length
+          ? mem.txids.map(t=>lienTx(t,12)).join(" ")
+          : "—")]
     ]);
 
     const debut = Math.max(0, info.hauteur - 11);
@@ -245,8 +515,8 @@ async function rafraichir(){
     );
     document.getElementById("blocs").innerHTML = blocs.map(b=>`
       <tr>
-        <td>${b.entete.hauteur}</td>
-        <td><span class="coupe">${court(b.entete.id, 24)}</span></td>
+        <td>${lienBloc(b.entete.hauteur)}</td>
+        <td><span class="coupe">${lien("bloc/"+b.entete.id, b.entete.id.slice(0,24)+"…")}</span></td>
         <td>${b.nb_transactions}</td>
         <td>${octets(b.taille_octets)}</td>
         <td>${ech(b.subvention.q21)}</td>
@@ -264,15 +534,194 @@ async function rafraichir(){
          blocs (${sec.defenses.finalite_glissante_heures} h).
          ${ech(sec.cout_de_la_finalite_glissante)}</p>`;
   }catch(e){
-    document.getElementById("erreur").style.display = "block";
-    document.getElementById("erreur-detail").textContent =
-      "Impossible d'interroger le nœud : " + e.message +
-      ". Si un jeton d'accès est configuré, l'explorateur le demandera.";
+    signalerErreur("Impossible d'interroger le nœud : " + e.message +
+      ". Si un jeton d'accès est configuré, l'explorateur le demandera.");
   }
 }
 
-rafraichir();
-setInterval(rafraichir, 4000);
+// ---------------------------------------------------------------------------
+// Bloc
+// ---------------------------------------------------------------------------
+
+const estHexa = s => /^[0-9a-fA-F]{64}$/.test(s);
+
+async function voirBloc(cle){
+  effacerErreur();
+  const params = estHexa(cle) ? {id: cle} : {hauteur: Number(cle)};
+  const b = await appel("getblock", params);
+  const e = b.entete;
+  document.getElementById("bloc-titre").textContent = "Bloc " + e.hauteur;
+
+  const info = await appel("getinfo");
+  const confirmations = info.hauteur - e.hauteur + 1;
+
+  document.getElementById("bloc-tuiles").innerHTML =
+    tuile("Hauteur", brut(lienBloc(e.hauteur))) +
+    tuile("Transactions", b.nb_transactions) +
+    tuile("Taille", octets(b.taille_octets)) +
+    tuile("Subvention", ech(b.subvention.q21) + " Q21") +
+    tuile("Confirmations", confirmations) +
+    tuile("Oncles", b.oncles.length);
+
+  lignes("bloc-entete", [
+    ["Identifiant", brut(`<span class="mono">${ech(e.id)}</span>`)],
+    ["Parent", brut(e.hauteur > 0 ? lien("bloc/"+e.prev_block, e.prev_block) : "—")],
+    ["Racine de Merkle", brut(`<span class="mono">${ech(e.merkle_root)}</span>`)],
+    ["Mineur", brut(`<span class="mono">${ech(e.miner)}</span>`)],
+    ["Horodatage", date(e.horodatage) + " UTC"],
+    ["Difficulté", e.bits],
+    ["Nonce", e.nonce]
+  ]);
+
+  document.getElementById("bloc-transactions").innerHTML = b.transactions.map((t,i)=>{
+    const sortant = t.sorties.reduce((a,o)=>a + BigInt(o.valeur.unites), 0n);
+    return `<tr>
+      <td>${ech(i)}</td>
+      <td><span class="coupe">${lienTx(t.txid, 24)}</span></td>
+      <td>${t.coinbase ? '<span class="badge">minage</span>' : '<span class="badge gris">transfert</span>'}</td>
+      <td>${ech(t.entrees.length)}</td>
+      <td>${ech(t.sorties.length)}</td>
+      <td>${ech(q21(sortant))}</td>
+      <td>${ech(t.poids)}</td>
+    </tr>`;
+  }).join("");
+
+  document.getElementById("bloc-oncles").innerHTML = b.oncles.length
+    ? `<h2>Oncles</h2><div class="defile"><table><thead><tr><th>Hauteur</th><th>Identifiant</th><th>Mineur</th></tr></thead><tbody>` +
+      b.oncles.map(o=>`<tr><td>${ech(o.hauteur)}</td><td><span class="coupe">${ech(o.id)}</span></td><td><span class="coupe">${court(o.miner,20)}</span></td></tr>`).join("") +
+      `</tbody></table></div>`
+    : "";
+}
+
+// Conversion d'unites vers Q21, en entiers uniquement.
+//
+// Un montant ne passe jamais par un flottant : 0,1 + 0,2 ne fait pas 0,3 en
+// virgule flottante binaire, et une chaine de blocs qui arrondit un solde n'est
+// plus une chaine de blocs.
+function q21(unites){
+  const u = BigInt(unites);
+  const neg = u < 0n;
+  const a = neg ? -u : u;
+  const ent = a / 100000000n;
+  const dec = (a % 100000000n).toString().padStart(8, "0");
+  return (neg ? "-" : "") + ent.toString() + "." + dec;
+}
+
+// ---------------------------------------------------------------------------
+// Transaction
+// ---------------------------------------------------------------------------
+
+async function voirTx(txid){
+  effacerErreur();
+  const r = await appel("gettransaction", {txid});
+  const t = r.transaction;
+  const info = await appel("getinfo");
+  const sortant = t.sorties.reduce((a,o)=>a + BigInt(o.valeur.unites), 0n);
+
+  document.getElementById("tx-tuiles").innerHTML =
+    tuile("Identifiant", brut(`<span class="coupe">${ech(t.txid.slice(0,20))}…</span>`), t.txid) +
+    tuile("État", r.confirmee
+        ? '<span class="badge">confirmée</span>'
+        : '<span class="badge gris">en attente</span>',
+      r.confirmee ? (info.hauteur - r.hauteur + 1) + " confirmation(s)" : "dans le réservoir") +
+    tuile("Bloc", brut(r.confirmee ? lienBloc(r.hauteur) : "—")) +
+    tuile("Valeur sortante", q21(sortant) + " Q21") +
+    tuile("Taille", octets(t.taille_octets), t.temoin_pourcent + " % de témoin") +
+    tuile("Poids", t.poids.toLocaleString("fr-FR"));
+
+  // Les entrees ne portent que la reference de la sortie qu'elles consomment.
+  // Montrer leur montant demanderait de resoudre chacune ; la page ne le fait
+  // pas ici et ne fait donc pas semblant de le savoir.
+  document.getElementById("tx-entrees").innerHTML =
+    `<div class="t">Entrées (${ech(t.entrees.length)})</div>` +
+    (t.coinbase
+      ? `<div class="l"><span class="g">Création monétaire — cette transaction ne consomme rien</span></div>`
+      : t.entrees.map(e=>`
+        <div class="l">
+          <span class="g">${lienTx(e.txid, 18)}<span style="color:var(--tenu)"> : ${ech(e.index)}</span></span>
+          <span class="d" style="color:var(--tenu)">${octets(e.temoin_octets)}</span>
+        </div>`).join(""));
+
+  document.getElementById("tx-sorties").innerHTML =
+    `<div class="t">Sorties (${ech(t.sorties.length)})</div>` +
+    t.sorties.map(o=>`
+      <div class="l">
+        <span class="g">${lienAdresse(o.adresse, 22)}</span>
+        <span class="d">${ech(o.valeur.q21)}</span>
+      </div>`).join("");
+
+  document.getElementById("tx-note").innerHTML = t.coinbase
+    ? `<div class="avert info"><h3>Transaction de minage</h3>
+       <p>Elle crée la subvention du bloc et récolte les frais des autres
+       transactions. Elle ne consomme aucune sortie antérieure, et ce qu'elle
+       produit n'est dépensable qu'après le délai de maturité — de sorte qu'un
+       bloc annulé par une réorganisation n'ait pas déjà servi à payer
+       quelqu'un.</p></div>`
+    : `<div class="avert info"><h3>Ce que cette page ne calcule pas</h3>
+       <p>Les frais, et la valeur de chaque entrée. Une entrée ne porte que la
+       référence de la sortie qu'elle consomme&nbsp;; les résoudre demanderait
+       une lecture par entrée. La page préfère se taire plutôt qu'afficher un
+       chiffre qu'elle n'a pas vérifié.</p></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Adresse
+// ---------------------------------------------------------------------------
+
+async function voirAdresse(adresse){
+  effacerErreur();
+  const a = await appel("getadresse", {adresse, max: 100});
+
+  lignes("adresse-identite", [
+    ["Adresse", brut(`<span class="mono" style="word-break:break-all;white-space:normal">${ech(a.adresse)}</span>`)],
+    ["Empreinte de clef", brut(`<span class="mono" style="word-break:break-all;white-space:normal">${ech(a.empreinte)}</span>`)]
+  ]);
+
+  const recu = a.mouvements.reduce((s,m)=>s + BigInt(m.recu.unites), 0n);
+  const envoye = a.mouvements.reduce((s,m)=>s + BigInt(m.envoye.unites), 0n);
+
+  document.getElementById("adresse-tuiles").innerHTML =
+    tuile("Solde", ech(a.solde.q21) + " Q21", a.sorties_non_depensees + " sortie(s) non dépensée(s)") +
+    tuile("Mouvements", a.mouvements_total,
+          a.mouvements.length < a.mouvements_total
+            ? a.mouvements.length + " affiché(s)" : "tous affichés") +
+    tuile("Reçu (affiché)", q21(recu) + " Q21") +
+    tuile("Envoyé (affiché)", a.montants_sortants_tous_resolus
+            ? q21(envoye) + " Q21" : "—",
+          a.montants_sortants_tous_resolus ? null : "non résolu sans index");
+
+  // L'honnetete de la reponse est affichee, pas devinee : une adresse dont
+  // l'historique est borne ressemble sinon a une adresse sans passe.
+  document.getElementById("adresse-note").innerHTML = a.historique_complet
+    ? `<div class="avert info"><h3>Historique complet</h3><p>${ech(a.note)}</p>
+       <p>Le solde, lui, ne dépend d'aucun index&nbsp;: il vient de l'ensemble
+       des sorties non dépensées que ce nœud a validé lui-même. Il est exact
+       même quand l'historique ne l'est pas.</p></div>`
+    : `<div class="avert"><h3>Historique borné</h3><p>${ech(a.note)}</p>
+       <p>Recherche remontée jusqu'au bloc ${ech(a.plancher)} sur ${ech(a.hauteur)}.
+       Le solde affiché reste exact&nbsp;: il vient de l'ensemble des sorties
+       non dépensées, pas de cette liste.</p></div>`;
+
+  document.getElementById("adresse-mouvements").innerHTML = a.mouvements.length
+    ? a.mouvements.map(m=>`
+      <tr>
+        <td>${m.coinbase ? '<span class="badge">minage</span>'
+             : (BigInt(m.envoye.unites) > 0n ? '<span class="badge gris">envoi</span>'
+                                             : '<span class="badge gris">réception</span>')}</td>
+        <td>${BigInt(m.recu.unites) > 0n ? ech(m.recu.q21) : "—"}</td>
+        <td>${!m.montant_sortant_connu ? '<span style="color:var(--tenu)">?</span>'
+             : (BigInt(m.envoye.unites) > 0n ? ech(m.envoye.q21) : "—")}</td>
+        <td>${ech(m.confirmations)}</td>
+        <td>${lienBloc(m.hauteur)}</td>
+        <td>${date(m.horodatage)}</td>
+        <td><span class="coupe">${lienTx(m.txid, 18)}</span></td>
+      </tr>`).join("")
+    : `<tr><td colspan="7" style="color:var(--tenu)">Aucun mouvement dans la portée de la recherche.</td></tr>`;
+}
+
+// ---------------------------------------------------------------------------
+
+routeur();
 </script>
 </body>
 </html>
@@ -347,6 +796,97 @@ mod tests {
             !PAGE.contains("location.search"),
             "la chaine de requete ne doit plus etre recopiee vers le RPC"
         );
+    }
+
+    /// Les quatre vues existent, et le routeur les connait toutes.
+    #[test]
+    fn les_quatre_vues_existent() {
+        for v in ["accueil", "bloc", "tx", "adresse"] {
+            assert!(
+                PAGE.contains(&format!(r#"id="vue-{v}""#)),
+                "vue manquante : {v}"
+            );
+        }
+        for r in ["case \"bloc\":", "case \"tx\":", "case \"adresse\":"] {
+            assert!(PAGE.contains(r), "route manquante : {r}");
+        }
+    }
+
+    /// Le jeton et le routage partagent le fragment sans se confondre.
+    ///
+    /// Une route commence par une barre oblique, un jeton jamais. C'est ce qui
+    /// permet au lanceur de passer le jeton dans le fragment — ou il n'est
+    /// jamais envoye au serveur — sans priver la page de son routage.
+    #[test]
+    fn le_jeton_et_la_route_se_distinguent_dans_le_fragment() {
+        assert!(
+            PAGE.contains(r#"if (f && !f.startsWith("/"))"#),
+            "rien ne distingue un jeton d'une route"
+        );
+        // Et le fragment est efface aussitot lu : une capture d'ecran ou un
+        // partage d'onglet ne doivent pas emporter le secret.
+        assert!(PAGE.contains("history.replaceState"));
+    }
+
+    /// Le jeton se demande dans la page, pas par une fenetre du navigateur.
+    ///
+    /// `window.prompt` bloque tout l'onglet, ne se met pas en forme, et sur
+    /// certains navigateurs ne s'affiche tout simplement pas.
+    #[test]
+    fn le_jeton_se_demande_dans_la_page() {
+        assert!(PAGE.contains(r#"id="panneau-jeton""#));
+        assert!(
+            !PAGE.contains("window.prompt"),
+            "le jeton est encore demande par une fenetre du navigateur"
+        );
+    }
+
+    /// La page a un champ de recherche, et il passe par le noeud.
+    ///
+    /// Deviner cote page ce qu'est une saisie obligerait a y reimplementer la
+    /// lecture d'une adresse — donc bech32, donc sa somme de controle. Le noeud
+    /// sait deja le faire, et une seule implementation ne peut pas diverger
+    /// d'elle-meme.
+    #[test]
+    fn la_recherche_passe_par_le_noeud() {
+        assert!(PAGE.contains(r#"id="forme-chercher""#));
+        assert!(PAGE.contains(r#"appel("rechercher", {q})"#));
+    }
+
+    /// Aucun montant ne passe par un flottant.
+    ///
+    /// La page additionne des montants — les sorties d'une transaction, ce
+    /// qu'une adresse a recu. En virgule flottante binaire, ces sommes
+    /// derivent. Une chaine de blocs qui arrondit un solde n'est plus une
+    /// chaine de blocs.
+    #[test]
+    fn aucun_flottant_sur_un_montant() {
+        let script = {
+            let d = PAGE.find("<script>").expect("bloc script") + "<script>".len();
+            let f = PAGE.find("</script>").expect("fin du script");
+            &PAGE[d..f]
+        };
+        assert!(
+            script.contains("BigInt("),
+            "les montants ne sont pas en entiers"
+        );
+        assert!(
+            script.contains("100000000n"),
+            "la conversion en Q21 doit se faire en entiers"
+        );
+        for interdit in ["parseFloat", "Number(o.valeur", "toFixed(8)"] {
+            assert!(
+                !script.contains(interdit),
+                "un montant passe par un flottant : {interdit}"
+            );
+        }
+    }
+
+    /// Une page de detail ne se recharge pas sous les yeux de qui la lit.
+    #[test]
+    fn seul_l_accueil_se_rafraichit() {
+        assert!(PAGE.contains("clearInterval(battement)"));
+        assert!(PAGE.contains(r#"if (vue === "accueil") battement = setInterval"#));
     }
 
     /// Les points d'insertion `innerHTML` echappent par defaut.

@@ -62,6 +62,7 @@ fn serveur(avec_portefeuille: bool, token: Option<&str>) -> ServerHandle {
             None
         },
         network: RESEAU,
+        index: None,
     };
     http::serve("127.0.0.1:0", token.map(|s| s.to_string()), move |req| {
         routeur(&ctx, req)
@@ -129,6 +130,7 @@ fn serveur_et_noeud() -> (ServerHandle, Arc<Node>) {
         node: node.clone(),
         wallet: Some(Arc::new(Mutex::new(Wallet::from_seed([7u8; 32], RESEAU)))),
         network: RESEAU,
+        index: None,
         sur_changement: None,
     };
     let h = http::serve("127.0.0.1:0", None, move |req| routeur(&ctx, req))
@@ -1981,9 +1983,25 @@ fn faille_latente_points_d_insertion_non_echappes_dans_l_explorateur() {
     );
 
     // Fonctions qui echappent ou qui ne peuvent produire que des caracteres surs.
-    const SURES: [&str; 5] = ["ech(", "rendu(", "court(", "octets(", "date("];
+    const SURES: [&str; 10] = [
+        "ech(",
+        "rendu(",
+        "court(",
+        "octets(",
+        "date(",
+        // Constructeurs de liens : ils echappent la route **et** le texte.
+        // La verification qu'ils le font est faite juste au-dessus, sur la
+        // source de `lien` : sans elle, les inscrire ici serait une croyance.
+        "lien(",
+        "lienBloc(",
+        "lienTx(",
+        "lienAdresse(",
+        // Conversion d'unites en Q21 : n'assemble que des chiffres issus d'un
+        // BigInt et un point. Aucun caractere de balisage n'en sort.
+        "q21(",
+    ];
     // Insertions crues admises, et la raison de chacune.
-    const CRUES_ADMISES: [&str; 8] = [
+    const CRUES_ADMISES: [&str; 12] = [
         // Condition d'un ternaire : jamais inseree, seulement testee.
         "n",
         // Champs numeriques du noeud (`Json::u64`), donc jamais des chaines.
@@ -1996,7 +2014,23 @@ fn faille_latente_points_d_insertion_non_echappes_dans_l_explorateur() {
         // Tableaux dont chaque element passe par ech() juste apres.
         "sec.un_attaquant_peut.map(x=>",
         "sec.un_attaquant_ne_peut_pas.map(x=>",
+        // Conditions de ternaires : testees, jamais inserees. Ce qui est
+        // insere ensuite est un litteral choisi dans la page elle-meme.
+        "t.coinbase",
+        "m.coinbase",
+        "BigInt(m.recu.unites) > 0n",
+        "!m.montant_sortant_connu",
     ];
+
+    // Les constructeurs de liens sont declares surs plus haut. On verifie ici
+    // qu'ils le sont : leurs deux moities passent par ech(). Sans ce controle,
+    // ajouter un nom a SURES reviendrait a desarmer l'epreuve d'une ligne.
+    assert!(
+        p.contains(r##"`<a class="plat" href="#/${ech(route)}">${ech(texte)}</a>`"##),
+        "le constructeur de liens n'echappe plus ses deux moities : tout ce qui \
+         passe par lien(), lienBloc(), lienTx() ou lienAdresse() devient une \
+         injection possible"
+    );
 
     let mut reste = p;
     let mut examines = 0;
@@ -2089,13 +2123,41 @@ fn faille_l_explorateur_recopie_la_chaine_de_requete() {
         p.contains("\"Authorization\"") && p.contains("\"Bearer \""),
         "le jeton doit voyager en en-tete"
     );
+    // Le jeton se demande dans la page. `window.prompt` bloque tout l'onglet,
+    // ne se met pas en forme, et plusieurs navigateurs ne l'affichent plus du
+    // tout dans certains contextes — un explorateur devenait alors
+    // inutilisable sans qu'aucun message n'explique pourquoi.
     assert!(
-        p.contains("window.prompt"),
-        "le jeton doit etre demande a l'utilisateur, pas lu dans l'adresse"
+        p.contains(r#"id="panneau-jeton""#),
+        "le jeton doit etre demande par un champ de la page"
     );
-    // Et rien d'autre de l'adresse ne se retrouve dans une requete sortante.
+    assert!(
+        !p.contains("window.prompt"),
+        "le jeton ne doit plus etre demande par une fenetre du navigateur"
+    );
+
+    // --- Le fragment sert maintenant a deux choses, et une seule est secrete.
+    //
+    // Le jeton y arrive — le navigateur ne l'envoie jamais au serveur — et le
+    // routage l'emploie ensuite. Ce qui doit rester vrai :
+    //
+    //  - le jeton est efface de la barre d'adresse des qu'il est lu ;
+    //  - il ne repart que dans l'en-tete `Authorization` ;
+    //  - rien de l'adresse n'est recopie dans une requete sortante.
+    assert!(
+        p.contains("history.replaceState"),
+        "le jeton reste dans la barre d'adresse apres avoir ete lu"
+    );
+    assert!(
+        p.contains(r##"if (f && !f.startsWith("/"))"##),
+        "rien ne distingue un jeton d'une route dans le fragment"
+    );
     assert!(!p.contains("location.href"));
-    assert!(!p.contains("location.hash"));
+    // Le corps d'une requete ne contient que la methode et ses parametres.
+    assert!(
+        p.contains("body: JSON.stringify({jsonrpc:\"2.0\", id:++compteur, method:methode, params:params||{}})"),
+        "le corps des requetes n'est plus celui qu'on croit"
+    );
 }
 
 // ===========================================================================
