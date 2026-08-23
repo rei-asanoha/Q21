@@ -300,7 +300,8 @@ Vérifié **à la compilation**.
 | 7 | ✅ | **Durabilité** : démarrage incrémental, mémoire bornée, mineur multi-fils, anti-éclipse |
 | 8 | ✅ | **Audit adverse** : 11 failles réelles corrigées, portefeuille chiffré, aléa multiplateforme |
 | 8b | ⬜ | Audit **humain externe** : cryptanalyse de la PoW, relecture du consensus |
-| 9 | ⬜ | Genèse publique : testnet ouvert, puis réseau principal |
+| 9 | 🔨 | **Réseau d'essai ouvert** : nœud sans portefeuille, amorçage par noms, ports par réseau, vérification de la genèse. Reste à ouvrir un point d'entrée public |
+| 10 | ⬜ | Réseau principal — préalable : engagement UTXO (MuHash) et audit externe |
 
 ---
 
@@ -347,6 +348,7 @@ src/
                  Aucune ressource externe, routage dans le fragment.
   index.rs       Index d'adresses et de transactions, facultatif.
                  Journal par bloc, chaque enregistrement contrôlé.
+  amorce.rs      Par où l'on entre dans un réseau : ports, noms, amorces
   verrou.rs      Un seul q21 par dossier de données (flock, LockFileEx)
   arret.rs       Arrêt propre sur Ctrl-C, fermeture de fenêtre, SIGTERM
   bin/q21.rs     Nœud, portefeuille, explorateur et bancs en ligne de commande
@@ -361,6 +363,7 @@ PORTEFEUILLE.md  Le portefeuille, et les treize défauts qu'un premier
                  utilisateur a trouvés en s'en servant vraiment
 EXPLORATEUR.md   L'explorateur, l'index d'adresses, et pourquoi il est
                  facultatif
+RESEAU.md        Rejoindre le réseau d'essai, et tenir un point d'entrée
 
 outils/
   verif-mldsa/   Programme jetable pour découvrir l'API réelle du crate ml-dsa
