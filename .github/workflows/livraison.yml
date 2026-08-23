@@ -19,10 +19,21 @@
 
 name: Livraison
 
+# Trois facons de la declencher :
+#
+# - `workflow_dispatch` : un bouton « Run workflow » dans l'onglet Actions.
+#   C'est le plus simple, et c'est celui a employer la premiere fois.
+# - une etiquette de version poussee (`v0.1.0`) ;
+# - une version publiee depuis le site.
+#
+# Les deux dernieres publient en plus une page de version telechargeable ; la
+# premiere depose seulement les fichiers sur la page de l'execution.
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
-  workflow_dispatch:
+  release:
+    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -120,7 +131,7 @@ jobs:
     name: Publication
     needs: construire
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' 
     permissions:
       contents: write
     steps:
