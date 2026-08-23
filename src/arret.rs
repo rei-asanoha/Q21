@@ -138,6 +138,15 @@ pub fn arret_termine() {
     DEMANDE.store(false, Ordering::Relaxed);
 }
 
+/// Verrou d'exclusion entre les epreuves qui touchent au drapeau.
+///
+/// Le drapeau est global au processus, et le lanceur d'epreuves execute les
+/// tests en parallele : deux epreuves qui le manipulent en meme temps se
+/// voleraient mutuellement leur etat. Toute epreuve qui appelle
+/// `demander_arret` ou `arret_termine` doit d'abord prendre ce verrou.
+#[cfg(test)]
+pub static VERROU_EPREUVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +158,7 @@ mod tests {
     /// pas le systeme.
     #[test]
     fn le_drapeau_se_leve_et_se_rabaisse() {
+        let _v = VERROU_EPREUVE.lock().unwrap_or_else(|e| e.into_inner());
         arret_termine();
         assert!(!demande());
         demander_arret();
@@ -160,6 +170,7 @@ mod tests {
     /// L'installation ne doit jamais faire echouer un demarrage.
     #[test]
     fn l_installation_ne_panique_pas() {
+        let _v = VERROU_EPREUVE.lock().unwrap_or_else(|e| e.into_inner());
         // Le resultat depend du systeme et de l'environnement d'execution ; ce
         // qui compte est qu'aucun chemin ne panique.
         let _ = installer();

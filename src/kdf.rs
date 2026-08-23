@@ -242,6 +242,15 @@ pub fn sceller(
     Ok(sortie)
 }
 
+/// Ce contenu est-il un fichier scelle ?
+///
+/// Utile pour prevenir l'utilisateur *avant* de lui demander sa phrase secrete :
+/// une invite nue, sans rien qui l'annonce, ressemble a une panne. On ne devine
+/// jamais — soit le fichier porte la magie, soit il n'est pas scelle.
+pub fn est_scelle(contenu: &[u8]) -> bool {
+    contenu.starts_with(MAGIE)
+}
+
 /// Verifie puis dechiffre.
 pub fn desceller(phrase: &[u8], scelle: &[u8]) -> Result<Vec<u8>, ScelleError> {
     // --- Un fichier tronque ne doit pas se distinguer d'une mauvaise phrase.

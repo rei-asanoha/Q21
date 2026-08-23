@@ -6,7 +6,7 @@ Cinq minutes. Aucune commande.
 
 ## 1 · Remplace le dossier
 
-Tu as téléchargé `q21-depot.tar.gz`. Décompresse-le : tu obtiens un dossier `q21`.
+Tu as téléchargé `q21-depot.zip`. Décompresse-le : tu obtiens un dossier `q21`.
 
 **Dans GitHub Desktop :**
 
@@ -29,7 +29,7 @@ Il devrait afficher **« 1 changed file »** ou plus, dans l'onglet *Changes*.
 En bas à gauche, dans le champ **Summary**, écris :
 
 ```
-Sept corrections trouvees a l'usage
+Un bouton pour fermer le portefeuille
 ```
 
 Clique sur **Commit to main**, puis sur **Push origin** en haut.
@@ -48,49 +48,81 @@ Dix à vingt minutes. Puis télécharge `q21-windows-x86_64.zip` en bas de la pa
 
 # Ce qui change pour toi
 
-## Tu double-cliques, c'est tout
+## Tu n'as plus besoin de Ctrl-C
 
-Dans la nouvelle archive, à côté de `q21.exe`, il y a **`Portefeuille Q21.bat`**.
+Dans le portefeuille, onglet **Informations**, tout en bas : un bouton
+**« Fermer le portefeuille »**.
 
-**Double-clique dessus.** Il crée le portefeuille s'il n'existe pas, puis ouvre
-le navigateur. Plus de fenêtre de commande à manipuler.
+Un premier clic demande confirmation, un second ferme. Le nœud écrit ses
+transactions en attente, son état et ton portefeuille, puis s'arrête. La fenêtre
+noire se referme toute seule.
 
-*(Sur Mac, c'est `Portefeuille Q21.command` — clic droit → Ouvrir la première fois.)*
+**Fermer la fenêtre noire** avec la croix marche aussi : c'est intercepté de la
+même façon.
 
-## Ctrl-C n'efface plus rien
+## Le message « Terminer le programme de commandes (O/N) ? »
 
-Avant, `Ctrl` + `C` **tuait le programme sur place**. Tout ce qu'il devait
-écrire en s'arrêtant — les transactions en attente, l'état de la chaîne, le
-carnet de pairs — était perdu.
+C'est ce qui t'a bloqué, et **ce n'était pas une panne**.
 
-C'est ce qui a réellement fait disparaître ta transaction. Le problème n'était
-pas seulement que le réservoir n'était pas sauvegardé : **même écrit, il ne
-l'aurait jamais été**, parce que le code d'arrêt n'était jamais atteint.
+Ce message ne vient pas de Q21. Il vient de Windows : quand tu fais `Ctrl` + `C`
+pendant qu'un fichier `.bat` tourne, l'interpréteur de commandes pose *sa* propre
+question avant de rendre la main. Aucune ligne du fichier ne peut l'en empêcher —
+elle arrive avant que le script ait son mot à dire.
 
-Maintenant tu verras :
+À ce moment-là, **tout est déjà enregistré**. La preuve est juste au-dessus, à
+l'écran :
 
 ```
   Arret demande. Ecriture en cours...
-  1 transaction(s) en attente conservee(s)
+Arret. Hauteur finale : ...
 ```
 
-## Ta transaction survit
+Ces deux lignes veulent dire que Q21 a intercepté ton `Ctrl` + `C`, écrit ce
+qu'il devait écrire, et s'est arrêté proprement. La question de Windows arrive
+**après**.
 
-Envoie, arrête, mine, relance : elle est toujours là, et `q21 mine` la met
-dans le bloc qu'il trouve. Vérifié sur ton scénario exact.
+**Réponds `O`.** Tu ne perds rien.
 
-## Tu peux rafraîchir la page
+Et maintenant tu n'as plus à le faire : le bouton existe.
 
-F5 ne casse plus rien.
+## La phrase secrète est demandée en premier
 
-## L'historique dit ce qui est sorti
+Avant, l'écran affichait l'adresse, « laissez cette fenêtre ouverte », puis
+d'un coup une ligne nue :
 
-Une colonne **Sorti** apparaît à côté de **Reçu**. Sur un envoi, tu vois enfin
-les deux : ce qui est parti, et la monnaie qui t'est revenue.
+```
+Phrase secrete du portefeuille :
+```
 
-## La fenêtre ne défile plus
+Sans rien qui l'annonce, après t'avoir dit que tout tournait. C'était le mauvais
+ordre. Maintenant :
 
-Elle affiche l'adresse, et se tait.
+```
+Portefeuille Q21
+
+  Ce portefeuille est protege par une phrase secrete.
+  Tapez-la puis Entree. Elle ne s'affiche pas pendant la frappe :
+  c'est voulu, pour que personne ne la lise par-dessus votre epaule.
+
+Phrase secrete du portefeuille :
+```
+
+Et l'adresse ne s'affiche qu'**après** — quand le portefeuille est réellement
+ouvert. Une phrase fausse échoue tout de suite, au lieu d'ouvrir un navigateur
+sur une page qui ne servirait à rien.
+
+## La fenêtre dit comment l'arrêter
+
+Les trois voies, écrites noir sur blanc au démarrage :
+
+```
+  Pour arreter, au choix :
+    - le bouton « Fermer le portefeuille », onglet Informations ;
+    - fermer cette fenetre ;
+    - Ctrl-C ici. Windows demande alors « Terminer le programme
+      de commandes (O/N) ? » : repondez O. Ce n'est pas une erreur,
+      tout est deja enregistre quand cette question s'affiche.
+```
 
 ---
 
