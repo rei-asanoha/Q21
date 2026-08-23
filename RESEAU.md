@@ -26,6 +26,37 @@ même chaîne — et aucune synchronisation n'y changera quoi que ce soit.
 C'est le seul acte de confiance de tout le processus, et il ne demande de croire
 personne : il demande de comparer deux nombres.
 
+## 1 bis · Sur macOS : lever la quarantaine, une fois
+
+Les fichiers livrés ne sont pas signés — cela demande un compte Apple Developer
+payant. macOS met donc en quarantaine tout ce qui vient d'un navigateur, et
+propose de le **mettre à la corbeille**. Ce n'est pas une panne, et le refuser
+est le bon réflexe de sa part.
+
+Deux choses à savoir, dans cet ordre :
+
+**`q21` ne se double-clique pas.** C'est un programme en ligne de commande. Le
+double-cliquer dans le Finder est précisément ce qui déclenche ce dialogue.
+
+**La quarantaine se lève depuis le Terminal**, en une fois, pour tout le dossier :
+
+```bash
+cd <le dossier décompressé>
+xattr -dr com.apple.quarantine .
+chmod +x q21
+./q21 genese testnet
+```
+
+Pour obtenir le `cd` sans se tromper : tapez `cd ` — avec l'espace — puis **faites
+glisser le dossier depuis le Finder dans la fenêtre du Terminal**. Le chemin
+s'écrit tout seul. Entrée.
+
+> Sur macOS 15 (Sequoia), le contournement historique « clic droit → Ouvrir » a
+> été retiré. Si vous préférez tout de même passer par l'interface : lancez le
+> programme une fois, laissez-vous refuser, puis allez dans **Réglages
+> Système → Confidentialité et sécurité**, descendez tout en bas, et cliquez sur
+> **Ouvrir quand même**.
+
 ## 2 · Un nœud simple, sans portefeuille
 
 ```
