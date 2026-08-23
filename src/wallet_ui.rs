@@ -15,11 +15,15 @@
 //! remplacer le code qui manipule les fonds. La regle est verifiee par une
 //! epreuve, pas par la vigilance.
 //!
-//! **Aucun stockage navigateur.** Le jeton d'acces et tout ce qui touche aux
-//! secrets vivent dans une variable JavaScript, le temps de l'onglet. Un
-//! portefeuille qui ecrit son jeton dans le stockage du navigateur le laisse a
-//! disposition de la premiere faille de script du navigateur, et il y reste
-//! apres la fermeture.
+//! **Presque aucun stockage navigateur.** Le seul objet conserve est le jeton
+//! de session, dans `sessionStorage` : il est cloisonne par origine — donc par
+//! port, tire au hasard a chaque lancement — et meurt avec l'onglet. Sans lui,
+//! un simple rafraichissement rendait le portefeuille inutilisable.
+//!
+//! `localStorage`, `indexedDB` et les cookies restent interdits : ils survivent
+//! a la fermeture, et rien ici ne doit survivre a la session. La graine et la
+//! phrase secrete, elles, ne quittent jamais le noeud — le navigateur ne les
+//! voit a aucun moment.
 //!
 //! **Aucun flottant sur un montant.** `0.1 + 0.2 != 0.3` en IEEE 754, et un
 //! `parseFloat` sur un solde perd des unites. Toute l'arithmetique monetaire de
@@ -111,6 +115,11 @@ tbody tr:hover{background:var(--accent-fond)}
 .defile{overflow-x:auto;background:var(--carte);border:1px solid var(--bord);border-radius:6px}
 .mono{font-family:ui-monospace,monospace}
 .coupe{max-width:18ch;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
+/* Une case sans valeur porte un tiret, pas un zero : un zero se lirait comme
+   un chiffre mesure. Un montant minore porte la couleur d'alerte, pour qu'on
+   ne le lise pas comme un fait. */
+.vide{color:var(--tenu)}
+.minore{color:var(--alerte)}
 
 .avert{background:var(--carte);border:1px solid var(--bord);border-left:3px solid var(--alerte);
   border-radius:5px;padding:.85rem .95rem;margin:.8rem 0}
@@ -309,19 +318,11 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
   <div id="note-historique"></div>
   <div class="defile">
     <table>
-      <thead><tr><th>Genre</th><th>Reçu</th><th>Conf.</th><th>Hauteur</th><th>Horodatage</th><th>Identifiant</th></tr></thead>
+      <thead><tr><th>Genre</th><th>Reçu</th><th>Sorti</th><th>Conf.</th><th>Hauteur</th><th>Horodatage</th><th>Identifiant</th></tr></thead>
       <tbody id="mouvements"></tbody>
     </table>
   </div>
-  <div class="note">
-    <h3>Ce que cette colonne ne dit pas</h3>
-    <p>
-      Le nœud ne rapporte que la somme <strong>reçue</strong> par ce
-      portefeuille dans chaque transaction. Pour un envoi, la ligne apparaît —
-      le genre le signale — mais la somme sortie n'est pas calculée&nbsp;; seule
-      la monnaie qui vous revient est comptée. Le solde, lui, reste juste.
-    </p>
-  </div>
+  <div id="note-colonnes"></div>
 </section>
 
 <section class="vue" id="vue-infos" hidden>
@@ -383,11 +384,54 @@ let adresseCourante = null;
 let envoiPrepare = null;
 let enCours = false;
 
-(function lireJetonDuFragment(){
+// Le jeton survit a un rafraichissement, et a rien d'autre.
+//
+// La premiere version le gardait dans une simple variable. Un F5 — le reflexe
+// de tout le monde devant une page qui semble figee — le perdait, et le
+// portefeuille devenait inutilisable jusqu'a relancer le lanceur. C'est
+// exactement ce qui est arrive au premier utilisateur.
+//
+// `sessionStorage` est le compromis retenu, et il merite d'etre justifie :
+//
+// - il est **cloisonne par origine**, et l'origine contient le port, que le
+//   lanceur tire au hasard a chaque demarrage. Ce qu'on y ecrit ne vaut donc
+//   que pour cette execution-la ;
+// - il **meurt avec l'onglet**, contrairement a `localStorage` ;
+// - le jeton lui-meme est ephemere : le lanceur en tire un neuf de trente-deux
+//   octets a chaque lancement, et l'ancien n'ouvre plus rien.
+//
+// Ce qu'on refuse toujours : que le jeton reste dans la **barre d'adresse**,
+// donc dans l'historique du navigateur, dans les journaux d'un mandataire et
+// dans l'en-tete `Referer`. Le fragment est efface aussitot lu.
+//
+// Aucun secret du portefeuille — ni graine, ni phrase — ne passe par la. Un
+// jeton de session n'est pas une clef.
+const CLEF_SESSION = "q21-jeton";
+
+function retenirJeton(v){
+  jeton = v;
+  try { if (v) sessionStorage.setItem(CLEF_SESSION, v); } catch (e) { /* refus du navigateur : tant pis */ }
+}
+
+function oublierJeton(){
+  jeton = null;
+  try { sessionStorage.removeItem(CLEF_SESSION); } catch (e) { /* rien a faire */ }
+}
+
+(function lireJeton(){
   const f = location.hash.slice(1);
-  history.replaceState(null, "", location.pathname);
-  if (!f) return;
-  try { jeton = decodeURIComponent(f); } catch (e) { jeton = f; }
+  if (f) {
+    history.replaceState(null, "", location.pathname);
+    let v = f;
+    try { v = decodeURIComponent(f); } catch (e) { v = f; }
+    retenirJeton(v);
+    return;
+  }
+  // Pas de fragment : un rafraichissement, ou une ouverture a la main.
+  try {
+    const garde = sessionStorage.getItem(CLEF_SESSION);
+    if (garde) jeton = garde;
+  } catch (e) { /* stockage refuse : le panneau de saisie prendra le relais */ }
 })();
 
 function entetes(){
@@ -417,7 +461,7 @@ async function appel(methode, params){
   // Un 401 rend du texte brut, pas du JSON : le lire comme du JSON masquerait
   // la vraie cause derriere une erreur d'analyse.
   if (r.status === 401){
-    jeton = null;
+    oublierJeton();
     demanderJeton();
     throw new Error("jeton d'accès manquant ou refusé");
   }
@@ -528,7 +572,7 @@ document.getElementById("forme-jeton").addEventListener("submit", ev => {
   const champ = document.getElementById("saisie-jeton");
   const v = champ.value.trim();
   if (!v) return;
-  jeton = v;
+  retenirJeton(v);
   champ.value = "";
   document.getElementById("panneau-jeton").hidden = true;
   rafraichir();
@@ -773,9 +817,47 @@ document.getElementById("bouton-envoyer").addEventListener("click", async () => 
 // Historique
 // ---------------------------------------------------------------------------
 
+// La case « sorti » d'une ligne.
+//
+// Le noeud ne porte `sorti` que sur un envoi : ailleurs il n'y a rien a
+// afficher, et un zero se lirait comme une mesure. Quand la piece ouverte est
+// anterieure a la fenetre examinee, `montant_sortant_connu` est faux : la somme
+// est alors un plancher, elle se donne precedee de « ≥ » et non comme un fait.
+// Le montant vient de `q21`, chaine deja formatee par le noeud — aucune
+// arithmetique ici, donc aucun flottant.
+function celluleSortie(m){
+  if (!m.sorti) return brut(`<span class="vide">—</span>`);
+  if (m.montant_sortant_connu === false){
+    return brut(`<span class="minore">${ech("≥ " + m.sorti.q21)}</span>`);
+  }
+  return m.sorti.q21;
+}
+
+// Ce qu'il faut dire sous le tableau, et seulement quand il y a lieu de le dire.
+function notesColonnes(h){
+  let t = "";
+  if (h.mouvements.some(m => m.genre === "envoi")){
+    t += `<div class="note"><h3>Reçu et sorti sur une même ligne</h3>
+      <p>Un envoi n'ouvre presque jamais une pièce de la taille exacte&nbsp;: le
+      portefeuille en ouvre une plus grosse, et la différence lui revient en
+      monnaie sur une adresse neuve, comme un billet rendu. La colonne
+      <strong>reçu</strong> porte cette monnaie, la colonne <strong>sorti</strong>
+      ce qui a réellement quitté le portefeuille — montant versé et frais compris.</p></div>`;
+  }
+  if (h.montants_sortants_tous_resolus === false){
+    t += `<div class="avert"><h3>Sommes sorties incomplètes</h3>
+      <p>Pour au moins un envoi, la pièce ouverte est antérieure à la fenêtre
+      examinée&nbsp;: sa valeur n'a pas été retrouvée, et la somme sortie ne peut
+      donc pas être établie. Ces montants s'affichent précédés de «&nbsp;≥&nbsp;»
+      — un minimum, pas un fait.</p></div>`;
+  }
+  return t;
+}
+
 async function historique(){
   const corps = document.getElementById("mouvements");
   const zone = document.getElementById("note-historique");
+  const sous = document.getElementById("note-colonnes");
   try{
     const h = await appel("listtransactions", '{"limite":100}');
     // Un historique tronque qui ne se declare pas fait croire a des fonds
@@ -784,9 +866,10 @@ async function historique(){
       ? `<div class="note"><h3>Historique complet</h3><p>${ech(h.note)}</p></div>`
       : `<div class="avert"><h3>Historique partiel</h3><p>${ech(h.note)}</p>
          <p>Recherche effectuée de la hauteur ${ech(h.regarde_depuis_hauteur)} à ${ech(h.hauteur)}. Ce qui est antérieur n'est pas affiché, et n'est pas perdu pour autant.</p></div>`;
+    sous.innerHTML = notesColonnes(h);
 
     if (!h.mouvements.length){
-      corps.innerHTML = `<tr><td colspan="6">Aucun mouvement dans la fenêtre examinée.</td></tr>`;
+      corps.innerHTML = `<tr><td colspan="7">Aucun mouvement dans la fenêtre examinée.</td></tr>`;
       return;
     }
     corps.innerHTML = h.mouvements.map(m => {
@@ -796,6 +879,7 @@ async function historique(){
       <tr>
         <td><span class="badge${ech(attente)}">${ech(m.genre)}</span></td>
         <td>${ech(m.recu.q21)}</td>
+        <td>${rendu(celluleSortie(m))}</td>
         <td>${ech(m.confirmations)}${html(marque)}</td>
         <td>${ech(m.hauteur)}</td>
         <td>${ech(date(m.horodatage))}</td>
@@ -805,6 +889,7 @@ async function historique(){
   }catch(e){
     zone.innerHTML = `<div class="avert"><h3>Historique indisponible</h3><p>${ech(e.message)}</p></div>`;
     corps.innerHTML = "";
+    sous.innerHTML = "";
   }
 }
 
@@ -903,20 +988,58 @@ mod tests {
         assert!(PAGE.contains("prefers-color-scheme: dark"));
     }
 
-    /// Un portefeuille n'ecrit rien dans le navigateur.
+    /// Ce que le portefeuille a le droit d'ecrire dans le navigateur, et ce
+    /// qu'il n'a pas le droit d'y ecrire.
+    ///
+    /// # Ce qui a change, et pourquoi
+    ///
+    /// La regle etait « aucun stockage, jamais ». Elle avait le merite d'etre
+    /// simple, et elle rendait le portefeuille inutilisable au premier
+    /// rafraichissement : le jeton vivait dans une variable, un F5 l'effacait,
+    /// et il fallait relancer le lanceur. C'est arrive au premier utilisateur,
+    /// devant une page qui semblait figee — le reflexe de tout le monde.
+    ///
+    /// Le jeton de session est donc admis dans `sessionStorage`, et lui seul.
+    /// Il est cloisonne par origine — donc par port, tire au hasard a chaque
+    /// lancement — et meurt avec l'onglet. Ce n'est pas une clef : la graine et
+    /// la phrase secrete ne quittent jamais le noeud.
+    ///
+    /// `localStorage`, `indexedDB` et les cookies restent interdits : ils
+    /// survivent a la fermeture, et rien ici ne doit survivre a la session.
     #[test]
-    fn la_page_n_ecrit_rien_dans_le_navigateur() {
+    fn la_page_ne_persiste_que_le_jeton_de_session() {
+        // On cherche des **appels**, pas des mentions : les commentaires du
+        // fichier nomment `localStorage` pour expliquer pourquoi il est ecarte,
+        // et une epreuve qui interdirait jusqu'au mot interdirait d'expliquer.
         for interdit in [
-            "localStorage",
-            "sessionStorage",
-            "indexedDB",
-            "document.cookie",
+            "localStorage.setItem",
+            "localStorage.getItem",
+            "localStorage[",
+            "indexedDB.open",
+            "document.cookie =",
         ] {
             assert!(
                 !PAGE.contains(interdit),
-                "le portefeuille persiste quelque chose dans le navigateur : {interdit}"
+                "le portefeuille persiste au-dela de la session : {interdit}"
             );
         }
+        let s = script();
+        assert!(
+            s.contains("sessionStorage.setItem(CLEF_SESSION"),
+            "le jeton doit survivre a un rafraichissement"
+        );
+        assert!(
+            s.contains("sessionStorage.removeItem(CLEF_SESSION"),
+            "un jeton refuse doit etre oublie, pas reessaye indefiniment"
+        );
+        // Toute lecture ou ecriture est gardee : un navigateur peut refuser le
+        // stockage, et la page doit alors fonctionner sans, pas s'arreter.
+        let occurrences = s.matches("sessionStorage").count();
+        let gardes = s.matches("try {").count();
+        assert!(
+            gardes >= occurrences,
+            "chaque acces au stockage doit etre garde : {occurrences} acces, {gardes} gardes"
+        );
     }
 
     /// Le fragment porte le jeton, et ne doit pas survivre a sa lecture.
@@ -1172,6 +1295,55 @@ mod tests {
         assert!(PAGE.contains("regarde_depuis_hauteur"));
         // La note du noeud est affichee telle quelle, pas resumee.
         assert!(PAGE.contains("ech(h.note)"));
+    }
+
+    /// L'encadre de l'historique explique la monnaie rendue, et rien d'autre.
+    ///
+    /// # Ce qu'il disait avant
+    ///
+    /// « Ce que cette colonne ne dit pas » : la somme sortie n'etait pas
+    /// calculee. Le noeud la calcule desormais, et l'encadre qui l'affirmait
+    /// encore mentait a son porteur. Ce qui reste a expliquer est l'inverse :
+    /// pourquoi « recu » et « sorti » figurent tous deux sur la ligne d'un
+    /// envoi.
+    #[test]
+    fn l_encadre_explique_la_monnaie_rendue() {
+        assert!(
+            !PAGE.contains("Ce que cette colonne ne dit pas"),
+            "l'ancien encadre affirme encore que la somme sortie n'est pas calculee"
+        );
+        assert!(!PAGE.contains("la somme sortie n'est pas calculée"));
+        assert!(PAGE.contains("Reçu et sorti sur une même ligne"));
+        assert!(PAGE.contains("comme un billet rendu"));
+        // Il ne s'affiche que s'il y a un envoi a expliquer.
+        assert!(PAGE.contains(r#"h.mouvements.some(m => m.genre === "envoi")"#));
+        // Une resolution partielle se declare, plutot que de passer pour exacte.
+        assert!(PAGE.contains("montants_sortants_tous_resolus === false"));
+        assert!(PAGE.contains("Sommes sorties incomplètes"));
+    }
+
+    /// La colonne « sorti » existe, et ne donne pas un plancher pour un fait.
+    #[test]
+    fn la_colonne_sortie_existe_et_avoue_son_incertitude() {
+        assert!(PAGE.contains("<th>Sorti</th>"));
+        // La case est alimentee par le champ du noeud, pas devinee.
+        assert!(PAGE.contains("m.sorti.q21"));
+        assert!(PAGE.contains("rendu(celluleSortie(m))"));
+        // Sans envoi, pas de chiffre : un tiret, jamais un zero.
+        assert!(PAGE.contains(r#"if (!m.sorti) return brut(`<span class="vide">—</span>`);"#));
+        // Le drapeau du noeud est consulte, et il decide de la marque affichee.
+        assert!(
+            PAGE.contains("m.montant_sortant_connu === false"),
+            "la page affiche la somme sortie sans verifier qu'elle est complete"
+        );
+        assert!(PAGE.contains(r#"ech("≥ " + m.sorti.q21)"#));
+        // Le tableau compte bien une colonne de plus qu'avant.
+        let entete = PAGE
+            .find("<thead><tr><th>Genre</th>")
+            .expect("entete de l'historique");
+        let fin = PAGE[entete..].find("</tr>").expect("fin de l'entete");
+        assert_eq!(PAGE[entete..entete + fin].matches("<th>").count(), 7);
+        assert!(PAGE.contains(r#"colspan="7""#));
     }
 
     /// Le schema post-quantique est nomme, avec sa norme et son niveau.

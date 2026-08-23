@@ -254,6 +254,10 @@ fn restreindre_acces(chemin: &Path) {
 /// Le compteur croit a chaque ecriture et sa valeur haute est conservee dans un
 /// fichier distinct. Un `wallet.dat` plus ancien que ce qu'on a deja vu est
 /// refuse, avec un message qui dit quoi faire.
+fn chemin_reservoir(d: &Path) -> PathBuf {
+    d.join("mempool.dat")
+}
+
 fn chemin_serie(d: &Path) -> PathBuf {
     d.join("wallet.seq")
 }
@@ -975,6 +979,36 @@ fn cmd_mine(datadir: &Path, n: Option<&str>) -> Result<(), String> {
     let n: u64 = n.unwrap_or("1").parse().map_err(|_| "nombre invalide")?;
     let mut e = charger(datadir)?;
 
+    // --- Les transactions en attente entrent dans les blocs qu'on mine.
+    //
+    // `q21 mine` ignorait le reservoir et minait des blocs vides. Une
+    // transaction envoyee puis suivie d'un `mine` restait donc en attente
+    // indefiniment, alors que la commande semblait faite pour la confirmer.
+    // C'est exactement l'enchainement qu'a suivi le premier utilisateur.
+    let mut reservoir = q21_core::mempool::Mempool::new();
+    let magasin = q21_core::state::clef_de_repertoire(datadir)
+        .ok()
+        .map(|clef| q21_core::state::MempoolStore::new(chemin_reservoir(datadir), clef));
+    if let Some(m) = &magasin {
+        if m.exists() {
+            if let Ok(attente) = m.load() {
+                let hauteur = e.chain.height();
+                let mut reprises = 0usize;
+                for tx in &attente {
+                    if reservoir
+                        .accept(tx, &e.chain.utxo, e.chain.network, hauteur)
+                        .is_ok()
+                    {
+                        reprises += 1;
+                    }
+                }
+                if reprises > 0 {
+                    println!("reservoir : {reprises} transaction(s) a confirmer");
+                }
+            }
+        }
+    }
+
     let debut = std::time::Instant::now();
     let mut total_essais = 0u64;
 
@@ -986,9 +1020,10 @@ fn cmd_mine(datadir: &Path, n: Option<&str>) -> Result<(), String> {
         let schema = addr.scheme;
         let t = maintenant().max(e.chain.tip().time + 1);
 
+        let selection = reservoir.select_for_block(q21_core::consensus::POIDS_BLOC_CIBLE);
         let bloc = e
             .chain
-            .mine_block(addr.hash, schema, &[], t, 200_000_000)
+            .mine_block(addr.hash, schema, &selection, t, 200_000_000)
             .ok_or_else(|| format!("aucun nonce trouve pour le bloc {}", e.chain.height() + 1))?;
         total_essais += bloc.header.nonce;
 
@@ -1014,6 +1049,7 @@ fn cmd_mine(datadir: &Path, n: Option<&str>) -> Result<(), String> {
             .connect(&bloc, horloge)
             .map_err(|x| format!("bloc refuse par notre propre validateur : {x:?}"))?;
         e.archive.append(&bloc).map_err(|x| x.to_string())?;
+        reservoir.on_block_connected(&bloc);
 
         let recompense = bloc.transactions[0].outputs[0].value;
         // Au-dela de quelques centaines de blocs, une ligne par bloc noie la
@@ -1033,6 +1069,18 @@ fn cmd_mine(datadir: &Path, n: Option<&str>) -> Result<(), String> {
         }
     }
     ecrire_instantane(&e.datadir, &e.chain);
+
+    // Ce qui reste en attente est reecrit ; ce qui vient d'etre confirme
+    // disparait. Laisser le fichier tel quel ferait ressusciter au prochain
+    // demarrage des transactions deja dans un bloc.
+    if let Some(m) = &magasin {
+        let restantes = reservoir.transactions_ordonnees();
+        if restantes.is_empty() {
+            let _ = m.remove();
+        } else if let Err(x) = m.save(&restantes) {
+            eprintln!("avertissement : reservoir non reecrit : {x}");
+        }
+    }
 
     let secondes = debut.elapsed().as_secs_f64();
     println!();
@@ -1506,6 +1554,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut rpc_wallet = false;
     let mut fils: usize = 0;
     let mut cible_pairs: usize = 8;
+    let mut silencieux = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1534,6 +1583,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 mine = true;
                 i += 1;
             }
+            // Le rapport d'etat toutes les deux secondes est precieux quand on
+            // fait tourner un noeud, et nuisible dans un portefeuille : il
+            // noyait l'adresse a ouvrir sous des dizaines de lignes identiques,
+            // au point qu'un utilisateur a cru que rien ne se passait.
+            "--silencieux" => {
+                silencieux = true;
+                i += 1;
+            }
             "--seconds" if i + 1 < args.len() => {
                 duree = args[i + 1].parse().unwrap_or(0);
                 i += 2;
@@ -1550,6 +1607,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         }
     }
 
+    // Le gestionnaire d'arret est installe avant toute chose : un Ctrl-C
+    // pendant le chargement doit deja etre entendu.
+    if !q21_core::arret::installer() {
+        eprintln!(
+            "avertissement : le systeme a refuse le gestionnaire d'arret.\n               Un Ctrl-C tuera le processus sans ecrire l'instantane ni le reservoir."
+        );
+    }
+
     let mut etat = charger(datadir)?;
     let reseau = etat.chain.network;
     let hauteur_depart = etat.chain.height();
@@ -1563,7 +1628,39 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // est ecrit sur disque au moment ou il est accepte.
     node.set_journal(archive.clone());
 
-    println!("Noeud Q21 — reseau {reseau:?}, hauteur {hauteur_depart}");
+    // --- Le reservoir de la session precedente.
+    //
+    // Chaque transaction repasse par `accept`, qui la revalide contre la chaine
+    // telle qu'elle est **maintenant**. La chaine a pu avancer pendant l'arret :
+    // certaines sont deja confirmees, d'autres sont devenues impossibles. Un
+    // reservoir relu n'est jamais cru sur parole.
+    if let Ok(clef) = q21_core::state::clef_de_repertoire(datadir) {
+        let magasin = q21_core::state::MempoolStore::new(chemin_reservoir(datadir), clef);
+        if magasin.exists() {
+            match magasin.load() {
+                Ok(attente) => {
+                    let mut reprises = 0usize;
+                    let total = attente.len();
+                    for tx in &attente {
+                        let ok = node.with_chain_and_mempool(|c, m| {
+                            m.accept(tx, &c.utxo, reseau, c.height()).is_ok()
+                        });
+                        if ok {
+                            reprises += 1;
+                        }
+                    }
+                    if total > 0 {
+                        println!("  reservoir : {reprises} transaction(s) reprise(s) sur {total}");
+                    }
+                }
+                Err(e) => eprintln!("avertissement : reservoir ignore ({e})"),
+            }
+        }
+    }
+
+    if !silencieux {
+        println!("Noeud Q21 — reseau {reseau:?}, hauteur {hauteur_depart}");
+    }
 
     if let Some(a) = &ecoute {
         let local = node
@@ -1628,22 +1725,36 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             })
             .map_err(|e| e.to_string())?;
 
-        println!("  RPC et explorateur sur http://{}", h.addr);
-        if rpc_wallet {
-            println!("  ATTENTION : methodes de portefeuille actives sur ce port.");
-        } else {
-            println!("  Portefeuille desactive (--rpc-wallet pour l'activer).");
-        }
-        if let Some(t) = &rpc_token {
-            println!("  Jeton exige. Explorateur : http://{}/?token={t}", h.addr);
+        // En mode silencieux, le lanceur a deja tout dit : repeter l'adresse et
+        // les avertissements ne ferait que rallonger ce que l'utilisateur doit
+        // lire pour trouver le lien.
+        if !silencieux {
+            println!("  RPC et explorateur sur http://{}", h.addr);
+            if rpc_wallet {
+                println!("  ATTENTION : methodes de portefeuille actives sur ce port.");
+            } else {
+                println!("  Portefeuille desactive (--rpc-wallet pour l'activer).");
+            }
+            if rpc_token.is_some() {
+                // --- Ce message proposait le jeton dans l'adresse.
+                //
+                // `?token=...` a cesse d'ouvrir quoi que ce soit — une adresse
+                // finit dans l'historique du navigateur, dans les journaux d'un
+                // mandataire et dans l'en-tete `Referer` — mais ce conseil-la
+                // survivait a la correction, et invitait donc a faire
+                // exactement ce qu'on venait d'interdire.
+                println!("  Jeton exige. Les pages le demandent a l'ouverture.");
+            }
         }
         Some(h)
     } else {
         None
     };
 
-    println!("  Ctrl-C pour arreter");
-    println!();
+    if !silencieux {
+        println!("  Ctrl-C pour arreter");
+        println!();
+    }
 
     let debut = std::time::Instant::now();
     let mut dernier_rapport = std::time::Instant::now();
@@ -1654,6 +1765,17 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 
     loop {
         if duree > 0 && debut.elapsed().as_secs() >= duree {
+            break;
+        }
+        // Ctrl-C : on sort de la boucle plutot que de se faire tuer sur place.
+        // Tout ce que ce noeud doit ecrire — reservoir, instantane, carnet,
+        // portefeuille — se trouve apres cette boucle, et n'etait jamais
+        // atteint.
+        if q21_core::arret::demande() {
+            if !silencieux {
+                println!();
+            }
+            println!("  Arret demande. Ecriture en cours...");
             break;
         }
 
@@ -1706,7 +1828,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
-        if dernier_rapport.elapsed().as_secs() >= 2 {
+        if !silencieux && dernier_rapport.elapsed().as_secs() >= 2 {
             let h = node.height();
             let s = &node.stats;
             println!(
@@ -1743,11 +1865,36 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     if let Err(e) = carnet.save_entrees(&node.address_entries()) {
         eprintln!("avertissement : carnet non ecrit : {e}");
     }
+    // --- Le reservoir survit a l'arret.
+    //
+    // Une transaction envoyee y patiente qu'un mineur la prenne. Elle n'etait
+    // ecrite nulle part : arreter le logiciel avant qu'elle soit minee
+    // l'effacait, sans un mot. Un premier utilisateur l'a vecu — envoi, arret
+    // pour lancer le minage, transaction disparue.
+    //
+    // Sur un reseau peuple, un pair l'aurait relayee et gardee. C'est donc le
+    // noeud isole — celui d'un portefeuille de bureau — qui payait ce defaut.
+    if let Ok(clef) = q21_core::state::clef_de_repertoire(datadir) {
+        let attente = node.with_mempool(|m| m.transactions_ordonnees());
+        let magasin = q21_core::state::MempoolStore::new(chemin_reservoir(datadir), clef);
+        if attente.is_empty() {
+            // Un reservoir vide efface le fichier : le laisser ferait ressusciter
+            // au prochain demarrage des transactions deja confirmees.
+            let _ = magasin.remove();
+        } else if let Err(e) = magasin.save(&attente) {
+            eprintln!("avertissement : reservoir non ecrit : {e}");
+        } else {
+            println!("  {} transaction(s) en attente conservee(s)", attente.len());
+        }
+    }
     // L'instantane est ecrit a l'arret, pas a chaque bloc : c'est une economie
     // de demarrage, pas une donnee dont la perte couterait quoi que ce soit.
     node.with_chain(|c| ecrire_instantane(datadir, c));
     println!();
     println!("Arret. Hauteur finale : {}", node.height());
+    // Sur Windows, le gestionnaire de console attend ce signal avant de laisser
+    // le systeme tuer le processus.
+    q21_core::arret::arret_termine();
     Ok(())
 }
 
@@ -1904,6 +2051,7 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         });
     }
     println!();
+    println!("  Cette fenetre fait tourner le portefeuille. Laissez-la ouverte.");
     println!("  Ctrl-C pour arreter.");
     println!();
 
@@ -1914,6 +2062,9 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         "--rpc-wallet".to_string(),
         "--rpc-token".to_string(),
         jeton,
+        // Pas de rapport d'etat : dans un portefeuille il noie la seule
+        // information utile, l'adresse a ouvrir.
+        "--silencieux".to_string(),
     ];
     arguments.extend(reste);
     cmd_node(datadir, &arguments)

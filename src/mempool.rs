@@ -223,6 +223,57 @@ impl Mempool {
         self.entrees.get(txid).map(|e| &e.tx)
     }
 
+    /// Transactions du reservoir, parents avant enfants.
+    ///
+    /// # A quoi sert cet ordre
+    ///
+    /// Le reservoir se reconstruit en rejouant `accept` sur chaque
+    /// transaction. Or `accept` refuse une transaction dont un parent non
+    /// confirme est absent — a juste titre : elle depenserait une sortie qui
+    /// n'existe nulle part. Les rendre dans le desordre perdrait donc tous les
+    /// enfants a chaque rechargement.
+    ///
+    /// L'ordre est aussi deterministe a etat egal : deux noeuds dans le meme
+    /// etat ecrivent le meme fichier, ce qui rend les reservoirs comparables.
+    pub fn transactions_ordonnees(&self) -> Vec<Transaction> {
+        let mut restants: Vec<Hash256> = self.txids();
+        let mut emises: HashSet<Hash256> = HashSet::new();
+        let mut sortie: Vec<Transaction> = Vec::with_capacity(restants.len());
+
+        // Au plus autant de passes que de transactions : une chaine de N
+        // transactions en demande N dans le pire des cas, et la boucle s'arrete
+        // des qu'une passe n'emet rien.
+        while !restants.is_empty() {
+            let avant = restants.len();
+            let mut reportes = Vec::new();
+            for id in restants {
+                let pret = self
+                    .parents
+                    .get(&id)
+                    .map(|ps| {
+                        ps.iter()
+                            .all(|p| emises.contains(p) || !self.entrees.contains_key(p))
+                    })
+                    .unwrap_or(true);
+                if pret {
+                    if let Some(e) = self.entrees.get(&id) {
+                        sortie.push(e.tx.clone());
+                    }
+                    emises.insert(id);
+                } else {
+                    reportes.push(id);
+                }
+            }
+            restants = reportes;
+            if restants.len() == avant {
+                // Aucune progression : il resterait un cycle, ce que la
+                // validation interdit. On s'arrete plutot que de boucler.
+                break;
+            }
+        }
+        sortie
+    }
+
     pub fn txids(&self) -> Vec<Hash256> {
         let mut v: Vec<Hash256> = self.entrees.keys().copied().collect();
         v.sort_unstable();

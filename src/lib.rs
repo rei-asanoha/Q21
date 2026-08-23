@@ -42,6 +42,7 @@
 pub mod addr;
 pub mod address;
 pub mod amount;
+pub mod arret;
 pub mod bech32;
 pub mod block;
 pub mod chain;

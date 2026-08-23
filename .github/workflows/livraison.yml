@@ -100,7 +100,16 @@ jobs:
           set -eu
           mkdir -p livraison
           cp "target/${{ matrix.cible }}/release/${{ matrix.binaire }}" livraison/
-          cp README.md AUDIT.md livraison/ 2>/dev/null || true
+          cp README.md AUDIT.md PORTEFEUILLE.md livraison/ 2>/dev/null || true
+          # Le lanceur a double-cliquer, propre a chaque systeme. Sans lui,
+          # l'utilisateur doit ouvrir une fenetre de commande et taper `wallet`,
+          # ce qu'aucune application de bureau ne demande.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "Portefeuille Q21.bat" livraison/
+          else
+            cp "Portefeuille Q21.command" livraison/
+            chmod +x "livraison/Portefeuille Q21.command"
+          fi
           cd livraison
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a "../${{ matrix.archive }}" ./*
