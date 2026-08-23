@@ -1,0 +1,26 @@
+# Fins de ligne — pourquoi ce fichier existe
+#
+# Windows termine ses lignes par deux caracteres la ou le reste du monde n'en
+# emploie qu'un. Git convertit par defaut en recuperant les fichiers sur une
+# machine Windows, ce qui est commode pour du texte et desastreux ici.
+#
+# Les sources vendorisees dans `vendor/` sont accompagnees d'une empreinte
+# SHA-256 par fichier, que cargo verifie avant toute compilation. Une conversion
+# de fin de ligne change le fichier, donc son empreinte, donc cargo refuse :
+#
+#     error: the listed checksum of `vendor\ml-dsa\src\lib.rs` has changed
+#
+# La compilation Windows echouait ainsi en quarante secondes, quand les trois
+# autres reussissaient. C'est un defaut qui ne peut apparaitre que sur une seule
+# plateforme, et seulement une fois le projet passe par un depot.
+
+# Partout : des fins de ligne Unix, quel que soit le systeme.
+* text=auto eol=lf
+
+# Les sources vendorisees : aucune conversion, jamais. Leur empreinte en depend.
+vendor/** -text
+
+# Les fichiers binaires, pour memoire.
+*.png binary
+*.gz binary
+*.zip binary
