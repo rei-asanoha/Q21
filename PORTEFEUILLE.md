@@ -81,8 +81,9 @@ Ces cinq verrous ont été éprouvés par 42 attaques réelles, en TCP, dans
 
 Le portefeuille a été mis entre les mains de quelqu'un qui ne l'avait pas écrit.
 En quelques heures, onze défauts sont sortis. Aucun n'aurait été trouvé
-autrement. Deux autres, plus graves, sont apparus en reproduisant l'un de ces
-scénarios de bout en bout.
+autrement. Deux autres sont apparus en reproduisant l'un de ces scénarios de
+bout en bout — et deux de plus, dont le pire de la liste, le jour où le
+portefeuille a tourné sur **deux machines réelles** au lieu d'une.
 
 | # | Ce qui clochait | Correction |
 |---|---|---|
@@ -99,9 +100,38 @@ scénarios de bout en bout.
 | 11 | Le seul arrêt possible était Ctrl-C, et Windows posait alors une question qui ressemblait à une panne | Bouton **Fermer le portefeuille**, méthode `arreter` |
 | 12 | Deux écritures simultanées du portefeuille laissaient `wallet.seq` en avance sur `wallet.dat` — le portefeuille refusait de s'ouvrir | Verrou d'écriture en processus, et `src/verrou.rs` entre processus |
 | 13 | `wallet.dat` était tronqué avant d'être réécrit : une coupure au mauvais moment perdait la graine | Écriture dans un fichier temporaire, puis renommage atomique |
+| 14 | La tuile **État** affichait son propre balisage en clair | Constructeur `badge()`, et une épreuve sur chaque tuile des deux pages |
+| 15 | **Un pair mort n'était jamais coupé** : le nœud restait bloqué à sa hauteur, pour toujours | `Ping` après 45 s de silence, coupure après 100 s, et reprise des amorces |
+| 16 | Au réveil d'une mise en veille, il fallait attendre le délai de silence | Un tour de boucle qui dure une minute trahit une veille : on coupe tout de suite |
 
-Les deux derniers sont sortis d'une reproduction, pas d'un rapport. Ils méritent
-d'être racontés parce qu'ils illustrent la même erreur.
+Le quinzième est le plus grave de toute la liste, et il n'a pu apparaître que
+sur du matériel réel.
+
+L'utilisateur a refermé l'écran de son MacBook, l'a rouvert, et **la chaîne n'a
+plus jamais bougé** : hauteur 442, pendant que l'autre machine minait
+jusqu'à 455. Trois virements envoyés dans l'intervalle n'y sont jamais arrivés.
+
+La cause tient en une ligne. La boucle de lecture posait un délai de 120
+secondes sur la socket, et traitait son expiration ainsi :
+
+```rust
+Err(e) if e.kind() == WouldBlock => continue,
+```
+
+C'est-à-dire : elle recommençait à attendre, indéfiniment. Un pair qui cesse
+d'émettre n'était donc **jamais** retiré. Le compte de pairs restait à un, et la
+boucle de maintien — qui ne cherche personne tant qu'il ne manque pas de
+pairs — n'avait rien à faire.
+
+Une connexion TCP peut survivre à la machine d'en face. Un portable qu'on
+referme ne dit rien en partant : ni `FIN`, ni `RST`. Le seul signe fiable de vie
+est **une trame reçue**, et c'est désormais ce qu'on mesure.
+
+Sur un réseau public, le même défaut était une voie d'éclipse : ouvrir des
+connexions puis se taire suffisait à occuper toutes les places d'un nœud.
+
+Les douzième et treizième sont sortis d'une reproduction, pas d'un rapport. Ils
+méritent d'être racontés parce qu'ils illustrent la même erreur.
 
 Écrire le portefeuille se fait en quatre temps : lire le numéro de série,
 sceller le contenu, écrire `wallet.dat`, écrire `wallet.seq`. Le scellement

@@ -38,7 +38,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Score de bannissement au-dela duquel on coupe.
 pub const BAN_THRESHOLD: u32 = 100;
@@ -53,6 +53,18 @@ pub const MAX_PEERS: usize = 32;
 
 /// Delai de lecture. Un pair muet finit par etre libere.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Silence apres lequel on demande au pair de se manifester.
+///
+/// Assez court pour qu'un portable qui se reveille retrouve le reseau en moins
+/// d'une minute, assez long pour ne pas bavarder sur une liaison lente.
+pub const PING_APRES: Duration = Duration::from_secs(45);
+
+/// Silence apres lequel on considere le pair mort et on libere sa place.
+///
+/// Compte a partir de la derniere trame recue, pas du `Ping` envoye : un pair
+/// qui repond a autre chose reste vivant.
+pub const SILENCE_MAX: Duration = Duration::from_secs(100);
 
 /// Delai maximal d'une ecriture vers un pair.
 ///
@@ -86,6 +98,32 @@ struct Peer {
     start_height: u64,
     /// Reconstructions de blocs compacts en attente de transactions.
     en_attente: HashMap<Hash256, (CompactBlock, Vec<u32>)>,
+    /// Instant de la derniere trame recue de ce pair.
+    ///
+    /// # Le defaut que ce champ repare
+    ///
+    /// La boucle de lecture pose un delai de 120 secondes sur la socket, et
+    /// traitait son expiration ainsi :
+    ///
+    /// ```text
+    ///     Err(e) if e.kind() == WouldBlock => continue,
+    /// ```
+    ///
+    /// C'est-a-dire : elle recommencait a attendre, indefiniment. Un pair qui
+    /// cesse d'emettre n'etait donc **jamais** retire. Le compte de pairs
+    /// restait a un, et la boucle de maintien — qui ne reconnecte que s'il
+    /// manque des pairs — n'avait rien a faire.
+    ///
+    /// Un portable dont on referme l'ecran produit exactement cela : la
+    /// connexion meurt sans qu'aucun FIN ni RST n'arrive, et le noeud garde un
+    /// pair fantome pour toujours. Trouve en refermant un MacBook — la chaine
+    /// s'est arretee a la hauteur 442 et n'a plus jamais bouge.
+    ///
+    /// Sur un reseau public, c'est aussi une voie d'eclipse : ouvrir des
+    /// connexions puis se taire suffit a occuper toutes les places.
+    derniere_reception: Instant,
+    /// Instant du dernier `Ping` envoye et resté sans reponse.
+    ping_en_attente: Option<Instant>,
     /// Nombre d'en-tetes recus qui ne se rattachent a rien de connu.
     ///
     /// Compte les signes que ce pair est sur une autre chaine. Sans ce compteur,
@@ -299,6 +337,85 @@ impl Node {
         self.partage.lock().unwrap().peers.len()
     }
 
+    /// Coupe toutes les connexions, et rend leur nombre.
+    ///
+    /// Employe au reveil d'une machine mise en veille : apres quelques minutes
+    /// d'arret, toutes les liaisons TCP sont mortes de toute facon — le
+    /// routeur a oublie sa table de traduction, le pair d'en face a renonce.
+    /// Attendre le delai de silence ferait perdre deux minutes de plus a
+    /// quelqu'un qui vient simplement de rouvrir son portable.
+    ///
+    /// Se tromper ne coute qu'une reconnexion.
+    pub fn couper_tous_les_pairs(&self) -> usize {
+        let ids: Vec<u64> = self.partage.lock().unwrap().peers.keys().copied().collect();
+        let n = ids.len();
+        for id in ids {
+            self.deconnecter(id);
+        }
+        n
+    }
+
+    /// Sommes-nous deja connectes a cette adresse ?
+    ///
+    /// Sert a ne pas ouvrir une seconde connexion vers une amorce qu'on
+    /// reessaie periodiquement : deux liaisons vers le meme pair gaspillent une
+    /// place et doublent le trafic sans rien apporter.
+    pub fn est_connecte_a(&self, addr: SocketAddr) -> bool {
+        self.partage
+            .lock()
+            .unwrap()
+            .peers
+            .values()
+            .any(|p| p.addr == addr)
+    }
+
+    /// Interroge les pairs silencieux, et libere la place de ceux qui sont
+    /// morts.
+    ///
+    /// # Pourquoi ce n'est pas la socket qui le dit
+    ///
+    /// Une connexion TCP peut survivre a la machine d'en face. Un portable dont
+    /// on referme l'ecran, un cable debranche, un routeur qui oublie sa table :
+    /// dans ces cas, aucun FIN ni RST n'arrive jamais. La socket reste ouverte,
+    /// la lecture attend, et le noeud croit avoir un pair.
+    ///
+    /// Le seul signe fiable de vie est **une trame recue**. On demande donc au
+    /// pair de se manifester apres un silence, et on libere sa place s'il ne le
+    /// fait pas. C'est ce que fait Bitcoin, pour la meme raison.
+    ///
+    /// Rend le nombre de pairs coupes.
+    pub fn entretenir_pairs(&self) -> usize {
+        let maintenant = Instant::now();
+        let mut a_pinger: Vec<(u64, Arc<Mutex<TcpStream>>)> = Vec::new();
+        let mut morts: Vec<u64> = Vec::new();
+        let magie = self.magie;
+        let nonce = {
+            let mut g = self.partage.lock().unwrap();
+            for (id, p) in g.peers.iter_mut() {
+                let silence = maintenant.duration_since(p.derniere_reception);
+                if silence >= SILENCE_MAX {
+                    morts.push(*id);
+                } else if silence >= PING_APRES && p.ping_en_attente.is_none() {
+                    p.ping_en_attente = Some(maintenant);
+                    a_pinger.push((*id, p.sortie.clone()));
+                }
+            }
+            g.nonce
+        };
+        // L'ecriture se fait hors du verrou : une socket bouchee bloquerait
+        // sinon tout le noeud pendant le delai d'ecriture.
+        for (_, sortie) in a_pinger {
+            let _ = ecrire(&sortie, &Message::Ping(nonce), magie);
+        }
+        let coupes = morts.len();
+        for id in morts {
+            // `deconnecter` ferme la socket des deux cotes : la boucle de
+            // lecture, qui attendait, en sort avec une erreur et son fil meurt.
+            self.deconnecter(id);
+        }
+        coupes
+    }
+
     pub fn mempool_len(&self) -> usize {
         self.partage.lock().unwrap().mempool.len()
     }
@@ -398,6 +515,8 @@ impl Node {
                     start_height: 0,
                     en_attente: HashMap::new(),
                     orphelins_consecutifs: 0,
+                    derniere_reception: Instant::now(),
+                    ping_en_attente: None,
                 },
             );
         }
@@ -497,6 +616,13 @@ impl Node {
 
         {
             let mut g = self.partage.lock().unwrap();
+            // Une trame recue, quelle qu'elle soit, prouve que le pair est
+            // vivant. C'est la seule preuve qui vaille : une socket ouverte n'en
+            // est pas une, elle peut survivre a la machine d'en face.
+            if let Some(p) = g.peers.get_mut(&id) {
+                p.derniere_reception = Instant::now();
+                p.ping_en_attente = None;
+            }
             let magie_reseau = g.network;
             let nonce_local = g.nonce;
             // La poignee de main conditionne l'acces aux messages couteux.
@@ -1284,6 +1410,109 @@ mod tests {
             ),
             "b aurait du apprendre que a est a la hauteur 3"
         );
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// Un pair muet finit par etre coupe, et sa place liberee.
+    ///
+    /// # Le defaut verrouille ici
+    ///
+    /// La boucle de lecture posait un delai de 120 secondes sur la socket et
+    /// traitait son expiration par `continue` : elle recommencait a attendre,
+    /// indefiniment. Un pair qui cesse d'emettre n'etait donc jamais retire.
+    ///
+    /// Consequence, observee sur un vrai portable : on referme l'ecran du
+    /// MacBook, la connexion meurt sans qu'aucun FIN ni RST n'arrive, et le
+    /// noeud garde un pair fantome. Le compte de pairs reste a un, la boucle de
+    /// maintien — qui ne cherche que s'il manque des pairs — n'a rien a faire,
+    /// et la chaine s'arrete a la hauteur ou elle en etait. Elle y est restee.
+    ///
+    /// Sur un reseau public, c'est aussi une voie d'eclipse : ouvrir des
+    /// connexions puis se taire suffit a occuper toutes les places.
+    ///
+    /// L'epreuve ne peut pas attendre cent secondes : elle vieillit la derniere
+    /// reception a la main, ce qui est exactement ce que le temps aurait fait.
+    #[test]
+    fn un_pair_muet_est_coupe_et_sa_place_liberee() {
+        let (a, b) = paire();
+        let addr = a.listen("127.0.0.1:0").expect("ecoute");
+        b.connect(addr).expect("connexion");
+        assert!(attendre(|| b.peer_count() == 1, 20), "pas de pair");
+
+        // Rien ne doit bouger tant que le pair parle.
+        assert_eq!(b.entretenir_pairs(), 0, "un pair vivant a ete coupe");
+        assert_eq!(b.peer_count(), 1);
+
+        // Le temps passe, et plus rien n'arrive.
+        {
+            let mut g = b.partage.lock().unwrap();
+            let ancien = Instant::now()
+                .checked_sub(SILENCE_MAX + Duration::from_secs(5))
+                .expect("horloge");
+            for p in g.peers.values_mut() {
+                p.derniere_reception = ancien;
+            }
+        }
+        assert_eq!(b.entretenir_pairs(), 1, "le pair muet n'a pas ete coupe");
+        assert_eq!(
+            b.peer_count(),
+            0,
+            "la place du pair muet n'a pas ete liberee : le noeud croira \
+             toujours avoir un pair, et ne cherchera personne"
+        );
+
+        // Et la place liberee se reprend : c'est tout l'objet de l'operation.
+        b.connect(addr).expect("reconnexion");
+        assert!(attendre(|| b.peer_count() == 1, 20), "pas de reconnexion");
+
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// Un silence plus court declenche un `Ping`, sans couper.
+    ///
+    /// Couper au premier silence serait aussi faux que ne jamais couper : une
+    /// liaison lente, un pair occupe, et l'on se retrouve a rouvrir des
+    /// connexions sans arret. On demande d'abord au pair de se manifester.
+    #[test]
+    fn un_silence_bref_interroge_le_pair_sans_le_couper() {
+        let (a, b) = paire();
+        let addr = a.listen("127.0.0.1:0").expect("ecoute");
+        b.connect(addr).expect("connexion");
+        assert!(attendre(|| b.peer_count() == 1, 20), "pas de pair");
+
+        {
+            let mut g = b.partage.lock().unwrap();
+            let ancien = Instant::now()
+                .checked_sub(PING_APRES + Duration::from_secs(2))
+                .expect("horloge");
+            for p in g.peers.values_mut() {
+                p.derniere_reception = ancien;
+            }
+        }
+        assert_eq!(
+            b.entretenir_pairs(),
+            0,
+            "un pair juste silencieux a ete coupe"
+        );
+        assert_eq!(b.peer_count(), 1);
+
+        // Le pair repond : la reponse le remet en vie, et le prochain entretien
+        // ne trouve plus rien a couper.
+        assert!(
+            attendre(
+                || {
+                    let g = b.partage.lock().unwrap();
+                    g.peers
+                        .values()
+                        .all(|p| p.derniere_reception.elapsed() < PING_APRES)
+                },
+                20
+            ),
+            "le pair n'a pas repondu au Ping"
+        );
+
         a.shutdown();
         b.shutdown();
     }
