@@ -221,6 +221,36 @@ d'adresses ne puisse pas occuper toutes vos places. Voir `net::addr`.
 
 ---
 
+# Ce qu'un portable a appris au protocole
+
+Le premier essai entre deux machines réelles — un PC Windows et un MacBook — a
+sorti un défaut qu'aucune épreuve en boucle locale ne pouvait produire.
+
+On referme l'écran du portable, on le rouvre : **la chaîne ne bouge plus.**
+Hauteur 442, définitivement, pendant que l'autre machine minait jusqu'à 455.
+
+Une connexion TCP peut survivre à la machine d'en face. Un portable qui
+s'endort ne dit rien en partant — ni `FIN`, ni `RST` — et la socket reste
+ouverte du côté qui reste. Le nœud croyait donc avoir un pair, ne cherchait
+personne, et attendait pour toujours des messages qui ne viendraient jamais.
+
+Trois mesures, dans cet ordre :
+
+| Silence | Ce qui se passe |
+|---|---|
+| 45 s | On envoie un `Ping` : « es-tu là ? » |
+| 100 s | Sans aucune trame reçue entre-temps, la place est libérée et les amorces retentées |
+| Un tour de boucle qui dure plus d'une minute | La machine a dormi : on coupe tout de suite, sans attendre les 100 s |
+
+Le troisième point rend le réveil quasi immédiat. Mesuré : un nœud endormi 75
+secondes retrouve son pair et rattrape 59 blocs en moins de vingt secondes après
+le réveil.
+
+Sur un réseau public, le même défaut était une voie d'éclipse : ouvrir des
+connexions puis se taire suffisait à occuper toutes les places d'un nœud.
+
+---
+
 # Ce que ce réseau d'essai va servir à mesurer
 
 Il n'est pas ouvert pour faire joli. Trois choses ne peuvent se mesurer nulle

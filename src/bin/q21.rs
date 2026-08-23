@@ -2212,6 +2212,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let debut = std::time::Instant::now();
     let mut dernier_rapport = std::time::Instant::now();
     let mut derniere_hauteur = node.height();
+    let mut dernier_tour = std::time::Instant::now();
     let mut derniere_recherche = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(60))
         .unwrap_or_else(std::time::Instant::now);
@@ -2237,10 +2238,69 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // Le carnet ne rend que des adresses de groupes reseau distincts, et
         // distincts de ceux deja connectes : c'est ce qui empeche un adversaire
         // detenant une seule plage d'occuper toutes les places. Voir `addr`.
+        // --- La machine s'est-elle endormie ?
+        //
+        // Cette boucle tourne toutes les deux cents millisecondes. Un tour qui
+        // dure une minute ne peut pas etre du travail : la machine a ete mise
+        // en veille, et pendant ce temps toutes ses liaisons TCP sont mortes —
+        // le routeur a oublie sa table, le pair d'en face a renonce.
+        //
+        // Attendre le delai de silence ferait perdre deux minutes de plus a
+        // quelqu'un qui vient simplement de rouvrir son portable. On coupe donc
+        // tout de suite, et on redemande les amorces au tour suivant. Se
+        // tromper ne coute qu'une reconnexion.
+        if dernier_tour.elapsed() >= std::time::Duration::from_secs(60) {
+            let n = node.couper_tous_les_pairs();
+            if n > 0 {
+                println!("  reveil apres veille : {n} liaison(s) coupee(s), on recommence");
+            }
+            derniere_recherche = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or_else(std::time::Instant::now);
+        }
+        dernier_tour = std::time::Instant::now();
+
         if derniere_recherche.elapsed().as_secs() >= 15 {
             derniere_recherche = std::time::Instant::now();
+
+            // --- D'abord, liberer les places occupees par des pairs morts.
+            //
+            // Une connexion TCP peut survivre a la machine d'en face : un
+            // portable dont on referme l'ecran ne dit rien en partant. Sans ce
+            // menage, le noeud croit avoir un pair, ne cherche donc personne, et
+            // reste bloque a la hauteur ou il en etait. C'est arrive sur un
+            // vrai MacBook : hauteur 442, plus rien pendant que l'autre machine
+            // continuait a miner.
+            let coupes = node.entretenir_pairs();
+            if coupes > 0 && !silencieux {
+                println!("  {coupes} pair(s) silencieux coupe(s)");
+            }
+
             let manquants = cible_pairs.saturating_sub(node.peer_count());
             if manquants > 0 {
+                // --- Les amorces explicites d'abord.
+                //
+                // Elles ne sont pas dans le carnet tant qu'aucune poignee de
+                // main n'a abouti — et c'est precisement quand rien n'aboutit
+                // qu'on en a besoin. Ce que l'utilisateur a ecrit en ligne de
+                // commande doit etre reessaye tant qu'il manque des pairs.
+                for a in &cibles {
+                    if let Ok(adresses) = q21_core::amorce::resoudre(a, reseau) {
+                        for sa in adresses {
+                            if node.est_connecte_a(sa) {
+                                continue;
+                            }
+                            if node.connect(sa).is_ok() {
+                                if !silencieux {
+                                    println!("  reconnexion vers {a} ({sa})");
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                // --- Puis le carnet, pour les places restantes.
+                let manquants = cible_pairs.saturating_sub(node.peer_count());
                 for a in node.addresses_to_try(manquants) {
                     let sa = std::net::SocketAddr::from((a.ip, a.port));
                     match node.connect(sa) {
