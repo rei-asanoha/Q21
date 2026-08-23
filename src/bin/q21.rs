@@ -124,6 +124,41 @@ fn main() {
         }
     }
 
+    // --- Le double-clic qui n'ouvrait rien.
+    //
+    // Lance sans argument, ce programme affichait son aide et rendait la main.
+    // Sous Windows, un double-clic ouvre alors une fenetre qui se referme dans
+    // la demi-seconde : rien n'est lisible, et l'utilisateur conclut — a juste
+    // titre — que le logiciel ne fonctionne pas. C'est arrive au premier a
+    // l'essayer, apres avoir suivi la procedure jusqu'au bout.
+    //
+    // Un programme lance depuis un terminal a recu une commande ; un programme
+    // double-clique n'en a aucune. La distinction est donc nette, et la reponse
+    // evidente : sans argument, c'est le portefeuille qu'on veut.
+    //
+    // Le repli reste l'aide, mais suivie d'une pause : une fenetre qui se
+    // referme avant qu'on ait pu lire n'a jamais rien appris a personne.
+    let sans_argument = reste.is_empty();
+    if sans_argument {
+        println!("Q21 — portefeuille");
+        println!();
+        println!("  Lance sans commande : ouverture du portefeuille.");
+        println!("  Pour la liste des commandes : q21 help");
+        println!();
+        let r = cmd_wallet(&datadir, &[]);
+        if let Err(e) = r {
+            eprintln!("erreur : {e}");
+            if q21_core::prompt::entree_interactive() {
+                println!();
+                println!("  Appuyez sur Entree pour fermer.");
+                let mut _l = String::new();
+                let _ = std::io::stdin().read_line(&mut _l);
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let commande = reste.first().map(|s| s.as_str()).unwrap_or("help");
     let r = match commande {
         "init" => cmd_init(
@@ -2019,21 +2054,32 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     let url = format!("http://{adresse}/portefeuille#{jeton}");
 
     println!("Portefeuille Q21");
-    println!("  interface   http://{adresse}/portefeuille");
-    println!("  explorateur http://{adresse}/");
     println!();
-    if sans_navigateur {
-        println!("  Ouvrez cette adresse dans votre navigateur :");
-        println!();
-        println!("      {url}");
-        println!();
-        println!("  Le jeton est apres le « # ». Il n'est jamais envoye au serveur");
-        println!("  dans l'adresse : le navigateur le garde, la page le lit, puis");
-        println!("  l'efface de la barre d'adresse.");
-    } else {
-        // 4. Le navigateur s'ouvre une fois le serveur pret. On sonde le port
-        //    plutot que d'attendre une duree fixe : une duree fixe est toujours
-        //    trop courte sur une machine chargee et trop longue ailleurs.
+
+    // --- L'adresse est toujours affichee.
+    //
+    // Elle ne l'etait que si l'on renoncait a ouvrir le navigateur. Quand
+    // l'ouverture echouait — un systeme sans navigateur par defaut, une session
+    // distante, une politique d'entreprise — il ne restait rien a l'ecran, et
+    // aucun moyen d'entrer.
+    //
+    // La montrer ne coute rien : elle s'affiche sur la machine de son
+    // proprietaire, dans une fenetre qu'il a ouverte. Ce qu'on refuse, c'est
+    // qu'elle parte ailleurs — dans un historique de navigateur, dans les
+    // journaux d'un mandataire. Sur son propre ecran, elle est a sa place.
+    println!("  Si le navigateur ne s'ouvre pas, ouvrez cette adresse :");
+    println!();
+    println!("      {url}");
+    println!();
+    println!("  Le jeton est apres le « # ». Il n'est jamais envoye au serveur");
+    println!("  dans l'adresse : le navigateur le garde, la page le lit, puis");
+    println!("  l'efface de la barre d'adresse.");
+    println!();
+
+    if !sans_navigateur {
+        // Le navigateur s'ouvre une fois le serveur pret. On sonde le port
+        // plutot que d'attendre une duree fixe : une duree fixe est toujours
+        // trop courte sur une machine chargee et trop longue ailleurs.
         let a = adresse.clone();
         let u = url.clone();
         std::thread::spawn(move || {
@@ -2041,16 +2087,15 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
                 if std::net::TcpStream::connect(&a).is_ok() {
                     if let Err(e) = ouvrir_navigateur(&u) {
                         eprintln!("  Le navigateur n'a pas pu etre ouvert ({e}).");
-                        eprintln!("  Ouvrez cette adresse a la main :\n\n      {u}\n");
+                        eprintln!("  Ouvrez l'adresse ci-dessus a la main.");
                     }
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            eprintln!("  Le serveur n'a pas repondu. Ouvrez a la main :\n\n      {u}\n");
+            eprintln!("  Le serveur n'a pas repondu. Ouvrez l'adresse ci-dessus a la main.");
         });
     }
-    println!();
     println!("  Cette fenetre fait tourner le portefeuille. Laissez-la ouverte.");
     println!("  Ctrl-C pour arreter.");
     println!();
