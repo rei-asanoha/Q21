@@ -80,7 +80,9 @@ Ces cinq verrous ont été éprouvés par 42 attaques réelles, en TCP, dans
 ## Ce qu'un premier utilisateur a trouvé
 
 Le portefeuille a été mis entre les mains de quelqu'un qui ne l'avait pas écrit.
-En quelques heures, onze défauts sont sortis. Aucun n'aurait été trouvé autrement.
+En quelques heures, onze défauts sont sortis. Aucun n'aurait été trouvé
+autrement. Deux autres, plus graves, sont apparus en reproduisant l'un de ces
+scénarios de bout en bout.
 
 | # | Ce qui clochait | Correction |
 |---|---|---|
@@ -95,6 +97,44 @@ En quelques heures, onze défauts sont sortis. Aucun n'aurait été trouvé autr
 | 9 | L'adresse n'était affichée que si le navigateur n'était pas ouvert | Elle l'est toujours |
 | 10 | La phrase secrète était demandée **après** la bannière, sans rien qui l'annonce | Le déverrouillage passe avant tout le reste |
 | 11 | Le seul arrêt possible était Ctrl-C, et Windows posait alors une question qui ressemblait à une panne | Bouton **Fermer le portefeuille**, méthode `arreter` |
+| 12 | Deux écritures simultanées du portefeuille laissaient `wallet.seq` en avance sur `wallet.dat` — le portefeuille refusait de s'ouvrir | Verrou d'écriture en processus, et `src/verrou.rs` entre processus |
+| 13 | `wallet.dat` était tronqué avant d'être réécrit : une coupure au mauvais moment perdait la graine | Écriture dans un fichier temporaire, puis renommage atomique |
+
+Les deux derniers sont sortis d'une reproduction, pas d'un rapport. Ils méritent
+d'être racontés parce qu'ils illustrent la même erreur.
+
+Écrire le portefeuille se fait en quatre temps : lire le numéro de série,
+sceller le contenu, écrire `wallet.dat`, écrire `wallet.seq`. Le scellement
+coûte six cent mille itérations de PBKDF2 — plusieurs centaines de
+millisecondes pendant lesquelles le numéro lu au départ vieillit. Deux
+écritures concurrentes s'entrelacent alors ainsi :
+
+```text
+  fil A  lit seq=5, série=6, commence à sceller ......................
+  fil B  lit seq=5, série=6, scelle, écrit wallet(6), écrit seq=6
+  fil B  lit seq=6, série=7, scelle, écrit wallet(7), écrit seq=7
+  fil A  ..... termine et écrit wallet(6)   <-- écrase la version 7
+```
+
+Il reste un `wallet.seq` à 7 et un `wallet.dat` à 6. Au démarrage suivant, la
+protection anti-rejeu **fait exactement ce qu'on lui demande** : elle refuse
+d'ouvrir le portefeuille, en annonçant une restauration depuis une sauvegarde
+ancienne. Le portefeuille est intact ; l'utilisateur, lui, lit qu'il a
+peut-être révélé ses clefs à usage unique.
+
+Le même scénario existe entre deux **processus** — le portefeuille dans sa
+fenêtre, `q21 mine` dans une autre — et là, ce ne sont pas seulement les deux
+fichiers du portefeuille qui divergent, mais aussi `blocks.dat` et son index.
+D'où deux verrous : un mutex pour les fils d'un même processus, un verrou de
+fichier posé par le système (`flock`, `LockFileEx`) pour les processus entre
+eux. Le second est relâché par le système quel que soit le genre de mort du
+processus — c'est la raison de ne pas le fabriquer à la main avec un fichier
+`.lock` portant un numéro de processus, qui laisserait un verrou fantôme après
+chaque arrêt brutal.
+
+> **Si vous rencontrez le message d'incohérence de série** sur une version
+> antérieure : effacez `wallet.seq` dans le dossier de données. La graine et les
+> fonds sont intacts — c'est le compteur qui a divergé, pas le portefeuille.
 
 Le onzième mérite qu'on s'y arrête, parce qu'il n'est pas dans le code.
 

@@ -138,6 +138,41 @@ fn main() {
     //
     // Le repli reste l'aide, mais suivie d'une pause : une fenetre qui se
     // referme avant qu'on ait pu lire n'a jamais rien appris a personne.
+    // --- Un seul q21 a la fois sur un dossier de donnees.
+    //
+    // Rien ne l'empechait, et le cas est banal : le portefeuille tourne dans sa
+    // fenetre, on lance `q21 mine` dans une autre pour confirmer une
+    // transaction. Deux processus ecrivent alors le meme `wallet.dat`, le meme
+    // `blocks.dat` et le meme `wallet.seq`. Le portefeuille en ressort avec un
+    // numero de serie incoherent, et refuse de s'ouvrir au demarrage suivant en
+    // annoncant une restauration depuis une sauvegarde ancienne.
+    //
+    // Les commandes qui ne touchent pas au repertoire — l'aide, la courbe
+    // d'emission, la note de securite — ne le verrouillent pas : refuser
+    // `q21 help` parce qu'un portefeuille tourne serait absurde.
+    let commande_lue = reste.first().map(|s| s.as_str()).unwrap_or("help");
+    let sans_repertoire = matches!(
+        commande_lue,
+        "emission" | "securite" | "help" | "--help" | "-h"
+    );
+    let _verrou = if sans_repertoire {
+        None
+    } else {
+        match q21_core::verrou::prendre(&datadir) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("erreur : {e}");
+                if q21_core::prompt::entree_interactive() {
+                    println!();
+                    println!("  Appuyez sur Entree pour fermer.");
+                    let mut _l = String::new();
+                    let _ = std::io::stdin().read_line(&mut _l);
+                }
+                std::process::exit(1);
+            }
+        }
+    };
+
     let sans_argument = reste.is_empty();
     if sans_argument {
         println!("Q21 — portefeuille");
@@ -312,7 +347,41 @@ fn enregistrer_serie(d: &Path, serie: u64) {
     }
 }
 
+/// Un seul fil ecrit le portefeuille a la fois.
+///
+/// # Le defaut que ce verrou repare
+///
+/// `ecrire_portefeuille` lit le numero de serie, scelle le contenu, ecrit
+/// `wallet.dat`, puis ecrit `wallet.seq`. Le scellement coute six cent mille
+/// iterations de PBKDF2 : plusieurs centaines de millisecondes pendant
+/// lesquelles le numero de serie lu au depart vieillit.
+///
+/// Deux ecritures concurrentes — le fil du RPC apres une depense, le fil
+/// principal a l'arret — s'entrelacent alors ainsi :
+///
+/// ```text
+///   fil A  lit seq=5, serie=6, commence a sceller ......................
+///   fil B  lit seq=5, serie=6, scelle, ecrit wallet(6), ecrit seq=6
+///   fil B  lit seq=6, serie=7, scelle, ecrit wallet(7), ecrit seq=7
+///   fil A  ..... termine et ecrit wallet(6)   <-- ecrase la version 7
+/// ```
+///
+/// Il reste un `wallet.seq` a 7 et un `wallet.dat` a 6. Au demarrage suivant,
+/// la protection anti-rejeu fait exactement ce qu'on lui demande : elle refuse
+/// d'ouvrir le portefeuille en annoncant une restauration depuis une
+/// sauvegarde ancienne. Le portefeuille est intact, mais l'utilisateur lit
+/// qu'il a peut-etre revele ses clefs a usage unique.
+///
+/// Le verrou couvre la totalite de la sequence : lecture de la serie,
+/// scellement, ecriture des deux fichiers. Entre processus, c'est le verrou de
+/// repertoire de `q21_core::verrou` qui s'en charge.
+static VERROU_ECRITURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
+    // Un fil qui panique en tenant ce verrou empoisonne le mutex. On reprend
+    // quand meme : la donnee protegee est le disque, pas une structure en
+    // memoire qu'une panique aurait pu laisser a moitie modifiee.
+    let _serialise = VERROU_ECRITURE.lock().unwrap_or_else(|e| e.into_inner());
     let reseau = match w.network() {
         Network::Mainnet => "mainnet",
         Network::Testnet => "testnet",
@@ -340,18 +409,29 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     // session. La graine ne doit jamais toucher le disque en clair quand
     // l'utilisateur a demande le contraire.
     let chemin = chemin_portefeuille(d);
-    match phrase_courante() {
-        Some(phrase) => {
-            let scelle = q21_core::kdf::sceller(
-                phrase.as_bytes(),
-                contenu.as_bytes(),
-                q21_core::kdf::ITERATIONS_DEFAUT,
-            )
-            .map_err(|e| e.to_string())?;
-            std::fs::write(&chemin, scelle).map_err(|e| e.to_string())?;
-        }
-        None => std::fs::write(&chemin, contenu).map_err(|e| e.to_string())?,
-    }
+    let octets = match phrase_courante() {
+        Some(phrase) => q21_core::kdf::sceller(
+            phrase.as_bytes(),
+            contenu.as_bytes(),
+            q21_core::kdf::ITERATIONS_DEFAUT,
+        )
+        .map_err(|e| e.to_string())?,
+        None => contenu.into_bytes(),
+    };
+    // --- L'ecriture passe par un fichier temporaire, puis un renommage.
+    //
+    // `std::fs::write` tronque le fichier existant **avant** d'ecrire le
+    // nouveau contenu. Une coupure entre les deux — plus de place, batterie a
+    // plat, arret brutal — laissait un `wallet.dat` vide ou incomplet, c'est-a-
+    // dire une graine perdue. Le renommage, lui, est atomique : le fichier
+    // contient l'ancienne version ou la nouvelle, jamais un melange.
+    //
+    // `wallet.seq` avait deja cette precaution ; le fichier qui porte les fonds
+    // ne l'avait pas.
+    let tmp = chemin.with_extension("tmp");
+    std::fs::write(&tmp, &octets).map_err(|e| e.to_string())?;
+    restreindre_acces(&tmp);
+    std::fs::rename(&tmp, &chemin).map_err(|e| e.to_string())?;
     restreindre_acces(&chemin);
     // La marque de serie n'est posee qu'apres l'ecriture reussie : sinon une
     // coupure entre les deux rendrait le portefeuille reel « trop ancien ».

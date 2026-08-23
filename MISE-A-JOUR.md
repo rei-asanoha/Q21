@@ -45,7 +45,7 @@ Retourne dans GitHub Desktop : il affiche les fichiers modifiés dans l'onglet
 En bas à gauche, dans le champ **Summary**, écris :
 
 ```
-Un bouton pour fermer le portefeuille
+Un verrou de dossier, et un bouton pour fermer
 ```
 
 Clique sur **Commit to main**, puis sur **Push origin** en haut.
@@ -63,6 +63,45 @@ Dix à vingt minutes. Puis télécharge `q21-windows-x86_64.zip` en bas de la pa
 ---
 
 # Ce qui change pour toi
+
+## Deux Q21 ne peuvent plus abîmer le même dossier
+
+C'est la correction la plus importante de cette version, et elle vient d'une
+reproduction : ton portefeuille pouvait devenir **impossible à ouvrir**.
+
+Le cas est banal. Le portefeuille tourne dans sa fenêtre ; tu ouvres une seconde
+fenêtre et tu lances `q21 mine` pour confirmer une transaction. Deux programmes
+écrivent alors le même fichier de portefeuille. Ils se marchent dessus, et au
+démarrage suivant tu lis ceci :
+
+```
+erreur : ce portefeuille porte le numero de serie 6, alors que ce
+         repertoire en a deja vu un plus recent (7).
+         C'est la signature d'une restauration depuis une sauvegarde ancienne.
+```
+
+Message alarmant, portefeuille intact : c'est un **compteur** qui a divergé, pas
+tes fonds. Mais tu ne pouvais pas le savoir.
+
+Maintenant, le second programme est refusé poliment :
+
+```
+erreur : un autre q21 utilise deja ce dossier de donnees.
+
+  Fermez l'autre fenetre — le bouton « Fermer le portefeuille » de l'onglet
+  Informations, ou la croix de la fenetre — puis relancez celle-ci.
+```
+
+> **Si tu tombes sur le message de série sur ton installation actuelle** :
+> efface le fichier `wallet.seq` dans le dossier `q21-data`. Tes Q21 et ta
+> graine sont intacts. Vérifié : le portefeuille se rouvre avec tout son solde.
+
+## Ton fichier de portefeuille ne peut plus être coupé en deux
+
+Il était effacé puis réécrit. Une coupure entre les deux — plus de batterie, un
+arrêt brutal — laissait un fichier vide, c'est-à-dire une graine perdue.
+Maintenant il est écrit à côté, puis renommé d'un coup : soit l'ancienne
+version, soit la nouvelle, jamais un mélange.
 
 ## Tu n'as plus besoin de Ctrl-C
 
