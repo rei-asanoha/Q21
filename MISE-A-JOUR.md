@@ -4,23 +4,39 @@ Cinq minutes. Aucune commande.
 
 ---
 
-## 1 · Remplace le dossier
+## 1 · Verse le nouveau contenu **dans** le dossier existant
+
+> ### ⚠ Ne supprime jamais le dossier `Q21` lui-même
+>
+> Il contient un sous-dossier **caché** nommé `.git`. Ce `.git` **est** le dépôt :
+> c'est lui qui connaît l'historique et le lien vers GitHub. Cette archive ne le
+> contient pas — volontairement, car un second `.git` provoquerait l'erreur
+> « unrelated histories ».
+>
+> Supprimer le dossier pour mettre celui de l'archive à la place détruit donc le
+> dépôt, et GitHub Desktop affiche **« Can't find Q21 »**.
+>
+> On **verse** le nouveau contenu dedans. On ne remplace pas le contenant.
 
 Tu as téléchargé `q21-depot.zip`. Décompresse-le : tu obtiens un dossier `q21`.
 
-**Dans GitHub Desktop :**
+1. Dans GitHub Desktop : menu **Repository** → **Show in Explorer**
+   → l'Explorateur s'ouvre sur ton dossier de dépôt
+2. Ouvre le dossier `q21` issu de l'archive, dans une **autre** fenêtre
+3. Dedans : `Ctrl` + `A` (tout sélectionner), puis `Ctrl` + `C`
+4. Reviens sur la fenêtre du dépôt : `Ctrl` + `V`
+5. Windows demande quoi faire → **Remplacer les fichiers dans la destination**
 
-1. Menu **Repository** → **Show in Explorer** (ou *Show in Finder*)
-   → l'Explorateur s'ouvre sur ton ancien dossier `q21`
-2. Ferme GitHub Desktop
-3. **Supprime** l'ancien dossier `q21`
-4. **Mets le nouveau à la place**, exactement au même endroit
-5. Rouvre GitHub Desktop
+Retourne dans GitHub Desktop : il affiche les fichiers modifiés dans l'onglet
+*Changes*.
 
-Il devrait afficher **« 1 changed file »** ou plus, dans l'onglet *Changes*.
-
-> **S'il dit que le dépôt a disparu** : menu **File** → **Add local repository** →
-> choisis le nouveau dossier `q21`.
+> **Si GitHub Desktop affiche déjà « Can't find Q21 »** — c'est que le dossier a
+> été supprimé. Clique sur **Clone Again** : GitHub Desktop retélécharge le dépôt
+> depuis ton compte, avec son `.git`. Reprends ensuite à l'étape 2 ci-dessus.
+>
+> Si un dossier `Q21` existe encore à cet endroit sans être un dépôt, renomme-le
+> en `Q21-ancien` avant de cliquer sur **Clone Again**, puis supprime-le une fois
+> l'opération finie.
 
 ---
 
