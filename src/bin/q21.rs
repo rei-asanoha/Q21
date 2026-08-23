@@ -45,8 +45,22 @@ COMMANDES
                              --sans-navigateur    n'ouvre pas le navigateur,
                                                   affiche l'adresse
     node [options]           Lance un noeud reseau
-                             --listen <ip:port>   accepte les connexions
-                             --connect <ip:port>  se connecte a un pair
+                             --reseau <nom>       testnet ou regtest. Permet de
+                                                  demarrer SANS portefeuille :
+                                                  la genese est ecrite seule et
+                                                  aucune clef n'est gardee
+                             --listen <port>      accepte les connexions. Un
+                                                  numero seul ecoute partout ;
+                                                  une adresse complete cible une
+                                                  interface
+                             --amorce <hote>      point d'entree. Un nom suffit,
+                                                  le port du reseau est pris par
+                                                  defaut. Repetable
+                             --sans-amorces       n'employer que ce que la ligne
+                                                  de commande donne
+                             --connect <ip:port>  synonyme d'--amorce
+                             --index-adresses     index de recherche (voir
+                                                  EXPLORATEUR.md)
                              --mine               mine en continu
                              --rpc <ip:port>      API JSON-RPC + explorateur web
                              --rpc-token <jeton>  exige un jeton (obligatoire
@@ -71,12 +85,19 @@ COMMANDES
                             --sans-index         s'en passer
                             --port <n>           imposer le port
                             --sans-navigateur    ne rien ouvrir
+    genese [reseau]          Identifiant du bloc de genese, et le port du reseau.
+                            A verifier avant de rejoindre : deux noeuds qui n'ont
+                            pas la meme genese ne sont pas sur la meme chaine.
     securite                 Ce qui est protege, et ce qui ne l'est pas
     help                     Cette aide
 
 EXEMPLE
     q21 init regtest
     q21 mine 205
+
+    # rejoindre un reseau d'essai, sans portefeuille
+    q21 genese testnet
+    q21 --datadir n node --reseau testnet --amorce amorce.exemple.fr
 
     # deux noeuds qui se synchronisent, dans deux terminaux
     q21 --datadir a node --listen 127.0.0.1:21021 --mine
@@ -160,7 +181,7 @@ fn main() {
     let commande_lue = reste.first().map(|s| s.as_str()).unwrap_or("help");
     let sans_repertoire = matches!(
         commande_lue,
-        "emission" | "securite" | "help" | "--help" | "-h"
+        "emission" | "securite" | "genese" | "genesis" | "help" | "--help" | "-h"
     );
     let _verrou = if sans_repertoire {
         None
@@ -232,6 +253,7 @@ fn main() {
             reste.get(1).map(|s| s.as_str()),
             reste.iter().any(|a| a == "--sans-table"),
         ),
+        "genese" | "genesis" => cmd_genese(reste.get(1).map(|s| s.as_str())),
         "securite" => cmd_securite(),
         "help" | "--help" | "-h" => {
             print!("{AIDE}");
@@ -253,6 +275,15 @@ fn main() {
 struct Etat {
     chain: Chain,
     wallet: Wallet,
+    /// Ce noeud tourne sans fichier de portefeuille.
+    ///
+    /// Le portefeuille en memoire n'est alors qu'une coquille : il n'est jamais
+    /// ecrit, aucune de ses adresses n'est distribuee, et les methodes qui
+    /// deplacent des fonds ne sont pas servies. C'est ce que doit etre un noeud
+    /// d'amorcage — un serveur qui redemarre seul apres une coupure ne peut pas
+    /// attendre qu'un humain tape une phrase secrete, et n'a aucune raison de
+    /// garder des clefs.
+    sans_portefeuille: bool,
     /// Le fichier de blocs **et** l'index de leurs positions. Les deux ensemble,
     /// jamais l'un sans l'autre : un bloc ecrit mais non indexe est un bloc que
     /// ce noeud ne saura plus servir a ses pairs.
@@ -339,6 +370,29 @@ fn chemin_reservoir(d: &Path) -> PathBuf {
 fn chemin_serie(d: &Path) -> PathBuf {
     d.join("wallet.seq")
 }
+
+/// Nom d'un reseau tel qu'on l'ecrit en ligne de commande.
+fn nom_de_reseau(n: Network) -> &'static str {
+    match n {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    }
+}
+
+fn reseau_depuis_nom(s: &str) -> Result<Network, String> {
+    match s {
+        "regtest" => Ok(Network::Regtest),
+        "testnet" => Ok(Network::Testnet),
+        "mainnet" => Err("le reseau principal n'existe pas : le protocole n'est pas \
+                          pret, et le dire serait mentir."
+            .into()),
+        autre => Err(format!(
+            "reseau inconnu : {autre}. Attendu : regtest ou testnet."
+        )),
+    }
+}
+
 fn chemin_index(d: &Path) -> PathBuf {
     d.join("index.dat")
 }
@@ -621,14 +675,68 @@ fn ecrire_instantane(datadir: &Path, chain: &Chain) {
 }
 
 fn charger(datadir: &Path) -> Result<Etat, String> {
+    charger_avec(datadir, None)
+}
+
+/// Charge l'etat du repertoire.
+///
+/// `reseau_impose` sert au noeud sans portefeuille : c'est alors la seule
+/// source de la reponse « quelle chaine ce repertoire contient-il ». Avec un
+/// portefeuille, la reponse vient de lui, et un desaccord est une erreur — pas
+/// quelque chose qu'on tranche en silence.
+fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, String> {
     let chrono = std::env::var("Q21_CHRONO").is_ok();
     let t0 = std::time::Instant::now();
-    let mut wallet = lire_portefeuille(datadir)?;
+
+    let a_un_portefeuille = chemin_portefeuille(datadir).exists();
+    let (mut wallet, sans_portefeuille) = if a_un_portefeuille {
+        (lire_portefeuille(datadir)?, false)
+    } else {
+        match reseau_impose {
+            Some(n) => {
+                // Coquille : jamais ecrite, jamais distribuee. Sa graine ne
+                // garde rien, et le minage est refuse plus haut precisement
+                // pour qu'aucune piece n'atterrisse sur une clef qui mourra
+                // avec le processus.
+                (Wallet::from_seed([0u8; 32], n), true)
+            }
+            None => {
+                return Err(
+                    "aucun portefeuille ici.\n\n                       Pour en creer un :        q21 init testnet\n                       Pour un noeud sans portefeuille : q21 node --reseau testnet"
+                        .into(),
+                )
+            }
+        }
+    };
     if chrono {
         eprintln!("[chrono] portefeuille {:.2} s", t0.elapsed().as_secs_f64());
     }
     let reseau = wallet.network();
+    if let Some(n) = reseau_impose {
+        if n != reseau {
+            return Err(format!(
+                "ce dossier contient une chaine {reseau:?}, et vous demandez {n:?}.\n                   Employez un autre dossier : q21 --datadir <autre> node --reseau {}",
+                nom_de_reseau(n)
+            ));
+        }
+    }
+
     // 1. Balayage des en-tetes : une lecture sequentielle, aucun corps decode.
+    //
+    // Un dossier vide n'est pas une erreur quand on sait de quel reseau il
+    // s'agit : la genese est deterministe, chacun peut donc l'ecrire lui-meme.
+    // C'est ce qui permet a quelqu'un de rejoindre le reseau sans recevoir de
+    // fichier de personne — et donc sans avoir a faire confiance a personne
+    // pour la racine de la chaine.
+    if reseau_impose.is_some() && !chemin_blocs(datadir).exists() {
+        std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
+        let genese = genesis_block(reseau);
+        q21_core::store::BlockStore::new(chemin_blocs(datadir))
+            .append(&genese)
+            .map_err(|e| e.to_string())?;
+        println!("  genese ecrite : {}", genese.header.block_id());
+    }
+
     let (archive, seuls_entetes, souci) =
         BlockArchive::open(chemin_blocs(datadir), reseau).map_err(|e| e.to_string())?;
     if seuls_entetes.is_empty() {
@@ -761,7 +869,9 @@ fn charger(datadir: &Path) -> Result<Etat, String> {
         // cela, un portefeuille qui ne depense jamais relisait toute la chaine
         // a chaque commande — un cout qui croit avec la hauteur, paye pour rien.
         wallet.noter_verification(chain.height());
-        let _ = ecrire_portefeuille(datadir, &wallet);
+        if !sans_portefeuille {
+            let _ = ecrire_portefeuille(datadir, &wallet);
+        }
     }
 
     Ok(Etat {
@@ -769,6 +879,7 @@ fn charger(datadir: &Path) -> Result<Etat, String> {
         wallet,
         archive,
         datadir: datadir.to_path_buf(),
+        sans_portefeuille,
     })
 }
 
@@ -1604,6 +1715,52 @@ fn cmd_pow(datadir: &Path, reseau_demande: Option<&str>, sans_table: bool) -> Re
     Ok(())
 }
 
+/// Identifiant du bloc de genese, pour verification avant de rejoindre.
+///
+/// # Pourquoi cette commande existe
+///
+/// Rejoindre un reseau, c'est decider a quelle chaine on croit. Cette decision
+/// se prend une fois, et elle tient a un seul nombre : l'identifiant du bloc de
+/// genese. Deux noeuds qui ne l'ont pas en commun ne se parleront jamais
+/// utilement — et il vaut mieux le constater en trois secondes qu'apres une
+/// heure de synchronisation qui n'aboutit pas.
+///
+/// La genese de Q21 n'est distribuee par personne : elle est **deterministe**.
+/// Chacun la calcule chez lui a partir du code, et compare. Il n'y a donc rien
+/// a telecharger, et personne a croire — c'est exactement la propriete qu'on
+/// veut pour la racine d'une chaine.
+fn cmd_genese(reseau: Option<&str>) -> Result<(), String> {
+    let reseaux: Vec<Network> = match reseau {
+        Some(n) => vec![reseau_depuis_nom(n)?],
+        None => vec![Network::Regtest, Network::Testnet],
+    };
+    println!("Genese");
+    println!();
+    for r in reseaux {
+        let g = genesis_block(r);
+        println!("  {}", nom_de_reseau(r));
+        println!("    identifiant   {}", g.header.block_id());
+        println!("    horodatage    {}", g.header.time);
+        println!("    difficulte    {:#010x}", g.header.bits);
+        println!(
+            "    message       {}",
+            String::from_utf8_lossy(&g.transactions[0].inputs[0].witness.signature)
+        );
+        println!("    port P2P      {}", q21_core::amorce::port_par_defaut(r));
+        let amorces = q21_core::amorce::amorces_integrees(r);
+        if amorces.is_empty() {
+            println!("    amorces       aucune (reseau non ouvert)");
+        } else {
+            println!("    amorces       {}", amorces.join(", "));
+        }
+        println!();
+    }
+    println!("  Cette valeur ne vient d'aucun serveur : elle se recalcule a partir du");
+    println!("  code. Si la votre differe de celle de quelqu'un d'autre, vous n'etes");
+    println!("  pas sur la meme chaine — et aucune synchronisation n'y changera rien.");
+    Ok(())
+}
+
 fn cmd_securite() -> Result<(), String> {
     use q21_core::consensus as k;
     println!("Attaque a 51 % — ce que Q21 protege, et ce qu'il ne protege pas");
@@ -1682,6 +1839,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut cible_pairs: usize = 8;
     let mut silencieux = false;
     let mut index_adresses = false;
+    let mut reseau_impose: Option<Network> = None;
+    let mut sans_amorces = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1690,9 +1849,16 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 ecoute = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--connect" if i + 1 < args.len() => {
+            "--connect" | "--amorce" if i + 1 < args.len() => {
                 vers.push(args[i + 1].clone());
                 i += 2;
+            }
+            // Un noeud public ne veut pas des amorces integrees : il **est**
+            // l'amorce. Sans cela, deux points d'entree d'un meme reseau
+            // passeraient leur temps a se rappeler l'un l'autre.
+            "--sans-amorces" => {
+                sans_amorces = true;
+                i += 1;
             }
             "--rpc" if i + 1 < args.len() => {
                 rpc = Some(args[i + 1].clone());
@@ -1738,6 +1904,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 index_adresses = true;
                 i += 1;
             }
+            // Un noeud d'amorcage n'a pas de portefeuille : il faut donc lui
+            // dire de quelle chaine il s'agit. Avec un portefeuille, c'est lui
+            // qui porte la reponse et cette option devient un controle.
+            "--reseau" if i + 1 < args.len() => {
+                reseau_impose = Some(reseau_depuis_nom(&args[i + 1])?);
+                i += 2;
+            }
             autre => return Err(format!("option inconnue : {autre}")),
         }
     }
@@ -1750,7 +1923,26 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         );
     }
 
-    let mut etat = charger(datadir)?;
+    let mut etat = charger_avec(datadir, reseau_impose)?;
+    let sans_portefeuille = etat.sans_portefeuille;
+
+    // --- Ce qu'un noeud sans portefeuille ne fait pas.
+    //
+    // Miner sur une coquille enverrait la subvention a une clef derivee d'une
+    // graine qui n'est ecrite nulle part : la piece serait creee, valide, et
+    // perdue au premier redemarrage. Mieux vaut refuser bruyamment que produire
+    // de la monnaie que personne ne pourra jamais depenser.
+    if sans_portefeuille {
+        if mine {
+            return Err("--mine demande un portefeuille : sans lui, la subvention \
+                        irait a une clef qui mourra avec le processus.\n                          Creez-en un (q21 init testnet), ou retirez --mine."
+                .into());
+        }
+        if rpc_wallet {
+            return Err("--rpc-wallet demande un portefeuille.".into());
+        }
+        println!("  sans portefeuille : aucune methode de portefeuille servie");
+    }
     let reseau = etat.chain.network;
     let hauteur_depart = etat.chain.height();
     etat.chain.set_mining_threads(fils);
@@ -1852,17 +2044,54 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 
     if let Some(a) = &ecoute {
         let local = node
-            .listen(a)
+            .listen(&q21_core::amorce::adresse_d_ecoute(a, reseau))
             .map_err(|e| format!("ecoute impossible : {e}"))?;
         println!("  ecoute sur {local}");
     }
-    for a in &vers {
-        match a.parse() {
-            Ok(sa) => match node.connect(sa) {
-                Ok(_) => println!("  connexion vers {a}"),
-                Err(e) => eprintln!("  echec vers {a} : {e}"),
-            },
-            Err(_) => eprintln!("  adresse illisible : {a}"),
+    // --- Ce vers quoi on tente de sortir.
+    //
+    // Trois sources, dans cet ordre : ce que la ligne de commande demande, le
+    // fichier `amorces.txt` du dossier, puis la liste integree au binaire. Les
+    // deux premieres l'emportent, parce qu'elles viennent de l'exploitant et
+    // que la troisieme vient de moi.
+    let mut cibles: Vec<String> = vers.clone();
+    if !sans_amorces {
+        cibles.extend(q21_core::amorce::amorces_du_dossier(datadir));
+        cibles.extend(
+            q21_core::amorce::amorces_integrees(reseau)
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
+    cibles.dedup();
+    if cibles.is_empty() && ecoute.is_none() {
+        println!(
+            "  aucune amorce : ce noeud ne cherchera personne. Donnez-lui\n               --amorce <hote> ou un fichier amorces.txt dans {}",
+            datadir.display()
+        );
+    }
+    for a in &cibles {
+        match q21_core::amorce::resoudre(a, reseau) {
+            Ok(adresses) => {
+                // Un nom peut rendre plusieurs adresses. On s'arrete a la
+                // premiere qui repond : les autres serviront si celle-ci tombe,
+                // et le carnet les aura retenues.
+                let mut ouverte = false;
+                for sa in &adresses {
+                    match node.connect(*sa) {
+                        Ok(_) => {
+                            println!("  connexion vers {a} ({sa})");
+                            ouverte = true;
+                            break;
+                        }
+                        Err(e) => eprintln!("  echec vers {a} ({sa}) : {e}"),
+                    }
+                }
+                if !ouverte && adresses.len() > 1 {
+                    eprintln!("  {a} : aucune des {} adresses n'a repondu", adresses.len());
+                }
+            }
+            Err(e) => eprintln!("  amorce illisible : {e}"),
         }
     }
     // Carnet d'adresses : ce qui a ete appris lors des sessions precedentes.
@@ -1881,6 +2110,37 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         println!("  minage actif sur {fils_effectifs} fil(s)");
     }
 
+    // --- Le RPC ne sort pas de la machine sans qu'on l'ait dit deux fois.
+    //
+    // Le controle d'en-tete `Host` refuse deja toute requete qui ne se presente
+    // pas comme locale, et le jeton garde chaque methode. Mais lier le service a
+    // une interface publique reste une decision qu'on peut prendre par
+    // distraction — en recopiant l'adresse d'ecoute P2P, par exemple — et ses
+    // consequences ne se voient pas : le service repond, simplement il repond a
+    // tout le monde.
+    //
+    // Sur un serveur d'amorcage, le P2P doit etre joignable et le RPC non. Les
+    // deux options se ressemblent trop pour qu'on laisse la confusion passer en
+    // silence.
+    if let Some(adresse) = &rpc {
+        let local = adresse.starts_with("127.")
+            || adresse.starts_with("localhost:")
+            || adresse.starts_with("[::1]");
+        if !local {
+            if rpc_token.is_none() {
+                return Err(format!(
+                    "refus : --rpc {adresse} sort de la boucle locale et aucun jeton \n                       n'est fourni. Toute machine qui vous atteint pourrait interroger\n                       ce noeud.\n\n                       Restez local :   --rpc 127.0.0.1:21080\n                       Ou exigez un jeton : --rpc-token <secret>"
+                ));
+            }
+            eprintln!(
+                "AVERTISSEMENT : le RPC ecoute sur {adresse}, hors de la boucle locale.\n\
+                 \x20              Le controle d'en-tete Host refusera les requetes qui ne se\n\
+                 \x20              presentent pas comme locales, mais le service est joignable.\n\
+                 \x20              Un noeud d'amorcage n'a aucune raison d'exposer son RPC."
+            );
+        }
+    }
+
     let _serveur = if let Some(adresse) = &rpc {
         // Toute operation qui modifie le portefeuille est ecrite sur disque
         // immediatement. Une depense qui ne serait consignee qu'en memoire
@@ -1896,11 +2156,15 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             },
             network: reseau,
             index: index.clone(),
-            sur_changement: Some(std::sync::Arc::new(move |w: &Wallet| {
-                if let Err(e) = ecrire_portefeuille(&dossier, w) {
-                    eprintln!("ALERTE : portefeuille non enregistre apres modification : {e}");
-                }
-            })),
+            sur_changement: if sans_portefeuille {
+                None
+            } else {
+                Some(std::sync::Arc::new(move |w: &Wallet| {
+                    if let Err(e) = ecrire_portefeuille(&dossier, w) {
+                        eprintln!("ALERTE : portefeuille non enregistre apres modification : {e}");
+                    }
+                }))
+            },
         };
         // La coquille de l'explorateur est servie sans jeton : elle ne porte
         // aucune donnee, et c'est elle qui demande le jeton a l'utilisateur.
@@ -2053,8 +2317,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
 
     node.shutdown();
-    if let Ok(w) = wallet.lock() {
-        let _ = ecrire_portefeuille(datadir, &w);
+    if !sans_portefeuille {
+        if let Ok(w) = wallet.lock() {
+            let _ = ecrire_portefeuille(datadir, &w);
+        }
     }
     // Le carnet survit a l'arret : sans cela, chaque redemarrage repartirait de
     // l'amorcage, ce qui donne a quiconque controle ce point d'amorcage un

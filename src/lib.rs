@@ -41,6 +41,7 @@
 
 pub mod addr;
 pub mod address;
+pub mod amorce;
 pub mod amount;
 pub mod arret;
 pub mod bech32;
