@@ -2033,7 +2033,36 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         ));
     }
 
-    // 2. Un port libre, si l'on n'en impose pas un.
+    println!("Portefeuille Q21");
+    println!();
+
+    // 2. Le deverrouillage vient AVANT tout le reste.
+    //
+    // Le defaut repare ici : la banniere — l'adresse a ouvrir, « laissez cette
+    // fenetre ouverte » — s'affichait d'abord, puis le noeud demandait la phrase
+    // secrete. L'utilisateur voyait donc un portefeuille en apparence demarre,
+    // suivi d'une ligne nue « Phrase secrete du portefeuille : » sans rien qui
+    // l'annonce. On lui demandait un secret sans lui dire pourquoi, apres lui
+    // avoir dit que tout tournait.
+    //
+    // On lit donc le portefeuille tout de suite. La phrase est retenue pour la
+    // duree du processus, le noeud la retrouvera sans la redemander, et une
+    // phrase fausse echoue ici — avant qu'on ait tire un port, un jeton, ou
+    // ouvert un navigateur sur une page qui ne servirait a rien.
+    let phrase_deja_fournie = std::env::var("Q21_PASSPHRASE").is_ok_and(|p| !p.is_empty());
+    if !phrase_deja_fournie
+        && q21_core::kdf::est_scelle(
+            &std::fs::read(chemin_portefeuille(datadir)).unwrap_or_default(),
+        )
+    {
+        println!("  Ce portefeuille est protege par une phrase secrete.");
+        println!("  Tapez-la puis Entree. Elle ne s'affiche pas pendant la frappe :");
+        println!("  c'est voulu, pour que personne ne la lise par-dessus votre epaule.");
+        println!();
+    }
+    lire_portefeuille(datadir)?;
+
+    // 3. Un port libre, si l'on n'en impose pas un.
     let port = if port != 0 {
         port
     } else {
@@ -2044,7 +2073,7 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
             .port()
     };
 
-    // 3. Un jeton tire du generateur du systeme. Trente-deux octets : il n'est
+    // 4. Un jeton tire du generateur du systeme. Trente-deux octets : il n'est
     //    pas devinable, et il ne sert que le temps de cette execution.
     let brut: [u8; 32] = q21_core::rng::octets()
         .map_err(|_| "generateur d'alea du systeme inaccessible".to_string())?;
@@ -2053,7 +2082,6 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     let adresse = format!("127.0.0.1:{port}");
     let url = format!("http://{adresse}/portefeuille#{jeton}");
 
-    println!("Portefeuille Q21");
     println!();
 
     // --- L'adresse est toujours affichee.
@@ -2097,7 +2125,24 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         });
     }
     println!("  Cette fenetre fait tourner le portefeuille. Laissez-la ouverte.");
-    println!("  Ctrl-C pour arreter.");
+    println!();
+
+    // --- Comment arreter.
+    //
+    // Ce paragraphe ne disait qu'une chose : « Ctrl-C pour arreter ». C'est
+    // exact, et c'etait insuffisant. Sur Windows, un Ctrl-C recu pendant un
+    // fichier `.bat` fait poser par l'interpreteur sa propre question —
+    // « Terminer le programme de commandes (O/N) ? » — a laquelle les deux
+    // reponses ferment la fenetre. Le premier utilisateur l'a lue comme une
+    // panne, et a cesse d'oser arreter son portefeuille.
+    //
+    // On donne donc d'abord la voie qui ne pose aucune question : le bouton.
+    println!("  Pour arreter, au choix :");
+    println!("    - le bouton « Fermer le portefeuille », onglet Informations ;");
+    println!("    - fermer cette fenetre ;");
+    println!("    - Ctrl-C ici. Windows demande alors « Terminer le programme");
+    println!("      de commandes (O/N) ? » : repondez O. Ce n'est pas une erreur,");
+    println!("      tout est deja enregistre quand cette question s'affiche.");
     println!();
 
     // 5. Le noeud, avec les methodes de portefeuille et le jeton.

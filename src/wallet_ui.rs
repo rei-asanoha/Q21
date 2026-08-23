@@ -352,6 +352,27 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
   </div>
   <h2>Chaîne</h2>
   <div class="grille" id="tuiles-chaine"></div>
+
+  <h2>Fermer</h2>
+  <div class="note">
+    <p>
+      Ce portefeuille est servi par un nœud qui tourne dans la fenêtre noire
+      ouverte par le lanceur. Ce bouton lui demande de s'arrêter proprement&nbsp;:
+      il écrit le réservoir de transactions en attente, l'instantané de l'état et
+      le portefeuille, puis rend la main. La fenêtre se referme d'elle-même.
+    </p>
+    <p>
+      C'est la façon recommandée d'arrêter. Fermer la fenêtre noire fonctionne
+      aussi. <strong>Ctrl-C</strong> fonctionne également, mais Windows pose
+      alors sa propre question — «&nbsp;Terminer le programme de commandes
+      (O/N)&nbsp;?&nbsp;»&nbsp;: répondez <strong>O</strong>, tout est déjà
+      enregistré à ce moment-là.
+    </p>
+    <div class="boutons">
+      <button type="button" class="action" id="bouton-fermer" style="margin-top:0">Fermer le portefeuille</button>
+    </div>
+    <p id="note-fermer" class="aide"></p>
+  </div>
 </section>
 
 <footer>
@@ -924,9 +945,66 @@ async function infos(){
 }
 
 // ---------------------------------------------------------------------------
+// Fermer le portefeuille
+//
+// Le seul moyen d'arreter etait Ctrl-C dans la fenetre noire. Sur Windows,
+// l'interpreteur pose alors sa propre question — « Terminer le programme de
+// commandes (O/N) ? » — a laquelle les deux reponses ferment la fenetre. Le
+// premier utilisateur l'a lue comme une panne. Une application se ferme par un
+// bouton ; celui-ci demande au noeud de s'arreter proprement.
+//
+// Deux clics, pas un : arreter le portefeuille pendant qu'on regarde son solde
+// n'est pas grave, mais le faire par megarde au milieu d'un envoi non confirme
+// oblige a relancer. La confirmation coute une seconde et se retire toute
+// seule au bout de cinq.
+// ---------------------------------------------------------------------------
+
+let battement = setInterval(rafraichir, 6000);
+let confirmeFermeture = false;
+let minuterieFermeture = null;
+
+function noteFermeture(texte, classe){
+  const n = document.getElementById("note-fermer");
+  n.className = "aide" + (classe ? " " + classe : "");
+  n.textContent = texte;
+}
+
+document.getElementById("bouton-fermer").addEventListener("click", async () => {
+  const b = document.getElementById("bouton-fermer");
+  if (!confirmeFermeture){
+    confirmeFermeture = true;
+    b.textContent = "Confirmer la fermeture";
+    noteFermeture("Cliquez une seconde fois pour arrêter le portefeuille.");
+    if (minuterieFermeture) clearTimeout(minuterieFermeture);
+    minuterieFermeture = setTimeout(() => {
+      confirmeFermeture = false;
+      b.textContent = "Fermer le portefeuille";
+      noteFermeture("");
+    }, 5000);
+    return;
+  }
+  if (minuterieFermeture) clearTimeout(minuterieFermeture);
+  b.disabled = true;
+  b.textContent = "Fermeture…";
+  try{
+    await appel("arreter");
+  }catch(e){
+    // Le noeud peut couper la connexion avant de repondre : c'est justement ce
+    // qu'on lui a demande de faire. On ne presente donc pas cela comme un
+    // echec — on le presente comme ce que c'est, une fermeture en cours.
+  }
+  // Plus rien a interroger : sans cela, la page afficherait « Nœud injoignable »
+  // trois secondes apres une fermeture reussie.
+  clearInterval(battement);
+  oublierJeton();
+  document.getElementById("erreur").hidden = true;
+  b.textContent = "Portefeuille fermé";
+  noteFermeture(
+    "Le nœud a écrit son état et s'est arrêté. Vous pouvez fermer cet onglet ; " +
+    "la fenêtre noire se referme d'elle-même.", "ok");
+});
 
 rafraichir();
-setInterval(rafraichir, 6000);
 </script>
 </body>
 </html>
@@ -1368,6 +1446,43 @@ mod tests {
                 "onglet manquant : {v}"
             );
         }
+    }
+
+    /// Le portefeuille se ferme par un bouton, pas seulement par Ctrl-C.
+    ///
+    /// Le defaut verrouille ici : le seul arret possible etait Ctrl-C dans la
+    /// fenetre du lanceur. Sur Windows, l'interpreteur pose alors sa propre
+    /// question — « Terminer le programme de commandes (O/N) ? » — que le
+    /// premier utilisateur a lue comme une panne, au point de ne plus oser
+    /// arreter son portefeuille.
+    #[test]
+    fn le_portefeuille_se_ferme_par_un_bouton() {
+        assert!(
+            PAGE.contains(r#"id="bouton-fermer""#),
+            "aucun bouton de fermeture dans la page"
+        );
+        let s = script();
+        assert!(
+            s.contains(r#"appel("arreter")"#),
+            "le bouton n'appelle pas la methode d'arret"
+        );
+        // Sans cela, la page afficherait « Nœud injoignable » quelques secondes
+        // apres une fermeture reussie : le battement continuerait d'interroger
+        // un noeud qu'on vient soi-meme d'eteindre.
+        assert!(
+            s.contains("clearInterval(battement)"),
+            "le battement de rafraichissement survit a la fermeture"
+        );
+        // Deux clics : arreter par megarde oblige a tout relancer.
+        assert!(
+            s.contains("confirmeFermeture"),
+            "la fermeture se fait en un seul clic"
+        );
+        // La question de Windows est expliquee la ou elle se pose.
+        assert!(
+            PAGE.contains("Terminer le programme de commandes"),
+            "la page n'explique pas la question que pose Windows apres un Ctrl-C"
+        );
     }
 
     /// La page est utilisable sur telephone avant de l'etre ailleurs.

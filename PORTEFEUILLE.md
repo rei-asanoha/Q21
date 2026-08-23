@@ -54,8 +54,11 @@ navigateur le garde pour lui. La page le lit, l'efface aussitôt de la barre
 d'adresse, et l'envoie ensuite en `Authorization`. Il ne laisse aucune trace
 ailleurs que dans la mémoire de l'onglet.
 
-Ni `localStorage`, ni `sessionStorage`, ni cookie. Le jeton vit dans une variable
-JavaScript et meurt avec l'onglet.
+Ni `localStorage`, ni cookie : les deux survivent à la fermeture du navigateur, et
+un jeton qui survit à la session qu'il ouvrait est un jeton de trop. Le jeton vit
+dans une variable JavaScript, doublée de `sessionStorage` — cloisonné par port,
+effacé à la fermeture de l'onglet — pour la seule raison qu'un `F5` ne doit pas
+couper l'utilisateur de son propre portefeuille.
 
 ---
 
@@ -77,7 +80,7 @@ Ces cinq verrous ont été éprouvés par 42 attaques réelles, en TCP, dans
 ## Ce qu'un premier utilisateur a trouvé
 
 Le portefeuille a été mis entre les mains de quelqu'un qui ne l'avait pas écrit.
-En une heure, sept défauts sont sortis. Aucun n'aurait été trouvé autrement.
+En quelques heures, onze défauts sont sortis. Aucun n'aurait été trouvé autrement.
 
 | # | Ce qui clochait | Correction |
 |---|---|---|
@@ -88,8 +91,31 @@ En une heure, sept défauts sont sortis. Aucun n'aurait été trouvé autrement.
 | 5 | Rafraîchir la page cassait la session | Le jeton survit dans `sessionStorage`, cloisonné par port |
 | 6 | Les lignes d'état noyaient l'adresse à ouvrir | Mode silencieux dans le portefeuille |
 | 7 | L'historique n'affichait pas la somme sortie | Colonne **Sorti**, et la page ne contredit plus le nœud |
+| 8 | `q21.exe` double-cliqué affichait l'aide et se refermait | Sans argument, `q21` ouvre le portefeuille |
+| 9 | L'adresse n'était affichée que si le navigateur n'était pas ouvert | Elle l'est toujours |
+| 10 | La phrase secrète était demandée **après** la bannière, sans rien qui l'annonce | Le déverrouillage passe avant tout le reste |
+| 11 | Le seul arrêt possible était Ctrl-C, et Windows posait alors une question qui ressemblait à une panne | Bouton **Fermer le portefeuille**, méthode `arreter` |
 
-Le deuxième est le plus instructif. La persistance du réservoir avait été écrite
+Le onzième mérite qu'on s'y arrête, parce qu'il n'est pas dans le code.
+
+Un `Ctrl-C` reçu pendant un fichier `.bat` fait poser par l'interpréteur de
+commandes sa propre question — « Terminer le programme de commandes (O/N) ? » —
+à laquelle les deux réponses ferment la fenêtre. Elle arrive **avant** que le
+script ait la main : aucune ligne du fichier ne peut l'empêcher.
+
+Le gestionnaire d'arrêt faisait son travail. Les lignes « Arret demande.
+Ecriture en cours... » puis « Arret. Hauteur finale » le prouvaient, à l'écran,
+juste au-dessus. Mais l'utilisateur a lu la question de Windows comme une
+erreur, et a cessé d'oser arrêter son portefeuille. Un logiciel dont on n'ose
+plus se servir est cassé, quoi qu'en dise le code.
+
+La correction n'est donc pas de faire taire Windows — c'est impossible — mais de
+ne plus passer par là : une application se ferme par un bouton. Il lève le même
+drapeau que `Ctrl-C`, la boucle principale le voit au tour suivant, écrit et rend
+la main. Rien n'est interrompu, l'interpréteur n'a aucune question à poser.
+
+Le deuxième est le plus instructif sur le plan technique. La persistance du
+réservoir avait été écrite
 **et testée** — mais uniquement sur le chemin d'arrêt des épreuves, l'expiration
 de `--seconds`. Personne n'arrête un logiciel ainsi : on fait Ctrl-C. Sur ce
 chemin-là, rien n'était écrit, et la correction n'aurait servi à rien.

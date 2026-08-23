@@ -428,6 +428,10 @@ impl RpcContext {
                 "[portefeuille] Chiffres exacts d'un envoi, pieces reellement selectionnees",
             ),
             ("getsyncstatus", "Etat de la synchronisation avec le reseau"),
+            (
+                "arreter",
+                "[portefeuille] Demande l'arret propre du noeud qui sert cette page",
+            ),
         ]
     }
 
@@ -463,6 +467,7 @@ impl RpcContext {
             "estimatefee" => self.estimatefee(params),
             "preparersend" => self.preparersend(params),
             "getsyncstatus" => Ok(self.getsyncstatus()),
+            "arreter" => self.arreter(),
             autre => Err(erreur(
                 ERR_METHODE,
                 &format!("methode inconnue : {autre}. Essayez listmethods."),
@@ -791,6 +796,44 @@ impl RpcContext {
                  fonds et doivent etre demandees explicitement au demarrage.",
             )
         })
+    }
+
+    /// Demande l'arret propre du noeud qui sert cette page.
+    ///
+    /// # Le defaut que cette methode repare
+    ///
+    /// Le seul moyen d'arreter le portefeuille etait Ctrl-C dans la fenetre
+    /// noire. Sur Windows, un Ctrl-C recu pendant un fichier `.bat` fait poser
+    /// par l'interpreteur sa propre question — « Terminer le programme de
+    /// commandes (O/N) ? » — a laquelle les deux reponses ferment la fenetre.
+    /// Le premier utilisateur a lu cela comme une panne. Ce n'en etait pas une :
+    /// l'ecriture avait deja eu lieu. Mais on ne peut pas demander a quelqu'un
+    /// de faire confiance a un message qui ressemble a une erreur.
+    ///
+    /// Une application se ferme par un bouton. Celui-ci leve le meme drapeau
+    /// que Ctrl-C, la boucle principale le voit au tour suivant, ecrit ce
+    /// qu'elle doit ecrire et rend la main : l'interpreteur n'a alors aucune
+    /// question a poser, puisque rien n'a ete interrompu.
+    ///
+    /// # Pourquoi elle est reservee au mode portefeuille
+    ///
+    /// Un noeud public expose des methodes de lecture a qui les demande.
+    /// « Arrete-toi » n'en est pas une. Elle passe donc par le meme controle
+    /// que les methodes qui deplacent des fonds : le jeton, et le mode
+    /// portefeuille demande explicitement au demarrage.
+    fn arreter(&self) -> Result<Json, Json> {
+        self.portefeuille()?;
+        crate::arret::demander_arret();
+        Ok(Json::obj()
+            .set("arret", Json::Bool(true))
+            .set(
+                "note",
+                Json::str(
+                    "arret demande : le noeud ecrit son etat puis rend la main, \
+                     en general en moins d'une seconde",
+                ),
+            )
+            .build())
     }
 
     // -----------------------------------------------------------------------
@@ -1632,5 +1675,50 @@ mod tests {
             cumul <= MAX_SUPPLY,
             "le plafond ne doit jamais etre franchi"
         );
+    }
+
+    /// « Arrete-toi » n'est pas une methode de lecture.
+    ///
+    /// Un noeud public repond volontiers a qui demande sa hauteur ; il ne doit
+    /// pas s'eteindre parce qu'on le lui demande. La methode passe donc par le
+    /// meme controle que celles qui deplacent des fonds.
+    #[test]
+    fn arreter_est_refuse_a_un_noeud_sans_portefeuille() {
+        let _v = crate::arret::VERROU_EPREUVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::arret::arret_termine();
+        let c = contexte(false);
+        let r = appel(&c, "arreter", "{}");
+        assert_eq!(
+            r.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
+            Some(ERR_PORTEFEUILLE_DESACTIVE)
+        );
+        assert!(
+            !crate::arret::demande(),
+            "un noeud sans portefeuille a quand meme leve le drapeau d'arret"
+        );
+    }
+
+    /// En mode portefeuille, le bouton leve le meme drapeau que Ctrl-C.
+    ///
+    /// C'est tout ce qu'il fait : la boucle principale le voit au tour suivant
+    /// et fait le travail — reservoir, instantane, carnet, portefeuille — dans
+    /// un contexte normal. Rien n'est ecrit depuis la reponse a une requete.
+    #[test]
+    fn arreter_leve_le_drapeau_en_mode_portefeuille() {
+        let _v = crate::arret::VERROU_EPREUVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::arret::arret_termine();
+        let c = contexte(true);
+        let r = resultat(&c, "arreter", "{}");
+        assert_eq!(r.get("arret"), Some(&Json::Bool(true)));
+        assert!(crate::arret::demande(), "le drapeau d'arret n'est pas leve");
+        // Le drapeau est global au processus : le laisser leve ferait sortir
+        // toute boucle qui le consulte ensuite.
+        crate::arret::arret_termine();
     }
 }
