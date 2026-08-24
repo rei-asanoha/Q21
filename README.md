@@ -364,6 +364,7 @@ PORTEFEUILLE.md  Le portefeuille, et les treize défauts qu'un premier
 EXPLORATEUR.md   L'explorateur, l'index d'adresses, et pourquoi il est
                  facultatif
 RESEAU.md        Rejoindre le réseau d'essai, et tenir un point d'entrée
+LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 
 outils/
   verif-mldsa/   Programme jetable pour découvrir l'API réelle du crate ml-dsa
