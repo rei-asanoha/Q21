@@ -101,15 +101,23 @@ mémoire et dix gigaoctets de disque suffisent pour un réseau d'essai. Une
 adresse IP fixe, et de préférence un **nom** qui pointe dessus : un nom se
 repointe en une minute, une adresse écrite dans un binaire ne se change plus.
 
+> **Pas à pas complet, pour qui n'a jamais administré un serveur :
+> [SERVEUR.md](SERVEUR.md).** Création du compte, clé d'accès, durcissement
+> SSH, pare-feu, service, nom de domaine — treize étapes, avec le détail de ce
+> qu'on doit voir à chaque fois.
+
 ## Installer
 
 ```bash
 # sur le serveur, en tant qu'utilisateur ordinaire
-mkdir -p ~/q21 && cd ~/q21
-# déposez-y le binaire q21 compilé pour Linux
-chmod +x q21
-./q21 genese testnet          # vérifiez l'identifiant
+sudo mv ~/q21 /opt/q21/q21
+sudo chmod +x /opt/q21/q21
+sudo -u q21 /opt/q21/q21 genese testnet    # vérifiez l'identifiant
 ```
+
+> ⚠️ **Le binaire livré est compilé pour x86_64.** Une machine ARM — la gamme
+> CAX de Hetzner, la moins chère — le refuserait avec
+> `cannot execute binary file`. Prenez une CX ou une CPX.
 
 ## Le service qui redémarre seul
 
@@ -125,15 +133,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=q21
-WorkingDirectory=/home/q21/q21
-ExecStart=/home/q21/q21/q21 --datadir /home/q21/q21/donnees \
+WorkingDirectory=/opt/q21
+ExecStart=/opt/q21/q21 --datadir /opt/q21/donnees \
           node --reseau testnet --listen 21121 --sans-amorces
 Restart=always
 RestartSec=10
 # Le nœud n'a besoin d'écrire que dans son dossier de données.
 ProtectSystem=strict
-ReadWritePaths=/home/q21/q21/donnees
-ProtectHome=read-only
+ReadWritePaths=/opt/q21/donnees
+ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
 

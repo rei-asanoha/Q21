@@ -364,6 +364,8 @@ PORTEFEUILLE.md  Le portefeuille, et les treize défauts qu'un premier
 EXPLORATEUR.md   L'explorateur, l'index d'adresses, et pourquoi il est
                  facultatif
 RESEAU.md        Rejoindre le réseau d'essai, et tenir un point d'entrée
+SERVEUR.md       Monter le point d'entrée pas à pas, pour qui n'a jamais
+                 administré un serveur
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 
 outils/
