@@ -63,6 +63,7 @@ jobs:
           cargo test --locked --features mldsa,audit --test audit_persistance
           cargo test --locked --features mldsa,audit --test audit_rpc
           cargo test --locked --features mldsa,audit --test integration
+          cargo test --locked --features mldsa,audit --test audit_arith
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --features mldsa,audit
@@ -75,7 +76,7 @@ jobs:
   # Les constats encore ouverts
   # ---------------------------------------------------------------------------
   #
-  # Trois fichiers d'audit — arithmetique, difficulte, reservoir — signalent
+  # Deux fichiers d'audit — difficulte, reservoir — signalent
   # leurs trouvailles **en echouant**. C'est leur convention : un test qui tombe
   # y decrit un defaut vivant, pas une regression.
   #
@@ -85,7 +86,8 @@ jobs:
   # exactement ce qui reste ouvert.
   #
   # Ils rejoindront les epreuves bloquantes au fur et a mesure des corrections,
-  # comme l'ont fait `audit_persistance` et `audit_rpc`.
+  # comme l'ont fait `audit_persistance`, `audit_rpc`, et maintenant
+  # `audit_arith` — dont les vingt-trois controles passent tous.
   constats:
     name: Constats encore ouverts
     runs-on: ubuntu-latest
@@ -97,7 +99,7 @@ jobs:
       - name: Audits diagnostiques
         continue-on-error: true
         run: |
-          for f in audit_arith audit_difficulte audit_mempool; do
+          for f in audit_difficulte audit_mempool; do
             echo "::group::$f"
             cargo test --locked --features mldsa,audit --no-fail-fast --test "$f" || true
             echo "::endgroup::"

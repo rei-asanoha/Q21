@@ -181,13 +181,17 @@ impl Block {
         let header = BlockHeader::decode(&data[..BlockHeader::SIZE])?;
         let mut r = Reader::new(&data[BlockHeader::SIZE..]);
 
-        let n = r.varint()? as usize;
+        // Chaque transaction est precedee de sa longueur et ne peut pas
+        // occuper moins de dix octets. On sous-estime volontairement : un
+        // minimum trop grand ferait refuser des donnees valides, un minimum
+        // trop petit ne fait qu'affaiblir le controle.
+        let n = r.compte(10)?;
         let mut transactions = Vec::with_capacity(n.min(4096));
         for _ in 0..n {
             transactions.push(Transaction::decode(r.var_bytes()?)?);
         }
 
-        let nu = r.varint()? as usize;
+        let nu = r.compte(BlockHeader::SIZE)?;
         let mut uncles = Vec::with_capacity(nu.min(64));
         for _ in 0..nu {
             let brut = r.remaining();
