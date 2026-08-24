@@ -422,7 +422,41 @@ Rien qui vole des fonds, rien qui casse le consensus. Ce qui reste est du
 |---|---|---|
 | Cout de saturer le reservoir (t03, t06, t08) | Ressources d'un noeud | Aucun fonds en jeu. Un testnet est l'endroit ou l'on mesure si cela mord vraiment |
 | CPFP casse par l'eviction (t12) | Marche des frais | Une transaction bien payante peut etre evincee avec son parent. Genant, pas dangereux |
-| Malleabilite de message (4 constats) | Encodages non canoniques P2P | Ne touche ni les `txid` ni les identifiants de bloc — aucune signature ne couvre les messages P2P |
+| ~~Malleabilite de message (4 constats)~~ | **Ferme** | Un decodeur refuse desormais ce qu'il ne sait pas representer, au lieu de tronquer |
+| ~~Amplification memoire a la lecture~~ | **Ferme** | 61 115 fois ce qui est recu, ramene a zero. Voir ci-dessous |
+
+### La lecture d'un message n'amplifie plus rien
+
+Le rapport d'allocation etait mesure par `rapport_allocation_par_message`, et
+personne ne l'avait jamais lu : l'outil de mesure lui-meme debordait — il
+soustrayait la taille de blocs liberes pendant la mesure mais alloues avant
+elle, le compteur passait sous zero, et l'addition suivante paniquait.
+
+Une fois l'outil repare, le rapport est sans appel :
+
+```
+inv          :    27 octets envoyes -> pic   1650003 octets alloues (x61111)
+getdata      :    27 octets envoyes -> pic   1650007 octets alloues (x61111)
+headers      :    27 octets envoyes -> pic    320007 octets alloues (x11852)
+block        :   189 octets envoyes -> pic    262149 octets alloues (x1387)
+```
+
+Vingt-sept octets annoncant cinquante mille inventaires — cinquante mille est
+la borne du protocole, le controle passait — faisaient reserver un million six
+cent cinquante mille octets avant d'echouer sur une fin prematuree. Pour le
+prix d'un envoi, et sur soixante-quatre connexions.
+
+Plafonner la reservation par `with_capacity(n.min(1024))` attenuait sans
+fermer : il restait un facteur mille.
+
+La regle qui ferme cela tient en une phrase, et vaut pour tout decodeur :
+**on ne reserve jamais de place pour plus d'elements que le reste de l'entree
+ne peut en contenir.** Chaque element ayant une taille minimale connue sur le
+fil — trente-trois octets pour un inventaire, quarante pour une entree de
+transaction, quarante et un pour une sortie — la comparaison est exacte et ne
+coute rien.
+
+Apres correction, le pire rapport de tous les messages est **zero**.
 
 ## Le niveau de securite retenu : ML-DSA-87
 

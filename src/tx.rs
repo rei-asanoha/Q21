@@ -138,7 +138,11 @@ impl Transaction {
         let mut r = Reader::new(data);
         let version = r.u32()?;
 
-        let n_in = r.varint()? as usize;
+        // Une entree occupe au minimum quarante octets avant son temoin :
+        // trente-deux pour l'identifiant, quatre pour l'indice, quatre pour la
+        // sequence. Annoncer plus d'entrees que le reste ne peut en porter est
+        // refuse avant toute reservation.
+        let n_in = r.compte(40)?;
         let mut prev: Vec<(OutPoint, u32)> = Vec::with_capacity(n_in.min(1024));
         for _ in 0..n_in {
             let txid = Hash256(r.array32()?);
@@ -147,7 +151,9 @@ impl Transaction {
             prev.push((OutPoint { txid, index }, sequence));
         }
 
-        let n_out = r.varint()? as usize;
+        // Une sortie occupe exactement quarante et un octets : huit de
+        // montant, un de schema, trente-deux d'empreinte.
+        let n_out = r.compte(41)?;
         let mut outputs = Vec::with_capacity(n_out.min(1024));
         for _ in 0..n_out {
             let value = Amount::from_units(r.u64()?);

@@ -261,10 +261,39 @@ impl Message {
         let mut r = Reader::new(data);
 
         /// Lit une longueur en la bornant avant toute allocation.
-        fn borne(r: &mut Reader<'_>, max: usize) -> Result<usize, WireError> {
+        ///
+        /// # Le defaut que `minimum` repare
+        ///
+        /// Borner par le maximum du protocole ne suffisait pas. Une trame de
+        /// vingt-sept octets annoncant cinquante mille inventaires passait le
+        /// controle — cinquante mille est la borne — et faisait reserver un
+        /// million six cent cinquante mille octets, avant d'echouer sur une fin
+        /// prematuree. Soit **soixante et un mille fois** ce qui avait ete
+        /// recu, pour le prix d'un `send()`.
+        ///
+        /// Le rapport a ete mesure, pas suppose : voir `rapport_allocation_par_message`
+        /// dans `tests/audit_arith.rs`, qui l'imprime message par message.
+        ///
+        /// La regle qui ferme cela tient en une phrase : **on ne reserve jamais
+        /// de place pour plus d'elements que le reste de la trame ne peut en
+        /// contenir.** Chaque element ayant une taille minimale connue, la
+        /// comparaison est exacte et ne coute rien.
+        ///
+        /// `minimum` est le nombre d'octets qu'un element ne peut pas ne pas
+        /// occuper. Zero signifie « inconnu » et desactive le controle — a
+        /// n'employer que si aucune borne inferieure n'existe.
+        fn borne_avec(r: &mut Reader<'_>, max: usize, minimum: usize) -> Result<usize, WireError> {
             let n = r.varint()? as usize;
             if n > max {
                 return Err(WireError::TropDElements { max, recu: n });
+            }
+            if let Some(tenable) = r.remaining().checked_div(minimum) {
+                if n > tenable {
+                    return Err(WireError::TropDElements {
+                        max: tenable,
+                        recu: n,
+                    });
+                }
             }
             Ok(n)
         }
@@ -311,7 +340,7 @@ impl Message {
                 Message::Pong(n)
             }
             "getheaders" => {
-                let n = borne(&mut r, MAX_LOCATOR)?;
+                let n = borne_avec(&mut r, MAX_LOCATOR, 32)?;
                 let mut locator = Vec::with_capacity(n);
                 for _ in 0..n {
                     locator.push(Hash256(r.array32()?));
@@ -321,7 +350,7 @@ impl Message {
                 Message::GetHeaders { locator, stop }
             }
             "headers" => {
-                let n = borne(&mut r, MAX_HEADERS)?;
+                let n = borne_avec(&mut r, MAX_HEADERS, BlockHeader::SIZE)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     let mut buf = [0u8; BlockHeader::SIZE];
@@ -334,7 +363,7 @@ impl Message {
                 Message::Headers(v)
             }
             "inv" | "getdata" => {
-                let n = borne(&mut r, MAX_INV)?;
+                let n = borne_avec(&mut r, MAX_INV, 33)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     let brut = r.u8()?;
@@ -361,17 +390,28 @@ impl Message {
             "cmpctblock" => Message::CmpctBlock(Box::new(CompactBlock::decode(data)?)),
             "getblocktxn" => {
                 let block = Hash256(r.array32()?);
-                let n = borne(&mut r, MAX_BLOCK_TXN)?;
+                let n = borne_avec(&mut r, MAX_BLOCK_TXN, 1)?;
                 let mut indices = Vec::with_capacity(n);
                 for _ in 0..n {
-                    indices.push(r.varint()? as u32);
+                    // Meme regle que pour le port : un indice qui ne tient pas
+                    // sur trente-deux bits n'est pas ramene a zero en silence.
+                    // Le ramener a zero ferait servir la transaction 0 a qui
+                    // demande la 2^32-ieme — une reponse fausse, pas seulement
+                    // un encodage redondant.
+                    let brut = r.varint()?;
+                    if brut > u32::MAX as u64 {
+                        return Err(WireError::ContenuInvalide(
+                            "indice hors des trente-deux bits : encodage non canonique",
+                        ));
+                    }
+                    indices.push(brut as u32);
                 }
                 r.expect_end()?;
                 Message::GetBlockTxn { block, indices }
             }
             "blocktxn" => {
                 let block = Hash256(r.array32()?);
-                let n = borne(&mut r, MAX_BLOCK_TXN)?;
+                let n = borne_avec(&mut r, MAX_BLOCK_TXN, 1)?;
                 let mut txs = Vec::with_capacity(n.min(1024));
                 for _ in 0..n {
                     let brut = r.var_bytes()?;
@@ -384,14 +424,29 @@ impl Message {
                 Message::BlockTxn { block, txs }
             }
             "addr" => {
-                let n = borne(&mut r, MAX_ADDR)?;
+                let n = borne_avec(&mut r, MAX_ADDR, 16)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     let mut ip = [0u8; 4];
                     for o in ip.iter_mut() {
                         *o = r.u8()?;
                     }
-                    let port = r.u32()? as u16;
+                    // --- Un decodeur refuse ce qu'il ne sait pas representer.
+                    //
+                    // Le port etait ecrit sur trente-deux bits et relu tronque
+                    // a seize : soixante-cinq mille cinq cent trente-six
+                    // trames distinctes decodaient vers la meme adresse. Rien
+                    // n'y volait de fonds — aucune signature ne couvre les
+                    // messages P2P — mais un decodeur qui tronque en silence
+                    // est un decodeur qui ment sur ce qu'il a lu, et deux
+                    // octets differents devenaient indistinguables.
+                    let port_brut = r.u32()?;
+                    if port_brut > u16::MAX as u32 {
+                        return Err(WireError::ContenuInvalide(
+                            "port hors des seize bits : encodage non canonique",
+                        ));
+                    }
+                    let port = port_brut as u16;
                     let last_seen = r.u64()?;
                     v.push(NetAddr {
                         ip,

@@ -112,6 +112,41 @@ impl<'a> Reader<'a> {
         Reader { data, pos: 0 }
     }
 
+    /// Lit un compte d'elements, en refusant ce que la suite ne peut contenir.
+    ///
+    /// # Le principe
+    ///
+    /// **On ne reserve jamais de place pour plus d'elements que le reste de
+    /// l'entree ne peut en contenir.** Chaque element ayant une taille
+    /// minimale connue sur le fil, la comparaison est exacte et gratuite.
+    ///
+    /// # Ce que cela ferme
+    ///
+    /// Sans ce controle, une trame de vingt-sept octets annoncant cinquante
+    /// mille elements faisait reserver un million six cent cinquante mille
+    /// octets avant d'echouer sur une fin prematuree : **soixante et un mille
+    /// fois** ce qui avait ete recu, pour le prix d'un envoi. Plafonner la
+    /// reservation — `with_capacity(n.min(1024))` — attenuait sans fermer :
+    /// il restait un facteur mille.
+    ///
+    /// Le rapport a ete mesure message par message, pas suppose : voir
+    /// `rapport_allocation_par_message` dans `tests/audit_arith.rs`.
+    ///
+    /// `minimum` est le nombre d'octets qu'un element ne peut pas ne pas
+    /// occuper. Le sous-estimer affaiblit le controle ; le surestimer ferait
+    /// refuser des donnees valides. Dans le doute, on sous-estime.
+    pub fn compte(&mut self, minimum: usize) -> Result<usize, ReadError> {
+        let n = self.varint()? as usize;
+        // `checked_div` rend None quand `minimum` vaut zero, ce qui desactive
+        // le controle — c'est exactement la convention voulue.
+        if let Some(tenable) = self.remaining().checked_div(minimum) {
+            if n > tenable {
+                return Err(ReadError::ValeurInvalide);
+            }
+        }
+        Ok(n)
+    }
+
     pub fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }

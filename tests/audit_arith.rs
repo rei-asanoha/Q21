@@ -34,14 +34,28 @@ unsafe impl GlobalAlloc for Compteur {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if ACTIF.load(Ordering::Relaxed) == 1 {
             ALLOUE.fetch_add(l.size(), Ordering::Relaxed);
-            let v = VIVANT.fetch_add(l.size(), Ordering::Relaxed) + l.size();
+            // --- L'outil de mesure debordait, pas le produit.
+            //
+            // `dealloc` soustrait la taille de tout bloc libere pendant la
+            // mesure — y compris ceux alloues **avant** qu'elle ne commence.
+            // Le compteur passait alors sous zero, repartait a l'autre bout de
+            // l'intervalle, et l'addition suivante debordait. Le rapport
+            // d'allocation n'a jamais pu etre lu.
+            //
+            // On sature aux deux bouts : la mesure devient approximative sur
+            // ses bords, ce qu'un diagnostic peut se permettre — paniquer, non.
+            let v = VIVANT
+                .fetch_add(l.size(), Ordering::Relaxed)
+                .saturating_add(l.size());
             PIC.fetch_max(v, Ordering::Relaxed);
         }
         System.alloc(l)
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         if ACTIF.load(Ordering::Relaxed) == 1 {
-            VIVANT.fetch_sub(l.size(), Ordering::Relaxed);
+            let _ = VIVANT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(l.size()))
+            });
         }
         System.dealloc(p, l)
     }
@@ -198,22 +212,52 @@ fn siphash_vecteurs_officiels() {
         assert_eq!(siphash24(k0, k1, &msg), *attendu, "longueur {len}");
     }
     // Vecteur long (longueur 63), qui exerce le compteur de longueur mod 256.
+    //
+    // --- La constante etait ecrite a l'envers.
+    //
+    // Ce controle etait rouge depuis toujours, et l'implementation n'y etait
+    // pour rien : 0x724506eb4c328a95 est exactement 0x958a324ceb064572 lu
+    // octet par octet dans l'autre sens. L'implementation de reference publie
+    // ses vecteurs sous forme de tableaux d'octets, en petit-boutien ; celui-ci
+    // a ete recopie comme s'il s'agissait d'un entier gros-boutien. Les seize
+    // premiers, eux, avaient ete pris correctement.
+    //
+    // Verifie contre une implementation independante de SipHash-2-4, elle-meme
+    // controlee sur les seize vecteurs ci-dessus.
     let msg: Vec<u8> = (0..63u8).collect();
-    assert_eq!(siphash24(k0, k1, &msg), 0x724506eb4c328a95, "longueur 63");
+    assert_eq!(
+        siphash24(k0, k1, &msg),
+        0x958a_324c_eb06_4572,
+        "longueur 63"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // 7. Bech32m : vecteurs officiels BIP-350
 // ---------------------------------------------------------------------------
 
+/// Vecteurs valides de BIP-350.
+///
+/// # Deux vecteurs etaient mal recopies
+///
+/// Ce controle etait rouge, et l'implementation n'y etait pour rien.
+///
+/// - `abcdef1…zm3wf7` : la somme de controle etait fausse. La bonne est
+///   `zd3ryx`, derivee d'une implementation independante — elle-meme validee
+///   en reproduisant a l'identique le vecteur bech32 de BIP-173
+///   `abcdef1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw`.
+/// - La chaine longue avait perdu deux caracteres a la transcription : elle
+///   faisait 88 caracteres au lieu de 90, qui est precisement la longueur
+///   maximale que ce vecteur existe pour eprouver.
+///
+/// La chaine de 90 caracteres est traitee a part : voir l'epreuve suivante.
 #[test]
 fn bech32m_vecteurs_valides_bip350() {
     let valides = [
         "A1LQFN3A",
         "a1lqfn3a",
         "an83characterlonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11sg7hg6",
-        "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzm3wf7",
-        "11llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllludsr8",
+        "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx",
         "split1checkupstagehandshakeupstreamerranterredcaperredlc445v",
         "?1v759aa",
     ];
@@ -223,6 +267,40 @@ fn bech32m_vecteurs_valides_bip350() {
             "vecteur BIP-350 valide refuse : {v} -> {:?}",
             bech32::decode(v)
         );
+    }
+}
+
+/// Une charge dont le rembourrage n'est pas nul est refusee — mais pas pour la
+/// somme de controle.
+///
+/// # La distinction qui compte
+///
+/// `decode` n'est pas un decodeur bech32m generique : c'est celui d'un format
+/// d'adresse, et il exige en plus que la charge se convertisse en octets
+/// entiers, avec un rembourrage nul. C'est la regle de BIP-173, et elle est
+/// juste.
+///
+/// Le vecteur long de BIP-350 porte quatre-vingt-deux groupes de cinq bits,
+/// soit 410 bits : cinquante et un octets et deux bits qui restent, tous a un.
+/// Il est donc legitimement refuse.
+///
+/// Ce qui doit rester vrai, et que cette epreuve verrouille : **le refus ne
+/// doit jamais venir de la somme de controle.** Si c'etait le cas, notre
+/// bech32m ne serait pas celui de tout le monde, et une adresse Q21 ne serait
+/// pas verifiable par un outil tiers.
+#[test]
+fn une_charge_mal_rembourree_est_refusee_sans_mettre_en_cause_la_somme_de_controle() {
+    let long_90 = "11llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllludsr8";
+    assert_eq!(
+        long_90.len(),
+        90,
+        "ce vecteur existe pour eprouver la longueur maximale"
+    );
+    match bech32::decode(long_90) {
+        Err(bech32::Bech32Error::RembourrageInvalide) => {}
+        autre => panic!(
+            "attendu un refus de rembourrage, obtenu {autre:?}.\n               Un refus pour somme de controle signifierait que notre bech32m \n               n'est pas celui de BIP-350."
+        ),
     }
 }
 
@@ -445,8 +523,18 @@ fn frame_brut(cmd: &[u8], charge: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Le port d'une NetAddr est ecrit sur 32 bits et relu tronque a 16.
-/// 65 536 encodages distincts donnent donc la meme adresse.
+/// Un port hors des seize bits est refuse, non tronque.
+///
+/// # Ce que ce controle affirmait, et ce qu'il affirme maintenant
+///
+/// Il a ete ecrit pour **demontrer** un defaut : le port etait ecrit sur
+/// trente-deux bits et relu tronque a seize, si bien que 65 536 trames
+/// distinctes decodaient vers la meme adresse. Il exigeait donc que les deux
+/// trames se decodent, et constatait qu'elles donnaient le meme message.
+///
+/// Le defaut etant corrige, la bonne exigence s'inverse : la trame non
+/// canonique doit etre **refusee**. C'est la meme propriete — deux octets
+/// differents ne doivent pas devenir indistinguables — enoncee du bon cote.
 #[test]
 fn addr_port_encodage_non_canonique() {
     let mut w = Writer::new();
@@ -464,18 +552,22 @@ fn addr_port_encodage_non_canonique() {
     let b = frame_brut(b"addr", w2.finish().as_slice());
 
     assert_ne!(a, b, "les deux trames doivent differer sur le fil");
-    let ma = Message::parse(&a, NETWORK_MAGIC_TESTNET);
-    let mb = Message::parse(&b, NETWORK_MAGIC_TESTNET);
-    match (ma, mb) {
-        (Ok((x, _)), Ok((y, _))) => assert_ne!(
-            x, y,
-            "MALLEABILITE : deux trames differentes decodent vers le meme message"
-        ),
-        (x, y) => panic!("au moins une trame doit se decoder : {x:?} {y:?}"),
-    }
+    assert!(
+        Message::parse(&a, NETWORK_MAGIC_TESTNET).is_err(),
+        "MALLEABILITE : un port hors des seize bits a ete accepte et tronque"
+    );
+    assert!(
+        Message::parse(&b, NETWORK_MAGIC_TESTNET).is_ok(),
+        "la trame canonique doit rester acceptee"
+    );
 }
 
-/// Les indices de `getblocktxn` sont des varints u64 tronques en u32.
+/// Un indice de `getblocktxn` hors des trente-deux bits est refuse.
+///
+/// Comme pour le port, ce controle demontrait le defaut ; il verrouille
+/// maintenant sa correction. Tronquer etait ici pire qu'un encodage
+/// redondant : l'indice 2^32 devenait zero, et le pair qui demandait la
+/// 2^32-ieme transaction d'un bloc recevait la premiere.
 #[test]
 fn getblocktxn_indice_encodage_non_canonique() {
     let mut w = Writer::new();
@@ -491,15 +583,14 @@ fn getblocktxn_indice_encodage_non_canonique() {
     let b = frame_brut(b"getblocktxn", w2.finish().as_slice());
 
     assert_ne!(a, b);
-    let ma = Message::parse(&a, NETWORK_MAGIC_TESTNET);
-    let mb = Message::parse(&b, NETWORK_MAGIC_TESTNET);
-    match (ma, mb) {
-        (Ok((x, _)), Ok((y, _))) => assert_ne!(
-            x, y,
-            "MALLEABILITE : deux encodages d'indice donnent le meme message"
-        ),
-        (x, y) => panic!("les deux trames doivent se decoder : {x:?} {y:?}"),
-    }
+    assert!(
+        Message::parse(&a, NETWORK_MAGIC_TESTNET).is_err(),
+        "MALLEABILITE : un indice hors des trente-deux bits a ete accepte et tronque"
+    );
+    assert!(
+        Message::parse(&b, NETWORK_MAGIC_TESTNET).is_ok(),
+        "la trame canonique doit rester acceptee"
+    );
 }
 
 /// Une transaction decodee doit se reencoder a l'identique.
@@ -585,17 +676,16 @@ fn compact_reencodage_identique() {
     };
 
     let a = construire(0);
-    let b = construire(0x1_0000_0000); // 2^32 -> tronque a 0
+    let b = construire(0x1_0000_0000); // 2^32, qui ne tient pas sur 32 bits
     assert_ne!(a, b);
-    let da = CompactBlock::decode(&a);
-    let db = CompactBlock::decode(&b);
-    match (da, db) {
-        (Ok(x), Ok(y)) => assert_ne!(
-            x, y,
-            "MALLEABILITE : deux cmpctblock differents decodent identiquement"
-        ),
-        (x, y) => panic!("les deux doivent se decoder : {x:?} {y:?}"),
-    }
+    assert!(
+        CompactBlock::decode(&a).is_ok(),
+        "le cmpctblock canonique doit rester accepte"
+    );
+    assert!(
+        CompactBlock::decode(&b).is_err(),
+        "MALLEABILITE : un indice pre-rempli hors des trente-deux bits a ete tronque"
+    );
 }
 
 // ---------------------------------------------------------------------------

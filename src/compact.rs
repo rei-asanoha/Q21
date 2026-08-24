@@ -192,7 +192,10 @@ impl CompactBlock {
 
         let nonce = r.u64()?;
 
-        let n = r.varint()? as usize;
+        // Meme regle que partout ailleurs : on ne reserve pas de place pour
+        // plus d'elements que le reste de la trame ne peut en contenir. Un
+        // identifiant court occupe six octets.
+        let n = r.compte(6)?;
         if n > MAX_TX_PAR_BLOC {
             return Err(CompactError::TropDeTransactions(n));
         }
@@ -205,20 +208,29 @@ impl CompactBlock {
             short_ids.push(u64::from_le_bytes(buf));
         }
 
-        let np = r.varint()? as usize;
+        // Un couple (indice, transaction) : au moins un octet d'indice, un de
+        // longueur, et dix de transaction.
+        let np = r.compte(12)?;
         if np > MAX_TX_PAR_BLOC {
             return Err(CompactError::TropDeTransactions(np));
         }
         let mut prefilled = Vec::with_capacity(np.min(1024));
         for _ in 0..np {
-            let i = r.varint()? as u32;
+            // Un indice de transaction pre-remplie qui ne tient pas sur
+            // trente-deux bits est refuse, non tronque : sans cela, deux
+            // `cmpctblock` differents sur le fil se decodaient a l'identique.
+            let brut = r.varint()?;
+            if brut > u32::MAX as u64 {
+                return Err(CompactError::Lecture(ReadError::ValeurInvalide));
+            }
+            let i = brut as u32;
             let brut = r.var_bytes()?;
             let tx = Transaction::decode(brut)
                 .map_err(|_| CompactError::Lecture(ReadError::ValeurInvalide))?;
             prefilled.push((i, tx));
         }
 
-        let nu = r.varint()? as usize;
+        let nu = r.compte(BlockHeader::SIZE)?;
         if nu > 64 {
             return Err(CompactError::TropDeTransactions(nu));
         }
@@ -585,6 +597,20 @@ mod tests {
         assert_eq!(CompactBlock::decode(&compact.encode()).unwrap(), compact);
     }
 
+    /// Une annonce absurde est refusee, et refusee **avant** d'allouer.
+    ///
+    /// # Pourquoi cette epreuve accepte deux refus differents
+    ///
+    /// Elle exigeait `TropDeTransactions`, c'est-a-dire le depassement de la
+    /// borne du protocole. Deux controles se succedent desormais, et le
+    /// premier est plus fin : on refuse d'emblee tout compte superieur a ce que
+    /// le reste de la trame peut contenir — six octets par identifiant court.
+    /// Quatre milliards d'identifiants annonces dans quarante octets tombent
+    /// donc sur ce controle-la, avec `Lecture(ValeurInvalide)`.
+    ///
+    /// La propriete verrouillee ici n'est pas le nom du refus : c'est qu'il y
+    /// ait refus, et qu'aucune place ne soit reservee pour ce qui a ete
+    /// annonce. Figer la variante reviendrait a interdire de refuser plus tot.
     #[test]
     fn une_annonce_absurde_est_refusee_avant_allocation() {
         let (bloc, _) = bloc_avec_transactions(1);
@@ -593,10 +619,14 @@ mod tests {
         // varint annoncant quatre milliards d'identifiants courts
         brut.push(0xfe);
         brut.extend_from_slice(&u32::MAX.to_le_bytes());
-        assert!(matches!(
-            CompactBlock::decode(&brut),
+        match CompactBlock::decode(&brut) {
             Err(CompactError::TropDeTransactions(_))
-        ));
+            | Err(CompactError::Lecture(ReadError::ValeurInvalide)) => {}
+            autre => panic!(
+                "une annonce de quatre milliards d'identifiants dans quarante \
+                 octets doit etre refusee : {autre:?}"
+            ),
+        }
     }
 
     #[test]
