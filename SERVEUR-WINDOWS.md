@@ -1,15 +1,21 @@
-# Monter le point d'entrée Q21, pas à pas
+# Monter le point d'entrée Q21 depuis Windows, pas à pas
 
 Pour quelqu'un qui n'a jamais administré un serveur. Comptez une heure et demie,
 sans se presser, et environ **4 € par mois** plus une dizaine d'euros par an pour
 le nom de domaine.
 
-Tout se pilote depuis le **Terminal du Mac**. Rien à installer.
+Tout se pilote depuis **PowerShell**, qui est déjà dans Windows. Rien à
+installer — sauf peut-être une case à cocher, et l'étape 0 le vérifie.
 
-> **Vous préférez piloter depuis Windows ?**
-> [SERVEUR-WINDOWS.md](SERVEUR-WINDOWS.md) refait le même chemin de bout en
-> bout, depuis PowerShell. Suivez l'un **ou** l'autre, pas les deux : ce qui
-> change est justement ce qu'on tape sur sa propre machine.
+> **Ce document fait doublon avec [SERVEUR.md](SERVEUR.md), et c'est voulu.**
+> Celui-là pilote depuis le Terminal du Mac, celui-ci depuis PowerShell. Envoyer
+> quelqu'un qui débute vers un document en lui disant « c'est pareil sauf aux
+> étapes 1, 5, 9, 11, 12 et 13 » est la meilleure façon de le faire échouer à
+> l'étape 7, qui est celle où l'on peut se verrouiller dehors. Les deux
+> documents se suivent donc de bout en bout, chacun dans sa langue.
+>
+> Ce qui se passe **sur le serveur** est identique dans les deux : le serveur est
+> un Ubuntu, quelle que soit la machine qui lui parle.
 
 ---
 
@@ -26,22 +32,64 @@ suit :
 2. **Un seul port est ouvert vers le monde**, celui du protocole Q21. Le reste
    est fermé, y compris l'interface de consultation.
 3. **On ne se connecte jamais par mot de passe.** Uniquement par une clé
-   cryptographique qui reste sur votre Mac.
+   cryptographique qui reste sur votre PC.
 
 Un serveur qui ne détient rien et n'expose qu'une porte est un serveur dont la
 compromission ne coûte presque rien. C'est le but.
+
+### Deux fichiers `q21` différents, dès le départ
+
+C'est le piège le plus facile de tout ce document, alors autant le poser tout de
+suite :
+
+| Fichier | Pour quelle machine | Où on le prend |
+|---|---|---|
+| `q21.exe` | **Votre PC** | `q21-windows-x86_64.zip` — vous l'avez déjà |
+| `q21` (sans extension) | **Le serveur** | `q21-linux-x86_64.tar.gz` — étape 9 |
+
+Ils ne sont pas interchangeables. Le second ne s'exécute pas sous Windows, le
+premier ne s'exécute pas sur le serveur. Gardez-les dans deux dossiers séparés.
+
+---
+
+# Étape 0 — Vérifier que PowerShell sait faire du SSH
+
+Cliquez sur **Démarrer**, tapez `PowerShell`, ouvrez **Windows PowerShell**.
+
+Une fenêtre bleue (ou noire) s'ouvre avec une invite qui finit par `>`. Tapez :
+
+```powershell
+ssh -V
+```
+
+**Ce qu'on doit voir** — une ligne du genre :
+
+```
+OpenSSH_for_Windows_9.5p1, LibreSSL 3.8.2
+```
+
+Le numéro n'a pas d'importance. Ce qui compte, c'est que la commande réponde.
+
+> **Si Windows répond `Le terme « ssh » n'est pas reconnu`** : le client OpenSSH
+> n'est pas activé. **Démarrer → Paramètres → Système → Fonctionnalités
+> facultatives → Ajouter une fonctionnalité**, cherchez **Client OpenSSH**,
+> **Installer**. Fermez PowerShell, rouvrez-le, refaites `ssh -V`.
+>
+> Microsoft ne garantit sa présence par défaut que depuis Windows Server 2025 ;
+> sur Windows 10 et 11 il est presque toujours là, mais « presque toujours »
+> n'est pas « toujours », d'où cette vérification.
 
 ---
 
 # Étape 1 — Fabriquer votre clé d'accès
 
-**Sur le Mac, et avant de créer le serveur.** L'ordre compte : le serveur naîtra
+**Sur le PC, et avant de créer le serveur.** L'ordre compte : le serveur naîtra
 avec votre clé déjà installée, et n'aura donc jamais eu de mot de passe à
 deviner.
 
-Ouvrez **Terminal** (⌘ + Espace, tapez `Terminal`).
+Dans PowerShell :
 
-```bash
+```powershell
 ssh-keygen -t ed25519 -C "q21-amorce"
 ```
 
@@ -50,26 +98,51 @@ Trois questions :
 | Question | Quoi répondre |
 |---|---|
 | `Enter file in which to save the key` | **Entrée** — l'emplacement par défaut est le bon |
-| `Enter passphrase` | **Mettez-en une**, et notez-la. Elle protège le fichier si le Mac est volé |
+| `Enter passphrase` | **Mettez-en une**, et notez-la. Elle protège le fichier si le PC est volé |
 | `Enter same passphrase again` | La même |
 
-Vous obtenez deux fichiers :
+Vous obtenez deux fichiers, dans `C:\Users\<votre nom>\.ssh\` :
 
-- `~/.ssh/id_ed25519` — la clé **privée**. Elle ne quitte jamais votre Mac.
-- `~/.ssh/id_ed25519.pub` — la clé **publique**. Celle-là se donne.
+- `id_ed25519` — la clé **privée**. Elle ne quitte jamais votre PC.
+- `id_ed25519.pub` — la clé **publique**. Celle-là se donne.
 
 Affichez la publique pour pouvoir la copier :
 
-```bash
-cat ~/.ssh/id_ed25519.pub
+```powershell
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
 ```
 
 Une ligne apparaît, qui commence par `ssh-ed25519` et finit par `q21-amorce`.
-**Sélectionnez-la entièrement et copiez-la.**
+**Sélectionnez-la entièrement à la souris et faites Ctrl + C.**
 
 > ⚠️ **Ne partagez jamais le fichier sans `.pub`.** C'est la clé privée. Celui
 > qui l'obtient entre chez vous. La publique, elle, peut être affichée partout
 > sans le moindre risque — c'est tout son intérêt.
+
+### Pour ne pas retaper la phrase à chaque connexion
+
+Windows a un équivalent du trousseau du Mac : le service `ssh-agent`. Il est
+arrêté par défaut.
+
+Fermez PowerShell. Rouvrez-le **en tant qu'administrateur** : clic **droit** sur
+**Windows PowerShell** dans le menu Démarrer → **Exécuter en tant
+qu'administrateur**. Puis :
+
+```powershell
+Get-Service ssh-agent | Set-Service -StartupType Automatic
+Start-Service ssh-agent
+```
+
+Refermez cette fenêtre d'administrateur — on n'en a plus besoin, et on
+n'administre pas au quotidien avec les pleins pouvoirs. Rouvrez un PowerShell
+**normal**, et enregistrez la clé :
+
+```powershell
+ssh-add $env:USERPROFILE\.ssh\id_ed25519
+```
+
+Il demande la phrase une dernière fois, puis affiche `Identity added`. C'est fait
+pour de bon : le service la retiendra d'un démarrage à l'autre.
 
 ---
 
@@ -91,10 +164,15 @@ Une fois connecté, créez un **projet** — le bouton **New Project**. Appelez-
 Dans le projet : menu de gauche → **Security** → onglet **SSH Keys** →
 **Add SSH Key**.
 
-Collez la ligne copiée à l'étape 1. Donnez-lui un nom : `mac`.
+Collez la ligne copiée à l'étape 1. Donnez-lui un nom : `pc`.
 
 Hetzner affiche une *empreinte* — une suite de caractères. C'est normal : c'est
 un résumé de votre clé, pas un secret.
+
+> **Si Hetzner refuse la clé** (« invalid public key ») : vous avez probablement
+> copié le contenu du fichier **sans** `.pub`, ou copié une ligne coupée en deux
+> par la largeur de la fenêtre. Refaites le `Get-Content`, élargissez la fenêtre
+> PowerShell, et recopiez tout d'un bloc — de `ssh-ed25519` à `q21-amorce`.
 
 ---
 
@@ -129,7 +207,7 @@ Laissez **IPv4** et **IPv6** cochés.
 
 ### SSH Keys
 
-**Cochez la clé `mac`** déposée à l'étape 3.
+**Cochez la clé `pc`** déposée à l'étape 3.
 
 > C'est ce qui fait qu'aucun mot de passe root ne sera jamais créé ni envoyé par
 > courriel. Si vous oubliez cette case, Hetzner vous enverra un mot de passe par
@@ -148,9 +226,9 @@ Cliquez **Create & Buy now**. Une minute plus tard, la machine existe.
 
 # Étape 5 — La première connexion
 
-Dans le Terminal du Mac :
+Dans PowerShell :
 
-```bash
+```powershell
 ssh root@VOTRE_IP
 ```
 
@@ -162,14 +240,19 @@ ED25519 key fingerprint is SHA256:...
 Are you sure you want to continue connecting (yes/no/[fingerprint])?
 ```
 
-Tapez `yes`, Entrée. C'est votre Mac qui note l'identité du serveur pour ne plus
+Tapez `yes`, Entrée. C'est votre PC qui note l'identité du serveur pour ne plus
 jamais avoir à la redemander — et pour vous prévenir si elle changeait.
 
-**Deuxième question :** la phrase secrète de votre clé. macOS propose de la
-retenir dans le trousseau — acceptez, c'est sans risque.
+**Deuxième question :** la phrase secrète de votre clé — sauf si vous avez fait
+le `ssh-add` de l'étape 1, auquel cas elle ne sera pas demandée.
 
 Vous devez arriver sur une bannière Ubuntu et une invite qui finit par `#`.
 **Vous êtes sur le serveur.**
+
+> À partir d'ici et jusqu'à l'étape 9, **tout ce que vous tapez part sur le
+> serveur**, pas sur votre PC. La fenêtre est la même, la machine ne l'est plus.
+> L'invite vous le rappelle : elle affiche `root@q21-amorce` au lieu du chemin
+> Windows habituel.
 
 ---
 
@@ -229,18 +312,24 @@ C'est l'étape où l'on peut se verrouiller dehors. **Suivez l'ordre exactement.
 
 ### 7.1 — D'abord vérifier que le nouveau compte marche
 
-**Ouvrez une DEUXIÈME fenêtre de Terminal** (⌘ + N). Ne fermez pas la première.
+**Ouvrez une DEUXIÈME fenêtre PowerShell** depuis le menu Démarrer. Ne fermez pas
+la première, qui est encore connectée en `root` : c'est votre filet.
 
 Dans la nouvelle :
 
-```bash
+```powershell
 ssh titi@VOTRE_IP
+```
+
+puis, une fois dessus :
+
+```bash
 sudo -v
 ```
 
-Il demande la phrase de votre clé, puis le mot de passe de `titi` pour `sudo`.
-Si les deux passent, continuez. **Si l'un des deux échoue, arrêtez-vous ici** et
-corrigez depuis la première fenêtre, encore ouverte en `root`.
+Il demande le mot de passe de `titi`. Si la connexion **et** le `sudo` passent,
+continuez. **Si l'un des deux échoue, arrêtez-vous ici** et corrigez depuis la
+première fenêtre, encore ouverte en `root`.
 
 ### 7.2 — Interdire le mot de passe et la connexion root
 
@@ -250,7 +339,9 @@ Dans la deuxième fenêtre, en tant que `titi` :
 sudo nano /etc/ssh/sshd_config.d/99-q21.conf
 ```
 
-Un éditeur de texte s'ouvre, vide. Tapez ces trois lignes :
+`nano` est un éditeur de texte qui tourne **sur le serveur** — ce n'est pas un
+programme Windows, et il s'utilise entièrement au clavier. La fenêtre se vide et
+affiche un fichier vierge. Tapez ces trois lignes :
 
 ```
 PermitRootLogin no
@@ -258,7 +349,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 ```
 
-Pour enregistrer : **Ctrl + O**, Entrée, puis **Ctrl + X**.
+Pour enregistrer : **Ctrl + O**, Entrée, puis **Ctrl + X** pour sortir.
 
 ### 7.3 — Vérifier la syntaxe AVANT de redémarrer
 
@@ -275,17 +366,20 @@ sudo systemctl restart ssh
 
 ### 7.4 — Vérifier depuis une TROISIÈME fenêtre
 
-```bash
+Ouvrez une troisième fenêtre PowerShell :
+
+```powershell
 ssh titi@VOTRE_IP
 ```
 
 Doit passer. Et :
 
-```bash
+```powershell
 ssh root@VOTRE_IP
 ```
 
-Doit être **refusé**. C'est le résultat attendu.
+Doit être **refusé** (`Permission denied`). C'est le résultat attendu, pas une
+panne.
 
 Maintenant seulement, vous pouvez fermer les fenêtres.
 
@@ -327,28 +421,48 @@ En bas, section **Apply to** : cochez le serveur `q21-amorce`. Puis
 
 # Étape 9 — Envoyer le programme
 
-Le fichier se télécharge **sur le Mac** (GitHub demande d'être connecté, ce que
-le serveur ne peut pas faire), puis se pousse vers le serveur.
+Le fichier se télécharge **sur le PC** (GitHub demande d'être connecté, ce que le
+serveur ne peut pas faire), puis se pousse vers le serveur.
 
-### Sur le Mac
+### Sur le PC
 
 Sur `github.com/golboy03/Q21` → **Actions** → **Livraison** → la dernière
 exécution verte → section **Artifacts** → **`q21-linux-x86_64.tar.gz`**.
 
-Décompressez-le (double-clic, éventuellement deux fois). Vous obtenez un dossier
-contenant un fichier `q21`.
+⚠️ **Bien celui-là** : `linux`, pas `windows`. C'est le programme du serveur.
 
-Dans le Terminal, placez-vous dans ce dossier — tapez `cd ` puis glissez le
-dossier depuis le Finder — et envoyez :
+GitHub vous livre un `.zip` qui contient le `.tar.gz`. Deux emballages, donc deux
+décompressions. Dans PowerShell — remplacez le chemin par le vôtre :
 
-```bash
-scp q21 titi@VOTRE_IP:~/
+```powershell
+cd $env:USERPROFILE\Downloads
+Expand-Archive .\q21-linux-x86_64.tar.gz.zip -DestinationPath .\pour-serveur
+cd .\pour-serveur
+tar -xzf .\q21-linux-x86_64.tar.gz
+dir
 ```
+
+`dir` doit lister un fichier nommé **`q21`**, sans extension, d'environ 1,6 Mo.
+
+> `tar` fait partie de Windows depuis Windows 10 (build 17063). Si la commande
+> n'est pas reconnue, décompressez le `.tar.gz` avec 7-Zip — deux fois, comme
+> ci-dessus.
+
+Envoyez-le :
+
+```powershell
+scp .\q21 titi@VOTRE_IP:~/
+```
+
+Une barre de progression s'affiche, puis `100%`.
 
 ### Sur le serveur
 
-```bash
+```powershell
 ssh titi@VOTRE_IP
+```
+
+```bash
 sudo mv ~/q21 /opt/q21/q21
 sudo chown q21:q21 /opt/q21/q21
 sudo chmod +x /opt/q21/q21
@@ -360,9 +474,18 @@ sudo chmod +x /opt/q21/q21
 sudo -u q21 /opt/q21/q21 genese testnet
 ```
 
-L'identifiant affiché doit être **exactement** celui de votre PC et de votre Mac.
-S'il diffère, ou si vous lisez `cannot execute binary file`, arrêtez-vous : dans
-le second cas, vous avez pris une machine ARM (voir l'étape 4).
+L'identifiant affiché doit être **exactement** celui de votre PC. Pour le
+comparer, dans une autre fenêtre PowerShell, dans le dossier de votre
+portefeuille :
+
+```powershell
+.\q21.exe genese testnet
+```
+
+Les deux lignes `identifiant` doivent être identiques, caractère pour caractère.
+Si elles diffèrent, les deux machines ne sont pas sur la même chaîne et aucune
+synchronisation n'y changera rien. Si vous lisez `cannot execute binary file`,
+vous avez pris une machine ARM (voir l'étape 4).
 
 ---
 
@@ -374,7 +497,8 @@ Un point d'entrée qui s'arrête après une coupure n'est pas un point d'entrée
 sudo nano /etc/systemd/system/q21.service
 ```
 
-Collez exactement ceci :
+Collez exactement ceci — dans PowerShell, **le collage se fait par clic droit**,
+pas par Ctrl + V :
 
 ```ini
 [Unit]
@@ -422,7 +546,8 @@ sudo systemctl enable --now q21
 sudo systemctl status q21
 ```
 
-Vous devez lire **`active (running)`** en vert.
+Vous devez lire **`active (running)`** en vert. Appuyez sur **q** pour sortir de
+l'affichage.
 
 ```bash
 sudo journalctl -u q21 -f
@@ -465,23 +590,26 @@ Dans son interface, créez un **enregistrement A** :
 > être **gris** (« DNS only »), pas orange. Le mandataire orange ne relaie que du
 > web, et casserait le protocole Q21 sans le moindre message d'erreur.
 
-### Vérifier, depuis le Mac
+### Vérifier, depuis le PC
 
-```bash
-dig +short amorce.VOTREDOMAINE.fr
+Windows n'a pas `dig`. PowerShell a mieux :
+
+```powershell
+Resolve-DnsName amorce.VOTREDOMAINE.fr -Type A
 ```
 
-Doit afficher votre adresse IP. Comptez quelques minutes de propagation.
+La colonne `IPAddress` doit afficher votre adresse IP. Comptez quelques minutes
+de propagation.
 
 ---
 
 # Étape 12 — Vérifier depuis l'extérieur
 
-C'est le moment de vérité. **Depuis le Mac**, dans le dossier où se trouve votre
-`q21` :
+C'est le moment de vérité. **Depuis le PC**, dans le dossier où se trouve votre
+`q21.exe` — celui de Windows, pas celui du serveur :
 
-```bash
-./q21 --datadir essai-reseau node --reseau testnet --amorce amorce.VOTREDOMAINE.fr
+```powershell
+.\q21.exe --datadir essai-reseau node --reseau testnet --amorce amorce.VOTREDOMAINE.fr
 ```
 
 Vous devez voir :
@@ -496,14 +624,17 @@ puis la ligne d'état afficher `pairs 1`.
 **Votre réseau est ouvert.** N'importe qui, n'importe où, peut désormais entrer
 avec cette seule ligne.
 
+**Ctrl + C** pour arrêter cet essai. Le dossier `essai-reseau` peut être
+supprimé : il ne servait qu'à prouver que la porte s'ouvre de l'extérieur.
+
 ---
 
 # Étape 13 — Y brancher vos deux machines
 
 Sur le **PC**, dans le dossier du portefeuille :
 
-```
-q21 wallet --mine --amorce amorce.VOTREDOMAINE.fr
+```powershell
+.\q21.exe wallet --mine --amorce amorce.VOTREDOMAINE.fr
 ```
 
 Sur le **Mac** :
@@ -519,23 +650,25 @@ n'ont plus besoin d'être sur le même réseau local.
 
 # Surveiller, au quotidien
 
-```bash
+```powershell
 ssh titi@VOTRE_IP
+```
 
+```bash
 sudo systemctl status q21      # est-il vivant ?
 sudo journalctl -u q21 -n 50   # les 50 dernieres lignes
 sudo journalctl -u q21 -f      # regarder en direct
 ```
 
 Pour consulter l'explorateur du serveur sans ouvrir aucun port, ouvrez un
-**tunnel** depuis le Mac :
+**tunnel** depuis le PC :
 
-```bash
+```powershell
 ssh -L 21080:127.0.0.1:21080 titi@VOTRE_IP
 ```
 
-Tant que cette fenêtre reste ouverte, `http://127.0.0.1:21080` sur votre Mac
-atteint le serveur. Rien n'est exposé à personne d'autre.
+Tant que cette fenêtre reste ouverte, `http://127.0.0.1:21080` dans votre
+navigateur atteint le serveur. Rien n'est exposé à personne d'autre.
 
 *(Le service actuel ne sert pas d'interface — il faudrait lui ajouter
 `--rpc 127.0.0.1:21080 --rpc-token <secret>`. À faire seulement si vous en avez
@@ -569,9 +702,12 @@ besoin.)*
 
 | Symptôme | Cause la plus probable |
 |---|---|
+| `Le terme « ssh » n'est pas reconnu` | Client OpenSSH non activé — voir l'étape 0 |
 | `Permission denied (publickey)` | La clé n'a pas été cochée à la création du serveur. Utilisez la **Console** web de Hetzner |
 | `cannot execute binary file` | Machine ARM (gamme CAX). Il faut une CX ou CPX |
+| `q21 : commande introuvable` sur le serveur | Vous avez envoyé le `q21.exe` de Windows. Reprenez l'étape 9 avec l'archive `linux` |
 | `Connection refused` depuis l'extérieur | Le port 21121 n'est pas ouvert dans le pare-feu Hetzner, ou le service ne tourne pas |
-| `dig` ne renvoie rien | L'enregistrement A n'est pas encore propagé, ou le nom est mal orthographié |
+| `Resolve-DnsName` ne renvoie rien | L'enregistrement A n'est pas encore propagé, ou le nom est mal orthographié |
 | Le nœud tourne mais personne ne se connecte | Nuage orange chez Cloudflare : passez-le en gris |
 | `Failed to start q21.service` | `sudo journalctl -u q21 -n 50` dira pourquoi. Souvent un chemin ou un droit |
+| Ctrl + V ne colle rien dans PowerShell | Employez le **clic droit** — c'est le collage historique des consoles Windows |

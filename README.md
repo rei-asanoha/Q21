@@ -364,8 +364,11 @@ PORTEFEUILLE.md  Le portefeuille, et les treize défauts qu'un premier
 EXPLORATEUR.md   L'explorateur, l'index d'adresses, et pourquoi il est
                  facultatif
 RESEAU.md        Rejoindre le réseau d'essai, et tenir un point d'entrée
-SERVEUR.md       Monter le point d'entrée pas à pas, pour qui n'a jamais
-                 administré un serveur
+SERVEUR.md       Monter le point d'entrée pas à pas, depuis le Mac, pour
+                 qui n'a jamais administré un serveur
+SERVEUR-WINDOWS.md  Le même chemin, depuis PowerShell
+MINAGE.md        Miner du Q21 expliqué sans jargon : ce qu'il faut, ce que
+                 ça coûte, et pourquoi une machine ordinaire suffit
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 
 outils/
