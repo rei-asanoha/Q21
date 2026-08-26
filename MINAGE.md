@@ -133,6 +133,73 @@ lequel vous lisez cette page convient probablement.
 > éternellement. Une machine qui ne mine pas, elle, n'aura jamais besoin que du
 > petit carnet — 64 Mo aujourd'hui, 256 Mo au maximum.
 
+### Est-ce que ma machine peut miner ? Cas par cas
+
+| La machine | Ça mine ? | Pourquoi |
+|---|---|---|
+| **PC de bureau, Windows 10 ou 11** | ✅ oui | Le cas normal. Plus il a de cœurs, mieux c'est |
+| **Portable Windows** | ✅ oui | Voir la réserve sur les portables plus bas |
+| **Mac Apple Silicon (M1 et suivants)** | ✅ oui | Mémoire unifiée très rapide : c'est du bon matériel pour ça |
+| **Mac Intel** | ✅ oui | Un binaire lui est destiné |
+| **PC sous Linux** | ✅ oui | Binaire `q21-linux-x86_64` |
+| **Raspberry Pi 5, 16 Go** | ⚠️ oui, mais lentement | Voir plus bas |
+| **Raspberry Pi 5, 8 Go ou moins** | ⚠️ pour un temps | La table dépasse 8 Go vers la sixième année |
+| **Raspberry Pi 4 ou antérieur** | ❌ non | 8 Go maximum, et une mémoire bien trop lente |
+| **Windows XP, Vista, 7, 8** | ❌ non | Deux raisons, toutes deux définitives — voir plus bas |
+| **Un téléphone** | ❌ non | Ni la mémoire, ni le refroidissement, ni l'autorisation du système |
+
+### Windows XP : non, et ce n'est pas une question de bonne volonté
+
+Deux raisons indépendantes, dont chacune suffirait.
+
+**Le langage.** Q21 est écrit en Rust, et Rust exige **Windows 10 au minimum**
+pour ses cibles Windows officielles. Windows 7 et 8 sont sortis du support en
+2024 ; XP l'a quitté il y a bien plus longtemps. Il n'existe donc aucun moyen
+simple de fabriquer un `q21.exe` qui démarrerait sous XP.
+
+**La mémoire.** XP est, en pratique, un système 32 bits : un programme n'y
+dispose que de 2 Go d'espace d'adressage, parfois 3. La table de Q21 en réclame
+**2 Go à elle seule**, et ira jusqu'à 8. Même en réécrivant tout, ça ne rentre
+pas. Ce n'est pas un problème de version de système, c'est un problème
+d'arithmétique.
+
+Une machine de l'époque XP peut en revanche parfaitement recevoir un Linux 64
+bits récent — et alors, si elle a assez de mémoire, elle mine.
+
+### Le Raspberry Pi : oui, et c'est intéressant
+
+Depuis cette version, un binaire **`q21-linux-arm64`** est fabriqué à chaque
+livraison, sur une vraie machine ARM. Un Raspberry Pi 5 en 16 Go peut donc miner
+sans rien compiler.
+
+Mais soyons précis sur ce qu'il faut en attendre :
+
+- **Sa mémoire est lente.** Le Pi 5 emploie de la LPDDR4X sur un bus étroit —
+  quelques gigaoctets par seconde, là où un PC de bureau récent en fait dix fois
+  plus. Or c'est exactement la ressource que la devinette consomme. Un Pi minera
+  donc, mais **plusieurs fois moins vite** qu'un PC ordinaire.
+- **Prenez le modèle 16 Go.** Le 8 Go tiendra jusqu'à ce que la table s'approche
+  de son plafond de 8 Gio, vers la sixième année, et deviendra alors inutilisable
+  pour le minage.
+- **En revanche, pour faire tourner un nœud qui ne mine pas, un Pi est parfait**,
+  et le restera : un vérificateur n'a jamais besoin que du petit carnet, 256 Mo
+  au maximum, pour toujours.
+
+C'est d'ailleurs le meilleur usage d'un Pi dans ce réseau : un point de
+vérification permanent, silencieux, à trois watts.
+
+### Le portable : oui, avec une réserve
+
+Un portable mine très bien. Trois choses à savoir :
+
+- **Il va chauffer et ventiler.** C'est bruyant, et cela use la machine plus vite
+  qu'une bureautique tranquille.
+- **Il va se brider.** Un portable réduit sa fréquence quand il chauffe. Le débit
+  affiché au bout de dix minutes est le vrai, pas celui de la première minute.
+- **Refermer l'écran endort la machine**, et le minage s'arrête. C'est normal.
+  *(Ce geste avait aussi révélé un vrai défaut du protocole, désormais corrigé —
+  voir `RESEAU.md`.)*
+
 ### Le premier démarrage est lent, et c'est normal
 
 Au tout premier lancement, le programme **fabrique le dictionnaire**. Cela prend
@@ -197,6 +264,58 @@ Dans l'ordre d'efficacité réelle :
 | **De la mémoire plus rapide** | La devinette passe son temps à lire la mémoire. C'est le vrai goulot |
 | **Une deuxième machine** | Un vieux portable qui traîne compte autant que la moitié d'un neuf |
 | **Laisser tourner plus longtemps** | Miner 24 h rapporte 24 fois plus que miner 1 h |
+
+### La mémoire : combien, et à quelle vitesse ?
+
+C'est la question qui revient toujours, alors répondons dans l'ordre.
+
+**Combien de mémoire faut-il ?** Ce n'est pas un chiffre fixe : le dictionnaire
+grandit de 5 % tous les 71 jours, jusqu'à un plafond de 8 Gio.
+
+| Quand | Le dictionnaire pèse | Mémoire vive à avoir |
+|---|---:|---|
+| Aujourd'hui | 2,0 Gio | 4 Go tient, 8 Go est confortable |
+| Dans 3 ans | 4,2 Gio | **8 Go devient juste** |
+| Dans 5 ans | 6,8 Gio | 8 Go ne suffit plus vraiment |
+| Dans 6 ans et au-delà | 8,0 Gio (plafond) | **16 Go, définitivement** |
+
+Autrement dit : **si vous achetez une machine pour miner sur la durée, prenez
+16 Go et n'y pensez plus.** Le plafond de 8 Gio est atteint vers la sixième
+année et ne bouge plus jamais ; 16 Go de mémoire vive couvrent donc toute la vie
+du réseau, dictionnaire plus système.
+
+**Faut-il beaucoup de barrettes ?** Non — il en faut **deux**, et c'est plus
+important qu'on ne croit.
+
+Les processeurs de bureau lisent la mémoire par deux canaux en parallèle. Avec
+une seule barrette, un seul canal travaille et la moitié du débit est perdue.
+Avec deux barrettes identiques, les deux canaux travaillent.
+
+> **Deux barrettes de 8 Go valent mieux qu'une seule de 16 Go**, à quantité
+> égale et à prix comparable. C'est le conseil le plus rentable de cette page.
+
+Au-delà de deux, on ne gagne presque rien : les machines grand public n'ont que
+deux canaux, et remplir les quatre emplacements oblige souvent la mémoire à
+tourner *moins* vite. Deux barrettes est le bon compte.
+
+**La vitesse compte-t-elle ?** Oui, et c'est probablement la variable la plus
+importante après le nombre de cœurs.
+
+Toute la conception de Q21 repose sur le fait que la devinette **attend la
+mémoire** plutôt qu'elle ne calcule. De la DDR5 rapide devrait donc battre de la
+DDR4 lente, à processeur égal. Deux détails techniques, pour qui veut :
+c'est la **latence** qui pèse le plus (le temps d'aller chercher *une* donnée au
+hasard), avant le **débit** (la quantité totale par seconde).
+
+> ⚠️ **Ceci est une prédiction, pas une mesure.** L'effet exact de la vitesse de
+> mémoire sur le débit de minage de Q21 n'a jamais été mesuré : il faudrait la
+> même machine avec deux jeux de barrettes différents, ce que le banc d'essai
+> actuel ne permet pas. Ce qui est mesuré, c'est le débit par cœur (84 053
+> essais/s) ; ce qui est déduit de la conception, c'est que la mémoire commande.
+>
+> Si vous avez deux jeux de barrettes sous la main, lancer
+> `cargo run --release --example banc_minage` avec l'un puis l'autre produirait
+> le premier chiffre réel sur la question. Ce serait une contribution utile.
 
 Et ce qui **n'aide pas**, contrairement à l'intuition :
 
