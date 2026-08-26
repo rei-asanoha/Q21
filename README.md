@@ -369,6 +369,8 @@ SERVEUR.md       Monter le point d'entrée pas à pas, depuis le Mac, pour
 SERVEUR-WINDOWS.md  Le même chemin, depuis PowerShell
 MINAGE.md        Miner du Q21 expliqué sans jargon : ce qu'il faut, ce que
                  ça coûte, et pourquoi une machine ordinaire suffit
+PROJECTION.md    La vie de la chaîne, calculée par le code de consensus :
+                 émission sur cent ans, capacité, et le mur des 4,74 tx/s
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 
 outils/

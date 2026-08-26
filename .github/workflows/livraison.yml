@@ -66,6 +66,17 @@ jobs:
             cible: x86_64-unknown-linux-gnu
             binaire: q21
             archive: q21-linux-x86_64.tar.gz
+          # Linux ARM 64 bits : Raspberry Pi 5, machines Ampere, serveurs CAX
+          # de Hetzner. Construit sur une machine ARM et non compile de facon
+          # croisee, comme les quatre autres — les epreuves passent donc sur
+          # l'architecture qu'elles verifient. Ces machines sont disponibles
+          # depuis aout 2025 pour les depots publics, janvier 2026 pour les
+          # autres.
+          - nom: Linux (ARM 64)
+            os: ubuntu-24.04-arm
+            cible: aarch64-unknown-linux-gnu
+            binaire: q21
+            archive: q21-linux-arm64.tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -156,6 +167,14 @@ jobs:
           files: livraisons/*
           body: |
             ## Portefeuille Q21
+
+            | Votre machine | L'archive a prendre |
+            |---|---|
+            | Windows | `q21-windows-x86_64.zip` |
+            | Mac Apple Silicon (M1 et suivants) | `q21-macos-arm64.tar.gz` |
+            | Mac Intel | `q21-macos-x86_64.tar.gz` |
+            | Linux PC ordinaire | `q21-linux-x86_64.tar.gz` |
+            | Raspberry Pi 5, Linux ARM | `q21-linux-arm64.tar.gz` |
 
             Telechargez l'archive de votre systeme, decompressez-la, puis :
 
