@@ -54,6 +54,7 @@ pub mod explorer;
 pub mod hash;
 pub mod http;
 pub mod index;
+pub mod installation;
 pub mod json;
 pub mod kdf;
 pub mod lamport;

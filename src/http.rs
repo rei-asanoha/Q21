@@ -259,10 +259,15 @@ fn traiter_connexion<F>(
     // seulement chaque lecture prise a part.
     let echeance = std::time::Instant::now() + REQUEST_TIMEOUT;
     let reponse = match lire_requete(&flux, echeance) {
-        Ok(req) => match garde_navigateur(&req) {
+        Ok(req) => {
+            let libre = chemins_publics.contains(&req.path.as_str());
+            // Une coquille statique demandee en GET est une page vide de
+            // donnees et sans effet. Elle seule tolere qu'on y arrive depuis un
+            // autre port de la boucle locale — voir `garde_navigateur`.
+            let coquille = libre && req.method == "GET";
+            match garde_navigateur(&req, coquille) {
             Some(raison) => Response::text(403, raison),
             None => {
-                let libre = chemins_publics.contains(&req.path.as_str());
                 if let Some(attendu) = token.filter(|_| !libre) {
                     if !autorise(&req, attendu) {
                         Response::text(401, "jeton d'acces manquant ou invalide")
@@ -273,7 +278,8 @@ fn traiter_connexion<F>(
                     handler(req)
                 }
             }
-        },
+            }
+        }
         Err(msg) => Response::text(400, msg),
     };
     let _ = ecrire_reponse(&mut flux, &reponse);
@@ -304,7 +310,30 @@ fn traiter_connexion<F>(
 ///
 /// Chacun ferme une des voies. Ils sont independants : aucun ne rattrape la
 /// defaillance d'un autre, et c'est voulu.
-fn garde_navigateur(req: &Request) -> Option<&'static str> {
+///
+/// # L'exception, et pourquoi elle ne perce pas le mur
+///
+/// `coquille` vaut vrai pour un **GET sur un chemin declare public** : la page
+/// de l'explorateur, celle du portefeuille, celle de l'installation. Ces
+/// documents ne portent aucune donnee et ne declenchent aucune action ; les
+/// obtenir n'apprend rien a personne.
+///
+/// Dans ce cas seul, le verrou 3 accepte aussi `same-site`. Le besoin est
+/// concret : la page d'installation ecoute sur un port, le nœud sur un autre,
+/// et passer de l'une a l'autre est une navigation `same-site` que le verrou
+/// refusait — le portefeuille s'ouvrait sur « requete inter-sites : refusee ».
+///
+/// Ce que l'exception ne donne pas :
+///
+/// - **`same-site` sur `127.0.0.1` ne peut venir que de `127.0.0.1`.** Le site
+///   d'un hote IP est cette IP elle-meme ; la page d'un attaquant distant reste
+///   `cross-site`, donc refusee.
+/// - Un nom de domaine qui resoudrait vers la boucle locale — la reliaison DNS —
+///   bute d'abord sur le verrou 1, qui lit `Host`.
+/// - `/rpc` n'est jamais public, donc jamais une coquille : rien de ce qui
+///   deplace des fonds n'est concerne.
+/// - Un POST n'est jamais une coquille, meme sur un chemin public.
+fn garde_navigateur(req: &Request, coquille: bool) -> Option<&'static str> {
     // 1. `Host` : seule la boucle locale est un hote legitime. Un nom de domaine
     //    quelconque signale une reliaison DNS.
     if let Some(host) = req.headers.get("host") {
@@ -328,7 +357,8 @@ fn garde_navigateur(req: &Request) -> Option<&'static str> {
     // 3. `Sec-Fetch-Site` : les navigateurs recents l'ajoutent d'office et une
     //    page ne peut pas le falsifier — c'est un en-tete interdit au script.
     if let Some(v) = req.headers.get("sec-fetch-site") {
-        if v != "same-origin" && v != "none" {
+        let admis = v == "same-origin" || v == "none" || (coquille && v == "same-site");
+        if !admis {
             return Some("requete inter-sites : refusee");
         }
     }
@@ -733,6 +763,51 @@ mod tests {
             ),
         );
         assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        h.shutdown();
+    }
+
+    /// L'exception `same-site` ne vaut que pour une coquille demandee en GET.
+    ///
+    /// Elle existe parce que la page d'installation et le nœud vivent sur deux
+    /// ports, et que passer de l'une a l'autre est une navigation `same-site`.
+    /// Ces quatre epreuves disent ou elle s'arrete.
+    #[test]
+    fn same_site_n_est_admis_que_sur_une_coquille_en_lecture() {
+        let h = serve_avec_public("127.0.0.1:0", None, &["/portefeuille"], echo())
+            .expect("demarrage");
+
+        let avec = |methode: &str, chemin: &str, site: &str| {
+            requete(
+                h.addr,
+                &format!(
+                    "{methode} {chemin} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                     Sec-Fetch-Site: {site}\r\n\
+                     Content-Type: application/json\r\nContent-Length: 2\r\n\
+                     Connection: close\r\n\r\n{{}}"
+                ),
+            )
+        };
+
+        // 1. Le cas voulu : arriver sur la page du portefeuille depuis la page
+        //    d'installation, qui est sur un autre port.
+        let r = avec("GET", "/portefeuille", "same-site");
+        assert!(r.starts_with("HTTP/1.1 200"), "la coquille doit passer : {r}");
+
+        // 2. Le meme assouplissement ne s'etend pas au RPC, qui n'est pas
+        //    public. C'est lui qui deplace des fonds.
+        let r = avec("POST", "/rpc", "same-site");
+        assert!(r.starts_with("HTTP/1.1 403"), "le RPC doit refuser : {r}");
+
+        // 3. Ni a un POST sur le chemin public lui-meme : une coquille se lit,
+        //    elle ne s'ecrit pas.
+        let r = avec("POST", "/portefeuille", "same-site");
+        assert!(r.starts_with("HTTP/1.1 403"), "un POST n'est pas une coquille : {r}");
+
+        // 4. Et `cross-site` reste refuse partout : c'est la marque que pose le
+        //    navigateur quand la page vient d'ailleurs que de cette machine.
+        let r = avec("GET", "/portefeuille", "cross-site");
+        assert!(r.starts_with("HTTP/1.1 403"), "cross-site doit refuser : {r}");
+
         h.shutdown();
     }
 
