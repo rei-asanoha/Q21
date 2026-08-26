@@ -11,36 +11,16 @@ rem  aussitot — trop vite pour lire quoi que ce soit. Un premier utilisateur y
 rem  bute, et il avait raison : il attendait une application.
 rem
 rem  Ce fichier lui dit `wallet`, et rien d'autre.
-rem ---------------------------------------------------------------------------
-setlocal
-cd /d "%~dp0"
-title Portefeuille Q21
-
-if not exist "q21-data\wallet.dat" (
-    echo.
-    echo   Aucun portefeuille dans ce dossier. On va en creer un.
-    echo.
-    echo   Une phrase secrete vous sera demandee. Elle ne s'affichera pas
-    echo   pendant la frappe : c'est voulu, pour que personne ne la lise
-    echo   par-dessus votre epaule. Tapez-la, puis Entree.
-    echo.
-    echo   Un code de sauvegarde s'affichera ensuite. RECOPIEZ-LE SUR PAPIER.
-    echo   C'est le seul moyen de retrouver vos fonds si ce dossier disparait.
-    echo.
-    pause
-    q21.exe init testnet
-    if errorlevel 1 (
-        echo.
-        echo   La creation a echoue. Rien n'a ete ecrit.
-        pause
-        exit /b 1
-    )
-    echo.
-    echo   Avez-vous recopie le code de sauvegarde sur papier ?
-    pause
-)
-
-rem ---------------------------------------------------------------------------
+rem
+rem  Ce qu'il ne fait plus
+rem
+rem  Il portait vingt lignes de preparation : detecter l'absence de portefeuille,
+rem  annoncer qu'une phrase secrete allait etre demandee, lancer `init`, attendre
+rem  que l'utilisateur confirme avoir recopie un code affiche dans la console.
+rem  Tout cela se passe maintenant dans des ecrans, a l'ouverture du navigateur —
+rem  voir src/installation.rs. Un fichier de commandes qui explique comment
+rem  taper une phrase secrete etait le signe qu'il manquait une interface.
+rem
 rem  Sur l'arret
 rem
 rem  Un Ctrl-C recu pendant un fichier .bat fait poser par l'interpreteur sa
@@ -52,9 +32,12 @@ rem
 rem  Ce n'en est pas une. Le portefeuille intercepte Ctrl-C, ecrit son etat et
 rem  s'arrete ; la question de Windows arrive apres. Mais on ne demande a
 rem  personne de faire confiance a un message qui ressemble a une erreur : le
-rem  portefeuille offre desormais un bouton « Fermer le portefeuille », et la
-rem  fermeture de cette fenetre est egalement interceptee. Les deux voies
-rem  laissent l'interpreteur tranquille.
+rem  portefeuille offre un bouton « Fermer le portefeuille », et la fermeture de
+rem  cette fenetre est egalement interceptee.
 rem ---------------------------------------------------------------------------
+setlocal
+cd /d "%~dp0"
+title Portefeuille Q21
+
 q21.exe wallet
 if errorlevel 1 pause

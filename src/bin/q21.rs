@@ -517,14 +517,41 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
 /// Elle sert a rouvrir le portefeuille **et** a le refermer apres chaque
 /// modification. La demander deux fois par commande serait une invitation a
 /// choisir une phrase courte.
-static PHRASE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+///
+/// # Pourquoi ce n'est plus un `OnceLock`
+///
+/// Ce fut un `OnceLock`, et cela tenait tant que la phrase etait tapee dans un
+/// terminal : elle arrivait une fois, avant tout le reste, et une phrase fausse
+/// terminait le programme. Des lors qu'elle se saisit dans une page —
+/// `installation.rs` —, l'utilisateur peut se tromper et recommencer. Un
+/// `OnceLock` aurait garde la premiere valeur pour toujours : le deuxieme essai,
+/// meme juste, aurait echoue avec le message du premier. Le defaut aurait ete
+/// invisible en epreuve et permanent a l'usage.
+///
+/// La valeur exterieure distingue « personne n'a encore rien dit » de « on sait
+/// qu'il n'y a pas de phrase », qui ne sont pas la meme chose : la seconde
+/// autorise a ecrire un portefeuille en clair, la premiere non.
+static PHRASE: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
 
 fn phrase_courante() -> Option<String> {
-    PHRASE.get().cloned().flatten()
+    PHRASE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .flatten()
 }
 
 fn retenir_phrase(p: Option<String>) {
-    let _ = PHRASE.set(p);
+    *PHRASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+}
+
+/// Oublie la phrase retenue, sans decider qu'il n'y en a pas.
+///
+/// Sert au seul cas ou une phrase s'est revelee fausse : on revient a l'etat
+/// « rien n'a ete dit », et non a l'etat « il n'y a pas de phrase », qui
+/// autoriserait a ecrire une graine en clair.
+fn oublier_phrase() {
+    *PHRASE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
@@ -982,6 +1009,43 @@ fn cmd_init(
     cmd_init_avec(datadir, reseau, schema, phrase_fichier, None)
 }
 
+/// Cree la chaine et le portefeuille dans un dossier neuf.
+///
+/// C'est le cœur de `init` et de `restore`, extrait pour que la page
+/// d'installation puisse l'appeler sans passer par un terminal. La fonction
+/// n'imprime rien et ne demande rien : la phrase secrete doit deja etre
+/// etablie — c'est [`ecrire_portefeuille`] qui l'emploie pour sceller.
+///
+/// L'ordre compte, et il est le meme que dans la version en ligne de commande :
+/// le portefeuille n'est ecrit qu'apres la genese, de sorte qu'un dossier ne
+/// puisse jamais contenir une graine sans la chaine qui va avec.
+fn ecrire_chaine_neuve(
+    datadir: &Path,
+    reseau: Network,
+    schema: SchemeId,
+    graine_fournie: Option<[u8; 32]>,
+) -> Result<(Wallet, q21_core::address::Address, q21_core::block::Block), String> {
+    let mut wallet = match graine_fournie {
+        Some(g) => Wallet::from_seed_scheme(g, reseau, schema)
+            .map_err(|_| format!("schema indisponible : {}", schema.name()))?,
+        None => Wallet::generate_scheme(reseau, schema).map_err(|e| match e {
+            q21_core::wallet::WalletError::AleaIndisponible => {
+                "le generateur d'alea du systeme est inaccessible : aucune clef n'a ete creee. \
+                 Mieux vaut aucun portefeuille qu'un portefeuille previsible."
+                    .to_string()
+            }
+            _ => format!("schema indisponible : {}", schema.name()),
+        })?,
+    };
+    let beneficiaire = wallet.new_address();
+    let genesis = genesis_block(reseau);
+
+    let store = q21_core::store::BlockStore::new(chemin_blocs(datadir));
+    store.append(&genesis).map_err(|e| e.to_string())?;
+    ecrire_portefeuille(datadir, &wallet)?;
+    Ok((wallet, beneficiaire, genesis))
+}
+
 fn cmd_init_avec(
     datadir: &Path,
     reseau: Option<&str>,
@@ -1061,26 +1125,7 @@ fn cmd_init_avec(
         println!();
     }
 
-    let mut wallet = match graine_fournie {
-        Some(g) => Wallet::from_seed_scheme(g, reseau, schema)
-            .map_err(|_| format!("schema indisponible : {}", schema.name()))?,
-        None => Wallet::generate_scheme(reseau, schema).map_err(|e| match e {
-            q21_core::wallet::WalletError::AleaIndisponible => {
-                "le generateur d'alea du systeme est inaccessible : aucune clef n'a ete creee. \
-                 Mieux vaut aucun portefeuille qu'un portefeuille previsible."
-                    .to_string()
-            }
-            _ => format!("schema indisponible : {}", schema.name()),
-        })?,
-    };
-    let beneficiaire = wallet.new_address();
-
-    println!("Minage du bloc de genese...");
-    let genesis = genesis_block(reseau);
-
-    let store = q21_core::store::BlockStore::new(chemin_blocs(datadir));
-    store.append(&genesis).map_err(|e| e.to_string())?;
-    ecrire_portefeuille(datadir, &wallet)?;
+    let (wallet, beneficiaire, genesis) = ecrire_chaine_neuve(datadir, reseau, schema, graine_fournie)?;
 
     println!();
     println!("  Chaine initialisee dans {}", datadir.display());
@@ -2509,52 +2554,14 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         }
     }
 
-    // 1. Le portefeuille doit exister. On ne le cree pas en silence : creer un
-    //    portefeuille est un acte qui produit un code de sauvegarde, et ce code
-    //    doit etre lu par un humain, pas defiler dans une fenetre qui se ferme.
-    if !chemin_portefeuille(datadir).exists() {
-        return Err(format!(
-            "aucun portefeuille dans {}.\n\n  \
-             Creez-en un d'abord :\n\n      \
-             q21 --datadir {} init testnet\n\n  \
-             Cette commande affiche un code de sauvegarde. Recopiez-le sur papier\n  \
-             avant d'aller plus loin : c'est le seul moyen de retrouver vos fonds\n  \
-             si ce fichier disparait.",
-            datadir.display(),
-            datadir.display()
-        ));
-    }
-
     println!("Portefeuille Q21");
     println!();
 
-    // 2. Le deverrouillage vient AVANT tout le reste.
+    // 1. Un port libre pour le nœud, si l'on n'en impose pas un.
     //
-    // Le defaut repare ici : la banniere — l'adresse a ouvrir, « laissez cette
-    // fenetre ouverte » — s'affichait d'abord, puis le noeud demandait la phrase
-    // secrete. L'utilisateur voyait donc un portefeuille en apparence demarre,
-    // suivi d'une ligne nue « Phrase secrete du portefeuille : » sans rien qui
-    // l'annonce. On lui demandait un secret sans lui dire pourquoi, apres lui
-    // avoir dit que tout tournait.
-    //
-    // On lit donc le portefeuille tout de suite. La phrase est retenue pour la
-    // duree du processus, le noeud la retrouvera sans la redemander, et une
-    // phrase fausse echoue ici — avant qu'on ait tire un port, un jeton, ou
-    // ouvert un navigateur sur une page qui ne servirait a rien.
-    let phrase_deja_fournie = std::env::var("Q21_PASSPHRASE").is_ok_and(|p| !p.is_empty());
-    if !phrase_deja_fournie
-        && q21_core::kdf::est_scelle(
-            &std::fs::read(chemin_portefeuille(datadir)).unwrap_or_default(),
-        )
-    {
-        println!("  Ce portefeuille est protege par une phrase secrete.");
-        println!("  Tapez-la puis Entree. Elle ne s'affiche pas pendant la frappe :");
-        println!("  c'est voulu, pour que personne ne la lise par-dessus votre epaule.");
-        println!();
-    }
-    lire_portefeuille(datadir)?;
-
-    // 3. Un port libre, si l'on n'en impose pas un.
+    // Il est tire **avant** l'installation : la page d'installation doit savoir
+    // vers ou renvoyer le navigateur quand elle a fini, et elle ne peut pas le
+    // demander a un serveur qui n'existe pas encore.
     let port = if port != 0 {
         port
     } else {
@@ -2565,11 +2572,36 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
             .port()
     };
 
-    // 4. Un jeton tire du generateur du systeme. Trente-deux octets : il n'est
-    //    pas devinable, et il ne sert que le temps de cette execution.
+    // 2. Le jeton de la session. Trente-deux octets tires du generateur du
+    //    systeme : il n'est pas devinable, et il ne sert que le temps de cette
+    //    execution. Le meme sert a l'installation et au nœud — c'est un secret
+    //    de session, pas un secret par serveur.
     let brut: [u8; 32] = q21_core::rng::octets()
         .map_err(|_| "generateur d'alea du systeme inaccessible".to_string())?;
     let jeton: String = brut.iter().map(|o| format!("{o:02x}")).collect();
+
+    // 3. L'installation, si le portefeuille n'existe pas encore ou s'il est
+    //    scelle et qu'aucune phrase n'a ete fournie autrement.
+    //
+    // C'est ce qui remplace les deux commandes de terminal d'avant : `init`
+    // pour creer, puis la question « Phrase secrete du portefeuille : » posee
+    // sur une ligne nue. Les deux se font maintenant dans des ecrans.
+    let phrase_deja_fournie = std::env::var("Q21_PASSPHRASE").is_ok_and(|p| !p.is_empty());
+    let existe = chemin_portefeuille(datadir).exists();
+    let scelle = existe
+        && q21_core::kdf::est_scelle(
+            &std::fs::read(chemin_portefeuille(datadir)).unwrap_or_default(),
+        );
+    let installation_necessaire = !existe || (scelle && !phrase_deja_fournie);
+
+    if installation_necessaire {
+        installer(datadir, &jeton, port, sans_navigateur, existe && scelle)?;
+    }
+
+    // 4. Le portefeuille se lit maintenant sans rien demander : ou bien
+    //    l'installation vient de retenir la phrase, ou bien elle etait deja
+    //    connue, ou bien le fichier n'est pas scelle.
+    lire_portefeuille(datadir)?;
 
     let adresse = format!("127.0.0.1:{port}");
     let url = format!("http://{adresse}/portefeuille#{jeton}");
@@ -2596,7 +2628,10 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     println!("  l'efface de la barre d'adresse.");
     println!();
 
-    if !sans_navigateur {
+    // Le navigateur est deja ouvert si l'installation vient de le faire : la
+    // page d'installation renvoie elle-meme vers le portefeuille. En rouvrir un
+    // second laisserait deux onglets, dont un mort.
+    if !sans_navigateur && !installation_necessaire {
         // Le navigateur s'ouvre une fois le serveur pret. On sonde le port
         // plutot que d'attendre une duree fixe : une duree fixe est toujours
         // trop courte sur une machine chargee et trop longue ailleurs.
@@ -2653,6 +2688,266 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     ];
     arguments.extend(reste);
     cmd_node(datadir, &arguments)
+}
+
+// ===========================================================================
+// L'installation, dans des ecrans
+// ===========================================================================
+
+/// Cree ou ouvre le portefeuille depuis une page, puis rend la main.
+///
+/// Le serveur vit le temps de l'echange et meurt ensuite : le nœud demarre
+/// apres, sur **son propre port**. Voir l'en-tete de `q21_core::installation`
+/// pour ce que ce choix coute et ce qu'il evite.
+///
+/// La fonction bloque jusqu'a ce que la page dise avoir fini. Quand elle rend
+/// la main, le portefeuille existe sur le disque et la phrase secrete est
+/// retenue pour la duree du processus.
+fn installer(
+    datadir: &Path,
+    jeton: &str,
+    port_noeud: u16,
+    sans_navigateur: bool,
+    scelle: bool,
+) -> Result<(), String> {
+    use q21_core::http::Response;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Le cas ou une chaine existe sans portefeuille : c'est le dossier d'un
+    // nœud lance avec `--sans-portefeuille`. Y greffer un portefeuille neuf
+    // ecrirait une seconde genese sur la premiere. On refuse, en le disant.
+    if !scelle && chemin_blocs(datadir).exists() && !chemin_portefeuille(datadir).exists() {
+        return Err(format!(
+            "le dossier {} contient une chaine mais aucun portefeuille.\n\n  \
+             C'est le dossier d'un nœud sans portefeuille. Prenez-en un autre :\n\n      \
+             q21 --datadir <un-dossier-neuf> wallet",
+            datadir.display()
+        ));
+    }
+
+    let fini = Arc::new(AtomicBool::new(false));
+    let datadir = datadir.to_path_buf();
+    let fini_h = fini.clone();
+
+    // Le reseau du portefeuille de bureau est le reseau d'essai. C'est le seul
+    // qui existe, et proposer un choix a une seule reponse est une facon de
+    // faire hesiter sans rien offrir. `regtest` reste accessible en ligne de
+    // commande, ou vont ceux qui en ont besoin.
+    let reseau = Network::Testnet;
+
+    let repondre = move |req: q21_core::http::Request| -> Response {
+        match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/bienvenue") => Response::html(q21_core::installation::PAGE.to_string()),
+            ("POST", "/installation") => {
+                let r = traiter_installation(&datadir, reseau, port_noeud, &req.body, &fini_h);
+                Response::json(r.encode())
+            }
+            _ => Response::not_found(),
+        }
+    };
+
+    // La coquille HTML est servie sans jeton — sinon la page ne pourrait meme
+    // pas se charger pour en demander un. Elle ne porte aucune donnee : c'est
+    // la meme regle que pour l'explorateur, et la liste reste nommee chemin par
+    // chemin.
+    let serveur = q21_core::http::serve_avec_public("127.0.0.1:0", Some(jeton.to_string()), &["/bienvenue"], repondre)
+        .map_err(|e| format!("le serveur d'installation n'a pas demarre : {e:?}"))?;
+    let url = format!("http://127.0.0.1:{}/bienvenue#{jeton}", serveur.addr.port());
+
+    if scelle {
+        println!("  Ce portefeuille est protege par une phrase secrete.");
+    } else {
+        println!("  Aucun portefeuille ici : on va en creer un.");
+    }
+    println!();
+    println!("  Si le navigateur ne s'ouvre pas, ouvrez cette adresse :");
+    println!();
+    println!("      {url}");
+    println!();
+
+    if !sans_navigateur {
+        if let Err(e) = ouvrir_navigateur(&url) {
+            eprintln!("  Le navigateur n'a pas pu etre ouvert ({e}).");
+            eprintln!("  Ouvrez l'adresse ci-dessus a la main.");
+        }
+    }
+
+    // On attend que la page dise avoir fini. Sans limite de temps : c'est un
+    // humain qui recopie un code de sauvegarde sur du papier, et lui imposer un
+    // chronometre serait exactement la mauvaise idee.
+    while !fini.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+
+    // Ce serveur ne meurt pas tout de suite : la page l'interroge encore pour
+    // savoir quand le nœud ecoute — elle ne peut pas le demander au nœud
+    // lui-meme, qui est sur une autre origine. Un guetteur attend donc que le
+    // nœud soit debout, laisse a la page le temps de s'en apercevoir, puis
+    // ferme la porte. Laisser un second serveur ouvert pour toute la duree du
+    // programme serait de la surface d'attaque sans usage.
+    std::thread::spawn(move || {
+        let cible = std::net::SocketAddr::from(([127, 0, 0, 1], port_noeud));
+        for _ in 0..600 {
+            if std::net::TcpStream::connect_timeout(&cible, std::time::Duration::from_millis(200))
+                .is_ok()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        serveur.shutdown();
+    });
+    Ok(())
+}
+
+/// Le corps des quatre methodes de l'installation.
+///
+/// Rend toujours un objet JSON. Une erreur est un champ `erreur` portant une
+/// phrase destinee a etre lue par quelqu'un, pas un code.
+fn traiter_installation(
+    datadir: &Path,
+    reseau: Network,
+    port_noeud: u16,
+    corps: &str,
+    fini: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> q21_core::json::Json {
+    use q21_core::json::Json;
+
+    let erreur = |m: &str| Json::obj().set("erreur", Json::str(m)).build();
+
+    let requete = match q21_core::json::parse(corps) {
+        Ok(j) => j,
+        Err(_) => return erreur("requete illisible"),
+    };
+    let methode = requete.get("methode").and_then(|j| j.as_str()).unwrap_or("");
+    let params = requete.get("params");
+    let texte = |clef: &str| -> Option<String> {
+        params
+            .and_then(|p| p.get(clef))
+            .and_then(|j| j.as_str())
+            .map(|s| s.to_string())
+    };
+
+    match methode {
+        "etat" => {
+            let brut = std::fs::read(chemin_portefeuille(datadir)).unwrap_or_default();
+            let quoi = if brut.is_empty() {
+                "absent"
+            } else if q21_core::kdf::est_scelle(&brut) {
+                "scelle"
+            } else {
+                "clair"
+            };
+            Json::obj()
+                .set("portefeuille", Json::str(quoi))
+                .set("reseau", Json::str(nom_de_reseau(reseau)))
+                .set("port_noeud", Json::u64(port_noeud as u64))
+                .build()
+        }
+
+        "creer" => {
+            if chemin_portefeuille(datadir).exists() {
+                return erreur("un portefeuille existe deja dans ce dossier");
+            }
+            // Un code fourni : c'est une restauration. La graine vient de la
+            // feuille de papier, pas du generateur.
+            let graine = match texte("code") {
+                Some(code) if !code.trim().is_empty() => {
+                    match Wallet::seed_from_backup(code.trim(), reseau) {
+                        Ok(g) => Some(g),
+                        Err(q21_core::wallet::WalletError::SauvegardeAutreReseau) => {
+                            return erreur("ce code de sauvegarde appartient a un autre reseau")
+                        }
+                        Err(_) => {
+                            return erreur(
+                                "code de sauvegarde illisible : la somme de controle ne \
+                                 correspond pas. Verifiez la recopie — l'alphabet employe ne \
+                                 contient ni 1, ni b, ni i, ni o.",
+                            )
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            // La phrase est etablie AVANT toute ecriture : `ecrire_portefeuille`
+            // la lit pour sceller, et un portefeuille ecrit en clair puis
+            // chiffre aurait laisse une trace en clair sur le disque.
+            match texte("phrase") {
+                Some(p) if !p.is_empty() => retenir_phrase(Some(p)),
+                // Chaine vide : le choix « sans protection », fait sciemment
+                // dans la page, derriere une case a cocher qui l'explique.
+                Some(_) => retenir_phrase(None),
+                None => return erreur("aucune phrase transmise"),
+            }
+
+            let schema = if SchemeId::MlDsa87.disponible() {
+                SchemeId::MlDsa87
+            } else {
+                SchemeId::LamportOts
+            };
+            if std::fs::create_dir_all(datadir).is_err() {
+                oublier_phrase();
+                return erreur("le dossier de donnees n'a pas pu etre cree");
+            }
+            match ecrire_chaine_neuve(datadir, reseau, schema, graine) {
+                Ok((w, adresse, _)) => Json::obj()
+                    .set("code", Json::str(w.backup_code()))
+                    .set("adresse", Json::str(adresse.to_string()))
+                    .build(),
+                Err(e) => {
+                    oublier_phrase();
+                    erreur(&e)
+                }
+            }
+        }
+
+        "ouvrir" => {
+            let phrase = match texte("phrase") {
+                Some(p) => p,
+                None => return erreur("aucune phrase transmise"),
+            };
+            retenir_phrase(Some(phrase));
+            match lire_portefeuille(datadir) {
+                Ok(mut w) => {
+                    let adresse = w.new_address().to_string();
+                    Json::obj().set("adresse", Json::str(adresse)).build()
+                }
+                Err(_) => {
+                    // On revient a « rien n'a ete dit », et non a « il n'y a pas
+                    // de phrase » : la seconde autoriserait une ecriture en
+                    // clair au prochain enregistrement.
+                    oublier_phrase();
+                    erreur("Phrase secrete incorrecte. Reessayez.")
+                }
+            }
+        }
+
+        // « J'ai fini » : la page a tout ce qu'il lui faut, le nœud peut
+        // demarrer. On ne coupe pas ce serveur pour autant — la page a encore
+        // besoin de lui pour savoir quand aller voir ailleurs.
+        "commencer" => {
+            fini.store(true, std::sync::atomic::Ordering::Relaxed);
+            Json::obj().set("ok", Json::Bool(true)).build()
+        }
+
+        // « Le nœud ecoute-t-il ? » La page ne peut pas le demander elle-meme :
+        // le nœud est sur une autre origine, et le navigateur refuse d'en lire
+        // la reponse. Ce serveur-ci, lui, n'a pas de politique de meme origine
+        // a respecter : il ouvre une connexion et dit ce qu'il a vu.
+        "noeud" => {
+            let pret = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port_noeud)),
+                std::time::Duration::from_millis(200),
+            )
+            .is_ok();
+            Json::obj().set("pret", Json::Bool(pret)).build()
+        }
+
+        _ => erreur("methode inconnue"),
+    }
 }
 
 /// Ouvre une adresse dans le navigateur par defaut du systeme.

@@ -22,8 +22,15 @@
 //!
 //! `localStorage`, `indexedDB` et les cookies restent interdits : ils survivent
 //! a la fermeture, et rien ici ne doit survivre a la session. La graine et la
-//! phrase secrete, elles, ne quittent jamais le noeud — le navigateur ne les
-//! voit a aucun moment.
+//! phrase secrete, elles, ne quittent jamais le noeud — **cette page-ci** ne
+//! les voit a aucun moment.
+//!
+//! La precision compte depuis que `installation.rs` existe. La page
+//! d'installation, elle, recoit la phrase secrete a la saisie et affiche le code
+//! de sauvegarde pour qu'il soit recopie ; elle ne vit que le temps de cet
+//! echange, et l'en-tete de ce module-la dit ce que cela coute. Ce fichier-ci
+//! garde sa propriete intacte : une fois le portefeuille ouvert, plus aucun
+//! secret ne traverse le navigateur.
 //!
 //! **Aucun flottant sur un montant.** `0.1 + 0.2 != 0.3` en IEEE 754, et un
 //! `parseFloat` sur un solde perd des unites. Toute l'arithmetique monetaire de
