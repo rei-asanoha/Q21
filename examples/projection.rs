@@ -40,7 +40,35 @@ fn q21(unites: u64) -> f64 {
     unites as f64 / UNITS_PER_COIN as f64
 }
 
+/// Imprime les memes grandeurs en CSV, annee par annee.
+///
+/// Sert a alimenter un graphique sans recopier des nombres a la main — une
+/// recopie est une occasion de se tromper, et un graphique faux est pire qu'un
+/// tableau juste.
+fn donnees() {
+    let p = TableParams::for_network(Network::Mainnet);
+    println!("annee,recompense_q21,circulation_q21,pct_plafond,table_gio");
+    for an in 0..=100u64 {
+        let h = an * BLOCS_PAR_AN;
+        let ep = memhard::epoch_of(h);
+        let t = memhard::table_size(p, ep) as u64 * POW_ELEMENT_SIZE as u64;
+        println!(
+            "{},{:.8},{:.2},{:.4},{:.4}",
+            an,
+            q21(emission::block_subsidy(h).units()),
+            q21(emission::total_supply_at(h).units()),
+            100.0 * emission::total_supply_at(h).units() as f64 / MAX_SUPPLY as f64,
+            t as f64 / 1024.0 / 1024.0 / 1024.0
+        );
+    }
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--donnees") {
+        donnees();
+        return;
+    }
+
     println!();
     println!("  ===  LA VIE DE Q21, CALCULEE  ===");
     println!();
