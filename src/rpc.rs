@@ -192,6 +192,12 @@ pub struct RpcContext {
     /// cherche. Une reponse incomplete qui se presente comme complete est pire
     /// qu'une absence de reponse.
     pub index: Option<Arc<Mutex<crate::index::Index>>>,
+    /// Interrupteur et compteurs du minage, si ce nœud peut miner.
+    ///
+    /// Absent, `getminage` repond que la machine ne mine pas et `setminage`
+    /// refuse : un nœud sans portefeuille n'a nulle part ou verser une
+    /// subvention, et le lui laisser croire serait pire que le lui refuser.
+    pub minage: Option<Arc<crate::minage::Minage>>,
     /// Appele apres chaque operation qui modifie le portefeuille.
     ///
     /// Absent en memoire pure (epreuves). En production il **doit** etre
@@ -207,6 +213,7 @@ impl RpcContext {
             wallet: None,
             network,
             index: None,
+            minage: None,
             sur_changement: None,
         }
     }
@@ -456,6 +463,11 @@ impl RpcContext {
                 "preparersend",
                 "[portefeuille] Chiffres exacts d'un envoi, pieces reellement selectionnees",
             ),
+            ("getminage", "Etat du minage : actif, debit mesure, blocs trouves"),
+            (
+                "setminage",
+                "[portefeuille] Allume ou eteint le minage sans relancer le programme",
+            ),
             ("getsyncstatus", "Etat de la synchronisation avec le reseau"),
             (
                 "arreter",
@@ -504,6 +516,8 @@ impl RpcContext {
             "estimatefee" => self.estimatefee(params),
             "preparersend" => self.preparersend(params),
             "getsyncstatus" => Ok(self.getsyncstatus()),
+            "getminage" => Ok(self.getminage()),
+            "setminage" => self.setminage(params),
             "arreter" => self.arreter(),
             "rechercher" => self.rechercher(params),
             "getadresse" => self.getadresse(params),
@@ -1600,6 +1614,49 @@ impl RpcContext {
             .build()
     }
 
+    /// Etat du minage : ce que la machine fait en ce moment.
+    ///
+    /// Toujours servi, meme sans portefeuille — savoir qu'on ne mine pas est
+    /// une reponse utile, et elle ne revele rien.
+    fn getminage(&self) -> Json {
+        let (actif, debit, blocs, total) = match &self.minage {
+            Some(m) => (m.actif(), m.debit(), m.blocs(), m.essais_total()),
+            None => (false, 0.0, 0, 0),
+        };
+        Json::obj()
+            .set("actif", Json::Bool(actif))
+            .set("possible", Json::Bool(self.minage.is_some() && self.wallet.is_some()))
+            .set("essais_par_seconde", Json::Int(debit as i64))
+            .set("essais_total", Json::u64(total))
+            .set("blocs_trouves", Json::u64(blocs))
+            .build()
+    }
+
+    /// Allume ou eteint le minage.
+    ///
+    /// Range parmi les methodes de portefeuille, et pour une raison de fond :
+    /// miner verse une subvention a une adresse du portefeuille. Sans
+    /// portefeuille servi, l'autoriser reviendrait a laisser une page decider
+    /// d'un travail dont le produit n'irait nulle part.
+    fn setminage(&self, params: &Json) -> Result<Json, Json> {
+        let m = self
+            .minage
+            .as_ref()
+            .ok_or_else(|| erreur(-32004, "ce noeud ne peut pas miner"))?;
+        if self.wallet.is_none() {
+            return Err(erreur(
+                -32004,
+                "miner demande un portefeuille : sans lui la subvention n'irait nulle part",
+            ));
+        }
+        let vers = match params.get("actif") {
+            Some(Json::Bool(b)) => *b,
+            _ => return Err(erreur(-32602, "parametre `actif` booleen attendu")),
+        };
+        m.basculer(vers);
+        Ok(self.getminage())
+    }
+
     fn getbalance(&self) -> Result<Json, Json> {
         let w = self.portefeuille()?;
         // --- Ne pas recopier l'ensemble des UTXO a chaque appel.
@@ -1766,6 +1823,10 @@ mod tests {
         RpcContext {
             sur_changement: None,
             index: None,
+            // Les epreuves du RPC voient un minage possible : c'est ce qui
+            // permet de verifier que l'interrupteur repond, et que sans
+            // portefeuille il refuse.
+            minage: Some(Arc::new(crate::minage::Minage::new(false))),
             node,
             wallet: if avec_portefeuille {
                 Some(Arc::new(Mutex::new(Wallet::from_seed([9u8; 32], RESEAU))))

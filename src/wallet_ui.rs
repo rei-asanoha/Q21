@@ -56,146 +56,256 @@ pub const PAGE: &str = r##"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Q21 — portefeuille</title>
 <style>
+/* =========================================================================
+   Q21 — portefeuille de bureau
+   =========================================================================
+
+   Le parti pris : ceci doit ressembler a une application, pas a un document.
+   Une barre en haut qui ne bouge jamais, une colonne de navigation a gauche
+   sur grand ecran et une barre en bas sur telephone, des cartes posees sur un
+   fond sombre. Les couleurs restent celles du projet — le vert de Q21 pousse
+   vers une menthe plus vive, le violet pour ce qui touche au post-quantique —
+   et rien n'est charge de l'exterieur : ni police, ni image, ni feuille.
+   ========================================================================= */
+
 :root{
-  --fond:#f5f4f0; --carte:#fffefb; --bord:#dcd8cf; --bord-fort:#c3bdb1;
-  --texte:#1a1a18; --doux:#57554d; --tenu:#8b887d;
-  --accent:#1d6f66; --accent-fond:#e2eeeb; --alerte:#8a5a1e; --alerte-fond:#f4e9d8;
+  color-scheme: light dark;
+  /* Le theme clair est la valeur de base : un jeton qui n'existe que dans un
+     media query ne s'applique jamais dans l'etat non marque. */
+  --fond:#f4f6f5; --voile:transparent;
+  --carte:#ffffff; --carte-2:#f9fbfa;
+  --bord:#dfe5e3; --bord-fort:#c6d0cd;
+  --texte:#0d1211; --doux:#4a5654; --tenu:#7b8785;
+  --accent:#00875f; --accent-vif:#00a273; --accent-fond:#e2f4ee;
+  --quantum:#6b5bd6; --quantum-fond:#ece9fb;
+  --alerte:#a35a10; --alerte-fond:#fbeeda;
+  --danger:#b03626; --danger-fond:#fae4e1;
+  --ombre:0 1px 2px rgba(13,18,17,.05), 0 8px 24px -12px rgba(13,18,17,.12);
+  --rail:236px;
+  --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI Variable Text",
+    "Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
 }
 @media (prefers-color-scheme: dark){
   :root{
-    --fond:#131410; --carte:#1c1e18; --bord:#32352b; --bord-fort:#454940;
-    --texte:#ecebe0; --doux:#aca99a; --tenu:#7b786b;
-    --accent:#62bfb2; --accent-fond:#16302c; --alerte:#d9a75f; --alerte-fond:#312716;
+    --fond:#07090a; --voile:radial-gradient(1200px 620px at 18% -12%,rgba(34,229,166,.10),transparent 62%),
+                           radial-gradient(900px 520px at 92% 4%,rgba(139,123,255,.09),transparent 60%);
+    --carte:#101416; --carte-2:#151a1c;
+    --bord:#1f2729; --bord-fort:#2f3a3c;
+    --texte:#e9f0ee; --doux:#9aa8a5; --tenu:#6d7a78;
+    --accent:#22e5a6; --accent-vif:#5cf3c0; --accent-fond:#0d2a22;
+    --quantum:#8b7bff; --quantum-fond:#1b1832;
+    --alerte:#ffb65c; --alerte-fond:#2e2312;
+    --danger:#ff6b5a; --danger-fond:#2e1613;
+    --ombre:0 1px 0 rgba(255,255,255,.03) inset, 0 18px 40px -24px rgba(0,0,0,.9);
   }
 }
+
 *{box-sizing:border-box}
-[hidden]{display:none !important}
+html,body{height:100%}
 body{
   margin:0;background:var(--fond);color:var(--texte);
-  font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  -webkit-text-size-adjust:100%;
+  font-family:var(--sans);font-size:15px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
-.enveloppe{max-width:900px;margin:0 auto;padding:1.1rem .9rem 3rem}
-header{border-bottom:2px solid var(--texte);padding-bottom:.8rem;margin-bottom:1rem}
-h1{margin:0;font-size:1.35rem;letter-spacing:-.02em}
-.sous{color:var(--doux);font-size:.85rem;margin-top:.3rem}
-.etat{display:inline-block;padding:.12rem .5rem;border-radius:3px;font-size:.72rem;
-  font-family:ui-monospace,monospace;background:var(--accent-fond);color:var(--accent);
-  margin-left:.4rem;vertical-align:middle}
-h2{font-size:.92rem;text-transform:uppercase;letter-spacing:.08em;color:var(--doux);
-  margin:1.6rem 0 .7rem;font-weight:600}
-h2:first-child{margin-top:.4rem}
+body::before{
+  content:"";position:fixed;inset:0;background:var(--voile);pointer-events:none;z-index:0;
+}
+.enveloppe{position:relative;z-index:1;min-height:100%;display:flex;flex-direction:column}
 
-/* Onglets : la barre defile lateralement sur telephone plutot que de se replier
-   en deux lignes, ce qui deplacerait le contenu a chaque changement de vue. */
-.onglets{display:flex;gap:.3rem;overflow-x:auto;margin-bottom:1.2rem;
-  border-bottom:1px solid var(--bord);scrollbar-width:none}
-.onglets::-webkit-scrollbar{display:none}
-.onglets button{
-  flex:0 0 auto;appearance:none;background:none;border:none;border-bottom:2px solid transparent;
-  color:var(--doux);font:inherit;font-size:.88rem;padding:.55rem .7rem;cursor:pointer;
-  white-space:nowrap;margin-bottom:-1px;
+/* ---- Barre du haut ---------------------------------------------------- */
+header{
+  position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--fond) 86%,transparent);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--bord);
 }
-.onglets button:hover{color:var(--texte)}
-.onglets button.actif{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+.barre{max-width:1180px;margin:0 auto;padding:.7rem 1rem;display:flex;align-items:center;gap:.9rem}
+.logo{display:flex;align-items:center;gap:.55rem;font-weight:700;letter-spacing:-.02em;font-size:1.05rem}
+.pastille{width:1.7rem;height:1.7rem;border-radius:9px;flex:0 0 auto;
+  background:linear-gradient(135deg,var(--accent),var(--quantum));
+  display:grid;place-items:center;color:#04120d;font-size:.72rem;font-weight:800;
+  font-family:var(--mono);letter-spacing:-.04em}
+h1{font-size:inherit;font-weight:inherit;margin:0;letter-spacing:inherit}
+.etat{margin-left:.15rem;font-family:var(--mono);font-size:.66rem;font-weight:600;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--accent);
+  background:var(--accent-fond);padding:.18rem .45rem;border-radius:5px;white-space:nowrap}
+.barre .pousse{margin-left:auto}
+.pouls{display:flex;align-items:center;gap:.45rem;font-size:.76rem;color:var(--doux);
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+.point{width:.5rem;height:.5rem;border-radius:50%;background:var(--tenu);flex:0 0 auto}
+.point.vert{background:var(--accent);box-shadow:0 0 0 3px var(--accent-fond)}
+.point.orange{background:var(--alerte);box-shadow:0 0 0 3px var(--alerte-fond)}
+.jauge-sync{height:2px;background:var(--bord)}
+.jauge-sync i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--quantum));
+  transition:width .4s ease}
+
+/* ---- Corps : rail + contenu ------------------------------------------- */
+.corps{max-width:1180px;width:100%;margin:0 auto;padding:1.1rem 1rem 5.5rem;
+  display:grid;gap:1.4rem;grid-template-columns:1fr;flex:1}
+@media(min-width:900px){
+  .corps{grid-template-columns:var(--rail) 1fr;padding-bottom:2.5rem;gap:2rem}
+}
+
+/* La navigation : barre du bas sur telephone, colonne a gauche au-dela. */
+nav.onglets{
+  position:fixed;left:0;right:0;bottom:0;z-index:30;display:flex;
+  background:color-mix(in srgb,var(--fond) 92%,transparent);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-top:1px solid var(--bord);padding:.3rem .3rem calc(.3rem + env(safe-area-inset-bottom));
+}
+nav.onglets button{
+  flex:1;display:flex;flex-direction:column;align-items:center;gap:.15rem;
+  background:none;border:none;color:var(--tenu);font:inherit;font-size:.68rem;
+  padding:.45rem .2rem;border-radius:10px;cursor:pointer;letter-spacing:.01em}
+nav.onglets button svg{width:1.25rem;height:1.25rem;stroke:currentColor;fill:none;
+  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+nav.onglets button:hover{color:var(--doux)}
+nav.onglets button.actif{color:var(--accent)}
+@media(min-width:900px){
+  nav.onglets{position:sticky;top:4.6rem;align-self:start;flex-direction:column;
+    background:none;backdrop-filter:none;-webkit-backdrop-filter:none;
+    border:none;padding:0;gap:.15rem}
+  nav.onglets button{flex-direction:row;justify-content:flex-start;gap:.7rem;
+    font-size:.9rem;padding:.6rem .8rem;width:100%}
+  nav.onglets button.actif{background:var(--accent-fond);font-weight:600}
+}
+
+main{min-width:0}
+section.vue{animation:entree .18s ease}
+@keyframes entree{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){section.vue{animation:none}}
+
+h2{font-size:.74rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tenu);
+  font-weight:600;margin:1.8rem 0 .7rem}
+h2:first-child{margin-top:0}
+h3{font-size:.95rem;margin:0 0 .4rem;font-weight:600}
+p{margin:0 0 .8rem}
+.aide{font-size:.82rem;color:var(--tenu);margin:.35rem 0 0}
+
+/* ---- Cartes ------------------------------------------------------------ */
+.carte{background:var(--carte);border:1px solid var(--bord);border-radius:16px;
+  padding:1.15rem 1.25rem;box-shadow:var(--ombre)}
+.carte+.carte{margin-top:.8rem}
+
+/* Le solde : le seul endroit ou l'on se permet un degrade. */
+.heros{background:var(--carte);border:1px solid var(--bord);border-radius:20px;
+  padding:1.6rem 1.5rem;box-shadow:var(--ombre);position:relative;overflow:hidden}
+.heros::after{content:"";position:absolute;inset:auto -30% -70% auto;width:70%;aspect-ratio:1;
+  background:radial-gradient(circle,var(--accent-fond),transparent 70%);opacity:.7;pointer-events:none}
+.heros .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.11em;color:var(--tenu);
+  font-weight:600}
+.gros{font-family:var(--mono);font-size:clamp(2.2rem,9vw,3.4rem);line-height:1.02;
+  letter-spacing:-.045em;font-variant-numeric:tabular-nums;display:inline-block;
+  word-break:break-all;font-weight:600;
+  background:linear-gradient(100deg,var(--texte) 30%,var(--accent));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+/* Le degre de texte se peint sur `.gros` : un enfant laisse a
+   `color:transparent` n'aurait aucun fond a decouper et disparaitrait. Les
+   centimes reprennent donc une couleur pleine, explicitement. */
+.centimes{font-size:.52em;letter-spacing:-.02em;color:var(--tenu);
+  -webkit-text-fill-color:var(--tenu)}
+.unite{font-family:var(--mono);font-size:.78rem;color:var(--tenu);margin-left:.5rem;
+  letter-spacing:.08em;font-weight:600}
+.heros .n{color:var(--doux);font-size:.86rem;margin-top:.5rem;position:relative;z-index:1}
 
 .grille{display:grid;gap:.7rem;grid-template-columns:1fr}
-@media(min-width:560px){.grille{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}}
-.tuile{background:var(--carte);border:1px solid var(--bord);border-radius:6px;padding:.8rem .95rem}
-.tuile .k{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--tenu)}
-.tuile .v{font-size:1.15rem;font-family:ui-monospace,monospace;margin-top:.2rem;
-  font-variant-numeric:tabular-nums;word-break:break-all}
-.tuile .n{font-size:.75rem;color:var(--doux);margin-top:.25rem}
-.tuile.forte{border-color:var(--bord-fort)}
-.gros{font-family:ui-monospace,monospace;font-size:2rem;line-height:1.15;letter-spacing:-.02em;
-  font-variant-numeric:tabular-nums;display:inline-block;word-break:break-all}
-@media(min-width:560px){.gros{font-size:2.4rem}}
-.gros .centimes{font-size:.55em;color:var(--doux)}
-.unite{font-size:.85rem;color:var(--doux);margin-left:.35rem}
+@media(min-width:560px){.grille{grid-template-columns:repeat(auto-fit,minmax(196px,1fr))}}
+.tuile{background:var(--carte);border:1px solid var(--bord);border-radius:14px;
+  padding:.85rem 1rem;box-shadow:var(--ombre)}
+.tuile .k{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:var(--tenu);
+  font-weight:600}
+.tuile .v{font-size:1.1rem;font-family:var(--mono);margin-top:.25rem;font-weight:600;
+  font-variant-numeric:tabular-nums;word-break:break-all;letter-spacing:-.02em}
+.tuile .n{font-size:.75rem;color:var(--doux);margin-top:.3rem}
+.tuile.forte{border-color:var(--accent);background:var(--carte-2)}
+.tuile.forte .v{color:var(--accent)}
 
-table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:.8rem}
-th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--bord);
-  font-variant-numeric:tabular-nums;white-space:nowrap}
-th{color:var(--tenu);font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;
-  border-bottom:1px solid var(--bord-fort)}
-tbody tr:hover{background:var(--accent-fond)}
-.defile{overflow-x:auto;background:var(--carte);border:1px solid var(--bord);border-radius:6px}
-.mono{font-family:ui-monospace,monospace}
-.coupe{max-width:18ch;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom}
-/* Une case sans valeur porte un tiret, pas un zero : un zero se lirait comme
-   un chiffre mesure. Un montant minore porte la couleur d'alerte, pour qu'on
-   ne le lise pas comme un fait. */
-.vide{color:var(--tenu)}
-.minore{color:var(--alerte)}
+/* ---- Le minage --------------------------------------------------------- */
+.mineur{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+.mineur .titre{flex:1;min-width:11rem}
+.mineur .titre h3{margin:0}
+.mineur .titre p{margin:.15rem 0 0;color:var(--tenu);font-size:.83rem}
+.bascule{position:relative;width:3.4rem;height:1.95rem;border-radius:999px;flex:0 0 auto;
+  border:1px solid var(--bord-fort);background:var(--carte-2);cursor:pointer;padding:0;
+  transition:background .18s,border-color .18s}
+.bascule i{position:absolute;top:.22rem;left:.24rem;width:1.4rem;height:1.4rem;border-radius:50%;
+  background:var(--tenu);transition:transform .18s,background .18s}
+.bascule[aria-pressed="true"]{background:var(--accent);border-color:var(--accent)}
+.bascule[aria-pressed="true"] i{transform:translateX(1.42rem);background:#04120d}
+.bascule:disabled{opacity:.4;cursor:not-allowed}
+.bascule:focus-visible{outline:3px solid var(--accent-fond);outline-offset:2px}
+@media(prefers-reduced-motion:reduce){.bascule,.bascule i{transition:none}}
 
-.avert{background:var(--carte);border:1px solid var(--bord);border-left:3px solid var(--alerte);
-  border-radius:5px;padding:.85rem .95rem;margin:.8rem 0}
-.avert h3{margin:0 0 .4rem;font-size:.76rem;text-transform:uppercase;letter-spacing:.06em;color:var(--alerte)}
-.avert p{margin:0 0 .5rem;font-size:.88rem;color:var(--doux)}
-.avert p:last-child{margin-bottom:0}
-.note{background:var(--carte);border:1px solid var(--bord);border-left:3px solid var(--accent);
-  border-radius:5px;padding:.85rem .95rem;margin:.8rem 0;font-size:.88rem;color:var(--doux)}
-.note h3{margin:0 0 .4rem;font-size:.76rem;text-transform:uppercase;letter-spacing:.06em;color:var(--accent)}
-.note p{margin:0 0 .5rem}
-.note p:last-child{margin-bottom:0}
+.debit{display:flex;align-items:baseline;gap:.4rem;margin-top:1rem}
+.debit .n{font-family:var(--mono);font-size:2rem;font-weight:600;letter-spacing:-.04em;
+  font-variant-numeric:tabular-nums;color:var(--accent)}
+.debit .u{font-size:.8rem;color:var(--tenu)}
+.courbe{width:100%;height:52px;margin-top:.5rem;display:block}
+.courbe path{fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.courbe .aire{fill:var(--accent-fond);stroke:none}
 
-label{display:block;font-size:.74rem;text-transform:uppercase;letter-spacing:.05em;
-  color:var(--tenu);margin:.9rem 0 .3rem}
-input{
-  width:100%;background:var(--carte);color:var(--texte);border:1px solid var(--bord-fort);
-  border-radius:5px;padding:.6rem .7rem;font:inherit;font-family:ui-monospace,monospace;
-  font-size:.92rem;
-}
-input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
-.aide{font-size:.78rem;color:var(--tenu);margin-top:.25rem}
-button.action{
-  appearance:none;background:var(--accent);color:var(--fond);border:1px solid var(--accent);
-  border-radius:5px;padding:.6rem 1rem;font:inherit;font-size:.9rem;font-weight:600;
-  cursor:pointer;margin-top:1rem;width:100%;
-}
-@media(min-width:560px){button.action{width:auto}}
-button.action:hover{filter:brightness(1.08)}
-button.action:disabled{opacity:.5;cursor:not-allowed}
-button.discret{
-  appearance:none;background:var(--carte);color:var(--texte);border:1px solid var(--bord-fort);
-  border-radius:5px;padding:.6rem 1rem;font:inherit;font-size:.9rem;cursor:pointer;
-  margin-top:1rem;width:100%;
-}
-@media(min-width:560px){button.discret{width:auto}}
-.boutons{display:flex;flex-direction:column;gap:.5rem}
-@media(min-width:560px){.boutons{flex-direction:row;align-items:center}}
+/* ---- Adresses ---------------------------------------------------------- */
+.adresse{background:var(--carte);border:1px solid var(--bord);border-radius:14px;
+  padding:.8rem .95rem;display:flex;gap:.75rem;align-items:center;box-shadow:var(--ombre)}
+.adresse+.adresse{margin-top:.55rem}
+.adresse .txt{flex:1;min-width:0;font-family:var(--mono);font-size:.82rem;
+  word-break:break-all;line-height:1.45}
+.adresse .rang{font-family:var(--mono);font-size:.68rem;color:var(--tenu);
+  border:1px solid var(--bord);border-radius:7px;padding:.15rem .4rem;flex:0 0 auto}
+.adresse.neuve{border-color:var(--accent);background:var(--carte-2)}
 
-.adresse{background:var(--carte);border:1px solid var(--bord);border-radius:6px;
-  padding:1rem;margin-top:.8rem}
-.adresse .champs{font-family:ui-monospace,monospace;font-size:1.02rem;line-height:1.9;
-  word-break:break-all;letter-spacing:.01em}
-@media(min-width:560px){.adresse .champs{font-size:1.2rem}}
-.adresse .champs .groupe{display:inline-block;margin-right:.55em;background:var(--accent-fond);
-  color:var(--accent);padding:.05em .3em;border-radius:3px}
-button.copier{
-  appearance:none;background:none;border:1px solid var(--bord-fort);color:var(--doux);
-  border-radius:4px;padding:.3rem .7rem;font:inherit;font-size:.78rem;cursor:pointer;margin-top:.7rem;
-}
-button.copier:hover{color:var(--texte);border-color:var(--texte)}
+/* ---- Controles --------------------------------------------------------- */
+label{display:block;font-size:.8rem;font-weight:600;margin:1rem 0 .35rem;color:var(--doux)}
+input[type=text],input[type=password]{
+  width:100%;padding:.7rem .85rem;font:inherit;font-family:var(--mono);font-size:.9rem;
+  color:var(--texte);background:var(--carte-2);border:1.5px solid var(--bord);
+  border-radius:11px;outline:none}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-fond)}
+.boutons{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1rem}
+button.action,button.discret,button.plat{
+  font:inherit;font-weight:600;font-size:.9rem;border-radius:11px;cursor:pointer;
+  padding:.68rem 1.1rem;border:1.5px solid transparent;transition:filter .15s}
+button.action{background:var(--accent);color:#04120d;border-color:var(--accent)}
+button.action:hover:not(:disabled){filter:brightness(1.08)}
+button.action:disabled{opacity:.45;cursor:not-allowed}
+button.discret{background:transparent;color:var(--doux);border-color:var(--bord-fort)}
+button.discret:hover{color:var(--texte);border-color:var(--tenu)}
+button.plat{background:var(--carte-2);color:var(--doux);border-color:var(--bord);
+  padding:.42rem .7rem;font-size:.78rem}
+button.plat:hover{color:var(--texte)}
+button:focus-visible{outline:3px solid var(--accent-fond);outline-offset:2px}
+a.plat{color:var(--accent);text-decoration:none;border-bottom:1px solid var(--accent-fond)}
+a.plat:hover{border-bottom-color:var(--accent)}
 
-.recap{background:var(--carte);border:1px solid var(--bord-fort);border-radius:6px;
-  padding:.2rem .95rem;margin-top:.8rem}
-.recap .l{display:flex;justify-content:space-between;gap:1rem;padding:.6rem 0;
-  border-bottom:1px solid var(--bord);font-size:.88rem;align-items:baseline}
-.recap .l:last-child{border-bottom:none}
-.recap .l .k{color:var(--tenu);flex:0 0 auto;font-size:.78rem;text-transform:uppercase;letter-spacing:.05em}
-.recap .l .v{font-family:ui-monospace,monospace;text-align:right;word-break:break-all;
-  font-variant-numeric:tabular-nums}
-.recap .l.total .v{font-weight:700;font-size:1.05rem}
+/* ---- Encarts ----------------------------------------------------------- */
+.note,.avert{border-radius:14px;padding:.9rem 1.05rem;margin:1rem 0;font-size:.87rem}
+.note{background:var(--carte-2);border:1px solid var(--bord);color:var(--doux)}
+.avert{background:var(--alerte-fond);border-left:3px solid var(--alerte);color:var(--doux)}
+.avert h3{color:var(--alerte)}
+.note h3{color:var(--texte)}
+.note p:last-child,.avert p:last-child{margin-bottom:0}
 
-.badge{display:inline-block;padding:.05rem .4rem;border-radius:3px;font-size:.72rem;
-  background:var(--accent-fond);color:var(--accent)}
+/* ---- Tableau ----------------------------------------------------------- */
+.defile{overflow-x:auto;border:1px solid var(--bord);border-radius:14px;background:var(--carte);
+  box-shadow:var(--ombre)}
+table{width:100%;border-collapse:collapse;font-size:.83rem}
+th,td{text-align:left;padding:.6rem .8rem;border-bottom:1px solid var(--bord);white-space:nowrap}
+thead th{font-size:.66rem;text-transform:uppercase;letter-spacing:.08em;color:var(--tenu);
+  font-weight:600;background:var(--carte-2)}
+tbody tr:last-child td{border-bottom:none}
+td{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.badge{display:inline-block;padding:.1rem .45rem;border-radius:6px;font-size:.7rem;
+  font-weight:600;background:var(--accent-fond);color:var(--accent);font-family:var(--sans)}
 .badge.attente{background:var(--alerte-fond);color:var(--alerte)}
-footer{margin-top:2.5rem;padding-top:.9rem;border-top:1px solid var(--bord);
+.badge.gris{background:var(--carte-2);color:var(--tenu)}
+
+.recap{background:var(--carte-2);border:1px solid var(--bord);border-radius:14px;
+  padding:1rem;font-family:var(--mono);font-size:.85rem;word-break:break-all}
+footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--bord);
   color:var(--tenu);font-size:.76rem}
-code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border-radius:3px;
-  font-size:.85em;font-family:ui-monospace,monospace}
-.err{color:var(--alerte)}
+code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;border-radius:5px;
+  font-size:.85em;font-family:var(--mono)}
+.err{color:var(--danger)}
 .ok{color:var(--accent)}
 </style>
 </head>
@@ -203,12 +313,43 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
 <div class="enveloppe">
 
 <header>
-  <h1>Q21 <span class="etat" id="reseau">…</span></h1>
-  <div class="sous">
-    Portefeuille servi par <strong>votre nœud</strong>, en local. Aucune ressource
-    externe n'est chargée, et rien n'est écrit dans le navigateur.
+  <div class="barre">
+    <div class="logo">
+      <span class="pastille" aria-hidden="true">Q21</span>
+      <h1>Portefeuille <span class="etat" id="reseau">…</span></h1>
+    </div>
+    <div class="pousse pouls">
+      <span class="point" id="point-sync"></span>
+      <span id="pouls-texte">connexion…</span>
+    </div>
   </div>
+  <div class="jauge-sync"><i id="jauge-sync"></i></div>
 </header>
+
+<div class="corps">
+
+<nav class="onglets" id="onglets" aria-label="Sections du portefeuille">
+  <button type="button" data-vue="solde" class="actif">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v12H3z"/><path d="M3 7l4-3h10l4 3"/><circle cx="16" cy="13" r="1.6"/></svg>
+    Solde</button>
+  <button type="button" data-vue="miner">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg>
+    Miner</button>
+  <button type="button" data-vue="recevoir">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v13"/><path d="M6 12l6 6 6-6"/><path d="M4 20h16"/></svg>
+    Recevoir</button>
+  <button type="button" data-vue="envoyer">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V7"/><path d="M6 12l6-6 6 6"/><path d="M4 4h16"/></svg>
+    Envoyer</button>
+  <button type="button" data-vue="historique">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+    Activité</button>
+  <button type="button" data-vue="infos">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>
+    Infos</button>
+</nav>
+
+<main>
 
 <div id="panneau-jeton" class="avert" hidden>
   <h3>Jeton d'accès requis</h3>
@@ -234,18 +375,10 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
   <p id="sync-detail"></p>
 </div>
 
-<nav class="onglets" id="onglets">
-  <button type="button" data-vue="solde" class="actif">Solde</button>
-  <button type="button" data-vue="recevoir">Recevoir</button>
-  <button type="button" data-vue="envoyer">Envoyer</button>
-  <button type="button" data-vue="historique">Historique</button>
-  <button type="button" data-vue="infos">Informations</button>
-</nav>
-
 <section class="vue" id="vue-solde">
-  <h2>Dépensable</h2>
-  <div class="tuile forte">
-    <div class="v" id="solde-gros">…</div>
+  <div class="heros">
+    <div class="k">Dépensable</div>
+    <div id="solde-gros">…</div>
     <div class="n" id="solde-note">Chargement…</div>
   </div>
   <h2>Détail</h2>
@@ -261,18 +394,64 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
   </div>
 </section>
 
+<section class="vue" id="vue-miner" hidden>
+  <h2>Minage</h2>
+  <div class="carte">
+    <div class="mineur">
+      <div class="titre">
+        <h3 id="minage-titre">Votre machine ne cherche pas</h3>
+        <p id="minage-sous">Le minage cherche le prochain bloc. Il utilise tous les cœurs.</p>
+      </div>
+      <button type="button" class="bascule" id="bascule-minage" aria-pressed="false"
+              aria-label="Activer le minage"><i></i></button>
+    </div>
+    <div class="debit">
+      <span class="n" id="minage-debit">0</span>
+      <span class="u">tentatives par seconde</span>
+    </div>
+    <svg class="courbe" id="courbe-minage" viewBox="0 0 300 52" preserveAspectRatio="none"
+         role="img" aria-label="Débit de minage des dernières minutes"></svg>
+    <div class="grille" style="margin-top:1rem">
+      <div class="tuile"><div class="k">Blocs trouvés</div><div class="v" id="minage-blocs">0</div>
+        <div class="n">depuis le lancement</div></div>
+      <div class="tuile"><div class="k">Tentatives</div><div class="v" id="minage-total">0</div>
+        <div class="n">depuis le lancement</div></div>
+      <div class="tuile"><div class="k">Blocs reçus</div><div class="v" id="vitesse-sync">0</div>
+        <div class="n">par seconde, depuis le réseau</div></div>
+    </div>
+  </div>
+  <div class="note">
+    <h3>Ce que fait votre machine quand ce bouton est allumé</h3>
+    <p>
+      Elle fouille une table de deux gigaoctets en mémoire, des centaines de
+      milliers de fois par seconde, à la recherche d'une valeur qui satisfasse
+      la difficulté du moment. C'est une loterie&nbsp;: on ne gagne pas à tous
+      les coups, on gagne d'autant plus souvent qu'on cherche vite.
+    </p>
+    <p>
+      La récompense d'un bloc trouvé est versée à une adresse de ce
+      portefeuille. Elle n'est dépensable qu'après le délai de maturation.
+    </p>
+  </div>
+</section>
+
 <section class="vue" id="vue-recevoir" hidden>
-  <h2>Adresse de réception</h2>
+  <h2>Recevoir</h2>
   <p class="aide">
     Chaque paiement mérite une adresse neuve. Réutiliser une adresse ne coûte
     rien au protocole, mais relie publiquement vos paiements entre eux.
   </p>
-  <button type="button" class="action" id="bouton-adresse">Créer une adresse de réception</button>
+  <div class="boutons">
+    <button type="button" class="action" id="bouton-adresse">Nouvelle adresse</button>
+  </div>
   <div id="zone-adresse"></div>
+  <h2>Vos adresses</h2>
+  <div id="liste-adresses"></div>
 </section>
 
 <section class="vue" id="vue-envoyer" hidden>
   <h2>Envoyer du Q21</h2>
+  <div class="carte">
   <form id="forme-envoi" autocomplete="off">
     <label for="champ-adresse">Adresse du destinataire</label>
     <input type="text" id="champ-adresse" placeholder="tq21…" spellcheck="false" autocomplete="off">
@@ -299,6 +478,7 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
       <button type="submit" class="action" id="bouton-verifier">Vérifier</button>
     </div>
   </form>
+  </div>
 
   <div id="confirmation" hidden>
     <h2>Confirmer l'envoi</h2>
@@ -321,7 +501,7 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
 </section>
 
 <section class="vue" id="vue-historique" hidden>
-  <h2>Mouvements</h2>
+  <h2>Activité</h2>
   <div id="note-historique"></div>
   <div class="defile">
     <table>
@@ -363,17 +543,17 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
   <h2>Fermer</h2>
   <div class="note">
     <p>
-      Ce portefeuille est servi par un nœud qui tourne dans la fenêtre noire
-      ouverte par le lanceur. Ce bouton lui demande de s'arrêter proprement&nbsp;:
-      il écrit le réservoir de transactions en attente, l'instantané de l'état et
-      le portefeuille, puis rend la main. La fenêtre se referme d'elle-même.
+      Ce portefeuille est servi par un nœud qui tourne dans la fenêtre ouverte
+      par le lanceur. Ce bouton lui demande de s'arrêter proprement&nbsp;: il
+      écrit le réservoir de transactions en attente, l'instantané de l'état et
+      le portefeuille, puis rend la main.
     </p>
     <p>
-      C'est la façon recommandée d'arrêter. Fermer la fenêtre noire fonctionne
-      aussi. <strong>Ctrl-C</strong> fonctionne également, mais Windows pose
-      alors sa propre question — «&nbsp;Terminer le programme de commandes
-      (O/N)&nbsp;?&nbsp;»&nbsp;: répondez <strong>O</strong>, tout est déjà
-      enregistré à ce moment-là.
+      C'est la façon recommandée d'arrêter. Fermer la fenêtre du lanceur
+      fonctionne aussi. <strong>Ctrl-C</strong> fonctionne également, mais
+      Windows pose alors sa propre question —
+      «&nbsp;Terminer le programme de commandes (O/N)&nbsp;?&nbsp;»&nbsp;:
+      répondez <strong>O</strong>, tout est déjà enregistré à ce moment-là.
     </p>
     <div class="boutons">
       <button type="button" class="action" id="bouton-fermer" style="margin-top:0">Fermer le portefeuille</button>
@@ -389,11 +569,14 @@ code{background:var(--accent-fond);color:var(--accent);padding:.1em .35em;border
   </p>
   API JSON-RPC sur <code>POST /rpc</code> — <code>listmethods</code> énumère les
   méthodes disponibles. Le jeton d'accès ne quitte pas cette page&nbsp;: rien
-  n'est écrit dans le navigateur. Code de recherche, non audité&nbsp;: ne protège
-  aucune valeur réelle.
+  n'est écrit dans le navigateur en dehors de lui. Code de recherche, non
+  audité&nbsp;: ne protège aucune valeur réelle.
 </footer>
 
+</main>
 </div>
+</div>
+
 <script>
 "use strict";
 
@@ -580,7 +763,7 @@ function gros(q21){
 // Onglets
 // ---------------------------------------------------------------------------
 
-const VUES = ["solde","recevoir","envoyer","historique","infos"];
+const VUES = ["solde","miner","recevoir","envoyer","historique","infos"];
 
 function montrer(nom){
   for (const v of VUES){
@@ -592,6 +775,8 @@ function montrer(nom){
   if (nom === "envoyer" && !document.getElementById("champ-frais").value) estimer();
   if (nom === "historique") historique();
   if (nom === "infos") infos();
+  if (nom === "recevoir") listerAdresses();
+  if (nom === "miner") minage();
 }
 
 document.getElementById("onglets").addEventListener("click", ev => {
@@ -632,6 +817,7 @@ async function rafraichir(){
     ]);
     document.getElementById("erreur").hidden = true;
     document.getElementById("reseau").textContent = info.reseau;
+    pouls(sync);
 
     const bandeau = document.getElementById("bandeau-sync");
     if (sync.synchronise){
@@ -1026,6 +1212,184 @@ document.getElementById("bouton-fermer").addEventListener("click", async () => {
 });
 
 rafraichir();
+
+// ---------------------------------------------------------------------------
+// Le pouls : etat du reseau et vitesse de synchronisation
+// ---------------------------------------------------------------------------
+//
+// La vitesse de reception se calcule ici, et non dans le noeud : c'est une
+// derivee de deux mesures de hauteur, et le navigateur en a deja deux sous la
+// main. Demander au noeud de la tenir aurait ajoute de l'etat partage a un
+// programme qui manipule des fonds, pour afficher un chiffre.
+
+let derniereHauteur = null, derniereMesure = 0, vitesseBlocs = 0;
+
+function pouls(sync){
+  const t = Date.now();
+  if (derniereHauteur !== null && t > derniereMesure){
+    const dh = Number(sync.hauteur) - derniereHauteur;
+    const dt = (t - derniereMesure) / 1000;
+    // Une moyenne glissante : sans elle le chiffre saute a chaque tour.
+    if (dt > 0) vitesseBlocs = vitesseBlocs * 0.6 + (dh / dt) * 0.4;
+  }
+  derniereHauteur = Number(sync.hauteur);
+  derniereMesure = t;
+
+  const pt = document.getElementById("point-sync");
+  const tx = document.getElementById("pouls-texte");
+  const jauge = document.getElementById("jauge-sync");
+  const cible = Number(sync.hauteur_reseau) || 1;
+  const part = Math.max(0, Math.min(100, (Number(sync.hauteur) / cible) * 100));
+  jauge.style.width = (sync.synchronise ? 100 : part) + "%";
+
+  pt.className = "point " + (sync.synchronise ? "vert" : (Number(sync.pairs) > 0 ? "orange" : ""));
+  tx.textContent = sync.synchronise
+    ? Number(sync.pairs) + " pair(s) · à jour · bloc " + sync.hauteur
+    : (Number(sync.pairs) === 0
+        ? "aucun pair · bloc " + sync.hauteur
+        : sync.blocs_restants + " bloc(s) à rattraper");
+
+  const v = document.getElementById("vitesse-sync");
+  if (v) v.textContent = (vitesseBlocs < 0.05 ? "0" : vitesseBlocs.toFixed(1));
+}
+
+// ---------------------------------------------------------------------------
+// Miner
+// ---------------------------------------------------------------------------
+//
+// Le noeud tient l'interrupteur et les compteurs ; cette vue ne fait que les
+// lire et les basculer. Le debit affiche est celui que le noeud mesure sur une
+// fenetre d'une seconde — pas une moyenne depuis le lancement, qui mettrait
+// plusieurs minutes a refleter un arret.
+
+const HISTO_DEBIT = [];
+let minageEnCours = false, minageTimer = null;
+
+function formatDebit(n){
+  n = Number(n) || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + " M";
+  if (n >= 1000) return (n / 1000).toFixed(1) + " k";
+  return String(Math.round(n));
+}
+
+function courbe(valeurs){
+  const svg = document.getElementById("courbe-minage");
+  if (!svg) return;
+  const L = 300, H = 52, n = valeurs.length;
+  if (n < 2){ svg.innerHTML = ""; return; }
+  const max = Math.max.apply(null, valeurs) || 1;
+  let d = "";
+  for (let i = 0; i < n; i++){
+    const x = (i / (n - 1)) * L;
+    const y = H - 3 - (valeurs[i] / max) * (H - 8);
+    d += (i ? " L " : "M ") + x.toFixed(1) + " " + y.toFixed(1);
+  }
+  const aire = d + " L " + L + " " + H + " L 0 " + H + " Z";
+  // Deux chemins construits ici, a partir de nombres : rien de ce qui vient du
+  // noeud n'entre dans ce balisage autrement que comme coordonnee calculee.
+  svg.innerHTML = '<path class="aire" d="' + aire + '"></path><path d="' + d + '"></path>';
+}
+
+function peindreMinage(etat){
+  const actif = !!etat.actif;
+  const b = document.getElementById("bascule-minage");
+  b.setAttribute("aria-pressed", actif ? "true" : "false");
+  b.disabled = !etat.possible;
+  b.setAttribute("aria-label", actif ? "Arrêter le minage" : "Activer le minage");
+  document.getElementById("minage-titre").textContent = etat.possible
+    ? (actif ? "Votre machine cherche un bloc" : "Votre machine ne cherche pas")
+    : "Ce nœud ne peut pas miner";
+  document.getElementById("minage-sous").textContent = etat.possible
+    ? (actif ? "Elle utilise tous les cœurs disponibles."
+             : "Le minage cherche le prochain bloc. Il utilise tous les cœurs.")
+    : "Miner demande un portefeuille : sans lui, la récompense n'irait nulle part.";
+  document.getElementById("minage-debit").textContent = formatDebit(etat.essais_par_seconde);
+  document.getElementById("minage-blocs").textContent = String(etat.blocs_trouves);
+  document.getElementById("minage-total").textContent = formatDebit(etat.essais_total);
+  HISTO_DEBIT.push(Number(etat.essais_par_seconde) || 0);
+  while (HISTO_DEBIT.length > 60) HISTO_DEBIT.shift();
+  courbe(HISTO_DEBIT);
+}
+
+async function minage(){
+  try{
+    peindreMinage(await appel("getminage"));
+  }catch(e){ /* le rafraichissement general signale deja la panne */ }
+}
+
+document.getElementById("bascule-minage").addEventListener("click", async () => {
+  if (minageEnCours) return;
+  minageEnCours = true;
+  const b = document.getElementById("bascule-minage");
+  const vers = b.getAttribute("aria-pressed") !== "true";
+  try{
+    peindreMinage(await appel("setminage", {actif: vers}));
+  }catch(e){
+    signalerErreur("Le minage n'a pas pu être " + (vers ? "activé" : "arrêté") + " : " + e.message);
+  }finally{
+    minageEnCours = false;
+  }
+});
+
+// La vue du minage se rafraichit plus souvent que le reste : un debit qui
+// bouge toutes les cinq secondes ne ressemble pas a une mesure.
+minageTimer = setInterval(() => {
+  if (!document.getElementById("vue-miner").hidden) minage();
+}, 1000);
+
+// ---------------------------------------------------------------------------
+// Toutes les adresses
+// ---------------------------------------------------------------------------
+
+// `listaddresses` rend un **tableau** d'objets `{adresse, indice, consommee}`,
+// et non un objet portant une liste de chaines. La premiere version de cette
+// fonction supposait la seconde forme : elle affichait « aucune adresse » sur un
+// portefeuille qui en comptait cent quarante-neuf. C'est le genre de defaut
+// qu'aucune relecture ne trouve et qu'un essai contre un vrai noeud sort en
+// trois secondes.
+const ADRESSES_MONTREES = 25;
+
+async function listerAdresses(){
+  const zone = document.getElementById("liste-adresses");
+  try{
+    const r = await appel("listaddresses");
+    const liste = Array.isArray(r) ? r : (r.adresses || []);
+    if (!liste.length){
+      zone.innerHTML = '<div class="note"><p>Aucune adresse encore dérivée. ' +
+        'Le bouton ci-dessus en crée une.</p></div>';
+      return;
+    }
+    // Les plus recentes en tete : c'est celle qu'on vient de creer qu'on cherche.
+    const recentes = liste.slice().reverse();
+    const lignes = recentes.slice(0, ADRESSES_MONTREES).map(e => {
+      const a = (e && typeof e === "object") ? e.adresse : e;
+      const indice = (e && typeof e === "object" && e.indice !== undefined) ? e.indice : "";
+      const servie = !!(e && typeof e === "object" && e.consommee);
+      return '<div class="adresse">' +
+        '<span class="rang">#' + ech(String(indice)) + '</span>' +
+        '<span class="txt">' + ech(String(a)) + '</span>' +
+        (servie ? '<span class="badge gris">servie</span>' : '') +
+        '<button type="button" class="plat" data-copier="' + ech(String(a)) + '">Copier</button>' +
+        '</div>';
+    });
+    if (recentes.length > ADRESSES_MONTREES){
+      lignes.push('<p class="aide">' + ech(String(recentes.length - ADRESSES_MONTREES)) +
+        ' adresse(s) plus ancienne(s) ne sont pas affichée(s). Elles restent ' +
+        'valides et leur solde est compté.</p>');
+    }
+    zone.innerHTML = lignes.join("");
+  }catch(e){
+    zone.innerHTML = '<div class="avert"><p>' + ech(e.message) + '</p></div>';
+  }
+}
+
+// Un seul ecouteur pour toute la liste : attacher un gestionnaire par ligne
+// laisse des fuites a chaque rafraichissement.
+document.getElementById("liste-adresses").addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-copier]");
+  if (b) copier(b.dataset.copier, b);
+});
+
 </script>
 </body>
 </html>
@@ -1229,15 +1593,48 @@ mod tests {
     }
 
     /// L'arithmetique monetaire ne touche jamais un flottant.
+    ///
+    /// # Pourquoi l'epreuve a du s'affiner
+    ///
+    /// Elle bannissait `toFixed` du script entier. C'etait juste tant que la
+    /// page n'affichait que de la monnaie ; le debit de minage et la vitesse de
+    /// reception des blocs sont des grandeurs continues, mesurees, et les
+    /// arrondir est exactement ce qu'il faut faire — les compter en entiers ne
+    /// dirait rien de plus et se lirait moins bien.
+    ///
+    /// L'invariant reel n'a pas bouge : **aucun flottant ne touche un montant**.
+    /// L'epreuve le verifie maintenant a la ligne, en cherchant un `toFixed` qui
+    /// cotoie un mot du vocabulaire monetaire. Un `parseFloat` reste interdit
+    /// partout : il n'a aucun usage legitime ici.
     #[test]
     fn aucun_flottant_sur_un_montant() {
         let s = script();
-        for interdit in ["parseFloat", "Number(m.", "toFixed", "+ 0.5"] {
+        for interdit in ["parseFloat", "Number(m.", "+ 0.5"] {
             assert!(
                 !s.contains(interdit),
                 "un montant passe par un flottant : {interdit}"
             );
         }
+        const MONNAIE: [&str; 8] = [
+            "unites", "q21", "solde", "montant", "frais", "depensable", "immature", "recu",
+        ];
+        let mut vus = 0;
+        for (n, ligne) in s.lines().enumerate() {
+            if !ligne.contains("toFixed") {
+                continue;
+            }
+            vus += 1;
+            let bas = ligne.to_lowercase();
+            for mot in MONNAIE {
+                assert!(
+                    !bas.contains(mot),
+                    "ligne {} : un montant passe par toFixed — {}",
+                    n + 1,
+                    ligne.trim()
+                );
+            }
+        }
+        assert!(vus > 0, "aucun toFixed : l'epreuve ne verifie plus rien");
         assert!(s.contains("BigInt"));
         assert!(s.contains("const UNITES_PAR_Q21 = 100000000n;"));
     }
@@ -1503,6 +1900,105 @@ mod tests {
         assert!(
             PAGE.contains("Terminer le programme de commandes"),
             "la page n'explique pas la question que pose Windows apres un Ctrl-C"
+        );
+    }
+
+    /// Les six vues existent, et le minage en fait partie.
+    ///
+    /// L'epreuve precedente en comptait cinq. Elle a ete elargie, pas
+    /// remplacee : une vue qui disparait est une regression, une vue qui
+    /// s'ajoute doit etre declaree ici.
+    #[test]
+    fn les_six_vues_existent() {
+        for v in ["solde", "miner", "recevoir", "envoyer", "historique", "infos"] {
+            assert!(
+                PAGE.contains(&format!(r#"id="vue-{v}""#)),
+                "vue absente du balisage : {v}"
+            );
+            assert!(
+                PAGE.contains(&format!(r#"data-vue="{v}""#)),
+                "vue absente de la navigation : {v}"
+            );
+        }
+        assert!(
+            script().contains(r#"const VUES = ["solde","miner","recevoir","envoyer","historique","infos"];"#),
+            "la liste des vues du script ne correspond pas au balisage"
+        );
+    }
+
+    /// Le minage se commande, et rien d'autre ne peut le commander.
+    #[test]
+    fn le_minage_se_commande_depuis_la_page() {
+        let s = script();
+        assert!(s.contains(r#"appel("setminage", {actif: vers})"#), "pas de bascule");
+        assert!(s.contains(r#"appel("getminage")"#), "pas de lecture d'etat");
+        // Le bouton reflete l'etat rendu par le nœud, jamais l'etat suppose :
+        // afficher « actif » sur la foi d'un clic ferait mentir la page si le
+        // nœud refusait.
+        assert!(
+            s.contains("peindreMinage(await appel(\"setminage\""),
+            "l'affichage du minage ne suit pas la reponse du nœud"
+        );
+        // Un nœud sans portefeuille ne peut pas miner : le bouton se desactive.
+        assert!(s.contains("b.disabled = !etat.possible"), "bouton toujours actif");
+    }
+
+    /// Le trace du debit ne construit son balisage qu'a partir de nombres.
+    ///
+    /// C'est le seul endroit de la page ou l'on ecrit du SVG a la volee. Si une
+    /// valeur venue du nœud pouvait s'y glisser telle quelle, elle y entrerait
+    /// comme balisage.
+    #[test]
+    fn la_courbe_ne_recoit_que_des_nombres() {
+        let s = script();
+        let d = s.find("function courbe(").expect("la fonction courbe");
+        let f = s[d..].find("\n}").expect("sa fin") + d;
+        let corps = &s[d..f];
+        assert!(
+            corps.contains("toFixed(1)"),
+            "les coordonnees ne sont pas forcees en nombre"
+        );
+        for interdit in ["ech(", "etat.", "adresse"] {
+            assert!(!corps.contains(interdit), "valeur non numerique dans la courbe : {interdit}");
+        }
+    }
+
+    /// La liste des adresses echappe chaque adresse, deux fois.
+    ///
+    /// Une adresse arrive du nœud. Elle est ecrite dans le texte visible **et**
+    /// dans un attribut `data-`, et les deux voies doivent etre echappees : un
+    /// attribut mal ferme est une injection au meme titre qu'un element.
+    #[test]
+    fn la_liste_des_adresses_echappe_tout() {
+        let s = script();
+        let d = s.find("async function listerAdresses(").expect("la fonction");
+        let f = s[d..].find("\n}").expect("sa fin") + d;
+        let corps = &s[d..f];
+        assert_eq!(
+            corps.matches("ech(String(a))").count(),
+            2,
+            "une adresse entre dans la page sans passer par ech"
+        );
+        assert!(
+            corps.contains("ech(e.message)"),
+            "un message d'erreur du nœud entre sans echappement"
+        );
+    }
+
+    /// La vitesse de reception se calcule dans la page, pas dans le nœud.
+    #[test]
+    fn la_vitesse_de_synchronisation_est_une_derivee_locale() {
+        let s = script();
+        assert!(s.contains("function pouls(sync)"), "pas de calcul de pouls");
+        assert!(
+            s.contains("vitesseBlocs = vitesseBlocs * 0.6"),
+            "la vitesse n'est pas lissee : elle sauterait a chaque tour"
+        );
+        // Elle ne doit pas etre reclamee au nœud : ce serait de l'etat partage
+        // de plus dans un programme qui manipule des fonds.
+        assert!(
+            !s.contains("vitesse_reseau") && !s.contains("getvitesse"),
+            "la vitesse est demandee au nœud alors qu'elle se derive ici"
         );
     }
 

@@ -60,6 +60,7 @@ pub mod kdf;
 pub mod lamport;
 pub mod memhard;
 pub mod mempool;
+pub mod minage;
 pub mod merkle;
 pub mod net;
 pub mod pow;
