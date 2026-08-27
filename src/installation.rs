@@ -290,12 +290,26 @@ function ecranChoix(){
 }
 
 // --- Ecran : la phrase secrete ------------------------------------------
+// Les deux chemins n'ont pas les memes etapes, et le fil doit le dire. Il
+// affichait celui de la creation pendant une restauration : on venait de saisir
+// son code, et l'ecran annoncait qu'il restait a le decouvrir.
+function etapes(restauration){
+  return restauration
+    ? ["Code de sauvegarde", "Phrase secrète", "Prêt"]
+    : ["Phrase secrète", "Code de sauvegarde", "Prêt"];
+}
+
 function ecranPhrase(restauration){
-  fil(["Phrase secrète", "Code de sauvegarde", "Prêt"], 0);
+  fil(etapes(restauration), restauration ? 1 : 0);
   pied("");
   $("carte").innerHTML =
-    '<div class="marque">Étape 1 sur 3</div>'
+    '<div class="marque">Étape ' + (restauration ? 2 : 1) + ' sur 3</div>'
   + '<h1>Choisissez une phrase secrète</h1>'
+  + (restauration
+      ? '<p>Cette phrase protège le portefeuille <strong>sur cette machine-ci</strong>. '
+      + 'Elle peut être différente de celle que vous aviez ailleurs : elle ne fait pas '
+      + 'partie de votre code de sauvegarde, elle ne fait que chiffrer ce disque.</p>'
+      : '')
   + '<p>Elle chiffre votre portefeuille sur ce disque. Sans elle, quiconque lit le '
   + 'fichier — une sauvegarde, un disque revendu — détient les fonds pour toujours.</p>'
   + '<div class="note"><p><b>Elle ne se récupère pas.</b> Aucun serveur ne la connaît, '
@@ -342,7 +356,7 @@ function ecranPhrase(restauration){
 }
 
 function ecranSansPhrase(){
-  fil(["Phrase secrète", "Code de sauvegarde", "Prêt"], 0);
+  fil(etapes(false), 0);
   $("carte").innerHTML =
     '<div class="marque">Étape 1 sur 3</div>'
   + '<h1>Sans phrase secrète ?</h1>'
@@ -365,7 +379,7 @@ function ecranSansPhrase(){
 
 // --- Ecran : restauration ------------------------------------------------
 function ecranRestaurer(){
-  fil(["Code", "Phrase secrète", "Prêt"], 0);
+  fil(etapes(true), 0);
   pied("");
   $("carte").innerHTML =
     '<div class="marque">Restauration</div>'
@@ -399,13 +413,18 @@ function creer(){
   + '<div class="attente"><span class="rotor"></span><span>Quelques secondes…</span></div>';
 
   appel("creer", {phrase: PHRASE, code: CODE})
-    .then(function(d){ ecranCode(d.code, d.adresse); })
+    .then(function(d){
+      // Restaurer n'est pas creer. On ne demande pas de recopier un code que
+      // l'on vient de taper ; on montre qu'il a ete compris, ce qui est la
+      // seule chose que la personne veut verifier a cet instant.
+      if (CODE) ecranRetrouve(d.code, d.adresse); else ecranCode(d.code, d.adresse);
+    })
     .catch(function(e){ echec(e.message, CODE ? ecranRestaurer : function(){ ecranPhrase(false); }); });
 }
 
 // --- Ecran : le code de sauvegarde --------------------------------------
 function ecranCode(code, adresse){
-  fil(["Phrase secrète", "Code de sauvegarde", "Prêt"], 1);
+  fil(etapes(false), 1);
   pied("");
   // Le code s'affiche en deux moities : l'œil recopie mieux ce qui est
   // decoupe, et la separation ne fait pas partie du code.
@@ -433,6 +452,29 @@ function ecranCode(code, adresse){
   $("suite").onclick = function(){ ecranVerif(code, adresse); };
 }
 
+// --- Ecran : le portefeuille est retrouve --------------------------------
+//
+// Le code affiche est celui que le nœud a redecode. Qu'il soit identique a
+// celui qui vient d'etre tape est la preuve, visible sans rien expliquer, que
+// la bonne graine a ete chargee.
+function ecranRetrouve(code, adresse){
+  fil(etapes(true), 2);
+  pied("");
+  var m = Math.ceil(code.length / 2);
+  $("carte").innerHTML =
+    '<div class="marque">Étape 3 sur 3</div>'
+  + '<h1>Portefeuille retrouvé</h1>'
+  + '<p>Le code a été compris et votre graine est chargée. Vérifiez qu\'il s\'agit '
+  + 'bien du vôtre&nbsp;:</p>'
+  + '<div class="code">' + ech(code.slice(0, m)) + '<br>' + ech(code.slice(m)) + '</div>'
+  + '<div class="note"><p><b>Vos fonds réapparaîtront à mesure que la chaîne '
+  + 'arrive.</b> Le portefeuille redérive vos adresses et y retrouve ce qui leur '
+  + 'appartient — rien n\'est perdu, mais il faut que la synchronisation ait eu '
+  + 'lieu. Sur une chaîne longue, comptez quelques minutes.</p></div>'
+  + '<div class="actions"><button class="p" id="suite">Ouvrir mon portefeuille</button></div>';
+  $("suite").onclick = function(){ termine(adresse); };
+}
+
 // --- Ecran : verification de la recopie ---------------------------------
 //
 // Demander de retaper le code entier serait plus sur, et personne ne le ferait :
@@ -440,7 +482,7 @@ function ecranCode(code, adresse){
 // verifie. Les huit derniers caracteres suffisent a prouver qu'on a la feuille
 // sous les yeux, et se retapent sans lassitude.
 function ecranVerif(code, adresse){
-  fil(["Phrase secrète", "Code de sauvegarde", "Prêt"], 1);
+  fil(etapes(false), 1);
   var n = 8, fin = code.slice(-n);
   $("carte").innerHTML =
     '<div class="marque">Étape 2 sur 3</div>'
@@ -506,7 +548,7 @@ function ecranOuvrir(erreur){
 // la main. On sonde donc sa page jusqu'a ce qu'elle reponde, puis on y va. Une
 // attente fixe serait toujours trop courte sur une machine chargee.
 function termine(adresse){
-  fil(["Phrase secrète", "Code de sauvegarde", "Prêt"], 2);
+  fil(etapes(!!CODE), 2);
   pied("");
   $("carte").innerHTML =
     '<div class="marque">Étape 3 sur 3</div>'
