@@ -1911,6 +1911,22 @@ pub const SCHEMA_PORTEFEUILLE: SchemeId = if cfg!(feature = "mldsa") {
     SchemeId::LamportOts
 };
 
+/// Convertit un travail de bloc en entier de 128 bits, en saturant.
+///
+/// Le travail d'un bloc tient tres largement dans 128 bits aux difficultes
+/// atteignables ; la saturation est une precaution, pas un cas attendu. On
+/// prefere un chiffre plafonne a une panique ou a un repli silencieux sur zero,
+/// qui ferait croire a un reseau a l'arret.
+fn travail_en_u128(t: crate::uint::U256) -> u128 {
+    let o = t.to_be_bytes();
+    if o[..16].iter().any(|&x| x != 0) {
+        return u128::MAX;
+    }
+    let mut bas = [0u8; 16];
+    bas.copy_from_slice(&o[16..]);
+    u128::from_be_bytes(bas)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2450,20 +2466,4 @@ mod tests {
         // toute boucle qui le consulte ensuite.
         crate::arret::arret_termine();
     }
-}
-
-/// Convertit un travail de bloc en entier de 128 bits, en saturant.
-///
-/// Le travail d'un bloc tient tres largement dans 128 bits aux difficultes
-/// atteignables ; la saturation est une precaution, pas un cas attendu. On
-/// prefere un chiffre plafonne a une panique ou a un repli silencieux sur zero,
-/// qui ferait croire a un reseau a l'arret.
-fn travail_en_u128(t: crate::uint::U256) -> u128 {
-    let o = t.to_be_bytes();
-    if o[..16].iter().any(|&x| x != 0) {
-        return u128::MAX;
-    }
-    let mut bas = [0u8; 16];
-    bas.copy_from_slice(&o[16..]);
-    u128::from_be_bytes(bas)
 }

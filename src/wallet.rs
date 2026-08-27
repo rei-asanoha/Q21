@@ -379,11 +379,9 @@ impl Wallet {
         // Dernier indice **inclus** qui a servi, s'il y en a un.
         let mut dernier: Option<u32> = None;
         let mut i: u32 = 0;
-        loop {
-            let fin = match i.checked_add(Self::ECART_DECOUVERTE) {
-                Some(f) => f,
-                None => break,
-            };
+        // `checked_add` borne la boucle : au bout des indices possibles, on
+        // s'arrete plutot que de reboucler a zero.
+        while let Some(fin) = i.checked_add(Self::ECART_DECOUVERTE) {
             let mut vu_dans_la_fenetre = false;
             for index in i..fin {
                 let h = pubkey_hash(self.scheme, &self.public_key(index));
