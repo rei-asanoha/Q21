@@ -301,7 +301,8 @@ Vérifié **à la compilation**.
 | 8 | ✅ | **Audit adverse** : 11 failles réelles corrigées, portefeuille chiffré, aléa multiplateforme |
 | 8b | ⬜ | Audit **humain externe** : cryptanalyse de la PoW, relecture du consensus |
 | 9 | 🔨 | **Réseau d'essai ouvert** : nœud sans portefeuille, amorçage par noms, ports par réseau, vérification de la genèse. Reste à ouvrir un point d'entrée public |
-| 10 | ⬜ | Réseau principal — préalable : engagement UTXO (MuHash) et audit externe |
+| 10 | ✅ | **Une application, pas une ligne de commande** : installation et restauration dans des écrans, minage commandé depuis la page, adresses multiples, état du réseau mesuré, trois états de connexion nommés |
+| 11 | ⬜ | Réseau principal — préalable : engagement UTXO (MuHash) et audit externe |
 
 ---
 

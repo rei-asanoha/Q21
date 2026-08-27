@@ -176,13 +176,37 @@ jobs:
             | Linux PC ordinaire | `q21-linux-x86_64.tar.gz` |
             | Raspberry Pi 5, Linux ARM | `q21-linux-arm64.tar.gz` |
 
-            Telechargez l'archive de votre systeme, decompressez-la, puis :
+            Telechargez l'archive de votre systeme, decompressez-la, puis
+            **double-cliquez sur le lanceur** :
 
-                ./q21 init testnet        # cree le portefeuille, affiche le code de sauvegarde
-                ./q21 wallet              # ouvre le portefeuille dans le navigateur
+            - Windows : `Portefeuille Q21.bat`
+            - macOS : `Portefeuille Q21.command`
+            - Linux : `./q21 wallet` dans un terminal
 
-            **Recopiez le code de sauvegarde sur papier avant tout.** Il est le
-            seul moyen de retrouver vos fonds si le fichier disparait.
+            Le navigateur s'ouvre et vous guide : creer un portefeuille, ou
+            restaurer le votre a partir de son code de sauvegarde. Il n'y a
+            aucune commande a taper, et aucune question posee dans la fenetre
+            noire.
+
+            **Recopiez le code de sauvegarde sur papier.** C'est le seul moyen
+            de retrouver vos fonds si ce disque disparait — et il suffit : sur
+            une machine neuve, ce code seul redonne l'integralite du
+            portefeuille, adresses comprises.
+
+            ### Une fois dedans
+
+            | Onglet | Ce qu'on y fait |
+            |---|---|
+            | Solde | ce qui est disponible, ce qui attend sa maturite |
+            | Miner | allumer le minage, voir le debit reel de la machine |
+            | Recevoir | creer des adresses, les copier |
+            | Reseau | la puissance de calcul du reseau, mesuree |
+            | Envoyer | payer quelqu'un, avec ecran de confirmation |
+            | Activite | l'historique des mouvements |
+
+            La pastille en haut a droite dit **Connecte**, **Synchronisation**
+            ou **Hors connexion**. Tant qu'elle n'est pas verte, le solde
+            affiche est incomplet — et la page le dit.
 
             ### Ces fichiers ne sont pas signes
 
