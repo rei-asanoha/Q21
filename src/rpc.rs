@@ -465,6 +465,10 @@ impl RpcContext {
             ),
             ("getminage", "Etat du minage : actif, debit mesure, blocs trouves"),
             (
+                "getreseau",
+                "Effort de minage du reseau, mesure sur la difficulte des derniers blocs",
+            ),
+            (
                 "setminage",
                 "[portefeuille] Allume ou eteint le minage sans relancer le programme",
             ),
@@ -517,6 +521,7 @@ impl RpcContext {
             "preparersend" => self.preparersend(params),
             "getsyncstatus" => Ok(self.getsyncstatus()),
             "getminage" => Ok(self.getminage()),
+            "getreseau" => Ok(self.getreseau()),
             "setminage" => self.setminage(params),
             "arreter" => self.arreter(),
             "rechercher" => self.rechercher(params),
@@ -1632,6 +1637,103 @@ impl RpcContext {
             .build()
     }
 
+    /// Ce que le reseau depense en travail, et ce qu'on ne peut pas en deduire.
+    ///
+    /// # La question qu'on aimerait poser
+    ///
+    /// « Combien de mineurs y a-t-il ? » Tout le monde la pose, et **aucune
+    /// chaine ne peut y repondre**. Un mineur ne s'annonce pas ; il pose des
+    /// blocs. Rien ne distingue mille machines d'une personne qui en possede
+    /// mille, et rien ne distingue une machine de quelqu'un qui en loue mille
+    /// pour une heure.
+    ///
+    /// On a d'abord voulu compter les empreintes de mineur distinctes dans les
+    /// derniers blocs. C'etait deja une borne inferieure et non un compte ; c'est
+    /// devenu inutilisable le jour ou le mineur a cesse de reutiliser son
+    /// adresse. Il en derive une par bloc trouve — pour ne pas relier
+    /// publiquement toutes ses recompenses entre elles — de sorte que le nombre
+    /// d'empreintes distinctes vaut desormais le nombre de blocs. La bonne
+    /// propriete de vie privee a detruit la mauvaise mesure, et c'est tres bien.
+    ///
+    /// # La question a laquelle on peut repondre
+    ///
+    /// **Combien de travail le reseau depense-t-il ?** Cela se lit dans la
+    /// difficulte : elle s'ajuste pour qu'un bloc tombe toutes les deux minutes,
+    /// donc le travail accumule divise par le temps ecoule est le debit du
+    /// reseau entier. C'est une mesure, pas une declaration, et personne ne peut
+    /// la gonfler sans depenser reellement.
+    ///
+    /// Le reste — combien de personnes, combien de machines — se deduit en
+    /// divisant par le debit d'**une** machine, et l'interface le presente comme
+    /// une equivalence, jamais comme un decompte.
+    fn getreseau(&self) -> Json {
+        // Une journee de blocs, ou ce qui existe si la chaine est plus jeune.
+        const FENETRE: usize = 720;
+        let entetes = self.node.with_chain(|c| c.headers());
+        let n = entetes.len();
+        // --- La genese ne compte jamais comme point de depart.
+        //
+        // Son horodatage est une constante du protocole, pas l'instant ou
+        // quelqu'un a mine. Sur une chaine jeune, la fenetre l'englobait et
+        // l'ecart mesure devenait la distance entre cette constante et
+        // aujourd'hui : 141 blocs mines en neuf secondes s'annoncaient comme
+        // « 371,8 jours de chaine », et le debit qui en decoulait etait nul.
+        // L'ancre est le premier bloc de la fenetre : c'est son horodatage qui
+        // ouvre l'intervalle, et le travail se somme sur ceux qui la suivent.
+        // Elle ne descend jamais sous la hauteur 1.
+        //
+        // Un premier jet ecrivait `.max(1)` puis relisait `entetes[debut - 1..]`,
+        // ce qui reintroduisait exactement la genese qu'on venait d'exclure.
+        // L'epreuve `la_genese_ne_sert_pas_de_point_de_depart` l'a vu tout de
+        // suite ; la relecture, non.
+        let ancre = n.saturating_sub(FENETRE + 1).max(1);
+        let tranche = if n > ancre { &entetes[ancre..] } else { &entetes[..0] };
+
+        let mut travail: u128 = 0;
+        for h in tranche.iter().skip(1) {
+            travail = travail.saturating_add(travail_en_u128(crate::pow::block_work(h.bits)));
+        }
+        // Les horodatages d'une chaine ne sont pas monotones : la regle du temps
+        // median laisse un bloc etre anterieur a son parent. On prend donc les
+        // extremes de la tranche, et l'on refuse de diviser par un ecart nul ou
+        // negatif plutot que d'annoncer un debit infini.
+        let (t0, t1) = (
+            tranche.first().map(|h| h.time).unwrap_or(0),
+            tranche.last().map(|h| h.time).unwrap_or(0),
+        );
+        let secondes = t1.saturating_sub(t0);
+        let blocs = tranche.len().saturating_sub(1) as u64;
+        // --- Le debit se calcule au millieme.
+        //
+        // La division entiere `travail / secondes` rendait zero des que le
+        // reseau produisait moins d'une unite de travail par seconde — ce qui
+        // est le cas normal d'un reseau d'essai peu difficile. Un zero se lit
+        // « le reseau est arrete », et c'etait faux. On multiplie donc avant de
+        // diviser, et l'unite annoncee est le milliexemplaire.
+        let debit_milli = if secondes > 0 && blocs > 0 {
+            travail.saturating_mul(1000) / secondes as u128
+        } else {
+            0
+        };
+
+        Json::obj()
+            .set("pairs", Json::u64(self.node.peer_count() as u64))
+            .set("blocs_examines", Json::u64(blocs))
+            .set("secondes_examinees", Json::u64(secondes))
+            .set("travail_total", Json::str(travail.to_string()))
+            .set("debit_reseau_milli", Json::str(debit_milli.to_string()))
+            .set("mesurable", Json::Bool(secondes > 0 && blocs > 0))
+            .set(
+                "note",
+                Json::str(
+                    "Le nombre de mineurs n'est pas connaissable : un mineur ne s'annonce \
+                     pas, et celui-ci change d'adresse a chaque bloc trouve. Ce qui se \
+                     mesure est le travail depense, lu dans la difficulte.",
+                ),
+            )
+            .build()
+    }
+
     /// Allume ou eteint le minage.
     ///
     /// Range parmi les methodes de portefeuille, et pour une raison de fond :
@@ -2009,6 +2111,105 @@ mod tests {
         assert!(r.get("cout_de_la_finalite_glissante").is_some());
     }
 
+    /// Le reseau se mesure en travail, et refuse de compter les mineurs.
+    ///
+    /// La tentation etait de compter les empreintes de mineur distinctes. Cette
+    /// epreuve fige le refus : la reponse ne doit contenir aucun champ qui
+    /// pretende denombrer des personnes ou des machines.
+    #[test]
+    fn getreseau_mesure_le_travail_et_ne_compte_personne() {
+        let c = contexte(false);
+        let r = c.handle(r#"{"jsonrpc":"2.0","id":1,"method":"getreseau"}"#);
+        for attendu in [
+            "\"pairs\"",
+            "\"blocs_examines\"",
+            "\"debit_reseau_milli\"",
+            "\"travail_total\"",
+            "\"mesurable\"",
+        ] {
+            assert!(r.contains(attendu), "champ absent : {attendu} dans {r}");
+        }
+        // On cherche des **clefs**, pas des mots : la note emploie a bon droit
+        // le mot « mineurs » pour dire qu'on ne les compte pas. Un premier jet
+        // de cette epreuve cherchait la sous-chaine nue et tombait sur sa propre
+        // explication.
+        for interdit in ["\"mineurs\":", "\"nombre_de_mineurs\":", "\"machines\":"] {
+            assert!(
+                !r.contains(interdit),
+                "la reponse pretend compter ce qui ne se compte pas : {interdit}"
+            );
+        }
+        // Et elle doit le dire, pas seulement s'en abstenir.
+        assert!(
+            r.contains("n'est pas connaissable"),
+            "la reponse ne dit pas pourquoi elle ne compte pas les mineurs"
+        );
+    }
+
+    /// La genese n'est jamais l'ancre de la mesure.
+    ///
+    /// Son horodatage est une constante du protocole. L'inclure faisait mesurer
+    /// la distance entre cette constante et aujourd'hui : sur une chaine minee
+    /// en neuf secondes, la reponse annoncait « 371,8 jours ».
+    #[test]
+    fn la_genese_ne_sert_pas_de_point_de_depart() {
+        let g = genesis_block(RESEAU);
+        let mut chaine = Chain::new(RESEAU, g);
+        // Trois blocs mines maintenant, tres loin de l'horodatage de la genese.
+        let maintenant = chaine.tip().time + 10_000_000;
+        for i in 0..3u64 {
+            let t = maintenant + i;
+            let b = chaine
+                .mine_block(Hash256([7u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
+                .expect("minage");
+            chaine.connect(&b, t + 1).expect("connexion");
+        }
+        let node = Arc::new(Node::new(RESEAU, chaine));
+        let c = RpcContext {
+            sur_changement: None,
+            index: None,
+            minage: None,
+            node,
+            wallet: None,
+            network: RESEAU,
+        };
+        let r = c.handle(r#"{"jsonrpc":"2.0","id":1,"method":"getreseau"}"#);
+        // Trois blocs espaces d'une seconde : l'ecart mesure doit rester petit,
+        // et non valoir les dix millions de secondes qui les separent de la
+        // genese.
+        let d = r
+            .find("\"secondes_examinees\":")
+            .map(|i| r[i + 21..].split(&[',', '}'][..]).next().unwrap_or("").to_string())
+            .expect("champ present");
+        let secondes: u64 = d.trim().parse().expect("un nombre");
+        assert!(
+            secondes < 100,
+            "la genese sert encore d'ancre : {secondes} secondes mesurees"
+        );
+    }
+
+    /// Une chaine d'un seul bloc ne produit pas un debit infini.
+    ///
+    /// Sur la genese seule, l'ecart de temps de la fenetre vaut zero. Diviser
+    /// par lui donnerait une division par zero, ou pire un chiffre enorme
+    /// affiche comme une mesure.
+    #[test]
+    fn un_reseau_sans_histoire_avoue_qu_il_ne_mesure_rien() {
+        let c = contexte(false);
+        let r = c.handle(r#"{"jsonrpc":"2.0","id":1,"method":"getreseau"}"#);
+        assert!(r.contains(r#""mesurable":false"#), "{r}");
+        assert!(r.contains(r#""debit_reseau_milli":"0""#), "{r}");
+    }
+
+    #[test]
+    fn le_travail_d_un_bloc_sature_au_lieu_de_deborder() {
+        // Un travail qui ne tient pas dans 128 bits doit rendre le plafond, et
+        // non zero : un zero se lirait comme « le reseau est arrete ».
+        let enorme = crate::uint::U256::from_be_bytes(&[0xff; 32]);
+        assert_eq!(travail_en_u128(enorme), u128::MAX);
+        assert_eq!(travail_en_u128(crate::uint::U256::ZERO), 0);
+    }
+
     #[test]
     fn getpow_expose_l_asymetrie_entre_noeud_et_mineur() {
         let c = contexte(false);
@@ -2249,4 +2450,20 @@ mod tests {
         // toute boucle qui le consulte ensuite.
         crate::arret::arret_termine();
     }
+}
+
+/// Convertit un travail de bloc en entier de 128 bits, en saturant.
+///
+/// Le travail d'un bloc tient tres largement dans 128 bits aux difficultes
+/// atteignables ; la saturation est une precaution, pas un cas attendu. On
+/// prefere un chiffre plafonne a une panique ou a un repli silencieux sur zero,
+/// qui ferait croire a un reseau a l'arret.
+fn travail_en_u128(t: crate::uint::U256) -> u128 {
+    let o = t.to_be_bytes();
+    if o[..16].iter().any(|&x| x != 0) {
+        return u128::MAX;
+    }
+    let mut bas = [0u8; 16];
+    bas.copy_from_slice(&o[16..]);
+    u128::from_be_bytes(bas)
 }
