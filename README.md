@@ -1,6 +1,6 @@
 # q21-core
 
-Protocole **Q21** — phases 1 à 8 de la feuille de route du livre blanc.
+Protocole **Q21** — phases 1 à 10 de la feuille de route du livre blanc.
 
 Une monnaie électronique pair-à-pair conçue pour survivre à l'algorithme de Shor,
 et pour être minée sur la machine que vous avez déjà.
@@ -15,7 +15,8 @@ Réseau             TCP nu, relais compact, carnet d'adresses anti-éclipse
 Consultation       JSON-RPC + explorateur servis par votre propre nœud
 ```
 
-**365 tests (380 avec ML-DSA). Zéro avertissement clippy. Zéro dépendance obligatoire.**
+**582 épreuves (597 avec ML-DSA). Zéro avertissement clippy sur la bibliothèque.
+Zéro dépendance obligatoire.**
 
 ---
 
