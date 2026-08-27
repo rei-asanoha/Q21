@@ -2151,6 +2151,12 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         let n = node.seed_addresses(&appris);
         println!("  carnet : {n} adresses rechargees");
     }
+    // L'interrupteur du minage. Il part de la valeur du drapeau `--mine`, mais
+    // ne s'y arrete plus : l'interface peut l'allumer et l'eteindre sans qu'on
+    // relance quoi que ce soit. Le drapeau devient une preference de depart.
+    let minage = std::sync::Arc::new(q21_core::minage::Minage::new(mine));
+    // Beneficiaire courant du minage. `None` signifie « il en faut un neuf ».
+    let mut beneficiaire_minage: Option<(q21_core::hash::Hash256, SchemeId)> = None;
     if mine {
         println!("  minage actif sur {fils_effectifs} fil(s)");
     }
@@ -2201,6 +2207,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             },
             network: reseau,
             index: index.clone(),
+            // Le nœud sans portefeuille ne recoit pas l'interrupteur : il n'a
+            // nulle part ou verser une subvention, et le refus est plus honnete
+            // qu'un bouton qui ne ferait rien.
+            minage: if sans_portefeuille {
+                None
+            } else {
+                Some(minage.clone())
+            },
             sur_changement: if sans_portefeuille {
                 None
             } else {
@@ -2356,24 +2370,46 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
         }
 
-        if mine {
-            // L'adresse du mineur se derive hors du verrou de la chaine : tenir
-            // deux verrous a la fois est le plus court chemin vers l'interblocage.
-            let (beneficiaire, schema) = {
+        if minage.actif() {
+            // --- Une adresse par bloc trouve, et non par tentative.
+            //
+            // Cette ligne derivait une adresse neuve **a chaque tour de
+            // boucle**. Mesure faite sur le reseau d'essai : six secondes de
+            // minage avaient consomme 149 indices pour 102 blocs. Le
+            // portefeuille gonflait sans raison, la liste des adresses devenait
+            // illisible, et le cache d'adresses etait reecrit vingt fois par
+            // seconde. Sur un schema a usage unique — Lamport, encore accepte en
+            // regtest — c'aurait ete pire qu'un gaspillage.
+            //
+            // On garde donc le beneficiaire tant qu'aucun bloc n'est sorti. Une
+            // adresse par recompense reste la bonne granularite : elle evite de
+            // relier publiquement toutes ses recompenses entre elles.
+            //
+            // La derivation reste hors du verrou de la chaine : tenir deux
+            // verrous a la fois est le plus court chemin vers l'interblocage.
+            if beneficiaire_minage.is_none() {
                 let mut w = wallet.lock().map_err(|_| "portefeuille verrouille")?;
                 let a = w.new_address();
-                (a.hash, a.scheme)
-            };
+                beneficiaire_minage = Some((a.hash, a.scheme));
+            }
+            let (beneficiaire, schema) = beneficiaire_minage.expect("derive juste au-dessus");
             // Les transactions du mempool entrent dans le bloc, dans l'ordre
             // topologique impose par la selection.
             let selection = node.with_mempool(|m| m.select_for_block(2_000_000));
-            let bloc = node.with_chain(|c| {
+            // La variante comptante : le debit affiche a l'ecran doit etre une
+            // mesure, pas une estimation tiree du plafond d'essais.
+            let (bloc, essais) = node.with_chain(|c| {
                 let t = maintenant().max(c.tip().time + 1);
-                c.mine_block(beneficiaire, schema, &selection, t, 2_000_000)
+                c.mine_block_comptant(beneficiaire, schema, &selection, t, 2_000_000)
             });
+            minage.compter(essais);
             if let Some(b) = bloc {
                 let ok = node.with_chain(|c| c.connect(&b, maintenant()).is_ok());
                 if ok {
+                    minage.bloc_trouve();
+                    // La recompense est encaissee : l'adresse a servi, la
+                    // suivante en aura une autre.
+                    beneficiaire_minage = None;
                     node.with_mempool(|m| m.on_block_connected(&b));
                     // L'ecriture passe par le journal, comme pour tout bloc
                     // accepte : une seule voie vers le disque, donc un seul

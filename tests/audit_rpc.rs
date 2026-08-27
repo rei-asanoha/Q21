@@ -63,6 +63,7 @@ fn serveur(avec_portefeuille: bool, token: Option<&str>) -> ServerHandle {
         },
         network: RESEAU,
         index: None,
+        minage: None,
     };
     http::serve("127.0.0.1:0", token.map(|s| s.to_string()), move |req| {
         routeur(&ctx, req)
@@ -131,6 +132,7 @@ fn serveur_et_noeud() -> (ServerHandle, Arc<Node>) {
         wallet: Some(Arc::new(Mutex::new(Wallet::from_seed([7u8; 32], RESEAU)))),
         network: RESEAU,
         index: None,
+        minage: None,
         sur_changement: None,
     };
     let h = http::serve("127.0.0.1:0", None, move |req| routeur(&ctx, req))

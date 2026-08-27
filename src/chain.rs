@@ -1305,6 +1305,26 @@ impl Chain {
         max_essais: u64,
     ) -> Option<Block> {
         let hauteur = self.height() + 1;
+        let mut b = self.assembler_candidat(beneficiaire, scheme, mempool, uncles, horodatage);
+        let table = self.table_for(crate::memhard::epoch_of(hauteur));
+        pow::mine_with_table_parallel(&mut b.header, &table, max_essais, self.fils_minage).ok()?;
+        Some(b)
+    }
+
+    /// Le bloc candidat, complet et coherent, mais sans preuve de travail.
+    ///
+    /// Extrait de [`Self::mine_block_with_uncles`] pour que le minage comptant
+    /// puisse le reutiliser : deux facons d'assembler un candidat, c'est deux
+    /// facons de se tromper sur la coinbase.
+    fn assembler_candidat(
+        &self,
+        beneficiaire: Hash256,
+        scheme: SchemeId,
+        mempool: &[Transaction],
+        uncles: &[BlockHeader],
+        horodatage: u64,
+    ) -> Block {
+        let hauteur = self.height() + 1;
 
         let mut frais: u64 = 0;
         for tx in mempool {
@@ -1364,10 +1384,31 @@ impl Chain {
         };
         b.header.merkle_root = b.compute_merkle_root();
         b.header.uncles_root = b.compute_uncles_root();
+        b
+    }
 
+    /// Comme [`Self::mine_block`], mais rend aussi le nombre d'essais consommes.
+    ///
+    /// Le compte est indispensable pour afficher un debit qui soit une mesure.
+    /// L'estimer — « si aucun bloc n'est sorti, c'est que `max_essais` ont ete
+    /// faits » — surevalue chaque tour gagnant, et un mineur qui trouve souvent
+    /// verrait un chiffre faux precisement quand il regarde.
+    pub fn mine_block_comptant(
+        &self,
+        beneficiaire: Hash256,
+        scheme: SchemeId,
+        mempool: &[Transaction],
+        horodatage: u64,
+        max_essais: u64,
+    ) -> (Option<Block>, u64) {
+        let hauteur = self.height() + 1;
+        let mut b = self.assembler_candidat(beneficiaire, scheme, mempool, &[], horodatage);
         let table = self.table_for(crate::memhard::epoch_of(hauteur));
-        pow::mine_with_table_parallel(&mut b.header, &table, max_essais, self.fils_minage).ok()?;
-        Some(b)
+        match pow::mine_with_table_parallel(&mut b.header, &table, max_essais, self.fils_minage) {
+            // `essai` est l'indice du gagnant : il y a eu `essai + 1` tentatives.
+            Ok(essai) => (Some(b), essai.saturating_add(1)),
+            Err(faits) => (None, faits),
+        }
     }
 }
 
