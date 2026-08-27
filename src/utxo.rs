@@ -183,6 +183,18 @@ impl UtxoSet {
 
     /// Sorties depensables par le detenteur d'une empreinte de clef donnee.
     ///
+    /// Cet ensemble contient-il au moins une sortie payant cette empreinte ?
+    ///
+    /// Sert a la decouverte d'adresses lors d'une restauration : on ne veut ni
+    /// les montants, ni la maturite, ni meme le nombre — seulement savoir si
+    /// l'indice essaye a deja recu quelque chose. La question se resout par une
+    /// seule consultation de l'index, sans construire de vecteur.
+    pub fn connait(&self, pubkey_hash: &crate::hash::Hash256) -> bool {
+        self.par_empreinte
+            .get(pubkey_hash)
+            .is_some_and(|s| !s.is_empty())
+    }
+
     /// Filtre la maturite des coinbases : une recompense de bloc fraiche n'est
     /// pas depensable.
     pub fn spendable_for(

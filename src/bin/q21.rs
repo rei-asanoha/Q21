@@ -901,6 +901,42 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
         }
     }
 
+    // --- La restauration retrouve ses adresses, ou elle ne restaure rien.
+    //
+    // Un portefeuille ne reconnait que les adresses qu'il a derivees. Restaure
+    // depuis son code de sauvegarde, il n'en a derive aucune : il affichait donc
+    // un solde de **zero** sur une chaine qui contenait ses fonds, et la
+    // promesse « ce code suffit a tout retrouver » etait fausse. L'essai qui l'a
+    // montre tient en trois commandes : creer, miner, restaurer ailleurs.
+    //
+    // On applique la regle de l'ecart : deriver par fenetres de deux cents
+    // indices tant qu'on trouve quelque chose, s'arreter quand une fenetre
+    // entiere ne trouve rien.
+    //
+    // Le declencheur est etroit a dessein. Un portefeuille qui a deja distribue
+    // des adresses connait son etat ; refaire la decouverte a chaque demarrage
+    // couterait une generation de clef ML-DSA par indice, pour rien. On ne la
+    // tente donc que si le portefeuille est presque vierge alors que la chaine,
+    // elle, a une histoire.
+    let a_decouvrir = !sans_portefeuille
+        && chain.height() > 0
+        && wallet.next_index() <= 1
+        && !chain.utxo.is_empty();
+    if a_decouvrir {
+        let avant = wallet.next_index();
+        let trouvees = {
+            let u = &chain.utxo;
+            wallet.decouvrir(|h| u.connait(h))
+        };
+        if trouvees > 0 {
+            println!(
+                "  restauration : {trouvees} sortie(s) retrouvee(s) sur la chaine, \n               {} adresse(s) rederivee(s)",
+                wallet.next_index().saturating_sub(avant)
+            );
+            let _ = ecrire_portefeuille(datadir, &wallet);
+        }
+    }
+
     Ok(Etat {
         chain,
         wallet,
@@ -2157,6 +2193,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let minage = std::sync::Arc::new(q21_core::minage::Minage::new(mine));
     // Beneficiaire courant du minage. `None` signifie « il en faut un neuf ».
     let mut beneficiaire_minage: Option<(q21_core::hash::Hash256, SchemeId)> = None;
+    // Hauteur a laquelle la derniere tentative de decouverte a eu lieu.
+    let mut derniere_decouverte: u64 = 0;
     if mine {
         println!("  minage actif sur {fils_effectifs} fil(s)");
     }
@@ -2420,6 +2458,48 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // --- La decouverte d'adresses, retentee tant qu'elle a un sens.
+        //
+        // Le declencheur du chargement ne couvre qu'un cas : celui ou la chaine
+        // est deja la. Sur une machine neuve, l'ordre est inverse — on restaure,
+        // *puis* on se synchronise — et la decouverte n'aurait jamais lieu. Le
+        // porteur verrait zero pendant que ses fonds arrivent sous ses yeux.
+        //
+        // On retente donc, mais rarement : la condition `next_index <= 1` cesse
+        // d'etre vraie des la premiere trouvaille, et le compteur de hauteur
+        // evite de rederiver deux cents clefs ML-DSA a chaque bloc recu.
+        if !sans_portefeuille {
+            let h = node.height();
+            if h > derniere_decouverte + 20 {
+                derniere_decouverte = h;
+                let vierge = {
+                    let w = wallet.lock().map_err(|_| "portefeuille verrouille")?;
+                    w.next_index() <= 1
+                };
+                if vierge {
+                    let trouvees = node.with_chain(|c| {
+                        let u = &c.utxo;
+                        if u.is_empty() {
+                            return 0;
+                        }
+                        let mut w = match wallet.lock() {
+                            Ok(w) => w,
+                            Err(_) => return 0,
+                        };
+                        w.decouvrir(|e| u.connait(e))
+                    });
+                    if trouvees > 0 {
+                        let w = wallet.lock().map_err(|_| "portefeuille verrouille")?;
+                        println!(
+                            "  restauration : {trouvees} sortie(s) retrouvee(s), {} adresse(s) rederivee(s)",
+                            w.next_index()
+                        );
+                        let _ = ecrire_portefeuille(datadir, &w);
+                    }
+                }
+            }
         }
 
         // --- L'index suit la chaine.

@@ -341,6 +341,74 @@ impl Wallet {
         self.next_index = self.next_index.max(jusqu_a);
     }
 
+    /// Ecart de decouverte : combien d'adresses vides on derive avant de
+    /// conclure qu'il n'y a plus rien.
+    ///
+    /// La valeur est celle qu'emploie l'ecosysteme depuis BIP44, et elle n'a pas
+    /// ete choisie au hasard : elle couvre le cas d'un porteur qui aurait
+    /// distribue des dizaines d'adresses sans qu'aucune soit payee, tout en
+    /// bornant le cout d'une restauration. Chaque indice derive une clef ML-DSA,
+    /// ce qui n'est pas gratuit.
+    pub const ECART_DECOUVERTE: u32 = 200;
+
+    /// Retrouve les adresses de ce portefeuille en interrogeant un ensemble de
+    /// sorties, et avance l'indice au-dela de la derniere trouvee.
+    ///
+    /// # Le defaut que cette fonction repare
+    ///
+    /// Un portefeuille restaure depuis son code de sauvegarde ne connaissait que
+    /// les adresses qu'il avait lui-meme derivees — c'est-a-dire aucune. Il
+    /// affichait donc **zero** sur une chaine qui contenait ses fonds. La
+    /// promesse « ce code suffit a tout retrouver » etait fausse, et l'essai qui
+    /// l'a montre tient en trois commandes : creer, miner, restaurer ailleurs.
+    ///
+    /// # Comment elle procede
+    ///
+    /// Elle derive par fenetres de [`Self::ECART_DECOUVERTE`] indices et demande
+    /// pour chacun si `possede` le reconnait. Des qu'une fenetre trouve quelque
+    /// chose, on repart apres la trouvaille ; quand une fenetre entiere ne
+    /// trouve rien, on s'arrete. C'est la regle de l'ecart, celle que tous les
+    /// portefeuilles deterministes emploient.
+    ///
+    /// Rend le nombre d'adresses reconnues.
+    pub fn decouvrir<F>(&mut self, possede: F) -> usize
+    where
+        F: Fn(&Hash256) -> bool,
+    {
+        let mut trouvees = 0usize;
+        // Dernier indice **inclus** qui a servi, s'il y en a un.
+        let mut dernier: Option<u32> = None;
+        let mut i: u32 = 0;
+        loop {
+            let fin = match i.checked_add(Self::ECART_DECOUVERTE) {
+                Some(f) => f,
+                None => break,
+            };
+            let mut vu_dans_la_fenetre = false;
+            for index in i..fin {
+                let h = pubkey_hash(self.scheme, &self.public_key(index));
+                self.connues.insert(h, index);
+                if possede(&h) {
+                    trouvees += 1;
+                    dernier = Some(index);
+                    vu_dans_la_fenetre = true;
+                }
+            }
+            if !vu_dans_la_fenetre {
+                break;
+            }
+            i = fin;
+        }
+        // L'indice suivant se place apres la derniere adresse qui a servi. On ne
+        // le place pas apres la derniere **derivee** : cela sauterait les deux
+        // cents indices vides que la fenetre vient d'explorer, et un porteur qui
+        // restaure deux fois de suite les sauterait deux fois.
+        if let Some(d) = dernier {
+            self.next_index = self.next_index.max(d + 1);
+        }
+        trouvees
+    }
+
     /// Empreintes deja derivees, dans l'ordre des indices.
     pub fn known_hashes(&self) -> Vec<Hash256> {
         let mut v: Vec<(u32, Hash256)> = self.connues.iter().map(|(h, i)| (*i, *h)).collect();
@@ -1206,5 +1274,92 @@ mod tests {
         let w = portefeuille();
         assert_eq!(Wallet::seed_from_hex(&w.seed_hex()), Some([0x11u8; 32]));
         assert_eq!(Wallet::seed_from_hex("pas hexadecimal"), None);
+    }
+
+    /// Le code de sauvegarde retrouve tout, y compris ce qu'on n'a jamais
+    /// derive sur cette machine.
+    ///
+    /// # Le defaut que cette epreuve fige
+    ///
+    /// Un portefeuille restaure ne connaissait que les adresses qu'il avait
+    /// lui-meme derivees — aucune. Il affichait donc zero sur une chaine qui
+    /// contenait ses fonds, et la promesse du code de sauvegarde etait fausse.
+    #[test]
+    fn un_portefeuille_restaure_retrouve_ses_adresses() {
+        let mut origine = Wallet::from_seed([42u8; 32], Network::Regtest);
+        // Le porteur a distribue quarante adresses ; la trentieme a ete payee.
+        let mut payees = Vec::new();
+        for i in 0..40 {
+            let a = origine.new_address();
+            if i == 29 {
+                payees.push(a.hash);
+            }
+        }
+
+        // Une machine neuve : meme graine, aucune adresse derivee.
+        let mut restaure = Wallet::from_seed([42u8; 32], Network::Regtest);
+        assert!(
+            !restaure.owns(&payees[0]),
+            "sans decouverte, l'adresse payee doit etre inconnue"
+        );
+
+        let trouvees = restaure.decouvrir(|h| payees.contains(h));
+        assert_eq!(trouvees, 1, "l'adresse payee n'a pas ete retrouvee");
+        assert!(restaure.owns(&payees[0]), "elle n'est pas devenue sienne");
+        // L'indice suivant se place apres la derniere adresse qui a servi, pas
+        // apres la derniere exploree.
+        assert_eq!(restaure.next_index(), 30);
+    }
+
+    /// Au-dela de l'ecart, on s'arrete — et l'on ne pretend pas avoir cherche.
+    #[test]
+    fn la_decouverte_s_arrete_apres_un_ecart_vide() {
+        let mut origine = Wallet::from_seed([7u8; 32], Network::Regtest);
+        // Une adresse tres loin devant, bien au-dela de l'ecart admis.
+        let mut lointaine = Hash256::ZERO;
+        for i in 0..(Wallet::ECART_DECOUVERTE + 50) {
+            let a = origine.new_address();
+            if i == Wallet::ECART_DECOUVERTE + 49 {
+                lointaine = a.hash;
+            }
+        }
+        let mut restaure = Wallet::from_seed([7u8; 32], Network::Regtest);
+        let trouvees = restaure.decouvrir(|h| *h == lointaine);
+        assert_eq!(
+            trouvees, 0,
+            "une adresse au-dela de l'ecart ne doit pas etre trouvee : \
+             la pretendre trouvable donnerait une fausse garantie"
+        );
+    }
+
+    /// Une adresse juste avant la limite de l'ecart reste trouvable, et la
+    /// fenetre suivante est bien exploree.
+    #[test]
+    fn la_decouverte_enjambe_les_fenetres() {
+        let mut origine = Wallet::from_seed([11u8; 32], Network::Regtest);
+        let mut cibles = Vec::new();
+        for i in 0..(Wallet::ECART_DECOUVERTE * 2 + 5) {
+            let a = origine.new_address();
+            // Une dans la premiere fenetre, une dans la deuxieme.
+            if i == Wallet::ECART_DECOUVERTE - 1 || i == Wallet::ECART_DECOUVERTE + 3 {
+                cibles.push(a.hash);
+            }
+        }
+        let mut restaure = Wallet::from_seed([11u8; 32], Network::Regtest);
+        let trouvees = restaure.decouvrir(|h| cibles.contains(h));
+        assert_eq!(trouvees, 2, "la deuxieme fenetre n'a pas ete exploree");
+        assert_eq!(restaure.next_index(), Wallet::ECART_DECOUVERTE + 4);
+    }
+
+    /// Deux graines differentes ne se reconnaissent pas.
+    ///
+    /// C'est l'autre moitie de la promesse : le code de sauvegarde retrouve
+    /// **vos** fonds, et rien d'autre.
+    #[test]
+    fn une_autre_graine_ne_decouvre_rien() {
+        let mut a = Wallet::from_seed([1u8; 32], Network::Regtest);
+        let sienne = a.new_address().hash;
+        let mut b = Wallet::from_seed([2u8; 32], Network::Regtest);
+        assert_eq!(b.decouvrir(|h| *h == sienne), 0);
     }
 }
