@@ -341,6 +341,9 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
   <button type="button" data-vue="envoyer">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V7"/><path d="M6 12l6-6 6 6"/><path d="M4 4h16"/></svg>
     Envoyer</button>
+  <button type="button" data-vue="reseau">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>
+    Réseau</button>
   <button type="button" data-vue="historique">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
     Activité</button>
@@ -377,7 +380,7 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
 
 <section class="vue" id="vue-solde">
   <div class="heros">
-    <div class="k">Dépensable</div>
+    <div class="k">Disponible</div>
     <div id="solde-gros">…</div>
     <div class="n" id="solde-note">Chargement…</div>
   </div>
@@ -446,6 +449,25 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
   </div>
   <div id="zone-adresse"></div>
   <h2>Vos adresses</h2>
+  <div class="note">
+    <h3>Pourquoi vous en avez plusieurs</h3>
+    <p>
+      Votre portefeuille ne contient <strong>qu'un seul secret</strong>&nbsp;: la
+      graine, celle du code de sauvegarde que vous avez recopié. Toutes vos
+      adresses en sont <em>fabriquées</em> par un calcul — la première, la
+      deuxième, la millième. C'est ce qu'on appelle les <strong>dériver</strong>.
+    </p>
+    <p>
+      Conséquence rassurante&nbsp;: <strong>ce code sauve tout</strong>. Pas
+      besoin de sauvegarder chaque adresse&nbsp;; elles se recalculent toutes à
+      partir de lui.
+    </p>
+    <p>
+      Conséquence utile&nbsp;: en donner une neuve à chaque personne qui vous
+      paie ne coûte rien, et évite qu'un curieux relie tous vos encaissements
+      entre eux en lisant la chaîne. Votre solde est la somme de toutes.
+    </p>
+  </div>
   <div id="liste-adresses"></div>
 </section>
 
@@ -500,12 +522,52 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
   <div id="resultat-envoi"></div>
 </section>
 
+<section class="vue" id="vue-reseau" hidden>
+  <h2>Le réseau</h2>
+  <div class="heros">
+    <div class="k">Puissance de calcul du réseau</div>
+    <div id="reseau-gros">…</div>
+    <div class="n" id="reseau-note">Mesure en cours…</div>
+  </div>
+  <div class="grille" style="margin-top:.8rem">
+    <div class="tuile"><div class="k">Machines comme la vôtre</div>
+      <div class="v" id="reseau-equiv">—</div>
+      <div class="n">équivalence, pas un décompte</div></div>
+    <div class="tuile"><div class="k">Ordinateurs reliés au vôtre</div>
+      <div class="v" id="reseau-pairs">0</div>
+      <div class="n">vos voisins directs, pas le réseau entier</div></div>
+    <div class="tuile"><div class="k">Mesuré sur</div>
+      <div class="v" id="reseau-fenetre">—</div>
+      <div class="n">les blocs les plus récents</div></div>
+  </div>
+  <div class="note">
+    <h3>Pourquoi on ne vous dit pas «&nbsp;combien de mineurs&nbsp;»</h3>
+    <p>
+      Parce que personne ne peut le savoir, et qu'un chiffre inventé serait pire
+      que pas de chiffre. Un mineur ne s'annonce pas&nbsp;: il pose des blocs.
+      Rien ne distingue mille machines d'une personne qui en possède mille.
+    </p>
+    <p>
+      Et Q21 rend le comptage encore plus impossible, volontairement&nbsp;: votre
+      portefeuille utilise <strong>une adresse différente pour chaque
+      récompense</strong>, pour qu'on ne puisse pas relier vos gains entre eux.
+      Compter les adresses de mineurs reviendrait donc à compter les blocs.
+    </p>
+    <p>
+      Ce qui se mesure, en revanche, ne se truque pas&nbsp;: <strong>le travail
+      réellement dépensé</strong>. Il se lit dans la difficulté, qui s'ajuste
+      pour qu'un bloc tombe toutes les deux minutes. Divisé par ce que fait
+      <em>votre</em> machine, il donne l'équivalence ci-dessus.
+    </p>
+  </div>
+</section>
+
 <section class="vue" id="vue-historique" hidden>
   <h2>Activité</h2>
   <div id="note-historique"></div>
   <div class="defile">
     <table>
-      <thead><tr><th>Genre</th><th>Reçu</th><th>Sorti</th><th>Conf.</th><th>Hauteur</th><th>Horodatage</th><th>Identifiant</th></tr></thead>
+      <thead><tr><th>Quoi</th><th>Reçu</th><th>Envoyé</th><th>Confirmations</th><th>Bloc n°</th><th>Date</th><th>Référence</th></tr></thead>
       <tbody id="mouvements"></tbody>
     </table>
   </div>
@@ -763,7 +825,7 @@ function gros(q21){
 // Onglets
 // ---------------------------------------------------------------------------
 
-const VUES = ["solde","miner","recevoir","envoyer","historique","infos"];
+const VUES = ["solde","miner","recevoir","reseau","envoyer","historique","infos"];
 
 function montrer(nom){
   for (const v of VUES){
@@ -777,6 +839,7 @@ function montrer(nom){
   if (nom === "infos") infos();
   if (nom === "recevoir") listerAdresses();
   if (nom === "miner") minage();
+  if (nom === "reseau") reseau();
 }
 
 document.getElementById("onglets").addEventListener("click", ev => {
@@ -834,15 +897,19 @@ async function rafraichir(){
 
     document.getElementById("solde-gros").innerHTML = gros(solde.depensable.q21);
     document.getElementById("solde-note").textContent =
-      solde.sorties_depensables + " sortie(s) dépensable(s)" +
+      solde.sorties_depensables + " somme(s) utilisable(s) tout de suite" +
       (sync.synchronise ? "" : " — chiffre incomplet, voir l'avertissement ci-dessus");
 
     const total = unitesDe(solde.depensable) + unitesDe(solde.immature);
     document.getElementById("tuiles-solde").innerHTML =
-      tuile("Immature", ech(solde.immature.q21) + " Q21", "récompenses de minage pas encore dépensables") +
-      tuile("Total détenu", ech(q21DepuisUnites(total)) + " Q21", "dépensable et immature réunis") +
-      tuile("Adresses dérivées", solde.adresses_derivees) +
-      tuile("Hauteur", info.hauteur, info.pairs + " pair(s), " + info.mempool + " transaction(s) en attente");
+      tuile("En attente de maturité", ech(solde.immature.q21) + " Q21",
+            "récompenses de minage : elles vous appartiennent, mais ne sont pas encore utilisables") +
+      tuile("Total détenu", ech(q21DepuisUnites(total)) + " Q21", "disponible et en attente réunis") +
+      tuile("Vos adresses", solde.adresses_derivees,
+            "votre portefeuille en fabrique une nouvelle à chaque encaissement") +
+      tuile("Blocs vérifiés", info.hauteur,
+            "votre machine les a tous recalculés elle-même — " + info.mempool +
+            " transaction(s) en attente d'être inscrite(s)");
   }catch(e){
     signalerErreur("Impossible d'interroger le nœud : " + e.message);
   }finally{
@@ -1130,12 +1197,12 @@ async function infos(){
       tuile("Signature", w.signature_octets + " o");
 
     document.getElementById("tuiles-chaine").innerHTML =
-      tuile("Hauteur", info.hauteur) +
-      tuile("Tête", brut(`<span class="coupe">${court(info.tete, 20)}</span>`)) +
+      tuile("Blocs vérifiés", info.hauteur) +
+      tuile("Dernier bloc", brut(`<span class="coupe">${court(info.tete, 20)}</span>`)) +
       tuile("Difficulté", info.difficulte_bits) +
-      tuile("Émis", ech(info.emis.q21) + " Q21") +
-      tuile("Sorties non dépensées", info.utxo_total) +
-      tuile("Pairs", info.pairs);
+      tuile("Q21 créés à ce jour", ech(info.emis.q21) + " Q21") +
+      tuile("Sommes non dépensées", info.utxo_total, "sur toute la chaîne, tous porteurs confondus") +
+      tuile("Ordinateurs reliés au vôtre", info.pairs);
   }catch(e){
     signalerErreur("Informations indisponibles : " + e.message);
   }
@@ -1336,6 +1403,84 @@ document.getElementById("bascule-minage").addEventListener("click", async () => 
 minageTimer = setInterval(() => {
   if (!document.getElementById("vue-miner").hidden) minage();
 }, 1000);
+
+// ---------------------------------------------------------------------------
+// Le reseau
+// ---------------------------------------------------------------------------
+//
+// Cette vue ne repond pas a « combien de mineurs ? » : personne ne le peut, et
+// Q21 moins que d'autres puisque le mineur change d'adresse a chaque bloc. Elle
+// repond a « combien de travail le reseau depense-t-il », qui se mesure, puis
+// le traduit en machines equivalentes — une division, presentee comme telle.
+
+function formatDebitLong(n){
+  n = Number(n) || 0;
+  if (n >= 1e12) return (n / 1e12).toFixed(2) + " T";
+  if (n >= 1e9)  return (n / 1e9).toFixed(2) + " G";
+  if (n >= 1e6)  return (n / 1e6).toFixed(2) + " M";
+  if (n >= 1e3)  return (n / 1e3).toFixed(1) + " k";
+  return String(Math.round(n));
+}
+
+function duree(sec){
+  sec = Number(sec) || 0;
+  if (sec >= 86400) return (sec / 86400).toFixed(1) + " jour(s)";
+  if (sec >= 3600)  return (sec / 3600).toFixed(1) + " heure(s)";
+  if (sec >= 60)    return Math.round(sec / 60) + " minute(s)";
+  return Math.round(sec) + " seconde(s)";
+}
+
+async function reseau(){
+  try{
+    const r = await appel("getreseau");
+    document.getElementById("reseau-pairs").textContent = String(r.pairs);
+    document.getElementById("reseau-fenetre").textContent =
+      String(r.blocs_examines) + " blocs";
+
+    if (!r.mesurable){
+      document.getElementById("reseau-gros").innerHTML =
+        '<span class="gros">—</span>';
+      document.getElementById("reseau-note").textContent =
+        "Pas encore assez de blocs pour mesurer quoi que ce soit. " +
+        "Il en faut au moins deux, séparés dans le temps.";
+      document.getElementById("reseau-equiv").textContent = "—";
+      return;
+    }
+
+    // `debit_reseau` arrive en chaine : il peut depasser ce qu'un Number
+    // represente exactement. On l'affiche depuis la chaine, et l'on ne convertit
+    // que pour la division en machines equivalentes, ou l'ordre de grandeur
+    // suffit et ou l'on annonce d'ailleurs un « environ ».
+    // Le nœud rend des milliemes : sous une unite de travail par seconde, une
+    // division entiere aurait rendu zero, et zero se lit « reseau arrete ».
+    const debit = Number(r.debit_reseau_milli) / 1000;
+    document.getElementById("reseau-gros").innerHTML =
+      '<span class="gros">' + ech(formatDebitLong(debit)) + '</span>' +
+      '<span class="unite">tentatives/s</span>';
+    document.getElementById("reseau-note").textContent =
+      "Mesuré sur " + r.blocs_examines + " bloc(s), soit " + duree(r.secondes_examinees) +
+      " de chaîne. Ce chiffre ne se déclare pas : il se déduit du travail " +
+      "réellement dépensé pour les produire.";
+
+    // L'equivalence en machines : le debit du reseau divise par celui de la
+    // votre. Sans mesure locale — le minage est eteint — on ne l'invente pas.
+    let mien = 0;
+    try { mien = Number((await appel("getminage")).essais_par_seconde) || 0; } catch (e) { mien = 0; }
+    const eq = document.getElementById("reseau-equiv");
+    if (mien > 0 && debit > 0){
+      const n = debit / mien;
+      eq.textContent = n < 1.5 ? "environ 1" : "environ " + formatDebitLong(n);
+    } else {
+      eq.textContent = "—";
+    }
+  }catch(e){ /* la boucle generale signale deja une panne du nœud */ }
+}
+
+// La vue du reseau se rafraichit au meme rythme que celle du minage tant
+// qu'elle est visible.
+setInterval(() => {
+  if (!document.getElementById("vue-reseau").hidden) reseau();
+}, 4000);
 
 // ---------------------------------------------------------------------------
 // Toutes les adresses
@@ -1821,7 +1966,7 @@ mod tests {
     /// La colonne « sorti » existe, et ne donne pas un plancher pour un fait.
     #[test]
     fn la_colonne_sortie_existe_et_avoue_son_incertitude() {
-        assert!(PAGE.contains("<th>Sorti</th>"));
+        assert!(PAGE.contains("<th>Envoyé</th>"));
         // La case est alimentee par le champ du noeud, pas devinee.
         assert!(PAGE.contains("m.sorti.q21"));
         assert!(PAGE.contains("rendu(celluleSortie(m))"));
@@ -1835,7 +1980,7 @@ mod tests {
         assert!(PAGE.contains(r#"ech("≥ " + m.sorti.q21)"#));
         // Le tableau compte bien une colonne de plus qu'avant.
         let entete = PAGE
-            .find("<thead><tr><th>Genre</th>")
+            .find("<thead><tr><th>Quoi</th>")
             .expect("entete de l'historique");
         let fin = PAGE[entete..].find("</tr>").expect("fin de l'entete");
         assert_eq!(PAGE[entete..entete + fin].matches("<th>").count(), 7);
@@ -1903,14 +2048,14 @@ mod tests {
         );
     }
 
-    /// Les six vues existent, et le minage en fait partie.
+    /// Les sept vues existent, et le minage comme le reseau en font partie.
     ///
     /// L'epreuve precedente en comptait cinq. Elle a ete elargie, pas
     /// remplacee : une vue qui disparait est une regression, une vue qui
     /// s'ajoute doit etre declaree ici.
     #[test]
-    fn les_six_vues_existent() {
-        for v in ["solde", "miner", "recevoir", "envoyer", "historique", "infos"] {
+    fn les_sept_vues_existent() {
+        for v in ["solde", "miner", "recevoir", "reseau", "envoyer", "historique", "infos"] {
             assert!(
                 PAGE.contains(&format!(r#"id="vue-{v}""#)),
                 "vue absente du balisage : {v}"
@@ -1921,7 +2066,7 @@ mod tests {
             );
         }
         assert!(
-            script().contains(r#"const VUES = ["solde","miner","recevoir","envoyer","historique","infos"];"#),
+            script().contains(r#"const VUES = ["solde","miner","recevoir","reseau","envoyer","historique","infos"];"#),
             "la liste des vues du script ne correspond pas au balisage"
         );
     }
@@ -1999,6 +2144,64 @@ mod tests {
         assert!(
             !s.contains("vitesse_reseau") && !s.contains("getvitesse"),
             "la vitesse est demandee au nœud alors qu'elle se derive ici"
+        );
+    }
+
+    /// La vue du reseau ne pretend jamais compter les mineurs.
+    ///
+    /// C'est une propriete de fond, pas de presentation : un chiffre invente
+    /// serait pire qu'une absence de chiffre, et la tentation reviendra.
+    #[test]
+    fn la_vue_du_reseau_ne_compte_pas_les_mineurs() {
+        let s = script();
+        assert!(s.contains(r#"appel("getreseau")"#), "la vue n'interroge pas le nœud");
+        // Aucune tuile ne doit s'intituler « mineurs » : la seule traduction
+        // offerte est une equivalence en machines, et elle est nommee ainsi.
+        assert!(
+            PAGE.contains("Machines comme la vôtre"),
+            "l'equivalence n'est pas presentee comme telle"
+        );
+        assert!(
+            PAGE.contains("équivalence, pas un décompte"),
+            "l'equivalence n'avoue pas qu'elle n'est pas un compte"
+        );
+        assert!(
+            PAGE.contains("Pourquoi on ne vous dit pas"),
+            "la page ne dit pas pourquoi elle ne compte pas les mineurs"
+        );
+        // Et sans mesure locale, on n'invente pas de division.
+        assert!(
+            s.contains("mien > 0 && debit > 0"),
+            "l'equivalence se calcule meme sans debit local connu"
+        );
+    }
+
+    /// Le vocabulaire de la page est celui de quelqu'un qui debute.
+    ///
+    /// « Hauteur », « adresses derivees », « depensable », « immature » sont les
+    /// mots du protocole. Ils sont justes et ils ne disent rien a personne. Cette
+    /// epreuve fige les traductions : les reintroduire demanderait de la
+    /// modifier, donc de le decider.
+    #[test]
+    fn la_page_parle_la_langue_de_tout_le_monde() {
+        for jargon in ["Hauteur", "Adresses dérivées", "Dépensable"] {
+            assert!(
+                !PAGE.contains(&format!(">{jargon}<")) && !PAGE.contains(&format!("\"{jargon}\"")),
+                "jargon reintroduit comme etiquette : {jargon}"
+            );
+        }
+        for clair in [
+            "Blocs vérifiés",
+            "Vos adresses",
+            "Disponible",
+            "En attente de maturité",
+        ] {
+            assert!(PAGE.contains(clair), "traduction perdue : {clair}");
+        }
+        // Et le mot « dériver » est explique la ou il apparait, pas ailleurs.
+        assert!(
+            PAGE.contains("dériver</strong>") || PAGE.contains("<strong>dériver"),
+            "le mot du protocole est employe sans etre explique"
         );
     }
 
