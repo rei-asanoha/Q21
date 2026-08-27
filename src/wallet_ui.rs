@@ -135,6 +135,35 @@ h1{font-size:inherit;font-weight:inherit;margin:0;letter-spacing:inherit}
 .point{width:.5rem;height:.5rem;border-radius:50%;background:var(--tenu);flex:0 0 auto}
 .point.vert{background:var(--accent);box-shadow:0 0 0 3px var(--accent-fond)}
 .point.orange{background:var(--alerte);box-shadow:0 0 0 3px var(--alerte-fond)}
+.point.rouge{background:var(--danger);box-shadow:0 0 0 3px var(--danger-fond)}
+/* Le point vert respire quand tout va bien : un indicateur fige ne se
+   distingue pas d'une page morte. */
+.point.vert{animation:battement 2.6s ease-in-out infinite}
+@keyframes battement{0%,100%{opacity:1}50%{opacity:.45}}
+@media(prefers-reduced-motion:reduce){.point.vert{animation:none}}
+.pouls b{font-weight:600;color:var(--texte)}
+.pouls.hors b{color:var(--danger)}
+.pouls.sync b{color:var(--alerte)}
+.pouls.ok b{color:var(--accent)}
+
+/* --- Le bandeau de recuperation ---------------------------------------- */
+.recup{background:var(--carte);border:1px solid var(--alerte);border-radius:16px;
+  padding:1.15rem 1.25rem;margin-bottom:1rem;box-shadow:var(--ombre)}
+.recup .tete{display:flex;align-items:center;gap:.75rem}
+.recup h3{margin:0;flex:1}
+.rotor{width:1.15rem;height:1.15rem;border:2px solid var(--bord-fort);
+  border-top-color:var(--alerte);border-radius:50%;flex:0 0 auto;
+  animation:tourne .8s linear infinite}
+@keyframes tourne{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.rotor{animation:none;border-top-color:var(--bord-fort)}}
+.recup .barre-p{height:6px;border-radius:3px;background:var(--carte-2);
+  margin:.9rem 0 .5rem;overflow:hidden;border:1px solid var(--bord)}
+.recup .barre-p i{display:block;height:100%;width:0;border-radius:3px;
+  background:linear-gradient(90deg,var(--alerte),var(--accent));transition:width .5s ease}
+.recup .chiffres{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;
+  font-family:var(--mono);font-size:.78rem;color:var(--doux);
+  font-variant-numeric:tabular-nums}
+.recup p{margin:.7rem 0 0;font-size:.86rem;color:var(--doux)}
 .jauge-sync{height:2px;background:var(--bord)}
 .jauge-sync i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--quantum));
   transition:width .4s ease}
@@ -318,9 +347,10 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
       <span class="pastille" aria-hidden="true">Q21</span>
       <h1>Portefeuille <span class="etat" id="reseau">…</span></h1>
     </div>
-    <div class="pousse pouls">
+    <div class="pousse pouls" id="pouls" role="status" aria-live="polite">
       <span class="point" id="point-sync"></span>
-      <span id="pouls-texte">connexion…</span>
+      <b id="pouls-etat">Connexion…</b>
+      <span id="pouls-texte"></span>
     </div>
   </div>
   <div class="jauge-sync"><i id="jauge-sync"></i></div>
@@ -372,9 +402,25 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
   <p id="erreur-detail"></p>
 </div>
 
-<div id="bandeau-sync" class="avert" hidden>
-  <h3>Le solde affiché est incomplet</h3>
+<div id="bandeau-sync" class="recup" hidden>
+  <div class="tete">
+    <span class="rotor" aria-hidden="true"></span>
+    <h3 id="recup-titre">Récupération de l'historique de la chaîne</h3>
+  </div>
+  <div id="recup-mesure">
+    <div class="barre-p"><i id="recup-barre"></i></div>
+    <div class="chiffres">
+      <span id="recup-position">—</span>
+      <span id="recup-vitesse">—</span>
+    </div>
+  </div>
   <p id="sync-note"></p>
+  <p id="recup-restaure" hidden>
+    <strong>Si vous venez de restaurer un portefeuille</strong>, vos fonds
+    réapparaîtront à la fin de cette étape&nbsp;: ils sont dans la chaîne, et
+    votre machine ne les a pas encore lus. Le solde affiché est incomplet
+    jusque-là.
+  </p>
   <p id="sync-detail"></p>
 </div>
 
@@ -882,17 +928,55 @@ async function rafraichir(){
     document.getElementById("reseau").textContent = info.reseau;
     pouls(sync);
 
+    // --- Le bandeau de recuperation.
+    //
+    // Il n'annonce pas « restauration en cours » : le nœud ne le sait pas, et
+    // l'affirmer serait inventer. Il annonce ce qui se passe reellement — la
+    // chaine se recupere — puis ajoute une ligne **conditionnelle** pour qui
+    // vient de restaurer. La conditionnelle est vraie dans les deux cas.
     const bandeau = document.getElementById("bandeau-sync");
     if (sync.synchronise){
       bandeau.hidden = true;
     } else {
       bandeau.hidden = false;
+      const ici = Number(sync.hauteur), la = Number(sync.hauteur_reseau) || 1;
+      const seul = Number(sync.pairs) === 0;
+
+      // --- Sans pair, il n'y a rien a mesurer.
+      //
+      // La barre affichait « 210 sur 210 » et se remplissait entierement sous
+      // un titre d'attente : une progression achevee pour une operation qui
+      // n'avait pas commence. Un nœud sans pair ne connait pas la hauteur du
+      // reseau ; il connait la sienne, et c'est tout. On cache donc la mesure
+      // plutot que d'en montrer une fausse.
+      document.getElementById("recup-mesure").hidden = seul;
+      document.getElementById("recup-titre").textContent = seul
+        ? "En attente d'un ordinateur à qui demander la chaîne"
+        : "Récupération de l'historique de la chaîne";
+      if (!seul){
+        const pct = Math.max(0, Math.min(100, (ici / la) * 100));
+        document.getElementById("recup-barre").style.width = pct.toFixed(1) + "%";
+        document.getElementById("recup-position").textContent =
+          ici.toLocaleString("fr-FR") + " sur " + la.toLocaleString("fr-FR") + " blocs";
+        // La vitesse vient de la meme derivee que celle du reseau ; sans elle on
+        // n'annonce pas de duree, plutot que d'en inventer une.
+        document.getElementById("recup-vitesse").textContent =
+          vitesseBlocs > 0.05
+            ? vitesseBlocs.toFixed(1) + " blocs/s · " + resteEnTemps(Number(sync.blocs_restants))
+            : "vitesse en cours de mesure";
+      }
       document.getElementById("sync-note").textContent = sync.note;
-      document.getElementById("sync-detail").textContent =
-        "Hauteur locale " + sync.hauteur + ", hauteur annoncée par le réseau " +
-        sync.hauteur_reseau + " — " + sync.blocs_restants + " bloc(s) restant(s), " +
-        sync.pairs + " pair(s) connecté(s). Ce qui est affiché ci-dessous ne " +
-        "compte que les blocs déjà validés par cette machine.";
+      // Un portefeuille qui n'a presque rien derive et qui rattrape la chaine
+      // est très probablement une restauration. On ne l'affirme pas : on
+      // s'adresse a lui par une condition qu'il reconnaitra.
+      document.getElementById("recup-restaure").hidden =
+        Number(solde.adresses_derivees) > 2;
+      document.getElementById("sync-detail").textContent = seul
+        ? "Votre machine a vérifié " + ici.toLocaleString("fr-FR") + " bloc(s), mais " +
+          "sans personne à qui parler elle ne peut pas savoir s'il en existe d'autres. " +
+          "Le solde affiché est donc peut-être incomplet."
+        : sync.pairs + " ordinateur(s) relié(s). Ce qui est affiché ci-dessous ne " +
+          "compte que les blocs déjà vérifiés par cette machine.";
     }
 
     document.getElementById("solde-gros").innerHTML = gros(solde.depensable.q21);
@@ -1302,19 +1386,34 @@ function pouls(sync){
   derniereHauteur = Number(sync.hauteur);
   derniereMesure = t;
 
-  const pt = document.getElementById("point-sync");
-  const tx = document.getElementById("pouls-texte");
   const jauge = document.getElementById("jauge-sync");
   const cible = Number(sync.hauteur_reseau) || 1;
   const part = Math.max(0, Math.min(100, (Number(sync.hauteur) / cible) * 100));
   jauge.style.width = (sync.synchronise ? 100 : part) + "%";
 
-  pt.className = "point " + (sync.synchronise ? "vert" : (Number(sync.pairs) > 0 ? "orange" : ""));
-  tx.textContent = sync.synchronise
-    ? Number(sync.pairs) + " pair(s) · à jour · bloc " + sync.hauteur
-    : (Number(sync.pairs) === 0
-        ? "aucun pair · bloc " + sync.hauteur
-        : sync.blocs_restants + " bloc(s) à rattraper");
+  // --- Trois etats, nommes, et de couleurs distinctes.
+  //
+  // Un point de couleur seul n'est pas lisible par tout le monde : environ un
+  // homme sur douze distingue mal le vert du rouge. Le mot porte donc l'etat,
+  // la couleur ne fait que le repeter — et la zone est annoncee `aria-live`,
+  // pour qu'un lecteur d'ecran signale le passage hors connexion.
+  const pairs = Number(sync.pairs);
+  const etat = pairs === 0 ? "hors" : (sync.synchronise ? "ok" : "sync");
+  const pouls = document.getElementById("pouls");
+  const pt = document.getElementById("point-sync");
+  const nom = document.getElementById("pouls-etat");
+  const tx = document.getElementById("pouls-texte");
+
+  pouls.className = "pousse pouls " + etat;
+  pt.className = "point " + (etat === "ok" ? "vert" : etat === "sync" ? "orange" : "rouge");
+  nom.textContent = etat === "ok" ? "Connecté"
+                  : etat === "sync" ? "Synchronisation"
+                  : "Hors connexion";
+  tx.textContent = etat === "ok"
+    ? "· " + pairs + " pair(s) · bloc " + sync.hauteur
+    : etat === "sync"
+      ? "· " + sync.blocs_restants + " bloc(s) restants"
+      : "· aucun ordinateur joignable";
 
   const v = document.getElementById("vitesse-sync");
   if (v) v.textContent = (vitesseBlocs < 0.05 ? "0" : vitesseBlocs.toFixed(1));
@@ -1420,6 +1519,17 @@ function formatDebitLong(n){
   if (n >= 1e6)  return (n / 1e6).toFixed(2) + " M";
   if (n >= 1e3)  return (n / 1e3).toFixed(1) + " k";
   return String(Math.round(n));
+}
+
+// Duree restante, a partir de la vitesse mesuree. Aucune estimation n'est
+// donnee tant que la vitesse ne l'est pas : « calcul en cours » vaut mieux
+// qu'un nombre tire d'un echantillon d'une seconde.
+function resteEnTemps(blocs){
+  if (!(vitesseBlocs > 0.05) || !(blocs > 0)) return "durée inconnue";
+  const sec = blocs / vitesseBlocs;
+  if (sec < 90) return "environ " + Math.round(sec) + " s";
+  if (sec < 5400) return "environ " + Math.round(sec / 60) + " min";
+  return "environ " + (sec / 3600).toFixed(1) + " h";
 }
 
 function duree(sec){
@@ -1763,6 +1873,25 @@ mod tests {
         const MONNAIE: [&str; 8] = [
             "unites", "q21", "solde", "montant", "frais", "depensable", "immature", "recu",
         ];
+        // Le mot doit etre un mot, pas une sous-chaine : « recu » se cache dans
+        // « recuperation », et l'epreuve refusait une barre de progression au
+        // motif qu'elle parlait d'argent.
+        fn contient_mot(ligne: &str, mot: &str) -> bool {
+            let borne = |c: char| !c.is_alphanumeric() && c != '_';
+            let mut depuis = 0;
+            while let Some(i) = ligne[depuis..].find(mot) {
+                let d = depuis + i;
+                let f = d + mot.len();
+                let avant = ligne[..d].chars().next_back().is_none_or(borne);
+                let apres = ligne[f..].chars().next().is_none_or(borne);
+                if avant && apres {
+                    return true;
+                }
+                depuis = d + 1;
+            }
+            false
+        }
+
         let mut vus = 0;
         for (n, ligne) in s.lines().enumerate() {
             if !ligne.contains("toFixed") {
@@ -1772,7 +1901,7 @@ mod tests {
             let bas = ligne.to_lowercase();
             for mot in MONNAIE {
                 assert!(
-                    !bas.contains(mot),
+                    !contient_mot(&bas, mot),
                     "ligne {} : un montant passe par toFixed — {}",
                     n + 1,
                     ligne.trim()
@@ -1926,6 +2055,66 @@ mod tests {
         assert!(PAGE.contains("Le solde affiché est incomplet"));
         assert!(PAGE.contains("sync.synchronise"));
         assert!(PAGE.contains("sync.blocs_restants"));
+    }
+
+    /// L'etat de connexion se lit sans distinguer les couleurs.
+    ///
+    /// Environ un homme sur douze distingue mal le vert du rouge. Un point de
+    /// couleur seul ne dit donc rien a tout le monde ; le mot porte l'etat, la
+    /// couleur ne fait que le repeter.
+    #[test]
+    fn l_etat_de_connexion_est_ecrit_en_toutes_lettres() {
+        let s = script();
+        for mot in ["\"Connecté\"", "\"Synchronisation\"", "\"Hors connexion\""] {
+            assert!(s.contains(mot), "etat sans nom : {mot}");
+        }
+        // Les trois etats mènent a trois couleurs distinctes, et rouge existe.
+        for classe in ["vert", "orange", "rouge"] {
+            assert!(
+                PAGE.contains(&format!(".point.{classe}{{")),
+                "couleur absente de la feuille de style : {classe}"
+            );
+        }
+        // La zone est annoncee : un passage hors connexion doit se dire, pas
+        // seulement se voir.
+        assert!(PAGE.contains(r#"role="status" aria-live="polite""#));
+        // Et l'etat vient du nombre de pairs, pas d'une supposition.
+        assert!(s.contains("const pairs = Number(sync.pairs);"));
+        assert!(s.contains(r#"pairs === 0 ? "hors""#));
+    }
+
+    /// La recuperation de la chaine se montre, avec une progression reelle.
+    #[test]
+    fn la_recuperation_de_la_chaine_se_voit() {
+        let s = script();
+        assert!(PAGE.contains("Récupération de l'historique de la chaîne"));
+        assert!(PAGE.contains(r#"class="rotor""#), "rien ne tourne pendant l'attente");
+        // La barre suit la hauteur reelle, elle n'est pas decorative.
+        assert!(s.contains(r#"document.getElementById("recup-barre").style.width"#));
+        assert!(s.contains("(ici / la) * 100"));
+        // Sans vitesse mesuree, aucune duree n'est annoncee.
+        assert!(
+            s.contains(r#"return "durée inconnue""#),
+            "une duree est annoncee avant d'avoir ete mesuree"
+        );
+        // Le cas « personne a qui demander » a son propre titre : une barre qui
+        // n'avance pas sans explication se lit comme une panne.
+        assert!(PAGE.contains("En attente d'un ordinateur à qui demander la chaîne"));
+    }
+
+    /// La page ne pretend jamais savoir qu'une restauration est en cours.
+    ///
+    /// Le nœud ne le sait pas. La ligne qui s'adresse a qui vient de restaurer
+    /// est donc formulee en condition, et elle reste vraie dans les deux cas.
+    #[test]
+    fn la_restauration_est_evoquee_sans_etre_affirmee() {
+        assert!(PAGE.contains("Si vous venez de restaurer un portefeuille"));
+        assert!(
+            !PAGE.contains("Restauration en cours") || PAGE.contains("Si vous venez de"),
+            "la page affirme une restauration qu'elle ne peut pas constater"
+        );
+        // Elle ne s'adresse qu'a un portefeuille qui n'a presque rien derive.
+        assert!(script().contains("Number(solde.adresses_derivees) > 2"));
     }
 
     /// Un historique tronque doit se declarer.
