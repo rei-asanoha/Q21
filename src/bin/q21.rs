@@ -2444,7 +2444,22 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             if let Some(b) = bloc {
                 let ok = node.with_chain(|c| c.connect(&b, maintenant()).is_ok());
                 if ok {
-                    minage.bloc_trouve();
+                    // Ce que ce bloc rapporte : la premiere sortie de la
+                    // coinbase, que le consensus oblige a payer le mineur —
+                    // subvention plus frais. C'est le chiffre que l'ecran
+                    // du minage montre a cote de chaque trouvaille.
+                    let recompense = b
+                        .transactions
+                        .first()
+                        .and_then(|c| c.outputs.first())
+                        .map(|o| o.value.units())
+                        .unwrap_or(0);
+                    minage.bloc_trouve(q21_core::minage::BlocTrouve {
+                        hauteur: b.header.height,
+                        identifiant: b.header.block_id(),
+                        recompense,
+                        horodatage: b.header.time,
+                    });
                     // La recompense est encaissee : l'adresse a servi, la
                     // suivante en aura une autre.
                     beneficiaire_minage = None;
