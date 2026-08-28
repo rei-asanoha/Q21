@@ -373,6 +373,8 @@ MINAGE.md        Miner du Q21 expliqué sans jargon : ce qu'il faut, ce que
                  ça coûte, et pourquoi une machine ordinaire suffit
 PROJECTION.md    La vie de la chaîne, calculée par le code de consensus :
                  émission sur cent ans, capacité, et le mur des 4,74 tx/s
+AUDIT-2026.md    La chaîne face à l'état de l'art 2026 : où elle est devant,
+                 où est le mur de la vitesse, et les axes classés par horizon
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 
 outils/
