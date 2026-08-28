@@ -221,6 +221,16 @@ laquelle la récompense monte linéairement depuis zéro. Sans elle, les quelque
 mineurs présents la première semaine capteraient une part disproportionnée de la
 masse totale.
 
+Et la courbe se termine, exactement. Une décroissance géométrique tronquée à
+l'entier ne rejoint jamais son plafond — calculé sur la trajectoire réelle, il
+serait resté 137 899 Q21 jamais créés. Un **plancher de queue** de 0,01 Q21 par
+bloc prend le relais quand la décroissance passe dessous (vers l'année 42), et
+l'émission cumulée est écrêtée au plafond près : le dernier bloc émetteur, à
+99,91 ans, reçoit le reliquat exact, puis plus rien. **Chaque unité des
+21 000 001 finit par exister** — le nombre qui donne son nom au projet est une
+promesse tenue, pas une asymptote. Une épreuve vérifie l'égalité à l'unité
+près.
+
 ### Levier C — payer le travail perdu
 
 Un gros mineur gagne les courses de propagation, et touche donc **plus** que sa

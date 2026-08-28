@@ -39,8 +39,9 @@ sur un instant qui secoue tout le marché du minage d'un coup.
 | 15 | 1,0263 | 19 304 086 | 91,92 % |
 | 20 | 0,4317 | 20 207 445 | 96,23 % |
 | 30 | 0,0762 | 20 746 536 | 98,79 % |
-| 50 | 0,0024 | 20 858 520 | 99,33 % |
-| 100 | 0 | 20 862 102 | 99,34 % |
+| 50 | 0,0100 | 20 868 755 | 99,38 % |
+| 75 | 0,0100 | 20 934 500 | 99,69 % |
+| 100 | 0 | **21 000 001** | **100,00 %** |
 
 ### Les seuils
 
@@ -50,25 +51,35 @@ sur un instant qui secoue tout le marché du minage d'un coup.
 | Trois quarts | 2 147 040 | **8,2 ans** |
 | 90 % | 3 598 560 | **13,7 ans** |
 | 99 % | 8 605 440 | **32,7 ans** |
-| Récompense de bloc nulle | 23 902 560 | **90,9 ans** |
+| 99,9 % | 24 174 720 | **91,9 ans** |
+| **Plafond atteint, exactement** | 26 273 578 | **99,91 ans** |
 
-### Le plafond n'est jamais atteint, et c'est net
+### Le plafond est atteint — au bloc près, à l'unité près
 
-À l'année 91, la récompense de base tombe sous l'unité indivisible et devient
-**zéro**. À cet instant, **20 862 102 Q21** ont été émis sur 21 000 001.
+Une décroissance géométrique tronquée à l'entier ne rejoint jamais son plafond.
+Calculé sur la première version du calendrier : la récompense passait sous
+l'unité indivisible à l'année 91, et **137 899 Q21 ne seraient jamais créés**.
+Le nombre gravé dans le nom du projet aurait été une asymptote, pas une
+promesse. Bitcoin assume ce trou ; Q21 ne le pouvait pas.
 
-**137 899 Q21 ne seront jamais créés**, soit 0,66 % du plafond.
+Le correctif tient en deux règles, toutes deux dans `emission.rs` :
 
-Ce n'est pas un défaut, c'est la conséquence arithmétique d'une décroissance
-géométrique tronquée à l'entier : la somme tend vers le plafond sans l'atteindre,
-et la troncature arrête le processus avant l'asymptote. La constante
-`MAX_SUPPLY` est donc bien ce qu'elle annonce — un **plafond**, une borne que
-rien ne peut franchir — et non une prédiction de ce qui existera.
+**Un plancher de queue.** La récompense d'époque vaut désormais
+`max(décroissance, 0,01 Q21)`. Le plancher ne mord que la queue — la
+décroissance ne passe sous 0,01 que vers l'année 42, quand 99,3 % du plafond
+est déjà émis — et il donne au mineur de la longue queue un revenu de
+subvention plancher, prévisible, en plus des frais.
 
-Après l'année 91, un mineur ne vit plus que des frais de transaction. C'est le
-même horizon que Bitcoin, à quelques décennies près, et le même problème ouvert :
-personne ne sait encore si les frais seuls suffisent à payer la sécurité d'une
-chaîne.
+**Un écrêtage exact.** L'émission cumulée est bornée à `EMISSION_CAP`, et la
+récompense d'un bloc est *définie* comme la différence des cumuls : le dernier
+bloc émetteur — le **26 273 578ᵉ**, à 99,91 ans — reçoit le reliquat exact de
+**0,00747908 Q21**, puis la subvention est nulle pour toujours. Une épreuve
+vérifie l'égalité : à cette hauteur, l'offre totale vaut **21 000 001,00000000**
+— pas une unité de moins.
+
+Après le siècle, un mineur ne vit plus que des frais de transaction. C'est le
+même horizon que Bitcoin, et le même problème ouvert : personne ne sait encore
+si les frais seuls suffisent à payer la sécurité d'une chaîne.
 
 ---
 
@@ -232,7 +243,8 @@ chaîne dont plus personne ne vérifie.
 | **La jeunesse** | Jusqu'à 4 ans | La moitié des Q21 est émise. La subvention paie tout ; les frais ne comptent pas |
 | **La maturité** | 4 à 14 ans | 90 % émis. La table atteint son plafond de 8 Gio à l'année 6. Les frais commencent à peser dans le revenu du mineur |
 | **La longue queue** | 14 à 91 ans | Les 10 % restants s'étalent. Le revenu du mineur bascule progressivement vers les frais |
-| **Après la subvention** | Au-delà de 91 ans | Plus un seul Q21 créé. 20 862 102 en circulation, définitivement. La sécurité repose entièrement sur les frais — question ouverte, ici comme ailleurs |
+| **La queue au plancher** | 42 à 100 ans | La décroissance est passée sous 0,01 Q21 : le plancher paie, constant, jusqu'au plafond |
+| **Après la subvention** | Au-delà de 99,91 ans | Plus un seul Q21 créé. 21 000 001 en circulation, exactement. La sécurité repose entièrement sur les frais — question ouverte, ici comme ailleurs |
 
 ---
 
@@ -245,7 +257,7 @@ chaîne dont plus personne ne vérifie.
 - **La tenue de la preuve de travail sous attaque.** Elle n'a reçu aucune
   cryptanalyse externe. Si elle tombait, toute la section 2 tomberait avec elle.
 - **Les frais.** Aucun marché des frais n'a été observé, et leur évolution
-  décide de tout après l'année 91.
+  décide de tout après le siècle d'émission.
 
 ---
 
