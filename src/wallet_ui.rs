@@ -370,6 +370,15 @@ td{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .badge.attente{background:var(--alerte-fond);color:var(--alerte)}
 .badge.gris{background:var(--carte-2);color:var(--tenu)}
 
+details.pli{background:var(--carte-2);border:1px solid var(--bord);border-radius:14px;
+  padding:.85rem 1.05rem;margin:1rem 0;font-size:.87rem;color:var(--doux)}
+details.pli summary{cursor:pointer;font-weight:600;color:var(--texte);
+  list-style-position:inside}
+details.pli summary:hover{color:var(--accent)}
+details.pli[open] summary{margin-bottom:.5rem}
+details.pli p{margin:0 0 .6rem}
+details.pli p:last-child{margin-bottom:0}
+
 .recap{background:var(--carte-2);border:1px solid var(--bord);border-radius:14px;
   padding:1rem;font-family:var(--mono);font-size:.85rem;word-break:break-all}
 footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--bord);
@@ -707,8 +716,8 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
 
   <h2>Portefeuille</h2>
   <div class="grille" id="tuiles-infos"></div>
-  <div class="note">
-    <h3>ML-DSA-87 — FIPS&nbsp;204, niveau NIST&nbsp;5</h3>
+  <details class="pli">
+    <summary>ML-DSA-87 (FIPS&nbsp;204, niveau NIST&nbsp;5) — pourquoi ça résiste au quantique</summary>
     <p>
       Les signatures de ce portefeuille reposent sur ML-DSA, le schéma à réseaux
       euclidiens normalisé par le NIST en 2024 sous le nom FIPS&nbsp;204. Q21
@@ -728,9 +737,21 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
       signature à réseaux euclidiens est une faute professionnelle. Il branche
       une implémentation auditée.
     </p>
-  </div>
+  </details>
   <h2>Chaîne</h2>
   <div class="grille" id="tuiles-chaine"></div>
+
+  <details class="pli">
+    <summary>Pour les développeurs</summary>
+    <p>
+      Le nœud sert une API JSON-RPC sur <code>POST /rpc</code> —
+      <code>listmethods</code> énumère les méthodes. Le jeton d'accès de la
+      session s'envoie en <code>Authorization: Bearer</code> ; il ne quitte
+      jamais cette page et rien n'est écrit dans le navigateur en dehors de
+      lui. L'explorateur et le portefeuille sont servis par le même processus,
+      sur le même port, sans aucune ressource externe.
+    </p>
+  </details>
 
   <h2>Fermer</h2>
   <div class="note">
@@ -757,12 +778,10 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
 <footer>
   <p style="margin:0 0 .6rem">
     <a class="plat" id="lien-explorateur" href="/">Explorateur de la chaîne</a> —
-    blocs, transactions et adresses, servis par le même nœud, sur le même port.
+    tout ce que votre nœud a vérifié, consultable sans faire confiance à personne.
   </p>
-  API JSON-RPC sur <code>POST /rpc</code> — <code>listmethods</code> énumère les
-  méthodes disponibles. Le jeton d'accès ne quitte pas cette page&nbsp;: rien
-  n'est écrit dans le navigateur en dehors de lui. Code de recherche, non
-  audité&nbsp;: ne protège aucune valeur réelle.
+  Réseau d'essai — les Q21 qui s'y minent n'ont aucune valeur, et n'en auront
+  jamais. Logiciel de recherche, non audité de l'extérieur.
 </footer>
 
 </main>
@@ -1016,7 +1035,11 @@ async function rafraichir(){
       appel("getsyncstatus"), appel("getbalance"), appel("getinfo")
     ]);
     document.getElementById("erreur").hidden = true;
-    document.getElementById("reseau").textContent = info.reseau;
+    // Le nœud annonce « Testnet » (nom Debug de l'enum). On compare donc en
+    // minuscules : la premiere version comparait a "testnet" exact et le badge
+    // affichait le jargon anglais qu'elle croyait traduire.
+    document.getElementById("reseau").textContent =
+      String(info.reseau).toLowerCase() === "testnet" ? "réseau d'essai" : info.reseau;
     pouls(sync);
 
     // --- Le bandeau de recuperation.
@@ -1239,14 +1262,18 @@ document.getElementById("bouton-envoyer").addEventListener("click", async () => 
     document.getElementById("champ-adresse").value = "";
     document.getElementById("resultat-envoi").innerHTML = `
       <div class="note">
-        <h3>Transaction émise</h3>
-        <p>Identifiant : <code>${ech(r.txid)}</code></p>
+        <h3>✓ Envoi transmis au réseau</h3>
         <p>
-          Elle est dans le réservoir de ce nœud et annoncée à ses pairs. Elle
-          n'est <strong>pas encore confirmée</strong> : tant qu'aucun bloc ne la
-          contient, elle peut être remplacée ou oubliée.
+          Il est annoncé aux pairs et attend d'entrer dans un bloc — comptez
+          l'ordre de deux minutes. Tant qu'aucun bloc ne le contient, il n'est
+          <strong>pas encore confirmé</strong>.
         </p>
-        <p>Taille ${ech(r.transaction.taille_octets)} octets, dont ${ech(r.transaction.temoin_pourcent)} % de témoin.</p>
+        <p>
+          <a class="plat" href="/#/tx/${ech(r.txid)}" target="_blank" rel="noopener">Suivre
+          cette transaction dans l'explorateur</a>
+        </p>
+        <p class="aide">Référence : <span class="coupe">${ech(r.txid)}</span> —
+        ${ech(r.transaction.taille_octets)} octets.</p>
       </div>`;
     rafraichir();
   }catch(e){
@@ -1346,7 +1373,9 @@ async function historique(){
     sous.innerHTML = notesColonnes(h);
 
     if (!h.mouvements.length){
-      corps.innerHTML = `<tr><td colspan="7">Aucun mouvement dans la fenêtre examinée.</td></tr>`;
+      corps.innerHTML = `<tr><td colspan="7">Rien pour l'instant. Vos premiers
+        mouvements apparaîtront ici — recevez du Q21 depuis l'onglet Recevoir,
+        ou trouvez un bloc depuis l'onglet Miner.</td></tr>`;
       return;
     }
     corps.innerHTML = h.mouvements.map(m => {
