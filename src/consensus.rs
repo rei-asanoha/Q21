@@ -102,6 +102,36 @@ pub const DECAY_DEN: u128 = 100_000_000;
 /// disproportionnee de la masse totale.
 pub const SLOW_START_BLOCKS: u64 = 20_000;
 
+/// Plancher de la recompense de bloc, en unites : 0,01 Q21.
+///
+/// # Le defaut que ce plancher repare
+///
+/// La decroissance geometrique tronquee a l'entier ne rejoint jamais le
+/// plafond. Calcule sur la trajectoire reelle : la recompense passait sous
+/// l'unite indivisible a l'annee 91, et **137 899 Q21 sur 21 000 001 ne
+/// seraient jamais crees**. Le nombre grave dans le nom du projet aurait ete
+/// une asymptote, pas une promesse.
+///
+/// # Ce que le plancher change
+///
+/// La recompense de base d'une epoque vaut desormais
+/// `max(decroissance geometrique, RECOMPENSE_PLANCHER)`, et l'emission cumulee
+/// est ecretee **exactement** a [`EMISSION_CAP`] : le dernier bloc emetteur
+/// recoit le reliquat, puis plus rien, pour toujours. Chaque unite du plafond
+/// finit donc par exister — c'est `emission::block_subsidy` qui applique la
+/// regle, et une epreuve verifie l'egalite exacte.
+///
+/// # Pourquoi 0,01 Q21
+///
+/// Assez petit pour ne rien changer au premier demi-siecle — la geometrique ne
+/// passe sous ce plancher que vers l'annee 42, quand plus de 99 % du plafond
+/// est deja emis. Assez grand pour que la fin arrive a echelle humaine plutot
+/// que geologique : le reliquat s'epuise en quelques decennies de queue, la ou
+/// un plancher d'une unite indivisible aurait etale la meme somme sur des
+/// dizaines de milliers d'annees. Et pendant toute la queue, un mineur touche
+/// un revenu de subvention plancher, previsible, en plus des frais.
+pub const TAIL_REWARD: u64 = 1_000_000;
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -455,4 +485,11 @@ const _: () = {
 
     assert!(SLOW_START_BLOCKS > 0);
     assert!(DECAY_EPOCH_BLOCKS > 0);
+
+    // Le plancher de queue : strictement positif — c'est lui qui garantit que
+    // l'emission atteint le plafond en temps fini — et tres en dessous de la
+    // recompense initiale, pour qu'il ne morde que la queue de la courbe et
+    // jamais son corps.
+    assert!(TAIL_REWARD > 0);
+    assert!(TAIL_REWARD < INITIAL_REWARD / 1000);
 };

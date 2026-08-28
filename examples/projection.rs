@@ -122,23 +122,27 @@ fn main() {
         epoque += 1;
     }
 
-    // La fin du minage : la premiere epoque ou la recompense de base tombe a
-    // zero unite indivisible. Au-dela, un mineur ne vit plus que des frais.
-    let mut e = 0u64;
-    while emission::epoch_base_reward(e) > 0 && e < 100_000 {
-        e += 1;
-    }
-    let h_fin = e * DECAY_EPOCH_BLOCKS;
+    // La fin du minage : le plancher de queue garantit qu'elle existe, et que
+    // le plafond y est atteint exactement.
+    let h_fin = emission::hauteur_de_fin_d_emission();
     println!(
-        "  recompense nulle a partir du bloc {:>10}  —  {:>5.1} ans",
-        h_fin,
-        h_fin as f64 / BLOCS_PAR_AN as f64
+        "  plafond atteint au bloc {:>10}  —  {:>6.2} ans",
+        h_fin - 1,
+        (h_fin - 1) as f64 / BLOCS_PAR_AN as f64
     );
     println!(
-        "  emis a ce moment : {:.0} Q21 sur {:.0} — il en manque {:.2}",
+        "  emis a ce moment : {:.8} Q21 sur {:.8} — il en manque {}",
         q21(emission::total_supply_at(h_fin).units()),
         q21(plafond),
-        q21(plafond - emission::total_supply_at(h_fin).units())
+        plafond - emission::total_supply_at(h_fin).units()
+    );
+    println!(
+        "  reliquat du dernier bloc emetteur : {:.8} Q21",
+        q21(emission::block_subsidy(h_fin - 1).units())
+    );
+    println!(
+        "  plancher de queue : {:.8} Q21 par bloc des que la decroissance passe dessous",
+        q21(TAIL_REWARD)
     );
     println!();
 
