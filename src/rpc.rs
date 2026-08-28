@@ -1624,16 +1624,39 @@ impl RpcContext {
     /// Toujours servi, meme sans portefeuille — savoir qu'on ne mine pas est
     /// une reponse utile, et elle ne revele rien.
     fn getminage(&self) -> Json {
-        let (actif, debit, blocs, total) = match &self.minage {
-            Some(m) => (m.actif(), m.debit(), m.blocs(), m.essais_total()),
-            None => (false, 0.0, 0, 0),
+        let (actif, debit, blocs, total, gagne, trouves) = match &self.minage {
+            Some(m) => (
+                m.actif(),
+                m.debit(),
+                m.blocs(),
+                m.essais_total(),
+                m.gagne_total(),
+                m.trouves(),
+            ),
+            None => (false, 0.0, 0, 0, 0, Vec::new()),
         };
+        // Les vingt dernieres trouvailles suffisent a l'ecran ; le compteur et
+        // le gain, eux, portent le total depuis le lancement.
+        let liste: Vec<Json> = trouves
+            .iter()
+            .take(20)
+            .map(|t| {
+                Json::obj()
+                    .set("hauteur", Json::u64(t.hauteur))
+                    .set("identifiant", Json::str(t.identifiant.to_string()))
+                    .set("recompense", montant(Amount::from_units(t.recompense)))
+                    .set("horodatage", Json::u64(t.horodatage))
+                    .build()
+            })
+            .collect();
         Json::obj()
             .set("actif", Json::Bool(actif))
             .set("possible", Json::Bool(self.minage.is_some() && self.wallet.is_some()))
             .set("essais_par_seconde", Json::Int(debit as i64))
             .set("essais_total", Json::u64(total))
             .set("blocs_trouves", Json::u64(blocs))
+            .set("gagne", montant(Amount::from_units(gagne)))
+            .set("trouves", Json::array(liste))
             .build()
     }
 

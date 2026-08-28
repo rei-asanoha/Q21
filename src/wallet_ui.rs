@@ -265,6 +265,48 @@ p{margin:0 0 .8rem}
 .bascule:focus-visible{outline:3px solid var(--accent-fond);outline-offset:2px}
 @media(prefers-reduced-motion:reduce){.bascule,.bascule i{transition:none}}
 
+/* --- Les gestes rapides du solde ---------------------------------------- */
+.gestes{display:flex;gap:.7rem;margin-top:1.2rem;position:relative;z-index:1}
+.gestes button{flex:1;display:flex;align-items:center;justify-content:center;gap:.5rem;
+  font:inherit;font-weight:600;font-size:.9rem;padding:.75rem 1rem;cursor:pointer;
+  border-radius:12px;border:1.5px solid var(--bord);background:var(--carte-2);
+  color:var(--texte);transition:border-color .15s}
+.gestes button:hover{border-color:var(--accent)}
+.gestes button svg{width:1.1rem;height:1.1rem;stroke:var(--accent);fill:none;
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.gestes button:focus-visible{outline:3px solid var(--accent-fond);outline-offset:2px}
+
+/* --- Le journal des trouvailles ----------------------------------------- */
+.trouvaille{display:flex;align-items:center;gap:.85rem;padding:.7rem .9rem;
+  border:1px solid var(--bord);border-radius:12px;background:var(--carte);
+  box-shadow:var(--ombre)}
+.trouvaille+.trouvaille{margin-top:.5rem}
+.trouvaille .pic{width:2.1rem;height:2.1rem;border-radius:10px;flex:0 0 auto;
+  display:grid;place-items:center;background:var(--accent-fond)}
+.trouvaille .pic svg{width:1.15rem;height:1.15rem;stroke:var(--accent);fill:none;
+  stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.trouvaille .quoi{flex:1;min-width:0}
+.trouvaille .quoi a{color:var(--texte);font-weight:600;text-decoration:none;
+  border-bottom:1px solid var(--bord-fort)}
+.trouvaille .quoi a:hover{border-bottom-color:var(--accent);color:var(--accent)}
+.trouvaille .quoi .quand{font-size:.76rem;color:var(--tenu);margin-top:.1rem}
+.trouvaille .gain{font-family:var(--mono);font-weight:600;color:var(--accent);
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+.trouvaille.neuve{animation:atterrit .5s ease}
+@keyframes atterrit{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.trouvaille.neuve{animation:none}}
+
+/* --- L'activite : des lignes qui se lisent d'un regard ------------------- */
+td .sens{display:inline-grid;place-items:center;width:1.6rem;height:1.6rem;
+  border-radius:8px;vertical-align:middle}
+td .sens svg{width:.95rem;height:.95rem;fill:none;stroke-width:2;
+  stroke-linecap:round;stroke-linejoin:round}
+td .sens.recu{background:var(--accent-fond)}td .sens.recu svg{stroke:var(--accent)}
+td .sens.envoi{background:var(--danger-fond)}td .sens.envoi svg{stroke:var(--danger)}
+td .sens.mine{background:var(--quantum-fond)}td .sens.mine svg{stroke:var(--quantum)}
+td.plus{color:var(--accent);font-weight:600}
+td.moins{color:var(--danger);font-weight:600}
+
 .debit{display:flex;align-items:baseline;gap:.4rem;margin-top:1rem}
 .debit .n{font-family:var(--mono);font-size:2rem;font-weight:600;letter-spacing:-.04em;
   font-variant-numeric:tabular-nums;color:var(--accent)}
@@ -429,6 +471,17 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
     <div class="k">Disponible</div>
     <div id="solde-gros">…</div>
     <div class="n" id="solde-note">Chargement…</div>
+    <div class="gestes">
+      <button type="button" data-aller="recevoir">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v13"/><path d="M6 12l6 6 6-6"/><path d="M4 20h16"/></svg>
+        Recevoir</button>
+      <button type="button" data-aller="envoyer">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V7"/><path d="M6 12l6-6 6 6"/><path d="M4 4h16"/></svg>
+        Envoyer</button>
+      <button type="button" data-aller="miner">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg>
+        Miner</button>
+    </div>
   </div>
   <h2>Détail</h2>
   <div class="grille" id="tuiles-solde"></div>
@@ -461,6 +514,8 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
     <svg class="courbe" id="courbe-minage" viewBox="0 0 300 52" preserveAspectRatio="none"
          role="img" aria-label="Débit de minage des dernières minutes"></svg>
     <div class="grille" style="margin-top:1rem">
+      <div class="tuile forte"><div class="k">Gagné en minant</div><div class="v" id="minage-gagne">0</div>
+        <div class="n">depuis le lancement — maturité comprise</div></div>
       <div class="tuile"><div class="k">Blocs trouvés</div><div class="v" id="minage-blocs">0</div>
         <div class="n">depuis le lancement</div></div>
       <div class="tuile"><div class="k">Tentatives</div><div class="v" id="minage-total">0</div>
@@ -469,6 +524,9 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
         <div class="n">par seconde, depuis le réseau</div></div>
     </div>
   </div>
+
+  <h2>Vos blocs</h2>
+  <div id="minage-trouves"></div>
   <div class="note">
     <h3>Ce que fait votre machine quand ce bouton est allumé</h3>
     <p>
@@ -621,6 +679,32 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
 </section>
 
 <section class="vue" id="vue-infos" hidden>
+  <h2>Votre sécurité</h2>
+  <div class="carte">
+    <div class="mineur">
+      <div class="titre">
+        <h3>Le code de sauvegarde est votre portefeuille</h3>
+        <p>Le fichier sur ce disque n'est qu'une copie de travail.</p>
+      </div>
+    </div>
+    <p style="margin-top:.8rem">
+      Tout votre portefeuille — chaque adresse, chaque fonds — se refabrique à
+      partir du seul code de sauvegarde que vous avez recopié à la création.
+      <strong>Sur n'importe quelle machine&nbsp;: Windows, Mac Intel, Mac Apple
+      Silicon, Linux, Raspberry Pi.</strong> Vous l'y saisissez via
+      «&nbsp;J'ai déjà un code de sauvegarde&nbsp;», et la chaîne fait le
+      reste — vérifié par une épreuve de restauration complète, sur les cinq
+      systèmes construits.
+    </p>
+    <div class="note avert" style="margin-bottom:0">
+      <h3>Deux choses à ne jamais faire</h3>
+      <p>Ne photographiez pas le code, ne le collez pas dans un nuage&nbsp;:
+      qui le lit détient vos fonds, définitivement. Et ne confondez pas le code
+      avec votre <strong>phrase secrète</strong>&nbsp;— elle, ne protège que le
+      fichier de <em>cette</em> machine, et peut être différente ailleurs.</p>
+    </div>
+  </div>
+
   <h2>Portefeuille</h2>
   <div class="grille" id="tuiles-infos"></div>
   <div class="note">
@@ -891,6 +975,13 @@ function montrer(nom){
 document.getElementById("onglets").addEventListener("click", ev => {
   const b = ev.target.closest("button[data-vue]");
   if (b) montrer(b.dataset.vue);
+});
+
+// Les gestes rapides du solde : les trois actions qu'on vient chercher neuf
+// fois sur dix, a un geste du chiffre qu'on vient de lire.
+document.addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-aller]");
+  if (b) montrer(b.dataset.aller);
 });
 
 document.getElementById("forme-jeton").addEventListener("submit", ev => {
@@ -1223,6 +1314,23 @@ function notesColonnes(h){
   return t;
 }
 
+// L'icone d'un mouvement : trois dessins en dur, choisis par le genre que le
+// nœud annonce. Un genre inconnu retombe sur la fleche de reception — un
+// dessin faux serait pire qu'un dessin generique.
+function iconeGenre(m){
+  const g = String(m.genre);
+  if (g === "minage"){
+    return brut('<span class="sens mine"><svg viewBox="0 0 24 24" aria-hidden="true">' +
+      '<path d="M13 2L4 14h6l-1 8 9-12h-6z"></path></svg></span>');
+  }
+  if (m.sorti){
+    return brut('<span class="sens envoi"><svg viewBox="0 0 24 24" aria-hidden="true">' +
+      '<path d="M12 20V7"></path><path d="M6 12l6-6 6 6"></path></svg></span>');
+  }
+  return brut('<span class="sens recu"><svg viewBox="0 0 24 24" aria-hidden="true">' +
+    '<path d="M12 4v13"></path><path d="M6 12l6 6 6-6"></path></svg></span>');
+}
+
 async function historique(){
   const corps = document.getElementById("mouvements");
   const zone = document.getElementById("note-historique");
@@ -1242,13 +1350,15 @@ async function historique(){
       return;
     }
     corps.innerHTML = h.mouvements.map(m => {
-      const attente = m.mature ? "" : " attente";
       const marque = m.mature ? "" : ` <span class="badge attente">immature</span>`;
+      // L'icone dit le sens avant que le mot soit lu ; la couleur du montant
+      // le repete. Les trois dessins sont en dur, le genre choisit lequel.
+      const recuQqc = BigInt(m.recu.unites) > 0n;
       return `
       <tr>
-        <td><span class="badge${ech(attente)}">${ech(m.genre)}</span></td>
-        <td>${ech(m.recu.q21)}</td>
-        <td>${rendu(celluleSortie(m))}</td>
+        <td>${rendu(iconeGenre(m))} ${ech(m.genre)}</td>
+        <td${html(recuQqc ? ' class="plus"' : '')}>${ech(recuQqc ? "+ " + m.recu.q21 : "—")}</td>
+        <td${html(m.sorti ? ' class="moins"' : '')}>${rendu(celluleSortie(m))}</td>
         <td>${ech(m.confirmations)}${html(marque)}</td>
         <td>${ech(m.hauteur)}</td>
         <td>${ech(date(m.horodatage))}</td>
@@ -1472,9 +1582,56 @@ function peindreMinage(etat){
   document.getElementById("minage-debit").textContent = formatDebit(etat.essais_par_seconde);
   document.getElementById("minage-blocs").textContent = String(etat.blocs_trouves);
   document.getElementById("minage-total").textContent = formatDebit(etat.essais_total);
+  document.getElementById("minage-gagne").textContent =
+    (etat.gagne ? etat.gagne.q21 : "0.00000000") + " Q21";
+  peindreTrouves(etat.trouves || [], Number(etat.blocs_trouves) || 0);
   HISTO_DEBIT.push(Number(etat.essais_par_seconde) || 0);
   while (HISTO_DEBIT.length > 60) HISTO_DEBIT.shift();
   courbe(HISTO_DEBIT);
+}
+
+// Le journal des blocs trouves. Chaque ligne : quel bloc, quand, combien —
+// et la hauteur est un lien vers l'explorateur, servi par le meme nœud sur le
+// meme port. Le pic de mineur est un dessin en dur ; tout ce qui vient du
+// nœud passe par `ech`.
+let dernierTrouve = null;
+
+function quandCourt(ts){
+  const d = new Date(Number(ts) * 1000);
+  return d.toLocaleDateString("fr-FR") + " " + d.toLocaleTimeString("fr-FR",
+    {hour: "2-digit", minute: "2-digit"});
+}
+
+function peindreTrouves(liste, total){
+  const zone = document.getElementById("minage-trouves");
+  if (!liste.length){
+    zone.innerHTML = '<div class="note"><p>Aucun bloc trouvé pour l\'instant. ' +
+      'C\'est une loterie : le bouton ci-dessus achète des tentatives, la ' +
+      'chance décide du moment.</p></div>';
+    dernierTrouve = null;
+    return;
+  }
+  const pic = '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+    '<path d="M13 2L4 14h6l-1 8 9-12h-6z"></path></svg>';
+  const lignes = liste.map((t, i) => {
+    const neuve = i === 0 && dernierTrouve !== null &&
+      String(t.hauteur) !== dernierTrouve ? " neuve" : "";
+    return '<div class="trouvaille' + neuve + '">' +
+      '<span class="pic">' + pic + '</span>' +
+      '<span class="quoi">' +
+        '<a href="/#/bloc/' + ech(String(t.hauteur)) + '" target="_blank" rel="noopener">' +
+          'Bloc ' + ech(String(t.hauteur)) + '</a>' +
+        '<div class="quand">' + ech(quandCourt(t.horodatage)) + '</div>' +
+      '</span>' +
+      '<span class="gain">+ ' + ech(t.recompense.q21) + ' Q21</span>' +
+      '</div>';
+  });
+  if (total > liste.length){
+    lignes.push('<p class="aide">' + ech(String(total - liste.length)) +
+      ' trouvaille(s) plus ancienne(s) — toutes comptées dans le total gagné.</p>');
+  }
+  zone.innerHTML = lignes.join("");
+  dernierTrouve = String(liste[0].hauteur);
 }
 
 async function minage(){
@@ -2392,6 +2549,78 @@ mod tests {
             PAGE.contains("dériver</strong>") || PAGE.contains("<strong>dériver"),
             "le mot du protocole est employe sans etre explique"
         );
+    }
+
+    /// Le journal des trouvailles dit quel bloc, quand, et combien.
+    ///
+    /// C'est ce qu'un mineur vient regarder : pas un compteur abstrait, ses
+    /// blocs a lui, avec le gain de chacun et un lien vers l'explorateur.
+    #[test]
+    fn le_journal_des_trouvailles_est_complet_et_echappe() {
+        let s = script();
+        assert!(s.contains("function peindreTrouves"), "pas de journal");
+        // Chaque champ venu du nœud traverse `ech` — hauteur comprise, car elle
+        // entre aussi dans un attribut href.
+        for e in [
+            "ech(String(t.hauteur))",
+            "ech(quandCourt(t.horodatage))",
+            "ech(t.recompense.q21)",
+        ] {
+            assert!(s.contains(e), "champ non echappe : {e}");
+        }
+        // La hauteur mene a l'explorateur du meme nœud, jamais ailleurs.
+        assert!(s.contains(r#"href="/#/bloc/"#), "pas de lien vers l'explorateur");
+        assert!(s.contains(r#"rel="noopener""#));
+        // Le gain total s'affiche, et vient du nœud — pas d'une addition JS.
+        assert!(s.contains("etat.gagne"), "le gain n'est pas celui du nœud");
+        // L'etat vide explique la loterie au lieu de montrer une liste nue.
+        assert!(s.contains("est une loterie"));
+    }
+
+    /// Les gestes rapides du solde menent aux trois actions principales.
+    #[test]
+    fn le_solde_porte_les_gestes_rapides() {
+        for v in ["recevoir", "envoyer", "miner"] {
+            assert!(
+                PAGE.contains(&format!(r#"data-aller="{v}""#)),
+                "geste rapide absent : {v}"
+            );
+        }
+        assert!(script().contains(r#"button[data-aller]"#));
+    }
+
+    /// L'activite se lit d'un regard : une icone par sens, un montant signe.
+    #[test]
+    fn l_activite_porte_des_icones_et_des_signes() {
+        let s = script();
+        assert!(s.contains("function iconeGenre"), "pas d'icones de mouvement");
+        // Trois sens, trois dessins — et le genre inconnu retombe sur un dessin
+        // generique plutot que sur rien.
+        for cl in ["sens mine", "sens envoi", "sens recu"] {
+            assert!(s.contains(cl), "sens absent : {cl}");
+        }
+        // Le montant recu s'affiche signe et colore ; l'absence reste un tiret.
+        assert!(s.contains(r#""+ " + m.recu.q21"#));
+        assert!(PAGE.contains("td.plus{color:var(--accent)"));
+        assert!(PAGE.contains("td.moins{color:var(--danger)"));
+    }
+
+    /// La carte de securite promet la restauration partout, et distingue le
+    /// code de la phrase secrete.
+    ///
+    /// La confusion entre les deux est la premiere cause de fonds crus perdus :
+    /// quelqu'un retient sa phrase, perd son code, et decouvre trop tard que la
+    /// phrase ne refabrique rien.
+    #[test]
+    fn la_carte_de_securite_dit_ce_qui_sauve_et_ce_qui_ne_sauve_pas() {
+        assert!(PAGE.contains("Le code de sauvegarde est votre portefeuille"));
+        for os in ["Windows", "Mac Intel", "Mac Apple
+      Silicon", "Linux", "Raspberry Pi"] {
+            assert!(PAGE.contains(os), "systeme absent de la promesse : {os}");
+        }
+        assert!(PAGE.contains("ne protège que le
+      fichier de <em>cette</em> machine"));
+        assert!(PAGE.contains("Ne photographiez pas le code"));
     }
 
     /// Aucun appel a `tuile` ne porte de balisage sans passer par `brut`.

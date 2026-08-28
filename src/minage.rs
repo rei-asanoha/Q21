@@ -35,6 +35,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// Un bloc trouve par cette machine : ce que le mineur veut revoir.
+///
+/// La chaine, elle, ne distingue pas « mes » blocs des autres — c'est voulu, le
+/// mineur change d'adresse a chaque bloc pour ne pas etre pistable. Seul ce
+/// processus sait ce qu'il a trouve, et il ne le savait que le temps d'une
+/// ligne de journal. On le retient donc ici, pour l'ecran.
+#[derive(Clone, Copy)]
+pub struct BlocTrouve {
+    pub hauteur: u64,
+    pub identifiant: crate::hash::Hash256,
+    /// Ce que la coinbase verse au mineur : subvention plus frais.
+    pub recompense: u64,
+    pub horodatage: u64,
+}
+
+/// Nombre de trouvailles conservees pour l'affichage.
+///
+/// L'ecran en montre une poignee ; en garder cinquante laisse de quoi remonter
+/// une soiree de minage sans transformer cet objet partage en archive.
+const TROUVES_GARDES: usize = 50;
+
 /// Duree minimale d'une fenetre de mesure.
 const FENETRE: std::time::Duration = std::time::Duration::from_millis(1000);
 
@@ -45,6 +66,10 @@ pub struct Minage {
     essais_total: AtomicU64,
     /// Blocs trouves depuis le lancement.
     blocs: AtomicU64,
+    /// Total verse au mineur depuis le lancement, en unites.
+    gagne: AtomicU64,
+    /// Les dernieres trouvailles, la plus recente en tete.
+    trouves: Mutex<Vec<BlocTrouve>>,
     /// Debit de la derniere fenetre fermee, en essais par seconde.
     debit: Mutex<f64>,
     /// Fenetre en cours : instant d'ouverture et essais comptes depuis.
@@ -63,6 +88,8 @@ impl Minage {
             actif: AtomicBool::new(actif),
             essais_total: AtomicU64::new(0),
             blocs: AtomicU64::new(0),
+            gagne: AtomicU64::new(0),
+            trouves: Mutex::new(Vec::new()),
             debit: Mutex::new(0.0),
             fenetre: Mutex::new((Instant::now(), 0)),
         }
@@ -101,8 +128,22 @@ impl Minage {
         }
     }
 
-    pub fn bloc_trouve(&self) {
+    pub fn bloc_trouve(&self, t: BlocTrouve) {
         self.blocs.fetch_add(1, Ordering::Relaxed);
+        self.gagne.fetch_add(t.recompense, Ordering::Relaxed);
+        let mut v = self.trouves.lock().unwrap_or_else(|e| e.into_inner());
+        v.insert(0, t);
+        v.truncate(TROUVES_GARDES);
+    }
+
+    /// Les dernieres trouvailles, la plus recente en tete.
+    pub fn trouves(&self) -> Vec<BlocTrouve> {
+        self.trouves.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Total verse au mineur depuis le lancement, en unites.
+    pub fn gagne_total(&self) -> u64 {
+        self.gagne.load(Ordering::Relaxed)
     }
 
     /// Debit courant, en essais par seconde.
@@ -177,12 +218,42 @@ mod tests {
         assert_eq!(m.essais_total(), 4_242);
     }
 
+    fn trouvaille(h: u64, recompense: u64) -> BlocTrouve {
+        BlocTrouve {
+            hauteur: h,
+            identifiant: crate::hash::Hash256([7u8; 32]),
+            recompense,
+            horodatage: 1_700_000_000 + h,
+        }
+    }
+
     #[test]
     fn les_blocs_se_comptent_a_part() {
         let m = Minage::new(true);
-        m.bloc_trouve();
-        m.bloc_trouve();
+        m.bloc_trouve(trouvaille(1, 100));
+        m.bloc_trouve(trouvaille(2, 250));
         assert_eq!(m.blocs(), 2);
         assert_eq!(m.essais_total(), 0, "un bloc trouve n'est pas un essai compte");
+        // Le gain s'accumule, et la trouvaille la plus recente est en tete :
+        // c'est elle qu'on cherche des yeux quand l'ecran s'anime.
+        assert_eq!(m.gagne_total(), 350);
+        let t = m.trouves();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].hauteur, 2);
+    }
+
+    #[test]
+    fn le_journal_des_trouvailles_est_borne() {
+        // Un objet partage entre la boucle de minage et l'interface ne doit pas
+        // grossir sans fin : au-dela de la fenetre, les anciennes tombent, mais
+        // le compte et le gain, eux, n'oublient rien.
+        let m = Minage::new(true);
+        for h in 0..200u64 {
+            m.bloc_trouve(trouvaille(h, 10));
+        }
+        assert_eq!(m.trouves().len(), TROUVES_GARDES);
+        assert_eq!(m.blocs(), 200);
+        assert_eq!(m.gagne_total(), 2_000);
+        assert_eq!(m.trouves()[0].hauteur, 199, "la plus recente doit etre en tete");
     }
 }
