@@ -24,7 +24,7 @@ fn main() {
     verifier_87(ATTENDU_PK_87, ATTENDU_SIG_87);
 
     println!();
-    println!("Envoyez toute cette sortie a la personne qui vous aide.");
+    println!("Conservez toute cette sortie : c'est elle qui sert au diagnostic.");
 }
 
 fn verifier_65(attendu_pk: usize, attendu_sig: usize) {
