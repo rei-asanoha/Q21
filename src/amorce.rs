@@ -61,13 +61,24 @@ pub fn port_par_defaut(n: Network) -> u16 {
 /// dans l'amorcage, c'est le carnet : voir `net::addr`, ses seaux par groupe
 /// /16 et son sel propre a chaque noeud.
 ///
-/// La liste est vide tant que le reseau d'essai n'est pas ouvert. Annoncer des
-/// noms qui ne repondent pas serait pire que rien : chaque demarrage attendrait
-/// une reponse qui ne vient pas.
+/// # Etat des listes
+///
+/// - **Testnet** : ouvert. `amorce.q21.dev` repond depuis le 29 aout 2026 ; le
+///   nom a ete verifie avant d'etre inscrit ici, poignee de main comprise.
+/// - **Mainnet** : vide, et il le reste tant que le reseau principal n'existe
+///   pas. Annoncer un nom qui ne repond pas serait pire que rien : chaque
+///   demarrage attendrait une reponse qui ne vient jamais.
+/// - **Regtest** : vide par nature — un reseau de regression est local, il
+///   n'a personne a rejoindre.
+///
+/// Un seul point d'entree est un point unique de defaillance : s'il tombe, plus
+/// personne ne peut *entrer* (ceux qui sont deja dans le reseau continuent, le
+/// carnet leur suffit). Le second, chez un autre hebergeur, est la premiere
+/// chose a ajouter ici.
 pub fn amorces_integrees(n: Network) -> &'static [&'static str] {
     match n {
         Network::Mainnet => &[],
-        Network::Testnet => &[],
+        Network::Testnet => &["amorce.q21.dev"],
         Network::Regtest => &[],
     }
 }
@@ -248,19 +259,51 @@ mod tests {
         assert_eq!(v, vec!["amorce1.exemple.fr", "amorce2.exemple.fr:21121"]);
     }
 
-    /// La liste integree est vide tant que le reseau n'est pas ouvert.
+    /// Le reseau d'essai est ouvert ; le reseau principal ne l'est pas.
     ///
-    /// Annoncer des noms qui ne repondent pas serait pire que rien : chaque
-    /// demarrage attendrait une reponse qui ne vient jamais. Cette epreuve
-    /// tombera le jour ou l'on ouvrira le reseau — c'est voulu, elle rappellera
-    /// qu'il faut alors verifier que les noms repondent vraiment.
+    /// L'ancienne version de cette epreuve exigeait que **toutes** les listes
+    /// soient vides, et elle est tombee le jour de l'ouverture — c'etait voulu :
+    /// elle rappelait qu'il fallait alors verifier que le nom repond vraiment.
+    /// Il a ete verifie (poignee de main et `pairs 1` depuis une machine
+    /// exterieure) avant d'etre inscrit.
+    ///
+    /// Elle garde desormais l'invariant qui reste vrai : on n'annonce un point
+    /// d'entree que pour un reseau qui existe.
     #[test]
-    fn aucune_amorce_n_est_annoncee_avant_l_ouverture() {
-        for r in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+    fn on_n_annonce_que_les_reseaux_ouverts() {
+        for r in [Network::Mainnet, Network::Regtest] {
             assert!(
                 amorces_integrees(r).is_empty(),
-                "des amorces sont annoncees pour {r:?} : verifiez qu'elles repondent"
+                "des amorces sont annoncees pour {r:?}, qui n'est pas ouvert"
             );
+        }
+        let t = amorces_integrees(Network::Testnet);
+        assert!(
+            !t.is_empty(),
+            "le reseau d'essai est ouvert : il doit avoir un point d'entree"
+        );
+    }
+
+    /// Chaque amorce integree doit etre une cible que `resoudre` sait lire.
+    ///
+    /// On ne resout pas ici — une epreuve ne doit pas dependre du reseau ni du
+    /// DNS — mais une faute de frappe dans un nom inscrit en dur ne se verrait
+    /// qu'au premier demarrage d'un utilisateur, ce qui est trop tard.
+    #[test]
+    fn les_amorces_integrees_ont_une_forme_lisible() {
+        for r in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            for a in amorces_integrees(r) {
+                assert!(!a.is_empty(), "amorce vide pour {r:?}");
+                assert!(!a.contains(' '), "espace dans une amorce : {a:?}");
+                assert!(
+                    !a.starts_with('.') && !a.ends_with('.'),
+                    "nom mal forme : {a:?}"
+                );
+                assert!(
+                    a.contains('.'),
+                    "un point d'entree public se designe par un nom, pas par {a:?}"
+                );
+            }
         }
     }
 }

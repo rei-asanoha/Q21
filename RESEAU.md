@@ -204,12 +204,31 @@ amorce1.exemple.fr
 amorce2.exemple.fr:21121
 ```
 
-Quand plusieurs points d'entrée existent et qu'ils tiennent, ils peuvent être
-inscrits dans le binaire lui-même — `amorces_integrees` dans `src/amorce.rs`.
-Tant qu'aucun ne répond de façon fiable, cette liste **reste vide** : annoncer
-des noms morts serait pire que rien, chaque démarrage attendrait une réponse qui
-ne vient pas. Une épreuve le vérifie, et elle tombera le jour où on l'ouvrira —
-c'est voulu.
+Les points d'entrée qui tiennent sont inscrits dans le binaire lui-même —
+`amorces_integrees` dans `src/amorce.rs`. C'est ce qui fait qu'un portefeuille
+fraîchement téléchargé trouve le réseau **sans que personne ne tape quoi que ce
+soit**.
+
+**Le réseau d'essai est ouvert depuis le 29 août 2026**, derrière un nom :
+
+```
+amorce.q21.dev
+```
+
+Un nom, et non une adresse IP : une adresse est attachée à une machine, et un
+binaire distribué ne se met pas à jour quand elle change. Un nom se repointe en
+une minute, sans rien redistribuer.
+
+La règle d'inscription ne bouge pas : **on n'écrit ici que ce qui répond
+vraiment**, vérifié depuis une machine extérieure, poignée de main comprise.
+Annoncer un nom mort serait pire que rien — chaque démarrage attendrait une
+réponse qui ne vient jamais. Le réseau principal, lui, n'a donc toujours aucune
+amorce, et une épreuve le garantit.
+
+Un seul point d'entrée reste un point unique de défaillance : s'il tombe, plus
+personne ne peut *entrer* — ceux qui sont déjà dans le réseau continuent, leur
+carnet leur suffit. Le second, chez un autre hébergeur, est la première chose à
+ajouter.
 
 ---
 
