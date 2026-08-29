@@ -464,6 +464,10 @@ impl RpcContext {
                 "[portefeuille] Adresses connues du portefeuille",
             ),
             (
+                "setaddresslabel",
+                "[portefeuille] Nomme une adresse dans le carnet local",
+            ),
+            (
                 "listtransactions",
                 "[portefeuille] Historique des mouvements",
             ),
@@ -531,6 +535,7 @@ impl RpcContext {
             "sendtoaddress" => self.sendtoaddress(params),
             "getwalletinfo" => self.getwalletinfo(),
             "listaddresses" => self.listaddresses(),
+            "setaddresslabel" => self.setaddresslabel(params),
             "listtransactions" => self.listtransactions(params),
             "estimatefee" => self.estimatefee(params),
             "preparersend" => self.preparersend(params),
@@ -1265,14 +1270,77 @@ impl RpcContext {
                     scheme: schema,
                     hash: *h,
                 };
-                Json::obj()
+                let mut o = Json::obj()
                     .set("indice", Json::u64(i as u64))
                     .set("adresse", Json::str(a.to_string_bech32()))
-                    .set("consommee", Json::Bool(consommees.contains(&(i as u32))))
-                    .build()
+                    .set("consommee", Json::Bool(consommees.contains(&(i as u32))));
+                // L'etiquette n'est presente que si elle existe : une chaine
+                // vide dans la reponse obligerait chaque appelant a distinguer
+                // « sans nom » de « nomme par du vide ».
+                if let Some(e) = g.etiquette(i as u32) {
+                    o = o.set("etiquette", Json::str(e));
+                }
+                o.build()
             })
             .collect();
         Ok(Json::array(v))
+    }
+
+    /// Nomme une adresse dans le carnet local.
+    ///
+    /// # Pourquoi cela existe
+    ///
+    /// Q21 pousse a donner une adresse differente a chaque correspondant : c'est
+    /// ce qui empeche de relier vos paiements entre eux. Le prix a payer est
+    /// qu'au bout d'un mois on a quatre cents suites de caracteres et aucune
+    /// idee de qui est qui. Le carnet rend au porteur ce que la vie privee lui a
+    /// coute.
+    ///
+    /// # Ce que cela n'est pas
+    ///
+    /// Ces noms **ne quittent jamais la machine**. Ils ne sont ni transmis aux
+    /// pairs, ni inscrits dans la chaine, ni visibles de quiconque recoit un
+    /// paiement. Ils sont scelles avec le portefeuille quand une phrase secrete
+    /// existe, parce que « pour Mathis » en dit long sur qui l'on frequente.
+    fn setaddresslabel(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.portefeuille()?;
+        let indice = params
+            .get("indice")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| erreur(-32602, "parametre `indice` entier attendu"))?;
+        let indice = u32::try_from(indice)
+            .map_err(|_| erreur(-32602, "indice d'adresse hors des valeurs possibles"))?;
+        let texte = params
+            .get("etiquette")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mut g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+        // On refuse de nommer une adresse qui n'existe pas : accepter
+        // laisserait des noms orphelins dans le fichier, et masquerait une
+        // faute de frappe de l'appelant.
+        if indice as usize >= g.known_hashes().len() {
+            return Err(erreur(
+                -32602,
+                "cette adresse n'existe pas encore dans ce portefeuille",
+            ));
+        }
+        g.etiqueter(indice, &texte);
+        self.enregistrer(&g);
+        Ok(Json::obj()
+            .set("indice", Json::u64(indice as u64))
+            .set(
+                "etiquette",
+                match g.etiquette(indice) {
+                    Some(e) => Json::str(e),
+                    None => Json::Null,
+                },
+            )
+            .set("longueur_maximale", Json::u64(Wallet::ETIQUETTE_MAX as u64))
+            .build())
     }
 
     /// Historique des mouvements de ce portefeuille.
@@ -2297,6 +2365,58 @@ mod tests {
                 >= 2
         );
         assert!(r.get("cout_de_la_finalite_glissante").is_some());
+    }
+
+    /// Une adresse se nomme, et le nom revient avec la liste.
+    ///
+    /// Q21 pousse a donner une adresse par correspondant. Sans carnet, on se
+    /// retrouve au bout d'un mois avec quatre cents suites de caracteres et
+    /// aucune idee de qui est qui : le carnet rend au porteur ce que la vie
+    /// privee lui a coute.
+    #[test]
+    fn une_adresse_se_nomme_et_le_nom_revient() {
+        let c = contexte(true);
+        let _ = resultat(&c, "getnewaddress", "{}");
+        let r = resultat(
+            &c,
+            "setaddresslabel",
+            r#"{"indice":0,"etiquette":"pour Mathis"}"#,
+        );
+        assert_eq!(
+            r.get("etiquette").and_then(|v| v.as_str()),
+            Some("pour Mathis")
+        );
+
+        let liste = resultat(&c, "listaddresses", "{}");
+        let a = liste.as_array().expect("tableau d'adresses");
+        assert_eq!(
+            a[0].get("etiquette").and_then(|v| v.as_str()),
+            Some("pour Mathis"),
+            "le nom doit revenir avec l'adresse qu'il designe"
+        );
+
+        // Un nom vide efface, et l'adresse repart sans champ `etiquette` :
+        // une chaine vide obligerait chaque appelant a distinguer « sans nom »
+        // de « nomme par du vide ».
+        let _ = resultat(&c, "setaddresslabel", r#"{"indice":0,"etiquette":""}"#);
+        let liste = resultat(&c, "listaddresses", "{}");
+        assert!(liste.as_array().expect("tableau")[0]
+            .get("etiquette")
+            .is_none());
+    }
+
+    /// On ne nomme pas une adresse qui n'existe pas.
+    ///
+    /// L'accepter laisserait des noms orphelins dans le fichier et masquerait
+    /// une faute de frappe de l'appelant.
+    #[test]
+    fn nommer_une_adresse_inexistante_est_refuse() {
+        let c = contexte(true);
+        let r = appel(&c, "setaddresslabel", r#"{"indice":9999,"etiquette":"x"}"#);
+        assert!(
+            r.get("error").is_some(),
+            "un indice inconnu doit etre refuse"
+        );
     }
 
     /// Un envoi se voit dans l'historique **avant** d'etre dans un bloc.
