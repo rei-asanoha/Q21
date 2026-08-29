@@ -364,6 +364,19 @@ th,td{text-align:left;padding:.6rem .8rem;border-bottom:1px solid var(--bord);wh
 thead th{font-size:.66rem;text-transform:uppercase;letter-spacing:.08em;color:var(--tenu);
   font-weight:600;background:var(--carte-2)}
 tbody tr:last-child td{border-bottom:none}
+/* La colonne des references porte l'empreinte entiere. Elle deroge au
+   `nowrap` du tableau : soixante-quatre caracteres sur une seule ligne
+   pousseraient toutes les autres colonnes hors de l'ecran, alors qu'ici la
+   coupure au caractere est sans danger — une empreinte n'a ni mots ni sens de
+   lecture. */
+td.ref{white-space:normal;word-break:break-all;max-width:23ch;font-size:.72rem;
+  line-height:1.4}
+td.ref .entier{display:block;color:var(--doux)}
+td.ref button.plat{margin-top:.3rem;padding:.2rem .5rem;font-size:.7rem}
+/* Meme empreinte entiere dans une tuile, ou la police des valeurs est grande. */
+.tuile .entier{display:block;font-family:var(--mono);font-size:.7rem;line-height:1.4;
+  word-break:break-all;color:var(--doux)}
+.tuile button.plat{margin-top:.35rem;padding:.2rem .5rem;font-size:.7rem}
 td{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .badge{display:inline-block;padding:.1rem .45rem;border-radius:6px;font-size:.7rem;
   font-weight:600;background:var(--accent-fond);color:var(--accent);font-family:var(--sans)}
@@ -931,6 +944,13 @@ const rendu = x => (x && x.__html !== undefined) ? x.__html : ech(x);
 // verifie sur la page servie.
 const html = f => rendu(brut(f));
 
+// `court` tronquait les empreintes a l'affichage. Plus rien ne l'appelle : une
+// empreinte qu'on ne peut pas emporter dans la recherche de l'explorateur ne
+// sert a rien, et les deux endroits qui l'employaient rendent desormais
+// l'empreinte entiere avec un bouton de copie. La fonction reste ecrite ici
+// parce que la regle d'echappement de cette page la nomme parmi les sorties
+// sures, et qu'un futur affichage tronque doit passer par elle plutot que par
+// un `slice` improvise.
 const court = (h,n)=> h ? ech(String(h).slice(0, n||16))+"…" : "—";
 const date = t => new Date(Number(t) * 1000).toISOString().replace("T"," ").slice(0,19);
 
@@ -1395,6 +1415,23 @@ function sablier(){
   return brut('<span class="tourne" aria-hidden="true"></span>');
 }
 
+// --- La reference se copie, elle ne se recopie pas a la main.
+//
+// Elle etait tronquee a vingt caracteres suivis de points de suspension. Pour
+// la lire, c'etait assez ; pour la **porter** dans la recherche de
+// l'explorateur, il en manquait quarante-quatre, et rien ne le disait. Une
+// reference qu'on ne peut pas emporter ne sert a rien.
+//
+// L'ecoute est posee une fois sur le corps du tableau, et non sur chaque
+// bouton : les lignes sont refaites a chaque rafraichissement, et des ecoutes
+// posees ligne par ligne s'accumuleraient a chaque tour.
+for (const zone of ["mouvements", "tuiles-chaine"]){
+  document.getElementById(zone).addEventListener("click", ev => {
+    const b = ev.target.closest("button.copie[data-ref]");
+    if (b) copier(b.dataset.ref, b);
+  });
+}
+
 async function historique(){
   const corps = document.getElementById("mouvements");
   const zone = document.getElementById("note-historique");
@@ -1433,7 +1470,8 @@ async function historique(){
         <td>${ech(m.confirmations)}${html(marque)}</td>
         <td>${ech(m.en_attente ? "—" : m.hauteur)}</td>
         <td>${ech(date(m.horodatage))}</td>
-        <td><span class="coupe">${court(m.txid, 20)}</span></td>
+        <td class="ref"><span class="entier">${ech(m.txid)}</span>
+          <button type="button" class="plat copie" data-ref="${ech(m.txid)}">copier</button></td>
       </tr>`;
     }).join("");
   }catch(e){
@@ -1463,7 +1501,11 @@ async function infos(){
 
     document.getElementById("tuiles-chaine").innerHTML =
       tuile("Blocs vérifiés", info.hauteur) +
-      tuile("Dernier bloc", brut(`<span class="coupe">${court(info.tete, 20)}</span>`)) +
+      // Meme raison que dans l'historique : une empreinte tronquee ne se porte
+      // pas dans la recherche de l'explorateur.
+      tuile("Dernier bloc", brut(
+        `<span class="entier">${ech(info.tete)}</span>` +
+        `<button type="button" class="plat copie" data-ref="${ech(info.tete)}">copier</button>`)) +
       tuile("Difficulté", info.difficulte_bits) +
       tuile("Q21 créés à ce jour", ech(info.emis.q21) + " Q21") +
       tuile("Sommes non dépensées", info.utxo_total, "sur toute la chaîne, tous porteurs confondus") +
@@ -2468,6 +2510,48 @@ mod tests {
         assert!(
             PAGE.contains(r#"ech(m.en_attente ? "—" : m.hauteur)"#),
             "une transaction en attente afficherait une hauteur qu'elle n'a pas"
+        );
+    }
+
+    /// Une reference s'affiche entiere, et se copie d'un clic.
+    ///
+    /// Elle etait tronquee a vingt caracteres. Assez pour la reconnaitre, pas
+    /// pour la porter dans la recherche de l'explorateur — et rien ne
+    /// signalait qu'il en manquait quarante-quatre.
+    #[test]
+    fn une_reference_est_entiere_et_copiable() {
+        assert!(
+            PAGE.contains("${ech(m.txid)}"),
+            "la reference de l'historique est encore tronquee"
+        );
+        assert!(
+            !PAGE.contains("court(m.txid"),
+            "l'historique coupe encore la reference"
+        );
+        assert!(
+            !PAGE.contains("court(info.tete"),
+            "l'empreinte du dernier bloc est encore coupee"
+        );
+        assert!(
+            PAGE.contains(r#"button.copie[data-ref]"#),
+            "aucun bouton de copie"
+        );
+        assert!(
+            PAGE.contains("td.ref{"),
+            "la colonne des references n'a pas de style"
+        );
+        // Le tableau interdit le retour a la ligne partout ailleurs : sans
+        // derogation explicite, une empreinte entiere pousserait les autres
+        // colonnes hors de l'ecran.
+        assert!(
+            PAGE.contains("white-space:normal;word-break:break-all"),
+            "l'empreinte ne peut pas revenir a la ligne"
+        );
+        // L'ecoute est posee une fois sur le conteneur, pas par ligne : les
+        // lignes sont refaites a chaque rafraichissement.
+        assert!(
+            PAGE.contains(r#"for (const zone of ["mouvements", "tuiles-chaine"])"#),
+            "les ecoutes de copie s'accumuleraient a chaque rafraichissement"
         );
     }
 
