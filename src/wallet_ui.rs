@@ -324,6 +324,21 @@ td.moins{color:var(--danger);font-weight:600}
 .adresse .rang{font-family:var(--mono);font-size:.68rem;color:var(--tenu);
   border:1px solid var(--bord);border-radius:7px;padding:.15rem .4rem;flex:0 0 auto}
 .adresse.neuve{border-color:var(--accent);background:var(--carte-2)}
+/* Une ligne de carnet porte deux etages : le nom donne par le porteur, puis
+   l'adresse elle-meme. Le nom passe devant parce que c'est lui qu'on cherche
+   des yeux — l'adresse, on la copie, on ne la lit pas. */
+.adresse{flex-wrap:wrap}
+.adresse .corps{flex:1;min-width:0}
+.adresse .nom{font-family:var(--sans);font-size:.85rem;font-weight:600;color:var(--texte);
+  margin-bottom:.15rem}
+.adresse .nom.vide{font-weight:400;color:var(--tenu);font-style:italic}
+.adresse .edition{flex:0 0 100%;display:flex;gap:.5rem;margin-top:.5rem}
+.adresse .edition input{flex:1;font-family:var(--sans);font-size:.85rem}
+.chercheur{margin:1rem 0}
+.chercheur input[type=search]{width:100%;padding:.7rem .85rem;font:inherit;font-size:.9rem;
+  color:var(--texte);background:var(--carte-2);border:1.5px solid var(--bord);
+  border-radius:11px;outline:none}
+.chercheur input[type=search]:focus{border-color:var(--accent)}
 
 /* ---- Controles --------------------------------------------------------- */
 label{display:block;font-size:.8rem;font-weight:600;margin:1rem 0 .35rem;color:var(--doux)}
@@ -603,7 +618,16 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
       entre eux en lisant la chaîne. Votre solde est la somme de toutes.
     </p>
   </div>
+  <div class="chercheur">
+    <label for="filtre-adresses">Chercher dans votre carnet</label>
+    <input id="filtre-adresses" type="search" autocomplete="off" spellcheck="false"
+           placeholder="un nom, un numéro (#12) ou un morceau d'adresse">
+    <p class="aide" id="compte-adresses"></p>
+  </div>
   <div id="liste-adresses"></div>
+  <div class="boutons" id="zone-plus" hidden>
+    <button type="button" class="plat" id="bouton-plus">Afficher les suivantes</button>
+  </div>
 </section>
 
 <section class="vue" id="vue-envoyer" hidden>
@@ -1891,45 +1915,148 @@ setInterval(() => {
 // trois secondes.
 const ADRESSES_MONTREES = 25;
 
+// --- Le carnet.
+//
+// Q21 pousse a donner une adresse differente a chaque correspondant : c'est ce
+// qui empeche de relier les paiements entre eux. Le prix a payer se voit au
+// bout d'un mois — quatre cents suites de caracteres, et aucune idee de qui est
+// qui. Trois choses le rendent : un nom libre par adresse, une recherche, et de
+// quoi remonter au-dela des vingt-cinq dernieres.
+//
+// La liste complete est gardee ici plutot que redemandee a chaque frappe : le
+// nœud derive les adresses, et rappeler quatre cents derivations a chaque
+// lettre tapee rendrait la recherche poussive.
+let carnet = [];
+let carnetMontrees = ADRESSES_MONTREES;
+let carnetFiltre = "";
+
 async function listerAdresses(){
   const zone = document.getElementById("liste-adresses");
   try{
     const r = await appel("listaddresses");
     const liste = Array.isArray(r) ? r : (r.adresses || []);
-    if (!liste.length){
-      zone.innerHTML = '<div class="note"><p>Aucune adresse encore dérivée. ' +
-        'Le bouton ci-dessus en crée une.</p></div>';
-      return;
-    }
     // Les plus recentes en tete : c'est celle qu'on vient de creer qu'on cherche.
-    const recentes = liste.slice().reverse();
-    const lignes = recentes.slice(0, ADRESSES_MONTREES).map(e => {
-      const a = (e && typeof e === "object") ? e.adresse : e;
-      const indice = (e && typeof e === "object" && e.indice !== undefined) ? e.indice : "";
-      const servie = !!(e && typeof e === "object" && e.consommee);
-      return '<div class="adresse">' +
-        '<span class="rang">#' + ech(String(indice)) + '</span>' +
-        '<span class="txt">' + ech(String(a)) + '</span>' +
-        (servie ? '<span class="badge gris">servie</span>' : '') +
-        '<button type="button" class="plat" data-copier="' + ech(String(a)) + '">Copier</button>' +
-        '</div>';
-    });
-    if (recentes.length > ADRESSES_MONTREES){
-      lignes.push('<p class="aide">' + ech(String(recentes.length - ADRESSES_MONTREES)) +
-        ' adresse(s) plus ancienne(s) ne sont pas affichée(s). Elles restent ' +
-        'valides et leur solde est compté.</p>');
-    }
-    zone.innerHTML = lignes.join("");
+    carnet = liste.slice().reverse();
+    rendreCarnet();
   }catch(e){
     zone.innerHTML = '<div class="avert"><p>' + ech(e.message) + '</p></div>';
   }
 }
 
+// Une adresse correspond a la recherche par son nom, son numero ou un morceau
+// de son adresse. Le numero se cherche aussi bien « 12 » que « #12 » : on ne
+// fait pas deviner a l'utilisateur la forme attendue.
+function correspond(e, f){
+  if (!f) return true;
+  const nom = String(e.etiquette || "").toLowerCase();
+  const adr = String(e.adresse || "").toLowerCase();
+  const num = String(e.indice);
+  return nom.includes(f) || adr.includes(f) || num === f || ("#" + num) === f;
+}
+
+function rendreCarnet(){
+  const zone = document.getElementById("liste-adresses");
+  const compte = document.getElementById("compte-adresses");
+  const plus = document.getElementById("zone-plus");
+  if (!carnet.length){
+    zone.innerHTML = '<div class="note"><p>Aucune adresse encore dérivée. ' +
+      'Le bouton ci-dessus en crée une.</p></div>';
+    compte.textContent = "";
+    plus.hidden = true;
+    return;
+  }
+  const f = carnetFiltre.trim().toLowerCase();
+  const vues = carnet.filter(e => correspond(e, f));
+  if (!vues.length){
+    zone.innerHTML = '<div class="note"><p>Aucune adresse ne correspond à ' +
+      '« ' + ech(carnetFiltre.trim()) + ' ». Vos ' + ech(String(carnet.length)) +
+      ' adresses restent toutes valides.</p></div>';
+    compte.textContent = "";
+    plus.hidden = true;
+    return;
+  }
+  const tranche = vues.slice(0, carnetMontrees);
+  zone.innerHTML = tranche.map(e => {
+    const a = String(e.adresse);
+    const indice = String(e.indice);
+    const nom = e.etiquette ? ech(String(e.etiquette)) : "sans nom";
+    return '<div class="adresse">' +
+      '<span class="rang">#' + ech(indice) + '</span>' +
+      '<span class="corps">' +
+        '<span class="nom' + (e.etiquette ? '' : ' vide') + '">' + nom + '</span>' +
+        '<span class="txt">' + ech(a) + '</span>' +
+      '</span>' +
+      (e.consommee ? '<span class="badge gris">servie</span>' : '') +
+      '<button type="button" class="plat" data-copier="' + ech(a) + '">Copier</button>' +
+      '<button type="button" class="plat" data-nommer="' + ech(indice) + '">' +
+        (e.etiquette ? 'Renommer' : 'Nommer') + '</button>' +
+      '<span class="edition" hidden data-edition="' + ech(indice) + '">' +
+        '<input type="text" maxlength="64" value="' + ech(String(e.etiquette || "")) + '" ' +
+        'placeholder="pour qui, ou pourquoi — visible de vous seul">' +
+        '<button type="button" class="action" data-enregistrer="' + ech(indice) + '">Enregistrer</button>' +
+      '</span>' +
+      '</div>';
+  }).join("");
+  compte.textContent = f
+    ? vues.length + " adresse(s) trouvée(s) sur " + carnet.length
+    : carnet.length + " adresse(s) au total";
+  plus.hidden = vues.length <= tranche.length;
+}
+
+document.getElementById("filtre-adresses").addEventListener("input", ev => {
+  carnetFiltre = ev.target.value;
+  // Une recherche repart du debut : garder une pagination heritee de la
+  // recherche precedente ferait disparaitre des resultats sans raison visible.
+  carnetMontrees = ADRESSES_MONTREES;
+  rendreCarnet();
+});
+
+document.getElementById("bouton-plus").addEventListener("click", () => {
+  carnetMontrees += ADRESSES_MONTREES;
+  rendreCarnet();
+});
+
 // Un seul ecouteur pour toute la liste : attacher un gestionnaire par ligne
 // laisse des fuites a chaque rafraichissement.
-document.getElementById("liste-adresses").addEventListener("click", ev => {
-  const b = ev.target.closest("button[data-copier]");
-  if (b) copier(b.dataset.copier, b);
+document.getElementById("liste-adresses").addEventListener("click", async ev => {
+  const c = ev.target.closest("button[data-copier]");
+  if (c){ copier(c.dataset.copier, c); return; }
+
+  const n = ev.target.closest("button[data-nommer]");
+  if (n){
+    const z = document.querySelector('[data-edition="' + n.dataset.nommer + '"]');
+    if (z){ z.hidden = !z.hidden; if (!z.hidden) z.querySelector("input").focus(); }
+    return;
+  }
+
+  const s = ev.target.closest("button[data-enregistrer]");
+  if (s){
+    const indice = s.dataset.enregistrer;
+    const z = document.querySelector('[data-edition="' + indice + '"]');
+    const texte = z ? z.querySelector("input").value : "";
+    s.disabled = true;
+    try{
+      await appel("setaddresslabel",
+        '{"indice":' + Number(indice) + ',"etiquette":' + JSON.stringify(texte) + '}');
+      // On relit le carnet plutot que de corriger la ligne a la main : le nœud
+      // a pu tailler le texte, et l'ecran doit montrer ce qui est enregistre,
+      // pas ce qui a ete tape.
+      await listerAdresses();
+    }catch(e){
+      signalerErreur("Nom non enregistré : " + e.message);
+      s.disabled = false;
+    }
+  }
+});
+
+// Entree vaut Enregistrer : personne ne va chercher le bouton a la souris
+// apres avoir tape un nom.
+document.getElementById("liste-adresses").addEventListener("keydown", ev => {
+  if (ev.key !== "Enter") return;
+  const z = ev.target.closest("[data-edition]");
+  if (!z) return;
+  ev.preventDefault();
+  z.querySelector("button[data-enregistrer]").click();
 });
 
 </script>
@@ -2513,6 +2640,52 @@ mod tests {
         );
     }
 
+    /// Le carnet : chercher, nommer, et remonter au-dela des dernieres.
+    ///
+    /// Avec quatre cents adresses derivees, une liste tronquee aux vingt-cinq
+    /// plus recentes n'est plus une liste : c'est un mur. Trois choses la
+    /// rouvrent, et cette epreuve les fige.
+    #[test]
+    fn le_carnet_se_cherche_se_nomme_et_se_deroule() {
+        for attendu in [
+            "filtre-adresses",
+            "Chercher dans votre carnet",
+            "bouton-plus",
+            "Afficher les suivantes",
+            "function correspond(",
+            "function rendreCarnet(",
+            "data-nommer=",
+            "data-enregistrer=",
+            "setaddresslabel",
+        ] {
+            assert!(
+                PAGE.contains(attendu),
+                "element du carnet absent : {attendu}"
+            );
+        }
+        // Le numero se cherche aussi bien « 12 » que « #12 » : on ne fait pas
+        // deviner a l'utilisateur la forme attendue.
+        assert!(
+            PAGE.contains(r##"("#" + num) === f"##),
+            "le numero ne se cherche pas avec son diese"
+        );
+        // Une nouvelle recherche repart du debut : garder la pagination de la
+        // precedente ferait disparaitre des resultats sans raison visible.
+        assert!(
+            PAGE.contains("carnetMontrees = ADRESSES_MONTREES;"),
+            "la pagination ne se remet pas a zero quand la recherche change"
+        );
+        // Le nom est local : la page doit le dire, sinon on croira qu'il
+        // accompagne le paiement.
+        assert!(
+            PAGE.contains("visible de vous seul"),
+            "rien ne dit que le nom reste sur cette machine"
+        );
+        // Une seule ecoute pour toute la liste : les lignes sont refaites a
+        // chaque rafraichissement.
+        assert!(PAGE.contains(r#"document.getElementById("liste-adresses").addEventListener"#));
+    }
+
     /// Une reference s'affiche entiere, et se copie d'un clic.
     ///
     /// Elle etait tronquee a vingt caracteres. Assez pour la reconnaitre, pas
@@ -2738,17 +2911,39 @@ mod tests {
     fn la_liste_des_adresses_echappe_tout() {
         let s = script();
         let d = s
-            .find("async function listerAdresses(")
-            .expect("la fonction");
+            .find("function rendreCarnet(")
+            .expect("la fonction de rendu");
         let f = s[d..].find("\n}").expect("sa fin") + d;
         let corps = &s[d..f];
+        // Deux fois : dans le texte visible, et dans l'attribut du bouton de
+        // copie. Un attribut mal ferme est une injection au meme titre qu'un
+        // element.
         assert_eq!(
-            corps.matches("ech(String(a))").count(),
+            corps.matches("ech(a)").count(),
             2,
             "une adresse entre dans la page sans passer par ech"
         );
         assert!(
-            corps.contains("ech(e.message)"),
+            corps.contains("const a = String(e.adresse)"),
+            "l'adresse doit etre convertie en chaine avant d'etre echappee"
+        );
+        // Le nom vient de l'utilisateur, mais il a pu etre saisi ailleurs — un
+        // portefeuille restaure, un fichier recopie. Il s'echappe comme tout le
+        // reste, dans le texte et dans la valeur du champ.
+        assert!(
+            corps.contains("ech(String(e.etiquette))"),
+            "une etiquette entre dans le texte sans echappement"
+        );
+        assert!(
+            corps.contains(r#"ech(String(e.etiquette || ""))"#),
+            "une etiquette entre dans un attribut sans echappement"
+        );
+        let dl = s
+            .find("async function listerAdresses(")
+            .expect("la fonction de chargement");
+        let fl = s[dl..].find("\n}").expect("sa fin") + dl;
+        assert!(
+            s[dl..fl].contains("ech(e.message)"),
             "un message d'erreur du nœud entre sans echappement"
         );
     }

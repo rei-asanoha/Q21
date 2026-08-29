@@ -460,15 +460,26 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
         .iter()
         .map(|i| i.to_string())
         .collect();
+    // --- Les etiquettes du carnet.
+    //
+    // Le texte est encode en hexadecimal, et ce n'est pas de la coquetterie :
+    // le format du fichier est « une clef, un signe egal, une valeur, par
+    // ligne », et une etiquette est saisie par un humain. Un retour a la ligne,
+    // une virgule ou un signe egal dans « Marie = boulangerie » suffirait a
+    // decaler la lecture de tout ce qui suit — c'est-a-dire, un jour, la
+    // graine. L'hexadecimal ne contient aucun de ces caracteres, par
+    // construction.
+    let etiquettes = etiquettes_en_texte(w.etiquettes());
     let contenu = format!(
-        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserie={}\nverifie_jusqu_a={}\nconsommes={}\n",
+        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserie={}\nverifie_jusqu_a={}\nconsommes={}\netiquettes={}\n",
         w.seed_hex(),
         w.next_index(),
         reseau,
         w.scheme().as_u8(),
         serie,
         w.verifie_jusqu_a(),
-        consommes.join(",")
+        consommes.join(","),
+        etiquettes
     );
     // Le portefeuille est scelle si une phrase secrete est connue de cette
     // session. La graine ne doit jamais toucher le disque en clair quand
@@ -554,6 +565,73 @@ fn oublier_phrase() {
     *PHRASE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// Encode le carnet pour la ligne `etiquettes=` du portefeuille.
+///
+/// Le texte part en hexadecimal, et ce n'est pas de la coquetterie : le format
+/// du fichier est « une clef, un signe egal, une valeur, par ligne », et une
+/// etiquette est saisie par un humain. Un retour a la ligne, une virgule ou un
+/// signe egal dans « Marie = boulangerie » suffirait a decaler la lecture de
+/// tout ce qui suit — c'est-a-dire, un jour, la graine. L'hexadecimal ne
+/// contient aucun de ces caracteres, par construction.
+fn etiquettes_en_texte(e: &std::collections::HashMap<u32, String>) -> String {
+    let mut v: Vec<(&u32, &String)> = e.iter().collect();
+    // Trie : deux ecritures du meme portefeuille doivent produire le meme
+    // fichier, sans quoi une sauvegarde differentielle recopie tout a chaque
+    // fois pour rien.
+    v.sort_by_key(|(i, _)| **i);
+    v.iter()
+        .map(|(i, t)| {
+            let hex: String = t.as_bytes().iter().map(|o| format!("{o:02x}")).collect();
+            format!("{i}:{hex}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Relit la ligne `etiquettes=`.
+///
+/// Une entree malformee est ignoree **seule**, sans emporter les autres :
+/// perdre un nom est ennuyeux, perdre le portefeuille ne l'est pas. Un fichier
+/// ecrit avant l'arrivee du carnet n'a pas cette ligne du tout, et rend
+/// simplement un carnet vide.
+fn texte_en_etiquettes(valeur: &str) -> std::collections::HashMap<u32, String> {
+    let mut m = std::collections::HashMap::new();
+    for entree in valeur.split(',').filter(|s| !s.is_empty()) {
+        let Some((i, hex)) = entree.split_once(':') else {
+            continue;
+        };
+        let Ok(indice) = i.parse::<u32>() else {
+            continue;
+        };
+        let Some(octets) = hex_en_octets(hex) else {
+            continue;
+        };
+        if let Ok(texte) = String::from_utf8(octets) {
+            m.insert(indice, texte);
+        }
+    }
+    m
+}
+
+/// Decode une suite hexadecimale. Rend `None` a la moindre anomalie.
+///
+/// Sert aux etiquettes du carnet. Un demi-octet en trop, un caractere qui n'est
+/// pas hexadecimal : on renonce a cette entree plutot que de deviner. Une
+/// etiquette perdue est un desagrement ; une etiquette devinee de travers est
+/// un carnet auquel on ne peut plus se fier.
+fn hex_en_octets(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut v = Vec::with_capacity(s.len() / 2);
+    let o = s.as_bytes();
+    for p in o.chunks(2) {
+        let paire = std::str::from_utf8(p).ok()?;
+        v.push(u8::from_str_radix(paire, 16).ok()?);
+    }
+    Some(v)
+}
+
 fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     let brut = std::fs::read(chemin_portefeuille(d))
         .map_err(|_| "aucun portefeuille ici. Lancez `q21 init` d'abord.".to_string())?;
@@ -582,6 +660,7 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     let mut next_index = 0u32;
     let mut serie = 0u64;
     let mut consommes: Vec<u32> = Vec::new();
+    let mut etiquettes: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     let mut verifie_jusqu_a = 0u64;
     let mut reseau = Network::Regtest;
     // Absent des portefeuilles ecrits avant l'arrivee de ML-DSA : on retombe
@@ -604,6 +683,11 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
                     .filter_map(|s| s.parse().ok())
                     .collect()
             }
+            // Absent des portefeuilles ecrits avant le carnet : leur lecture
+            // donne simplement un carnet vide, jamais une erreur. Une entree
+            // malformee est ignoree seule, sans emporter les autres — perdre un
+            // nom est ennuyeux, perdre le portefeuille ne l'est pas.
+            "etiquettes" => etiquettes = texte_en_etiquettes(valeur),
             "scheme" => {
                 scheme = valeur
                     .parse::<u8>()
@@ -660,6 +744,7 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
         }
     };
     w.marquer_consommes(&consommes);
+    w.charger_etiquettes(etiquettes);
     w.noter_verification(verifie_jusqu_a);
     if !adopte {
         w.rescan(next_index);
@@ -1161,7 +1246,8 @@ fn cmd_init_avec(
         println!();
     }
 
-    let (wallet, beneficiaire, genesis) = ecrire_chaine_neuve(datadir, reseau, schema, graine_fournie)?;
+    let (wallet, beneficiaire, genesis) =
+        ecrire_chaine_neuve(datadir, reseau, schema, graine_fournie)?;
 
     println!();
     println!("  Chaine initialisee dans {}", datadir.display());
@@ -2882,8 +2968,13 @@ fn installer(
     // pas se charger pour en demander un. Elle ne porte aucune donnee : c'est
     // la meme regle que pour l'explorateur, et la liste reste nommee chemin par
     // chemin.
-    let serveur = q21_core::http::serve_avec_public("127.0.0.1:0", Some(jeton.to_string()), &["/bienvenue"], repondre)
-        .map_err(|e| format!("le serveur d'installation n'a pas demarre : {e:?}"))?;
+    let serveur = q21_core::http::serve_avec_public(
+        "127.0.0.1:0",
+        Some(jeton.to_string()),
+        &["/bienvenue"],
+        repondre,
+    )
+    .map_err(|e| format!("le serveur d'installation n'a pas demarre : {e:?}"))?;
     let url = format!("http://127.0.0.1:{}/bienvenue#{jeton}", serveur.addr.port());
 
     if scelle {
@@ -2952,7 +3043,10 @@ fn traiter_installation(
         Ok(j) => j,
         Err(_) => return erreur("requete illisible"),
     };
-    let methode = requete.get("methode").and_then(|j| j.as_str()).unwrap_or("");
+    let methode = requete
+        .get("methode")
+        .and_then(|j| j.as_str())
+        .unwrap_or("");
     let params = requete.get("params");
     let texte = |clef: &str| -> Option<String> {
         params
@@ -3275,4 +3369,74 @@ fn cmd_explorateur(datadir: &Path, args: &[String]) -> Result<(), String> {
     arguments.push("--silencieux".to_string());
     arguments.extend(reste);
     cmd_node(datadir, &arguments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Le carnet fait l'aller-retour sans rien perdre.
+    #[test]
+    fn les_etiquettes_survivent_a_l_ecriture_et_a_la_relecture() {
+        let mut e = HashMap::new();
+        e.insert(0u32, "pour Mathis".to_string());
+        e.insert(12, "loyer — février".to_string());
+        e.insert(7, "Marie, boulangerie".to_string());
+        let texte = etiquettes_en_texte(&e);
+        assert_eq!(texte_en_etiquettes(&texte), e);
+    }
+
+    /// Une etiquette ne peut pas casser le fichier du portefeuille.
+    ///
+    /// C'est la raison d'etre de l'hexadecimal. Le format est « une clef, un
+    /// signe egal, une valeur, par ligne » : un retour a la ligne ou un signe
+    /// egal dans un nom decalerait la lecture de tout ce qui suit, et ce qui
+    /// suit contient la graine.
+    #[test]
+    fn une_etiquette_ne_peut_pas_casser_le_format() {
+        let mut e = HashMap::new();
+        e.insert(3u32, "seed=0000\nnext_index=0,virgule=egal".to_string());
+        let texte = etiquettes_en_texte(&e);
+        assert!(
+            !texte.contains('\n'),
+            "un saut de ligne a survecu : {texte}"
+        );
+        assert!(!texte.contains('='), "un signe egal a survecu : {texte}");
+        // La virgule separe les entrees : elle ne doit apparaitre qu'entre
+        // elles, jamais a l'interieur d'un nom. Ici il n'y a qu'une entree.
+        assert!(!texte.contains(','), "une virgule a survecu : {texte}");
+        assert_eq!(
+            texte_en_etiquettes(&texte),
+            e,
+            "le texte doit revenir intact"
+        );
+    }
+
+    /// Une entree abimee est perdue seule.
+    ///
+    /// Perdre un nom est ennuyeux ; perdre le portefeuille ne l'est pas. Un
+    /// fichier recopie a la main, tronque, ou ecrit par une version future ne
+    /// doit jamais empecher d'ouvrir ses fonds.
+    #[test]
+    fn une_entree_abimee_n_emporte_pas_les_autres() {
+        let m = texte_en_etiquettes("0:706f7572,pasdedeuxpoints,x:6161,9:zz,4:626f6e");
+        assert_eq!(m.get(&0).map(|s| s.as_str()), Some("pour"));
+        assert_eq!(m.get(&4).map(|s| s.as_str()), Some("bon"));
+        assert_eq!(m.len(), 2, "seules les entrees valides entrent : {m:?}");
+    }
+
+    /// Un portefeuille ecrit avant le carnet se lit sans carnet.
+    #[test]
+    fn l_absence_de_carnet_n_est_pas_une_erreur() {
+        assert!(texte_en_etiquettes("").is_empty());
+    }
+
+    #[test]
+    fn l_hexadecimal_refuse_ce_qu_il_ne_comprend_pas() {
+        assert_eq!(hex_en_octets("48656c6c6f"), Some(b"Hello".to_vec()));
+        assert_eq!(hex_en_octets("abc"), None, "longueur impaire");
+        assert_eq!(hex_en_octets("zz"), None, "hors de l'alphabet");
+        assert_eq!(hex_en_octets(""), Some(Vec::new()));
+    }
 }

@@ -98,6 +98,20 @@ pub struct Wallet {
     /// dans la chaine les clefs deja revelees. Mais il coute une lecture
     /// complete, et sans memoire il recommencait a chaque commande.
     verifie_jusqu_a: u64,
+    /// Etiquettes libres posees par le porteur sur ses adresses.
+    ///
+    /// # Pourquoi elles vivent dans le portefeuille
+    ///
+    /// Une adresse Q21 est une suite de caracteres que personne ne reconnait.
+    /// Celui qui en distribue plusieurs — une par correspondant, comme le
+    /// protocole y invite — perd tres vite le fil de qui a recu quoi. Le carnet
+    /// est donc la reponse a un besoin cree par la vie privee elle-meme.
+    ///
+    /// Elles sont **strictement locales** : jamais transmises, jamais inscrites
+    /// dans la chaine, jamais visibles d'un pair. Et elles sont scellees avec le
+    /// reste du portefeuille quand une phrase secrete existe — « pour Mathis »
+    /// en dit long sur qui l'on frequente, et cela ne regarde personne.
+    etiquettes: HashMap<u32, String>,
 }
 
 /// Efface la graine a la destruction du portefeuille.
@@ -126,6 +140,7 @@ impl Wallet {
             connues: HashMap::new(),
             consommes: Vec::new(),
             verifie_jusqu_a: 0,
+            etiquettes: HashMap::new(),
         }
     }
 
@@ -154,6 +169,7 @@ impl Wallet {
             connues: HashMap::new(),
             consommes: Vec::new(),
             verifie_jusqu_a: 0,
+            etiquettes: HashMap::new(),
         })
     }
 
@@ -523,6 +539,54 @@ impl Wallet {
     /// Hauteur jusqu'a laquelle la chaine a deja ete balayee.
     pub fn verifie_jusqu_a(&self) -> u64 {
         self.verifie_jusqu_a
+    }
+
+    /// Pose, remplace ou retire l'etiquette d'une adresse.
+    ///
+    /// Une chaine vide — ou faite d'espaces — **retire** l'etiquette plutot
+    /// que d'en enregistrer une invisible : sinon le carnet se remplit de
+    /// lignes vides qu'on ne peut plus distinguer d'une adresse sans nom.
+    ///
+    /// Le texte est borne a [`Wallet::ETIQUETTE_MAX`] caracteres. La coupure
+    /// se fait sur les **caracteres** et non sur les octets : couper un octet
+    /// au milieu d'un accent produirait une chaine qui n'est pas de l'UTF-8, et
+    /// le fichier du portefeuille deviendrait illisible. C'est un carnet, pas
+    /// un journal intime : un nom, un prenom, un motif court.
+    pub fn etiqueter(&mut self, indice: u32, texte: &str) {
+        let propre: String = texte
+            .trim()
+            // Les sauts de ligne et les tabulations casseraient le format du
+            // fichier, qui est une ligne par clef. On les remplace plutot que
+            // de refuser : l'utilisateur a colle un texte, il ne veut pas d'un
+            // message d'erreur.
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(Self::ETIQUETTE_MAX)
+            .collect();
+        let propre = propre.trim().to_string();
+        if propre.is_empty() {
+            self.etiquettes.remove(&indice);
+        } else {
+            self.etiquettes.insert(indice, propre);
+        }
+    }
+
+    /// Longueur maximale d'une etiquette, en caracteres.
+    pub const ETIQUETTE_MAX: usize = 64;
+
+    /// L'etiquette d'une adresse, s'il y en a une.
+    pub fn etiquette(&self, indice: u32) -> Option<&str> {
+        self.etiquettes.get(&indice).map(|s| s.as_str())
+    }
+
+    /// Toutes les etiquettes, pour l'ecriture du portefeuille.
+    pub fn etiquettes(&self) -> &HashMap<u32, String> {
+        &self.etiquettes
+    }
+
+    /// Reinstalle les etiquettes lues dans le fichier.
+    pub fn charger_etiquettes(&mut self, e: HashMap<u32, String>) {
+        self.etiquettes = e;
     }
 
     /// Note qu'un balayage a couvert la chaine jusqu'a cette hauteur.
@@ -1359,5 +1423,53 @@ mod tests {
         let sienne = a.new_address().hash;
         let mut b = Wallet::from_seed([2u8; 32], Network::Regtest);
         assert_eq!(b.decouvrir(|h| *h == sienne), 0);
+    }
+
+    #[test]
+    fn une_adresse_se_nomme_et_se_renomme() {
+        let mut w = Wallet::from_seed([3u8; 32], Network::Regtest);
+        assert_eq!(w.etiquette(0), None, "rien n'est nomme au depart");
+        w.etiqueter(0, "  pour Mathis  ");
+        assert_eq!(
+            w.etiquette(0),
+            Some("pour Mathis"),
+            "les espaces de bord n'appartiennent pas au nom"
+        );
+        w.etiqueter(0, "loyer");
+        assert_eq!(w.etiquette(0), Some("loyer"), "un nom se remplace");
+    }
+
+    #[test]
+    fn un_nom_vide_retire_l_etiquette() {
+        // Sinon le carnet se remplit de lignes vides qu'on ne distingue plus
+        // d'une adresse sans nom, et qu'aucun bouton ne permet d'effacer.
+        let mut w = Wallet::from_seed([4u8; 32], Network::Regtest);
+        w.etiqueter(7, "provisoire");
+        w.etiqueter(7, "   ");
+        assert_eq!(w.etiquette(7), None);
+        assert!(w.etiquettes().is_empty());
+    }
+
+    #[test]
+    fn un_nom_ne_peut_pas_casser_le_fichier_ni_s_etendre_sans_fin() {
+        let mut w = Wallet::from_seed([5u8; 32], Network::Regtest);
+        // Les caracteres de controle casseraient le format du portefeuille, qui
+        // est une ligne par clef : un retour a la ligne dans un nom decalerait
+        // la lecture de tout ce qui suit.
+        w.etiqueter(0, "Marie\nBoulangerie\tcentre");
+        let e = w.etiquette(0).expect("nom pose");
+        assert!(
+            !e.contains('\n') && !e.contains('\t'),
+            "controle survivant : {e:?}"
+        );
+        assert_eq!(e, "Marie Boulangerie centre");
+
+        // La coupure se fait sur les caracteres, jamais sur les octets : couper
+        // un accent en deux produirait une chaine qui n'est pas de l'UTF-8, et
+        // le portefeuille deviendrait illisible.
+        w.etiqueter(1, &"é".repeat(200));
+        let long = w.etiquette(1).expect("nom pose");
+        assert_eq!(long.chars().count(), Wallet::ETIQUETTE_MAX);
+        assert!(long.chars().all(|c| c == 'é'));
     }
 }
