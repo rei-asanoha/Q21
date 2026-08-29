@@ -369,6 +369,15 @@ td{font-family:var(--mono);font-variant-numeric:tabular-nums}
   font-weight:600;background:var(--accent-fond);color:var(--accent);font-family:var(--sans)}
 .badge.attente{background:var(--alerte-fond);color:var(--alerte)}
 .badge.gris{background:var(--carte-2);color:var(--tenu)}
+/* Le disque qui tourne d'une transaction encore au reservoir. Il vit dans le
+   badge, prend la couleur du texte, et disparait avec lui des qu'un bloc
+   confirme. Une machine reglee pour limiter les animations n'en verra qu'un
+   arc immobile — l'information reste portee par le mot, pas par le mouvement. */
+.tourne{display:inline-block;width:.62em;height:.62em;margin-right:.3em;
+  vertical-align:-.05em;border:2px solid currentColor;border-right-color:transparent;
+  border-radius:50%;animation:tourner .9s linear infinite}
+@keyframes tourner{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){.tourne{animation:none}}
 
 details.pli{background:var(--carte-2);border:1px solid var(--bord);border-radius:14px;
   padding:.85rem 1.05rem;margin:1rem 0;font-size:.87rem;color:var(--doux)}
@@ -643,9 +652,15 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
     <div class="n" id="reseau-note">Mesure en cours…</div>
   </div>
   <div class="grille" style="margin-top:.8rem">
+    <div class="tuile"><div class="k">Votre machine</div>
+      <div class="v" id="reseau-mien">—</div>
+      <div class="n" id="reseau-part">mesurée chez vous, en direct</div></div>
     <div class="tuile"><div class="k">Machines comme la vôtre</div>
       <div class="v" id="reseau-equiv">—</div>
       <div class="n">équivalence, pas un décompte</div></div>
+    <div class="tuile"><div class="k">Machines connues du réseau</div>
+      <div class="v" id="reseau-carnet">—</div>
+      <div class="n">adresses apprises, présentes ou passées</div></div>
     <div class="tuile"><div class="k">Ordinateurs reliés au vôtre</div>
       <div class="v" id="reseau-pairs">0</div>
       <div class="n">vos voisins directs, pas le réseau entier</div></div>
@@ -1276,6 +1291,18 @@ document.getElementById("bouton-envoyer").addEventListener("click", async () => 
         ${ech(r.transaction.taille_octets)} octets.</p>
       </div>`;
     rafraichir();
+    // --- Puis on emmene l'utilisateur voir sa transaction.
+    //
+    // Une confirmation ecrite sur l'ecran d'envoi laissait le doute entier :
+    // le solde avait baisse, et l'onglet Activite — le seul endroit ou l'on
+    // verifie qu'un paiement existe — restait vide jusqu'au bloc suivant. On
+    // l'y conduit donc, ou la ligne est desormais deja la, marquee « en
+    // attente ». Voir vaut mieux que lire qu'on aurait pu voir.
+    //
+    // Le delai laisse le temps de lire la carte verte avant que l'ecran ne
+    // change : basculer dans la seconde donnerait l'impression d'un ecran qui
+    // saute.
+    setTimeout(() => montrer("historique"), 1200);
   }catch(e){
     let indice = "";
     if (/TauxDeFraisTropBas|frais/i.test(e.message)){
@@ -1358,6 +1385,16 @@ function iconeGenre(m){
     '<path d="M12 4v13"></path><path d="M6 12l6 6 6-6"></path></svg></span>');
 }
 
+// Le petit disque qui tourne, pour ce qui est parti mais pas encore grave.
+//
+// Un badge immobile disant « en attente » se lit comme un etat fige ; un
+// mouvement dit « ca travaille ». C'est la difference entre patienter et
+// craindre. L'animation est en CSS pur, sans image ni script : rien a charger,
+// et elle s'arrete d'elle-meme quand la ligne bascule en confirmee.
+function sablier(){
+  return brut('<span class="tourne" aria-hidden="true"></span>');
+}
+
 async function historique(){
   const corps = document.getElementById("mouvements");
   const zone = document.getElementById("note-historique");
@@ -1379,7 +1416,12 @@ async function historique(){
       return;
     }
     corps.innerHTML = h.mouvements.map(m => {
-      const marque = m.mature ? "" : ` <span class="badge attente">immature</span>`;
+      // Trois etats, trois marques. « en attente » l'emporte sur « immature » :
+      // une transaction qui n'est dans aucun bloc n'a pas encore de maturite a
+      // discuter.
+      const marque = m.en_attente
+        ? ` <span class="badge attente">${rendu(sablier())} en attente</span>`
+        : (m.mature ? "" : ` <span class="badge attente">immature</span>`);
       // L'icone dit le sens avant que le mot soit lu ; la couleur du montant
       // le repete. Les trois dessins sont en dur, le genre choisit lequel.
       const recuQqc = BigInt(m.recu.unites) > 0n;
@@ -1389,7 +1431,7 @@ async function historique(){
         <td${html(recuQqc ? ' class="plus"' : '')}>${ech(recuQqc ? "+ " + m.recu.q21 : "—")}</td>
         <td${html(m.sorti ? ' class="moins"' : '')}>${rendu(celluleSortie(m))}</td>
         <td>${ech(m.confirmations)}${html(marque)}</td>
-        <td>${ech(m.hauteur)}</td>
+        <td>${ech(m.en_attente ? "—" : m.hauteur)}</td>
         <td>${ech(date(m.horodatage))}</td>
         <td><span class="coupe">${court(m.txid, 20)}</span></td>
       </tr>`;
@@ -1730,8 +1772,17 @@ async function reseau(){
   try{
     const r = await appel("getreseau");
     document.getElementById("reseau-pairs").textContent = String(r.pairs);
+    document.getElementById("reseau-carnet").textContent = String(r.carnet);
     document.getElementById("reseau-fenetre").textContent =
       String(r.blocs_examines) + " blocs";
+
+    // Ce que fait *votre* machine, a cote de ce que fait le reseau. Les deux
+    // chiffres cote a cote repondent a la question qu'on se pose vraiment :
+    // « quelle part est la mienne ». Le minage eteint, on ne l'invente pas.
+    let mien = 0;
+    try { mien = Number((await appel("getminage")).essais_par_seconde) || 0; } catch (e) { mien = 0; }
+    document.getElementById("reseau-mien").textContent =
+      mien > 0 ? formatDebitLong(mien) + " tentatives/s" : "à l'arrêt";
 
     if (!r.mesurable){
       document.getElementById("reseau-gros").innerHTML =
@@ -1740,6 +1791,8 @@ async function reseau(){
         "Pas encore assez de blocs pour mesurer quoi que ce soit. " +
         "Il en faut au moins deux, séparés dans le temps.";
       document.getElementById("reseau-equiv").textContent = "—";
+      document.getElementById("reseau-part").textContent =
+        "le réseau n'est pas encore mesurable";
       return;
     }
 
@@ -1760,14 +1813,20 @@ async function reseau(){
 
     // L'equivalence en machines : le debit du reseau divise par celui de la
     // votre. Sans mesure locale — le minage est eteint — on ne l'invente pas.
-    let mien = 0;
-    try { mien = Number((await appel("getminage")).essais_par_seconde) || 0; } catch (e) { mien = 0; }
     const eq = document.getElementById("reseau-equiv");
+    const part = document.getElementById("reseau-part");
     if (mien > 0 && debit > 0){
       const n = debit / mien;
       eq.textContent = n < 1.5 ? "environ 1" : "environ " + formatDebitLong(n);
+      // La part se calcule sur la mesure de l'instant chez vous, contre une
+      // moyenne du reseau sur une fenetre de blocs : elle peut donc depasser
+      // cent pour cent quand vous venez d'allumer, le temps que la fenetre
+      // rattrape. On l'ecrete a cent plutot que d'afficher une absurdite.
+      const p = Math.min(100, Math.round((mien / debit) * 100));
+      part.textContent = "soit environ " + p + " % du réseau";
     } else {
       eq.textContent = "—";
+      part.textContent = "allumez le minage pour vous situer";
     }
   }catch(e){ /* la boucle generale signale deja une panne du nœud */ }
 }
@@ -2057,7 +2116,14 @@ mod tests {
             );
         }
         const MONNAIE: [&str; 8] = [
-            "unites", "q21", "solde", "montant", "frais", "depensable", "immature", "recu",
+            "unites",
+            "q21",
+            "solde",
+            "montant",
+            "frais",
+            "depensable",
+            "immature",
+            "recu",
         ];
         // Le mot doit etre un mot, pas une sous-chaine : « recu » se cache dans
         // « recuperation », et l'epreuve refusait une barre de progression au
@@ -2274,7 +2340,10 @@ mod tests {
     fn la_recuperation_de_la_chaine_se_voit() {
         let s = script();
         assert!(PAGE.contains("Récupération de l'historique de la chaîne"));
-        assert!(PAGE.contains(r#"class="rotor""#), "rien ne tourne pendant l'attente");
+        assert!(
+            PAGE.contains(r#"class="rotor""#),
+            "rien ne tourne pendant l'attente"
+        );
         // La barre suit la hauteur reelle, elle n'est pas decorative.
         assert!(s.contains(r#"document.getElementById("recup-barre").style.width"#));
         assert!(s.contains("(ici / la) * 100"));
@@ -2362,6 +2431,82 @@ mod tests {
         assert!(PAGE.contains(r#"colspan="7""#));
     }
 
+    /// Un envoi se voit sur-le-champ, et se dit non confirme.
+    ///
+    /// Le silence entre l'envoi et le bloc etait le pire moment du
+    /// portefeuille : le solde baissait, l'activite restait vide, et
+    /// l'utilisateur croyait son argent perdu. Trois choses le comblent, et
+    /// cette epreuve les fige : la ligne porte une marque « en attente », un
+    /// disque tourne pour dire que ca travaille, et la hauteur reste un tiret
+    /// plutot qu'un zero qui designerait le bloc de genese.
+    #[test]
+    fn une_transaction_en_attente_se_voit_et_se_dit_non_confirmee() {
+        assert!(
+            PAGE.contains("m.en_attente"),
+            "l'historique ignore le reservoir"
+        );
+        assert!(
+            PAGE.contains("en attente</span>"),
+            "pas de marque « en attente »"
+        );
+        assert!(
+            PAGE.contains("function sablier()"),
+            "aucun indicateur de progression"
+        );
+        assert!(PAGE.contains(".tourne{"), "le disque n'a pas de style");
+        assert!(
+            PAGE.contains("@keyframes tourner"),
+            "le disque ne tourne pas"
+        );
+        // Une animation permanente doit pouvoir etre desactivee : c'est une
+        // exigence d'accessibilite, pas une preference.
+        assert!(
+            PAGE.contains("prefers-reduced-motion"),
+            "l'animation ne respecte pas le reglage systeme"
+        );
+        // La hauteur d'une transaction qui n'est dans aucun bloc n'existe pas.
+        assert!(
+            PAGE.contains(r#"ech(m.en_attente ? "—" : m.hauteur)"#),
+            "une transaction en attente afficherait une hauteur qu'elle n'a pas"
+        );
+    }
+
+    /// Apres un envoi, on conduit l'utilisateur a sa transaction.
+    #[test]
+    fn l_envoi_reussi_emmene_vers_l_activite() {
+        assert!(
+            PAGE.contains(r#"montrer("historique")"#),
+            "l'envoi ne bascule pas vers l'activite"
+        );
+    }
+
+    /// La page du reseau situe la machine de l'utilisateur dans l'ensemble.
+    ///
+    /// « Puissance du reseau » seule ne repond pas a la question qu'on se pose,
+    /// qui est « quelle part est la mienne ». Les deux chiffres cote a cote y
+    /// repondent d'un coup d'œil.
+    #[test]
+    fn la_page_reseau_montre_la_machine_et_l_ensemble() {
+        for attendu in [
+            "Votre machine",
+            "reseau-mien",
+            "reseau-part",
+            "Machines connues du réseau",
+            "reseau-carnet",
+            "Ordinateurs reliés au vôtre",
+        ] {
+            assert!(PAGE.contains(attendu), "tuile absente : {attendu}");
+        }
+        // Le carnet est une liste d'adresses apprises, pas un decompte du
+        // reseau, et la page doit le dire — sinon elle ment par raccourci.
+        assert!(
+            PAGE.contains("adresses apprises, présentes ou passées"),
+            "le carnet est presente comme un decompte du reseau"
+        );
+        // Le refus de compter les mineurs, lui, ne bouge pas.
+        assert!(PAGE.contains("Pourquoi on ne vous dit pas"));
+    }
+
     /// Le schema post-quantique est nomme, avec sa norme et son niveau.
     #[test]
     fn la_page_nomme_le_schema_de_signature() {
@@ -2430,7 +2575,15 @@ mod tests {
     /// s'ajoute doit etre declaree ici.
     #[test]
     fn les_sept_vues_existent() {
-        for v in ["solde", "miner", "recevoir", "reseau", "envoyer", "historique", "infos"] {
+        for v in [
+            "solde",
+            "miner",
+            "recevoir",
+            "reseau",
+            "envoyer",
+            "historique",
+            "infos",
+        ] {
             assert!(
                 PAGE.contains(&format!(r#"id="vue-{v}""#)),
                 "vue absente du balisage : {v}"
@@ -2450,7 +2603,10 @@ mod tests {
     #[test]
     fn le_minage_se_commande_depuis_la_page() {
         let s = script();
-        assert!(s.contains(r#"appel("setminage", {actif: vers})"#), "pas de bascule");
+        assert!(
+            s.contains(r#"appel("setminage", {actif: vers})"#),
+            "pas de bascule"
+        );
         assert!(s.contains(r#"appel("getminage")"#), "pas de lecture d'etat");
         // Le bouton reflete l'etat rendu par le nœud, jamais l'etat suppose :
         // afficher « actif » sur la foi d'un clic ferait mentir la page si le
@@ -2460,7 +2616,10 @@ mod tests {
             "l'affichage du minage ne suit pas la reponse du nœud"
         );
         // Un nœud sans portefeuille ne peut pas miner : le bouton se desactive.
-        assert!(s.contains("b.disabled = !etat.possible"), "bouton toujours actif");
+        assert!(
+            s.contains("b.disabled = !etat.possible"),
+            "bouton toujours actif"
+        );
     }
 
     /// Le trace du debit ne construit son balisage qu'a partir de nombres.
@@ -2479,7 +2638,10 @@ mod tests {
             "les coordonnees ne sont pas forcees en nombre"
         );
         for interdit in ["ech(", "etat.", "adresse"] {
-            assert!(!corps.contains(interdit), "valeur non numerique dans la courbe : {interdit}");
+            assert!(
+                !corps.contains(interdit),
+                "valeur non numerique dans la courbe : {interdit}"
+            );
         }
     }
 
@@ -2491,7 +2653,9 @@ mod tests {
     #[test]
     fn la_liste_des_adresses_echappe_tout() {
         let s = script();
-        let d = s.find("async function listerAdresses(").expect("la fonction");
+        let d = s
+            .find("async function listerAdresses(")
+            .expect("la fonction");
         let f = s[d..].find("\n}").expect("sa fin") + d;
         let corps = &s[d..f];
         assert_eq!(
@@ -2529,7 +2693,10 @@ mod tests {
     #[test]
     fn la_vue_du_reseau_ne_compte_pas_les_mineurs() {
         let s = script();
-        assert!(s.contains(r#"appel("getreseau")"#), "la vue n'interroge pas le nœud");
+        assert!(
+            s.contains(r#"appel("getreseau")"#),
+            "la vue n'interroge pas le nœud"
+        );
         // Aucune tuile ne doit s'intituler « mineurs » : la seule traduction
         // offerte est une equivalence en machines, et elle est nommee ainsi.
         assert!(
@@ -2598,7 +2765,10 @@ mod tests {
             assert!(s.contains(e), "champ non echappe : {e}");
         }
         // La hauteur mene a l'explorateur du meme nœud, jamais ailleurs.
-        assert!(s.contains(r#"href="/#/bloc/"#), "pas de lien vers l'explorateur");
+        assert!(
+            s.contains(r#"href="/#/bloc/"#),
+            "pas de lien vers l'explorateur"
+        );
         assert!(s.contains(r#"rel="noopener""#));
         // Le gain total s'affiche, et vient du nœud — pas d'une addition JS.
         assert!(s.contains("etat.gagne"), "le gain n'est pas celui du nœud");
@@ -2622,7 +2792,10 @@ mod tests {
     #[test]
     fn l_activite_porte_des_icones_et_des_signes() {
         let s = script();
-        assert!(s.contains("function iconeGenre"), "pas d'icones de mouvement");
+        assert!(
+            s.contains("function iconeGenre"),
+            "pas d'icones de mouvement"
+        );
         // Trois sens, trois dessins — et le genre inconnu retombe sur un dessin
         // generique plutot que sur rien.
         for cl in ["sens mine", "sens envoi", "sens recu"] {
@@ -2643,12 +2816,20 @@ mod tests {
     #[test]
     fn la_carte_de_securite_dit_ce_qui_sauve_et_ce_qui_ne_sauve_pas() {
         assert!(PAGE.contains("Le code de sauvegarde est votre portefeuille"));
-        for os in ["Windows", "Mac Intel", "Mac Apple
-      Silicon", "Linux", "Raspberry Pi"] {
+        for os in [
+            "Windows",
+            "Mac Intel",
+            "Mac Apple
+      Silicon",
+            "Linux",
+            "Raspberry Pi",
+        ] {
             assert!(PAGE.contains(os), "systeme absent de la promesse : {os}");
         }
-        assert!(PAGE.contains("ne protège que le
-      fichier de <em>cette</em> machine"));
+        assert!(PAGE.contains(
+            "ne protège que le
+      fichier de <em>cette</em> machine"
+        ));
         assert!(PAGE.contains("Ne photographiez pas le code"));
     }
 
