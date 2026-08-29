@@ -51,6 +51,18 @@ pub const ERR_PARSE: i64 = -32700;
 ///
 /// Les autres variantes ne portent rien de sensible et gardent un message
 /// precis : un utilisateur qui se trompe doit comprendre pourquoi.
+/// Secondes depuis 1970, pour horodater ce qui n'est pas encore dans un bloc.
+///
+/// Une transaction du reservoir n'a pas d'heure de protocole : la sienne sera
+/// celle du bloc qui l'inclura. En attendant, l'interface a besoin de quelque
+/// chose a afficher, et « maintenant » est la moins fausse des reponses.
+fn maintenant_utc() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Message rendu a l'appelant pour un refus du reservoir.
 ///
 /// # Ce qui etait rendu avant
@@ -463,7 +475,10 @@ impl RpcContext {
                 "preparersend",
                 "[portefeuille] Chiffres exacts d'un envoi, pieces reellement selectionnees",
             ),
-            ("getminage", "Etat du minage : actif, debit mesure, blocs trouves"),
+            (
+                "getminage",
+                "Etat du minage : actif, debit mesure, blocs trouves",
+            ),
             (
                 "getreseau",
                 "Effort de minage du reseau, mesure sur la difficulte des derniers blocs",
@@ -1283,6 +1298,30 @@ impl RpcContext {
             .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
         let schema = g.scheme();
 
+        // --- Ce qui attend au reservoir compte comme un mouvement.
+        //
+        // L'historique ne lisait que les blocs. Un envoi tout juste emis
+        // n'apparaissait donc **nulle part** tant qu'aucun mineur ne l'avait
+        // inclus — soit deux minutes en moyenne, et bien plus si le reseau est
+        // charge. Vu de celui qui vient de payer, son argent avait disparu :
+        // le solde avait baisse, et rien n'expliquait pourquoi. C'est le genre
+        // de silence qui fait douter d'un portefeuille, et douter d'un
+        // portefeuille est pire qu'une erreur affichee.
+        //
+        // On lit donc le reservoir avant les blocs. Ces lignes portent
+        // `en_attente` et zero confirmation : elles disent la verite, qui est
+        // « c'est parti, ce n'est pas encore grave dans la pierre ».
+        //
+        // Le verrou du reservoir est pris et relache **avant** celui de la
+        // chaine : deux verrous imbriques dans deux ordres differents sont la
+        // recette d'un blocage mortel.
+        let en_attente: Vec<Transaction> = self.node.with_mempool(|m| {
+            m.txids()
+                .iter()
+                .filter_map(|id| m.get(id).cloned())
+                .collect()
+        });
+
         let (mouvements, depuis, hauteur, tout_resolu) = self.node.with_chain(|c| {
             let hauteur = c.height();
             let depuis = hauteur.saturating_sub(FENETRE_HISTORIQUE);
@@ -1323,6 +1362,68 @@ impl RpcContext {
 
             let mut v: Vec<Json> = Vec::new();
             let mut tout_resolu = true;
+
+            // Le reservoir d'abord : c'est le plus recent, et c'est ce que
+            // cherche des yeux celui qui vient d'appuyer sur « Envoyer ».
+            for tx in &en_attente {
+                let recu: u64 = tx
+                    .outputs
+                    .iter()
+                    .filter(|o| g.owns(&o.pubkey_hash))
+                    .map(|o| o.value.units())
+                    .sum();
+                let mut engage: u64 = 0;
+                let mut engage_complet = true;
+                let mut emis = false;
+                for e in &tx.inputs {
+                    if e.witness.pubkey.is_empty() {
+                        continue;
+                    }
+                    if !g.owns(&crate::sig::pubkey_hash(schema, &e.witness.pubkey)) {
+                        continue;
+                    }
+                    emis = true;
+                    // Une piece consommee par une transaction du reservoir est
+                    // toujours dans le jeu d'UTXO : le reservoir n'y touche pas,
+                    // seul un bloc le fait. C'est donc la qu'on lit son montant.
+                    match c.utxo.get(&e.prev_out) {
+                        Some(e) => engage += e.output.value.units(),
+                        None => engage_complet = false,
+                    }
+                }
+                if recu == 0 && !emis {
+                    continue;
+                }
+                if emis && !engage_complet {
+                    tout_resolu = false;
+                }
+                let sorti = engage.saturating_sub(recu);
+                let mut ligne = Json::obj()
+                    .set("txid", Json::str(tx.txid().to_hex()))
+                    // Pas de hauteur : elle n'existera qu'au bloc qui l'inclura.
+                    // Zero serait un mensonge lisible — la hauteur du bloc de
+                    // genese.
+                    .set("hauteur", Json::Null)
+                    .set("horodatage", Json::u64(maintenant_utc()))
+                    .set("confirmations", Json::u64(0))
+                    .set("en_attente", Json::Bool(true))
+                    .set("genre", Json::str(if emis { "envoi" } else { "reception" }))
+                    .set("recu", montant(Amount::from_units(recu)))
+                    // Une transaction du reservoir n'est jamais une coinbase :
+                    // la maturite ne la concerne pas.
+                    .set("mature", Json::Bool(true));
+                if emis {
+                    ligne = ligne
+                        .set("engage", montant(Amount::from_units(engage)))
+                        .set("sorti", montant(Amount::from_units(sorti)))
+                        .set("montant_sortant_connu", Json::Bool(engage_complet));
+                }
+                v.push(ligne.build());
+                if v.len() as u64 >= limite {
+                    break;
+                }
+            }
+
             for b in &blocs {
                 if v.len() as u64 >= limite {
                     break;
@@ -1651,7 +1752,10 @@ impl RpcContext {
             .collect();
         Json::obj()
             .set("actif", Json::Bool(actif))
-            .set("possible", Json::Bool(self.minage.is_some() && self.wallet.is_some()))
+            .set(
+                "possible",
+                Json::Bool(self.minage.is_some() && self.wallet.is_some()),
+            )
             .set("essais_par_seconde", Json::Int(debit as i64))
             .set("essais_total", Json::u64(total))
             .set("blocs_trouves", Json::u64(blocs))
@@ -1710,7 +1814,11 @@ impl RpcContext {
         // L'epreuve `la_genese_ne_sert_pas_de_point_de_depart` l'a vu tout de
         // suite ; la relecture, non.
         let ancre = n.saturating_sub(FENETRE + 1).max(1);
-        let tranche = if n > ancre { &entetes[ancre..] } else { &entetes[..0] };
+        let tranche = if n > ancre {
+            &entetes[ancre..]
+        } else {
+            &entetes[..0]
+        };
 
         let mut travail: u128 = 0;
         for h in tranche.iter().skip(1) {
@@ -1741,6 +1849,16 @@ impl RpcContext {
 
         Json::obj()
             .set("pairs", Json::u64(self.node.peer_count() as u64))
+            // --- Le carnet : ce qui se rapproche le plus d'un « combien de
+            // machines ».
+            //
+            // Le nombre de mineurs reste inconnaissable, et le restera. Mais le
+            // nombre de machines dont ce nœud a **appris l'existence** est un
+            // fait, lui : chaque poignee de main echange des adresses, et le
+            // carnet les retient. Ce n'est pas un decompte du reseau — une
+            // machine eteinte y figure encore, une machine qui vient d'arriver
+            // pas encore — et c'est dit tel quel dans l'interface.
+            .set("carnet", Json::u64(self.node.address_count() as u64))
             .set("blocs_examines", Json::u64(blocs))
             .set("secondes_examinees", Json::u64(secondes))
             .set("travail_total", Json::str(travail.to_string()))
@@ -1978,6 +2096,37 @@ mod tests {
         }
     }
 
+    /// Un contexte dont le portefeuille a reellement des pieces depensables.
+    ///
+    /// Mine jusqu'a depasser la maturite des coinbases, sans quoi rien n'est
+    /// depensable et l'on n'eprouve que le message « fonds insuffisants ».
+    fn contexte_avec_fonds() -> RpcContext {
+        let mut w = Wallet::from_seed([0x5a; 32], RESEAU);
+        let g = genesis_block(RESEAU);
+        let mut c = Chain::new(RESEAU, g);
+        for i in 1..=(COINBASE_MATURITY + 3) {
+            let a = w.new_address();
+            let t = crate::chain::GENESIS_TIME + i * TARGET_BLOCK_SECS;
+            // Le schema vient de l'adresse elle-meme, jamais d'une constante :
+            // l'empreinte d'une clef publique depend du schema, et miner vers
+            // un autre que celui du portefeuille produit un verrou qu'il ne
+            // sait pas ouvrir. Le defaut ne se voyait qu'avec ML-DSA active,
+            // ou la constante et le portefeuille divergent.
+            let b = c
+                .mine_block(a.hash, a.scheme, &[], t, 5_000_000)
+                .expect("minage");
+            c.connect(&b, t + 1).expect("connexion");
+        }
+        RpcContext {
+            sur_changement: None,
+            index: None,
+            minage: Some(Arc::new(crate::minage::Minage::new(false))),
+            node: Arc::new(Node::new(RESEAU, c)),
+            wallet: Some(Arc::new(Mutex::new(w))),
+            network: RESEAU,
+        }
+    }
+
     fn appel(c: &RpcContext, methode: &str, params: &str) -> Json {
         let corps = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{methode}","params":{params}}}"#);
         jparse(&c.handle(&corps)).expect("reponse JSON valide")
@@ -2150,6 +2299,128 @@ mod tests {
         assert!(r.get("cout_de_la_finalite_glissante").is_some());
     }
 
+    /// Un envoi se voit dans l'historique **avant** d'etre dans un bloc.
+    ///
+    /// C'est le defaut que cette epreuve fige. L'historique ne lisait que les
+    /// blocs : entre l'instant ou l'on appuie sur « Envoyer » et le bloc qui
+    /// inclut la transaction — deux minutes en moyenne, davantage si le reseau
+    /// est charge — le paiement n'apparaissait nulle part, alors que le solde
+    /// avait deja baisse. Constate sur un vrai noeud, par quelqu'un qui a cru
+    /// son argent perdu.
+    #[test]
+    fn un_envoi_apparait_dans_l_historique_des_le_reservoir() {
+        let c = contexte_avec_fonds();
+        let mut dest = Wallet::from_seed([0xcc; 32], RESEAU);
+        let adresse = dest.new_address().to_string_bech32();
+
+        // Rien en attente avant l'envoi : ce qui suit mesure bien l'effet de
+        // l'envoi, et non une ligne qui trainait.
+        let avant = resultat(&c, "listtransactions", r#"{"limite":5}"#);
+        assert!(
+            avant
+                .get("mouvements")
+                .and_then(|v| v.as_array())
+                .expect("mouvements")
+                .iter()
+                .all(|m| m.get("en_attente").is_none()),
+            "aucune ligne ne doit etre en attente avant l'envoi"
+        );
+
+        let envoi = resultat(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"adresse":"{adresse}","unites":100000}}"#),
+        );
+        let txid = envoi
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .expect("txid")
+            .to_string();
+        assert_eq!(
+            c.node.mempool_len(),
+            1,
+            "la transaction doit etre au reservoir"
+        );
+
+        let apres = resultat(&c, "listtransactions", r#"{"limite":5}"#);
+        let mouvements = apres
+            .get("mouvements")
+            .and_then(|v| v.as_array())
+            .expect("mouvements");
+        assert_eq!(
+            mouvements
+                .iter()
+                .filter(|m| m.get("en_attente").is_some())
+                .count(),
+            1,
+            "l'envoi doit ajouter exactement une ligne en attente"
+        );
+
+        // La plus recente est en tete : c'est celle qu'on cherche des yeux.
+        let l = &mouvements[0];
+        assert_eq!(l.get("txid").and_then(|v| v.as_str()), Some(txid.as_str()));
+        assert_eq!(l.get("en_attente"), Some(&Json::Bool(true)));
+        assert_eq!(
+            l.get("confirmations").and_then(|v| v.as_u64()),
+            Some(0),
+            "rien ne la confirme encore, et il faut le dire"
+        );
+        assert_eq!(
+            l.get("hauteur"),
+            Some(&Json::Null),
+            "pas de hauteur tant qu'aucun bloc ne la porte : zero serait la genese"
+        );
+        assert_eq!(l.get("genre").and_then(|v| v.as_str()), Some("envoi"));
+        // Le montant engage se lit dans le jeu d'UTXO : le reservoir n'y touche
+        // pas, donc les pieces consommees y sont encore.
+        assert_eq!(l.get("montant_sortant_connu"), Some(&Json::Bool(true)));
+        assert!(
+            l.get("sorti")
+                .and_then(|v| v.get("unites"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                >= 100_000,
+            "le montant sortant doit etre annonce, pas laisse a zero"
+        );
+    }
+
+    /// Une transaction en attente ne se compte pas comme confirmee.
+    ///
+    /// L'inverse serait pire que le silence d'origine : afficher « confirmee »
+    /// pour ce qui peut encore etre evince du reservoir ferait expedier une
+    /// marchandise contre un paiement qui n'existe pas.
+    #[test]
+    fn le_reservoir_ne_se_fait_pas_passer_pour_un_bloc() {
+        let c = contexte_avec_fonds();
+        let mut dest = Wallet::from_seed([0xcd; 32], RESEAU);
+        let adresse = dest.new_address().to_string_bech32();
+        let _ = resultat(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"adresse":"{adresse}","unites":100000}}"#),
+        );
+        let r = c.handle(r#"{"jsonrpc":"2.0","id":1,"method":"listtransactions"}"#);
+        assert!(r.contains("\"en_attente\":true"));
+        assert!(
+            !r.contains("\"en_attente\":true,\"genre\":\"minage\""),
+            "une coinbase ne passe jamais par le reservoir"
+        );
+    }
+
+    /// Le carnet est annonce, et il ne pretend pas denombrer le reseau.
+    #[test]
+    fn getreseau_annonce_le_carnet_sans_pretendre_compter() {
+        let c = contexte(false);
+        let r = c.handle(r#"{"jsonrpc":"2.0","id":1,"method":"getreseau"}"#);
+        assert!(
+            r.contains("\"carnet\""),
+            "le carnet doit etre annonce : {r}"
+        );
+        // Le nom compte : « carnet » dit ce que c'est — des adresses apprises —
+        // la ou « machines » aurait laisse croire a un decompte du reseau.
+        assert!(!r.contains("\"machines\":"));
+    }
+
     /// Le reseau se mesure en travail, et refuse de compter les mineurs.
     ///
     /// La tentation etait de compter les empreintes de mineur distinctes. Cette
@@ -2218,7 +2489,13 @@ mod tests {
         // genese.
         let d = r
             .find("\"secondes_examinees\":")
-            .map(|i| r[i + 21..].split(&[',', '}'][..]).next().unwrap_or("").to_string())
+            .map(|i| {
+                r[i + 21..]
+                    .split(&[',', '}'][..])
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
             .expect("champ present");
         let secondes: u64 = d.trim().parse().expect("un nombre");
         assert!(
