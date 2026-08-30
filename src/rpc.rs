@@ -656,6 +656,7 @@ impl RpcContext {
             return Ok(Json::obj()
                 .set("confirmee", Json::Bool(false))
                 .set("transaction", tx_json(&t, self.network))
+                .set_all(self.champs_frais(&t))
                 .build());
         }
 
@@ -672,6 +673,7 @@ impl RpcContext {
                     .set("hauteur", Json::u64(hauteur))
                     .set("bloc", Json::str(bloc.to_hex()))
                     .set("transaction", tx_json(&t, self.network))
+                    .set_all(self.champs_frais(&t))
                     .build());
             }
         }
@@ -715,6 +717,7 @@ impl RpcContext {
                 .set("hauteur", Json::u64(hauteur))
                 .set("bloc", Json::str(bloc.to_hex()))
                 .set("transaction", tx_json(&t, self.network))
+                .set_all(self.champs_frais(&t))
                 .build()),
             None => Err(erreur(ERR_INTROUVABLE, "transaction introuvable")),
         }
@@ -971,6 +974,77 @@ impl RpcContext {
             let t = b.transactions.get(rang as usize)?;
             t.outputs.get(point.index as usize).cloned()
         })
+    }
+
+    /// Le montant de chaque entree, la somme entrante, et si tout est resolu.
+    ///
+    /// Une entree ne porte que la reference de la sortie qu'elle consomme, pas
+    /// son montant. On le retrouve par l'index — une lecture de table, pas un
+    /// balayage. Si une seule entree echappe a l'index (pas d'index, ou piece
+    /// trop ancienne pour lui), `connu` passe a `false` : les frais ne se
+    /// calculent pas sur une somme partielle, et la page le dira plutot que de
+    /// livrer un chiffre faux.
+    ///
+    /// Rend `(entrees, entrant, connu)` : `entrees` est aligne sur les entrees
+    /// de la transaction, chaque element portant `valeur` quand elle est connue.
+    fn resoudre_entrees(&self, t: &Transaction) -> (Vec<Json>, u64, bool) {
+        let mut entrees = Vec::with_capacity(t.inputs.len());
+        let mut entrant = 0u64;
+        let mut connu = true;
+        for e in &t.inputs {
+            if e.prev_out.is_coinbase() {
+                entrees.push(Json::obj().set("connu", Json::Bool(true)).build());
+                continue;
+            }
+            match self.resoudre_sortie(&e.prev_out) {
+                Some(o) => {
+                    entrant = entrant.saturating_add(o.value.units());
+                    entrees.push(
+                        Json::obj()
+                            .set("valeur", montant(o.value))
+                            .set("connu", Json::Bool(true))
+                            .build(),
+                    );
+                }
+                None => {
+                    connu = false;
+                    entrees.push(Json::obj().set("connu", Json::Bool(false)).build());
+                }
+            }
+        }
+        (entrees, entrant, connu)
+    }
+
+    /// Enrichit une reponse de transaction confirmee avec les montants d'entree
+    /// et les frais, quand ils sont resolus.
+    ///
+    /// Les frais d'une coinbase n'ont pas de sens — elle *percoit* les frais du
+    /// bloc, elle n'en paie pas — donc on ne les affiche pas pour elle.
+    fn champs_frais(&self, t: &Transaction) -> Vec<(&'static str, Json)> {
+        let (entrees, entrant, connu) = self.resoudre_entrees(t);
+        let coinbase = t.is_coinbase();
+        let sortant: u64 = t.outputs.iter().map(|o| o.value.units()).sum();
+        let frais_connu = connu && !coinbase;
+        vec![
+            ("entrees_montants", Json::array(entrees)),
+            ("frais_connu", Json::Bool(frais_connu)),
+            (
+                "montant_entrant",
+                if frais_connu {
+                    montant(Amount::from_units(entrant))
+                } else {
+                    Json::Null
+                },
+            ),
+            (
+                "frais",
+                if frais_connu {
+                    montant(Amount::from_units(entrant.saturating_sub(sortant)))
+                } else {
+                    Json::Null
+                },
+            ),
+        ]
     }
 
     /// Devine ce qu'on lui donne, et dit ou aller.
@@ -2332,6 +2406,39 @@ mod tests {
         let c = contexte(false);
         let r = resultat(&c, "getblock", "{}");
         assert!(r.get("entete").is_some());
+    }
+
+    /// Les frais sont toujours annonces — connus, ou avoues comme inconnus.
+    ///
+    /// Une coinbase ne paie pas de frais : elle les percoit. Le champ existe
+    /// donc, et il vaut `false`, plutot qu'un montant qui n'aurait pas de sens.
+    /// Sans index (le cas de ce contexte d'essai), une depense ordinaire serait
+    /// de meme « non resolue » — jamais un chiffre invente.
+    #[test]
+    fn gettransaction_annonce_les_frais_ou_avoue_ne_pas_savoir() {
+        let c = contexte_avec_fonds();
+        let bloc = resultat(&c, "getblock", r#"{"hauteur":1}"#);
+        let txid = bloc.get("transactions").and_then(|v| v.as_array()).unwrap()[0]
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let r = resultat(&c, "gettransaction", &format!(r#"{{"txid":"{txid}"}}"#));
+
+        // Le champ est toujours la : la page ne devine jamais son absence.
+        assert_eq!(
+            r.get("frais_connu"),
+            Some(&Json::Bool(false)),
+            "une coinbase ne paie pas de frais"
+        );
+        assert_eq!(r.get("frais"), Some(&Json::Null));
+        // Un montant par entree, aligne sur la transaction — ici l'unique
+        // entree de coinbase.
+        let m = r
+            .get("entrees_montants")
+            .and_then(|v| v.as_array())
+            .expect("entrees_montants present");
+        assert_eq!(m.len(), 1);
     }
 
     #[test]

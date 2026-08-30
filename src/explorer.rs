@@ -634,27 +634,40 @@ async function voirTx(txid){
   const info = await appel("getinfo");
   const sortant = t.sorties.reduce((a,o)=>a + BigInt(o.valeur.unites), 0n);
 
+  // Les frais : ce que les entrées apportent moins ce que les sorties emportent.
+  // Le nœud les résout par son index ; sans lui, ou pour une pièce trop
+  // ancienne, `frais_connu` est faux et l'on ne montre pas un chiffre inventé.
+  const fraisTuile = t.coinbase
+    ? tuile("Frais", "—", "une coinbase les perçoit, elle n'en paie pas")
+    : (r.frais_connu
+        ? tuile("Frais", ech(r.frais.q21) + " Q21", "payés au mineur")
+        : tuile("Frais", "—", "non résolu sans index"));
+
   document.getElementById("tx-tuiles").innerHTML =
     tuile("Identifiant", brut(`<span class="coupe">${ech(t.txid.slice(0,20))}…</span>`), t.txid) +
     tuile("État", badge(r.confirmee ? "confirmée" : "en attente", !r.confirmee),
       r.confirmee ? (info.hauteur - r.hauteur + 1) + " confirmation(s)" : "dans le réservoir") +
     tuile("Bloc", brut(r.confirmee ? lienBloc(r.hauteur) : "—")) +
     tuile("Valeur sortante", q21(sortant) + " Q21") +
+    fraisTuile +
     tuile("Taille", octets(t.taille_octets), t.temoin_pourcent + " % de témoin") +
     tuile("Poids", t.poids.toLocaleString("fr-FR"));
 
-  // Les entrees ne portent que la reference de la sortie qu'elles consomment.
-  // Montrer leur montant demanderait de resoudre chacune ; la page ne le fait
-  // pas ici et ne fait donc pas semblant de le savoir.
+  // Chaque entrée porte maintenant le montant de la sortie qu'elle consomme,
+  // quand l'index a su le retrouver. Un « ? » dit honnêtement « non résolu ».
+  const mont = r.entrees_montants || [];
   document.getElementById("tx-entrees").innerHTML =
     `<div class="t">Entrées (${ech(t.entrees.length)})</div>` +
     (t.coinbase
       ? `<div class="l"><span class="g">Création monétaire — cette transaction ne consomme rien</span></div>`
-      : t.entrees.map(e=>`
+      : t.entrees.map((e,i)=>{
+          const m = mont[i] || {};
+          const v = (m.connu && m.valeur) ? m.valeur.q21 : "?";
+          return `
         <div class="l">
           <span class="g">${lienTx(e.txid, 18)}<span style="color:var(--tenu)"> : ${ech(e.index)}</span></span>
-          <span class="d" style="color:var(--tenu)">${octets(e.temoin_octets)}</span>
-        </div>`).join(""));
+          <span class="d">${ech(v)}</span>
+        </div>`;}).join(""));
 
   document.getElementById("tx-sorties").innerHTML =
     `<div class="t">Sorties (${ech(t.sorties.length)})</div>` +
@@ -671,11 +684,13 @@ async function voirTx(txid){
        produit n'est dépensable qu'après le délai de maturité — de sorte qu'un
        bloc annulé par une réorganisation n'ait pas déjà servi à payer
        quelqu'un.</p></div>`
-    : `<div class="avert info"><h3>Ce que cette page ne calcule pas</h3>
-       <p>Les frais, et la valeur de chaque entrée. Une entrée ne porte que la
-       référence de la sortie qu'elle consomme&nbsp;; les résoudre demanderait
-       une lecture par entrée. La page préfère se taire plutôt qu'afficher un
-       chiffre qu'elle n'a pas vérifié.</p></div>`;
+    : (r.frais_connu
+        ? ""
+        : `<div class="avert info"><h3>Frais non résolus</h3>
+       <p>Une entrée au moins échappe à l'index de ce nœud — index absent, ou
+       pièce trop ancienne pour lui. Les frais ne se calculent pas sur une somme
+       partielle&nbsp;: la page préfère se taire plutôt qu'afficher un chiffre
+       qu'elle n'a pas vérifié.</p></div>`);
 }
 
 // ---------------------------------------------------------------------------
