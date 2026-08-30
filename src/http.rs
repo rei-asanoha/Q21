@@ -185,6 +185,51 @@ pub fn serve_avec_public<F>(
 where
     F: Fn(Request) -> Response + Send + Sync + 'static,
 {
+    serve_complet(adresse, token, chemins_publics, None, handler)
+}
+
+/// Comme [`serve_avec_public`], mais pour un service **destine a etre public**.
+///
+/// # Pourquoi ce mode existe, et pourquoi il est separe
+///
+/// La garde de ce serveur refuse toute requete dont l'en-tete `Host` n'est pas
+/// locale. C'est la bonne regle pour un portefeuille : le RPC ecoute sur la
+/// boucle locale, et le navigateur de l'utilisateur y est aussi — sans cette
+/// garde, une page hostile ouverte dans un onglet quelconque atteindrait les
+/// fonds par reliaison DNS.
+///
+/// Un explorateur public est l'exact oppose : on l'expose **exprès**, derriere
+/// un nom de domaine, et les navigateurs qui l'atteignent enverront ce nom en
+/// `Host` et en `Origin`. La garde les refuserait tous.
+///
+/// On aurait pu reecrire ces en-tetes dans le mandataire. Ce serait desactiver
+/// un controle de securite par un artifice de configuration, sans que le
+/// programme sache qu'il est expose. On declare donc le nom au serveur, qui
+/// l'accepte pour lui seul et garde toutes ses autres regles.
+///
+/// **L'appelant doit garantir qu'aucune methode de portefeuille n'est servie
+/// sur ce port.** C'est verifie a l'appel, dans le binaire.
+pub fn serve_public_web<F>(
+    adresse: &str,
+    hote_public: String,
+    handler: F,
+) -> Result<ServerHandle, HttpError>
+where
+    F: Fn(Request) -> Response + Send + Sync + 'static,
+{
+    serve_complet(adresse, None, &[], Some(hote_public), handler)
+}
+
+fn serve_complet<F>(
+    adresse: &str,
+    token: Option<String>,
+    chemins_publics: &'static [&'static str],
+    hote_public: Option<String>,
+    handler: F,
+) -> Result<ServerHandle, HttpError>
+where
+    F: Fn(Request) -> Response + Send + Sync + 'static,
+{
     let listener = TcpListener::bind(adresse)?;
     let local = listener.local_addr()?;
 
@@ -192,10 +237,14 @@ where
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
     };
-    if !bouclage && token.is_none() {
+    // Un service public web n'a pas de jeton : c'est un explorateur, il est
+    // fait pour etre lu par n'importe qui. La regle « pas d'exposition sans
+    // jeton » ne s'applique donc qu'aux autres, et l'exception est nommee.
+    if !bouclage && token.is_none() && hote_public.is_none() {
         return Err(HttpError::ExpositionSansJeton(local));
     }
 
+    let hote = Arc::new(hote_public);
     let arret = Arc::new(AtomicBool::new(false));
     let arret_fil = arret.clone();
     let handler = Arc::new(handler);
@@ -228,6 +277,7 @@ where
             let t = token.clone();
             let c = en_cours.clone();
             let pubs = chemins_publics;
+            let hp = hote.clone();
             c.fetch_add(1, Ordering::Relaxed);
             let lance = std::thread::Builder::new().spawn(move || {
                 // Le delai de lecture ne doit pas pouvoir survivre a l'echeance
@@ -235,7 +285,7 @@ where
                 // meme qu'on la consulte.
                 let _ = flux.set_read_timeout(Some(REQUEST_TIMEOUT));
                 let _ = flux.set_write_timeout(Some(READ_TIMEOUT));
-                traiter_connexion(flux, &*h, t.as_ref().as_deref(), pubs);
+                traiter_connexion(flux, &*h, t.as_ref().as_deref(), pubs, hp.as_deref());
                 c.fetch_sub(1, Ordering::Relaxed);
             });
             if lance.is_err() {
@@ -252,6 +302,7 @@ fn traiter_connexion<F>(
     handler: &F,
     token: Option<&str>,
     chemins_publics: &[&str],
+    hote_public: Option<&str>,
 ) where
     F: Fn(Request) -> Response,
 {
@@ -265,19 +316,19 @@ fn traiter_connexion<F>(
             // donnees et sans effet. Elle seule tolere qu'on y arrive depuis un
             // autre port de la boucle locale — voir `garde_navigateur`.
             let coquille = libre && req.method == "GET";
-            match garde_navigateur(&req, coquille) {
-            Some(raison) => Response::text(403, raison),
-            None => {
-                if let Some(attendu) = token.filter(|_| !libre) {
-                    if !autorise(&req, attendu) {
-                        Response::text(401, "jeton d'acces manquant ou invalide")
+            match garde_navigateur(&req, coquille, hote_public) {
+                Some(raison) => Response::text(403, raison),
+                None => {
+                    if let Some(attendu) = token.filter(|_| !libre) {
+                        if !autorise(&req, attendu) {
+                            Response::text(401, "jeton d'acces manquant ou invalide")
+                        } else {
+                            handler(req)
+                        }
                     } else {
                         handler(req)
                     }
-                } else {
-                    handler(req)
                 }
-            }
             }
         }
         Err(msg) => Response::text(400, msg),
@@ -333,11 +384,16 @@ fn traiter_connexion<F>(
 /// - `/rpc` n'est jamais public, donc jamais une coquille : rien de ce qui
 ///   deplace des fonds n'est concerne.
 /// - Un POST n'est jamais une coquille, meme sur un chemin public.
-fn garde_navigateur(req: &Request, coquille: bool) -> Option<&'static str> {
-    // 1. `Host` : seule la boucle locale est un hote legitime. Un nom de domaine
-    //    quelconque signale une reliaison DNS.
+fn garde_navigateur(
+    req: &Request,
+    coquille: bool,
+    hote_public: Option<&str>,
+) -> Option<&'static str> {
+    // 1. `Host` : seule la boucle locale est un hote legitime — ou le nom que
+    //    l'exploitant a **declare** pour un service public. Un autre nom de
+    //    domaine signale une reliaison DNS.
     if let Some(host) = req.headers.get("host") {
-        if !hote_local(host) {
+        if !hote_local(host) && !hote_declare(host, hote_public) {
             return Some(
                 "en-tete Host inattendue : ce service ne repond qu'a 127.0.0.1,                  [::1] ou localhost",
             );
@@ -345,10 +401,12 @@ fn garde_navigateur(req: &Request, coquille: bool) -> Option<&'static str> {
     }
 
     // 2. `Origin` / `Referer` : une page web n'a rien a faire ici. Presents et
-    //    non locaux, ils designent une origine tierce.
+    //    non locaux, ils designent une origine tierce — sauf, la encore, le nom
+    //    declare : la page de l'explorateur public est servie depuis lui, et
+    //    ses appels en portent l'origine.
     for cle in ["origin", "referer"] {
         if let Some(v) = req.headers.get(cle) {
-            if !origine_locale(v) {
+            if !origine_locale(v) && !origine_declaree(v, hote_public) {
                 return Some("requete emise depuis une autre origine : refusee");
             }
         }
@@ -383,6 +441,40 @@ fn garde_navigateur(req: &Request, coquille: bool) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// L'hote declare par l'exploitant pour un service public, port compris ou non.
+///
+/// La comparaison est insensible a la casse — un nom de domaine l'est — et
+/// exacte sur le reste : `q21.dev.evil.example` ne doit pas passer pour
+/// `q21.dev`, et c'est le genre de sous-chaine qui trompe une comparaison
+/// paresseuse.
+fn hote_declare(host: &str, declare: Option<&str>) -> bool {
+    let Some(d) = declare else { return false };
+    let nu = match host.rsplit_once(':') {
+        // Un seul deux-points et un port numerique : c'est un port.
+        Some((avant, apres))
+            if !avant.contains(':') && apres.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            avant
+        }
+        _ => host,
+    };
+    nu.eq_ignore_ascii_case(d)
+}
+
+/// Une origine servie par l'hote declare.
+///
+/// On exige `https` : le service public est derriere un mandataire qui termine
+/// le chiffrement, et une origine en clair signalerait autre chose.
+fn origine_declaree(valeur: &str, declare: Option<&str>) -> bool {
+    let Some(d) = declare else { return false };
+    let Some(reste) = valeur.strip_prefix("https://") else {
+        return false;
+    };
+    // Le referent porte un chemin ; l'origine non. On coupe au premier `/`.
+    let hote = reste.split('/').next().unwrap_or("");
+    hote_declare(hote, Some(d))
 }
 
 /// Un hote qui designe cette machine, et rien d'autre.
@@ -766,6 +858,108 @@ mod tests {
         h.shutdown();
     }
 
+    /// Le mode public accepte le nom declare, et lui seul.
+    ///
+    /// # Ce que ce mode desarme, et ce qu'il ne desarme pas
+    ///
+    /// La garde refuse tout `Host` non local : c'est la defense contre la
+    /// reliaison DNS, celle qui empeche une page hostile d'atteindre un
+    /// portefeuille par la boucle locale. Un explorateur public, lui, est
+    /// expose **exprès** : les navigateurs qui l'atteignent enverront son nom
+    /// de domaine, et la garde les refuserait tous.
+    ///
+    /// On declare donc ce nom au serveur. Tout le reste tient : un autre nom
+    /// est refuse, une origine tierce est refusee, et le `Content-Type` reste
+    /// exige. Et le binaire refuse de combiner ce mode avec un portefeuille.
+    #[test]
+    fn le_mode_public_n_accepte_que_le_nom_declare() {
+        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+            .expect("demarrage");
+
+        let avec = |entetes: &str| {
+            requete(
+                h.addr,
+                &format!(
+                    "POST /rpc HTTP/1.1\r\n{entetes}\
+                     Content-Type: application/json\r\nContent-Length: 2\r\n\
+                     Connection: close\r\n\r\n{{}}"
+                ),
+            )
+        };
+
+        // 1. Le nom declare passe, avec ou sans port, quelle que soit la casse.
+        for hote in [
+            "explorateur.q21.dev",
+            "explorateur.q21.dev:443",
+            "Explorateur.Q21.Dev",
+        ] {
+            let r = avec(&format!("Host: {hote}\r\n"));
+            assert!(r.starts_with("HTTP/1.1 200"), "{hote} doit passer : {r}");
+        }
+
+        // 2. La boucle locale reste admise : le mandataire parle en local.
+        let r = avec("Host: 127.0.0.1\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 200"),
+            "le mandataire local doit passer : {r}"
+        );
+
+        // 3. Un autre nom est refuse. Et surtout : un nom qui **contient** le
+        //    notre ne passe pas. `explorateur.q21.dev.evil.example` est le
+        //    genre de chaine qui trompe une comparaison paresseuse.
+        for hote in [
+            "evil.example",
+            "explorateur.q21.dev.evil.example",
+            "q21.dev",
+        ] {
+            let r = avec(&format!("Host: {hote}\r\n"));
+            assert!(
+                r.starts_with("HTTP/1.1 403"),
+                "{hote} doit etre refuse : {r}"
+            );
+        }
+
+        // 4. L'origine declaree passe — la page de l'explorateur est servie par
+        //    ce nom — mais une origine tierce reste refusee.
+        let r = avec("Host: explorateur.q21.dev\r\nOrigin: https://explorateur.q21.dev\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 200"),
+            "l'origine declaree doit passer : {r}"
+        );
+        let r = avec("Host: explorateur.q21.dev\r\nOrigin: https://evil.example\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 403"),
+            "une origine tierce doit etre refusee : {r}"
+        );
+        // En clair, non : le service public est derriere un mandataire qui
+        // termine le chiffrement.
+        let r = avec("Host: explorateur.q21.dev\r\nOrigin: http://explorateur.q21.dev\r\n");
+        assert!(
+            r.starts_with("HTTP/1.1 403"),
+            "une origine en clair doit etre refusee : {r}"
+        );
+
+        h.shutdown();
+    }
+
+    /// Le mode public n'assouplit pas le `Content-Type`.
+    #[test]
+    fn le_mode_public_exige_toujours_du_json() {
+        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+            .expect("demarrage");
+        let r = requete(
+            h.addr,
+            "POST /rpc HTTP/1.1\r\nHost: explorateur.q21.dev\r\n\
+             Content-Type: text/plain\r\nContent-Length: 2\r\n\
+             Connection: close\r\n\r\n{}",
+        );
+        assert!(
+            r.starts_with("HTTP/1.1 403"),
+            "un POST non-JSON doit etre refuse : {r}"
+        );
+        h.shutdown();
+    }
+
     /// L'exception `same-site` ne vaut que pour une coquille demandee en GET.
     ///
     /// Elle existe parce que la page d'installation et le nœud vivent sur deux
@@ -773,8 +967,8 @@ mod tests {
     /// Ces quatre epreuves disent ou elle s'arrete.
     #[test]
     fn same_site_n_est_admis_que_sur_une_coquille_en_lecture() {
-        let h = serve_avec_public("127.0.0.1:0", None, &["/portefeuille"], echo())
-            .expect("demarrage");
+        let h =
+            serve_avec_public("127.0.0.1:0", None, &["/portefeuille"], echo()).expect("demarrage");
 
         let avec = |methode: &str, chemin: &str, site: &str| {
             requete(
@@ -791,7 +985,10 @@ mod tests {
         // 1. Le cas voulu : arriver sur la page du portefeuille depuis la page
         //    d'installation, qui est sur un autre port.
         let r = avec("GET", "/portefeuille", "same-site");
-        assert!(r.starts_with("HTTP/1.1 200"), "la coquille doit passer : {r}");
+        assert!(
+            r.starts_with("HTTP/1.1 200"),
+            "la coquille doit passer : {r}"
+        );
 
         // 2. Le meme assouplissement ne s'etend pas au RPC, qui n'est pas
         //    public. C'est lui qui deplace des fonds.
@@ -801,12 +998,18 @@ mod tests {
         // 3. Ni a un POST sur le chemin public lui-meme : une coquille se lit,
         //    elle ne s'ecrit pas.
         let r = avec("POST", "/portefeuille", "same-site");
-        assert!(r.starts_with("HTTP/1.1 403"), "un POST n'est pas une coquille : {r}");
+        assert!(
+            r.starts_with("HTTP/1.1 403"),
+            "un POST n'est pas une coquille : {r}"
+        );
 
         // 4. Et `cross-site` reste refuse partout : c'est la marque que pose le
         //    navigateur quand la page vient d'ailleurs que de cette machine.
         let r = avec("GET", "/portefeuille", "cross-site");
-        assert!(r.starts_with("HTTP/1.1 403"), "cross-site doit refuser : {r}");
+        assert!(
+            r.starts_with("HTTP/1.1 403"),
+            "cross-site doit refuser : {r}"
+        );
 
         h.shutdown();
     }
