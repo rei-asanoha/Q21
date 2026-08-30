@@ -983,6 +983,19 @@ const date = t => new Date(Number(t) * 1000).toISOString().replace("T"," ").slic
 // Une quantite d'octets, dans l'unite ou un humain la reconnait. Les puissances
 // de 1024 et non de 1000 : c'est ainsi qu'une barrette de memoire se compte, et
 // c'est de memoire qu'il s'agit ici.
+// Une attente en blocs, traduite dans le temps des humains.
+//
+// Le nœud donne l'intervalle visé par le protocole ; on ne le recopie pas ici,
+// pour qu'il n'y ait qu'un seul endroit au monde où ce chiffre soit écrit.
+function dureeBlocs(blocs, info){
+  const t = Number(info && info.intervalle_cible_secondes) || 120;
+  const sec = Math.max(0, Number(blocs) || 0) * t;
+  if (sec < 90) return "environ " + Math.round(sec) + " s";
+  if (sec < 5400) return "environ " + Math.round(sec / 60) + " min";
+  if (sec < 172800) return "environ " + (sec / 3600).toFixed(1) + " h";
+  return "environ " + (sec / 86400).toFixed(1) + " jours";
+}
+
 function octets(n){
   n = Number(n) || 0;
   if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " Gio";
@@ -1171,9 +1184,20 @@ async function rafraichir(){
       (sync.synchronise ? "" : " — chiffre incomplet, voir l'avertissement ci-dessus");
 
     const total = unitesDe(solde.depensable) + unitesDe(solde.immature);
+    // --- « Quand ? » : la seule question qu'on se pose devant un solde bloqué.
+    //
+    // La tuile annonçait une somme en attente sans jamais dire quand elle se
+    // libérerait. Un mineur voyait son gain monter et son disponible rester à
+    // zéro pendant des heures, sans repère : plusieurs y ont vu une panne. On
+    // annonce donc le prochain déblocage, en blocs et en temps.
+    const attenteNote = solde.prochaine_maturite_blocs !== undefined
+      ? "prochaine libération : " + ech(solde.prochaine_maturite_montant.q21) +
+        " Q21 dans " + ech(String(solde.prochaine_maturite_blocs)) + " bloc(s), soit " +
+        dureeBlocs(solde.prochaine_maturite_blocs, info) + " — au bloc " +
+        ech(String(solde.prochaine_maturite_hauteur))
+      : "récompenses de minage : elles vous appartiennent, mais ne sont pas encore utilisables";
     document.getElementById("tuiles-solde").innerHTML =
-      tuile("En attente de maturité", ech(solde.immature.q21) + " Q21",
-            "récompenses de minage : elles vous appartiennent, mais ne sont pas encore utilisables") +
+      tuile("En attente de maturité", ech(solde.immature.q21) + " Q21", attenteNote) +
       tuile("Total détenu", ech(q21DepuisUnites(total)) + " Q21", "disponible et en attente réunis") +
       tuile("Vos adresses", solde.adresses_derivees,
             "votre portefeuille en fabrique une nouvelle à chaque encaissement") +
@@ -1474,7 +1498,13 @@ async function historique(){
   const zone = document.getElementById("note-historique");
   const sous = document.getElementById("note-colonnes");
   try{
-    const h = await appel("listtransactions", '{"limite":100}');
+    // Les deux appels partent ensemble : l'historique, et les constantes du
+    // protocole qui permettent de traduire une attente en blocs en une durée.
+    const [h, infoChaine] = await Promise.all([
+      appel("listtransactions", '{"limite":100}'),
+      appel("getinfo")
+    ]);
+    const maturite = Number(infoChaine.maturite_coinbase) || 200;
     // Un historique tronque qui ne se declare pas fait croire a des fonds
     // disparus. Le noeud dit jusqu'ou il a regarde ; on le repete.
     // Un bloc de la chaîne dont le corps est illisible n'est pas la même chose
@@ -1503,9 +1533,24 @@ async function historique(){
       // Trois etats, trois marques. « en attente » l'emporte sur « immature » :
       // une transaction qui n'est dans aucun bloc n'a pas encore de maturite a
       // discuter.
-      const marque = m.en_attente
-        ? ` <span class="badge attente">${rendu(sablier())} en attente</span>`
-        : (m.mature ? "" : ` <span class="badge attente">immature</span>`);
+      // Une récompense immature dit désormais **dans combien de temps** elle
+      // sera utilisable. « Immature » seul est un état, pas une information :
+      // il laisse entière la question qu'on se pose en le lisant.
+      let marque;
+      if (m.en_attente){
+        marque = ` <span class="badge attente">${rendu(sablier())} en attente</span>`;
+      } else if (!m.mature){
+        // Ni `Number()` ni conversion : ces deux champs sont des entiers de
+        // comptage rendus par le nœud, jamais des montants. La règle « aucun
+        // flottant sur un montant » reste entière, et l'épreuve qui la garde
+        // interdit toute conversion numérique sur un champ de mouvement, par
+        // principe — on ne la contourne pas, on n'en a pas besoin.
+        const reste = maturite - m.confirmations;
+        marque = ` <span class="badge attente" title="utilisable au bloc ${ech(String(m.hauteur + maturite))}">`
+               + `mûrit dans ${ech(dureeBlocs(reste > 0 ? reste : 0, infoChaine))}</span>`;
+      } else {
+        marque = "";
+      }
       // L'icone dit le sens avant que le mot soit lu ; la couleur du montant
       // le repete. Les trois dessins sont en dur, le genre choisit lequel.
       const recuQqc = BigInt(m.recu.unites) > 0n;
@@ -2719,6 +2764,45 @@ mod tests {
         assert!(
             PAGE.contains("tous les 71 jours"),
             "rien ne dit que la table grandit"
+        );
+    }
+
+    /// Une somme immature dit **quand** elle se liberera.
+    ///
+    /// # Ce que l'absence de cette reponse a coute
+    ///
+    /// La tuile annoncait « en attente de maturite : 3,05 Q21 » et s'arretait
+    /// la. Un mineur voyait donc son gain monter pendant une demi-heure et son
+    /// solde disponible rester a zero, sans le moindre reperage temporel. La
+    /// question qu'on se pose devant un solde bloque n'est pas « combien »,
+    /// c'est « quand » — et la page n'y repondait pas.
+    #[test]
+    fn une_somme_immature_annonce_sa_date_de_liberation() {
+        assert!(
+            PAGE.contains("prochaine_maturite_blocs"),
+            "le solde ne lit pas la prochaine liberation"
+        );
+        assert!(
+            PAGE.contains("prochaine libération"),
+            "le solde ne l'annonce pas"
+        );
+        assert!(
+            PAGE.contains("mûrit dans"),
+            "l'historique n'annonce pas l'echeance"
+        );
+        assert!(
+            PAGE.contains("function dureeBlocs("),
+            "aucune traduction des blocs en temps"
+        );
+        // L'intervalle vient du nœud : le recopier dans la page le figerait a
+        // la main, et le ferait mentir le jour ou il changerait.
+        assert!(
+            PAGE.contains("info.intervalle_cible_secondes"),
+            "l'intervalle de bloc est recopie au lieu d'etre demande"
+        );
+        assert!(
+            PAGE.contains("infoChaine.maturite_coinbase"),
+            "la maturite est recopiee au lieu d'etre demandee"
         );
     }
 

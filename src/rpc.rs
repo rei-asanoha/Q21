@@ -584,6 +584,16 @@ impl RpcContext {
             .set("pairs", Json::u64(self.node.peer_count() as u64))
             .set("mempool", Json::u64(self.node.mempool_len() as u64))
             .set("portefeuille_actif", Json::Bool(self.wallet.is_some()))
+            // --- Deux constantes du protocole, rendues avec l'etat.
+            //
+            // Une interface qui veut annoncer *quand* une recompense sera
+            // disponible a besoin des deux : combien de blocs il faut attendre,
+            // et combien de temps dure un bloc. Les recopier dans la page
+            // serait les figer a la main, et donc mentir le jour ou elles
+            // changeraient. Le nœud est la seule source qui ait le droit de les
+            // dire.
+            .set("maturite_coinbase", Json::u64(COINBASE_MATURITY))
+            .set("intervalle_cible_secondes", Json::u64(TARGET_BLOCK_SECS))
             .set(
                 "reseau_stats",
                 Json::obj()
@@ -2029,29 +2039,61 @@ impl RpcContext {
         let g = w
             .lock()
             .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
-        let (solde, sorties, immature, hauteur) = self.node.with_chain(|c| {
+        let (solde, sorties, immature, hauteur, prochaine) = self.node.with_chain(|c| {
             let hauteur = c.height();
             let solde = g.balance(&c.utxo, hauteur);
             let sorties = g.spendable(&c.utxo, hauteur).len();
             let mut immature = 0u64;
+            // --- « Quand ? » est la question qu'on pose devant un solde bloque.
+            //
+            // Le portefeuille annoncait une somme en attente de maturite sans
+            // jamais dire a quelle date elle se libererait. Un mineur voyait
+            // donc son gain monter et son solde disponible rester a zero,
+            // pendant des heures, sans le moindre reperage. Plusieurs y ont vu
+            // une panne. On rend donc la hauteur de la **prochaine** liberation
+            // et le montant qu'elle porte : de quoi afficher un compte a
+            // rebours plutot qu'un mystere.
+            let mut prochaine: Option<(u64, u64)> = None;
             for (_, e) in c.utxo.iter() {
                 if e.is_coinbase
                     && hauteur < e.height + COINBASE_MATURITY
                     && g.owns(&e.output.pubkey_hash)
                 {
                     immature += e.output.value.units();
+                    let libre_a = e.height + COINBASE_MATURITY;
+                    match prochaine {
+                        // A hauteur egale, on cumule : plusieurs sorties d'un
+                        // meme bloc se liberent ensemble.
+                        Some((h, m)) if h == libre_a => {
+                            prochaine = Some((h, m + e.output.value.units()))
+                        }
+                        Some((h, _)) if h < libre_a => {}
+                        _ => prochaine = Some((libre_a, e.output.value.units())),
+                    }
                 }
             }
-            (solde, sorties, immature, hauteur)
+            (solde, sorties, immature, hauteur, prochaine)
         });
-        let _ = hauteur;
 
-        Ok(Json::obj()
+        let mut sortie = Json::obj()
             .set("depensable", montant(solde))
             .set("immature", montant(Amount::from_units(immature)))
             .set("sorties_depensables", Json::u64(sorties as u64))
             .set("adresses_derivees", Json::u64(g.next_index() as u64))
-            .build())
+            .set("hauteur", Json::u64(hauteur));
+        if let Some((libre_a, montant_libere)) = prochaine {
+            sortie = sortie
+                .set("prochaine_maturite_hauteur", Json::u64(libre_a))
+                .set(
+                    "prochaine_maturite_blocs",
+                    Json::u64(libre_a.saturating_sub(hauteur)),
+                )
+                .set(
+                    "prochaine_maturite_montant",
+                    montant(Amount::from_units(montant_libere)),
+                );
+        }
+        Ok(sortie.build())
     }
 
     fn getnewaddress(&self) -> Result<Json, Json> {
@@ -2415,6 +2457,46 @@ mod tests {
                 >= 2
         );
         assert!(r.get("cout_de_la_finalite_glissante").is_some());
+    }
+
+    /// Le solde dit quand la prochaine somme se liberera.
+    ///
+    /// Sans cela, l'interface annonce « en attente de maturite » et rien
+    /// d'autre : un mineur voit son gain monter et son disponible rester a
+    /// zero pendant des heures, sans repere. La question devant un solde
+    /// bloque n'est pas « combien », c'est « quand ».
+    #[test]
+    fn le_solde_annonce_la_prochaine_maturite() {
+        let c = contexte_avec_fonds();
+        let r = resultat(&c, "getbalance", "{}");
+        // La chaine d'epreuve mine au-dela de la maturite : il reste donc des
+        // coinbases immatures en haut, et la reponse doit les dater.
+        assert!(
+            r.get("prochaine_maturite_hauteur").is_some(),
+            "aucune date de liberation annoncee : {}",
+            r.encode()
+        );
+        let blocs = r
+            .get("prochaine_maturite_blocs")
+            .and_then(|v| v.as_u64())
+            .expect("blocs restants");
+        assert!(
+            blocs > 0 && blocs <= COINBASE_MATURITY,
+            "attente absurde : {blocs}"
+        );
+        assert!(r.get("prochaine_maturite_montant").is_some());
+
+        // Et les constantes qui permettent de traduire cette attente en temps
+        // viennent du nœud, pour n'etre ecrites qu'a un seul endroit au monde.
+        let i = resultat(&c, "getinfo", "{}");
+        assert_eq!(
+            i.get("maturite_coinbase").and_then(|v| v.as_u64()),
+            Some(COINBASE_MATURITY)
+        );
+        assert_eq!(
+            i.get("intervalle_cible_secondes").and_then(|v| v.as_u64()),
+            Some(TARGET_BLOCK_SECS)
+        );
     }
 
     /// Un bloc illisible ne fait pas disparaitre un paiement en silence.
