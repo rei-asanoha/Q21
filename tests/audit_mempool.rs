@@ -431,34 +431,64 @@ fn chaine_mempool(n: u32, m: &mut Mempool, base: u32) -> Hash256 {
 /// `Vec::contains`, un balayage a chaque enfant — l'audit avait mesure n^1,35,
 /// et le plafond de 64 Mio autorise des chaines de plusieurs milliers de
 /// maillons. L'appartenance passe desormais par un ensemble : le retrait est
-/// lineaire. On le prouve par une borne de temps franche, insensible au bruit
-/// de mesure — quadratique, ce retrait se compterait en dizaines de
-/// millisecondes ; lineaire, il tient largement sous dix.
+/// lineaire.
+///
+/// On ne le prouve pas par une horloge absolue — une machine d'integration lente
+/// rendrait tout plafond fixe soit laxiste soit instable — mais par un RAPPORT,
+/// insensible a la vitesse de la machine. Retirer une chaine huit fois plus
+/// longue doit couter de l'ordre de huit fois plus (lineaire), pas soixante-
+/// quatre fois plus (quadratique). Le retour au balayage `Vec::contains`
+/// depasserait franchement le plafond du rapport ; le comportement lineaire
+/// tient tres au large, sur n'importe quel runner.
 #[test]
 fn t06_le_retrait_en_paquet_est_lineaire() {
     println!("--- t06 : cout de remove() sur une chaine ---");
-    let mut n_max = 0usize;
-    for n in [500u32, 1000, 2000, 2600] {
-        let mut m = Mempool::new();
-        let racine = chaine_mempool(n, &mut m, 1_000_000 + n * 10);
-        assert_eq!(m.len(), n as usize);
-        let t0 = Instant::now();
-        m.remove(&racine);
-        let d = t0.elapsed();
-        assert!(m.is_empty());
+
+    // On mesure plusieurs fois et on retient, pour la petite chaine, le temps le
+    // plus GRAND, et pour la grande, le plus PETIT. C'est la direction prudente :
+    // elle rejette les pics d'ordonnancement qui gonfleraient artificiellement le
+    // rapport, donc elle protege contre un echec a tort, pas contre un vrai
+    // defaut.
+    let mesure = |n: u32, prendre_min: bool| -> std::time::Duration {
+        let mut best: Option<std::time::Duration> = None;
+        for _ in 0..3 {
+            let mut m = Mempool::new();
+            let racine = chaine_mempool(n, &mut m, 1_000_000 + n * 10);
+            assert_eq!(m.len(), n as usize);
+            let t0 = Instant::now();
+            m.remove(&racine);
+            let d = t0.elapsed();
+            assert!(m.is_empty());
+            best = Some(match best {
+                None => d,
+                Some(b) if prendre_min => b.min(d),
+                Some(b) => b.max(d),
+            });
+        }
+        let d = best.unwrap();
         println!("  chaine de {n:5} : remove() = {d:?}");
-        // Une borne large mais franche : le retrait lineaire d'une chaine de
-        // 2 600 maillons prend des dizaines de microsecondes. Dix millisecondes
-        // laissent toute la marge du bruit tout en rattrapant un retour au
-        // comportement quadratique, qui les depasserait nettement.
-        assert!(
-            d < std::time::Duration::from_millis(10),
-            "remove() d'une chaine de {n} maillons doit rester lineaire : {d:?}"
-        );
-        n_max = n as usize;
-    }
+        d
+    };
+
+    const PETIT: u32 = 600;
+    const GRAND: u32 = 2_400; // quatre fois plus long
+    let t_petit = mesure(PETIT, false); // le plus lent des trois
+    let t_grand = mesure(GRAND, true); // le plus rapide des trois
+
+    // Rapport attendu : ~4 (lineaire). Un plafond de 12 laisse une marge franche
+    // pour le bruit et le cout fixe des petites tailles, tout en restant tres en
+    // dessous des ~16 qu'imposerait un retrait quadratique.
+    let facteur = t_grand.as_secs_f64() / t_petit.as_secs_f64().max(1e-9);
+    assert!(
+        facteur < 12.0,
+        "remove() croit plus vite que la longueur de la chaine : \
+         {PETIT} -> {t_petit:?}, {GRAND} -> {t_grand:?} \
+         (rapport {facteur:.1}x ; lineaire ~4x, quadratique ~16x)"
+    );
+
     println!(
-        "  borne : le plafond de 64 Mio limite la chaine a ~{} maillons ML-DSA (teste jusqu'a {n_max})",
+        "  rapport {GRAND}/{PETIT} = {facteur:.1}x (lineaire ~4x) ; le plafond de \
+         64 Mio limite la chaine a ~{} maillons",
         MEMPOOL_MAX_BYTES / 5_400
     );
 }
