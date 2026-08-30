@@ -324,6 +324,36 @@ fn tx_json(t: &Transaction, reseau: Network) -> Json {
         .build()
 }
 
+/// Lit un montant en Q21 (ex. `1.5`, `0.005`) et le rend en unites, sans
+/// jamais passer par un flottant. Rend `None` sur une saisie qui n'est pas un
+/// montant : plus de huit decimales, un caractere etranger, ou rien du tout.
+fn montant_en_unites(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (ent, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (s, ""),
+    };
+    if ent.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if frac.len() > DECIMALS as usize {
+        return None;
+    }
+    if !ent.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let e: u64 = if ent.is_empty() { 0 } else { ent.parse().ok()? };
+    let mut f: u64 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse().ok()?
+    };
+    for _ in frac.len()..DECIMALS as usize {
+        f = f.checked_mul(10)?;
+    }
+    e.checked_mul(UNITS_PER_COIN)?.checked_add(f)
+}
+
 fn bloc_json(b: &Block, reseau: Network) -> Json {
     let txs: Vec<Json> = b.transactions.iter().map(|t| tx_json(t, reseau)).collect();
     let oncles: Vec<Json> = b.uncles.iter().map(entete_json).collect();
@@ -498,11 +528,15 @@ impl RpcContext {
             ),
             (
                 "rechercher",
-                "Devine ce qu'on lui donne : hauteur, bloc, transaction ou adresse",
+                "Devine ce qu'on lui donne : hauteur, bloc, transaction, adresse ou montant",
             ),
             (
                 "getadresse",
                 "Mouvements et solde d'une adresse, sans qu'elle appartienne au portefeuille",
+            ),
+            (
+                "getmontant",
+                "Transactions portant une sortie d'un montant donne, sur une fenetre bornee",
             ),
         ]
     }
@@ -546,6 +580,7 @@ impl RpcContext {
             "arreter" => self.arreter(),
             "rechercher" => self.rechercher(params),
             "getadresse" => self.getadresse(params),
+            "getmontant" => self.getmontant(params),
             autre => Err(erreur(
                 ERR_METHODE,
                 &format!("methode inconnue : {autre}. Essayez listmethods."),
@@ -1090,6 +1125,16 @@ impl RpcContext {
             return trouve("bloc", h.to_string());
         }
 
+        // Un nombre a virgule decimale : un montant. La hauteur, elle, est un
+        // entier — le point suffit a lever l'ambiguite, sans menu a choisir.
+        if brut.contains('.') {
+            let unites = montant_en_unites(&brut)
+                .ok_or_else(|| erreur(ERR_PARAMS, "montant illisible : au plus 8 decimales"))?;
+            // Forme canonique en Q21 : lisible dans l'URL, et reparsable telle
+            // quelle par `getmontant`.
+            return trouve("montant", Amount::from_units(unites).to_string());
+        }
+
         // Une adresse : elle porte sa propre somme de controle, donc une faute
         // de frappe se detecte au lieu de mener ailleurs.
         if let Ok(a) = crate::address::Address::parse(&brut) {
@@ -1298,6 +1343,89 @@ impl RpcContext {
                      complete."
                 }),
             )
+            .build())
+    }
+
+    /// Transactions portant une sortie d'exactement ce montant.
+    ///
+    /// # Le compromis, assume
+    ///
+    /// Il n'y a pas d'index par montant : le batir doublerait la taille de
+    /// l'index pour une recherche rare, dont une somme courante — `1.00000000`
+    /// — renvoie des milliers de resultats. On balaie donc en arriere une
+    /// **fenetre bornee**, exactement comme `gettransaction` sans index : la
+    /// requete coute au plus [`MAX_BLOCS_BALAYES`] lectures, jamais toute la
+    /// chaine, et la reponse **dit jusqu'ou** elle a cherche. C'est le meme
+    /// honnete « voila ce que j'ai pu voir » qu'ailleurs, plutot qu'une
+    /// promesse que le cout dementirait a mesure que la chaine grandit.
+    ///
+    /// Les resultats sont plafonnes : personne ne lit mille lignes, et un
+    /// plafond protege le service autant que le lecteur.
+    fn getmontant(&self, params: &Json) -> Result<Json, Json> {
+        const MAX_RESULTATS: usize = 100;
+        let unites = params
+            .get("unites")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                params
+                    .get("montant")
+                    .and_then(|v| v.as_str())
+                    .and_then(montant_en_unites)
+            })
+            .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'unites' ou 'montant' attendu"))?;
+
+        let (resultats, hauteur, depuis, plafonne) = self.node.with_chain(|c| {
+            let hauteur = c.height();
+            let depuis = hauteur.saturating_sub(MAX_BLOCS_BALAYES);
+            let mut out: Vec<Json> = Vec::new();
+            let mut plafonne = false;
+            let mut h = hauteur as i64;
+            'blocs: while h >= depuis as i64 {
+                if let Some(b) = c.block_at(h as u64) {
+                    for tx in &b.transactions {
+                        let txid = tx.txid();
+                        for (i, o) in tx.outputs.iter().enumerate() {
+                            if o.value.units() != unites {
+                                continue;
+                            }
+                            if out.len() >= MAX_RESULTATS {
+                                plafonne = true;
+                                break 'blocs;
+                            }
+                            out.push(
+                                Json::obj()
+                                    .set("txid", Json::str(txid.to_hex()))
+                                    .set("hauteur", Json::u64(h as u64))
+                                    .set("index", Json::u64(i as u64))
+                                    .set(
+                                        "adresse",
+                                        Json::str(
+                                            crate::address::Address {
+                                                network: self.network,
+                                                scheme: o.scheme,
+                                                hash: o.pubkey_hash,
+                                            }
+                                            .to_string_bech32(),
+                                        ),
+                                    )
+                                    .set("valeur", montant(o.value))
+                                    .build(),
+                            );
+                        }
+                    }
+                }
+                h -= 1;
+            }
+            (out, hauteur, depuis, plafonne)
+        });
+
+        Ok(Json::obj()
+            .set("montant", montant(Amount::from_units(unites)))
+            .set("resultats", Json::array(resultats))
+            .set("hauteur", Json::u64(hauteur))
+            .set("depuis", Json::u64(depuis))
+            .set("fenetre", Json::u64(MAX_BLOCS_BALAYES))
+            .set("plafonne", Json::Bool(plafonne))
             .build())
     }
 
@@ -2439,6 +2567,52 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("entrees_montants present");
         assert_eq!(m.len(), 1);
+    }
+
+    /// Un nombre a virgule est reconnu comme un montant, sous sa forme canonique.
+    #[test]
+    fn rechercher_reconnait_un_montant() {
+        let c = contexte(false);
+        let r = resultat(&c, "rechercher", r#"{"q":"1.5"}"#);
+        assert_eq!(r.get("genre").and_then(|v| v.as_str()), Some("montant"));
+        assert_eq!(
+            r.get("valeur").and_then(|v| v.as_str()),
+            Some("1.50000000"),
+            "le montant doit revenir sous sa forme canonique en Q21"
+        );
+    }
+
+    /// La recherche par montant retrouve une sortie qui existe, et ne rend que
+    /// des sorties de ce montant exact.
+    #[test]
+    fn getmontant_trouve_une_sortie_de_ce_montant() {
+        let c = contexte_avec_fonds();
+        // La valeur exacte de la piece de genese, lue sur la chaine.
+        let g = resultat(&c, "getblock", r#"{"hauteur":0}"#);
+        let val = g.get("transactions").and_then(|v| v.as_array()).unwrap()[0]
+            .get("sorties")
+            .and_then(|v| v.as_array())
+            .unwrap()[0]
+            .get("valeur")
+            .and_then(|v| v.get("q21"))
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let r = resultat(&c, "getmontant", &format!(r#"{{"montant":"{val}"}}"#));
+        let res = r.get("resultats").and_then(|v| v.as_array()).unwrap();
+        assert!(
+            !res.is_empty(),
+            "une sortie de {val} Q21 existe et devrait etre trouvee"
+        );
+        assert!(
+            res.iter().all(|s| s
+                .get("valeur")
+                .and_then(|v| v.get("q21"))
+                .and_then(|v| v.as_str())
+                == Some(val.as_str())),
+            "toutes les sorties rendues doivent valoir exactement le montant cherche"
+        );
     }
 
     #[test]
