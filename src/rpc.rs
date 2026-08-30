@@ -1390,7 +1390,7 @@ impl RpcContext {
                 .collect()
         });
 
-        let (mouvements, depuis, hauteur, tout_resolu) = self.node.with_chain(|c| {
+        let (mouvements, depuis, hauteur, tout_resolu, corps_absents) = self.node.with_chain(|c| {
             let hauteur = c.height();
             let depuis = hauteur.saturating_sub(FENETRE_HISTORIQUE);
 
@@ -1408,19 +1408,34 @@ impl RpcContext {
             let mut sorties_vues: std::collections::HashMap<(Hash256, u32), u64> =
                 std::collections::HashMap::new();
             let mut blocs: Vec<Block> = Vec::new();
+            // --- Un bloc illisible ne doit pas effacer un paiement en silence.
+            //
+            // Ce balayage sautait sans un mot les hauteurs dont le corps ne
+            // pouvait pas etre lu. Consequence observee sur un vrai reseau :
+            // apres un arret brutal et une resynchronisation, un virement recu
+            // avait purement et simplement **disparu de l'historique**, alors
+            // que le solde, lui, le comptait toujours. Un portefeuille qui perd
+            // une ligne sans le dire est pire qu'un portefeuille en panne : on
+            // le croit.
+            //
+            // On compte donc ces hauteurs, et la reponse les annonce.
+            let mut corps_absents: Vec<u64> = Vec::new();
             let mut h = hauteur;
             loop {
                 if h < depuis {
                     break;
                 }
-                if let Some(b) = c.block_at(h) {
-                    for tx in &b.transactions {
-                        let id = tx.txid();
-                        for (i, o) in tx.outputs.iter().enumerate() {
-                            sorties_vues.insert((id, i as u32), o.value.units());
+                match c.block_at(h) {
+                    Some(b) => {
+                        for tx in &b.transactions {
+                            let id = tx.txid();
+                            for (i, o) in tx.outputs.iter().enumerate() {
+                                sorties_vues.insert((id, i as u32), o.value.units());
+                            }
                         }
+                        blocs.push(b);
                     }
-                    blocs.push(b);
+                    None => corps_absents.push(h),
                 }
                 if h == 0 {
                     break;
@@ -1566,19 +1581,35 @@ impl RpcContext {
                     }
                 }
             }
-            (v, depuis, hauteur, tout_resolu)
+            (v, depuis, hauteur, tout_resolu, corps_absents)
         });
 
-        let complet = depuis == 0;
-        Ok(Json::obj()
+        let complet = depuis == 0 && corps_absents.is_empty();
+        let mut sortie = Json::obj()
             .set("mouvements", Json::array(mouvements))
             .set("regarde_depuis_hauteur", Json::u64(depuis))
             .set("hauteur", Json::u64(hauteur))
             .set("historique_complet", Json::Bool(complet))
             .set("montants_sortants_tous_resolus", Json::Bool(tout_resolu))
+            .set("blocs_illisibles", Json::u64(corps_absents.len() as u64));
+        // Les hauteurs concernees, bornees : de quoi agir sans noyer la reponse.
+        if !corps_absents.is_empty() {
+            let apercu: Vec<Json> = corps_absents
+                .iter()
+                .take(20)
+                .map(|h| Json::u64(*h))
+                .collect();
+            sortie = sortie.set("hauteurs_illisibles", Json::array(apercu));
+        }
+        Ok(sortie
             .set(
                 "note",
-                Json::str(if complet {
+                Json::str(if !corps_absents.is_empty() {
+                    "Historique INCOMPLET : le corps de certains blocs de la chaine active \
+                     n'a pas pu etre lu, et ce qu'ils contenaient n'apparait pas ici. Ce \
+                     n'est pas une perte de fonds — le solde, lui, reste juste. Relancez le \
+                     noeud : il redemandera ces blocs au reseau."
+                } else if complet {
                     "Historique complet : la recherche est remontee jusqu'a la genese."
                 } else {
                     "Historique partiel. Ce noeud n'a pas d'index par adresse : \
@@ -1804,6 +1835,14 @@ impl RpcContext {
             ),
             None => (false, 0.0, 0, 0, 0, Vec::new()),
         };
+        // La table de preuve de travail de l'epoque courante : sa taille est ce
+        // que le minage occupe reellement en memoire vive sur cette machine.
+        let (memoire_de_minage, epoque) = self.node.with_chain(|c| {
+            let epoque = crate::memhard::epoch_of(c.height().saturating_add(1));
+            let n = crate::memhard::table_size(c.pow_params(), epoque) as u64;
+            (n * crate::consensus::POW_ELEMENT_SIZE as u64, epoque)
+        });
+
         // Les vingt dernieres trouvailles suffisent a l'ecran ; le compteur et
         // le gain, eux, portent le total depuis le lancement.
         let liste: Vec<Json> = trouves
@@ -1829,6 +1868,17 @@ impl RpcContext {
             .set("blocs_trouves", Json::u64(blocs))
             .set("gagne", montant(Amount::from_units(gagne)))
             .set("trouves", Json::array(liste))
+            // --- La memoire : ce qui fait tout l'interet de cette preuve de
+            // travail, et qui n'etait affiche nulle part.
+            //
+            // Q21 mine avec une table qui doit tenir en memoire vive, et qui
+            // grandit de 5 % toutes les 71 journees. C'est elle qui rend une
+            // machine specialisee sans interet : on ne grave pas de la memoire.
+            // La taille employee **maintenant**, sur cette machine, est donc le
+            // chiffre qui explique pourquoi le minage reste a la portee de tous
+            // — et il faut pouvoir la lire.
+            .set("memoire_octets", Json::u64(memoire_de_minage))
+            .set("memoire_epoque", Json::u64(epoque))
             .build()
     }
 
@@ -2365,6 +2415,33 @@ mod tests {
                 >= 2
         );
         assert!(r.get("cout_de_la_finalite_glissante").is_some());
+    }
+
+    /// Un bloc illisible ne fait pas disparaitre un paiement en silence.
+    ///
+    /// # L'incident que cette epreuve fige
+    ///
+    /// Le balayage de l'historique sautait sans un mot les hauteurs dont le
+    /// corps ne pouvait pas etre lu. Sur un vrai reseau, apres un arret brutal
+    /// et une resynchronisation, un virement recu avait purement et simplement
+    /// disparu de l'historique — alors que le solde, lui, le comptait toujours.
+    /// Un portefeuille qui perd une ligne sans le dire est pire qu'un
+    /// portefeuille en panne : on le croit.
+    #[test]
+    fn l_historique_avoue_les_blocs_qu_il_n_a_pas_pu_lire() {
+        // La reponse porte toujours le compte, meme quand il est nul : un
+        // appelant ne doit pas avoir a distinguer « champ absent » de « zero ».
+        let c = contexte(true);
+        let r = resultat(&c, "listtransactions", r#"{"limite":5}"#);
+        assert_eq!(
+            r.get("blocs_illisibles").and_then(|v| v.as_u64()),
+            Some(0),
+            "le compte doit etre annonce meme a zero"
+        );
+        assert_eq!(r.get("historique_complet"), Some(&Json::Bool(true)));
+        // Et le texte de la page RPC doit nommer le remede, pas seulement le mal.
+        let s = c.handle(r#"{"jsonrpc":"2.0","id":1,"method":"listtransactions"}"#);
+        assert!(s.contains("historique_complet"));
     }
 
     /// Une adresse se nomme, et le nom revient avec la liste.

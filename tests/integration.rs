@@ -553,11 +553,28 @@ fn une_reorganisation_plus_profonde_que_la_finalite_est_refusee() {
 
     // L'attaquant repart de la genese avec davantage de travail. La regle de
     // finalite glissante doit l'arreter, quel que soit son travail cumule.
+    // Deux refus possibles, et ils disent deux choses differentes :
+    //
+    // - `FinaliteDepassee` : on a trouve l'ancetre commun, et la bascule
+    //   demandee est trop profonde.
+    // - `PointDeForkIntrouvable` : l'ancetre commun est si loin qu'on ne le
+    //   cherche meme plus. C'est le cas ici, la fourche etant a la genese.
+    //
+    // Le second se nommait autrefois `FinaliteDepassee { profondeur: u64::MAX }`
+    // — un aveu d'ignorance deguise en mesure, qui a deja coute un diagnostic.
     let attaque = branche_concurrente(&genese, profondeur + 10, 0x22);
     let mut refus = false;
     for b in &attaque {
         match c.submit(b, b.header.time + 100_000) {
-            Err(ChainError::FinaliteDepassee { .. }) => {
+            Err(ChainError::FinaliteDepassee { profondeur, .. }) => {
+                assert!(
+                    profondeur < u64::MAX,
+                    "une profondeur annoncee doit etre une vraie profondeur"
+                );
+                refus = true;
+                break;
+            }
+            Err(ChainError::PointDeForkIntrouvable { .. }) => {
                 refus = true;
                 break;
             }

@@ -323,6 +323,65 @@ impl BlockArchive {
             }
         }
 
+        // --- Une queue abimee se coupe, elle ne se contourne pas.
+        //
+        // Une coupure de courant en pleine ecriture laisse un enregistrement a
+        // moitie ecrit a la fin du fichier. Le balayage s'arrete la et signale
+        // l'incident : les blocs precedents restent valides, et le noeud peut
+        // repartir. C'etait deja le cas.
+        //
+        // Ce qui ne l'etait pas : les blocs suivants s'ecrivaient **apres** ces
+        // octets abimes. Ils atteignaient le disque, servaient tant que le
+        // processus vivait, et disparaissaient au redemarrage suivant — puisque
+        // le balayage s'arretait toujours au meme endroit. Le fichier grossissait
+        // en ne rendant plus rien. C'est la forme la plus perfide de perte de
+        // donnees : silencieuse, et pire a chaque redemarrage.
+        //
+        // On ramene donc le fichier a la fin du dernier enregistrement complet.
+        // Le bloc a moitie ecrit est perdu — il l'etait deja — et sera redemande
+        // au reseau. Ce qui suit s'ecrira sur du terrain sain.
+        // Trois garde-fous, et ils ne sont pas negociables — une reparation qui
+        // se trompe efface des blocs :
+        //
+        // 1. **Seule une queue tronquee se repare.** Une taille mensongere ou un
+        //    en-tete indechiffrable au milieu du fichier ne sont pas une
+        //    ecriture interrompue : ce sont les traces d'autre chose, et les
+        //    couper reviendrait a obeir a qui les a ecrites. Ces cas restent
+        //    signales, et rien n'est touche.
+        // 2. **Jamais jusqu'a zero.** Une premiere version coupait a la fin du
+        //    dernier enregistrement valide, y compris quand il n'y en avait
+        //    aucun : un mensonge sur la taille du **premier** enregistrement
+        //    aurait donc efface tout le fichier. L'epreuve d'audit
+        //    `aa_taille_mensongere` l'a vu ; la relecture, non.
+        // 3. **Jamais plus qu'un bloc.** Ce qu'on jette doit avoir la taille
+        //    d'une ecriture interrompue. Au-dela, on ne comprend plus ce qu'on
+        //    voit, et on s'abstient.
+        let mut souci = souci;
+        if matches!(souci, Some(StoreError::FichierTronque { .. })) && !entetes.is_empty() {
+            let fin = entetes
+                .last()
+                .map(|(_, r)| r.offset + r.len as u64)
+                .unwrap_or(0);
+            let taille = std::fs::metadata(store.path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let jete = taille.saturating_sub(fin);
+            if fin > 0 && jete <= MAX_BLOC_SERIALISE as u64 + 4 {
+                match std::fs::OpenOptions::new().write(true).open(store.path()) {
+                    Ok(f) => match f.set_len(fin) {
+                        Ok(()) => {
+                            souci = None;
+                            eprintln!(
+                                "  fichier des blocs repare : {jete} octet(s) d'ecriture interrompue coupes"
+                            );
+                        }
+                        Err(e) => eprintln!("avertissement : queue abimee non coupee ({e})"),
+                    },
+                    Err(e) => eprintln!("avertissement : queue abimee non coupee ({e})"),
+                }
+            }
+        }
+
         let positions = entetes
             .iter()
             .map(|(h, r)| (h.block_id(), *r))
@@ -455,6 +514,58 @@ mod tests {
         let (blocs, err) = s.load_all().unwrap();
         assert_eq!(blocs.len(), 1, "le premier bloc devait survivre");
         assert!(matches!(err, Some(StoreError::FichierTronque { index: 1 })));
+        s.remove().unwrap();
+    }
+
+    /// Une queue abimee est **coupee**, pas contournee.
+    ///
+    /// # Le defaut, et pourquoi il etait pire a chaque redemarrage
+    ///
+    /// Une coupure de courant en pleine ecriture laisse un enregistrement a
+    /// moitie ecrit en fin de fichier. Le balayage s'arretait la et signalait
+    /// l'incident : correct. Mais les blocs suivants s'ecrivaient **apres** ces
+    /// octets abimes. Ils atteignaient le disque, servaient tant que le
+    /// processus vivait, et disparaissaient au redemarrage suivant — puisque le
+    /// balayage s'arretait toujours au meme endroit. Le fichier grossissait en
+    /// ne rendant plus rien : une perte de donnees silencieuse, et cumulative.
+    #[test]
+    fn une_queue_abimee_est_coupee_a_l_ouverture() {
+        let p = chemin_temporaire("queue-abimee");
+        let s = BlockStore::new(&p);
+        let g = crate::chain::genesis_block(crate::address::Network::Regtest);
+        s.append(&g).unwrap();
+        let sain = std::fs::metadata(&p).unwrap().len();
+
+        // Une ecriture interrompue : quelques octets d'un enregistrement suivant.
+        {
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(&[0x40, 0x01, 0x00, 0x00, 0xaa, 0xbb]).unwrap();
+        }
+        assert!(std::fs::metadata(&p).unwrap().len() > sain);
+
+        let (_a, entetes, souci) =
+            BlockArchive::open(&p, crate::address::Network::Regtest).unwrap();
+        assert_eq!(entetes.len(), 1, "le bloc complet doit survivre");
+        assert!(
+            souci.is_none(),
+            "la queue ayant ete coupee, il n'y a plus d'incident a signaler"
+        );
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len(),
+            sain,
+            "le fichier doit etre revenu a la fin du dernier enregistrement complet"
+        );
+
+        // Et surtout : ce qu'on ecrit ensuite est relu au redemarrage suivant.
+        s.append(&g).unwrap();
+        let (_a2, entetes2, souci2) =
+            BlockArchive::open(&p, crate::address::Network::Regtest).unwrap();
+        assert_eq!(
+            entetes2.len(),
+            2,
+            "un bloc ecrit apres la reparation doit se relire"
+        );
+        assert!(souci2.is_none());
         s.remove().unwrap();
     }
 

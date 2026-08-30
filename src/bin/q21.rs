@@ -903,34 +903,79 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
             c
         }
         None => {
-            // 3b. Sans instantane exploitable, on revalide tout. Lent, et sûr.
+            // 3b. Sans instantane exploitable, on reconstruit tout depuis la
+            // genese. C'est le chemin de secours, celui qui doit fonctionner le
+            // jour ou tout le reste a echoue — un debranchement, une batterie a
+            // plat, un arret force.
             //
-            // --- Le fichier n'est pas une ligne droite.
+            // --- Ce qui n'allait pas, et qui a couté un incident
             //
-            // Ce rejeu appelait `connect`, qui exige que chaque bloc prolonge la
-            // tete active. C'etait vrai tant que seuls les blocs de la chaine
-            // active atteignaient le disque. Depuis que le journal consigne
-            // **aussi** les branches laterales — sans quoi aucune reorganisation
-            // ne survit a un redemarrage — le fichier contient des blocs qui ne
-            // prolongent rien.
+            // Ce chemin rejouait le fichier **dans son ordre d'ecriture**, en
+            // appelant `submit` pour chaque enregistrement. Or le fichier n'est
+            // pas une ligne droite : il consigne aussi les branches laterales,
+            // sans quoi aucune reorganisation ne survivrait a un redemarrage.
+            // Rejouer cet ordre revenait donc a demander a la chaine d'accepter
+            // des dizaines de reorganisations successives — et a se heurter aux
+            // **defenses anti-reorganisation**, qui sont faites pour repousser
+            // un attaquant, pas pour relire sa propre histoire deja validee.
             //
-            // Un vrai lancement l'a montre sans ambiguite : deux noeuds minant
-            // l'un contre l'autre produisent des branches concurrentes, et le
-            // noeud refusait de redemarrer avec
-            // `HauteurIncorrecte { attendu: 853, recu: 218 }`. Le repli de
-            // securite — celui qui doit fonctionner quand l'instantane est
-            // perdu — ne fonctionnait plus du tout.
+            // Mesure faite sur deux noeuds minant l'un contre l'autre : au bout
+            // de deux mille blocs, le noeud refusait purement et simplement de
+            // redemarrer, avec un message qui ne pouvait mener nulle part —
+            // `FinaliteDepassee { profondeur: 18446744073709551615 }`. Un noeud
+            // incapable de relire son propre fichier est un noeud a une coupure
+            // de courant de la perte totale.
             //
-            // `submit` accepte ce que `connect` refuse : branche laterale,
-            // reorganisation, bloc deja vu. L'ordre du fichier est celui de
-            // l'acceptation, donc un parent y precede toujours ses enfants.
-            let (blocs, _) = archive.store().load_all().map_err(|e| e.to_string())?;
-            let mut c = Chain::new(reseau, blocs[0].clone());
+            // --- Ce qu'on fait a la place
+            //
+            // On demande d'abord aux **en-tetes** quelle est la chaine active —
+            // c'est un calcul, pas une opinion : la tete la plus lourde, puis la
+            // remontee jusqu'a la genese. Puis on valide cette suite **dans
+            // l'ordre des hauteurs**, de la genese a la tete, avec `connect`.
+            //
+            // Il n'y a alors plus une seule reorganisation a accepter : chaque
+            // bloc prolonge le precedent, par construction. Les branches
+            // laterales restent dans le fichier et dans l'index — une
+            // reorganisation ulterieure retrouvera leurs corps.
+            let ordre = Chain::arborescence(&seuls_entetes)
+                .map_err(|e| format!("index des blocs illisible : {e:?}"))?;
+            let genese_id = ordre.active[0];
+            let corps_genese = archive
+                .read(&genese_id)
+                .ok_or("le bloc de genese est absent du fichier")?;
+            let mut c = Chain::new(reseau, corps_genese);
             c.set_body_source(archive.clone());
-            for (i, b) in blocs.iter().enumerate().skip(1) {
+            for id in ordre.active.iter().skip(1) {
+                let b = archive
+                    .read(id)
+                    .ok_or_else(|| format!("corps du bloc {id} absent du fichier"))?;
                 let now = b.header.time + MAX_FUTURE_TIME;
-                c.submit(b, now)
-                    .map_err(|e| format!("bloc {i} refuse au rejeu : {e:?}"))?;
+                c.connect(&b, now).map_err(|e| {
+                    format!(
+                        "bloc {} refuse a la reconstruction : {e:?}",
+                        b.header.height
+                    )
+                })?;
+            }
+            // Les branches laterales sont reinjectees ensuite, une fois la
+            // chaine active en place. Chacune est alors une simple branche
+            // concurrente moins lourde : aucune ne declenche de reorganisation,
+            // et leur presence dans l'index est ce qui permettra d'en adopter
+            // une plus tard si elle prend l'avantage.
+            let actifs: std::collections::HashSet<_> = ordre.active.iter().copied().collect();
+            let mut laterales = 0usize;
+            for (id, entete) in &ordre.par_id {
+                if actifs.contains(id) || !ordre.travail.contains_key(id) {
+                    continue;
+                }
+                let Some(b) = archive.read(id) else { continue };
+                let now = entete.time + MAX_FUTURE_TIME;
+                if c.submit(&b, now).is_ok() {
+                    laterales += 1;
+                }
+            }
+            if laterales > 0 {
+                println!("  {laterales} bloc(s) de branches laterales reintegres");
             }
             c
         }
@@ -2399,10 +2444,28 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut derniere_recherche = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(60))
         .unwrap_or_else(std::time::Instant::now);
+    // --- L'instantane ne s'ecrit plus seulement a l'arret.
+    //
+    // Il ne s'ecrivait qu'apres la boucle, ce qui suppose un arret propre. Un
+    // debranchement, une batterie a plat, un `kill -9` : aucun de ces cas ne
+    // passe par la. Le noeud repartait alors sans instantane, et devait
+    // reconstruire tout son etat depuis la genese — plusieurs minutes sur une
+    // chaine deja longue, pendant lesquelles l'utilisateur ne voit rien.
+    //
+    // Cinq minutes est un compromis : c'est assez rare pour que le cout soit
+    // invisible, assez frequent pour qu'une coupure ne coute jamais plus de
+    // cinq minutes de rejeu. L'instantane est pris en retrait de la tete, donc
+    // ecrire souvent n'entame pas la capacite a reorganiser.
+    const PERIODE_INSTANTANE: std::time::Duration = std::time::Duration::from_secs(300);
+    let mut dernier_instantane = std::time::Instant::now();
 
     loop {
         if duree > 0 && debut.elapsed().as_secs() >= duree {
             break;
+        }
+        if dernier_instantane.elapsed() >= PERIODE_INSTANTANE {
+            node.with_chain(|c| ecrire_instantane(datadir, c));
+            dernier_instantane = std::time::Instant::now();
         }
         // Ctrl-C : on sort de la boucle plutot que de se faire tuer sur place.
         // Tout ce que ce noeud doit ecrire — reservoir, instantane, carnet,
