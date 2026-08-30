@@ -568,6 +568,8 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
         <div class="n">depuis le lancement</div></div>
       <div class="tuile"><div class="k">Blocs reçus</div><div class="v" id="vitesse-sync">0</div>
         <div class="n">par seconde, depuis le réseau</div></div>
+      <div class="tuile"><div class="k">Mémoire occupée</div><div class="v" id="minage-memoire">—</div>
+        <div class="n" id="minage-memoire-note">la table de calcul, en mémoire vive</div></div>
     </div>
   </div>
 
@@ -977,6 +979,17 @@ const html = f => rendu(brut(f));
 // un `slice` improvise.
 const court = (h,n)=> h ? ech(String(h).slice(0, n||16))+"…" : "—";
 const date = t => new Date(Number(t) * 1000).toISOString().replace("T"," ").slice(0,19);
+
+// Une quantite d'octets, dans l'unite ou un humain la reconnait. Les puissances
+// de 1024 et non de 1000 : c'est ainsi qu'une barrette de memoire se compte, et
+// c'est de memoire qu'il s'agit ici.
+function octets(n){
+  n = Number(n) || 0;
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " Gio";
+  if (n >= 1048576)    return (n / 1048576).toFixed(0) + " Mio";
+  if (n >= 1024)       return (n / 1024).toFixed(0) + " Kio";
+  return String(Math.round(n)) + " o";
+}
 
 function tuile(k,v,n){
   const bas = n ? `<div class="n">${rendu(n)}</div>` : "";
@@ -1464,7 +1477,17 @@ async function historique(){
     const h = await appel("listtransactions", '{"limite":100}');
     // Un historique tronque qui ne se declare pas fait croire a des fonds
     // disparus. Le noeud dit jusqu'ou il a regarde ; on le repete.
-    zone.innerHTML = h.historique_complet
+    // Un bloc de la chaîne dont le corps est illisible n'est pas la même chose
+    // qu'un historique tronqué par la fenêtre de recherche : le premier est un
+    // incident, le second un réglage. Les confondre a fait croire à un
+    // virement disparu ; on les distingue, et on dit quoi faire.
+    const illisibles = Number(h.blocs_illisibles) || 0;
+    zone.innerHTML = illisibles > 0
+      ? `<div class="avert"><h3>${ech(String(illisibles))} bloc(s) illisible(s) — historique incomplet</h3>
+         <p>${ech(h.note)}</p>
+         <p><strong>Vos fonds ne sont pas perdus</strong> : le solde reste juste.
+         Fermez puis rouvrez le portefeuille&nbsp;: il redemandera ces blocs au réseau.</p></div>`
+      : h.historique_complet
       ? `<div class="note"><h3>Historique complet</h3><p>${ech(h.note)}</p></div>`
       : `<div class="avert"><h3>Historique partiel</h3><p>${ech(h.note)}</p>
          <p>Recherche effectuée de la hauteur ${ech(h.regarde_depuis_hauteur)} à ${ech(h.hauteur)}. Ce qui est antérieur n'est pas affiché, et n'est pas perdu pour autant.</p></div>`;
@@ -1721,6 +1744,13 @@ function peindreMinage(etat){
   document.getElementById("minage-total").textContent = formatDebit(etat.essais_total);
   document.getElementById("minage-gagne").textContent =
     (etat.gagne ? etat.gagne.q21 : "0.00000000") + " Q21";
+  // La mémoire est ce qui fait tout l'intérêt de cette preuve de travail :
+  // une machine spécialisée ne sert à rien face à une table qui doit tenir en
+  // mémoire vive, et qui grossit avec le temps. Le chiffre méritait un écran.
+  document.getElementById("minage-memoire").textContent = octets(etat.memoire_octets);
+  document.getElementById("minage-memoire-note").textContent =
+    "table de l'époque " + ech(String(etat.memoire_epoque)) +
+    " — elle grandit de 5 % tous les 71 jours";
   peindreTrouves(etat.trouves || [], Number(etat.blocs_trouves) || 0);
   HISTO_DEBIT.push(Number(etat.essais_par_seconde) || 0);
   while (HISTO_DEBIT.length > 60) HISTO_DEBIT.shift();
@@ -2637,6 +2667,54 @@ mod tests {
         assert!(
             PAGE.contains(r#"ech(m.en_attente ? "—" : m.hauteur)"#),
             "une transaction en attente afficherait une hauteur qu'elle n'a pas"
+        );
+    }
+
+    /// La memoire du minage est affichee : c'est tout l'interet du procede.
+    ///
+    /// Q21 mine avec une table qui doit tenir en memoire vive et qui grandit de
+    /// 5 % toutes les 71 journees. C'est elle qui rend une machine specialisee
+    /// sans interet — on ne grave pas de la memoire. Ne pas l'afficher revenait
+    /// a cacher la seule grandeur qui explique pourquoi ce minage reste a la
+    /// portee de tous.
+    #[test]
+    fn l_ecran_de_minage_montre_la_memoire_occupee() {
+        assert!(PAGE.contains("Mémoire occupée"), "tuile de memoire absente");
+        assert!(PAGE.contains("minage-memoire"), "valeur de memoire absente");
+        assert!(
+            PAGE.contains("etat.memoire_octets"),
+            "la memoire n'est pas lue depuis le nœud"
+        );
+        // En gibioctets, pas en gigaoctets : c'est ainsi qu'une barrette de
+        // memoire se compte.
+        assert!(
+            PAGE.contains("Gio"),
+            "l'unite de memoire n'est pas la bonne"
+        );
+        assert!(
+            PAGE.contains("tous les 71 jours"),
+            "rien ne dit que la table grandit"
+        );
+    }
+
+    /// Un bloc illisible se signale, et se distingue d'un historique tronque.
+    ///
+    /// Les confondre a fait croire a un virement disparu : l'un est un
+    /// incident a reparer, l'autre un reglage sans consequence.
+    #[test]
+    fn un_bloc_illisible_ne_se_confond_pas_avec_une_fenetre_trop_courte() {
+        assert!(PAGE.contains("blocs_illisibles"), "le compte n'est pas lu");
+        assert!(
+            PAGE.contains("historique incomplet"),
+            "l'incident n'est pas nomme"
+        );
+        assert!(
+            PAGE.contains("Vos fonds ne sont pas perdus"),
+            "rien ne rassure sur le point qui compte"
+        );
+        assert!(
+            PAGE.contains("redemandera ces blocs au réseau"),
+            "rien ne dit quoi faire"
         );
     }
 

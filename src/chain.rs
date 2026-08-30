@@ -284,6 +284,24 @@ fn fils_par_defaut() -> usize {
         .unwrap_or(1)
 }
 
+/// L'arborescence des blocs deduite des seuls en-tetes.
+///
+/// Le fichier des blocs n'est pas une ligne droite : il consigne aussi les
+/// branches laterales, sans quoi aucune reorganisation ne survivrait a un
+/// redemarrage. Savoir laquelle de ces branches est la chaine active demande
+/// donc un calcul, et c'est celui-ci.
+pub struct Arborescence {
+    /// Tous les en-tetes connus, par identifiant.
+    pub par_id: HashMap<Hash256, BlockHeader>,
+    /// Travail cumule depuis la genese, par identifiant. Une branche dont le
+    /// parent manque n'y figure pas : elle est orpheline, donc inexploitable.
+    pub travail: HashMap<Hash256, U256>,
+    /// La chaine active, de la genese a la tete la plus lourde.
+    pub active: Vec<Hash256>,
+    /// Identifiant du bloc de genese.
+    pub genese: Hash256,
+}
+
 /// Resultat d'une reprise sur instantane.
 pub struct Reprise {
     /// Chaine positionnee a l'instantane.
@@ -359,6 +377,15 @@ pub enum ChainError {
     Validation(ValidationError),
     /// Parent inconnu : impossible de rattacher ce bloc.
     ParentInconnu(Hash256),
+    /// Aucun ancetre commun entre cette branche et la chaine active, dans la
+    /// portee ou l'on accepte d'en chercher un.
+    ///
+    /// Se distingue de [`ChainError::FinaliteDepassee`] : la, on sait de
+    /// combien la reorganisation depasse ; ici, on ne sait meme pas d'ou vient
+    /// la branche. Les confondre a deja coute un diagnostic.
+    PointDeForkIntrouvable {
+        portee: u64,
+    },
     /// La reorganisation demandee depasse la profondeur de finalite.
     ///
     /// C'est la defense anti-reorganisation profonde. Elle protege le passe au
@@ -498,15 +525,23 @@ impl Chain {
     /// L'instantane doit etre pris **en retrait de la tete**, pas a la tete :
     /// rejouer la derniere fenetre reconstruit les enregistrements d'annulation,
     /// sans lesquels aucune reorganisation ne serait plus possible au demarrage.
-    pub fn from_snapshot(
-        network: Network,
-        snapshot: Snapshot,
-        headers: &[BlockHeader],
-    ) -> Result<Reprise, RepriseError> {
-        if snapshot.network != network {
-            return Err(RepriseError::MauvaisReseau);
-        }
-
+    /// L'arborescence des blocs, telle que les seuls en-tetes la decrivent.
+    ///
+    /// Trois choses, calculees ensemble parce qu'elles se deduisent l'une de
+    /// l'autre : quels blocs existent, quel travail cumule chacun porte, et
+    /// quelle suite mene de la genese a la tete la plus lourde.
+    ///
+    /// # Pourquoi c'est une fonction a part
+    ///
+    /// Deux chemins de demarrage en ont besoin, et pour la meme raison. Celui
+    /// qui reprend sur un instantane doit savoir ou se trouve cet instantane
+    /// dans l'arborescence. Celui qui n'a **pas** d'instantane — le cas d'un
+    /// arret brutal — doit reconstruire l'etat depuis la genese, et pour cela
+    /// il lui faut d'abord savoir quelle est la chaine active. Sans cette
+    /// reponse, il rejouait le fichier dans son ordre d'ecriture, qui melange
+    /// les branches, et se heurtait aux defenses anti-reorganisation sur sa
+    /// propre histoire. Voir `RECONSTRUCTION` dans les epreuves.
+    pub fn arborescence(headers: &[BlockHeader]) -> Result<Arborescence, RepriseError> {
         // 1. Index brut, par identifiant.
         let mut par_id: HashMap<Hash256, BlockHeader> = HashMap::new();
         let mut genese = None;
@@ -574,6 +609,30 @@ impl Chain {
             }
         }
         active.reverse();
+
+        Ok(Arborescence {
+            par_id,
+            travail,
+            active,
+            genese,
+        })
+    }
+
+    pub fn from_snapshot(
+        network: Network,
+        snapshot: Snapshot,
+        headers: &[BlockHeader],
+    ) -> Result<Reprise, RepriseError> {
+        if snapshot.network != network {
+            return Err(RepriseError::MauvaisReseau);
+        }
+
+        let Arborescence {
+            par_id,
+            travail,
+            active,
+            ..
+        } = Self::arborescence(headers)?;
 
         // 4. L'instantane doit se trouver sur cette chaine active, a sa hauteur.
         let pos = snapshot.height as usize;
@@ -1191,11 +1250,15 @@ impl Chain {
     /// Atomique : si un bloc de la nouvelle branche echoue a la validation,
     /// l'ancienne chaine est integralement restauree.
     fn try_reorg(&mut self, nouvelle_tete: Hash256, now: u64) -> Result<u64, ChainError> {
+        // Aucun ancetre commun a portee : ce n'est pas une reorganisation trop
+        // profonde, c'est une branche dont on ne sait pas d'ou elle vient. Le
+        // dire ainsi a un cout : l'ancienne version rendait ici
+        // `FinaliteDepassee { profondeur: u64::MAX }`, et un exploitant lisant
+        // « profondeur 18446744073709551615 » ne pouvait rien en faire.
         let (fourche, branche) =
             self.chemin_vers_active(nouvelle_tete)
-                .ok_or(ChainError::FinaliteDepassee {
-                    profondeur: u64::MAX,
-                    max: MAX_REORG_DEPTH,
+                .ok_or(ChainError::PointDeForkIntrouvable {
+                    portee: MAX_REORG_DEPTH,
                 })?;
 
         let profondeur = (self.active.len() - 1 - fourche) as u64;
@@ -1442,6 +1505,79 @@ mod tests {
             pow::mine_with_table(&mut b.header, table, ESSAIS)
         })
         .unwrap();
+    }
+
+    /// L'arborescence retrouve la chaine active au milieu des branches.
+    ///
+    /// # L'incident que cette epreuve fige
+    ///
+    /// Le chemin de secours — celui qui sert quand l'instantane manque, donc
+    /// apres tout arret brutal — rejouait le fichier des blocs **dans son ordre
+    /// d'ecriture**. Ce fichier consigne aussi les branches laterales : le rejeu
+    /// demandait donc a la chaine d'accepter des dizaines de reorganisations
+    /// successives, et se heurtait aux defenses anti-reorganisation, qui sont
+    /// faites pour repousser un attaquant et non pour relire sa propre histoire.
+    ///
+    /// Mesure faite sur deux noeuds minant l'un contre l'autre : au bout de deux
+    /// mille blocs, le noeud **refusait de redemarrer**. Un noeud incapable de
+    /// relire son propre fichier est a une coupure de courant de la perte totale.
+    ///
+    /// La reponse est ici : on demande d'abord aux en-tetes quelle est la chaine
+    /// active, et on la valide dans l'ordre des hauteurs. Plus une seule
+    /// reorganisation a accepter.
+    #[test]
+    fn l_arborescence_designe_la_chaine_active_parmi_les_branches() {
+        let mut c = chaine();
+        mine(&mut c, 5);
+        let fourche = c.tip_id();
+        let apres_fourche: Vec<Hash256> = c.active[1..].to_vec();
+
+        // Une branche concurrente, plus courte : elle ne doit pas l'emporter.
+        let mut rivale = Chain::new(RESEAU, genesis_block(RESEAU));
+        for id in &apres_fourche {
+            let b = c.block_by_id(id).expect("corps");
+            rivale.connect(&b, b.header.time + 1).expect("meme prefixe");
+        }
+        let t = rivale.tip().time + TARGET_BLOCK_SECS;
+        let b = rivale
+            .mine_block(Hash256([9u8; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
+            .expect("minage rival");
+        rivale.connect(&b, t + 1).expect("connexion rivale");
+        assert_eq!(b.header.prev_block, fourche);
+
+        // On prolonge la chaine principale au-dela de la rivale.
+        mine(&mut c, 3);
+
+        // Le fichier melange tout, dans un ordre quelconque : c'est bien ce que
+        // l'arborescence doit savoir demeler.
+        let mut entetes: Vec<BlockHeader> = c.headers();
+        entetes.insert(2, b.header);
+
+        let a = Chain::arborescence(&entetes).expect("arborescence");
+        assert_eq!(
+            a.active, c.active,
+            "la chaine active doit etre la plus lourde, pas l'ordre du fichier"
+        );
+        assert_eq!(a.genese, c.active[0]);
+        assert!(
+            a.travail.contains_key(&b.header.block_id()),
+            "la branche laterale reste connue : sans elle, aucune reorganisation \
+             ne survivrait a un redemarrage"
+        );
+    }
+
+    /// Une branche sans ancetre commun se nomme pour ce qu'elle est.
+    ///
+    /// Elle etait signalee comme `FinaliteDepassee { profondeur: u64::MAX }`.
+    /// Un exploitant lisant « profondeur 18446744073709551615 » ne peut rien en
+    /// faire : ce n'est pas une profondeur, c'est un aveu d'ignorance deguise.
+    #[test]
+    fn une_branche_sans_ancetre_commun_ne_se_dit_pas_trop_profonde() {
+        let e = ChainError::PointDeForkIntrouvable { portee: 720 };
+        match e {
+            ChainError::PointDeForkIntrouvable { portee } => assert_eq!(portee, 720),
+            autre => panic!("mauvaise erreur : {autre:?}"),
+        }
     }
 
     /// Rejoue une reprise complete : instantane, reconstruction depuis les
