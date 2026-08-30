@@ -148,7 +148,7 @@ a.plat:hover{text-decoration:underline}
     externe n'est chargée&nbsp;: ce que vous lisez, votre machine l'a validé.
   </div>
   <form class="chercher" id="forme-chercher" autocomplete="off">
-    <input id="saisie-chercher" placeholder="hauteur, identifiant de bloc, transaction ou adresse" spellcheck="false">
+    <input id="saisie-chercher" placeholder="hauteur, bloc, transaction, adresse ou montant (ex. 1.5)" spellcheck="false">
     <button type="submit">Chercher</button>
   </form>
   <div class="aide" id="aide-chercher">Un seul champ&nbsp;: le nœud reconnaît ce que vous collez.</div>
@@ -248,6 +248,20 @@ a.plat:hover{text-decoration:underline}
     <table>
       <thead><tr><th>Genre</th><th>Reçu</th><th>Envoyé</th><th>Conf.</th><th>Hauteur</th><th>Horodatage</th><th>Identifiant</th></tr></thead>
       <tbody id="adresse-mouvements"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="vue" id="vue-montant" hidden>
+  <div class="fil"><a href="#/">Accueil</a> → montant</div>
+  <h2>Recherche par montant</h2>
+  <div class="grille" id="montant-tuiles"></div>
+  <div id="montant-note"></div>
+  <h2>Sorties trouvées</h2>
+  <div class="defile">
+    <table>
+      <thead><tr><th>Transaction</th><th>Hauteur</th><th>Adresse</th><th>Montant</th></tr></thead>
+      <tbody id="montant-lignes"></tbody>
     </table>
   </div>
 </section>
@@ -427,6 +441,7 @@ async function routeur(){
       case "bloc":    montrer("bloc");    await voirBloc(decodeURIComponent(bouts[1]||"")); break;
       case "tx":      montrer("tx");      await voirTx(decodeURIComponent(bouts[1]||"")); break;
       case "adresse": montrer("adresse"); await voirAdresse(decodeURIComponent(bouts[1]||"")); break;
+      case "montant": montrer("montant"); await voirMontant(decodeURIComponent(bouts[1]||"")); break;
       default:        location.hash = "#/";
     }
   }catch(e){
@@ -450,6 +465,7 @@ document.getElementById("forme-chercher").addEventListener("submit", async ev =>
     else if (r.genre === "bloc-id")    location.hash = "#/bloc/" + encodeURIComponent(r.valeur);
     else if (r.genre === "transaction")location.hash = "#/tx/" + encodeURIComponent(r.valeur);
     else if (r.genre === "adresse")    location.hash = "#/adresse/" + encodeURIComponent(r.valeur);
+    else if (r.genre === "montant")    location.hash = "#/montant/" + encodeURIComponent(r.valeur);
   }catch(e){
     aide.innerHTML = `<span class="err">${ech(e.message)}</span>`;
   }
@@ -746,6 +762,40 @@ async function voirAdresse(adresse){
         <td><span class="coupe">${lienTx(m.txid, 18)}</span></td>
       </tr>`).join("")
     : `<tr><td colspan="7" style="color:var(--tenu)">Aucun mouvement dans la portée de la recherche.</td></tr>`;
+}
+
+// ---------------------------------------------------------------------------
+// Montant
+// ---------------------------------------------------------------------------
+
+async function voirMontant(m){
+  effacerErreur();
+  const r = await appel("getmontant", {montant: m});
+
+  document.getElementById("montant-tuiles").innerHTML =
+    tuile("Montant cherché", ech(r.montant.q21) + " Q21") +
+    tuile("Sorties trouvées", r.resultats.length + (r.plafonne ? " (plafonné)" : ""),
+          r.plafonne ? "les 100 plus récentes" : null) +
+    tuile("Fenêtre", "blocs " + ech(r.depuis) + " → " + ech(r.hauteur),
+          ech(r.fenetre) + " blocs au plus");
+
+  // Le même honnête « voilà jusqu'où j'ai cherché » que le reste de la page.
+  document.getElementById("montant-note").innerHTML =
+    `<div class="avert info"><h3>Recherche bornée</h3>
+     <p>Sans index par montant, la recherche remonte une fenêtre de ${ech(r.fenetre)}
+     blocs — ici de ${ech(r.depuis)} à ${ech(r.hauteur)}. Une somme courante peut
+     apparaître des milliers de fois&nbsp;: la liste est plafonnée aux 100 plus
+     récentes. Rapide, bornée, et la page dit jusqu'où elle est allée.</p></div>`;
+
+  document.getElementById("montant-lignes").innerHTML = r.resultats.length
+    ? r.resultats.map(s=>`
+      <tr>
+        <td><span class="coupe">${lienTx(s.txid, 18)}</span></td>
+        <td>${lienBloc(s.hauteur)}</td>
+        <td>${lienAdresse(s.adresse, 22)}</td>
+        <td>${ech(s.valeur.q21)}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="4" style="color:var(--tenu)">Aucune sortie de ce montant dans la fenêtre parcourue.</td></tr>`;
 }
 
 // ---------------------------------------------------------------------------
