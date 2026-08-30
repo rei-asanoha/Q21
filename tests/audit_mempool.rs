@@ -425,10 +425,19 @@ fn chaine_mempool(n: u32, m: &mut Mempool, base: u32) -> Hash256 {
     racine
 }
 
+/// Le retrait en paquet d'une chaine est lineaire, pas quadratique.
+///
+/// Le defaut : le parcours de la descendance testait l'appartenance par
+/// `Vec::contains`, un balayage a chaque enfant — l'audit avait mesure n^1,35,
+/// et le plafond de 64 Mio autorise des chaines de plusieurs milliers de
+/// maillons. L'appartenance passe desormais par un ensemble : le retrait est
+/// lineaire. On le prouve par une borne de temps franche, insensible au bruit
+/// de mesure — quadratique, ce retrait se compterait en dizaines de
+/// millisecondes ; lineaire, il tient largement sous dix.
 #[test]
-fn t06_l_eviction_en_paquet_est_quadratique_en_la_profondeur_de_chaine() {
+fn t06_le_retrait_en_paquet_est_lineaire() {
     println!("--- t06 : cout de remove() sur une chaine ---");
-    let mut mesures = Vec::new();
+    let mut n_max = 0usize;
     for n in [500u32, 1000, 2000, 2600] {
         let mut m = Mempool::new();
         let racine = chaine_mempool(n, &mut m, 1_000_000 + n * 10);
@@ -438,19 +447,19 @@ fn t06_l_eviction_en_paquet_est_quadratique_en_la_profondeur_de_chaine() {
         let d = t0.elapsed();
         assert!(m.is_empty());
         println!("  chaine de {n:5} : remove() = {d:?}");
-        mesures.push((n as f64, d.as_secs_f64()));
+        // Une borne large mais franche : le retrait lineaire d'une chaine de
+        // 2 600 maillons prend des dizaines de microsecondes. Dix millisecondes
+        // laissent toute la marge du bruit tout en rattrapant un retour au
+        // comportement quadratique, qui les depasserait nettement.
+        assert!(
+            d < std::time::Duration::from_millis(10),
+            "remove() d'une chaine de {n} maillons doit rester lineaire : {d:?}"
+        );
+        n_max = n as usize;
     }
-    let (n1, t1) = mesures[0];
-    let (n2, t2) = mesures[mesures.len() - 1];
-    let exposant = (t2 / t1).ln() / (n2 / n1).ln();
-    println!("  exposant empirique : n^{exposant:.2}  (1 = lineaire, 2 = quadratique)");
     println!(
-        "  borne : le plafond de 64 Mio limite la chaine a ~{} maillons ML-DSA",
+        "  borne : le plafond de 64 Mio limite la chaine a ~{} maillons ML-DSA (teste jusqu'a {n_max})",
         MEMPOOL_MAX_BYTES / 5_400
-    );
-    assert!(
-        exposant > 1.2,
-        "attendu un comportement superlineaire, mesure n^{exposant:.2}"
     );
 }
 

@@ -448,12 +448,20 @@ impl Mempool {
     pub fn remove(&mut self, txid: &Hash256) -> Option<MempoolEntry> {
         // Parcours en largeur de la descendance, pour eviter la recursion sur
         // une chaine profonde.
+        //
+        // L'appartenance se teste dans un ensemble, pas par un balayage du
+        // vecteur : `Vec::contains` a chaque enfant rendait le retrait d'une
+        // chaine de n maillons quadratique — l'audit l'avait mesure en n^1,35,
+        // et le plafond de 64 Mio autorise des chaines de plusieurs milliers de
+        // maillons. Avec l'ensemble, le retrait redevient lineaire.
         let mut a_retirer = vec![*txid];
+        let mut vus: HashSet<Hash256> = HashSet::new();
+        vus.insert(*txid);
         let mut i = 0;
         while i < a_retirer.len() {
             if let Some(enfants) = self.enfants.get(&a_retirer[i]) {
                 for c in enfants.clone() {
-                    if !a_retirer.contains(&c) {
+                    if vus.insert(c) {
                         a_retirer.push(c);
                     }
                 }
