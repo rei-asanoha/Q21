@@ -1047,15 +1047,23 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
     // indices tant qu'on trouve quelque chose, s'arreter quand une fenetre
     // entiere ne trouve rien.
     //
-    // Le declencheur est etroit a dessein. Un portefeuille qui a deja distribue
-    // des adresses connait son etat ; refaire la decouverte a chaque demarrage
-    // couterait une generation de clef ML-DSA par indice, pour rien. On ne la
-    // tente donc que si le portefeuille est presque vierge alors que la chaine,
-    // elle, a une histoire.
+    // Le declencheur ne regarde pas le nombre d'adresses derivees — il regarde
+    // ce que le portefeuille RECONNAIT. L'ancien test `next_index <= 1` se
+    // croyait synonyme de « fraichement restaure » ; il ne l'est pas. La page
+    // d'accueil tire une adresse a l'ouverture, un clic sur « Nouvelle adresse »
+    // en tire une autre, et des le deuxieme indice la decouverte ne se
+    // declenchait plus. Un porteur restaurait, ouvrait, et voyait zero sur une
+    // chaine qui portait ses fonds — le defaut meme que cette fonction devait
+    // fermer restait grand ouvert des qu'on touchait au portefeuille.
+    //
+    // Le bon signal est simple : si le portefeuille ne voit AUCUN de ses fonds
+    // sur une chaine qui en porte, il faut chercher. Une fois ses adresses
+    // retrouvees, il les voit, et la decouverte ne se redeclenche plus — sans
+    // dependre d'un compteur que la moindre action fait mentir.
     let a_decouvrir = !sans_portefeuille
         && chain.height() > 0
-        && wallet.next_index() <= 1
-        && !chain.utxo.is_empty();
+        && !chain.utxo.is_empty()
+        && !wallet.voit_des_fonds(&chain.utxo);
     if a_decouvrir {
         let avant = wallet.next_index();
         let trouvees = {
@@ -2676,18 +2684,26 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // *puis* on se synchronise — et la decouverte n'aurait jamais lieu. Le
         // porteur verrait zero pendant que ses fonds arrivent sous ses yeux.
         //
-        // On retente donc, mais rarement : la condition `next_index <= 1` cesse
-        // d'etre vraie des la premiere trouvaille, et le compteur de hauteur
-        // evite de rederiver deux cents clefs ML-DSA a chaque bloc recu.
+        // On retente donc, mais rarement : le compteur de hauteur evite de
+        // rederiver deux cents clefs ML-DSA a chaque bloc recu. Le declencheur
+        // regarde ce que le portefeuille reconnait, pas `next_index` : voir
+        // `charger_avec` pour la raison. Tant qu'il ne voit aucun de ses fonds
+        // sur une chaine qui en porte, on cherche ; des qu'il les voit, on
+        // s'arrete.
         if !sans_portefeuille {
             let h = node.height();
             if h > derniere_decouverte + 20 {
                 derniere_decouverte = h;
-                let vierge = {
-                    let w = wallet.lock().map_err(|_| "portefeuille verrouille")?;
-                    w.next_index() <= 1
-                };
-                if vierge {
+                let a_chercher = node.with_chain(|c| {
+                    if c.utxo.is_empty() {
+                        return false;
+                    }
+                    match wallet.lock() {
+                        Ok(w) => !w.voit_des_fonds(&c.utxo),
+                        Err(_) => false,
+                    }
+                });
+                if a_chercher {
                     let trouvees = node.with_chain(|c| {
                         let u = &c.utxo;
                         if u.is_empty() {
