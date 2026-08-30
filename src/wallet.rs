@@ -515,6 +515,19 @@ impl Wallet {
         self.connues.contains_key(h)
     }
 
+    /// Le portefeuille reconnait-il au moins une sortie non depensee de cet
+    /// ensemble comme etant la sienne ?
+    ///
+    /// C'est le vrai signal d'un portefeuille « a jour » : non pas le nombre
+    /// d'adresses qu'il a derivees, mais le fait qu'il **voie ses fonds**. Un
+    /// portefeuille restaure puis simplement ouvert a deja derive quelques
+    /// adresses — la page d'accueil en tire une — sans pour autant reconnaitre
+    /// le moindre de ses avoirs sur la chaine. C'est ce cas que la decouverte
+    /// doit rattraper, et que l'ancien declencheur `next_index <= 1` manquait.
+    pub fn voit_des_fonds(&self, utxo: &crate::utxo::UtxoSet) -> bool {
+        self.connues.keys().any(|h| utxo.connait(h))
+    }
+
     /// Cet indice a-t-il deja servi a signer ?
     ///
     /// Pour un schema a usage unique, la reponse `true` est definitive : la clef
@@ -1423,6 +1436,86 @@ mod tests {
         let sienne = a.new_address().hash;
         let mut b = Wallet::from_seed([2u8; 32], Network::Regtest);
         assert_eq!(b.decouvrir(|h| *h == sienne), 0);
+    }
+
+    /// Construit un jeu d'UTXO tenant une sortie vers `empreinte`.
+    fn utxo_avec(empreinte: Hash256) -> crate::utxo::UtxoSet {
+        let mut u = crate::utxo::UtxoSet::new();
+        u.insert(
+            OutPoint {
+                txid: Hash256([9u8; 32]),
+                index: 0,
+            },
+            crate::utxo::UtxoEntry {
+                output: TxOut {
+                    value: crate::amount::Amount::from_units(1),
+                    scheme: SchemeId::LamportOts,
+                    pubkey_hash: empreinte,
+                },
+                height: 1,
+                is_coinbase: false,
+            },
+        );
+        u
+    }
+
+    /// Le vrai declencheur de la restauration : voir ses fonds, pas compter ses
+    /// adresses.
+    ///
+    /// Le defaut corrige : la decouverte ne se lançait que si `next_index <= 1`.
+    /// Or un portefeuille restaure derive une adresse des qu'on l'ouvre, une
+    /// autre au premier clic — et des le deuxieme indice la decouverte etait
+    /// coupee. Le porteur voyait alors **zero** sur une chaine qui portait ses
+    /// fonds. Le bon signal n'est pas le compteur d'indices : c'est que le
+    /// portefeuille ne reconnaisse encore aucun de ses avoirs.
+    #[test]
+    fn un_portefeuille_deja_entame_voit_encore_qu_il_lui_manque_ses_fonds() {
+        // Le porteur possede l'adresse d'indice 30 sur la chaine.
+        let mut origine = Wallet::from_seed([64u8; 32], Network::Regtest);
+        let mut payee = Hash256::ZERO;
+        for i in 0..40 {
+            let a = origine.new_address();
+            if i == 30 {
+                payee = a.hash;
+            }
+        }
+        let utxo = utxo_avec(payee);
+
+        // Machine neuve : restauree, puis DEJA entamee — deux adresses tirees,
+        // comme a l'ouverture de la page. L'ancien test `next_index <= 1` aurait
+        // ici saute la decouverte.
+        let mut restaure = Wallet::from_seed([64u8; 32], Network::Regtest);
+        restaure.new_address();
+        restaure.new_address();
+        assert!(restaure.next_index() > 1);
+
+        // Avant decouverte : le portefeuille ne voit aucun de ses fonds.
+        assert!(
+            !restaure.voit_des_fonds(&utxo),
+            "il ne devrait pas encore reconnaitre l'adresse payee"
+        );
+
+        // C'est exactement ce que le declencheur corrige regarde. On cherche.
+        let trouvees = restaure.decouvrir(|h| utxo.connait(h));
+        assert_eq!(trouvees, 1, "l'adresse payee n'a pas ete retrouvee");
+
+        // Apres decouverte : il voit ses fonds, et ne relancera donc plus rien.
+        assert!(
+            restaure.voit_des_fonds(&utxo),
+            "apres decouverte, ses fonds doivent etre visibles"
+        );
+    }
+
+    /// Un portefeuille vraiment vierge, lui, ne voit rien — et c'est correct :
+    /// le declencheur restera actif tant qu'aucun fonds n'apparait, sans jamais
+    /// pretendre le contraire.
+    #[test]
+    fn un_portefeuille_sans_fonds_ne_voit_rien() {
+        let w = Wallet::from_seed([65u8; 32], Network::Regtest);
+        // Une sortie qui paie l'adresse d'un AUTRE portefeuille.
+        let mut autre = Wallet::from_seed([66u8; 32], Network::Regtest);
+        let etrangere = autre.new_address().hash;
+        assert!(!w.voit_des_fonds(&utxo_avec(etrangere)));
     }
 
     #[test]
