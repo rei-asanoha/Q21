@@ -186,6 +186,14 @@ impl JsonObj {
         self.0.insert(clef.to_string(), v);
         self
     }
+    /// Pose plusieurs champs d'un coup — pratique pour greffer un groupe
+    /// calcule a part sans casser le chainage.
+    pub fn set_all<'a>(mut self, champs: impl IntoIterator<Item = (&'a str, Json)>) -> JsonObj {
+        for (clef, v) in champs {
+            self.0.insert(clef.to_string(), v);
+        }
+        self
+    }
     pub fn build(self) -> Json {
         Json::Object(self.0)
     }
