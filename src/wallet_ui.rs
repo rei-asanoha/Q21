@@ -334,6 +334,11 @@ td.moins{color:var(--danger);font-weight:600}
 .adresse .nom.vide{font-weight:400;color:var(--tenu);font-style:italic}
 .adresse .edition{flex:0 0 100%;display:flex;gap:.5rem;margin-top:.5rem}
 .adresse .edition input{flex:1;font-family:var(--sans);font-size:.85rem}
+/* Les filtres de l'activite. Un seul actif a la fois, et le mot porte l'etat :
+   la couleur ne fait que le repeter, pour qui la distingue mal. */
+.filtres{display:flex;flex-wrap:wrap;gap:.4rem;margin:.9rem 0}
+.filtres button.actif{background:var(--accent-fond);color:var(--accent);
+  border-color:var(--accent)}
 .chercheur{margin:1rem 0}
 .chercheur input[type=search]{width:100%;padding:.7rem .85rem;font:inherit;font-size:.9rem;
   color:var(--texte);background:var(--carte-2);border:1.5px solid var(--bord);
@@ -732,6 +737,12 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
 <section class="vue" id="vue-historique" hidden>
   <h2>Activité</h2>
   <div id="note-historique"></div>
+  <div class="filtres" id="filtres-activite" role="group" aria-label="Ne montrer que">
+    <button type="button" class="plat actif" data-filtre="tout">Tout</button>
+    <button type="button" class="plat" data-filtre="minage">Minage</button>
+    <button type="button" class="plat" data-filtre="reception">Reçu</button>
+    <button type="button" class="plat" data-filtre="envoi">Envoyé</button>
+  </div>
   <div class="defile">
     <table>
       <thead><tr><th>Quoi</th><th>Reçu</th><th>Envoyé</th><th>Confirmations</th><th>Bloc n°</th><th>Date</th><th>Référence</th></tr></thead>
@@ -1493,7 +1504,30 @@ for (const zone of ["mouvements", "tuiles-chaine"]){
   });
 }
 
+// --- L'activite se rafraichit d'elle-meme, et se filtre.
+//
+// Deux manques signales a l'usage. Une transaction recue apparaissait « en
+// attente » et **y restait** : il fallait changer d'onglet et revenir pour la
+// voir confirmee. Et avec quelques dizaines de recompenses de minage, le seul
+// virement de la journee se perdait au milieu.
+//
+// Le rafraichissement est volontairement plus lent que celui du solde : chaque
+// appel fait relire des blocs au nœud, et l'activite n'a pas besoin de la
+// seconde pres. Dix secondes suffisent a ce qu'une confirmation apparaisse
+// « toute seule », ce qui est la seule chose qu'on demande.
+let filtreActivite = "tout";
+let historiqueEnCours = false;
+
+function correspondFiltre(m){
+  if (filtreActivite === "tout") return true;
+  return String(m.genre) === filtreActivite;
+}
+
 async function historique(){
+  // Deux tours qui se chevauchent liraient la chaine deux fois pour rien, et
+  // le second ecraserait le premier a l'arrivee.
+  if (historiqueEnCours) return;
+  historiqueEnCours = true;
   const corps = document.getElementById("mouvements");
   const zone = document.getElementById("note-historique");
   const sous = document.getElementById("note-colonnes");
@@ -1529,7 +1563,14 @@ async function historique(){
         ou trouvez un bloc depuis l'onglet Miner.</td></tr>`;
       return;
     }
-    corps.innerHTML = h.mouvements.map(m => {
+    const vus = h.mouvements.filter(correspondFiltre);
+    if (!vus.length){
+      corps.innerHTML = `<tr><td colspan="7">Aucun mouvement de ce type parmi les
+        ${ech(String(h.mouvements.length))} derniers. Choisissez « Tout » pour
+        les voir tous.</td></tr>`;
+      return;
+    }
+    corps.innerHTML = vus.map(m => {
       // Trois etats, trois marques. « en attente » l'emporte sur « immature » :
       // une transaction qui n'est dans aucun bloc n'a pas encore de maturite a
       // discuter.
@@ -1570,8 +1611,28 @@ async function historique(){
     zone.innerHTML = `<div class="avert"><h3>Historique indisponible</h3><p>${ech(e.message)}</p></div>`;
     corps.innerHTML = "";
     sous.innerHTML = "";
+  }finally{
+    historiqueEnCours = false;
   }
 }
+
+// Un seul écouteur pour les quatre boutons. Le filtre ne redemande rien au
+// nœud : il rejoue l'affichage sur ce qu'on a déjà, donc il est instantané.
+document.getElementById("filtres-activite").addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-filtre]");
+  if (!b) return;
+  filtreActivite = b.dataset.filtre;
+  for (const autre of document.querySelectorAll("#filtres-activite button")){
+    autre.classList.toggle("actif", autre === b);
+  }
+  historique();
+});
+
+// Tant que l'écran est visible, il se tient à jour. Caché, il ne coûte rien :
+// un portefeuille ouvert sur le solde ne doit pas faire relire la chaîne.
+setInterval(() => {
+  if (!document.getElementById("vue-historique").hidden) historique();
+}, 10000);
 
 // ---------------------------------------------------------------------------
 // Informations
@@ -2765,6 +2826,43 @@ mod tests {
             PAGE.contains("tous les 71 jours"),
             "rien ne dit que la table grandit"
         );
+    }
+
+    /// L'activite se filtre, et se tient a jour toute seule.
+    ///
+    /// Deux manques signales a l'usage. Une transaction recue apparaissait
+    /// « en attente » et **y restait** : il fallait changer d'onglet et revenir
+    /// pour la voir confirmee. Et avec quelques dizaines de recompenses de
+    /// minage, le seul virement de la journee se perdait au milieu.
+    #[test]
+    fn l_activite_se_filtre_et_se_rafraichit_seule() {
+        for attendu in [
+            "filtres-activite",
+            r#"data-filtre="minage""#,
+            r#"data-filtre="reception""#,
+            r#"data-filtre="envoi""#,
+            "function correspondFiltre(",
+        ] {
+            assert!(
+                PAGE.contains(attendu),
+                "element de filtre absent : {attendu}"
+            );
+        }
+        // Le rafraichissement ne tourne que si l'ecran est visible : un
+        // portefeuille ouvert sur le solde ne doit pas faire relire la chaine.
+        assert!(
+            PAGE.contains(
+                r#"if (!document.getElementById("vue-historique").hidden) historique();"#
+            ),
+            "l'activite se rafraichit meme cachee, ou pas du tout"
+        );
+        // Deux tours qui se chevauchent liraient la chaine deux fois pour rien.
+        assert!(
+            PAGE.contains("if (historiqueEnCours) return;"),
+            "rien n'empeche deux lectures simultanees"
+        );
+        // Le filtre ne redemande rien au nœud : il rejoue l'affichage.
+        assert!(PAGE.contains("h.mouvements.filter(correspondFiltre)"));
     }
 
     /// Une somme immature dit **quand** elle se liberera.
