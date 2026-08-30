@@ -1,6 +1,11 @@
 //! Audit adverse — axe « reservoir de transactions et epuisement de ressources ».
 //!
-//! Chaque test correspond a une faille candidate. Il mesure, il n'argumente pas.
+//! Ces epreuves ont d'abord servi a **mesurer** neuf failles d'engorgement —
+//! la lecon que le protocole d'origine n'avait pas anticipee : un reservoir
+//! qu'on remplit a cout nul de transactions qui ne seront jamais minees. Les
+//! corrections sont en place (voir `src/mempool.rs`) ; ces tests **verrouillent
+//! desormais le comportement corrige** : chacun echouerait si l'une des portes
+//! se rouvrait. Les tests de cout (t02, t03, t08) restent des mesures.
 
 use q21_core::amount::Amount;
 use q21_core::consensus::WITNESS_DISCOUNT;
@@ -98,37 +103,32 @@ fn puits(n: u8) -> Hash256 {
     Hash256([n; 32])
 }
 
-fn rss_kio() -> u64 {
-    let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages: u64 = s
-        .split_whitespace()
-        .nth(1)
-        .and_then(|x| x.parse().ok())
-        .unwrap_or(0);
-    pages * 4
-}
-
 // ---------------------------------------------------------------------------
 // 1. Cout de verification asymetrique : l'ordre des rejets
 // ---------------------------------------------------------------------------
 
-/// Une transaction a frais nuls est-elle rejetee avant ou apres les signatures ?
+/// Le filtre de frais s'applique **avant** toute cryptographie.
+///
+/// Le defaut d'origine faisait l'inverse : 15,9 ms de calcul pour un rejet a
+/// frais nuls contre 91 us pour un rejet de forme — un rapport de 175. Un
+/// adversaire faisait bruler du processeur au prix d'un simple envoi. La preuve
+/// du correctif ne depend d'aucune horloge : une transaction a la fois **sans
+/// frais** et **a la clef non conforme** est rejetee pour ses FRAIS. Le filtre
+/// a donc agi avant meme qu'on regarde la clef.
 #[test]
-fn t01_le_filtre_de_frais_passe_apres_la_verification_des_signatures() {
+fn t01_le_filtre_de_frais_precede_la_verification_des_signatures() {
     const K: u32 = 40;
     let (u, ops) = utxo_synthetique(K, 1_000, 0);
 
     // Frais nuls : la somme des sorties egale la somme des entrees.
     let tx = tx_signee(&ops, vec![sortie(K as u64 * 1_000, puits(0xaa))], 0);
-    let taille = tx.encode().len();
 
     let mut m = Mempool::new();
     let t0 = Instant::now();
     let r = m.accept(&tx, &u, RESEAU, 10);
     let cher = t0.elapsed();
 
-    // Meme transaction, mais une clef publique qui ne correspond pas au verrou :
-    // rejet AVANT toute verification cryptographique.
+    // Meme transaction, mais une clef publique qui ne correspond a aucun verrou.
     let mut tx2 = tx.clone();
     for e in &mut tx2.inputs {
         e.witness.pubkey[0] ^= 0xff;
@@ -139,25 +139,24 @@ fn t01_le_filtre_de_frais_passe_apres_la_verification_des_signatures() {
     let bon_marche = t1.elapsed();
 
     println!("--- t01 : ordre des rejets ---");
-    println!("  transaction : {K} entrees, {taille} octets serialises");
     println!("  rejet a frais nuls      : {r:?} en {cher:?}");
     println!("  rejet clef non conforme : {r2:?} en {bon_marche:?}");
     println!(
-        "  rapport de cout : x{:.1}",
+        "  rapport de cout : x{:.2} (il valait 175 avant le correctif)",
         cher.as_secs_f64() / bon_marche.as_secs_f64().max(1e-9)
-    );
-    println!(
-        "  cout CPU par octet recu (rejet a frais nuls) : {:.3} us/Kio",
-        cher.as_secs_f64() * 1e6 / (taille as f64 / 1024.0)
     );
 
     assert!(
         matches!(r, Err(MempoolError::TauxDeFraisTropBas { .. })),
-        "attendu : rejet pour frais insuffisants APRES les signatures, obtenu {r:?}"
+        "attendu : rejet pour frais insuffisants, obtenu {r:?}"
     );
+    // Preuve structurelle, sans horloge : la clef falsifiee ne change rien au
+    // verdict. Si les signatures etaient verifiees d'abord, `r2` serait une
+    // erreur de validation, pas de frais.
     assert!(
-        cher > bon_marche * 4,
-        "le rejet a frais nuls doit couter bien plus cher : {cher:?} vs {bon_marche:?}"
+        matches!(r2, Err(MempoolError::TauxDeFraisTropBas { .. })),
+        "une clef non conforme ne doit rien changer : le filtre de frais passe \
+         avant la cryptographie. Obtenu {r2:?}"
     );
 }
 
@@ -289,60 +288,37 @@ fn t03_cout_reel_de_saturer_le_reservoir() {
 // 4. Une transaction que personne ne peut miner
 // ---------------------------------------------------------------------------
 
-/// `accept` ne borne ni la taille ni le poids d'une transaction. Une transaction
-/// plus lourde que le budget du mineur est acceptee, occupe le reservoir, et
-/// n'est jamais selectionnee : ses frais ne sont donc jamais dus.
+/// Une transaction plus lourde que le budget du mineur est **refusee a
+/// l'entree** : elle ne serait jamais selectionnee, l'accepter reviendrait a
+/// offrir du reservoir gratuit a qui n'a aucune intention de payer.
 #[test]
-fn t04_une_transaction_plus_lourde_qu_un_bloc_est_acceptee_et_jamais_minee() {
+fn t04_une_transaction_plus_lourde_qu_un_bloc_est_refusee() {
     // Le mineur du binaire q21 appelle select_for_block(2_000_000).
     const POIDS_MINEUR: u64 = 2_000_000;
     const K: u32 = 120; // 120 entrees Lamport ~ 3 Mo, poids > 2 000 000
 
     let (u, ops) = utxo_synthetique(K, 1_000_000, 10_000);
-    // Frais tres eleves : taux de frais maximal, donc inevincable.
+    // Frais tres eleves : taux de frais maximal. Cela ne la sauve pas.
     let tx = tx_signee(&ops, vec![sortie(1, puits(2))], 0);
     let poids = tx.weight(WITNESS_DISCOUNT);
-    let taille = tx.encode().len();
 
     let mut m = Mempool::new();
-    let id = m
-        .accept(&tx, &u, RESEAU, 10)
-        .expect("le mempool accepte une transaction inminable");
+    let r = m.accept(&tx, &u, RESEAU, 10);
 
-    let choisies = m.select_for_block(POIDS_MINEUR);
-    let choisies_max = m.select_for_block(u64::MAX);
-
-    println!("--- t04 : transaction inminable ---");
-    println!("  taille {taille} octets, poids pondere {poids} (budget mineur {POIDS_MINEUR})");
-    println!(
-        "  MAX_BLOCK_SIZE = {} octets",
-        q21_core::consensus::MAX_BLOCK_SIZE
-    );
-    println!("  acceptee au mempool : oui, id {}", hex(&id));
-    println!(
-        "  select_for_block(2_000_000) : {} transaction(s)",
-        choisies.len()
-    );
-    println!(
-        "  select_for_block(u64::MAX)  : {} transaction(s)",
-        choisies_max.len()
-    );
-    println!(
-        "  frais reclames : {} unites, jamais payes",
-        tx.inputs.len() as u64 * 1_000_000 - 1
-    );
+    println!("--- t04 : transaction inminable refusee ---");
+    println!("  poids pondere {poids} (budget mineur {POIDS_MINEUR}) -> {r:?}");
 
     assert!(poids > POIDS_MINEUR);
     assert!(
-        choisies.is_empty(),
-        "une transaction plus lourde que le budget n'est jamais selectionnee"
+        matches!(r, Err(MempoolError::Inminable { .. })),
+        "une transaction plus lourde que le budget doit etre refusee, obtenu {r:?}"
     );
-    assert_eq!(m.len(), 1, "et elle reste indefiniment au reservoir");
+    assert_eq!(m.len(), 0, "elle n'occupe jamais le reservoir");
 }
 
-/// Une transaction plus grosse que MAX_BLOCK_SIZE : jamais minable par personne.
+/// Une transaction plus grosse que MAX_BLOCK_SIZE : refusee, car jamais minable.
 #[test]
-fn t04b_une_transaction_plus_grosse_qu_un_bloc_entier_est_acceptee() {
+fn t04b_une_transaction_plus_grosse_qu_un_bloc_entier_est_refusee() {
     const K: u32 = 200; // 200 * ~24,6 Kio ~ 4,9 Mio > MAX_BLOCK_SIZE (4 Mio)
     let (u, ops) = utxo_synthetique(K, 1_000_000, 20_000);
     let tx = tx_signee(&ops, vec![sortie(1, puits(3))], 0);
@@ -353,118 +329,75 @@ fn t04b_une_transaction_plus_grosse_qu_un_bloc_entier_est_acceptee() {
 
     println!("--- t04b : transaction plus grosse qu'un bloc ---");
     println!(
-        "  taille {taille} octets vs MAX_BLOCK_SIZE {}",
+        "  taille {taille} octets vs MAX_BLOCK_SIZE {} -> {r:?}",
         q21_core::consensus::MAX_BLOCK_SIZE
     );
-    println!("  acceptee : {}", r.is_ok());
     assert!(taille > q21_core::consensus::MAX_BLOCK_SIZE);
-    assert!(r.is_ok(), "aucun controle de taille a l'entree du mempool");
+    assert!(
+        matches!(r, Err(MempoolError::Inminable { .. })),
+        "une transaction plus grosse qu'un bloc doit etre refusee a l'entree, obtenu {r:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // 3/5. Eviction manipulable
 // ---------------------------------------------------------------------------
 
-/// Saturer le reservoir avec des transactions inminables a taux de frais eleve,
-/// puis constater qu'une transaction honnete normale est refusee.
+/// L'inminable ne peut plus evincer les honnetes : il est refuse a l'entree.
+///
+/// L'attaque d'origine remplissait le reservoir a **99,8 %** de transactions
+/// inminables a taux de frais eleve — donc inevincables — pour un cout reel de
+/// **zero**, rien n'etant jamais mine. Il ne restait aux transactions honnetes
+/// que 107 Kio sur 64 Mio. La borne de poids coupe l'attaque a la racine :
+/// aucune de ces transactions n'entre plus au reservoir.
 #[test]
-fn t05_eviction_des_honnetes_par_des_transactions_qui_ne_seront_jamais_minees() {
-    const PAR_TX: u32 = 90; // ~2,2 Mio, poids ~2,23 M > budget du mineur
+fn t05_l_inminable_ne_peut_plus_evincer_les_honnetes() {
+    const PAR_TX: u32 = 90; // ~2,23 M de poids > budget du mineur (2 000 000)
+    let (u, ops) = utxo_synthetique(PAR_TX, 1_000_000, 100_000);
+    // Une entree, une sortie de 1 unite : taux de frais quasi maximal — et
+    // pourtant refusee, car trop lourde pour un bloc.
+    let grosse = tx_signee(&ops, vec![sortie(1, puits(4))], 0);
+    let poids = grosse.weight(WITNESS_DISCOUNT);
+
     let mut m = Mempool::new();
-    let mut depart = 100_000u32;
-    let mut u = UtxoSet::new();
-    let mut n_attaque = 0usize;
-    let mut poids_attaque = 0u64;
-    let t0 = Instant::now();
+    let r_attaque = m.accept(&grosse, &u, RESEAU, 10);
 
-    // Chaque transaction : PAR_TX entrees, une seule sortie de 1 unite -> taux
-    // de frais quasi maximal, et poids > budget du mineur.
-    loop {
-        let (uu, ops) = utxo_synthetique(PAR_TX, 1_000_000, depart);
-        for (o, _) in &ops {
-            u.insert(*o, *uu.get(o).unwrap());
-        }
-        depart += PAR_TX;
-        let tx = tx_signee(&ops, vec![sortie(1, puits(4))], 0);
-        poids_attaque = tx.weight(WITNESS_DISCOUNT);
-        match m.accept(&tx, &u, RESEAU, 10) {
-            Ok(_) => n_attaque += 1,
-            Err(e) => {
-                println!("  reservoir sature apres {n_attaque} transactions : {e:?}");
-                break;
-            }
-        }
-    }
-    let duree_remplissage = t0.elapsed();
-    println!("  poids d'une transaction d'attaque : {poids_attaque}");
+    // La plus « fine » inminable : peu d'octets, mais un poids gonfle par ses
+    // milliers de sorties. Refusee de meme.
+    let (uf, opf) = utxo_synthetique(1, 1_000_000, 200_000);
+    let mut outs: Vec<TxOut> = (0..12_100).map(|_| sortie(0, puits(4))).collect();
+    outs[0] = sortie(1, puits(4));
+    let fine = tx_signee(&opf, outs, 0);
+    let r_fine = m.accept(&fine, &uf, RESEAU, 10);
 
-    // Deuxieme couche : la plus PETITE transaction inminable possible. Le poids
-    // pondere compte le corps quatre fois : une transaction a une entree et
-    // ~12 100 sorties depasse le budget du mineur pour ~520 Kio seulement.
-    let mut n_fines = 0usize;
-    loop {
-        let gap = MEMPOOL_MAX_BYTES.saturating_sub(m.bytes());
-        let (uu, ops) = utxo_synthetique(1, 1_000_000, depart);
-        depart += 1;
-        for (o, _) in &ops {
-            u.insert(*o, *uu.get(o).unwrap());
-        }
-        let mut outs: Vec<TxOut> = (0..12_100).map(|_| sortie(0, puits(4))).collect();
-        outs[0] = sortie(1, puits(4));
-        let tx = tx_signee(&ops, outs, 0);
-        if tx.encode().len() > gap || tx.weight(WITNESS_DISCOUNT) <= 2_000_000 {
-            println!(
-                "  plus fine transaction inminable : {} octets, poids {} ; espace restant {gap}",
-                tx.encode().len(),
-                tx.weight(WITNESS_DISCOUNT)
-            );
-            break;
-        }
-        m.accept(&tx, &u, RESEAU, 10).expect("acceptation fine");
-        n_fines += 1;
-    }
-
-    // Transaction honnete : 1 entree, frais genereux mais taux ordinaire.
+    // Une transaction honnete ordinaire, elle, entre sans entrave.
     let (uh, oph) = utxo_synthetique(1, 1_000_000, 900_000);
-    for (o, _) in &oph {
-        u.insert(*o, *uh.get(o).unwrap());
-    }
     let honnete = tx_signee(&oph, vec![sortie(900_000, puits(5))], 0);
-    let poids_h = honnete.weight(WITNESS_DISCOUNT);
-    let taux_h = 100_000u64 * 1000 / poids_h;
-    let occupe = m.bytes();
-    let r = m.accept(&honnete, &u, RESEAU, 10);
+    let r_honnete = m.accept(&honnete, &uh, RESEAU, 10);
 
-    let minables = m.select_for_block(2_000_000);
-    let octets_minables: usize = minables.iter().map(|t| t.encode().len()).sum();
+    println!("--- t05 : l'inminable est refuse a l'entree ---");
+    println!("  grosse (poids {poids}, taux quasi max) -> {r_attaque:?}");
+    println!(
+        "  fine ({} octets, poids {}) -> {r_fine:?}",
+        fine.encode().len(),
+        fine.weight(WITNESS_DISCOUNT)
+    );
+    println!("  honnete -> {r_honnete:?}");
 
-    println!("--- t05 : eviction ---");
-    println!(
-        "  remplissage : {n_attaque} grosses + {n_fines} fines, {} Mio sur 64, en {duree_remplissage:?}",
-        occupe / 1024 / 1024
-    );
-    println!(
-        "  part du reservoir occupee par de l'inminable : {:.2} %",
-        100.0 * (occupe - octets_minables) as f64 / MEMPOOL_MAX_BYTES as f64
-    );
-    println!(
-        "  espace laisse aux transactions honnetes : {} octets (~{} transactions ML-DSA de 5,4 Kio)",
-        MEMPOOL_MAX_BYTES - occupe,
-        (MEMPOOL_MAX_BYTES - occupe) / 5_400
-    );
-    println!("  contre {} sans attaque", MEMPOOL_MAX_BYTES / 5_400);
-    println!("  honnete : poids {poids_h}, frais 100 000 unites, taux {taux_h} -> {r:?}");
-    println!("  cout reel pour l'attaquant : 0 unite (rien n'est minable, donc rien n'est paye)");
-
+    assert!(poids > 2_000_000);
     assert!(
-        octets_minables * 100 < occupe,
-        "plus de 1 % du reservoir est minable : {octets_minables} sur {occupe}"
+        matches!(r_attaque, Err(MempoolError::Inminable { .. })),
+        "l'attaque inevincable doit etre refusee, obtenu {r_attaque:?}"
     );
     assert!(
-        MEMPOOL_MAX_BYTES - occupe < MEMPOOL_MAX_BYTES / 100,
-        "il reste plus de 1 % de place : {} octets",
-        MEMPOOL_MAX_BYTES - occupe
+        matches!(r_fine, Err(MempoolError::Inminable { .. })),
+        "meme la plus fine inminable est refusee, obtenu {r_fine:?}"
     );
+    assert!(
+        r_honnete.is_ok(),
+        "une transaction honnete normale doit entrer, obtenu {r_honnete:?}"
+    );
+    assert_eq!(m.len(), 1, "seule l'honnete occupe le reservoir");
 }
 
 // ---------------------------------------------------------------------------
@@ -521,13 +454,18 @@ fn t06_l_eviction_en_paquet_est_quadratique_en_la_profondeur_de_chaine() {
     );
 }
 
-/// `select_for_block` recalcule le `txid` — donc un SHA-256 sur tout le corps de
-/// la transaction — a **chaque comparaison** du tri : `Ordering::then` evalue son
-/// argument sans paresse. Le cout devient n log n fois la taille des corps.
+/// `select_for_block` ne recalcule pas le `txid` a chaque comparaison du tri.
+///
+/// Le defaut : le comparateur appelait `txid()` — un SHA-256 sur tout le corps —
+/// a chaque comparaison, donc O(n log n) fois. L'audit avait mesure **3,96
+/// secondes pour retenir une seule transaction**, sous le verrou global du
+/// noeud : tout s'arretait pendant ce temps, a chaque modele de bloc. Le txid et
+/// le taux sont desormais calcules **une seule fois** : le tri redevient bon
+/// marche, meme sur des transactions au corps volumineux.
 #[test]
-fn t11_select_for_block_rehashe_a_chaque_comparaison_du_tri() {
+fn t11_select_for_block_ne_rehashe_pas_a_chaque_comparaison() {
     const N: u32 = 400;
-    const SORTIES: usize = 12_000;
+    const SORTIES: usize = 8_000; // corps lourd a hasher, mais minable (poids < 2 M)
 
     let mut m = Mempool::new();
     let mut u = UtxoSet::new();
@@ -544,43 +482,25 @@ fn t11_select_for_block_rehashe_a_chaque_comparaison_du_tri() {
         }
     }
     let n = m.len();
-    let octets = m.bytes();
+    assert!(n > 10, "il faut un reservoir consequent pour mesurer : {n}");
 
     let t0 = Instant::now();
     let choisies = m.select_for_block(2_000_000);
     let d = t0.elapsed();
 
-    // Cout d'un seul txid, pour attribuer la depense.
-    let un = m.txids();
-    let tx0 = m.get(&un[0]).unwrap().clone();
-    let t1 = Instant::now();
-    for _ in 0..50 {
-        let _ = tx0.txid();
-    }
-    let par_txid = t1.elapsed().as_secs_f64() / 50.0;
-
     println!("--- t11 : cout du tri de select_for_block ---");
-    println!("  reservoir : {n} transactions, {} Mio", octets / 1048576);
+    println!("  reservoir : {n} transactions de {SORTIES} sorties");
     println!(
-        "  select_for_block(2 000 000) : {d:?} pour {} transaction(s) retenue(s)",
+        "  select_for_block = {d:?} pour {} retenue(s)",
         choisies.len()
     );
-    println!(
-        "  un txid = {:.0} us ; comparaisons attendues ~ n log2 n = {:.0}",
-        par_txid * 1e6,
-        n as f64 * (n as f64).log2()
-    );
-    println!(
-        "  soit ~{:.2} s de SHA-256 pur pour un reservoir de 64 Mio ainsi rempli",
-        d.as_secs_f64() * (MEMPOOL_MAX_BYTES as f64 / octets as f64)
-    );
-    println!(
-        "  appele sous le verrou global du noeud a chaque modele de bloc (src/bin/q21.rs:1485)"
-    );
 
+    // Le defaut coutait des SECONDES. Une borne large — un dixieme de seconde —
+    // passe tres au-dessus du cout reel (dizaines de us) tout en rattrapant tout
+    // retour au rehash par comparaison, qui se compterait de nouveau en secondes.
     assert!(
-        d.as_secs_f64() > 50.0 * par_txid,
-        "le tri devrait couter bien plus qu'un txid : {d:?}"
+        d < std::time::Duration::from_millis(100),
+        "le tri ne doit pas rehasher a chaque comparaison : {d:?}"
     );
 }
 
@@ -636,10 +556,16 @@ fn t12_l_eviction_detruit_les_enfants_bien_payants_avec_leur_parent() {
 // 5. revalidate
 // ---------------------------------------------------------------------------
 
-/// `revalidate` valide chaque transaction contre une vue dont `consommees`
-/// contient **ses propres entrees**. Elles lui sont donc invisibles.
+/// `revalidate` sur un jeu d'UTXO inchange est l'identite.
+///
+/// Le defaut d'origine validait chaque transaction contre une vue ou
+/// `consommees` contenait **ses propres entrees** : chacune se voyait comme sa
+/// propre double depense et se retirait. Appelee a chaque bloc connecte, la
+/// fonction **vidait integralement le reservoir** — mesure de l'audit : « avant
+/// 50, apres 0 ». Elle ne verifie desormais que la disponibilite des entrees et
+/// la maturite des coinbases : rien ne change quand rien n'a change.
 #[test]
-fn t07_revalidate_detruit_un_reservoir_parfaitement_valide() {
+fn t07_revalidate_preserve_un_reservoir_valide() {
     let (u, ops) = utxo_synthetique(3, 1_000_000, 300_000);
     let mut m = Mempool::new();
     for (i, op) in ops.iter().enumerate() {
@@ -652,32 +578,33 @@ fn t07_revalidate_detruit_un_reservoir_parfaitement_valide() {
     m.revalidate(&u, RESEAU, 10);
     let apres = m.len();
 
-    println!("--- t07 : revalidate ---");
-    println!("  avant revalidate (jeu d'UTXO inchange) : {avant} transactions");
-    println!("  apres revalidate                        : {apres} transactions");
-    println!("  appele a CHAQUE bloc connecte : src/net.rs:976");
+    println!("--- t07 : revalidate preserve ---");
+    println!("  avant {avant}, apres {apres} (jeu d'UTXO inchange)");
 
     assert_eq!(avant, 3);
     assert_eq!(
-        apres, 0,
-        "revalidate devrait etre l'identite ici ; elle vide le reservoir"
+        apres, 3,
+        "revalidate sur un jeu inchange doit etre l'identite, pas un vidage"
     );
 }
 
-/// Meme sur une chaine de transactions : tout part.
+/// Meme sur une chaine de transactions dependantes : tout survit.
 #[test]
-fn t07b_revalidate_vide_aussi_les_chaines() {
+fn t07b_revalidate_preserve_les_chaines() {
     let mut m = Mempool::new();
     let _ = chaine_mempool(50, &mut m, 400_000);
     let avant = m.len();
-    // La vue de revalidate n'a besoin d'aucun UTXO confirme pour les maillons
-    // 2..n : ils dependent du mempool. Le maillon 1 depend du jeu confirme.
+    // Les maillons 2..n dependent du mempool ; le maillon 1 du jeu confirme.
     let (u, _) = utxo_synthetique(1, 100_000_000, 400_000);
     m.revalidate(&u, RESEAU, 10);
     println!("--- t07b : chaine de 50 maillons ---");
-    println!("  avant : {avant}   apres : {}", m.len());
+    println!("  avant {avant}, apres {}", m.len());
     assert_eq!(avant, 50);
-    assert_eq!(m.len(), 0);
+    assert_eq!(
+        m.len(),
+        50,
+        "une chaine de dependances valides doit survivre a revalidate"
+    );
 }
 
 /// Cout de revalidate si le defaut de t07 etait corrige : une reverification
@@ -756,58 +683,38 @@ fn t09_une_transaction_confirmee_ne_peut_pas_revenir_et_le_rejet_est_bon_marche(
 // 8. Plafond memoire reel
 // ---------------------------------------------------------------------------
 
-/// Le plafond compte `tx.encode().len()`. Combien d'octets reels par octet compte ?
+/// La memoire reelle est bornee par le poids, pas seulement par les octets.
+///
+/// Le defaut : le plafond ne comptait que `tx.encode().len()`, alors que chaque
+/// sortie cree une entree dans `creees` — de la memoire reelle qu'aucun octet
+/// serialise ne refletait. La borne de poids ferme cette porte indirectement :
+/// une transaction a assez de sorties pour gonfler la memoire pese, par ce meme
+/// nombre de sorties, plus que le budget du mineur. Elle est donc refusee.
 #[test]
-fn t10_le_plafond_de_64_mio_ne_borne_pas_la_memoire_reelle() {
-    // Transaction a 1 entree et beaucoup de sorties : chaque sortie pese 41
-    // octets sur le fil mais cree une entree dans `creees`.
+fn t10_le_nombre_de_sorties_est_borne_par_le_poids() {
     const SORTIES: usize = 20_000;
-    const TX: u32 = 40;
+    let (u, ops) = utxo_synthetique(1, 1_000_000_000, 700_000);
+    let mut outs: Vec<TxOut> = (0..SORTIES)
+        .map(|j| sortie(0, puits((j % 256) as u8)))
+        .collect();
+    outs[0] = sortie(1, puits(9));
+    let tx = tx_signee(&ops, outs, 0);
+    let poids = tx.weight(WITNESS_DISCOUNT);
 
     let mut m = Mempool::new();
-    let mut u = UtxoSet::new();
-    let rss0 = rss_kio();
-    for i in 0..TX {
-        let (uu, ops) = utxo_synthetique(1, 1_000_000_000, 700_000 + i * 3);
-        for (o, _) in &ops {
-            u.insert(*o, *uu.get(o).unwrap());
-        }
-        let mut outs = Vec::with_capacity(SORTIES);
-        for j in 0..SORTIES {
-            outs.push(sortie(0, puits((j % 256) as u8)));
-        }
-        // Une sortie non nulle pour laisser des frais.
-        outs[0] = sortie(1, puits(9));
-        let tx = tx_signee(&ops, outs, 0);
-        m.accept(&tx, &u, RESEAU, 10).expect("acceptation");
-    }
-    let rss1 = rss_kio();
+    let r = m.accept(&tx, &u, RESEAU, 10);
 
-    let compte = m.bytes();
-    let reel = (rss1 - rss0) * 1024;
-    println!("--- t10 : comptabilite memoire ---");
-    println!("  transactions : {TX}, {SORTIES} sorties chacune");
-    println!(
-        "  octets comptes par le mempool : {compte} ({:.1} Mio)",
-        compte as f64 / 1048576.0
-    );
-    println!(
-        "  croissance RSS mesuree        : {reel} ({:.1} Mio)",
-        reel as f64 / 1048576.0
-    );
-    println!(
-        "  rapport reel/compte : x{:.2}",
-        reel as f64 / compte as f64
-    );
-    println!(
-        "  extrapolation au plafond de 64 Mio : {:.0} Mio de memoire reelle",
-        64.0 * reel as f64 / compte as f64
-    );
-}
+    println!("--- t10 : sorties bornees par le poids ---");
+    println!("  {SORTIES} sorties -> poids pondere {poids} (budget mineur 2 000 000)");
+    println!("  {} octets serialises -> {r:?}", tx.encode().len());
 
-fn hex(h: &Hash256) -> String {
-    h.as_bytes()[..6]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    assert!(
+        poids > 2_000_000,
+        "20 000 sorties doivent peser plus que le budget : {poids}"
+    );
+    assert!(
+        matches!(r, Err(MempoolError::Inminable { .. })),
+        "une transaction qui gonfle la memoire par ses sorties est refusee, obtenu {r:?}"
+    );
+    assert_eq!(m.len(), 0);
 }
