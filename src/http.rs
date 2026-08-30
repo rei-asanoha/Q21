@@ -68,6 +68,11 @@ pub struct Response {
     pub status: u16,
     pub content_type: String,
     pub body: String,
+    /// Jeton a usage unique du script en ligne de cette page.
+    ///
+    /// Voir [`Response::html`] : il remplace `'unsafe-inline'` dans la
+    /// politique de securite du contenu.
+    pub nonce: Option<String>,
 }
 
 impl Response {
@@ -76,13 +81,49 @@ impl Response {
             status: 200,
             content_type: "application/json; charset=utf-8".into(),
             body,
+            nonce: None,
         }
     }
+
+    /// Une page, et le jeton qui autorise son seul script.
+    ///
+    /// # Ce que cela ferme
+    ///
+    /// La politique de securite du contenu disait `script-src 'unsafe-inline'`.
+    /// Elle autorisait donc **n'importe quel** script en ligne — dont un script
+    /// qu'un attaquant serait parvenu a faire ecrire dans la page. Tant qu'aucun
+    /// texte libre ne traverse le nœud, ce trou reste theorique ; un audit l'a
+    /// verifie champ par champ. Mais une politique n'a d'interet que si elle
+    /// tient encore le jour ou l'on ajoute un champ sans y penser.
+    ///
+    /// Chaque reponse porte donc un jeton tire au hasard, inscrit sur la balise
+    /// `<script>` **et** dans l'en-tete. Le navigateur n'execute alors que ce
+    /// script-la : un script injecte n'a pas le jeton, et ne s'execute pas.
+    /// Deux pages servies coup sur coup n'ont pas le meme jeton, donc il ne se
+    /// devine pas.
+    ///
+    /// # Pourquoi l'echec est ferme
+    ///
+    /// Sans alea sur, on ne fabrique pas un jeton previsible : la page part
+    /// alors avec une politique qui interdit **tout** script, et elle ne
+    /// fonctionne pas. C'est le bon echec — un generateur d'alea en panne est
+    /// un probleme bien plus grave qu'une page inerte, et ce nœud ne devrait de
+    /// toute facon pas manipuler de clefs dans cet etat.
     pub fn html(body: String) -> Response {
+        let mut brut = [0u8; 16];
+        let nonce = match crate::rng::remplir(&mut brut) {
+            Ok(()) => Some(brut.iter().map(|o| format!("{o:02x}")).collect::<String>()),
+            Err(_) => None,
+        };
+        let body = match &nonce {
+            Some(n) => body.replacen("<script>", &format!("<script nonce=\"{n}\">"), 1),
+            None => body,
+        };
         Response {
             status: 200,
             content_type: "text/html; charset=utf-8".into(),
             body,
+            nonce,
         }
     }
     pub fn text(status: u16, body: &str) -> Response {
@@ -90,6 +131,7 @@ impl Response {
             status,
             content_type: "text/plain; charset=utf-8".into(),
             body: body.into(),
+            nonce: None,
         }
     }
     pub fn not_found() -> Response {
@@ -404,13 +446,12 @@ fn garde_navigateur(
     //    l'exploitant a **declare** pour un service public. Un autre nom de
     //    domaine signale une reliaison DNS.
     match req.headers.get("host") {
-        Some(host) => {
-            if !hote_local(host) && !hote_declare(host, hote_public) {
-                return Some(
-                    "en-tete Host inattendue : ce service ne repond qu'a 127.0.0.1,                  [::1] ou localhost",
-                );
-            }
+        Some(host) if !hote_local(host) && !hote_declare(host, hote_public) => {
+            return Some(
+                "en-tete Host inattendue : ce service ne repond qu'a 127.0.0.1, [::1] ou localhost",
+            )
         }
+        Some(_) => {}
         // Absente, elle ne prouve rien — mais un service publie ne repond que
         // sous le nom qu'on lui a donne, et une requete anonyme n'a pas ce nom.
         // En local on reste tolerant : la garde y protege d'un navigateur, qui
@@ -755,6 +796,28 @@ fn decoder_url(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// La politique de securite du contenu de cette reponse.
+///
+/// `script-src` change selon la reponse : le jeton de la page quand il y en a
+/// une, et l'interdiction pure sinon. Une reponse JSON ou un message d'erreur
+/// n'ont aucun script a executer, et le dire coute une ligne.
+///
+/// `style-src` garde `'unsafe-inline'` : les pages emploient des attributs
+/// `style`, qu'un jeton ne couvre pas — c'est une limite de la norme, pas un
+/// choix. Le risque est sans commune mesure : une feuille de style injectee ne
+/// s'execute pas.
+fn politique(r: &Response) -> String {
+    let scripts = match &r.nonce {
+        Some(n) => format!("'nonce-{n}'"),
+        None => "'none'".to_string(),
+    };
+    format!(
+        "default-src 'none'; script-src {scripts}; style-src 'unsafe-inline'; \
+         connect-src 'self'; base-uri 'none'; form-action 'self'; \
+         frame-ancestors 'none'"
+    )
+}
+
 fn ecrire_reponse(flux: &mut TcpStream, r: &Response) -> std::io::Result<()> {
     let texte = match r.status {
         200 => "OK",
@@ -776,13 +839,13 @@ fn ecrire_reponse(flux: &mut TcpStream, r: &Response) -> std::io::Result<()> {
          X-Frame-Options: DENY\r\n\
          Referrer-Policy: no-referrer\r\n\
          Cache-Control: no-store\r\n\
-         Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; \
-style-src 'unsafe-inline'; connect-src 'self'\r\n\
+         Content-Security-Policy: {}\r\n\
          \r\n",
         r.status,
         texte,
         r.content_type,
-        r.body.len()
+        r.body.len(),
+        politique(r)
     );
     flux.write_all(entete.as_bytes())?;
     flux.write_all(r.body.as_bytes())?;
@@ -1314,6 +1377,98 @@ mod tests {
         let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
         let r = get(h.addr, "/x");
         assert!(r.contains("X-Content-Type-Options: nosniff"), "{r}");
+        h.shutdown();
+    }
+
+    /// Page d'essai : un seul script en ligne, comme les pages reelles.
+    fn page() -> impl Fn(Request) -> Response + Send + Sync + 'static {
+        |_r: Request| Response::html("<!doctype html><body><script>1;</script>".into())
+    }
+
+    /// Extrait la valeur du jeton porte par la politique de securite.
+    fn jeton_de_l_entete(reponse: &str) -> Option<String> {
+        let d = reponse.find("script-src 'nonce-")? + "script-src 'nonce-".len();
+        let f = d + reponse[d..].find('\'')?;
+        Some(reponse[d..f].to_string())
+    }
+
+    #[test]
+    fn le_script_en_ligne_n_est_plus_autorise_globalement() {
+        let h = serve("127.0.0.1:0", None, page()).expect("demarrage");
+        let r = get(h.addr, "/p");
+        let ligne = r
+            .lines()
+            .find(|l| l.starts_with("Content-Security-Policy:"))
+            .unwrap_or("")
+            .to_string();
+        let scripts = ligne
+            .split("script-src ")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !scripts.contains("unsafe-inline"),
+            "la politique autorise encore n'importe quel script en ligne : {ligne}"
+        );
+        assert!(ligne.contains("default-src 'none'"), "{ligne}");
+        assert!(ligne.contains("frame-ancestors 'none'"), "{ligne}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn le_jeton_de_l_entete_est_celui_de_la_page() {
+        let h = serve("127.0.0.1:0", None, page()).expect("demarrage");
+        let r = get(h.addr, "/p");
+        let jeton = jeton_de_l_entete(&r).expect("jeton dans l'en-tete");
+        assert_eq!(jeton.len(), 32, "jeton trop court : {jeton}");
+        assert!(jeton.chars().all(|c| c.is_ascii_hexdigit()), "{jeton}");
+        assert!(
+            r.contains(&format!("<script nonce=\"{jeton}\">")),
+            "la balise ne porte pas le jeton de l'en-tete : {r}"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn deux_pages_servies_n_ont_pas_le_meme_jeton() {
+        let h = serve("127.0.0.1:0", None, page()).expect("demarrage");
+        let a = jeton_de_l_entete(&get(h.addr, "/p")).expect("jeton a");
+        let b = jeton_de_l_entete(&get(h.addr, "/p")).expect("jeton b");
+        assert_ne!(a, b, "un jeton previsible n'en est pas un");
+        h.shutdown();
+    }
+
+    /// Un script injecte n'a pas le jeton : il reste inerte.
+    ///
+    /// La page ne porte qu'un seul `<script>`, celui qu'on a ecrit. Une balise
+    /// arrivee par un autre chemin ne peut pas porter le jeton, tire apres
+    /// coup et different a chaque reponse.
+    #[test]
+    fn un_second_script_ne_recoit_pas_le_jeton() {
+        let h = serve("127.0.0.1:0", None, |_r: Request| {
+            Response::html("<script>bon()</script><script>injecte()</script>".into())
+        })
+        .expect("demarrage");
+        let r = get(h.addr, "/p");
+        let jeton = jeton_de_l_entete(&r).expect("jeton");
+        assert!(
+            r.contains(&format!("<script nonce=\"{jeton}\">bon()")),
+            "{r}"
+        );
+        assert!(r.contains("<script>injecte()"), "{r}");
+        h.shutdown();
+    }
+
+    #[test]
+    fn une_reponse_json_n_autorise_aucun_script() {
+        let h = serve("127.0.0.1:0", None, |_r: Request| {
+            Response::json("{\"ok\":true}".into())
+        })
+        .expect("demarrage");
+        let r = get(h.addr, "/j");
+        assert!(r.contains("script-src 'none'"), "{r}");
+        assert!(!r.contains("nonce-"), "{r}");
         h.shutdown();
     }
 }

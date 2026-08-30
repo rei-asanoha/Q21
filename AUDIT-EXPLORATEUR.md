@@ -187,7 +187,7 @@ qui a été vérifié, et qui est le bon compromis.
 
 ## Les épreuves qui gardent ces corrections
 
-Six épreuves nouvelles, dans `src/http.rs`, qui échouent si l'une des portes se
+Des épreuves nouvelles, dans `src/http.rs`, qui échouent si l'une des portes se
 rouvre :
 
 - le nom déclaré est accepté, un autre non, y compris celui qui le contient ;
@@ -199,3 +199,68 @@ rouvre :
 - l'excès d'en-têtes est un refus, pas une réinterprétation.
 
 Elles tournent à chaque livraison.
+
+---
+
+## Second passage : simulations d'attaque, plus en profondeur
+
+Reprise après coup, avec une seule question de plus : **si un jour un texte
+choisi par un inconnu atteignait la page, resterait-il inerte ?** Et une
+deuxième surface, jamais éprouvée jusque-là : **le port pair-à-pair public**.
+
+### Ce que la chaîne peut injecter — rien, aujourd'hui
+
+Le seul champ d'un bloc qu'un inconnu remplit à sa guise est le message de la
+transaction de récompense. On a vérifié, réponse brute à l'appui, qu'**aucune
+méthode de l'explorateur ne l'expose** : ni `getblock`, ni `gettransaction` ne
+le rendent. Tout ce que la page affiche est de l'hexadécimal, un nombre ou une
+adresse bech32 — trois alphabets sans le moindre caractère actif.
+
+Chaque valeur qui traverse tout de même la page passe par un échappement
+unique, et les messages d'erreur sont posés en `textContent`, jamais en HTML.
+Chaque page ne porte qu'**un seul** script, celui qu'on a écrit, et **aucun**
+gestionnaire en ligne.
+
+### Le durcissement quand même : un jeton par réponse
+
+Une porte fermée aujourd'hui peut se rouvrir le jour où l'on ajoute un champ
+sans y penser. La politique de sécurité du contenu disait
+`script-src 'unsafe-inline'` — elle autorisait donc n'importe quel script en
+ligne, y compris un script glissé dans la page. Elle porte désormais un **jeton
+tiré au hasard à chaque réponse**, inscrit sur la balise `<script>` et dans
+l'en-tête. Le navigateur n'exécute que ce script-là ; un script injecté n'a pas
+le jeton, et reste mort. Deux pages servies coup sur coup n'ont pas le même
+jeton : il ne se devine pas. Sans aléa sûr, la page part avec une politique qui
+interdit **tout** script — le bon échec.
+
+Cinq épreuves nouvelles gardent ce point : le jeton diffère d'une réponse à
+l'autre, la balise porte celui de l'en-tête, une réponse JSON n'autorise aucun
+script, et `'unsafe-inline'` ne revient pas dans la politique.
+
+### Le port pair-à-pair, éprouvé pour la première fois
+
+C'est la première chose que touche un octet venu d'un inconnu, et il est
+public. **1 930 trames malformées** lui ont été envoyées : octets purement
+aléatoires, bonne magie avec commande inconnue, commandes connues aux charges
+absurdes, en-têtes annonçant quatre milliards d'éléments, trames tronquées puis
+coupées net, sommes de contrôle fausses, rembourrage non nul, envoi octet par
+octet puis abandon.
+
+Le nœud a **tout encaissé sans une seule panique**, mémoire stable à 4,5 Mio,
+et il répondait encore normalement à la fin. C'est la promesse écrite en tête
+du fichier de protocole — *aucune allocation avant contrôle, aucune panique* —
+tenue à l'épreuve.
+
+### Les trois batteries, rejouées contre la nouvelle version
+
+Les batteries du premier passage — traversée de chemin, reliaison DNS, méthodes
+qui modifieraient quelque chose, bornes de taille, analyseur JSON,
+amplification par lot, coût par requête, Slowloris — ont été **rejouées à
+l'identique** contre la version au jeton. Même verdict : chaque porte tient. Le
+seul résidu reste le même, et il est assumé : deux cents connexions muettes
+saturent un serveur à un fil par connexion. La parade n'est pas dans le nœud —
+elle est dans le portier, et dans le refus du nœud de s'exposer ailleurs que
+sur la boucle locale. Les deux sont en place.
+
+**Verdict du second passage : rien de nouveau à corriger sur le fond, un cran
+de durcissement ajouté par prudence.** Le coffre tient.
