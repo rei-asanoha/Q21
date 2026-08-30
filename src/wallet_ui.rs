@@ -566,8 +566,8 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
         <div class="n">depuis le lancement</div></div>
       <div class="tuile"><div class="k">Tentatives</div><div class="v" id="minage-total">0</div>
         <div class="n">depuis le lancement</div></div>
-      <div class="tuile"><div class="k">Blocs reçus</div><div class="v" id="vitesse-sync">0</div>
-        <div class="n">par seconde, depuis le réseau</div></div>
+      <div class="tuile"><div class="k">Rythme de la chaîne</div><div class="v" id="vitesse-sync">—</div>
+        <div class="n" id="vitesse-note">cible : un bloc toutes les 2 minutes</div></div>
       <div class="tuile"><div class="k">Mémoire occupée</div><div class="v" id="minage-memoire">—</div>
         <div class="n" id="minage-memoire-note">la table de calcul, en mémoire vive</div></div>
     </div>
@@ -1685,8 +1685,33 @@ function pouls(sync){
       ? "· " + sync.blocs_restants + " bloc(s) restants"
       : "· aucun ordinateur joignable";
 
+  // --- Le rythme se dit dans l'unite ou on le vit.
+  //
+  // Cette tuile annoncait « blocs reçus par seconde ». Sur une chaine en bonne
+  // sante, un bloc toutes les deux minutes fait 0,008 par seconde : elle
+  // affichait donc « 0 » en permanence, et deux utilisateurs y ont lu que leur
+  // machine ne recevait rien alors que tout allait bien. Un chiffre qui vaut
+  // toujours zero n'informe pas, il inquiete.
+  //
+  // On affiche donc la **cadence** — un bloc toutes les tant de minutes —, qui
+  // est la grandeur que le protocole vise et que l'œil compare d'un coup. Le
+  // rattrapage garde les blocs par seconde : la, ils se comptent par dizaines
+  // et c'est bien l'unite utile.
   const v = document.getElementById("vitesse-sync");
-  if (v) v.textContent = (vitesseBlocs < 0.05 ? "0" : vitesseBlocs.toFixed(1));
+  const vn = document.getElementById("vitesse-note");
+  if (v){
+    if (vitesseBlocs >= 1){
+      v.textContent = vitesseBlocs.toFixed(1) + " blocs/s";
+      if (vn) vn.textContent = "rattrapage en cours";
+    } else if (vitesseBlocs > 0.0005){
+      const min = 1 / (vitesseBlocs * 60);
+      v.textContent = "1 bloc / " + (min < 10 ? min.toFixed(1) : Math.round(min)) + " min";
+      if (vn) vn.textContent = "cadence observée — cible : 2 minutes";
+    } else {
+      v.textContent = "—";
+      if (vn) vn.textContent = "aucun bloc depuis le lancement de cet écran";
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2695,6 +2720,33 @@ mod tests {
             PAGE.contains("tous les 71 jours"),
             "rien ne dit que la table grandit"
         );
+    }
+
+    /// Le rythme de la chaine ne s'affiche pas dans une unite ou il vaut zero.
+    ///
+    /// La tuile annoncait « blocs reçus par seconde ». Un bloc toutes les deux
+    /// minutes fait 0,008 par seconde : elle affichait donc « 0 » en
+    /// permanence, sur un reseau parfaitement sain. Deux utilisateurs y ont lu
+    /// que leur machine ne recevait rien. Un chiffre qui vaut toujours zero
+    /// n'informe pas, il inquiete.
+    #[test]
+    fn le_rythme_de_la_chaine_se_dit_en_minutes_par_bloc() {
+        assert!(
+            PAGE.contains("Rythme de la chaîne"),
+            "la tuile n'est pas renommee"
+        );
+        assert!(
+            PAGE.contains(r#""1 bloc / ""#),
+            "la cadence ne s'exprime pas en minutes par bloc"
+        );
+        assert!(
+            !PAGE.contains("par seconde, depuis le réseau"),
+            "l'ancienne unite, toujours nulle, est encore la"
+        );
+        // Le rattrapage garde les blocs par seconde : la, ils se comptent par
+        // dizaines et c'est l'unite utile.
+        assert!(PAGE.contains("rattrapage en cours"));
+        assert!(PAGE.contains("cible : 2 minutes"));
     }
 
     /// Un bloc illisible se signale, et se distingue d'un historique tronque.
