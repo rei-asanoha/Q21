@@ -758,7 +758,30 @@ impl Wallet {
         montant: Amount,
         frais: Amount,
     ) -> Result<Transaction, WalletError> {
-        if montant.units() == 0 {
+        self.create_transaction_multi(utxo, hauteur, &[(*destinataire, montant)], frais)
+    }
+
+    /// Une transaction qui paie **plusieurs** destinataires d'un coup.
+    ///
+    /// # Pourquoi elle existe
+    ///
+    /// Payer dix personnes en dix transactions, c'est dix ossatures, dix
+    /// signatures d'entree, dix fois le passage au reservoir. Les regrouper en
+    /// une seule transaction a N sorties partage l'ossature et n'engage les
+    /// pieces qu'une fois : le debit de paiements par seconde grimpe d'un ordre
+    /// de grandeur, et les frais totaux baissent d'autant.
+    ///
+    /// Le reste ne change pas : selection des pieces, monnaie sur une adresse
+    /// neuve, une signature a usage unique par entree, et la meme derniere
+    /// barriere qui refuse de signer si la clef derivee n'ouvre pas le verrou.
+    pub fn create_transaction_multi(
+        &mut self,
+        utxo: &UtxoSet,
+        hauteur: u64,
+        destinations: &[(Address, Amount)],
+        frais: Amount,
+    ) -> Result<Transaction, WalletError> {
+        if destinations.is_empty() {
             return Err(WalletError::MontantNul);
         }
         if !self.scheme.disponible() {
@@ -769,30 +792,41 @@ impl Wallet {
         //
         // `montant + frais` etait une addition nue. Avec `overflow-checks` sur
         // tous les profils et `panic = "abort"` en release, un appel RPC
-        // `sendtoaddress` portant un montant proche de `u64::MAX` **arretait le
-        // demon**. Et l'analyseur JSON ne fermait pas la porte : `as_u64`
-        // accepte une chaine, donc la borne `i64::MAX` se contourne en passant
-        // le nombre entre guillemets.
+        // portant un montant proche de `u64::MAX` **arretait le demon**. Et
+        // l'analyseur JSON ne fermait pas la porte : `as_u64` accepte une
+        // chaine, donc la borne `i64::MAX` se contourne en passant le nombre
+        // entre guillemets. Un lot n'ajoute qu'une chose : la somme des
+        // montants doit, elle aussi, rester sous le plafond a chaque pas.
         //
         // Aucun montant legitime ne depasse le plafond d'emission. On refuse
         // les deux : le debordement, et l'invraisemblance.
-        if montant.units() > crate::consensus::MAX_SUPPLY
-            || frais.units() > crate::consensus::MAX_SUPPLY
-        {
+        if frais.units() > crate::consensus::MAX_SUPPLY {
             return Err(WalletError::MontantHorsBornes);
         }
-        let besoin = montant
-            .units()
+        let mut total_sortant: u64 = 0;
+        for (_, montant) in destinations {
+            if montant.units() == 0 {
+                return Err(WalletError::MontantNul);
+            }
+            total_sortant = total_sortant
+                .checked_add(montant.units())
+                .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
+                .ok_or(WalletError::MontantHorsBornes)?;
+        }
+        let besoin = total_sortant
             .checked_add(frais.units())
             .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
             .ok_or(WalletError::MontantHorsBornes)?;
         let (choisies, total) = self.selectionner(utxo, hauteur, besoin)?;
 
-        let mut sorties = vec![TxOut {
-            value: montant,
-            scheme: destinataire.scheme,
-            pubkey_hash: destinataire.hash,
-        }];
+        let mut sorties: Vec<TxOut> = destinations
+            .iter()
+            .map(|(adresse, montant)| TxOut {
+                value: *montant,
+                scheme: adresse.scheme,
+                pubkey_hash: adresse.hash,
+            })
+            .collect();
 
         let monnaie = total - besoin;
         if monnaie > 0 {

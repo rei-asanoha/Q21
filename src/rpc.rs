@@ -486,6 +486,10 @@ impl RpcContext {
             ("getnewaddress", "[portefeuille] Adresse de reception neuve"),
             ("sendtoaddress", "[portefeuille] Envoi de fonds"),
             (
+                "sendmany",
+                "[portefeuille] Envoi a plusieurs destinataires en une transaction",
+            ),
+            (
                 "getwalletinfo",
                 "[portefeuille] Schema, reseau, adresses, clefs consommees",
             ),
@@ -567,6 +571,7 @@ impl RpcContext {
             "getbalance" => self.getbalance(),
             "getnewaddress" => self.getnewaddress(),
             "sendtoaddress" => self.sendtoaddress(params),
+            "sendmany" => self.sendmany(params),
             "getwalletinfo" => self.getwalletinfo(),
             "listaddresses" => self.listaddresses(),
             "setaddresslabel" => self.setaddresslabel(params),
@@ -2397,6 +2402,97 @@ impl RpcContext {
             .set("transaction", tx_json(&tx, self.network))
             .build())
     }
+
+    /// Paie plusieurs destinataires en **une seule** transaction.
+    ///
+    /// Meme chemin que `sendtoaddress` — un seul verrou pour construire et
+    /// accepter, la clef consommee ecrite sur disque quoi qu'il arrive — mais
+    /// sur une liste de sorties. Le nombre de destinataires est borne : une
+    /// transaction demesuree serait de toute facon refusee par le poids, et un
+    /// plafond franc vaut mieux qu'un refus obscur du reservoir.
+    fn sendmany(&self, params: &Json) -> Result<Json, Json> {
+        const MAX_DESTINATAIRES: usize = 1000;
+        let w = self.portefeuille()?;
+
+        let liste = params
+            .get("destinations")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                erreur(
+                    ERR_PARAMS,
+                    "parametre 'destinations' attendu : une liste d'objets {adresse, unites}",
+                )
+            })?;
+        if liste.is_empty() {
+            return Err(erreur(ERR_PARAMS, "au moins un destinataire est attendu"));
+        }
+        if liste.len() > MAX_DESTINATAIRES {
+            return Err(erreur(
+                ERR_PARAMS,
+                &format!("au plus {MAX_DESTINATAIRES} destinataires par envoi"),
+            ));
+        }
+
+        let mut destinations = Vec::with_capacity(liste.len());
+        for d in liste {
+            let adresse = d.get("adresse").and_then(|v| v.as_str()).ok_or_else(|| {
+                erreur(ERR_PARAMS, "chaque destination attend un champ 'adresse'")
+            })?;
+            let unites = d.get("unites").and_then(|v| v.as_u64()).ok_or_else(|| {
+                erreur(
+                    ERR_PARAMS,
+                    "chaque destination attend un champ 'unites' (entier)",
+                )
+            })?;
+            let dest = Address::parse_on(adresse, self.network)
+                .map_err(|e| erreur(ERR_PARAMS, &format!("adresse invalide : {e:?}")))?;
+            destinations.push((dest, Amount::from_units(unites)));
+        }
+
+        let frais = match params.get("frais") {
+            None | Some(Json::Null) => FRAIS_DEFAUT,
+            Some(v) => v.as_u64().ok_or_else(|| {
+                erreur(
+                    ERR_PARAMS,
+                    "parametre 'frais' present mais illisible : un entier d'unites est attendu",
+                )
+            })?,
+        };
+
+        let (tx, txid) = {
+            let mut g = w
+                .lock()
+                .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+            let resultat = self.node.with_chain_and_mempool(|c, m| {
+                let tx = g.create_transaction_multi(
+                    &c.utxo,
+                    c.height(),
+                    &destinations,
+                    Amount::from_units(frais),
+                );
+                match tx {
+                    Ok(tx) => {
+                        let r = m.accept(&tx, &c.utxo, self.network, c.height());
+                        Ok((tx, r))
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+            self.enregistrer(&g);
+            let (tx, accepte) =
+                resultat.map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
+            let txid = accepte.map_err(|e| erreur(ERR_PORTEFEUILLE, &message_reservoir(&e)))?;
+            (tx, txid)
+        };
+
+        self.node.announce_tx(txid);
+
+        Ok(Json::obj()
+            .set("txid", Json::str(txid.to_hex()))
+            .set("destinataires", Json::u64(destinations.len() as u64))
+            .set("transaction", tx_json(&tx, self.network))
+            .build())
+    }
 }
 
 /// Schema par defaut du portefeuille, expose pour la documentation.
@@ -2612,6 +2708,60 @@ mod tests {
                 .and_then(|v| v.as_str())
                 == Some(val.as_str())),
             "toutes les sorties rendues doivent valoir exactement le montant cherche"
+        );
+    }
+
+    /// Un seul envoi paie plusieurs destinataires : la transaction porte bien
+    /// toutes leurs sorties, et la monnaie revient au portefeuille.
+    #[test]
+    fn sendmany_paie_plusieurs_destinataires_en_une_transaction() {
+        let c = contexte_avec_fonds();
+        let mut autre = Wallet::from_seed([0x11; 32], RESEAU);
+        let a1 = autre.new_address().to_string_bech32();
+        let a2 = autre.new_address().to_string_bech32();
+
+        let params = format!(
+            r#"{{"destinations":[{{"adresse":"{a1}","unites":1000}},{{"adresse":"{a2}","unites":2000}}]}}"#
+        );
+        let r = resultat(&c, "sendmany", &params);
+
+        assert!(
+            r.get("txid").and_then(|v| v.as_str()).is_some(),
+            "un envoi accepte doit rendre un identifiant"
+        );
+        assert_eq!(r.get("destinataires").and_then(|v| v.as_u64()), Some(2));
+
+        let sorties = r
+            .get("transaction")
+            .and_then(|t| t.get("sorties"))
+            .and_then(|v| v.as_array())
+            .expect("sorties presentes");
+        // Deux destinataires, plus la monnaie : au moins deux sorties.
+        assert!(sorties.len() >= 2);
+        let unites: Vec<u64> = sorties
+            .iter()
+            .filter_map(|s| {
+                s.get("valeur")
+                    .and_then(|v| v.get("unites"))
+                    .and_then(|v| v.as_u64())
+            })
+            .collect();
+        assert!(
+            unites.contains(&1000) && unites.contains(&2000),
+            "les deux montants demandes doivent figurer parmi les sorties : {unites:?}"
+        );
+    }
+
+    /// Un envoi sans destinataire est refuse proprement, pas construit a vide.
+    #[test]
+    fn sendmany_refuse_une_liste_vide() {
+        let c = contexte_avec_fonds();
+        let r = appel(&c, "sendmany", r#"{"destinations":[]}"#);
+        assert_eq!(
+            r.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_i64()),
+            Some(ERR_PARAMS)
         );
     }
 

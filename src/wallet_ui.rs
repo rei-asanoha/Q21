@@ -649,6 +649,12 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
     <input type="text" id="champ-montant" placeholder="0.00000000" inputmode="decimal" spellcheck="false" autocomplete="off">
     <div class="aide" id="aide-montant">Huit décimales au maximum. Une unité vaut 0.00000001&nbsp;Q21.</div>
 
+    <div id="destinataires-plus"></div>
+    <div class="boutons">
+      <button type="button" class="discret" id="bouton-ajouter-destinataire">+ Ajouter un destinataire</button>
+    </div>
+    <div class="aide">Un seul envoi peut payer plusieurs destinataires à la fois&nbsp;: c'est une transaction unique, aux frais partagés, plutôt que plusieurs envois séparés.</div>
+
     <label for="champ-frais">Frais, en Q21</label>
     <input type="text" id="champ-frais" placeholder="0.00000000" inputmode="decimal" spellcheck="false" autocomplete="off">
     <div class="aide" id="aide-frais">Suggestion du nœud, modifiable.</div>
@@ -1284,8 +1290,12 @@ async function estimer(){
   const aide = document.getElementById("aide-frais");
   const n = document.getElementById("champ-entrees").value.trim();
   const entrees = /^[0-9]+$/.test(n) ? Math.min(Math.max(parseInt(n, 10), 1), 100) : 2;
+  // Une sortie par destinataire, plus la monnaie : les frais suivent le nombre
+  // de destinataires quand l'envoi en compte plusieurs.
+  const dest = 1 + document.querySelectorAll("#destinataires-plus .dest-plus").length;
+  const sorties = dest + 1;
   try{
-    const f = await appel("estimatefee", '{"entrees":' + entrees + ',"sorties":2}');
+    const f = await appel("estimatefee", '{"entrees":' + entrees + ',"sorties":' + sorties + '}');
     document.getElementById("champ-frais").value = f.frais_suggeres.q21;
     aide.textContent =
       "Suggestion du nœud pour " + f.entrees + " entrée(s) et " + f.sorties +
@@ -1299,23 +1309,59 @@ async function estimer(){
 
 document.getElementById("bouton-estimer").addEventListener("click", estimer);
 
+// Ajoute une ligne « destinataire supplémentaire ». Le gabarit est statique —
+// aucune donnée n'y est interpolée — pour rester hors de portée de toute
+// injection : les champs partent vides, l'utilisateur les remplit ensuite.
+document.getElementById("bouton-ajouter-destinataire").addEventListener("click", () => {
+  const zone = document.getElementById("destinataires-plus");
+  const ligne = document.createElement("div");
+  ligne.className = "dest-plus";
+  ligne.style.marginTop = ".6rem";
+  ligne.innerHTML =
+    '<label>Adresse d\'un autre destinataire</label>'
+  + '<input type="text" class="dest-adresse" placeholder="tq21…" spellcheck="false" autocomplete="off">'
+  + '<label>Montant, en Q21</label>'
+  + '<input type="text" class="dest-montant" placeholder="0.00000000" inputmode="decimal" spellcheck="false" autocomplete="off">'
+  + '<div class="boutons"><button type="button" class="discret dest-retirer">Retirer</button></div>';
+  zone.appendChild(ligne);
+  ligne.querySelector(".dest-retirer").addEventListener("click", () => ligne.remove());
+});
+
 document.getElementById("forme-envoi").addEventListener("submit", async ev => {
   ev.preventDefault();
   document.getElementById("resultat-envoi").innerHTML = "";
-
-  const adresse = document.getElementById("champ-adresse").value.trim();
-  const montant = unitesDepuisQ21(document.getElementById("champ-montant").value);
-  const frais = unitesDepuisQ21(document.getElementById("champ-frais").value);
 
   const refus = m => {
     document.getElementById("resultat-envoi").innerHTML =
       `<div class="avert"><h3>Envoi non préparé</h3><p>${ech(m)}</p></div>`;
   };
-  if (!adresse) return refus("Aucune adresse de destination.");
-  if (montant === null) return refus("Montant illisible. Attendu : un nombre en Q21, huit décimales au maximum.");
-  if (montant <= 0n) return refus("Le montant doit être strictement positif.");
+
+  // Le destinataire principal, puis les éventuels destinataires ajoutés. Un
+  // seul chemin de validation pour tous : chaque montant est un entier d'unités.
+  const destinations = [];
+  const a0 = document.getElementById("champ-adresse").value.trim();
+  const m0 = unitesDepuisQ21(document.getElementById("champ-montant").value);
+  if (!a0) return refus("Aucune adresse de destination.");
+  if (m0 === null) return refus("Montant illisible. Attendu : un nombre en Q21, huit décimales au maximum.");
+  if (m0 <= 0n) return refus("Le montant doit être strictement positif.");
+  destinations.push({adresse: a0, montant: m0});
+
+  for (const ligne of document.querySelectorAll("#destinataires-plus .dest-plus")) {
+    const a = ligne.querySelector(".dest-adresse").value.trim();
+    const mm = unitesDepuisQ21(ligne.querySelector(".dest-montant").value);
+    if (!a) return refus("Un destinataire supplémentaire est sans adresse. Retirez la ligne ou remplissez-la.");
+    if (mm === null) return refus("Un montant supplémentaire est illisible. Attendu : un nombre en Q21.");
+    if (mm <= 0n) return refus("Chaque montant doit être strictement positif.");
+    destinations.push({adresse: a, montant: mm});
+  }
+
+  const frais = unitesDepuisQ21(document.getElementById("champ-frais").value);
   if (frais === null) return refus("Frais illisibles. Attendu : un nombre en Q21, huit décimales au maximum.");
   if (frais < 0n) return refus("Les frais ne peuvent pas être négatifs.");
+
+  let somme = 0n;
+  for (const d of destinations) somme += d.montant;
+  const total = somme + frais;
 
   // Le solde est relu maintenant, pas au chargement de la page : entre les
   // deux, un bloc a pu arriver.
@@ -1325,19 +1371,27 @@ document.getElementById("forme-envoi").addEventListener("submit", async ev => {
   }catch(e){
     return refus("Solde non relu, envoi interrompu : " + e.message);
   }
-  const total = montant + frais;
   if (total > depensable){
     return refus("Fonds insuffisants : " + q21DepuisUnites(total) +
                  " Q21 demandés, " + q21DepuisUnites(depensable) + " Q21 dépensables.");
   }
 
-  envoiPrepare = {adresse: adresse, montant: montant, frais: frais};
-  document.getElementById("recap").innerHTML = `
-    <div class="l"><span class="k">Destinataire</span><span class="v">${ech(adresse)}</span></div>
-    <div class="l"><span class="k">Montant</span><span class="v">${ech(q21DepuisUnites(montant))} Q21</span></div>
-    <div class="l"><span class="k">Frais</span><span class="v">${ech(q21DepuisUnites(frais))} Q21</span></div>
-    <div class="l total"><span class="k">Débité au total</span><span class="v">${ech(q21DepuisUnites(total))} Q21</span></div>
-    <div class="l"><span class="k">Solde après</span><span class="v">${ech(q21DepuisUnites(depensable - total))} Q21</span></div>`;
+  const lignesRecap = destinations.map(d =>
+      `<div class="l"><span class="k">Destinataire</span><span class="v">${ech(d.adresse)}</span></div>`
+    + `<div class="l"><span class="k">Montant</span><span class="v">${ech(q21DepuisUnites(d.montant))} Q21</span></div>`
+    ).join("");
+  document.getElementById("recap").innerHTML = lignesRecap
+    + `<div class="l"><span class="k">Frais</span><span class="v">${ech(q21DepuisUnites(frais))} Q21</span></div>`
+    + `<div class="l total"><span class="k">Débité au total</span><span class="v">${ech(q21DepuisUnites(total))} Q21</span></div>`
+    + `<div class="l"><span class="k">Solde après</span><span class="v">${ech(q21DepuisUnites(depensable - total))} Q21</span></div>`;
+
+  // Un seul destinataire garde la forme d'origine — et le chemin sendtoaddress
+  // qui va avec ; plusieurs portent la liste, envoyée par sendmany.
+  if (destinations.length === 1) {
+    envoiPrepare = {adresse: a0, montant: m0, frais: frais};
+  } else {
+    envoiPrepare = {destinations: destinations, frais: frais};
+  }
   document.getElementById("forme-envoi").hidden = true;
   document.getElementById("confirmation").hidden = false;
 });
@@ -1356,17 +1410,29 @@ document.getElementById("bouton-envoyer").addEventListener("click", async () => 
   const p = envoiPrepare;
   // Les entiers partent en chiffres, sans passer par un `Number` : c'est la
   // seule facon d'etre certain que la somme envoyee est celle qui a ete
-  // affichee sur l'ecran de confirmation.
-  const params = '{"adresse":' + JSON.stringify(p.adresse) +
-                 ',"unites":' + p.montant.toString() +
-                 ',"frais":' + p.frais.toString() + '}';
+  // affichee sur l'ecran de confirmation. Un destinataire prend sendtoaddress ;
+  // plusieurs prennent sendmany, avec la meme rigueur sur chaque montant.
+  let methode, params;
+  if (p.destinations) {
+    const items = p.destinations.map(d =>
+      '{"adresse":' + JSON.stringify(d.adresse) + ',"unites":' + d.montant.toString() + '}'
+    ).join(",");
+    methode = "sendmany";
+    params = '{"destinations":[' + items + '],"frais":' + p.frais.toString() + '}';
+  } else {
+    methode = "sendtoaddress";
+    params = '{"adresse":' + JSON.stringify(p.adresse) +
+             ',"unites":' + p.montant.toString() +
+             ',"frais":' + p.frais.toString() + '}';
+  }
   try{
-    const r = await appel("sendtoaddress", params);
+    const r = await appel(methode, params);
     envoiPrepare = null;
     document.getElementById("confirmation").hidden = true;
     document.getElementById("forme-envoi").hidden = false;
     document.getElementById("champ-montant").value = "";
     document.getElementById("champ-adresse").value = "";
+    document.getElementById("destinataires-plus").innerHTML = "";
     document.getElementById("resultat-envoi").innerHTML = `
       <div class="note">
         <h3>✓ Envoi transmis au réseau</h3>
