@@ -68,6 +68,10 @@ COMMANDES
                              --rpc-wallet         active les methodes de
                                                   portefeuille (elles peuvent
                                                   deplacer des fonds)
+                             --rpc-public <nom>   publie l'explorateur sous ce
+                                                  nom de domaine, derriere un
+                                                  mandataire. Refuse si un
+                                                  portefeuille est servi
                              --seconds <n>        s'arrete apres n secondes
                              --fils <n>           fils de minage (defaut : tous
                                                   les coeurs)
@@ -2046,6 +2050,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut duree = 0u64;
     let mut rpc: Option<String> = None;
     let mut rpc_token: Option<String> = None;
+    // Nom de domaine sous lequel ce nœud est publie. Voir plus bas : il n'est
+    // accepte que sur un nœud sans portefeuille.
+    let mut rpc_public: Option<String> = None;
     let mut rpc_wallet = false;
     let mut fils: usize = 0;
     let mut cible_pairs: usize = 8;
@@ -2083,6 +2090,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             "--rpc-wallet" => {
                 rpc_wallet = true;
                 i += 1;
+            }
+            "--rpc-public" if i + 1 < args.len() => {
+                rpc_public = Some(args[i + 1].clone());
+                i += 2;
             }
             "--mine" => {
                 mine = true;
@@ -2361,6 +2372,30 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         }
     }
 
+    // --- Publier un explorateur n'est jamais publier un portefeuille.
+    //
+    // `--rpc-public` fait accepter au serveur un nom de domaine dans l'en-tete
+    // `Host`, ce qui desarme la garde anti-reliaison DNS pour ce nom. C'est
+    // exactement ce qu'il faut pour un explorateur derriere un mandataire, et
+    // exactement ce qu'il ne faut jamais faire quand des fonds sont servis sur
+    // le meme port. Le refus est ici, avant tout demarrage, et il n'est pas
+    // negociable.
+    if let Some(nom) = &rpc_public {
+        if rpc_wallet || !sans_portefeuille {
+            return Err(format!(
+                "refus : --rpc-public {nom} publie ce noeud sur Internet, et ce dossier
+                       porte un portefeuille. Un explorateur public se lance depuis un
+                       dossier sans portefeuille :
+
+                       q21 --datadir <dossier-sans-portefeuille> node --reseau testnet \\
+                           --rpc 127.0.0.1:21080 --rpc-public {nom}"
+            ));
+        }
+        if rpc.is_none() {
+            return Err("--rpc-public demande --rpc <adresse>".to_string());
+        }
+    }
+
     let _serveur = if let Some(adresse) = &rpc {
         // Toute operation qui modifie le portefeuille est ecrite sur disque
         // immediatement. Une depense qui ne serait consignee qu'en memoire
@@ -2400,11 +2435,21 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // Les deux coquilles statiques. Elles ne portent aucune donnee : c'est
         // le JavaScript qui interroge le RPC, et le RPC exige le jeton.
         const PUBLICS: &[&str] = &["/", "/index.html", "/portefeuille", "/portefeuille.html"];
-        let h =
-            q21_core::http::serve_avec_public(adresse, rpc_token.clone(), PUBLICS, move |req| {
-                servir(&ctx, req)
-            })
-            .map_err(|e| e.to_string())?;
+        let h = match &rpc_public {
+            // Explorateur public : pas de jeton — il est fait pour etre lu par
+            // n'importe qui — mais un nom declare, et aucun portefeuille servi,
+            // ce que le refus ci-dessus a deja garanti.
+            Some(nom) => {
+                q21_core::http::serve_public_web(adresse, nom.clone(), move |req| servir(&ctx, req))
+                    .map_err(|e| e.to_string())?
+            }
+            None => {
+                q21_core::http::serve_avec_public(adresse, rpc_token.clone(), PUBLICS, move |req| {
+                    servir(&ctx, req)
+                })
+                .map_err(|e| e.to_string())?
+            }
+        };
 
         // En mode silencieux, le lanceur a deja tout dit : repeter l'adresse et
         // les avertissements ne ferait que rallonger ce que l'utilisateur doit
