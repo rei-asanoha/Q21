@@ -1221,23 +1221,27 @@ fn faille_slowloris_aucun_delai_global() {
     h.shutdown();
 }
 
-/// Au-dela de `MAX_HEADERS` en-tetes, la boucle de lecture s'arrete **sans
-/// consommer la ligne vide**. Les en-tetes suivantes ne sont ni lues ni
-/// refusees : elles deviennent silencieusement le corps.
+/// Au-dela de `MAX_HEADERS` en-tetes, la requete est **refusee**.
 ///
-/// Ce comportement n'a pas change, et ce test le fixe tel quel. Ce qui a change,
-/// c'est que chacune de ses consequences est desormais **fermante** — aucune ne
-/// laisse passer une requete qui serait autrement refusee :
+/// # L'histoire de ce test, qui est celle du correctif
 ///
-/// - une authentification placee apres la 64e en-tete est ignoree, donc 401 ;
-/// - un `Content-Type` place apres la 64e en-tete est ignore, donc 403 par
-///   `garde_navigateur` ;
-/// - un `Content-Length` correct mais suivi de bourrage voit son corps decale :
-///   le document analyse est du bourrage, donc une erreur d'analyse.
+/// La boucle de lecture s'arretait a la limite **sans consommer la ligne
+/// vide** : les en-tetes suivantes n'etaient ni lues ni refusees, elles
+/// devenaient silencieusement le debut du corps. Ce test fixait ce
+/// comportement tel quel, en verifiant que chacune de ses consequences etait au
+/// moins *fermante* — une authentification hors de portee donnait 401, un
+/// `Content-Type` hors de portee donnait 403, un corps decale donnait une
+/// erreur d'analyse. Aucune ne laissait passer une requete qui aurait ete
+/// refusee autrement.
 ///
-/// Reste qu'un 400 franc — « trop d'en-tetes » — vaudrait mieux qu'un corps
-/// silencieusement decale. C'est la rugosite que ces assertions surveillent : si
-/// l'une d'elles cesse de valoir, c'est que le decoupage a bouge.
+/// Sa derniere ligne disait pourtant : « un 400 franc vaudrait mieux qu'un
+/// corps silencieusement decale ». L'audit d'intrusion mene avant la mise en
+/// ligne de l'explorateur public a tranche — une requete dont le decoupage
+/// depend de l'emetteur est le terrain de la contrebande, et cette tolerance
+/// deviendrait une faille le jour ou l'on ajouterait la reutilisation des
+/// connexions.
+///
+/// Les trois cas rendent desormais **400**, et ce test verifie qu'ils le font.
 #[test]
 fn faille_au_dela_de_64_entetes_le_reste_devient_le_corps() {
     let bourrage = |n: usize| {
@@ -1257,8 +1261,8 @@ fn faille_au_dela_de_64_entetes_le_reste_devient_le_corps() {
     );
     let r = brut(h.addr, req.as_bytes());
     assert!(
-        r.starts_with("HTTP/1.1 401"),
-        "l'authentification apres {} en-tetes doit etre ignoree, pas honoree : {}",
+        r.starts_with("HTTP/1.1 400"),
+        "au-dela de {} en-tetes, la requete doit etre refusee franchement : {}",
         http::MAX_HEADERS,
         r.lines().next().unwrap_or("(rien)")
     );
@@ -1283,13 +1287,14 @@ fn faille_au_dela_de_64_entetes_le_reste_devient_le_corps() {
     );
     let r = brut(h2.addr, req.as_bytes());
     assert!(
-        r.starts_with("HTTP/1.1 403"),
+        r.starts_with("HTTP/1.1 400"),
         "un Content-Type hors de portee doit fermer la requete : {}",
         r.lines().next().unwrap_or("(rien)")
     );
 
-    // 3. En-tetes valides d'abord, bourrage ensuite : le corps annonce est
-    //    decale par les en-tetes non lues, et l'appel devient illisible.
+    // 3. En-tetes valides d'abord, bourrage ensuite : autrefois le corps
+    //    annonce se trouvait decale par les en-tetes non lues et l'appel
+    //    devenait illisible. Desormais la requete n'est simplement pas servie.
     let req = format!(
         "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\n{}\r\n{corps}",
@@ -1298,14 +1303,23 @@ fn faille_au_dela_de_64_entetes_le_reste_devient_le_corps() {
     );
     let r = brut(h2.addr, req.as_bytes());
     assert!(
-        corps_de(&r).contains("-32700"),
-        "le corps decale doit produire une erreur d'analyse, jamais un appel \
-         execute : {r}"
+        r.starts_with("HTTP/1.1 400"),
+        "le bourrage doit fermer la requete : {}",
+        r.lines().next().unwrap_or("(rien)")
     );
     assert!(
         !corps_de(&r).contains("\"hauteur\""),
-        "l'appel a ete execute malgre le decalage : {r}"
+        "l'appel a ete execute malgre le bourrage : {r}"
     );
+
+    // Et la meme requete sans bourrage est servie : c'est bien la limite qui
+    // coupe, pas autre chose.
+    let req = format!(
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{corps}",
+        corps.len()
+    );
+    assert!(corps_de(&brut(h2.addr, req.as_bytes())).contains("\"hauteur\""));
     h2.shutdown();
 }
 
