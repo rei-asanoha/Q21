@@ -197,11 +197,40 @@ Effacez tout ce qui s'y trouve (**Ctrl + K** répété efface ligne par ligne) e
 mettez exactement ceci :
 
 ```
+{
+	servers {
+		timeouts {
+			read_header 5s
+			read_body   10s
+			idle        30s
+		}
+	}
+}
+
 explorateur.q21.dev {
 	encode gzip
+	request_body {
+		max_size 1MB
+	}
+	@portefeuille path /portefeuille* /bienvenue*
+	respond @portefeuille 404
 	reverse_proxy 127.0.0.1:21080
 }
 ```
+
+Chaque ligne a une raison, et elle vient de l'audit d'intrusion :
+
+- **`read_header 5s`** — c'est la parade à *Slowloris*. Le nœud traite une
+  connexion par fil, soixante-quatre au plus : deux cents connexions ouvertes et
+  jamais terminées suffisaient à le rendre indisponible. L'audit l'a reproduit en
+  deux lignes. Le portier, lui, est fait pour tenir des milliers de connexions
+  lentes, et il n'ouvre une connexion vers le nœud qu'une fois la requête
+  complète. C'est la raison d'être de cette architecture.
+- **`max_size 1MB`** — la même borne que celle du nœud, appliquée un cran plus
+  tôt.
+- **Le blocage de `/portefeuille`** — le nœud refuse déjà ces chemins en mode
+  public. C'est une deuxième serrure sur la même porte : si un jour quelqu'un
+  lance le service sans `--rpc-public`, le portier refusera quand même.
 
 **Ctrl + O**, **Entrée**, **Ctrl + X**. Puis :
 

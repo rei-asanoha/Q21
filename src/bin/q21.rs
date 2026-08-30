@@ -2439,13 +2439,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // Explorateur public : pas de jeton — il est fait pour etre lu par
             // n'importe qui — mais un nom declare, et aucun portefeuille servi,
             // ce que le refus ci-dessus a deja garanti.
-            Some(nom) => {
-                q21_core::http::serve_public_web(adresse, nom.clone(), move |req| servir(&ctx, req))
-                    .map_err(|e| e.to_string())?
-            }
+            Some(nom) => q21_core::http::serve_public_web(adresse, nom.clone(), move |req| {
+                servir(&ctx, req, true)
+            })
+            .map_err(|e| e.to_string())?,
             None => {
                 q21_core::http::serve_avec_public(adresse, rpc_token.clone(), PUBLICS, move |req| {
-                    servir(&ctx, req)
+                    servir(&ctx, req, false)
                 })
                 .map_err(|e| e.to_string())?
             }
@@ -2802,16 +2802,26 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 fn servir(
     ctx: &q21_core::rpc::RpcContext,
     req: q21_core::http::Request,
+    public: bool,
 ) -> q21_core::http::Response {
     use q21_core::http::Response;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => {
             Response::html(q21_core::explorer::PAGE.to_string())
         }
-        // Le portefeuille, sur son propre chemin. Les deux pages parlent au
-        // meme noeud ; seule celle-ci demande les methodes qui deplacent des
-        // fonds, et elles restent desactivees sans `--rpc-wallet`.
-        ("GET", "/portefeuille") | ("GET", "/portefeuille.html") => {
+        // --- Le portefeuille n'a rien a faire sur un explorateur public.
+        //
+        // Les deux pages parlent au meme nœud, et un nœud publie n'a pas de
+        // portefeuille : la page ne pourrait donc rien deplacer. Ce n'est pas
+        // une raison de la servir.
+        //
+        // Un audit d'intrusion l'a releve avant la mise en ligne : un visiteur
+        // qui tombe sur `https://explorateur.q21.dev/portefeuille` voit une
+        // interface de portefeuille Q21 authentique, servie par le domaine
+        // officiel du projet. C'est le decor exact d'un hameconnage — sauf
+        // qu'ici c'est nous qui le montons, et qu'il habitue les gens a saisir
+        // des choses sur un site web. Une surface qui ne sert a rien se retire.
+        ("GET", "/portefeuille") | ("GET", "/portefeuille.html") if !public => {
             Response::html(q21_core::wallet_ui::PAGE.to_string())
         }
         ("POST", "/rpc") => Response::json(ctx.handle(&req.body)),

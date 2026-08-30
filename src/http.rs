@@ -237,10 +237,21 @@ where
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
     };
-    // Un service public web n'a pas de jeton : c'est un explorateur, il est
-    // fait pour etre lu par n'importe qui. La regle « pas d'exposition sans
-    // jeton » ne s'applique donc qu'aux autres, et l'exception est nommee.
-    if !bouclage && token.is_none() && hote_public.is_none() {
+    // --- Le mode public se met derriere un mandataire, jamais devant.
+    //
+    // Il n'a pas de jeton : c'est un explorateur, fait pour etre lu par
+    // n'importe qui. Mais ce serveur traite une connexion par fil, soixante-
+    // quatre au plus : expose directement, il tombe sous une poignee de
+    // connexions ouvertes et jamais terminees — l'attaque Slowloris, qu'un
+    // audit d'intrusion a reproduite ici en deux lignes.
+    //
+    // Le mandataire, lui, est fait pour ca. On exige donc que ce mode ecoute
+    // sur la boucle locale, et le refus est ici plutot que dans une note de
+    // documentation que personne ne relit.
+    if !bouclage && hote_public.is_some() {
+        return Err(HttpError::ExpositionSansJeton(local));
+    }
+    if !bouclage && token.is_none() {
         return Err(HttpError::ExpositionSansJeton(local));
     }
 
@@ -392,12 +403,22 @@ fn garde_navigateur(
     // 1. `Host` : seule la boucle locale est un hote legitime — ou le nom que
     //    l'exploitant a **declare** pour un service public. Un autre nom de
     //    domaine signale une reliaison DNS.
-    if let Some(host) = req.headers.get("host") {
-        if !hote_local(host) && !hote_declare(host, hote_public) {
-            return Some(
-                "en-tete Host inattendue : ce service ne repond qu'a 127.0.0.1,                  [::1] ou localhost",
-            );
+    match req.headers.get("host") {
+        Some(host) => {
+            if !hote_local(host) && !hote_declare(host, hote_public) {
+                return Some(
+                    "en-tete Host inattendue : ce service ne repond qu'a 127.0.0.1,                  [::1] ou localhost",
+                );
+            }
         }
+        // Absente, elle ne prouve rien — mais un service publie ne repond que
+        // sous le nom qu'on lui a donne, et une requete anonyme n'a pas ce nom.
+        // En local on reste tolerant : la garde y protege d'un navigateur, qui
+        // envoie toujours cet en-tete.
+        None if hote_public.is_some() => {
+            return Some("en-tete Host absente : ce service publie ne repond que sous son nom")
+        }
+        None => {}
     }
 
     // 2. `Origin` / `Referer` : une page web n'a rien a faire ici. Presents et
@@ -578,17 +599,47 @@ fn lire_requete(flux: &TcpStream, echeance: std::time::Instant) -> Result<Reques
     }
 
     let mut headers = BTreeMap::new();
+    // --- Depasser la limite est un refus, jamais un silence.
+    //
+    // Cette boucle s'arretait a `MAX_HEADERS` **sans rien dire**, et la lecture
+    // du corps reprenait la ou elle en etait : les en-tetes en trop devenaient
+    // silencieusement le debut du corps. Aucune fuite ne s'ensuivait tant que
+    // les connexions se ferment apres chaque reponse — mais une requete dont
+    // le decoupage depend de l'emetteur est exactement le terrain de la
+    // contrebande de requetes, et c'est le genre de tolerance qui devient une
+    // faille le jour ou l'on ajoute la reutilisation des connexions.
+    //
+    // Un audit d'intrusion l'a releve avant cette mise en ligne. On refuse.
+    let mut fin_des_entetes = false;
     for _ in 0..MAX_HEADERS {
         let mut l = String::new();
         lire_ligne(&mut lecteur, &mut l, echeance)?;
         let l = l.trim_end();
         if l.is_empty() {
+            fin_des_entetes = true;
             break;
         }
         if let Some((k, v)) = l.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            let clef = k.trim().to_ascii_lowercase();
+            // --- Un `Host` en double n'est jamais une maladresse.
+            //
+            // La table conserve la derniere valeur : `Host: evil.example` suivi
+            // de `Host: explorateur.q21.dev` passait donc la garde, alors que le
+            // premier `Host` est celui qu'un intermediaire aura lu. Deux
+            // machines qui ne lisent pas la meme valeur pour le meme champ,
+            // c'est la definition de la contrebande de requetes.
+            //
+            // Aucun navigateur n'en envoie deux, et la norme l'interdit. On
+            // refuse plutot que de choisir.
+            if clef == "host" && headers.contains_key("host") {
+                return Err("en-tete Host en double");
+            }
+            headers.insert(clef, v.trim().to_string());
         }
         expire(echeance)?;
+    }
+    if !fin_des_entetes {
+        return Err("trop d'en-tetes");
     }
 
     let taille: usize = headers
@@ -939,6 +990,93 @@ mod tests {
             "une origine en clair doit etre refusee : {r}"
         );
 
+        h.shutdown();
+    }
+
+    /// Un `Host` en double est refuse, quel que soit l'ordre.
+    ///
+    /// La table des en-tetes conserve la derniere valeur. `Host: evil.example`
+    /// suivi de `Host: explorateur.q21.dev` passait donc la garde, alors qu'un
+    /// intermediaire aurait lu le premier. Deux machines qui ne lisent pas la
+    /// meme valeur pour le meme champ, c'est la definition de la contrebande de
+    /// requetes. Releve par l'audit d'intrusion avant la mise en ligne.
+    #[test]
+    fn un_host_en_double_est_refuse_dans_les_deux_ordres() {
+        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+            .expect("demarrage");
+        for (a, b) in [
+            ("evil.example", "explorateur.q21.dev"),
+            ("explorateur.q21.dev", "evil.example"),
+        ] {
+            let r = requete(
+                h.addr,
+                &format!(
+                    "POST /rpc HTTP/1.1\r\nHost: {a}\r\nHost: {b}\r\n\
+                     Content-Type: application/json\r\nContent-Length: 2\r\n\
+                     Connection: close\r\n\r\n{{}}"
+                ),
+            );
+            assert!(
+                r.starts_with("HTTP/1.1 400"),
+                "Host double ({a}, {b}) doit etre refuse : {r}"
+            );
+        }
+        h.shutdown();
+    }
+
+    /// Un service publie ne repond que sous son nom : sans `Host`, il refuse.
+    #[test]
+    fn le_mode_public_exige_un_host() {
+        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+            .expect("demarrage");
+        let r = requete(
+            h.addr,
+            "POST /rpc HTTP/1.1\r\nContent-Type: application/json\r\n\
+             Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        assert!(
+            r.starts_with("HTTP/1.1 403"),
+            "sans Host, refus attendu : {r}"
+        );
+        h.shutdown();
+    }
+
+    /// Le mode public refuse d'ecouter ailleurs que sur la boucle locale.
+    ///
+    /// Ce serveur traite une connexion par fil, soixante-quatre au plus :
+    /// expose directement, il tombe sous une poignee de connexions ouvertes et
+    /// jamais terminees. L'audit l'a reproduit en deux lignes — deux cents
+    /// connexions muettes, et le service repondait 503 a tout le monde. Le
+    /// mandataire est fait pour ca ; le refus est ici plutot que dans une note.
+    #[test]
+    fn le_mode_public_refuse_d_ecouter_hors_de_la_boucle_locale() {
+        let r = serve_public_web("0.0.0.0:0", "explorateur.q21.dev".to_string(), echo());
+        assert!(
+            matches!(r, Err(HttpError::ExpositionSansJeton(_))),
+            "un mode public expose directement doit etre refuse"
+        );
+    }
+
+    /// Au-dela de la limite, les en-tetes ne deviennent pas le corps.
+    ///
+    /// La boucle s'arretait a `MAX_HEADERS` sans rien dire, et la lecture du
+    /// corps reprenait la ou elle en etait : les en-tetes en trop devenaient
+    /// silencieusement le debut du corps. Une requete dont le decoupage depend
+    /// de l'emetteur est le terrain de la contrebande de requetes.
+    #[test]
+    fn trop_d_en_tetes_est_un_refus_pas_un_reinterpretation() {
+        let h = serve("127.0.0.1:0", None, echo()).expect("demarrage");
+        let bourrage: String = (0..MAX_HEADERS + 10)
+            .map(|i| format!("X-{i}: v\r\n"))
+            .collect();
+        let r = requete(
+            h.addr,
+            &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n{bourrage}Connection: close\r\n\r\n"),
+        );
+        assert!(
+            r.starts_with("HTTP/1.1 400"),
+            "l'exces doit etre refuse : {r}"
+        );
         h.shutdown();
     }
 
