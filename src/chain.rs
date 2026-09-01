@@ -323,6 +323,46 @@ pub enum RepriseError {
     InstantaneHorsChaine,
 }
 
+/// Pourquoi l'adoption d'un instantane portable a echoue.
+///
+/// Chaque cas refuse l'adoption : jamais un etat n'est adopte sur un doute. Le
+/// noeud retombe alors sur la synchronisation ordinaire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptionError {
+    /// L'empreinte de l'instantane ne correspond pas a la valeur de confiance
+    /// fournie : ce n'est pas l'etat attendu.
+    EmpreinteInattendue,
+    /// La tete de l'instantane ne correspond pas a la tete de confiance fournie.
+    TeteInattendue,
+    /// Les en-tetes ne menent pas a la tete de confiance, a la hauteur annoncee,
+    /// depuis la vraie genese : la chaine d'en-tetes n'authentifie pas la tete.
+    EntetesInauthentiques,
+    /// La construction de la chaine a echoue (reseau, genese, hors chaine).
+    Reprise(RepriseError),
+}
+
+impl std::fmt::Display for AdoptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdoptionError::EmpreinteInattendue => write!(
+                f,
+                "l'empreinte de l'instantane ne correspond pas a la valeur de \
+                 confiance : ce n'est pas l'etat attendu, il n'est pas adopte"
+            ),
+            AdoptionError::TeteInattendue => write!(
+                f,
+                "la tete de l'instantane ne correspond pas a la tete de confiance"
+            ),
+            AdoptionError::EntetesInauthentiques => write!(
+                f,
+                "les en-tetes ne menent pas a la tete de confiance a la hauteur \
+                 annoncee : la tete n'est pas authentifiee"
+            ),
+            AdoptionError::Reprise(e) => write!(f, "reprise impossible : {e}"),
+        }
+    }
+}
+
 impl std::fmt::Display for RepriseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -616,6 +656,75 @@ impl Chain {
             active,
             genese,
         })
+    }
+
+    /// Adopte un instantane **portable** — venu d'ailleurs — apres l'avoir ancre
+    /// a une valeur de confiance.
+    ///
+    /// # Le modele de confiance, dit franchement
+    ///
+    /// `from_snapshot` fait confiance a ses en-tetes : elles viennent du propre
+    /// fichier de blocs du noeud, deja valide. Un instantane portable, lui, n'a
+    /// aucune de ces garanties. Deux ancrages, tous deux fournis par l'operateur
+    /// depuis une source qu'il tient pour sure (l'empreinte et la tete
+    /// qu'affichent son explorateur ou l'export de son propre noeud), les
+    /// remplacent :
+    ///
+    /// - **l'empreinte** authentifie le jeu d'UTXO — le condensat MuHash de
+    ///   l'instantane doit egaler la valeur de confiance ;
+    /// - **la tete** authentifie la position — l'instantane doit s'en reclamer,
+    ///   et les en-tetes doivent y mener, a la hauteur annoncee, depuis la vraie
+    ///   genese.
+    ///
+    /// # Pourquoi la preuve de travail n'est pas reverifiee
+    ///
+    /// Un enchainement structurel jusqu'a une tete de confiance authentifie
+    /// **toute** la chaine : le condensat de chaque en-tete est fige par le champ
+    /// `prev_block` du suivant, jusqu'a la tete. Un seul en-tete falsifie romprait
+    /// la chaine. La confiance descend donc de la tete vers la genese sans qu'on
+    /// ait a recalculer une seule preuve de travail — ce qui serait aussi couteux
+    /// que la synchronisation qu'on cherche a eviter.
+    pub fn adopter_instantane(
+        network: Network,
+        instantane: Snapshot,
+        headers: &[BlockHeader],
+        tete_de_confiance: Hash256,
+        empreinte_de_confiance: Hash256,
+    ) -> Result<Reprise, AdoptionError> {
+        // 1. L'etat.
+        if instantane.muhash != empreinte_de_confiance {
+            return Err(AdoptionError::EmpreinteInattendue);
+        }
+        // 2. La position revendiquee.
+        if instantane.tip != tete_de_confiance {
+            return Err(AdoptionError::TeteInattendue);
+        }
+        // 3. L'authentification de la tete par les en-tetes : on remonte de la
+        //    tete de confiance jusqu'a la genese, en verifiant a chaque pas
+        //    l'enchainement et la hauteur. Rien n'est cru sur parole ; tout est
+        //    force par les condensats.
+        let par_id: std::collections::HashMap<Hash256, &BlockHeader> =
+            headers.iter().map(|h| (h.block_id(), h)).collect();
+        let mut courant = tete_de_confiance;
+        let mut hauteur = instantane.height;
+        loop {
+            let Some(h) = par_id.get(&courant) else {
+                return Err(AdoptionError::EntetesInauthentiques);
+            };
+            if h.height != hauteur {
+                return Err(AdoptionError::EntetesInauthentiques);
+            }
+            if hauteur == 0 {
+                if courant != genesis_id(network) {
+                    return Err(AdoptionError::EntetesInauthentiques);
+                }
+                break;
+            }
+            courant = h.prev_block;
+            hauteur -= 1;
+        }
+        // 4. La construction : positionnement, index, fenetre a rejouer.
+        Chain::from_snapshot(network, instantane, headers).map_err(AdoptionError::Reprise)
     }
 
     pub fn from_snapshot(
