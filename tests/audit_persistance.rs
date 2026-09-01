@@ -410,10 +410,11 @@ fn g_instantane_fabrique_credite_des_fonds_inexistants() {
     etat_de(&d).save(&s).unwrap();
     drop(c);
 
-    // L'instantane est desormais confronte au calendrier d'emission : une
-    // sortie qui n'a jamais ete minee fait passer la somme des UTXO au-dessus
-    // du total emis, et le fichier est rejete. Le noeud revalide alors depuis
-    // le fichier de blocs, qui porte une preuve de travail.
+    // L'empreinte MuHash tranche la premiere, et plus franchement que le
+    // calendrier d'emission : la sortie ajoutee change le jeu d'UTXO, donc son
+    // empreinte ne correspond plus a celle inscrite, et le fichier est rejete —
+    // meme si le montant vole restait sous le plafond d'emission. Le noeud
+    // revalide alors depuis le fichier de blocs, qui porte une preuve de travail.
     let (repris, _) = charger(&d).expect("reprise par revalidation complete");
     let vole: u64 = repris
         .utxo
@@ -1211,6 +1212,17 @@ fn bb_emis_forge_fausse_l_emission_rapportee() {
 
 /// Une sortie retirée de `state.dat` : le nœud repris refuse la transaction qui
 /// la dépense, que tout nœud complet accepte.
+///
+/// # Depuis l'empreinte MuHash
+///
+/// Retirer une sortie sans recalculer l'empreinte ne trompe plus personne :
+/// l'instantane est rejete pour engagement invalide, et le noeud rejoue la
+/// chaine — plus de divergence. Le constat ne subsiste donc que face a un
+/// faussaire qui **recalcule aussi l'empreinte** pour la faire suivre. C'est
+/// exactement la limite documentee dans `state.rs` : tant qu'aucune valeur de
+/// confiance venue d'ailleurs n'ancre l'empreinte, un `state.dat` coherent avec
+/// lui-meme mais infidele a la chaine diverge encore. On simule donc le
+/// faussaire complet.
 #[test]
 fn bc_utxo_retire_de_l_instantane_fait_refuser_une_depense() {
     let d = rep("utxo-retire");
@@ -1218,6 +1230,9 @@ fn bc_utxo_retire_de_l_instantane_fait_refuser_une_depense() {
     let mut s = complet.snapshot().unwrap();
     let victime = *s.utxo.iter().next().unwrap().0;
     s.utxo.remove(&victime);
+    // Le faussaire recalcule l'empreinte pour qu'elle corresponde a son jeu
+    // ampute : sans ancrage externe, rien ne l'en empeche.
+    s.muhash = s.utxo.commitment();
     etat_de(&d).save(&s).unwrap();
 
     let (repris, _) = charger(&d).expect("reprise");

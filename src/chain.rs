@@ -709,12 +709,14 @@ impl Chain {
             utxo.undo(undo);
         }
 
+        let muhash = utxo.commitment();
         Some(Snapshot {
             network: self.network,
             height: hauteur,
             tip,
             emis: self.index.get(&tip).map(|b| b.emis).unwrap_or(self.emis),
             utxo,
+            muhash,
         })
     }
 
