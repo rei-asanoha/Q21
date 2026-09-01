@@ -49,6 +49,12 @@ use std::path::{Path, PathBuf};
 const MAGIE: &[u8; 8] = b"Q21STATE";
 const VERSION: u32 = 1;
 
+/// Version du format d'instantane, distincte de [`VERSION`] (qui reste celle du
+/// reservoir de transactions). Elle passe a 2 avec l'arrivee de l'empreinte
+/// MuHash : un instantane porte desormais l'engagement sur son jeu d'UTXO, et un
+/// ancien fichier de version 1 est simplement rejoue depuis les blocs.
+const SNAPSHOT_VERSION: u32 = 2;
+
 /// Borne de securite : un fichier corrompu ne doit pas provoquer une allocation
 /// delirante avant meme la verification de la somme de controle.
 const MAX_UTXO: u64 = 500_000_000;
@@ -71,6 +77,10 @@ pub enum StateError {
     /// L'instantane se contredit lui-meme : total emis impossible a cette
     /// hauteur, ou somme des sorties superieure a ce qui a jamais ete emis.
     Incoherent(&'static str),
+    /// L'empreinte MuHash inscrite dans l'instantane ne correspond pas au jeu
+    /// d'UTXO qu'il contient : le fichier a ete altere sans que l'empreinte soit
+    /// recalculee, ou il a ete corrompu.
+    EngagementInvalide,
     /// Structure illisible.
     Illisible,
     /// Nombre d'entrees annonce hors de toute vraisemblance.
@@ -103,6 +113,11 @@ impl std::fmt::Display for StateError {
                  il est ignore"
             ),
             StateError::Incoherent(quoi) => write!(f, "instantane incoherent : {quoi}"),
+            StateError::EngagementInvalide => write!(
+                f,
+                "empreinte du jeu d'UTXO incorrecte : l'instantane ne correspond \
+                 pas a l'etat qu'il pretend porter, il est ignore"
+            ),
             StateError::Illisible => write!(f, "instantane illisible"),
             StateError::TropDEntrees(n) => write!(f, "{n} entrees annoncees : refuse"),
         }
@@ -118,6 +133,11 @@ pub struct Snapshot {
     /// Total emis, en unites.
     pub emis: u64,
     pub utxo: UtxoSet,
+    /// Empreinte MuHash du jeu d'UTXO ci-dessus, calculee a l'ecriture et
+    /// verifiee au chargement. C'est l'engagement sur l'etat : deux noeuds a la
+    /// meme hauteur portent la meme, et un fichier dont le jeu ne la reproduit
+    /// pas est rejete.
+    pub muhash: Hash256,
 }
 
 impl Snapshot {
@@ -138,13 +158,21 @@ impl Snapshot {
     /// calendrier autorise a cette hauteur, quelle que soit l'origine du
     /// fichier.
     ///
-    /// # Ce qu'elles n'attrapent pas
+    /// # Ce qu'elles n'attrapent pas, et ce qui s'en charge desormais
     ///
     /// Une falsification qui *deplace* la propriete sans rien creer — reecrire
-    /// l'empreinte d'une sortie existante — respecte ces invariants. Seul un
-    /// engagement sur le jeu d'UTXO inscrit dans l'en-tete de bloc y
-    /// repondrait ; c'est note comme tel dans `AUDIT.md`, et ce n'est pas une
-    /// omission mais une dette assumee et datee.
+    /// l'empreinte d'une sortie existante — respecte ces invariants d'emission.
+    /// C'est l'**empreinte MuHash** ([`Snapshot::muhash`]) qui la voit : elle
+    /// depend de chaque empreinte de clef, donc tout deplacement la change.
+    ///
+    /// Attention a ce que cela prouve, et a ce que cela ne prouve pas. Verifier
+    /// que le jeu reproduit l'empreinte inscrite ne fait que lier le fichier a
+    /// lui-meme : un faussaire qui reecrit le jeu recalcule l'empreinte pour
+    /// suivre. La defense n'est complete que lorsque cette empreinte est comparee
+    /// a une **valeur de confiance venue d'ailleurs** — un point de controle
+    /// livre avec le binaire, ou l'empreinte qu'un pair deja synchronise
+    /// annonce. Cet ancrage est l'etape suivante ; le present module calcule,
+    /// porte et verifie l'empreinte pour la rendre possible.
     pub fn verifier_coherence(&self) -> Result<(), StateError> {
         use crate::consensus::{GENESIS_PREMINT, MAX_SUPPLY};
 
@@ -204,13 +232,14 @@ impl Snapshot {
     fn encode(&self) -> Vec<u8> {
         // 105 octets par entree, plus l'en-tete : on evite quelques centaines de
         // reallocations sur un jeu d'UTXO reel.
-        let mut w = Writer::with_capacity(64 + self.utxo.len() * 112);
+        let mut w = Writer::with_capacity(96 + self.utxo.len() * 112);
         w.bytes(MAGIE);
-        w.u32(VERSION);
+        w.u32(SNAPSHOT_VERSION);
         w.u8(code_reseau(self.network));
         w.u64(self.height);
         w.bytes(self.tip.as_bytes());
         w.u64(self.emis);
+        w.bytes(self.muhash.as_bytes());
         w.varint(self.utxo.len() as u64);
 
         // Ordre déterministe : deux nœuds au même état écrivent le même fichier,
@@ -252,7 +281,7 @@ impl Snapshot {
             return Err(StateError::MagieInvalide);
         }
         let version = r.u32().map_err(|_| StateError::Illisible)?;
-        if version != VERSION {
+        if version != SNAPSHOT_VERSION {
             return Err(StateError::VersionInconnue(version));
         }
         let reseau = r.u8().map_err(|_| StateError::Illisible)?;
@@ -263,6 +292,7 @@ impl Snapshot {
         let height = r.u64().map_err(|_| StateError::Illisible)?;
         let tip = Hash256(r.array32().map_err(|_| StateError::Illisible)?);
         let emis = r.u64().map_err(|_| StateError::Illisible)?;
+        let muhash = Hash256(r.array32().map_err(|_| StateError::Illisible)?);
         let n = r.varint().map_err(|_| StateError::Illisible)?;
         if n > MAX_UTXO {
             return Err(StateError::TropDEntrees(n));
@@ -294,12 +324,20 @@ impl Snapshot {
         }
         r.expect_end().map_err(|_| StateError::Illisible)?;
 
+        // L'engagement d'abord : le jeu d'UTXO doit reproduire l'empreinte
+        // inscrite. Un fichier dont on a altere une sortie sans recalculer
+        // l'empreinte tombe ici, avant meme les invariants d'emission.
+        if utxo.commitment() != muhash {
+            return Err(StateError::EngagementInvalide);
+        }
+
         let s = Snapshot {
             network: attendu,
             height,
             tip,
             emis,
             utxo,
+            muhash,
         };
         // Un instantane qui se contredit lui-meme n'est pas charge, quelle que
         // soit la validite de sa somme de controle.
@@ -727,12 +765,14 @@ mod tests {
         // chargement confronte le total emis au calendrier d'emission, un
         // fixture fantaisiste serait refuse — a juste titre.
         let hauteur = 5_000;
+        let muhash = utxo.commitment();
         Snapshot {
             network: Network::Regtest,
             height: hauteur,
             tip: Hash256([7u8; 32]),
             emis: crate::emission::total_supply_at(hauteur).units(),
             utxo,
+            muhash,
         }
     }
 
@@ -751,6 +791,37 @@ mod tests {
         for (o, e) in a.utxo.iter() {
             assert_eq!(b.utxo.get(o), Some(e), "entree perdue : {o:?}");
         }
+        s.remove().unwrap();
+    }
+
+    #[test]
+    fn l_empreinte_survit_a_l_aller_retour() {
+        let p = chemin("empreinte");
+        let s = StateStore::new(&p);
+        let a = instantane(40);
+        s.save(&a).unwrap();
+        let b = s.load(Network::Regtest).unwrap();
+        assert_eq!(a.muhash, b.muhash, "l'empreinte doit survivre au disque");
+        assert_eq!(
+            b.muhash,
+            b.utxo.commitment(),
+            "l'empreinte relue doit correspondre au jeu relu"
+        );
+        s.remove().unwrap();
+    }
+
+    #[test]
+    fn une_empreinte_perimee_fait_rejeter_l_instantane() {
+        let p = chemin("empreinte-perimee");
+        let s = StateStore::new(&p);
+        let mut a = instantane(15);
+        // L'empreinte ne correspond plus au jeu : fichier altere ou corrompu.
+        a.muhash = Hash256([0xAB; 32]);
+        s.save(&a).unwrap();
+        assert!(matches!(
+            s.load(Network::Regtest),
+            Err(StateError::EngagementInvalide)
+        ));
         s.remove().unwrap();
     }
 
