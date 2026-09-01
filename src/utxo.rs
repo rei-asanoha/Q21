@@ -138,6 +138,33 @@ impl UtxoSet {
             .expect("la masse monetaire ne peut pas deborder sous le plafond")
     }
 
+    /// Empreinte de l'ensemble : le condensat MuHash de toutes les sorties non
+    /// depensees.
+    ///
+    /// # Ce qu'elle vaut
+    ///
+    /// C'est l'engagement sur l'etat de la monnaie. Deux noeuds qui detiennent le
+    /// meme jeu d'UTXO en tirent la meme empreinte, quel que soit l'ordre dans
+    /// lequel ils ont recu les blocs — la multiplication du MuHash est
+    /// commutative, et c'est pourquoi ce parcours n'a pas besoin de trier. Une
+    /// falsification qui *deplace* la propriete d'une sortie sans rien creer —
+    /// celle que le controle d'emission de `state.rs` ne pouvait pas attraper —
+    /// change l'empreinte : la piece serialisee inclut l'empreinte de clef.
+    ///
+    /// # Le format de la piece
+    ///
+    /// Chaque sortie est serialisee dans l'ordre exact de l'instantane
+    /// ([`crate::state`]) : point de sortie, valeur, schema, empreinte de clef,
+    /// hauteur, caractere de coinbase. Ce format est fige : le changer changerait
+    /// toutes les empreintes.
+    pub fn commitment(&self) -> crate::hash::Hash256 {
+        let mut mu = crate::muhash::MuHash::new();
+        for (o, e) in self.map.iter() {
+            mu.insert(&piece_serialisee(o, e));
+        }
+        mu.digest()
+    }
+
     /// Applique une transaction : consomme ses entrees, cree ses sorties.
     ///
     /// Ne valide rien. La validation a lieu dans [`crate::validate`], avant.
@@ -216,6 +243,24 @@ impl UtxoSet {
         v.sort_by_key(|(o, _)| *o);
         v
     }
+}
+
+/// Serialise une sortie non depensee dans le format canonique de la piece.
+///
+/// 86 octets, dans l'ordre de l'instantane : txid (32), index (4), valeur (8),
+/// schema (1), empreinte de clef (32), hauteur (8), coinbase (1). C'est cette
+/// suite d'octets qui entre dans le MuHash ; son ordre est du consensus local et
+/// ne doit jamais changer.
+fn piece_serialisee(o: &OutPoint, e: &UtxoEntry) -> Vec<u8> {
+    let mut w = crate::ser::Writer::with_capacity(86);
+    w.bytes(o.txid.as_bytes());
+    w.u32(o.index);
+    w.u64(e.output.value.units());
+    w.u8(e.output.scheme.as_u8());
+    w.bytes(e.output.pubkey_hash.as_bytes());
+    w.u64(e.height);
+    w.u8(u8::from(e.is_coinbase));
+    w.finish()
 }
 
 #[cfg(test)]
@@ -375,5 +420,96 @@ mod tests {
             .map(|(o, _)| *o)
             .collect();
         assert_eq!(a, b, "l'ordre doit etre stable entre deux appels");
+    }
+
+    #[test]
+    fn l_empreinte_est_independante_de_l_ordre_d_insertion() {
+        // Deux jeux identiques, remplis dans deux ordres opposes, ont la meme
+        // empreinte : c'est toute la promesse du MuHash.
+        let mut a = UtxoSet::new();
+        let mut b = UtxoSet::new();
+        let mut entrees = Vec::new();
+        for i in 0..25u8 {
+            let o = OutPoint {
+                txid: Hash256([i; 32]),
+                index: u32::from(i),
+            };
+            let e = UtxoEntry {
+                output: sortie(1_000 + u64::from(i), i),
+                height: u64::from(i),
+                is_coinbase: i % 4 == 0,
+            };
+            entrees.push((o, e));
+        }
+        for (o, e) in &entrees {
+            a.insert(*o, *e);
+        }
+        for (o, e) in entrees.iter().rev() {
+            b.insert(*o, *e);
+        }
+        assert_eq!(a.commitment(), b.commitment());
+    }
+
+    #[test]
+    fn l_empreinte_du_jeu_vide_est_stable() {
+        assert_eq!(UtxoSet::new().commitment(), UtxoSet::new().commitment());
+    }
+
+    #[test]
+    fn depenser_change_l_empreinte_et_defaire_la_restaure() {
+        let mut u = UtxoSet::new();
+        let mut undo0 = UndoRecord::default();
+        u.apply_transaction(&coinbase(10_000, 1), 1, &mut undo0);
+        let avant = u.commitment();
+
+        let cb_txid = coinbase(10_000, 1).txid();
+        let depense = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: cb_txid,
+                    index: 0,
+                },
+                witness: Witness::default(),
+                sequence: 0,
+            }],
+            outputs: vec![sortie(9_000, 2)],
+            lock_time: 0,
+        };
+        let mut undo = UndoRecord::default();
+        u.apply_transaction(&depense, 2, &mut undo);
+        assert_ne!(u.commitment(), avant, "depenser doit changer l'empreinte");
+
+        u.undo(&undo);
+        assert_eq!(u.commitment(), avant, "defaire doit restaurer l'empreinte");
+    }
+
+    #[test]
+    fn deplacer_la_propriete_change_l_empreinte() {
+        // La falsification que le controle d'emission ne voit pas : meme montant,
+        // meme hauteur, autre beneficiaire. L'empreinte, elle, la voit.
+        let o = OutPoint {
+            txid: Hash256([9; 32]),
+            index: 0,
+        };
+        let mut honnete = UtxoSet::new();
+        honnete.insert(
+            o,
+            UtxoEntry {
+                output: sortie(5_000, 1),
+                height: 3,
+                is_coinbase: false,
+            },
+        );
+        let mut falsifie = UtxoSet::new();
+        falsifie.insert(
+            o,
+            UtxoEntry {
+                output: sortie(5_000, 2), // meme montant, autre empreinte de clef
+                height: 3,
+                is_coinbase: false,
+            },
+        );
+        assert_ne!(honnete.commitment(), falsifie.commitment());
     }
 }

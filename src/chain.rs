@@ -816,6 +816,20 @@ impl Chain {
         Amount::from_units(self.emis)
     }
 
+    /// Empreinte MuHash du jeu d'UTXO a la tete de la chaine.
+    ///
+    /// C'est l'engagement sur l'etat de la monnaie a cette hauteur : deux noeuds
+    /// synchronises la calculent a l'identique. Elle est ce qui rend un instantane
+    /// verifiable au lieu d'etre cru sur parole.
+    pub fn utxo_commitment(&self) -> Hash256 {
+        self.utxo.commitment()
+    }
+
+    /// Nombre de sorties non depensees a la tete.
+    pub fn utxo_count(&self) -> usize {
+        self.utxo.len()
+    }
+
     pub fn known_blocks(&self) -> usize {
         self.index.len()
     }
