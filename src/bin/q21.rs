@@ -42,13 +42,16 @@ COMMANDES
     utxo                     Resume du jeu de sorties non depensees
     emission [annee]         Courbe d'emission theorique
     instantane <action>      Instantane portable de l'etat de la monnaie
-                             exporter <fichier>   ecrit un instantane portable
-                                                  (le noeud doit etre arrete)
+                             exporter <fichier> [--reseau <nom>]
+                                                  ecrit un instantane portable
+                                                  (le noeud doit etre arrete ;
+                                                  --reseau pour un noeud sans
+                                                  portefeuille)
                              verifier <fichier> [--empreinte <hex>]
                                                   controle un instantane, et le
                                                   compare a une empreinte de
                                                   confiance si elle est fournie
-                             exporter-amorce <dossier>
+                             exporter-amorce <dossier> [--reseau <nom>]
                                                   ecrit une amorce de synchro
                                                   rapide (instantane + en-tetes
                                                   + fenetre de corps)
@@ -1774,6 +1777,32 @@ fn cmd_utxo(datadir: &Path) -> Result<(), String> {
 /// machine pour lui epargner de tout revalider. Il ne porte pas sa propre
 /// confiance : celui qui l'adopte compare son empreinte a une valeur sure — celle
 /// qu'affiche son explorateur. `exporter` l'ecrit, `verifier` le controle.
+/// Charge l'etat pour une commande d'instantane, en acceptant un `--reseau`
+/// explicite.
+///
+/// Un noeud d'amorcage — comme le serveur d'explorateur — tourne **sans
+/// portefeuille** : il n'a alors aucune source pour dire de quelle chaine il
+/// s'agit, et `charger` echouerait faute de portefeuille. `--reseau` la lui
+/// donne. Avec un portefeuille, l'option est superflue : la chaine vient de lui.
+fn charger_instantane(datadir: &Path, options: &[String]) -> Result<Etat, String> {
+    let mut reseau = None;
+    let mut i = 0;
+    while i < options.len() {
+        if options[i] == "--reseau" {
+            reseau = Some(reseau_depuis_nom(
+                options.get(i + 1).ok_or("--reseau demande une valeur")?,
+            )?);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    match reseau {
+        Some(r) => charger_avec(datadir, Some(r)),
+        None => charger(datadir),
+    }
+}
+
 fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
     use q21_core::state::Snapshot;
     use q21_core::store::{BlockStore, HeaderStore};
@@ -1782,8 +1811,8 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
         Some("exporter-amorce") => {
             let dossier = args
                 .get(1)
-                .ok_or("usage : q21 instantane exporter-amorce <dossier>")?;
-            let e = charger(datadir)?;
+                .ok_or("usage : q21 instantane exporter-amorce <dossier> [--reseau <nom>]")?;
+            let e = charger_instantane(datadir, &args[2..])?;
             let reseau = e.chain.network;
             let s = e
                 .chain
@@ -1968,11 +1997,11 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
         Some("exporter") => {
             let fichier = args
                 .get(1)
-                .ok_or("usage : q21 instantane exporter <fichier>")?;
+                .ok_or("usage : q21 instantane exporter <fichier> [--reseau <nom>]")?;
             // Le noeud doit etre arrete : le verrou de repertoire, pris au
             // demarrage, l'impose deja. On reconstruit l'etat a la tete depuis
             // les blocs, puis on prend l'instantane en retrait (rejouable).
-            let e = charger(datadir)?;
+            let e = charger_instantane(datadir, &args[2..])?;
             let s = e
                 .chain
                 .snapshot()
