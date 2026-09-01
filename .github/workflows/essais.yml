@@ -65,6 +65,7 @@ jobs:
           cargo test --locked --features mldsa,audit --test integration
           cargo test --locked --features mldsa,audit --test audit_arith
           cargo test --locked --features mldsa,audit --test audit_mempool
+          cargo test --locked --features mldsa,audit --test audit_muhash
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --features mldsa,audit
