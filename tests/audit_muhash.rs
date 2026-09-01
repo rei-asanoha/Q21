@@ -8,7 +8,7 @@
 //! synchronisation rapide : sans elle, adopter un instantane serait un pari.
 
 use q21_core::block::Block;
-use q21_core::chain::{genesis_block, Chain, GENESIS_TIME};
+use q21_core::chain::{genesis_block, AdoptionError, Chain, GENESIS_TIME};
 use q21_core::consensus::TARGET_BLOCK_SECS;
 use q21_core::hash::Hash256;
 use q21_core::sig::SchemeId;
@@ -148,6 +148,75 @@ fn un_noeud_qui_adopte_l_instantane_atteint_le_meme_etat() {
         complet.utxo_commitment(),
         "le noeud repris et le noeud complet doivent porter la MEME empreinte"
     );
+}
+
+/// Adoption ancree : avec la bonne tete et la bonne empreinte de confiance, un
+/// noeud adopte l'instantane, rejoue la fenetre, et atteint le meme etat qu'un
+/// noeud complet. C'est la passe B2 posee sur la B1 : l'assumeutxo de Q21.
+#[test]
+fn adopter_avec_les_bonnes_valeurs_atteint_le_meme_etat() {
+    let (complet, archive, blocs) = chaine_minee(&rep("adopt-ok"), 20);
+    let s = complet.snapshot().expect("instantane");
+    let tete = s.tip;
+    let empreinte = s.muhash;
+
+    let reprise = Chain::adopter_instantane(RESEAU, s, &complet.headers(), tete, empreinte)
+        .unwrap_or_else(|e| panic!("adoption refusee : {e:?}"));
+    let mut repris = reprise.chain;
+    repris.set_body_source(archive.clone());
+    for id in &reprise.a_rejouer {
+        let bloc = blocs
+            .iter()
+            .find(|b| b.header.block_id() == *id)
+            .expect("bloc a rejouer connu");
+        repris
+            .connect(bloc, horodatage(bloc.header.height) + 1)
+            .expect("rejeu");
+    }
+
+    assert_eq!(repris.height(), complet.height());
+    assert_eq!(repris.utxo_commitment(), complet.utxo_commitment());
+}
+
+/// Une empreinte de confiance qui ne correspond pas fait refuser l'adoption —
+/// meme si le fichier est, en lui-meme, parfaitement coherent.
+#[test]
+fn adopter_avec_une_mauvaise_empreinte_est_refuse() {
+    let (complet, _ar, _) = chaine_minee(&rep("adopt-emp"), 12);
+    let s = complet.snapshot().expect("instantane");
+    let tete = s.tip;
+    let fausse = Hash256([0x99; 32]);
+    assert!(matches!(
+        Chain::adopter_instantane(RESEAU, s, &complet.headers(), tete, fausse),
+        Err(AdoptionError::EmpreinteInattendue)
+    ));
+}
+
+/// Une tete de confiance qui ne correspond pas fait refuser l'adoption.
+#[test]
+fn adopter_avec_une_mauvaise_tete_est_refuse() {
+    let (complet, _ar, _) = chaine_minee(&rep("adopt-tete"), 12);
+    let s = complet.snapshot().expect("instantane");
+    let empreinte = s.muhash;
+    let fausse = Hash256([0x77; 32]);
+    assert!(matches!(
+        Chain::adopter_instantane(RESEAU, s, &complet.headers(), fausse, empreinte),
+        Err(AdoptionError::TeteInattendue)
+    ));
+}
+
+/// Des en-tetes qui ne menent pas a la tete de confiance — ici, aucun en-tete —
+/// font refuser l'adoption : la tete n'est pas authentifiee.
+#[test]
+fn adopter_sans_entetes_authentifiants_est_refuse() {
+    let (complet, _ar, _) = chaine_minee(&rep("adopt-hdr"), 12);
+    let s = complet.snapshot().expect("instantane");
+    let tete = s.tip;
+    let empreinte = s.muhash;
+    assert!(matches!(
+        Chain::adopter_instantane(RESEAU, s, &[], tete, empreinte),
+        Err(AdoptionError::EntetesInauthentiques)
+    ));
 }
 
 /// Un instantane sauvegarde puis relu conserve son empreinte, et le jeu relu la
