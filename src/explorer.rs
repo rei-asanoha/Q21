@@ -477,9 +477,9 @@ document.getElementById("forme-chercher").addEventListener("submit", async ev =>
 
 async function accueil(){
   try{
-    const [info, supply, pow, sec, mem] = await Promise.all([
+    const [info, supply, pow, sec, mem, emp] = await Promise.all([
       appel("getinfo"), appel("getsupply"), appel("getpow"),
-      appel("getsecurity"), appel("getmempool")
+      appel("getsecurity"), appel("getmempool"), appel("getempreinteutxo")
     ]);
     effacerErreur();
     document.getElementById("reseau").textContent = info.reseau;
@@ -511,7 +511,8 @@ async function accueil(){
       tuile("Plafond", supply.plafond_q21.toLocaleString("fr-FR"),
             supply.sous_le_plafond ? "sous le plafond ✓" : "PLAFOND FRANCHI") +
       tuile("Part émise", pct.toFixed(6) + " %") +
-      tuile("Sorties non dépensées", info.utxo_total);
+      tuile("Sorties non dépensées", info.utxo_total) +
+      tuile("Empreinte de l'état (MuHash)", court(emp.empreinte, 20), ech(emp.empreinte));
 
     lignes("pow", [
       ["Époque", pow.epoque],
