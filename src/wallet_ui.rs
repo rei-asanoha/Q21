@@ -1706,8 +1706,9 @@ setInterval(() => {
 
 async function infos(){
   try{
-    const [w, info, adresses] = await Promise.all([
-      appel("getwalletinfo"), appel("getinfo"), appel("listaddresses")
+    const [w, info, adresses, emp] = await Promise.all([
+      appel("getwalletinfo"), appel("getinfo"), appel("listaddresses"),
+      appel("getempreinteutxo")
     ]);
     document.getElementById("tuiles-infos").innerHTML =
       tuile("Schéma de signature", w.schema, "identifiant " + w.schema_id + " dans le protocole") +
@@ -1728,6 +1729,13 @@ async function infos(){
       tuile("Difficulté", info.difficulte_bits) +
       tuile("Q21 créés à ce jour", ech(info.emis.q21) + " Q21") +
       tuile("Sommes non dépensées", info.utxo_total, "sur toute la chaîne, tous porteurs confondus") +
+      // L'empreinte de l'etat : deux noeuds a la meme hauteur la portent
+      // identique. On la donne entiere, avec un bouton de copie, pour qu'elle se
+      // compare a celle de l'explorateur — c'est tout son usage.
+      tuile("Empreinte de l'état", brut(
+        `<span class="entier">${ech(emp.empreinte)}</span>` +
+        `<button type="button" class="plat copie" data-ref="${ech(emp.empreinte)}">copier</button>`),
+        "engagement MuHash sur le jeu d'UTXO — identique sur tout nœud à cette hauteur") +
       tuile("Ordinateurs reliés au vôtre", info.pairs);
   }catch(e){
     signalerErreur("Informations indisponibles : " + e.message);

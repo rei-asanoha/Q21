@@ -481,6 +481,10 @@ impl RpcContext {
                 "Ce qui est protege face a une attaque a 51 %",
             ),
             ("getsupply", "Masse monetaire emise et plafond"),
+            (
+                "getempreinteutxo",
+                "Empreinte MuHash du jeu d'UTXO a la tete (engagement sur l'etat)",
+            ),
             ("listmethods", "Cette liste"),
             ("getbalance", "[portefeuille] Solde depensable"),
             ("getnewaddress", "[portefeuille] Adresse de reception neuve"),
@@ -548,6 +552,7 @@ impl RpcContext {
     fn dispatch(&self, methode: &str, params: &Json) -> Result<Json, Json> {
         match methode {
             "getinfo" => Ok(self.getinfo()),
+            "getempreinteutxo" => Ok(self.getempreinteutxo()),
             "getblock" => self.getblock(params, true),
             "getblockheader" => self.getblock(params, false),
             "gettransaction" => self.gettransaction(params),
@@ -660,6 +665,31 @@ impl RpcContext {
                     )
                     .build(),
             )
+            .build()
+    }
+
+    /// Engagement sur l'etat de la monnaie : l'empreinte MuHash du jeu d'UTXO a
+    /// la tete, avec le nombre de sorties et le total en circulation.
+    ///
+    /// Le calcul parcourt tout le jeu d'UTXO — c'est un appel qu'on fait a la
+    /// demande, quand on veut comparer deux noeuds ou verifier un instantane, pas
+    /// une valeur qu'on rafraichit en boucle. `getinfo` reste donc leger.
+    fn getempreinteutxo(&self) -> Json {
+        let (hauteur, tete, entrees, emis, empreinte) = self.node.with_chain(|c| {
+            (
+                c.height(),
+                c.tip_id().to_hex(),
+                c.utxo_count(),
+                c.total_issued(),
+                c.utxo_commitment().to_hex(),
+            )
+        });
+        Json::obj()
+            .set("hauteur", Json::u64(hauteur))
+            .set("tete", Json::str(tete))
+            .set("entrees", Json::u64(entrees as u64))
+            .set("total", montant(emis))
+            .set("empreinte", Json::str(empreinte))
             .build()
     }
 
@@ -2611,6 +2641,21 @@ mod tests {
             Some(&Json::Bool(false)),
             "le portefeuille doit etre annonce inactif"
         );
+    }
+
+    #[test]
+    fn getempreinteutxo_rend_l_engagement_sur_l_etat() {
+        let c = contexte(false);
+        let r = resultat(&c, "getempreinteutxo", "{}");
+        assert_eq!(r.get("hauteur").and_then(|v| v.as_u64()), Some(0));
+        let empreinte = r
+            .get("empreinte")
+            .and_then(|v| v.as_str())
+            .expect("champ empreinte");
+        assert_eq!(empreinte.len(), 64, "un condensat de 256 bits en hexa");
+        // Elle doit egaler ce que la chaine calcule directement.
+        let attendue = c.node.with_chain(|ch| ch.utxo_commitment().to_hex());
+        assert_eq!(empreinte, attendue);
     }
 
     #[test]
