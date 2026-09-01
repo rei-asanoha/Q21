@@ -10,6 +10,7 @@ use q21_core::amount::Amount;
 use q21_core::chain::{genesis_block, Chain};
 use q21_core::consensus::*;
 use q21_core::emission;
+use q21_core::hash::Hash256;
 use q21_core::pow;
 use q21_core::sig::SchemeId;
 use q21_core::state::{AddressCache, StateStore};
@@ -47,6 +48,16 @@ COMMANDES
                                                   controle un instantane, et le
                                                   compare a une empreinte de
                                                   confiance si elle est fournie
+                             exporter-amorce <dossier>
+                                                  ecrit une amorce de synchro
+                                                  rapide (instantane + en-tetes
+                                                  + fenetre de corps)
+                             adopter <dossier> --tete <hex> --empreinte <hex>
+                                                  amorce un dossier vide depuis
+                                                  une amorce, apres avoir ancre
+                                                  tete et empreinte a une source
+                                                  de confiance : le noeud repart
+                                                  de la hauteur de l'instantane
     wallet [options]         Ouvre le portefeuille dans le navigateur
                              --port <n>           port d'ecoute (defaut : libre)
                              --sans-navigateur    n'ouvre pas le navigateur,
@@ -771,6 +782,13 @@ fn chemin_etat(d: &Path) -> PathBuf {
     d.join("state.dat")
 }
 
+/// Magasin d'en-tetes. Sa presence marque un dossier **adopte** : un noeud qui
+/// est parti d'un instantane, et dont la chaine d'en-tetes ne se reconstruit pas
+/// du fichier de blocs — puisqu'il n'a pas les corps d'avant l'instantane.
+fn chemin_entetes(d: &Path) -> PathBuf {
+    d.join("entetes.dat")
+}
+
 fn chemin_adresses(d: &Path) -> PathBuf {
     d.join("addresses.dat")
 }
@@ -861,7 +879,7 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
         println!("  genese ecrite : {}", genese.header.block_id());
     }
 
-    let (archive, seuls_entetes, souci) =
+    let (archive, mut seuls_entetes, souci) =
         BlockArchive::open(chemin_blocs(datadir), reseau).map_err(|e| e.to_string())?;
     if seuls_entetes.is_empty() {
         return Err("aucun bloc. Lancez `q21 init` d'abord.".into());
@@ -869,6 +887,33 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
     if let Some(s) = souci {
         eprintln!("avertissement : {s}");
     }
+
+    // --- Dossier adopte : la chaine d'en-tetes vient du magasin, pas des corps.
+    //
+    // Un noeud parti d'un instantane n'a pas les corps d'avant lui, donc leurs
+    // en-tetes ne se relisent pas du fichier de blocs. Elles viennent du magasin
+    // d'en-tetes (genese -> hauteur de l'instantane), etendu par les blocs
+    // posterieurs deja synchronises, presents, eux, dans le fichier de blocs.
+    let adopte = chemin_entetes(datadir).exists();
+    if adopte {
+        let hs = q21_core::store::HeaderStore::new(chemin_entetes(datadir));
+        let mut base = hs
+            .load(reseau)
+            .map_err(|e| format!("magasin d'en-tetes illisible : {e}"))?;
+        let h_inst = base
+            .last()
+            .map(|h| h.height)
+            .ok_or("dossier adopte sans en-tetes")?;
+        let mut posterieurs: Vec<_> = seuls_entetes
+            .iter()
+            .copied()
+            .filter(|h| h.height > h_inst)
+            .collect();
+        posterieurs.sort_by_key(|h| h.height);
+        base.extend(posterieurs);
+        seuls_entetes = base;
+    }
+
     if chrono {
         eprintln!(
             "[chrono] balayage en-tetes {:.2} s",
@@ -915,6 +960,16 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
             c
         }
         None => {
+            // Un dossier adopte n'a pas d'histoire d'avant l'instantane : il ne
+            // PEUT pas revalider depuis la genese. Si l'instantane est devenu
+            // inexploitable, c'est une erreur franche, pas un repli silencieux.
+            if adopte {
+                return Err(
+                    "dossier adopte, mais l'instantane est illisible ou incoherent : \
+                     rien a revalider. Re-adoptez depuis une amorce saine."
+                        .into(),
+                );
+            }
             // 3b. Sans instantane exploitable, on reconstruit tout depuis la
             // genese. C'est le chemin de secours, celui qui doit fonctionner le
             // jour ou tout le reste a echoue — un debranchement, une batterie a
@@ -1721,8 +1776,195 @@ fn cmd_utxo(datadir: &Path) -> Result<(), String> {
 /// qu'affiche son explorateur. `exporter` l'ecrit, `verifier` le controle.
 fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
     use q21_core::state::Snapshot;
+    use q21_core::store::{BlockStore, HeaderStore};
 
     match args.first().map(|s| s.as_str()) {
+        Some("exporter-amorce") => {
+            let dossier = args
+                .get(1)
+                .ok_or("usage : q21 instantane exporter-amorce <dossier>")?;
+            let e = charger(datadir)?;
+            let reseau = e.chain.network;
+            let s = e
+                .chain
+                .snapshot()
+                .ok_or("la chaine est trop courte pour un instantane : il faut plusieurs blocs")?;
+            let h = s.height;
+
+            // Les en-tetes de la genese a la hauteur de l'instantane : la chaine
+            // d'en-tetes qu'un noeud adopte ne peut pas reconstruire, faute des
+            // corps d'avant l'instantane.
+            let tous = e.chain.headers();
+            if h as usize >= tous.len() {
+                return Err("hauteur d'instantane incoherente avec les en-tetes".into());
+            }
+            let entetes = &tous[..=h as usize];
+
+            // Une fenetre bornee de corps autour de l'instantane : la regle du
+            // double paiement d'oncle relit les quelques blocs qui precedent
+            // chaque bloc rejoue, jusqu'a MAX_UNCLE_AGE en arriere. Sans eux, le
+            // premier bloc au-dessus de l'instantane ne pourrait pas etre valide.
+            let marge = MAX_UNCLE_AGE + 2;
+            let debut = h.saturating_sub(marge);
+
+            let d = Path::new(dossier);
+            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+
+            std::fs::write(d.join("instantane.q21snap"), s.to_portable_bytes())
+                .map_err(|err| format!("ecriture de l'instantane : {err}"))?;
+
+            let hs = HeaderStore::new(d.join("entetes.q21hdr"));
+            let _ = hs.remove();
+            hs.append(entetes).map_err(|e| e.to_string())?;
+
+            // Le fichier de corps commence par la genese — une constante du
+            // reseau — pour que le controle de racine du fichier de blocs soit
+            // satisfait a l'adoption, puis la fenetre autour de l'instantane.
+            let bs = BlockStore::new(d.join("corps.dat"));
+            let _ = bs.remove();
+            bs.append(&genesis_block(reseau))
+                .map_err(|e| e.to_string())?;
+            for hh in debut..=h {
+                if hh == 0 {
+                    continue; // la genese est deja ecrite
+                }
+                let b = e
+                    .chain
+                    .block_at(hh)
+                    .ok_or_else(|| format!("corps du bloc {hh} absent"))?;
+                bs.append(&b).map_err(|e| e.to_string())?;
+            }
+
+            let notice = format!(
+                "Amorce de synchronisation rapide Q21\n\
+                 Reseau     {reseau:?}\n\
+                 Hauteur    {h}\n\
+                 Tete       {}\n\
+                 Empreinte  {}\n\n\
+                 Pour l'adopter sur une machine neuve, dans un dossier vide :\n  \
+                 q21 --datadir <dossier> instantane adopter {dossier} \\\n    \
+                 --tete {} --empreinte {}\n\n\
+                 Comparez d'abord la tete et l'empreinte a celles qu'affiche une\n\
+                 source de confiance (votre explorateur).\n",
+                s.tip, s.muhash, s.tip, s.muhash
+            );
+            std::fs::write(d.join("amorce.txt"), &notice)
+                .map_err(|err| format!("ecriture de la notice : {err}"))?;
+
+            println!("Amorce ecrite dans : {dossier}");
+            print!("{notice}");
+            Ok(())
+        }
+        Some("adopter") => {
+            let dossier = args
+                .get(1)
+                .ok_or("usage : q21 instantane adopter <dossier> --tete <hex> --empreinte <hex>")?;
+            let (mut tete_hex, mut emp_hex) = (None, None);
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--tete" => {
+                        tete_hex =
+                            Some(args.get(i + 1).ok_or("--tete demande une valeur")?.clone());
+                        i += 2;
+                    }
+                    "--empreinte" => {
+                        emp_hex = Some(
+                            args.get(i + 1)
+                                .ok_or("--empreinte demande une valeur")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    autre => return Err(format!("option inconnue : {autre}")),
+                }
+            }
+            let tete = Hash256::from_hex(
+                tete_hex
+                    .ok_or("--tete <hex> est obligatoire : la tete de confiance")?
+                    .trim(),
+            )
+            .ok_or("--tete : 64 caracteres hexadecimaux attendus")?;
+            let empreinte = Hash256::from_hex(
+                emp_hex
+                    .ok_or("--empreinte <hex> est obligatoire : l'empreinte de confiance")?
+                    .trim(),
+            )
+            .ok_or("--empreinte : 64 caracteres hexadecimaux attendus")?;
+
+            // On n'adopte que dans un dossier vierge : jamais par-dessus une
+            // chaine existante.
+            if chemin_blocs(datadir).exists()
+                || chemin_etat(datadir).exists()
+                || chemin_entetes(datadir).exists()
+            {
+                return Err(format!(
+                    "le dossier {} contient deja une chaine : l'adoption ne se fait \
+                     que dans un dossier vide",
+                    datadir.display()
+                ));
+            }
+
+            let d = Path::new(dossier);
+            let octets = std::fs::read(d.join("instantane.q21snap"))
+                .map_err(|e| format!("instantane illisible : {e}"))?;
+            let mut snap = None;
+            let mut derniere = None;
+            for reseau in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+                match Snapshot::from_portable_bytes(&octets, reseau) {
+                    Ok(s) => {
+                        snap = Some(s);
+                        break;
+                    }
+                    Err(q21_core::state::StateError::MauvaisReseau) => continue,
+                    Err(e) => derniere = Some(e),
+                }
+            }
+            let snap = snap.ok_or_else(|| {
+                format!(
+                    "instantane invalide : {}",
+                    derniere.map(|e| e.to_string()).unwrap_or_default()
+                )
+            })?;
+            let reseau = snap.network;
+
+            let hs = HeaderStore::new(d.join("entetes.q21hdr"));
+            let entetes = hs
+                .load(reseau)
+                .map_err(|e| format!("en-tetes illisibles : {e}"))?;
+
+            // La validation, avant de rien ecrire : ancrages de confiance et
+            // authentification de la tete par les en-tetes.
+            Chain::adopter_instantane(reseau, snap.clone(), &entetes, tete, empreinte)
+                .map_err(|e| format!("adoption refusee : {e}"))?;
+
+            // Poser le dossier adopte.
+            std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
+            std::fs::copy(d.join("corps.dat"), chemin_blocs(datadir))
+                .map_err(|e| format!("copie des corps : {e}"))?;
+            std::fs::copy(d.join("entetes.q21hdr"), chemin_entetes(datadir))
+                .map_err(|e| format!("copie des en-tetes : {e}"))?;
+            let clef = q21_core::state::clef_de_repertoire(datadir).map_err(|e| e.to_string())?;
+            StateStore::new_scelle(chemin_etat(datadir), clef)
+                .save(&snap)
+                .map_err(|e| format!("ecriture de l'etat : {e}"))?;
+
+            println!(
+                "Instantane adopte dans {} a la hauteur {}.",
+                datadir.display(),
+                snap.height
+            );
+            println!("  Tete       {}", snap.tip);
+            println!("  Empreinte  {}", snap.muhash);
+            println!();
+            println!("Lancez le noeud : il rejoint le reseau et rattrape la tete a partir de la.");
+            println!(
+                "  q21 --datadir {} node --reseau {}",
+                datadir.display(),
+                nom_de_reseau(reseau)
+            );
+            Ok(())
+        }
         Some("exporter") => {
             let fichier = args
                 .get(1)
