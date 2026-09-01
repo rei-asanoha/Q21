@@ -40,6 +40,13 @@ COMMANDES
     block <hauteur>          Detaille un bloc
     utxo                     Resume du jeu de sorties non depensees
     emission [annee]         Courbe d'emission theorique
+    instantane <action>      Instantane portable de l'etat de la monnaie
+                             exporter <fichier>   ecrit un instantane portable
+                                                  (le noeud doit etre arrete)
+                             verifier <fichier> [--empreinte <hex>]
+                                                  controle un instantane, et le
+                                                  compare a une empreinte de
+                                                  confiance si elle est fournie
     wallet [options]         Ouvre le portefeuille dans le navigateur
                              --port <n>           port d'ecoute (defaut : libre)
                              --sans-navigateur    n'ouvre pas le navigateur,
@@ -249,6 +256,7 @@ fn main() {
         "block" => cmd_block(&datadir, reste.get(1).map(|s| s.as_str())),
         "utxo" => cmd_utxo(&datadir),
         "emission" => cmd_emission(reste.get(1).map(|s| s.as_str())),
+        "instantane" | "snapshot" => cmd_instantane(&datadir, &reste[1..]),
         "node" => cmd_node(&datadir, &reste[1..]),
         "wallet" | "portefeuille" => cmd_wallet(&datadir, &reste[1..]),
         "explorateur" | "explorer" => cmd_explorateur(&datadir, &reste[1..]),
@@ -1703,6 +1711,136 @@ fn cmd_utxo(datadir: &Path) -> Result<(), String> {
         }
     );
     Ok(())
+}
+
+/// `instantane <exporter|verifier> ...`
+///
+/// Un instantane portable est l'etat de la monnaie qu'on peut donner a une autre
+/// machine pour lui epargner de tout revalider. Il ne porte pas sa propre
+/// confiance : celui qui l'adopte compare son empreinte a une valeur sure — celle
+/// qu'affiche son explorateur. `exporter` l'ecrit, `verifier` le controle.
+fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
+    use q21_core::state::Snapshot;
+
+    match args.first().map(|s| s.as_str()) {
+        Some("exporter") => {
+            let fichier = args
+                .get(1)
+                .ok_or("usage : q21 instantane exporter <fichier>")?;
+            // Le noeud doit etre arrete : le verrou de repertoire, pris au
+            // demarrage, l'impose deja. On reconstruit l'etat a la tete depuis
+            // les blocs, puis on prend l'instantane en retrait (rejouable).
+            let e = charger(datadir)?;
+            let s = e
+                .chain
+                .snapshot()
+                .ok_or("la chaine est trop courte pour un instantane : il faut plusieurs blocs")?;
+            std::fs::write(fichier, s.to_portable_bytes())
+                .map_err(|err| format!("ecriture impossible : {err}"))?;
+
+            println!("Instantane portable ecrit : {fichier}");
+            println!("  Reseau     {:?}", s.network);
+            println!("  Hauteur    {}", s.height);
+            println!("  Tete       {}", s.tip);
+            println!("  Sorties    {}", s.utxo.len());
+            println!("  Empreinte  {}", s.muhash);
+            println!();
+            println!("Pour l'adopter sur une autre machine, la personne compare cette");
+            println!("empreinte a celle qu'affiche une source de confiance (l'explorateur),");
+            println!("puis la controle :");
+            println!(
+                "  q21 instantane verifier <fichier> --empreinte {}",
+                s.muhash
+            );
+            Ok(())
+        }
+        Some("verifier") => {
+            let fichier = args
+                .get(1)
+                .ok_or("usage : q21 instantane verifier <fichier> [--empreinte <hex>]")?;
+            let mut attendue: Option<String> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--empreinte" => {
+                        attendue = Some(
+                            args.get(i + 1)
+                                .ok_or("--empreinte demande une valeur")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    autre => return Err(format!("option inconnue : {autre}")),
+                }
+            }
+
+            let octets =
+                std::fs::read(fichier).map_err(|err| format!("lecture impossible : {err}"))?;
+
+            // Le fichier porte son propre reseau : on le devine en essayant les
+            // trois. Un seul valide, les autres tombent sur « autre reseau ».
+            let mut trouve = None;
+            let mut derniere = None;
+            for reseau in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+                match Snapshot::from_portable_bytes(&octets, reseau) {
+                    Ok(s) => {
+                        trouve = Some(s);
+                        break;
+                    }
+                    Err(q21_core::state::StateError::MauvaisReseau) => continue,
+                    Err(e) => derniere = Some(e),
+                }
+            }
+            let s = trouve.ok_or_else(|| {
+                format!(
+                    "instantane invalide : {}",
+                    derniere
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "reseau inconnu".into())
+                )
+            })?;
+
+            println!("Instantane portable coherent.");
+            println!("  Reseau     {:?}", s.network);
+            println!("  Hauteur    {}", s.height);
+            println!("  Tete       {}", s.tip);
+            println!("  Sorties    {}", s.utxo.len());
+            println!("  Total      {} Q21", Amount::from_units(s.emis));
+            println!("  Empreinte  {}", s.muhash);
+            println!();
+
+            match attendue {
+                Some(att) => {
+                    let att = att.trim().to_lowercase();
+                    if att == s.muhash.to_hex() {
+                        println!("  ✓ L'empreinte correspond a la valeur de confiance fournie.");
+                        println!("    Cet instantane represente bien l'etat attendu : il peut");
+                        println!("    etre adopte.");
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "L'empreinte NE correspond PAS a la valeur fournie — a ne pas adopter.\n  \
+                             attendu : {att}\n  obtenu  : {}",
+                            s.muhash.to_hex()
+                        ))
+                    }
+                }
+                None => {
+                    println!("  Aucune empreinte de confiance fournie : le fichier est coherent");
+                    println!("  avec lui-meme, mais rien ne prouve encore qu'il decrit la vraie");
+                    println!(
+                        "  chaine. Avant de l'adopter, comparez l'empreinte ci-dessus a celle"
+                    );
+                    println!(
+                        "  qu'affiche une source sure (votre explorateur), puis relancez avec"
+                    );
+                    println!("  --empreinte <hex>.");
+                    Ok(())
+                }
+            }
+        }
+        _ => Err("usage : q21 instantane <exporter|verifier> ...".to_string()),
+    }
 }
 
 fn cmd_emission(annee: Option<&str>) -> Result<(), String> {

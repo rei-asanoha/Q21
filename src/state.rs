@@ -346,6 +346,34 @@ impl Snapshot {
     }
 }
 
+impl Snapshot {
+    /// Serialise l'instantane sous sa forme **portable** : le meme encodage que
+    /// l'instantane local, mais **sans le sceau du repertoire**.
+    ///
+    /// # Ce que ce format est, et ce qu'il n'est pas
+    ///
+    /// Il se partage : aucune clef locale n'y entre, donc n'importe quelle
+    /// machine peut le relire. Sa **fidelite** — le jeu correspond-il a
+    /// l'empreinte inscrite — est verifiee a la relecture, comme pour un
+    /// instantane local. Ce qu'il ne porte pas, c'est la **confiance** : rien
+    /// dans le fichier ne prouve que cette empreinte est celle de la vraie
+    /// chaine. C'est a celui qui l'adopte de comparer [`Snapshot::muhash`] a une
+    /// valeur qu'il tient d'une source sure — l'empreinte qu'affiche son propre
+    /// explorateur, par exemple.
+    pub fn to_portable_bytes(&self) -> Vec<u8> {
+        self.encode()
+    }
+
+    /// Relit un instantane portable : verifie la somme de controle, puis que le
+    /// jeu reproduit l'empreinte inscrite, puis la coherence d'emission.
+    ///
+    /// Ne verifie **pas** la confiance. L'appelant doit encore confronter
+    /// l'empreinte relue a une valeur sure avant d'adopter l'etat.
+    pub fn from_portable_bytes(donnees: &[u8], reseau: Network) -> Result<Snapshot, StateError> {
+        Snapshot::decode(donnees, reseau)
+    }
+}
+
 /// Secret propre a un repertoire de donnees.
 ///
 /// # A quoi il sert, et a quoi il ne sert pas
@@ -823,6 +851,41 @@ mod tests {
             Err(StateError::EngagementInvalide)
         ));
         s.remove().unwrap();
+    }
+
+    #[test]
+    fn un_instantane_portable_fait_l_aller_retour() {
+        let a = instantane(30);
+        let octets = a.to_portable_bytes();
+        let b = Snapshot::from_portable_bytes(&octets, Network::Regtest).unwrap();
+        assert_eq!(a.muhash, b.muhash);
+        assert_eq!(a.height, b.height);
+        assert_eq!(a.tip, b.tip);
+        assert_eq!(a.utxo.len(), b.utxo.len());
+        assert_eq!(b.utxo.commitment(), b.muhash);
+    }
+
+    #[test]
+    fn un_instantane_portable_corrompu_est_refuse() {
+        let mut octets = instantane(20).to_portable_bytes();
+        let milieu = octets.len() / 2;
+        octets[milieu] ^= 0x01;
+        assert!(matches!(
+            Snapshot::from_portable_bytes(&octets, Network::Regtest),
+            Err(StateError::SommeInvalide)
+        ));
+    }
+
+    #[test]
+    fn un_instantane_portable_d_un_autre_reseau_est_refuse() {
+        // Le mecanisme sur lequel s'appuie la detection automatique du reseau :
+        // relu sous le mauvais reseau, un instantane tombe sur MauvaisReseau.
+        let octets = instantane(5).to_portable_bytes();
+        assert!(matches!(
+            Snapshot::from_portable_bytes(&octets, Network::Mainnet),
+            Err(StateError::MauvaisReseau)
+        ));
+        assert!(Snapshot::from_portable_bytes(&octets, Network::Regtest).is_ok());
     }
 
     #[test]
