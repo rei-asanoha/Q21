@@ -48,6 +48,12 @@ pub enum StoreError {
         attendu: crate::hash::Hash256,
         vu: crate::hash::Hash256,
     },
+    /// Le fichier d'en-tetes ne porte pas la magie attendue.
+    EntetesMagie,
+    /// Un en-tete ne s'enchaine pas sur le precedent : parent ou hauteur faux.
+    EntetesMaillonRompu {
+        index: u64,
+    },
 }
 
 impl From<std::io::Error> for StoreError {
@@ -76,6 +82,14 @@ impl std::fmt::Display for StoreError {
                 "ce fichier de blocs commence par {vu}, alors que la genese de \
                  ce reseau est {attendu} : il appartient a une autre chaine et \
                  n'est pas adopte"
+            ),
+            StoreError::EntetesMagie => {
+                write!(f, "ce fichier n'est pas un magasin d'en-tetes Q21")
+            }
+            StoreError::EntetesMaillonRompu { index } => write!(
+                f,
+                "l'en-tete {index} ne s'enchaine pas sur le precedent : \
+                 chaine d'en-tetes corrompue"
             ),
         }
     }
@@ -454,6 +468,176 @@ impl crate::chain::BodySource for BlockArchive {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Magasin d'en-tetes : la chaine d'en-tetes, sans les corps
+// ---------------------------------------------------------------------------
+
+/// Magie du fichier d'en-tetes.
+const MAGIE_ENTETES: &[u8; 8] = b"Q21HDRS\0";
+/// Version du format d'en-tetes.
+const VERSION_ENTETES: u32 = 1;
+/// Longueur du prefixe : magie (8) + version (4).
+const PREFIXE_ENTETES: u64 = 12;
+
+/// Magasin des en-tetes seuls, independant du fichier de blocs.
+///
+/// # Pourquoi il existe
+///
+/// Un noeud qui **adopte** un instantane repart a la hauteur H sans detenir les
+/// blocs 1..H. Il lui faut pourtant leur chaine d'en-tetes : c'est elle qui
+/// prouve que la tete porte une preuve de travail, et elle qui donne la
+/// difficulte du prochain bloc. Le fichier de blocs ne peut pas la lui fournir —
+/// il ne garde que les corps qu'il possede. Ce magasin la conserve a part.
+///
+/// Un noeud complet n'en a pas besoin : ses en-tetes se relisent du fichier de
+/// blocs ([`BlockStore::scan_headers`]). Ce magasin ne sert donc qu'au noeud
+/// repris sur instantane.
+///
+/// # Le format
+///
+/// Un prefixe (magie, version), puis des en-tetes de taille fixe
+/// ([`BlockHeader::SIZE`]) mis bout a bout. Pas de prefixe de longueur par
+/// enregistrement : un en-tete a toujours la meme taille. Une ecriture
+/// interrompue laisse un enregistrement partiel en fin de fichier, coupe a la
+/// relecture — comme pour le fichier de blocs.
+///
+/// # Ce qu'il verifie, et ce qu'il ne verifie pas
+///
+/// A la relecture : la magie, que le premier en-tete est bien la genese du
+/// reseau, et que chaque en-tete s'enchaine sur le precedent (parent et hauteur).
+/// Il **ne verifie pas** la preuve de travail : ce fichier local est cru, comme
+/// l'est le fichier de blocs — qui peut reecrire le repertoire a deja gagne. La
+/// preuve de travail des en-tetes **venus d'ailleurs** est verifiee a
+/// l'adoption, avant qu'ils entrent ici.
+pub struct HeaderStore {
+    chemin: PathBuf,
+}
+
+impl HeaderStore {
+    pub fn new<P: AsRef<Path>>(chemin: P) -> HeaderStore {
+        HeaderStore {
+            chemin: chemin.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.chemin
+    }
+
+    pub fn exists(&self) -> bool {
+        self.chemin.exists()
+    }
+
+    /// Ajoute des en-tetes a la fin, en creant le fichier (avec son prefixe) au
+    /// besoin. L'appelant garantit qu'ils s'enchainent sur ce qui precede ; la
+    /// relecture le reverifie de toute facon.
+    pub fn append(&self, entetes: &[BlockHeader]) -> Result<(), StoreError> {
+        if entetes.is_empty() {
+            return Ok(());
+        }
+        let neuf = !self.exists() || std::fs::metadata(&self.chemin)?.len() < PREFIXE_ENTETES;
+        let mut fichier = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.chemin)?;
+        {
+            let mut f = BufWriter::new(&mut fichier);
+            if neuf {
+                f.write_all(MAGIE_ENTETES)?;
+                f.write_all(&VERSION_ENTETES.to_le_bytes())?;
+            }
+            for h in entetes {
+                f.write_all(&h.encode())?;
+            }
+            f.flush()?;
+        }
+        fichier.sync_all()?;
+        Ok(())
+    }
+
+    /// Relit toute la chaine d'en-tetes.
+    ///
+    /// Verifie la magie, la genese, l'enchainement (parent et hauteur), et coupe
+    /// une eventuelle queue partielle. Une rupture d'enchainement **au milieu**
+    /// du fichier n'est pas une ecriture interrompue : elle est signalee, jamais
+    /// coupee.
+    pub fn load(&self, reseau: crate::address::Network) -> Result<Vec<BlockHeader>, StoreError> {
+        if !self.exists() {
+            return Ok(Vec::new());
+        }
+        let taille = std::fs::metadata(&self.chemin)?.len();
+        if taille < PREFIXE_ENTETES {
+            return Err(StoreError::EntetesMagie);
+        }
+
+        let mut f = BufReader::new(File::open(&self.chemin)?);
+        let mut magie = [0u8; 8];
+        f.read_exact(&mut magie)?;
+        if &magie != MAGIE_ENTETES {
+            return Err(StoreError::EntetesMagie);
+        }
+        let mut v = [0u8; 4];
+        f.read_exact(&mut v)?;
+        if u32::from_le_bytes(v) != VERSION_ENTETES {
+            return Err(StoreError::EntetesMagie);
+        }
+
+        // Une queue partielle — ecriture interrompue — est coupee proprement.
+        let corps = taille - PREFIXE_ENTETES;
+        let taille_entete = BlockHeader::SIZE as u64;
+        let n = corps / taille_entete;
+        if corps % taille_entete != 0 {
+            let propre = PREFIXE_ENTETES + n * taille_entete;
+            if let Ok(fh) = OpenOptions::new().write(true).open(&self.chemin) {
+                if fh.set_len(propre).is_ok() {
+                    eprintln!(
+                        "  magasin d'en-tetes repare : {} octet(s) d'ecriture interrompue coupes",
+                        taille - propre
+                    );
+                }
+            }
+        }
+
+        let mut entetes = Vec::with_capacity(n as usize);
+        let mut brut = [0u8; BlockHeader::SIZE];
+        for index in 0..n {
+            if f.read_exact(&mut brut).is_err() {
+                return Err(StoreError::FichierTronque { index });
+            }
+            let h = BlockHeader::decode(&brut).map_err(|_| StoreError::BlocIllisible { index })?;
+            entetes.push(h);
+        }
+
+        // La genese, avant tout : un fichier d'en-tetes d'une autre chaine ne
+        // doit pas etre adopte.
+        if let Some(premier) = entetes.first() {
+            let attendu = crate::chain::genesis_id(reseau);
+            let vu = premier.block_id();
+            if vu != attendu {
+                return Err(StoreError::GeneseEtrangere { attendu, vu });
+            }
+        }
+        // Puis l'enchainement : chaque en-tete pointe sur le precedent, hauteurs
+        // contigues. Un maillon rompu est une corruption, pas une troncature.
+        for i in 1..entetes.len() {
+            if entetes[i].prev_block != entetes[i - 1].block_id()
+                || entetes[i].height != entetes[i - 1].height + 1
+            {
+                return Err(StoreError::EntetesMaillonRompu { index: i as u64 });
+            }
+        }
+
+        Ok(entetes)
+    }
+
+    pub fn remove(&self) -> Result<(), StoreError> {
+        if self.exists() {
+            std::fs::remove_file(&self.chemin)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +839,116 @@ mod tests {
         let s = BlockStore::new(&p);
         let (_, err) = s.load_all().unwrap();
         assert!(matches!(err, Some(StoreError::BlocIllisible { index: 0 })));
+        s.remove().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Magasin d'en-tetes
+    // -----------------------------------------------------------------------
+
+    /// Chaine d'en-tetes structurellement liee : la vraie genese, puis des
+    /// en-tetes qui pointent sur le precedent. La preuve de travail n'est pas
+    /// valide — le magasin ne la verifie pas, c'est l'affaire de l'adoption.
+    fn chaine_entetes(n: u64) -> Vec<BlockHeader> {
+        let g = genesis_block(Network::Regtest).header;
+        let mut v = vec![g];
+        for i in 1..n {
+            let mut h = g;
+            h.height = i;
+            h.nonce = i;
+            h.prev_block = v[(i - 1) as usize].block_id();
+            v.push(h);
+        }
+        v
+    }
+
+    #[test]
+    fn un_magasin_d_entetes_absent_se_lit_comme_vide() {
+        let s = HeaderStore::new(chemin_temporaire("hdr-absent"));
+        assert!(s.load(Network::Regtest).unwrap().is_empty());
+    }
+
+    #[test]
+    fn aller_retour_sur_la_chaine_d_entetes() {
+        let p = chemin_temporaire("hdr-aller-retour");
+        let s = HeaderStore::new(&p);
+        let chaine = chaine_entetes(12);
+        s.append(&chaine).unwrap();
+        assert_eq!(s.load(Network::Regtest).unwrap(), chaine);
+        s.remove().unwrap();
+    }
+
+    #[test]
+    fn les_entetes_s_ajoutent_par_tranches() {
+        let p = chemin_temporaire("hdr-tranches");
+        let s = HeaderStore::new(&p);
+        let chaine = chaine_entetes(10);
+        s.append(&chaine[..4]).unwrap();
+        s.append(&chaine[4..]).unwrap();
+        assert_eq!(s.load(Network::Regtest).unwrap(), chaine);
+        s.remove().unwrap();
+    }
+
+    #[test]
+    fn une_queue_partielle_d_entete_est_coupee() {
+        let p = chemin_temporaire("hdr-queue");
+        let s = HeaderStore::new(&p);
+        let chaine = chaine_entetes(6);
+        s.append(&chaine).unwrap();
+        // Une ecriture interrompue : la moitie d'un en-tete de plus.
+        {
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(&[0xaa; BlockHeader::SIZE / 2]).unwrap();
+        }
+        assert_eq!(
+            s.load(Network::Regtest).unwrap(),
+            chaine,
+            "la queue partielle doit etre coupee, la chaine complete relue"
+        );
+        s.remove().unwrap();
+    }
+
+    #[test]
+    fn un_maillon_rompu_est_signale() {
+        let p = chemin_temporaire("hdr-maillon");
+        let s = HeaderStore::new(&p);
+        let mut chaine = chaine_entetes(5);
+        // On casse l'enchainement du troisieme en-tete.
+        chaine[3].prev_block = crate::hash::Hash256([0x77; 32]);
+        s.append(&chaine).unwrap();
+        assert!(matches!(
+            s.load(Network::Regtest),
+            Err(StoreError::EntetesMaillonRompu { index: 3 })
+        ));
+        s.remove().unwrap();
+    }
+
+    #[test]
+    fn une_genese_etrangere_dans_les_entetes_est_refusee() {
+        let p = chemin_temporaire("hdr-genese");
+        let s = HeaderStore::new(&p);
+        let mut chaine = chaine_entetes(3);
+        // Le premier en-tete n'est plus la vraie genese.
+        chaine[0].nonce = 999;
+        // On refait pointer le second pour que seul le controle de genese morde.
+        chaine[1].prev_block = chaine[0].block_id();
+        s.append(&chaine).unwrap();
+        assert!(matches!(
+            s.load(Network::Regtest),
+            Err(StoreError::GeneseEtrangere { .. })
+        ));
+        s.remove().unwrap();
+    }
+
+    #[test]
+    fn un_fichier_sans_magie_n_est_pas_un_magasin_d_entetes() {
+        let p = chemin_temporaire("hdr-magie");
+        std::fs::write(&p, b"ceci n'est pas un magasin d'en-tetes du tout").unwrap();
+        let s = HeaderStore::new(&p);
+        assert!(matches!(
+            s.load(Network::Regtest),
+            Err(StoreError::EntetesMagie)
+        ));
         s.remove().unwrap();
     }
 }
