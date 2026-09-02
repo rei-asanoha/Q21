@@ -42,9 +42,24 @@
 use crate::block::{Block, BlockHeader};
 use crate::hash::Hash256;
 use crate::ser::{ReadError, Reader, Writer};
+use crate::wire::{Message, WireError, HEADER_LEN, MAX_PAYLOAD, PROTOCOL_VERSION};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIE: &[u8; 8] = b"Q21AMORC";
 const VERSION: u32 = 1;
+
+/// Taille d'une tranche de transfert.
+///
+/// Sous la taille maximale d'un message (8 Mio) et sous le budget de reponse du
+/// noeud (4 Mio) : une tranche qui ne tiendrait pas dans un message serait un
+/// gaspillage a sens unique.
+pub const TAILLE_TRANCHE: usize = 1024 * 1024;
+
+/// Plafond du telechargement complet d'une amorce, cote client. Meme borne que
+/// le decodage : de quoi tenir un tres grand jeu d'UTXO, jamais l'infini.
+const MAX_AMORCE_OCTETS: usize = 2 * 1024 * 1024 * 1024;
 
 /// Bornes de securite a la lecture : une amorce vient d'un pair, donc d'un
 /// inconnu. Aucune allocation n'est dictee par ce qu'il annonce.
@@ -188,6 +203,205 @@ impl Amorce {
         self.instantane
             .get(DECALAGE..fin)
             .map(|s| Hash256(s.try_into().unwrap()))
+    }
+
+    /// La hauteur de l'instantane, lue a sa position.
+    pub fn hauteur_annoncee(&self) -> Option<u64> {
+        const DECALAGE: usize = 8 + 4 + 1;
+        self.instantane
+            .get(DECALAGE..DECALAGE + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    }
+
+    /// La tete de l'instantane, lue a sa position.
+    pub fn tete_annoncee(&self) -> Option<Hash256> {
+        const DECALAGE: usize = 8 + 4 + 1 + 8;
+        self.instantane
+            .get(DECALAGE..DECALAGE + 32)
+            .map(|s| Hash256(s.try_into().unwrap()))
+    }
+}
+
+/// Nombre de tranches pour une amorce de `taille` octets.
+pub fn nombre_de_tranches(taille: usize) -> u32 {
+    taille.div_ceil(TAILLE_TRANCHE) as u32
+}
+
+/// La tranche numero `index` des octets d'une amorce, ou vide si l'index est
+/// hors de portee.
+pub fn tranche(octets: &[u8], index: u32) -> &[u8] {
+    let debut = (index as usize).saturating_mul(TAILLE_TRANCHE);
+    if debut >= octets.len() {
+        return &[];
+    }
+    let fin = (debut + TAILLE_TRANCHE).min(octets.len());
+    &octets[debut..fin]
+}
+
+// ---------------------------------------------------------------------------
+// Client : telecharger une amorce depuis un pair
+// ---------------------------------------------------------------------------
+
+/// Telecharge une amorce depuis un pair, la reassemble, et **verifie son
+/// empreinte** contre la valeur de confiance fournie par l'operateur.
+///
+/// # Le modele de confiance, redit ici
+///
+/// Le pair fournit les octets ; il ne fournit pas la confiance. Une amorce dont
+/// l'empreinte annoncee — puis l'empreinte du paquet reassemble — ne correspond
+/// pas a `empreinte_attendue` est **rejetee** : le pair est ecarte, rien n'est
+/// adopte. C'est a l'appelant d'essayer un autre pair. `empreinte_attendue` vient
+/// de l'operateur (l'empreinte qu'affiche son explorateur), jamais du pair.
+///
+/// # Bornes
+///
+/// Chaque lecture a un delai, et l'ensemble a une echeance globale : un pair qui
+/// distille les octets ne peut pas retenir le client indefiniment. La taille
+/// totale est plafonnee avant toute reservation.
+pub fn telecharger_amorce(
+    adresse: SocketAddr,
+    magie: [u8; 4],
+    hauteur_locale: u64,
+    empreinte_attendue: Hash256,
+    delai_lecture: Duration,
+    delai_total: Duration,
+) -> Result<Amorce, String> {
+    let echeance = Instant::now() + delai_total;
+    let mut flux = TcpStream::connect_timeout(&adresse, delai_lecture)
+        .map_err(|e| format!("connexion a {adresse} impossible : {e}"))?;
+    let _ = flux.set_read_timeout(Some(delai_lecture));
+    let _ = flux.set_write_timeout(Some(delai_lecture));
+    let _ = flux.set_nodelay(true);
+
+    // Poignee de main : on parle en premier, puis on scelle par un verack — c'est
+    // lui qui, cote pair, ouvre l'acces aux messages couteux.
+    ecrire(&mut flux, magie, &poignee(hauteur_locale))?;
+    ecrire(&mut flux, magie, &Message::VerAck)?;
+    ecrire(&mut flux, magie, &Message::GetAmorce)?;
+
+    let mut tampon: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+    // On attend les metadonnees, en repondant aux pings et en ignorant le reste
+    // (le pair peut tenter de nous synchroniser en parallele : ce n'est pas ce
+    // qu'on est venu chercher).
+    let (taille, tranches, empreinte) = loop {
+        match lire_message(&mut flux, &mut tampon, magie, echeance)? {
+            Message::AmorceInfo {
+                taille,
+                tranches,
+                empreinte,
+                ..
+            } => break (taille as usize, tranches, empreinte),
+            Message::Ping(n) => ecrire(&mut flux, magie, &Message::Pong(n))?,
+            Message::Reject { raison, .. } => return Err(format!("le pair refuse : {raison}")),
+            _ => {}
+        }
+    };
+
+    if empreinte != empreinte_attendue {
+        return Err(format!(
+            "empreinte annoncee {empreinte} differente de la valeur de confiance \
+             {empreinte_attendue} : ce pair est ecarte"
+        ));
+    }
+    if taille > MAX_AMORCE_OCTETS {
+        return Err(format!("amorce annoncee trop grande : {taille} octets"));
+    }
+    if nombre_de_tranches(taille) != tranches {
+        return Err("le compte de tranches ne correspond pas a la taille".into());
+    }
+
+    // On demande les tranches dans l'ordre, une par une.
+    let mut octets: Vec<u8> = Vec::with_capacity(taille.min(64 * 1024 * 1024));
+    for i in 0..tranches {
+        ecrire(&mut flux, magie, &Message::GetAmorceTranche { index: i })?;
+        loop {
+            match lire_message(&mut flux, &mut tampon, magie, echeance)? {
+                Message::AmorceTranche { index, donnees } if index == i => {
+                    if octets.len() + donnees.len() > taille {
+                        return Err("le pair envoie plus que la taille annoncee".into());
+                    }
+                    octets.extend_from_slice(&donnees);
+                    break;
+                }
+                Message::Ping(n) => ecrire(&mut flux, magie, &Message::Pong(n))?,
+                _ => {}
+            }
+        }
+    }
+
+    if octets.len() != taille {
+        return Err(format!(
+            "taille recue {} differente de l'annonce {taille}",
+            octets.len()
+        ));
+    }
+
+    let amorce = Amorce::decode(&octets).map_err(|e| format!("amorce illisible : {e}"))?;
+    // Ceinture et bretelles : l'empreinte du paquet reassemble doit, elle aussi,
+    // egaler la valeur de confiance.
+    if amorce.empreinte_annoncee() != Some(empreinte_attendue) {
+        return Err("apres reassemblage, l'empreinte du paquet ne correspond plus".into());
+    }
+    Ok(amorce)
+}
+
+fn poignee(hauteur: u64) -> Message {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(1)
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1);
+    Message::Version {
+        version: PROTOCOL_VERSION,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        nonce,
+        user_agent: "q21:0.1".into(),
+        start_height: hauteur,
+    }
+}
+
+fn ecrire(flux: &mut TcpStream, magie: [u8; 4], m: &Message) -> Result<(), String> {
+    flux.write_all(&m.frame(magie))
+        .map_err(|e| format!("ecriture reseau : {e}"))
+}
+
+/// Lit le prochain message complet, en accumulant les octets. Le tampon ne
+/// grandit jamais au-dela d'une trame, et l'echeance globale coupe un pair qui
+/// distille.
+fn lire_message(
+    flux: &mut TcpStream,
+    tampon: &mut Vec<u8>,
+    magie: [u8; 4],
+    echeance: Instant,
+) -> Result<Message, String> {
+    loop {
+        match Message::parse(tampon, magie) {
+            Ok((m, n)) => {
+                tampon.drain(..n);
+                return Ok(m);
+            }
+            Err(WireError::Incomplet) => {}
+            Err(e) => return Err(format!("trame invalide recue : {e:?}")),
+        }
+        if Instant::now() >= echeance {
+            return Err("delai global depasse pendant le telechargement".into());
+        }
+        if tampon.len() > MAX_PAYLOAD + HEADER_LEN {
+            return Err("trame plus grande que le maximum du protocole".into());
+        }
+        let mut morceau = [0u8; 32 * 1024];
+        let lu = flux
+            .read(&mut morceau)
+            .map_err(|e| format!("lecture reseau : {e}"))?;
+        if lu == 0 {
+            return Err("connexion fermee par le pair".into());
+        }
+        tampon.extend_from_slice(&morceau[..lu]);
     }
 }
 

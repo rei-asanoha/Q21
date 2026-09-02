@@ -104,6 +104,7 @@ jobs:
           cargo test --locked --features mldsa,audit --test audit_arith
           cargo test --locked --features mldsa,audit --test audit_mempool
           cargo test --locked --features mldsa,audit --test audit_muhash
+          cargo test --locked --features mldsa,audit --test audit_synchro_rapide
 
       - name: Compilation
         run: cargo build --locked --release --features mldsa --target ${{ matrix.cible }}

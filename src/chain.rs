@@ -941,6 +941,39 @@ impl Chain {
         self.utxo.len()
     }
 
+    /// Construit l'amorce de synchronisation rapide que ce noeud peut servir.
+    ///
+    /// Les trois memes pieces que `instantane exporter-amorce` : l'instantane
+    /// pris en retrait, les en-tetes de la genese a sa hauteur, et une fenetre
+    /// bornee de corps autour de lui (la genese, puis les blocs qu'il faut pour
+    /// rejouer par-dessus sans violer la regle du double paiement d'oncle).
+    ///
+    /// Rend `None` si la chaine est trop courte, ou si un corps de la fenetre
+    /// manque — un noeud sans source de corps ne sert pas d'amorce.
+    pub fn construire_amorce(&self) -> Option<crate::synchro_rapide::Amorce> {
+        let s = self.snapshot()?;
+        let h = s.height;
+        let tous = self.headers();
+        if h as usize >= tous.len() {
+            return None;
+        }
+        let entetes = tous[..=h as usize].to_vec();
+        let marge = crate::consensus::MAX_UNCLE_AGE + 2;
+        let debut = h.saturating_sub(marge);
+        let mut corps = vec![self.block_at(0)?];
+        for hh in debut..=h {
+            if hh == 0 {
+                continue; // la genese est deja la
+            }
+            corps.push(self.block_at(hh)?);
+        }
+        Some(crate::synchro_rapide::Amorce {
+            instantane: s.to_portable_bytes(),
+            entetes,
+            corps,
+        })
+    }
+
     pub fn known_blocks(&self) -> usize {
         self.index.len()
     }
