@@ -80,6 +80,15 @@ COMMANDES
                              --sans-amorces       n'employer que ce que la ligne
                                                   de commande donne
                              --connect <ip:port>  synonyme d'--amorce
+                             --adopter-empreinte <hex>
+                                                  synchro rapide : dans un
+                                                  dossier vide, telecharge
+                                                  l'amorce d'un pair et l'adopte
+                                                  si son empreinte correspond
+                                                  (exige --reseau et
+                                                  --adopter-tete)
+                             --adopter-tete <hex> la tete de confiance qui
+                                                  accompagne l'empreinte
                              --index-adresses     index de recherche (voir
                                                   EXPLORATEUR.md)
                              --mine               mine en continu
@@ -646,7 +655,7 @@ fn texte_en_etiquettes(valeur: &str) -> std::collections::HashMap<u32, String> {
 /// etiquette perdue est un desagrement ; une etiquette devinee de travers est
 /// un carnet auquel on ne peut plus se fier.
 fn hex_en_octets(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if s.len() % 2 != 0 {
         return None;
     }
     let mut v = Vec::with_capacity(s.len() / 2);
@@ -2457,6 +2466,109 @@ fn cmd_securite() -> Result<(), String> {
     Ok(())
 }
 
+/// Pose dans un dossier vierge un etat adopte : valide l'amorce (empreinte,
+/// tete, authentification par les en-tetes), puis ecrit le magasin d'en-tetes,
+/// les corps, et l'instantane scelle. Rend (hauteur, empreinte).
+///
+/// Une seule implementation, partagee par l'adoption sur fichier
+/// (`instantane adopter`) et par l'adoption de pair a pair (`node
+/// --adopter-empreinte`).
+fn stager_amorce_adoptee(
+    datadir: &Path,
+    reseau: Network,
+    instantane: &[u8],
+    entetes: &[q21_core::block::BlockHeader],
+    corps: &[q21_core::block::Block],
+    tete: Hash256,
+    empreinte: Hash256,
+) -> Result<(u64, Hash256), String> {
+    use q21_core::state::{Snapshot, StateStore};
+    use q21_core::store::{BlockStore, HeaderStore};
+
+    let snap = Snapshot::from_portable_bytes(instantane, reseau)
+        .map_err(|e| format!("instantane invalide : {e}"))?;
+    Chain::adopter_instantane(reseau, snap.clone(), entetes, tete, empreinte)
+        .map_err(|e| format!("adoption refusee : {e}"))?;
+
+    if chemin_blocs(datadir).exists()
+        || chemin_etat(datadir).exists()
+        || chemin_entetes(datadir).exists()
+    {
+        return Err(format!(
+            "le dossier {} contient deja une chaine : l'adoption ne se fait que \
+             dans un dossier vide",
+            datadir.display()
+        ));
+    }
+    std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
+    HeaderStore::new(chemin_entetes(datadir))
+        .append(entetes)
+        .map_err(|e| e.to_string())?;
+    let bs = BlockStore::new(chemin_blocs(datadir));
+    for b in corps {
+        bs.append(b).map_err(|e| e.to_string())?;
+    }
+    let clef = q21_core::state::clef_de_repertoire(datadir).map_err(|e| e.to_string())?;
+    StateStore::new_scelle(chemin_etat(datadir), clef)
+        .save(&snap)
+        .map_err(|e| e.to_string())?;
+    Ok((snap.height, snap.muhash))
+}
+
+/// Telecharge une amorce depuis l'un des pairs donnes, la premiere qui repond et
+/// dont l'empreinte correspond, puis l'adopte dans le dossier.
+fn adopter_depuis_pairs(
+    datadir: &Path,
+    reseau: Network,
+    cibles: &[String],
+    tete: Hash256,
+    empreinte: Hash256,
+) -> Result<(), String> {
+    let magie = q21_core::net::magic_for(reseau);
+    let mut derniere = String::from("aucun pair contacte");
+    for cible in cibles {
+        let adresses = match q21_core::amorce::resoudre(cible, reseau) {
+            Ok(a) => a,
+            Err(e) => {
+                derniere = e;
+                continue;
+            }
+        };
+        for addr in adresses {
+            println!("  telechargement de l'amorce depuis {addr}...");
+            match q21_core::synchro_rapide::telecharger_amorce(
+                addr,
+                magie,
+                0,
+                empreinte,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(600),
+            ) {
+                Ok(amorce) => {
+                    let (h, emp) = stager_amorce_adoptee(
+                        datadir,
+                        reseau,
+                        &amorce.instantane,
+                        &amorce.entetes,
+                        &amorce.corps,
+                        tete,
+                        empreinte,
+                    )?;
+                    println!("  amorce adoptee a la hauteur {h}, empreinte {emp}.");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("  {addr} : {e}");
+                    derniere = e;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "aucun pair n'a fourni d'amorce adoptable. Derniere raison : {derniere}"
+    ))
+}
+
 fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     use q21_core::net::Node;
     use std::sync::atomic::Ordering;
@@ -2477,10 +2589,20 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut index_adresses = false;
     let mut reseau_impose: Option<Network> = None;
     let mut sans_amorces = false;
+    let mut adopter_empreinte: Option<String> = None;
+    let mut adopter_tete: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--adopter-empreinte" if i + 1 < args.len() => {
+                adopter_empreinte = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--adopter-tete" if i + 1 < args.len() => {
+                adopter_tete = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--listen" if i + 1 < args.len() => {
                 ecoute = Some(args[i + 1].clone());
                 i += 2;
@@ -2561,6 +2683,39 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         eprintln!(
             "avertissement : le systeme a refuse le gestionnaire d'arret.\n               Un Ctrl-C tuera le processus sans ecrire l'instantane ni le reservoir."
         );
+    }
+
+    // --- Synchronisation rapide : adopter une amorce d'un pair avant de charger.
+    //
+    // Si l'operateur fournit une empreinte et une tete de confiance, et que le
+    // dossier est vierge, on telecharge une amorce d'un pair et on l'adopte —
+    // apres avoir verifie que son empreinte correspond a la valeur donnee. Le
+    // chargement qui suit repart alors de l'etat adopte, et la synchronisation
+    // ordinaire rattrape la tete. Un dossier deja peuple n'est jamais touche.
+    if let (Some(eh), Some(th)) = (&adopter_empreinte, &adopter_tete) {
+        let reseau = reseau_impose.ok_or(
+            "--adopter-empreinte exige --reseau : un noeud neuf n'a pas de \
+             portefeuille pour deviner la chaine",
+        )?;
+        if chemin_blocs(datadir).exists() {
+            eprintln!("  ce dossier contient deja une chaine : l'adoption est ignoree.");
+        } else {
+            let empreinte = Hash256::from_hex(eh.trim())
+                .ok_or("--adopter-empreinte : 64 caracteres hexadecimaux attendus")?;
+            let tete = Hash256::from_hex(th.trim())
+                .ok_or("--adopter-tete : 64 caracteres hexadecimaux attendus")?;
+            let mut cibles: Vec<String> = vers.clone();
+            if cibles.is_empty() && !sans_amorces {
+                cibles = q21_core::amorce::amorces_integrees(reseau)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+            if cibles.is_empty() {
+                return Err("aucun pair pour telecharger l'amorce : donnez --amorce <hote>".into());
+            }
+            adopter_depuis_pairs(datadir, reseau, &cibles, tete, empreinte)?;
+        }
     }
 
     let mut etat = charger_avec(datadir, reseau_impose)?;

@@ -151,6 +151,41 @@ struct Partage {
     nonce: u64,
     /// Ou consigner les blocs acceptes. Absent en memoire pure (tests).
     journal: Option<Arc<dyn crate::chain::Journal>>,
+    /// L'amorce de synchronisation rapide deja serialisee, gardee tant que la
+    /// tete ne bouge pas. La reconstruire coute cher (instantane + empreinte) :
+    /// on ne le fait qu'a la demande, et une seule fois par tete.
+    amorce_cache: Option<AmorceCache>,
+}
+
+/// L'amorce servie, figee pour une tete donnee.
+struct AmorceCache {
+    tip: Hash256,
+    octets: Vec<u8>,
+    hauteur: u64,
+    tete: Hash256,
+    empreinte: Hash256,
+}
+
+/// Reconstruit l'amorce servie si la tete a bouge depuis la derniere fois.
+///
+/// Un client qui telecharge pendant que la tete avance recevra des tranches
+/// d'une amorce differente de celle annoncee ; son controle d'empreinte le
+/// detecte et il recommence. La coherence n'est donc jamais rompue en silence.
+fn rafraichir_amorce(g: &mut Partage) {
+    let tip = g.chain.tip_id();
+    if g.amorce_cache.as_ref().map(|c| c.tip) == Some(tip) {
+        return;
+    }
+    g.amorce_cache = g.chain.construire_amorce().map(|a| {
+        let octets = a.encode();
+        AmorceCache {
+            tip,
+            hauteur: a.hauteur_annoncee().unwrap_or(0),
+            tete: a.tete_annoncee().unwrap_or(Hash256::ZERO),
+            empreinte: a.empreinte_annoncee().unwrap_or(Hash256::ZERO),
+            octets,
+        }
+    });
 }
 
 /// Items servis au maximum en reponse a un seul message.
@@ -224,6 +259,7 @@ impl Node {
                 network,
                 nonce,
                 journal: None,
+                amorce_cache: None,
             })),
             magie: magic_for(network),
             prochain_id: Arc::new(AtomicU64::new(1)),
@@ -1089,15 +1125,51 @@ impl Node {
                 }
                 Message::Reject { .. } => {}
 
-                // Synchronisation rapide par amorce : le protocole existe (voir
-                // `crate::synchro_rapide` et `crate::wire`), mais le service et
-                // la demande ne sont pas encore branches. On ignore donc ces
-                // messages sans broncher — un pair qui les envoie n'obtient rien,
-                // il ne casse rien.
-                Message::GetAmorce
-                | Message::AmorceInfo { .. }
-                | Message::GetAmorceTranche { .. }
-                | Message::AmorceTranche { .. } => {}
+                // --- Synchronisation rapide : servir une amorce.
+                //
+                // Comme tout message couteux, ces reponses exigent la poignee de
+                // main : servir un jeu d'UTXO entier a une connexion anonyme
+                // ramenerait une amplification au prix d'un `connect()`.
+                Message::GetAmorce => {
+                    if handshaked {
+                        rafraichir_amorce(&mut g);
+                        if let Some(c) = &g.amorce_cache {
+                            envois.push(Envoi {
+                                peer: id,
+                                message: Message::AmorceInfo {
+                                    hauteur: c.hauteur,
+                                    tete: c.tete,
+                                    empreinte: c.empreinte,
+                                    taille: c.octets.len() as u64,
+                                    tranches: crate::synchro_rapide::nombre_de_tranches(
+                                        c.octets.len(),
+                                    ),
+                                },
+                            });
+                        }
+                        // Pas d'amorce (chaine trop courte) : on ne repond rien.
+                        // Le demandeur ira voir ailleurs.
+                    }
+                }
+                Message::GetAmorceTranche { index } => {
+                    if handshaked {
+                        rafraichir_amorce(&mut g);
+                        if let Some(c) = &g.amorce_cache {
+                            let tr = crate::synchro_rapide::tranche(&c.octets, index);
+                            if !tr.is_empty() {
+                                envois.push(Envoi {
+                                    peer: id,
+                                    message: Message::AmorceTranche {
+                                        index,
+                                        donnees: tr.to_vec(),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                // Un serveur ne recoit pas de reponses d'amorce : on les ignore.
+                Message::AmorceInfo { .. } | Message::AmorceTranche { .. } => {}
             }
         } // --- verrou relache ici, avant toute ecriture reseau ---
 
