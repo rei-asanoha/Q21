@@ -1088,6 +1088,16 @@ impl Node {
                     }
                 }
                 Message::Reject { .. } => {}
+
+                // Synchronisation rapide par amorce : le protocole existe (voir
+                // `crate::synchro_rapide` et `crate::wire`), mais le service et
+                // la demande ne sont pas encore branches. On ignore donc ces
+                // messages sans broncher — un pair qui les envoie n'obtient rien,
+                // il ne casse rien.
+                Message::GetAmorce
+                | Message::AmorceInfo { .. }
+                | Message::GetAmorceTranche { .. }
+                | Message::AmorceTranche { .. } => {}
             }
         } // --- verrou relache ici, avant toute ecriture reseau ---
 

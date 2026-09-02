@@ -154,6 +154,27 @@ pub enum Message {
         commande: String,
         raison: String,
     },
+    /// Demande a un pair de decrire l'amorce de synchronisation rapide qu'il peut
+    /// servir.
+    GetAmorce,
+    /// Metadonnees de l'amorce : de quoi savoir quoi demander et a quoi
+    /// s'attendre, avant d'en recevoir le moindre morceau.
+    AmorceInfo {
+        hauteur: u64,
+        tete: Hash256,
+        empreinte: Hash256,
+        taille: u64,
+        tranches: u32,
+    },
+    /// Demande la tranche numero `index` de l'amorce serialisee.
+    GetAmorceTranche {
+        index: u32,
+    },
+    /// Une tranche de l'amorce serialisee, a reassembler dans l'ordre.
+    AmorceTranche {
+        index: u32,
+        donnees: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -175,6 +196,10 @@ impl Message {
             Message::GetAddr => "getaddr",
             Message::Addr(_) => "addr",
             Message::Reject { .. } => "reject",
+            Message::GetAmorce => "getamorce",
+            Message::AmorceInfo { .. } => "amorceinfo",
+            Message::GetAmorceTranche { .. } => "getamotrn",
+            Message::AmorceTranche { .. } => "amotranche",
         }
     }
 
@@ -252,6 +277,27 @@ impl Message {
             Message::Reject { commande, raison } => {
                 w.var_bytes(commande.as_bytes());
                 w.var_bytes(raison.as_bytes());
+            }
+            Message::GetAmorce => {}
+            Message::AmorceInfo {
+                hauteur,
+                tete,
+                empreinte,
+                taille,
+                tranches,
+            } => {
+                w.u64(*hauteur);
+                w.bytes(tete.as_bytes());
+                w.bytes(empreinte.as_bytes());
+                w.u64(*taille);
+                w.u32(*tranches);
+            }
+            Message::GetAmorceTranche { index } => {
+                w.u32(*index);
+            }
+            Message::AmorceTranche { index, donnees } => {
+                w.u32(*index);
+                w.var_bytes(donnees);
             }
         }
         w.finish()
@@ -469,6 +515,38 @@ impl Message {
                     raison: String::from_utf8_lossy(raison).into_owned(),
                 }
             }
+            "getamorce" => {
+                r.expect_end()?;
+                Message::GetAmorce
+            }
+            "amorceinfo" => {
+                let hauteur = r.u64()?;
+                let tete = Hash256(r.array32()?);
+                let empreinte = Hash256(r.array32()?);
+                let taille = r.u64()?;
+                let tranches = r.u32()?;
+                r.expect_end()?;
+                Message::AmorceInfo {
+                    hauteur,
+                    tete,
+                    empreinte,
+                    taille,
+                    tranches,
+                }
+            }
+            "getamotrn" => {
+                let index = r.u32()?;
+                r.expect_end()?;
+                Message::GetAmorceTranche { index }
+            }
+            "amotranche" => {
+                let index = r.u32()?;
+                // La tranche est bornee par la trame elle-meme : la charge ne
+                // depasse jamais MAX_PAYLOAD, controle avant meme d'arriver ici.
+                let donnees = r.var_bytes()?.to_vec();
+                r.expect_end()?;
+                Message::AmorceTranche { index, donnees }
+            }
             autre => return Err(WireError::CommandeInconnue(autre.to_string())),
         };
         Ok(m)
@@ -628,6 +706,27 @@ mod tests {
                 last_seen: 0,
             },
         ]));
+    }
+
+    #[test]
+    fn aller_retour_sur_les_messages_d_amorce() {
+        aller_retour(Message::GetAmorce);
+        aller_retour(Message::AmorceInfo {
+            hauteur: 98_993,
+            tete: Hash256([0x11; 32]),
+            empreinte: Hash256([0x22; 32]),
+            taille: 54_321_000,
+            tranches: 52,
+        });
+        aller_retour(Message::GetAmorceTranche { index: 7 });
+        aller_retour(Message::AmorceTranche {
+            index: 7,
+            donnees: vec![0xcd; 4096],
+        });
+        aller_retour(Message::AmorceTranche {
+            index: 0,
+            donnees: Vec::new(),
+        });
     }
 
     #[test]
