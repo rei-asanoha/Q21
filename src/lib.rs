@@ -74,6 +74,7 @@ pub mod sig;
 pub mod siphash;
 pub mod state;
 pub mod store;
+pub mod synchro_rapide;
 pub mod tx;
 pub mod uint;
 pub mod utxo;
