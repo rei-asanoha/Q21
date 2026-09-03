@@ -1508,6 +1508,24 @@ fn cmd_balance(datadir: &Path) -> Result<(), String> {
             Amount::from_units(immature)
         );
     }
+
+    // --- Ce qu'une adresse reutilisee a immobilise.
+    //
+    // Avec une signature a usage unique, une clef ne signe qu'une fois : si une
+    // adresse recoit deux paiements, une seule des deux pieces est depensable.
+    // Taire la seconde ferait disparaitre des fonds sans explication. On la
+    // nomme, et on dit quoi faire pour que cela ne se reproduise pas.
+    let fige = e.wallet.montant_fige(&e.chain.utxo, h);
+    if fige.units() > 0 {
+        let reutilisees = e.wallet.adresses_reutilisees(&e.chain.utxo, h);
+        println!("{fige} Q21 immobilises par la reutilisation d'adresse");
+        println!(
+            "  {} adresse(s) ont recu plus d'un paiement. Une clef a usage unique",
+            reutilisees.len()
+        );
+        println!("  ne signe qu'une fois : seule la plus grosse piece reste depensable.");
+        println!("  Donnez une adresse neuve a chaque paiement (q21 adresse).");
+    }
     Ok(())
 }
 

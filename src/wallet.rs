@@ -661,21 +661,107 @@ impl Wallet {
         self.connues.insert(empreinte, index);
     }
 
-    /// Sorties depensables appartenant au portefeuille.
+    /// Sorties reellement depensables appartenant au portefeuille.
+    ///
+    /// « Reellement » n'est pas un ornement. Avec un schema a usage unique, une
+    /// clef ne signe qu'une fois : si une adresse a recu deux paiements — parce
+    /// que celui qui paie a reutilise l'adresse — une seule des deux pieces
+    /// pourra jamais etre depensee. Les annoncer toutes reviendrait a afficher
+    /// un solde que la depense refuserait ensuite, sans explication. Cette
+    /// methode ne rend donc que ce qui est vrai ; [`Wallet::montant_fige`] dit
+    /// ce qui manque et pourquoi.
     pub fn spendable(&self, utxo: &UtxoSet, hauteur: u64) -> Vec<(OutPoint, TxOut, u32)> {
+        let usage_unique = self.scheme.est_a_usage_unique();
         let mut v = Vec::new();
         for (h, index) in &self.connues {
             // Une clef Lamport consommee est morte : les fonds qu'elle garde ne
             // sont plus depensables sans reveler la clef privee. ML-DSA n'a pas
             // cette contrainte, et masquer ses fonds serait un bogue.
-            if self.scheme.est_a_usage_unique() && self.consommes.contains(index) {
+            if usage_unique && self.consommes.contains(index) {
                 continue;
             }
-            for (o, e) in utxo.spendable_for(h, hauteur, COINBASE_MATURITY) {
-                v.push((o, e.output, *index));
+            let pieces = utxo.spendable_for(h, hauteur, COINBASE_MATURITY);
+            if usage_unique {
+                // Une seule piece par indice, et la plus grosse : c'est celle
+                // qui laisse le plus de valeur accessible. A montant egal, le
+                // point de sortie departage, pour que deux executions du meme
+                // portefeuille choisissent toujours la meme piece.
+                if let Some((o, e)) =
+                    pieces
+                        .into_iter()
+                        .max_by_key(|(o, e): &(OutPoint, crate::utxo::UtxoEntry)| {
+                            (e.output.value.units(), std::cmp::Reverse(*o))
+                        })
+                {
+                    v.push((o, e.output, *index));
+                }
+            } else {
+                for (o, e) in pieces {
+                    v.push((o, e.output, *index));
+                }
             }
         }
         v.sort_by_key(|(o, _, _)| *o);
+        v
+    }
+
+    /// Montant immobilise par la discipline d'usage unique, et par elle seule.
+    ///
+    /// Une clef Lamport ne signe qu'une fois. Deux pieces sur la meme adresse,
+    /// c'est donc une piece depensable et une piece figee : signer les deux
+    /// revelerait la clef privee, et le portefeuille refuse de le faire.
+    ///
+    /// Cette somme appartient bien a l'utilisateur et ne se depensera pourtant
+    /// jamais. La taire serait le pire choix possible — il verrait un solde
+    /// diminuer sans cause, ou une depense echouer sans raison affichee. On la
+    /// nomme donc, pour que l'interface puisse l'expliquer.
+    ///
+    /// Vaut toujours zero pour un schema sans usage unique (ML-DSA).
+    pub fn montant_fige(&self, utxo: &UtxoSet, hauteur: u64) -> Amount {
+        if !self.scheme.est_a_usage_unique() {
+            return Amount::ZERO;
+        }
+        let mut total: u64 = 0;
+        for (h, index) in &self.connues {
+            let pieces = utxo.spendable_for(h, hauteur, COINBASE_MATURITY);
+            let somme = pieces
+                .iter()
+                .fold(0u64, |a, (_, e)| a.saturating_add(e.output.value.units()));
+            // Clef deja employee : tout ce qui reste dessus est fige. Sinon,
+            // tout sauf la piece que `spendable` retiendra.
+            let retenue = if self.consommes.contains(index) {
+                0
+            } else {
+                pieces
+                    .iter()
+                    .map(|(_, e)| e.output.value.units())
+                    .max()
+                    .unwrap_or(0)
+            };
+            total = total.saturating_add(somme.saturating_sub(retenue));
+        }
+        Amount::from_units(total)
+    }
+
+    /// Adresses ayant recu plus d'un paiement, avec le nombre de pieces.
+    ///
+    /// C'est la cause, la ou [`Wallet::montant_fige`] en donne le montant : elle
+    /// permet a l'interface de dire *quelle* adresse a ete reutilisee, et donc
+    /// d'apprendre a l'utilisateur a ne plus la redonner. Vide pour un schema
+    /// sans usage unique.
+    pub fn adresses_reutilisees(&self, utxo: &UtxoSet, hauteur: u64) -> Vec<(Hash256, usize)> {
+        if !self.scheme.est_a_usage_unique() {
+            return Vec::new();
+        }
+        let mut v: Vec<(Hash256, usize)> = self
+            .connues
+            .keys()
+            .filter_map(|h| {
+                let n = utxo.spendable_for(h, hauteur, COINBASE_MATURITY).len();
+                (n > 1).then_some((*h, n))
+            })
+            .collect();
+        v.sort_by_key(|(h, _)| *h);
         v
     }
 
@@ -1323,28 +1409,46 @@ mod tests {
             c.connect(&b, t + 1).expect("connexion");
         }
 
-        // Plusieurs pieces mûres, toutes sur l'indice 0.
-        let pieces = w.spendable(&c.utxo, c.height());
-        assert!(
-            pieces.len() >= 2,
-            "le test suppose au moins deux pieces sur le meme indice"
+        // L'adresse a recu bien plus d'une piece...
+        let reutilisees = w.adresses_reutilisees(&c.utxo, c.height());
+        assert_eq!(
+            reutilisees.len(),
+            1,
+            "une adresse reutilisee doit etre signalee comme telle"
         );
-        assert!(
-            pieces.iter().all(|p| p.2 == pieces[0].2),
-            "toutes les pieces doivent etre sur le meme indice"
+        assert!(reutilisees[0].1 >= 2, "elle porte plusieurs pieces");
+
+        // ... mais une seule est depensable, et c'est la plus grosse.
+        let pieces = w.spendable(&c.utxo, c.height());
+        assert_eq!(
+            pieces.len(),
+            1,
+            "une clef a usage unique ne peut rendre qu'une piece depensable"
         );
         let une_piece = pieces[0].1.value.units();
 
+        // Le solde annonce est exactement ce qui est depensable, et le reste
+        // est nomme « fige » plutot que tu.
+        let solde = w.balance(&c.utxo, c.height()).units();
+        assert_eq!(
+            solde, une_piece,
+            "le solde doit etre celui qu'on peut payer"
+        );
+        assert!(
+            w.montant_fige(&c.utxo, c.height()).units() > 0,
+            "les pieces immobilisees doivent etre visibles"
+        );
+
         let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
 
-        // Un montant qui exigerait une deuxieme piece du meme indice : refus,
-        // jamais une co-signature.
+        // Un montant au-dela du solde annonce : refus franc, jamais une
+        // co-signature (qui revelerait la clef Lamport).
         let d = dest.new_address();
         let r = w.create_transaction(
             &c.utxo,
             c.height(),
             &d,
-            Amount::from_units(une_piece + 1),
+            Amount::from_units(solde + 1),
             Amount::ZERO,
         );
         assert!(
@@ -1352,17 +1456,18 @@ mod tests {
             "le portefeuille a co-signe deux pieces du meme indice : clef Lamport revelee"
         );
 
-        // Dans la limite d'une piece : possible, avec une seule entree.
+        // La promesse inverse, celle qui rend le portefeuille utilisable : tout
+        // ce qui est annonce se paie vraiment, et en une seule entree.
         let d2 = dest.new_address();
         let tx = w
             .create_transaction(
                 &c.utxo,
                 c.height(),
                 &d2,
-                Amount::from_units(une_piece / 2),
+                Amount::from_units(solde),
                 Amount::ZERO,
             )
-            .expect("une piece suffit");
+            .expect("le solde annonce doit toujours etre payable");
         assert_eq!(
             tx.inputs.len(),
             1,

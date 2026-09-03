@@ -2269,41 +2269,56 @@ impl RpcContext {
         let g = w
             .lock()
             .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
-        let (solde, sorties, immature, hauteur, prochaine) = self.node.with_chain(|c| {
-            let hauteur = c.height();
-            let solde = g.balance(&c.utxo, hauteur);
-            let sorties = g.spendable(&c.utxo, hauteur).len();
-            let mut immature = 0u64;
-            // --- « Quand ? » est la question qu'on pose devant un solde bloque.
-            //
-            // Le portefeuille annoncait une somme en attente de maturite sans
-            // jamais dire a quelle date elle se libererait. Un mineur voyait
-            // donc son gain monter et son solde disponible rester a zero,
-            // pendant des heures, sans le moindre reperage. Plusieurs y ont vu
-            // une panne. On rend donc la hauteur de la **prochaine** liberation
-            // et le montant qu'elle porte : de quoi afficher un compte a
-            // rebours plutot qu'un mystere.
-            let mut prochaine: Option<(u64, u64)> = None;
-            for (_, e) in c.utxo.iter() {
-                if e.is_coinbase
-                    && hauteur < e.height + COINBASE_MATURITY
-                    && g.owns(&e.output.pubkey_hash)
-                {
-                    immature += e.output.value.units();
-                    let libre_a = e.height + COINBASE_MATURITY;
-                    match prochaine {
-                        // A hauteur egale, on cumule : plusieurs sorties d'un
-                        // meme bloc se liberent ensemble.
-                        Some((h, m)) if h == libre_a => {
-                            prochaine = Some((h, m + e.output.value.units()))
+        let (solde, sorties, immature, hauteur, prochaine, fige, reutilisees) =
+            self.node.with_chain(|c| {
+                let hauteur = c.height();
+                let solde = g.balance(&c.utxo, hauteur);
+                let sorties = g.spendable(&c.utxo, hauteur).len();
+                let mut immature = 0u64;
+                // --- « Quand ? » est la question qu'on pose devant un solde bloque.
+                //
+                // Le portefeuille annoncait une somme en attente de maturite sans
+                // jamais dire a quelle date elle se libererait. Un mineur voyait
+                // donc son gain monter et son solde disponible rester a zero,
+                // pendant des heures, sans le moindre reperage. Plusieurs y ont vu
+                // une panne. On rend donc la hauteur de la **prochaine** liberation
+                // et le montant qu'elle porte : de quoi afficher un compte a
+                // rebours plutot qu'un mystere.
+                let mut prochaine: Option<(u64, u64)> = None;
+                for (_, e) in c.utxo.iter() {
+                    if e.is_coinbase
+                        && hauteur < e.height + COINBASE_MATURITY
+                        && g.owns(&e.output.pubkey_hash)
+                    {
+                        immature += e.output.value.units();
+                        let libre_a = e.height + COINBASE_MATURITY;
+                        match prochaine {
+                            // A hauteur egale, on cumule : plusieurs sorties d'un
+                            // meme bloc se liberent ensemble.
+                            Some((h, m)) if h == libre_a => {
+                                prochaine = Some((h, m + e.output.value.units()))
+                            }
+                            Some((h, _)) if h < libre_a => {}
+                            _ => prochaine = Some((libre_a, e.output.value.units())),
                         }
-                        Some((h, _)) if h < libre_a => {}
-                        _ => prochaine = Some((libre_a, e.output.value.units())),
                     }
                 }
-            }
-            (solde, sorties, immature, hauteur, prochaine)
-        });
+                // Ce qu'une adresse reutilisee a immobilise. Une clef a usage unique
+                // ne signe qu'une fois : la seconde piece recue sur une meme adresse
+                // ne sera jamais depensable. La taire ferait disparaitre des fonds
+                // sans explication ; on la nomme, avec sa cause.
+                let fige = g.montant_fige(&c.utxo, hauteur);
+                let reutilisees = g.adresses_reutilisees(&c.utxo, hauteur).len();
+                (
+                    solde,
+                    sorties,
+                    immature,
+                    hauteur,
+                    prochaine,
+                    fige,
+                    reutilisees,
+                )
+            });
 
         let mut sortie = Json::obj()
             .set("depensable", montant(solde))
@@ -2311,6 +2326,19 @@ impl RpcContext {
             .set("sorties_depensables", Json::u64(sorties as u64))
             .set("adresses_derivees", Json::u64(g.next_index() as u64))
             .set("hauteur", Json::u64(hauteur));
+        if fige.units() > 0 {
+            sortie = sortie
+                .set("fige_par_reutilisation", montant(fige))
+                .set("adresses_reutilisees", Json::u64(reutilisees as u64))
+                .set(
+                    "avertissement",
+                    Json::str(
+                        "Une clef a usage unique ne signe qu'une fois : sur une adresse \
+                         ayant recu plusieurs paiements, seule la plus grosse piece reste \
+                         depensable. Donnez une adresse neuve a chaque paiement.",
+                    ),
+                );
+        }
         if let Some((libre_a, montant_libere)) = prochaine {
             sortie = sortie
                 .set("prochaine_maturite_hauteur", Json::u64(libre_a))
