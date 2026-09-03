@@ -227,3 +227,81 @@ fn l_amorce_recue_par_le_reseau_s_adopte() {
         Chain::adopter_instantane(RESEAU, instantane, &recue.entetes, tete, empreinte);
     assert!(r.is_ok(), "l'amorce recue doit s'adopter : {:?}", r.err());
 }
+
+/// Un ancrage inscrit dans le binaire prime sur ce que l'operateur recopie.
+///
+/// C'est la derniere barriere du modele de confiance. La reverification du
+/// travail rend deja l'attaque couteuse, mais un adversaire disposant d'une
+/// grande puissance pourrait la payer. Un ancrage compile lui oppose une valeur
+/// qui ne vient d'aucun reseau : elle vient du logiciel que l'utilisateur
+/// execute deja, relu par quiconque lit le depot.
+#[test]
+fn un_ancrage_compile_prime_sur_la_valeur_de_l_operateur() {
+    use q21_core::chain::AdoptionError;
+    use q21_core::synchro_rapide::Ancrage;
+
+    let dir = rep("ancrage");
+    let (chain, _archive) = chaine_minee(&dir, 30);
+    let instantane = chain.snapshot_at_depth(1).expect("instantane");
+
+    // Le chemin honnete, tel que l'adoption le reconstruit.
+    let chemin: Vec<q21_core::block::BlockHeader> = (0..=instantane.height)
+        .map(|h| {
+            let id = chain.active_at(h).expect("hauteur active");
+            chain.header_of(&id).expect("en-tete")
+        })
+        .collect();
+
+    // 1. Un ancrage conforme laisse passer.
+    let vrai = Ancrage {
+        hauteur: 10,
+        tete: chain.active_at(10).expect("bloc 10"),
+        empreinte: Hash256::ZERO, // ignoree : hauteur != celle de l'instantane
+    };
+    assert!(
+        Chain::verifier_les_ancrages(&chemin, &instantane, &[vrai]).is_ok(),
+        "une chaine conforme a l'ancrage doit etre acceptee"
+    );
+
+    // 2. Un ancrage qui designe un autre bloc a cette hauteur refuse tout, meme
+    //    si la chaine porte un travail parfaitement valide.
+    let empoisonne = Ancrage {
+        hauteur: 10,
+        tete: Hash256([0xab; 32]),
+        empreinte: Hash256::ZERO,
+    };
+    assert!(
+        matches!(
+            Chain::verifier_les_ancrages(&chemin, &instantane, &[empoisonne]),
+            Err(AdoptionError::AncrageContredit { hauteur: 10 })
+        ),
+        "une chaine qui contredit un ancrage doit etre refusee"
+    );
+
+    // 3. A la hauteur exacte de l'instantane, l'empreinte doit correspondre :
+    //    l'operateur ne peut pas faire adopter un autre etat monetaire la ou le
+    //    binaire connait l'empreinte.
+    let mauvaise_empreinte = Ancrage {
+        hauteur: instantane.height,
+        tete: instantane.tip,
+        empreinte: Hash256([0xcd; 32]),
+    };
+    assert!(
+        matches!(
+            Chain::verifier_les_ancrages(&chemin, &instantane, &[mauvaise_empreinte]),
+            Err(AdoptionError::AncrageContredit { .. })
+        ),
+        "une empreinte contredisant l'ancrage doit etre refusee"
+    );
+
+    // 4. Un ancrage au-dela de ce qu'on adopte ne dit rien.
+    let au_dela = Ancrage {
+        hauteur: instantane.height + 1_000,
+        tete: Hash256([0xef; 32]),
+        empreinte: Hash256([0xef; 32]),
+    };
+    assert!(
+        Chain::verifier_les_ancrages(&chemin, &instantane, &[au_dela]).is_ok(),
+        "un ancrage plus haut que l'instantane ne doit rien interdire"
+    );
+}

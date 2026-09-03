@@ -344,6 +344,10 @@ pub enum AdoptionError {
     /// Un en-tete ne satisfait pas sa propre cible : le travail annonce n'a pas
     /// ete fourni.
     TravailInvalide { hauteur: u64 },
+    /// La chaine proposee contredit un ancrage inscrit dans le binaire. C'est le
+    /// cas ou l'operateur a recopie une valeur de confiance empoisonnee : le
+    /// logiciel sait mieux, et refuse.
+    AncrageContredit { hauteur: u64 },
     /// La construction de la chaine a echoue (reseau, genese, hors chaine).
     Reprise(RepriseError),
 }
@@ -374,6 +378,12 @@ impl std::fmt::Display for AdoptionError {
                 f,
                 "l'en-tete de hauteur {hauteur} ne satisfait pas sa cible : le \
                  travail annonce n'a pas ete fourni"
+            ),
+            AdoptionError::AncrageContredit { hauteur } => write!(
+                f,
+                "la chaine proposee contredit l'ancrage inscrit dans ce binaire a \
+                 la hauteur {hauteur} : la valeur de confiance fournie est fausse \
+                 ou empoisonnee, rien n'est adopte"
             ),
             AdoptionError::Reprise(e) => write!(f, "reprise impossible : {e}"),
         }
@@ -782,8 +792,55 @@ impl Chain {
         chemin.reverse(); // de la genese vers la tete
         Self::verifier_le_travail(network, &chemin)?;
 
+        // 5. Les ancrages inscrits dans le binaire. Ils priment sur tout ce que
+        //    l'operateur a pu recopier : aux hauteurs qu'ils couvrent, la verite
+        //    vient du logiciel relu par tous, pas d'une valeur transmise.
+        Self::verifier_les_ancrages(
+            &chemin,
+            &instantane,
+            crate::synchro_rapide::ancrages_integres(network),
+        )?;
+
         // 5. La construction : positionnement, index, fenetre a rejouer.
         Chain::from_snapshot(network, instantane, headers).map_err(AdoptionError::Reprise)
+    }
+
+    /// Confronte une chaine candidate aux ancrages inscrits dans le binaire.
+    ///
+    /// `chemin` est ordonne par hauteurs croissantes, `chemin[0]` etant la
+    /// genese. Deux exigences, et la seconde est celle qui compte le plus :
+    ///
+    /// - **tout ancrage situe sous la tete doit se retrouver dans la chaine**, a
+    ///   sa hauteur et avec son identifiant. Une chaine qui pretend passer par
+    ///   ailleurs a un point que le binaire tient pour vrai est refusee, meme si
+    ///   elle porte du travail : c'est la ou un adversaire tres puissant
+    ///   viendrait, et c'est la qu'on l'arrete ;
+    /// - **a la hauteur exacte d'un ancrage, l'empreinte doit correspondre**.
+    ///   L'operateur ne peut donc pas faire adopter un autre etat monetaire a une
+    ///   hauteur dont le binaire connait l'empreinte.
+    ///
+    /// Une table vide n'interdit rien : la reverification du travail reste, elle,
+    /// toujours appliquee.
+    pub fn verifier_les_ancrages(
+        chemin: &[BlockHeader],
+        instantane: &Snapshot,
+        ancrages: &[crate::synchro_rapide::Ancrage],
+    ) -> Result<(), AdoptionError> {
+        for a in ancrages {
+            if a.hauteur > instantane.height {
+                continue; // au-dela de ce qu'on adopte : rien a dire
+            }
+            let Some(entete) = chemin.get(a.hauteur as usize) else {
+                return Err(AdoptionError::AncrageContredit { hauteur: a.hauteur });
+            };
+            if entete.block_id() != a.tete {
+                return Err(AdoptionError::AncrageContredit { hauteur: a.hauteur });
+            }
+            if a.hauteur == instantane.height && instantane.muhash != a.empreinte {
+                return Err(AdoptionError::AncrageContredit { hauteur: a.hauteur });
+            }
+        }
+        Ok(())
     }
 
     /// Verifie, de la genese a la tete, que chaque en-tete porte la difficulte
