@@ -722,9 +722,25 @@ impl Wallet {
     ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
         let disponibles = self.spendable(utxo, hauteur);
 
+        // Un schema a usage unique (Lamport) ne peut signer qu'une seule fois
+        // par clef, jamais deux : signer deux messages differents avec la meme
+        // clef en revele les deux preimages, et **livre la clef privee**. Le
+        // garde `consommes` ferme ce risque *entre* deux transactions ; il
+        // manquait de le fermer *a l'interieur* d'une meme transaction. Deux
+        // pieces recues sur le meme indice (une adresse reutilisee par celui qui
+        // paie) seraient sinon co-signees ici, chacune sur son propre condensat,
+        // et la clef partirait dans le bloc. On n'en retient donc qu'une par
+        // indice ; l'autre reste non depensee — une piece figee vaut infiniment
+        // mieux qu'une clef brulee.
+        let usage_unique = self.scheme.est_a_usage_unique();
+        let mut indices_pris: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
         let mut choisies: Vec<(OutPoint, TxOut, u32)> = Vec::new();
         let mut total: u64 = 0;
         for e in disponibles {
+            if usage_unique && !indices_pris.insert(e.2) {
+                continue;
+            }
             total += e.1.value.units();
             choisies.push(e);
             if total >= besoin {
@@ -1284,6 +1300,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Deux pieces recues sur le **meme** indice a usage unique ne doivent
+    /// jamais entrer ensemble dans une transaction : les co-signer signerait
+    /// deux condensats differents avec une clef Lamport, ce qui en revele les
+    /// deux preimages et **livre la clef privee**. Le garde `consommes` ferme ce
+    /// risque entre transactions ; ce test verrouille sa fermeture *a
+    /// l'interieur* d'une meme transaction. Le portefeuille prefere refuser
+    /// (une piece figee) plutot que de bruler la clef.
+    #[test]
+    fn deux_utxo_du_meme_indice_ne_se_co_signent_jamais() {
+        let mut w = portefeuille();
+        let a = w.new_address(); // indice 0 — toutes les coinbases y vont
+        let g = genesis_block(Network::Regtest);
+        let mut c = Chain::new(Network::Regtest, g);
+        for i in 0..(COINBASE_MATURITY + 2) {
+            let t = GENESIS_TIME + (i + 1) * TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(a.hash, SchemeId::LamportOts, &[], t, 20_000_000)
+                .expect("minage");
+            c.connect(&b, t + 1).expect("connexion");
+        }
+
+        // Plusieurs pieces mûres, toutes sur l'indice 0.
+        let pieces = w.spendable(&c.utxo, c.height());
+        assert!(
+            pieces.len() >= 2,
+            "le test suppose au moins deux pieces sur le meme indice"
+        );
+        assert!(
+            pieces.iter().all(|p| p.2 == pieces[0].2),
+            "toutes les pieces doivent etre sur le meme indice"
+        );
+        let une_piece = pieces[0].1.value.units();
+
+        let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
+
+        // Un montant qui exigerait une deuxieme piece du meme indice : refus,
+        // jamais une co-signature.
+        let d = dest.new_address();
+        let r = w.create_transaction(
+            &c.utxo,
+            c.height(),
+            &d,
+            Amount::from_units(une_piece + 1),
+            Amount::ZERO,
+        );
+        assert!(
+            matches!(r, Err(WalletError::FondsInsuffisants { .. })),
+            "le portefeuille a co-signe deux pieces du meme indice : clef Lamport revelee"
+        );
+
+        // Dans la limite d'une piece : possible, avec une seule entree.
+        let d2 = dest.new_address();
+        let tx = w
+            .create_transaction(
+                &c.utxo,
+                c.height(),
+                &d2,
+                Amount::from_units(une_piece / 2),
+                Amount::ZERO,
+            )
+            .expect("une piece suffit");
+        assert_eq!(
+            tx.inputs.len(),
+            1,
+            "une seule entree pour un montant couvert par une piece"
+        );
     }
 
     #[test]
