@@ -429,6 +429,18 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
   font-size:.85em;font-family:var(--mono)}
 .err{color:var(--danger)}
 .ok{color:var(--accent)}
+
+/* --- Choix de la langue -------------------------------------------------
+   Trois drapeaux dans l'en-tete. Un clic suffit : la page se traduit sur
+   place, sans rechargement et sans aller-retour avec le noeud. */
+.langues{display:flex;gap:.25rem;align-items:center;margin-left:.75rem}
+.langues button{background:transparent;border:1px solid transparent;border-radius:.4rem;
+  cursor:pointer;font-size:1.05rem;line-height:1;padding:.22rem .3rem;opacity:.5;
+  transition:opacity .15s,border-color .15s,background .15s}
+.langues button:hover{opacity:.9;background:rgba(255,255,255,.07)}
+.langues button[aria-pressed="true"]{opacity:1;border-color:rgba(255,255,255,.28);
+  background:rgba(255,255,255,.10)}
+.langues button:focus-visible{outline:2px solid #4ade80;outline-offset:1px}
 </style>
 </head>
 <body>
@@ -444,6 +456,11 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
       <span class="point" id="point-sync"></span>
       <b id="pouls-etat">Connexion…</b>
       <span id="pouls-texte"></span>
+    </div>
+    <div class="langues" id="langues" role="group" aria-label="Langue / Language">
+      <button type="button" data-langue="fr" aria-pressed="true" title="Français">&#127467;&#127479;</button>
+      <button type="button" data-langue="en" aria-pressed="false" title="English">&#127468;&#127463;</button>
+      <button type="button" data-langue="ja" aria-pressed="false" title="&#26085;&#26412;&#35486;">&#127471;&#127477;</button>
     </div>
   </div>
   <div class="jauge-sync"><i id="jauge-sync"></i></div>
@@ -860,6 +877,125 @@ code{background:var(--quantum-fond);color:var(--quantum);padding:.12em .38em;bor
 </div>
 
 <script>
+/* =======================================================================
+   Langues — francais, anglais, japonais
+   =======================================================================
+
+   La page a ete ecrite en francais. Plutot que de semer des identifiants de
+   traduction dans plusieurs centaines d'endroits — ce qui aurait manque tout
+   le texte que le script fabrique a l'execution — on traduit par
+   correspondance du texte source.
+
+   Chaque noeud de texte garde son original francais. Changer de langue le
+   remplace ; revenir au francais le restaure. Un observateur de mutations
+   couvre ce que le script ecrit ensuite, de sorte qu'une traduction ne se
+   perd pas au premier rafraichissement des donnees.
+
+   Ce qui n'est pas traduit reste en francais, jamais vide : une phrase dans
+   la mauvaise langue se comprend, une phrase absente ne se comprend pas.
+
+   Rien ne sort de la page : aucun service de traduction, aucune requete.
+*/
+const I18N = {"en": {"Portefeuille": "Wallet", "Connexion…": "Connecting…", "Solde": "Balance", "Miner": "Mine", "Recevoir": "Receive", "Envoyer": "Send", "Réseau": "Network", "Activité": "Activity", "Infos": "Info", "Chargement…": "Loading…", "Détail": "Details", "Fermer": "Close", "Revenir": "Back", "Tout": "All", "Reçu": "Received", "Envoyé": "Sent", "Quoi": "What", "Date": "Date", "Référence": "Reference", "Confirmations": "Confirmations", "Bloc n°": "Block no.", "Disponible": "Available", "Minage": "Mining", "Chaîne": "Chain", "Vos blocs": "Your blocks", "Vos adresses": "Your addresses", "Le réseau": "The network", "Votre sécurité": "Your security", "Votre machine": "Your machine", "Mesure en cours…": "Measuring…", "Nœud injoignable": "Node unreachable", "Déverrouiller": "Unlock", "Nouvelle adresse": "New address", "Afficher les suivantes": "Show more", "Chercher dans votre carnet": "Search your address book", "+ Ajouter un destinataire": "+ Add a recipient", "Recalculer les frais": "Recalculate fee", "Vérifier": "Review", "Envoyer définitivement": "Send for good", "Fermer le portefeuille": "Close the wallet", "Envoyer du Q21": "Send Q21", "Adresse du destinataire": "Recipient address", "Montant, en Q21": "Amount, in Q21", "Frais, en Q21": "Fee, in Q21", "Suggestion du nœud, modifiable.": "Suggested by the node, editable.", "Confirmer l'envoi": "Confirm the send", "Un envoi est définitif": "A send is final", "Entrées supposées, pour l'estimation des frais": "Assumed inputs, for the fee estimate", "L'adresse porte une somme de contrôle : une faute de frappe sera détectée par le nœud, pas subie.": "The address carries a checksum: a typo is caught by the node, not suffered.", "Huit décimales au maximum. Une unité vaut 0.00000001 Q21.": "Eight decimals at most. One unit is 0.00000001 Q21.", "Aucune autorité ne peut annuler une transaction acceptée. Relisez l'adresse caractère par caractère : c'est la seule vérification qui vous reste.": "No authority can reverse an accepted transaction. Re-read the address character by character: it is the only check you have left.", "Un seul envoi peut payer plusieurs destinataires à la fois : c'est une transaction unique, aux frais partagés, plutôt que plusieurs envois séparés.": "One send can pay several recipients at once: a single transaction with shared fees, rather than several separate sends.", "Votre machine ne cherche pas": "Your machine is not searching", "Le minage cherche le prochain bloc. Il utilise tous les cœurs.": "Mining looks for the next block. It uses every core.", "tentatives par seconde": "attempts per second", "Gagné en minant": "Earned by mining", "depuis le lancement — maturité comprise": "since launch — maturing included", "Blocs trouvés": "Blocks found", "depuis le lancement": "since launch", "Tentatives": "Attempts", "Rythme de la chaîne": "Chain pace", "cible : un bloc toutes les 2 minutes": "target: one block every 2 minutes", "Mémoire occupée": "Memory in use", "la table de calcul, en mémoire vive": "the computation table, in RAM", "Puissance de calcul du réseau": "Network computing power", "mesurée chez vous, en direct": "measured on your machine, live", "Machines comme la vôtre": "Machines like yours", "équivalence, pas un décompte": "an equivalence, not a count", "Machines connues du réseau": "Machines known to the network", "adresses apprises, présentes ou passées": "addresses learned, present or past", "Ordinateurs reliés au vôtre": "Computers connected to yours", "vos voisins directs, pas le réseau entier": "your direct neighbours, not the whole network", "Mesuré sur": "Measured over", "les blocs les plus récents": "the most recent blocks", "Le code de sauvegarde est votre portefeuille": "The backup code is your wallet", "Le fichier sur ce disque n'est qu'une copie de travail.": "The file on this disk is only a working copy.", "Deux choses à ne jamais faire": "Two things never to do", "Pour les développeurs": "For developers", "Explorateur de la chaîne": "Chain explorer", "Jeton d'accès requis": "Access token required", "Récupération de l'historique de la chaîne": "Catching up on chain history", "Pourquoi une part du solde est immature": "Why part of the balance is immature", "Pourquoi vous en avez plusieurs": "Why you have several", "Ce que fait votre machine quand ce bouton est allumé": "What your machine does when this switch is on", "Chaque paiement mérite une adresse neuve. Réutiliser une adresse ne coûte rien au protocole, mais relie publiquement vos paiements entre eux.": "Every payment deserves a fresh address. Reusing one costs the protocol nothing, but publicly links your payments together.", "Réseau d'essai — les Q21 qui s'y minent n'ont aucune valeur, et n'en auront jamais. Logiciel de recherche, non audité de l'extérieur.": "Test network — the Q21 mined here have no value, and never will. Research software, not externally audited.", "Activer le minage": "Turn mining on", "Arrêter le minage": "Turn mining off", "Ce nœud ne peut pas miner": "This node cannot mine", "Connecté": "Connected", "Fermeture…": "Shutting down…", "Confirmer la fermeture": "Confirm shutdown", "Cliquez une seconde fois pour arrêter le portefeuille.": "Click once more to stop the wallet.", "Adresses connues": "Known addresses", "Blocs vérifiés": "Blocks verified", "Dernier bloc": "Latest block", "Destinataire": "Recipient", "Difficulté": "Difficulty", "En attente de maturité": "Awaiting maturity", "Empreinte de l'état": "State fingerprint", "Clef publique": "Public key", "Clefs consommées": "Keys consumed", "En attente d'un ordinateur à qui demander la chaîne": "Waiting for a computer to ask for the chain", "Débit de minage des dernières minutes": "Mining rate over the last minutes", "Elle utilise tous les cœurs disponibles.": "It uses every available core.", "Aucune adresse de destination.": "No destination address.", "Chaque montant doit être strictement positif.": "Every amount must be strictly positive.", "Frais illisibles. Attendu : un nombre en Q21, huit décimales au maximum.": "Unreadable fee. Expected: a number in Q21, eight decimals at most."}, "ja": {"Portefeuille": "ウォレット", "Connexion…": "接続中…", "Solde": "残高", "Miner": "マイニング", "Recevoir": "受け取る", "Envoyer": "送る", "Réseau": "ネットワーク", "Activité": "履歴", "Infos": "情報", "Chargement…": "読み込み中…", "Détail": "詳細", "Fermer": "閉じる", "Revenir": "戻る", "Tout": "すべて", "Reçu": "受取", "Envoyé": "送金", "Quoi": "種別", "Date": "日付", "Référence": "参照", "Confirmations": "承認数", "Bloc n°": "ブロック番号", "Disponible": "利用可能", "Minage": "マイニング", "Chaîne": "チェーン", "Vos blocs": "あなたのブロック", "Vos adresses": "あなたのアドレス", "Le réseau": "ネットワーク", "Votre sécurité": "セキュリティ", "Votre machine": "あなたのマシン", "Mesure en cours…": "測定中…", "Nœud injoignable": "ノードに接続できません", "Déverrouiller": "ロック解除", "Nouvelle adresse": "新しいアドレス", "Afficher les suivantes": "さらに表示", "Chercher dans votre carnet": "アドレス帳を検索", "+ Ajouter un destinataire": "+ 宛先を追加", "Recalculer les frais": "手数料を再計算", "Vérifier": "確認", "Envoyer définitivement": "確定して送る", "Fermer le portefeuille": "ウォレットを終了", "Envoyer du Q21": "Q21 を送る", "Adresse du destinataire": "宛先アドレス", "Montant, en Q21": "金額 (Q21)", "Frais, en Q21": "手数料 (Q21)", "Suggestion du nœud, modifiable.": "ノードの提案値です。変更できます。", "Confirmer l'envoi": "送金の確認", "Un envoi est définitif": "送金は取り消せません", "Entrées supposées, pour l'estimation des frais": "手数料見積り用の入力数", "L'adresse porte une somme de contrôle : une faute de frappe sera détectée par le nœud, pas subie.": "アドレスにはチェックサムがあります。打ち間違いはノードが検出します。", "Huit décimales au maximum. Une unité vaut 0.00000001 Q21.": "小数点以下は最大 8 桁。1 単位は 0.00000001 Q21 です。", "Aucune autorité ne peut annuler une transaction acceptée. Relisez l'adresse caractère par caractère : c'est la seule vérification qui vous reste.": "承認された取引を取り消せる権威は存在しません。アドレスを一文字ずつ読み直してください。それが最後の確認です。", "Un seul envoi peut payer plusieurs destinataires à la fois : c'est une transaction unique, aux frais partagés, plutôt que plusieurs envois séparés.": "一度の送金で複数の宛先に支払えます。手数料を分け合う単一の取引になります。", "Votre machine ne cherche pas": "マシンは探索していません", "Le minage cherche le prochain bloc. Il utilise tous les cœurs.": "マイニングは次のブロックを探します。全コアを使います。", "tentatives par seconde": "秒あたりの試行", "Gagné en minant": "マイニング報酬", "depuis le lancement — maturité comprise": "起動以降 — 成熟待ちを含む", "Blocs trouvés": "発見ブロック", "depuis le lancement": "起動以降", "Tentatives": "試行回数", "Rythme de la chaîne": "チェーンの速度", "cible : un bloc toutes les 2 minutes": "目標: 2 分に 1 ブロック", "Mémoire occupée": "使用メモリ", "la table de calcul, en mémoire vive": "計算テーブル (RAM 上)", "Puissance de calcul du réseau": "ネットワークの計算力", "mesurée chez vous, en direct": "あなたのマシンでの実測値", "Machines comme la vôtre": "あなたと同等のマシン", "équivalence, pas un décompte": "換算値であり実数ではありません", "Machines connues du réseau": "ネットワークが知るマシン", "adresses apprises, présentes ou passées": "学習済みアドレス (現在・過去)", "Ordinateurs reliés au vôtre": "接続中のコンピュータ", "vos voisins directs, pas le réseau entier": "直接の隣接ノードのみ", "Mesuré sur": "測定範囲", "les blocs les plus récents": "直近のブロック", "Le code de sauvegarde est votre portefeuille": "バックアップコードがあなたのウォレットです", "Le fichier sur ce disque n'est qu'une copie de travail.": "このディスク上のファイルは作業用の複製にすぎません。", "Deux choses à ne jamais faire": "絶対にしてはいけない二つのこと", "Pour les développeurs": "開発者向け", "Explorateur de la chaîne": "チェーンエクスプローラ", "Jeton d'accès requis": "アクセストークンが必要です", "Récupération de l'historique de la chaîne": "チェーン履歴を取得中", "Pourquoi une part du solde est immature": "残高の一部が未成熟な理由", "Pourquoi vous en avez plusieurs": "複数ある理由", "Ce que fait votre machine quand ce bouton est allumé": "このスイッチが入っているとき、マシンは何をするか", "Chaque paiement mérite une adresse neuve. Réutiliser une adresse ne coûte rien au protocole, mais relie publiquement vos paiements entre eux.": "支払いごとに新しいアドレスを。再利用はプロトコル上は無料ですが、支払い同士が公に結び付きます。", "Réseau d'essai — les Q21 qui s'y minent n'ont aucune valeur, et n'en auront jamais. Logiciel de recherche, non audité de l'extérieur.": "テストネット — ここで採掘される Q21 に価値はなく、今後もありません。外部監査を受けていない研究用ソフトウェアです。", "Activer le minage": "マイニングを開始", "Arrêter le minage": "マイニングを停止", "Ce nœud ne peut pas miner": "このノードはマイニングできません", "Connecté": "接続済み", "Fermeture…": "終了中…", "Confirmer la fermeture": "終了の確認", "Cliquez une seconde fois pour arrêter le portefeuille.": "もう一度クリックするとウォレットを停止します。", "Adresses connues": "既知のアドレス", "Blocs vérifiés": "検証済みブロック", "Dernier bloc": "最新ブロック", "Destinataire": "宛先", "Difficulté": "難易度", "En attente de maturité": "成熟待ち", "Empreinte de l'état": "状態フィンガープリント", "Clef publique": "公開鍵", "Clefs consommées": "使用済みの鍵", "En attente d'un ordinateur à qui demander la chaîne": "チェーンを要求する相手を待っています", "Débit de minage des dernières minutes": "直近数分のマイニング速度", "Elle utilise tous les cœurs disponibles.": "利用可能な全コアを使用します。", "Aucune adresse de destination.": "宛先アドレスがありません。", "Chaque montant doit être strictement positif.": "金額は必ず正の値である必要があります。", "Frais illisibles. Attendu : un nombre en Q21, huit décimales au maximum.": "手数料を解釈できません。Q21 の数値 (小数点以下 8 桁まで) を入力してください。"}};
+const I18N_PREFIXES = {"en": {"Impossible d'interroger le nœud : ": "Cannot reach the node: ", "Fonds insuffisants : ": "Insufficient funds: ", "Frais non estimés : ": "Fee not estimated: "}, "ja": {"Impossible d'interroger le nœud : ": "ノードに問い合わせできません: ", "Fonds insuffisants : ": "残高不足: ", "Frais non estimés : ": "手数料を見積れません: "}};
+let LANGUE = "fr";
+
+function q21Norm(s){ return s.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim(); }
+
+function q21Trad(src){
+  const d = I18N[LANGUE];
+  if (!d) return null;
+  const n = q21Norm(src);
+  let v = d[n];
+  if (v === undefined){
+    // Certains messages portent une queue variable — une erreur, un montant.
+    // On traduit alors la partie fixe et on garde la queue telle quelle :
+    // mieux vaut une phrase a moitie traduite qu'une phrase absente.
+    const pr = I18N_PREFIXES[LANGUE] || {};
+    for (const k in pr){ if (n.startsWith(k)){ v = pr[k] + n.slice(k.length); break; } }
+  }
+  if (v === undefined) return null;
+  // On conserve l'espacement d'origine : le texte est souvent colle a une
+  // balise voisine, et le manger deplacerait la mise en page.
+  const av = src.match(/^\s*/)[0], ap = src.match(/\s*$/)[0];
+  return av + v + ap;
+}
+
+function q21TraduireTexte(n){
+  // Si la valeur courante est exactement ce que nous avions ecrit, c'est
+  // notre propre ecriture : l'original reste l'original. Sinon, c'est le
+  // script de la page qui vient d'ecrire, et cette nouvelle valeur devient
+  // la source a traduire. Sans cette distinction, un rafraichissement
+  // ferait traduire une traduction, ou ecraserait la donnee fraiche.
+  if (n.__q21pose === undefined || n.nodeValue !== n.__q21pose) n.__q21fr = n.nodeValue;
+  let v = n.__q21fr;
+  if (LANGUE !== "fr"){ const t = q21Trad(n.__q21fr); if (t !== null) v = t; }
+  if (n.nodeValue !== v) n.nodeValue = v;
+  n.__q21pose = v;
+}
+
+const Q21_ATTRS = ["placeholder", "title", "aria-label"];
+
+function q21Traduire(n){
+  if (!n) return;
+  if (n.nodeType === 3){ q21TraduireTexte(n); return; }
+  if (n.nodeType !== 1) return;
+  const t = n.tagName;
+  if (t === "SCRIPT" || t === "STYLE") return;
+  // Le selecteur lui-meme garde ses intitules : le nom d'une langue s'ecrit
+  // dans cette langue, pas dans celle de la page.
+  if (n.id !== "langues"){
+    for (const a of Q21_ATTRS){
+      if (!n.hasAttribute(a)) continue;
+      const cle = "__q21a_" + a;
+      if (n[cle] === undefined) n[cle] = n.getAttribute(a);
+      let v = n[cle];
+      if (LANGUE !== "fr"){ const x = q21Trad(n[cle]); if (x !== null) v = x; }
+      if (n.getAttribute(a) !== v) n.setAttribute(a, v);
+    }
+  }
+  if (n.id === "langues") return;
+  for (const e of n.childNodes) q21Traduire(e);
+}
+
+function q21AppliquerLangue(code){
+  LANGUE = (code === "en" || code === "ja") ? code : "fr";
+  document.documentElement.lang = LANGUE;
+  try { sessionStorage.setItem("q21-langue", LANGUE); } catch (e) {}
+  q21Traduire(document.body);
+  const g = document.getElementById("langues");
+  if (g) for (const b of g.querySelectorAll("button"))
+    b.setAttribute("aria-pressed", b.dataset.langue === LANGUE ? "true" : "false");
+}
+
+(function q21InitLangue(){
+  let choix = null;
+  try { choix = sessionStorage.getItem("q21-langue"); } catch (e) {}
+  if (!choix){
+    const n = (navigator.language || "fr").slice(0, 2).toLowerCase();
+    choix = (n === "en" || n === "ja") ? n : "fr";
+  }
+  const demarrer = function(){
+    const g = document.getElementById("langues");
+    if (g) g.addEventListener("click", function(ev){
+      const b = ev.target.closest("button[data-langue]");
+      if (b) q21AppliquerLangue(b.dataset.langue);
+    });
+    q21AppliquerLangue(choix);
+    // Ce que le script ecrit ensuite doit etre traduit aussi, sans quoi la
+    // langue choisie se perdrait au premier rafraichissement des donnees.
+    new MutationObserver(function(ms){
+      if (LANGUE === "fr") return;
+      for (const m of ms){
+        if (m.type === "characterData") q21Traduire(m.target);
+        else for (const n of m.addedNodes) q21Traduire(n);
+      }
+    }).observe(document.body, {childList:true, subtree:true, characterData:true});
+  };
+  if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", demarrer);
+  else demarrer();
+})();
 "use strict";
 
 // ---------------------------------------------------------------------------
@@ -3579,6 +3715,59 @@ mod tests {
         assert!(
             !PAGE.contains("@media(max-width"),
             "une regle en max-width trahit une mise en page pensee pour l'ecran large"
+        );
+    }
+
+    /// Le portefeuille se lit en francais, en anglais et en japonais, et le
+    /// choix tient en un clic.
+    ///
+    /// La traduction se fait par correspondance du texte source plutot que par
+    /// des identifiants semes dans la page : c'est ce qui permet de couvrir
+    /// aussi le texte que le script fabrique a l'execution. Cette epreuve fige
+    /// le mecanisme et quelques traductions temoins — les perdre passerait
+    /// autrement inapercu jusqu'a ce qu'un utilisateur tombe sur une page a
+    /// moitie traduite.
+    #[test]
+    fn le_portefeuille_se_traduit_en_trois_langues() {
+        // Le selecteur, et ses trois drapeaux.
+        assert!(
+            PAGE.contains(r#"id="langues""#),
+            "selecteur de langue absent"
+        );
+        for l in ["fr", "en", "ja"] {
+            assert!(
+                PAGE.contains(&format!(r#"data-langue="{l}""#)),
+                "langue absente du selecteur : {l}"
+            );
+        }
+
+        let s = script();
+        // Le moteur.
+        for f in [
+            "function q21Norm",
+            "function q21Trad",
+            "function q21TraduireTexte",
+            "function q21AppliquerLangue",
+            "MutationObserver",
+        ] {
+            assert!(s.contains(f), "moteur de traduction incomplet : {f}");
+        }
+
+        // Quelques traductions temoins, dans les deux langues.
+        for (fr, en, ja) in [
+            ("Solde", "Balance", "残高"),
+            ("Envoyer", "Send", "送る"),
+            ("Reseau", "Network", "ネットワーク"),
+        ] {
+            let _ = fr;
+            assert!(s.contains(en), "traduction anglaise perdue : {en}");
+            assert!(s.contains(ja), "traduction japonaise perdue : {ja}");
+        }
+
+        // Ce qui n'est pas traduit doit rester en francais, jamais vide.
+        assert!(
+            s.contains("if (t !== null) v = t;"),
+            "le repli sur le texte d'origine a disparu"
         );
     }
 }
