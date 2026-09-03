@@ -1340,17 +1340,10 @@ impl RpcContext {
         // Il ne depend ni de l'index ni du balayage : c'est l'etat que ce noeud
         // a valide lui-meme, et il est donc toujours exact, meme quand
         // l'historique affiche est borne.
-        let (solde, sorties) = self.node.with_chain(|c| {
-            let mut somme = 0u64;
-            let mut n = 0u64;
-            for (_, e) in c.utxo.iter() {
-                if e.output.pubkey_hash == empreinte {
-                    somme = somme.saturating_add(e.output.value.units());
-                    n += 1;
-                }
-            }
-            (somme, n)
-        });
+        // Par l'index d'empreintes, jamais par un balayage : cette requete est
+        // publique et non authentifiee, et le verrou qu'elle prend est celui du
+        // consensus. Voir `UtxoSet::solde_de`.
+        let (solde, sorties) = self.node.with_chain(|c| c.utxo.solde_de(&empreinte));
 
         Ok(Json::obj()
             .set("adresse", Json::str(brut))

@@ -222,6 +222,40 @@ impl UtxoSet {
             .is_some_and(|s| !s.is_empty())
     }
 
+    /// Solde et nombre de sorties non depensees d'une empreinte.
+    ///
+    /// # Le defaut que cette methode ferme
+    ///
+    /// L'explorateur calculait ce solde en parcourant **tout** le jeu d'UTXO, et
+    /// il le faisait en tenant le verrou global — celui-la meme qui sert a
+    /// valider les blocs et a servir le reservoir. Sur une chaine mure, chaque
+    /// consultation d'adresse — publique, non authentifiee, et l'usage principal
+    /// d'un explorateur — immobilisait donc le consensus le temps d'un balayage
+    /// complet. Quelques requetes par seconde suffisaient a ralentir
+    /// l'acceptation des blocs, sans qu'aucune n'ait l'air malveillante.
+    ///
+    /// L'index par empreinte existait deja pour `spendable_for`, ou il avait
+    /// resolu exactement le meme cout quadratique. Il ne restait qu'a s'en
+    /// servir ici : le prix passe de la taille du jeu entier au nombre de
+    /// sorties de la seule adresse demandee.
+    ///
+    /// La valeur rendue est identique a celle du balayage, saturation comprise :
+    /// c'est le meme calcul, sur les memes sorties, dans un ordre different.
+    pub fn solde_de(&self, pubkey_hash: &crate::hash::Hash256) -> (u64, u64) {
+        let Some(points) = self.par_empreinte.get(pubkey_hash) else {
+            return (0, 0);
+        };
+        let mut somme = 0u64;
+        let mut nombre = 0u64;
+        for o in points {
+            if let Some(e) = self.map.get(o) {
+                somme = somme.saturating_add(e.output.value.units());
+                nombre += 1;
+            }
+        }
+        (somme, nombre)
+    }
+
     /// Filtre la maturite des coinbases : une recompense de bloc fraiche n'est
     /// pas depensable.
     pub fn spendable_for(
@@ -285,6 +319,82 @@ mod tests {
             outputs: vec![sortie(v, h)],
             lock_time: 0,
         }
+    }
+
+    /// Le solde rendu par l'index doit coincider avec un balayage complet, en
+    /// toute circonstance — y compris apres une annulation, qui remet en
+    /// circulation des sorties depensees et retire des sorties creees. C'est
+    /// precisement la qu'un index derive peut s'ecarter de la verite, et le
+    /// solde d'un explorateur ne vaut que s'il ne s'en ecarte jamais.
+    #[test]
+    fn le_solde_par_empreinte_coincide_toujours_avec_le_balayage() {
+        fn balayage(u: &UtxoSet, cle: &Hash256) -> (u64, u64) {
+            let mut somme = 0u64;
+            let mut n = 0u64;
+            for (_, e) in u.iter() {
+                if e.output.pubkey_hash == *cle {
+                    somme = somme.saturating_add(e.output.value.units());
+                    n += 1;
+                }
+            }
+            (somme, n)
+        }
+        fn verifier(u: &UtxoSet, etape: &str) {
+            for h in 0..5u8 {
+                let cle = Hash256([h; 32]);
+                assert_eq!(
+                    u.solde_de(&cle),
+                    balayage(u, &cle),
+                    "{etape} : l'index diverge du balayage sur l'empreinte {h}"
+                );
+            }
+        }
+
+        let mut u = UtxoSet::new();
+
+        // Deux sorties sur une meme empreinte, une troisieme ailleurs.
+        let a1 = coinbase(5_000, 1);
+        let a2 = coinbase(3_000, 1);
+        let b1 = coinbase(7_000, 2);
+        let mut undo1 = UndoRecord::default();
+        u.apply_transaction(&a1, 1, &mut undo1);
+        u.apply_transaction(&a2, 1, &mut undo1);
+        u.apply_transaction(&b1, 1, &mut undo1);
+        verifier(&u, "apres creation");
+        assert_eq!(u.solde_de(&Hash256([1; 32])), (8_000, 2));
+
+        // Une depense : l'empreinte 1 perd une sortie, l'empreinte 3 en gagne.
+        let depense = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: a1.txid(),
+                    index: 0,
+                },
+                witness: Witness::default(),
+                sequence: 0,
+            }],
+            outputs: vec![sortie(4_000, 3)],
+            lock_time: 0,
+        };
+        let mut undo2 = UndoRecord::default();
+        u.apply_transaction(&depense, 2, &mut undo2);
+        verifier(&u, "apres depense");
+        assert_eq!(u.solde_de(&Hash256([1; 32])), (3_000, 1));
+        assert_eq!(u.solde_de(&Hash256([3; 32])), (4_000, 1));
+
+        // Annulation : l'index doit revenir exactement a l'etat precedent.
+        u.undo(&undo2);
+        verifier(&u, "apres annulation");
+        assert_eq!(u.solde_de(&Hash256([1; 32])), (8_000, 2));
+        assert_eq!(
+            u.solde_de(&Hash256([3; 32])),
+            (0, 0),
+            "une sortie annulee ne doit plus compter"
+        );
+
+        // Une empreinte inconnue n'a ni solde ni sortie.
+        assert_eq!(u.solde_de(&Hash256([42; 32])), (0, 0));
     }
 
     #[test]
