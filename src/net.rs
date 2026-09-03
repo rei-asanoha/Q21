@@ -92,6 +92,13 @@ fn maintenant() -> u64 {
 struct Peer {
     addr: SocketAddr,
     sortie: Arc<Mutex<TcpStream>>,
+    /// Vrai si **nous** avons initie cette connexion (sortante). Une connexion
+    /// entrante est choisie par l'autre bout ; seules les sortantes sont
+    /// choisies par nous, dans le carnet, avec sa diversite de groupes. Compter
+    /// les entrantes dans la cible de pairs laisserait un attaquant remplir nos
+    /// places depuis une seule IP et **supprimer tout appel sortant** : le
+    /// carnet anti-eclipse ne serait alors jamais consulte. On les distingue.
+    sortant: bool,
     handshaked: bool,
     ban_score: u32,
     /// Hauteur annoncee par le pair a la poignee de main.
@@ -373,6 +380,21 @@ impl Node {
         self.partage.lock().unwrap().peers.len()
     }
 
+    /// Nombre de connexions **sortantes** — celles que nous avons initiees
+    /// depuis le carnet. C'est ce compte, et non le total, que la boucle de
+    /// maintien doit ramener a la cible : sinon un flot de connexions entrantes
+    /// depuis une seule IP suffit a nous empecher d'aller chercher des pairs
+    /// diversifies, et la defense anti-eclipse tombe.
+    pub fn peer_count_sortants(&self) -> usize {
+        self.partage
+            .lock()
+            .unwrap()
+            .peers
+            .values()
+            .filter(|p| p.sortant)
+            .count()
+    }
+
     /// Coupe toutes les connexions, et rend leur nombre.
     ///
     /// Employe au reveil d'une machine mise en veille : apres quelques minutes
@@ -546,6 +568,7 @@ impl Node {
                 Peer {
                     addr,
                     sortie: sortie.clone(),
+                    sortant,
                     handshaked: false,
                     ban_score: 0,
                     start_height: 0,
@@ -1468,6 +1491,35 @@ mod tests {
         assert!(
             attendre(|| a.peer_count() == 1 && b.peer_count() == 1, 5),
             "les deux noeuds auraient du se voir"
+        );
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// Une connexion entrante ne compte pas comme sortante. C'est l'invariant
+    /// qui protege de l'eclipse : la boucle de maintien vise un nombre de pairs
+    /// **sortants** (choisis dans le carnet, avec sa diversite de groupes) ; si
+    /// une connexion entrante les comptait, un attaquant remplirait nos places
+    /// depuis une seule IP et nous n'irions jamais chercher de pair diversifie.
+    #[test]
+    fn une_connexion_entrante_ne_compte_pas_comme_sortante() {
+        let a = noeud();
+        let b = noeud();
+        let addr = a.listen("127.0.0.1:0").expect("ecoute");
+        b.connect(addr).expect("connexion");
+
+        assert!(
+            attendre(|| a.peer_count() == 1 && b.peer_count() == 1, 5),
+            "les deux noeuds auraient du se voir"
+        );
+
+        // b a initie : c'est une sortante pour b. a l'a acceptee : une entrante
+        // pour a, qui ne doit donc compter aucun pair sortant.
+        assert_eq!(b.peer_count_sortants(), 1, "b a initie la connexion");
+        assert_eq!(
+            a.peer_count_sortants(),
+            0,
+            "a n'a fait qu'accepter : aucune sortante, sinon l'eclipse passe"
         );
         a.shutdown();
         b.shutdown();

@@ -3139,7 +3139,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 println!("  {coupes} pair(s) silencieux coupe(s)");
             }
 
-            let manquants = cible_pairs.saturating_sub(node.peer_count());
+            let manquants = cible_pairs.saturating_sub(node.peer_count_sortants());
             if manquants > 0 {
                 // --- Les amorces explicites d'abord.
                 //
@@ -3163,7 +3163,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     }
                 }
                 // --- Puis le carnet, pour les places restantes.
-                let manquants = cible_pairs.saturating_sub(node.peer_count());
+                let manquants = cible_pairs.saturating_sub(node.peer_count_sortants());
                 for a in node.addresses_to_try(manquants) {
                     let sa = std::net::SocketAddr::from((a.ip, a.port));
                     match node.connect(sa) {
