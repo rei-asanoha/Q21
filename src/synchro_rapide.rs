@@ -39,6 +39,7 @@
 //! module definit le paquet et son (de)codage ; le decoupage et l'echange
 //! relevent de la couche reseau.
 
+use crate::address::Network;
 use crate::block::{Block, BlockHeader};
 use crate::hash::Hash256;
 use crate::ser::{ReadError, Reader, Writer};
@@ -56,6 +57,63 @@ const VERSION: u32 = 1;
 /// noeud (4 Mio) : une tranche qui ne tiendrait pas dans un message serait un
 /// gaspillage a sens unique.
 pub const TAILLE_TRANCHE: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Ancrages compiles dans le binaire
+// ---------------------------------------------------------------------------
+
+/// Un point de la chaine tenu pour vrai, **inscrit dans le binaire lui-meme**.
+///
+/// # Pourquoi cela existe
+///
+/// L'adoption d'une amorce s'appuie sur une tete et une empreinte que
+/// l'operateur recopie depuis une source qu'il croit sure. C'est un maillon
+/// humain : un explorateur usurpe, une interception, un miroir malveillant ou
+/// une simple faute de frappe suffisent a le rompre. La reverification du
+/// travail rend deja l'attaque couteuse — il faut refaire le travail de toute la
+/// chaine — mais elle ne la rend pas impossible a qui detiendrait beaucoup de
+/// puissance.
+///
+/// Un ancrage compile ferme cette porte pour de bon, aux hauteurs qu'il couvre :
+/// la valeur ne vient plus d'un site web, elle vient du **logiciel que
+/// l'utilisateur execute deja**, relu par quiconque lit le depot. C'est la
+/// reponse de Bitcoin a la meme question, et elle est fidele a la philosophie de
+/// Q21 : ce n'est pas une autorite qui tranche, c'est une valeur publique que
+/// tout le monde peut verifier et contester avant qu'elle ne soit publiee.
+///
+/// # Comment en ajouter un
+///
+/// 1. Sur un noeud complet **dont on a soi-meme valide toute la chaine** :
+///    `q21 instantane exporter-amorce <dossier> --reseau <nom>` affiche la
+///    hauteur, la tete et l'empreinte.
+/// 2. Faire confirmer ces trois valeurs par plusieurs personnes, sur des noeuds
+///    independants. Un ancrage qu'une seule personne a vu ne vaut pas mieux que
+///    la parole de cette personne.
+/// 3. Les inscrire ici, dans la table du reseau concerne, et publier le
+///    changement pour relecture.
+///
+/// Un ancrage n'est jamais retire ni modifie : il decrit un fait passe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ancrage {
+    pub hauteur: u64,
+    pub tete: Hash256,
+    pub empreinte: Hash256,
+}
+
+/// Les ancrages connus du reseau, par ordre de hauteur croissante.
+///
+/// Les tables sont **vides tant qu'aucune valeur n'a ete confirmee de facon
+/// independante** : inscrire une valeur non verifiee serait pire que de n'en
+/// inscrire aucune, puisqu'elle porterait l'autorite du binaire sans en avoir
+/// merite la confiance. Une table vide n'affaiblit rien — la reverification du
+/// travail s'applique de toute facon.
+pub fn ancrages_integres(reseau: Network) -> &'static [Ancrage] {
+    match reseau {
+        Network::Mainnet => &[],
+        Network::Testnet => &[],
+        Network::Regtest => &[],
+    }
+}
 
 /// Plafond du telechargement complet d'une amorce, cote client. Meme borne que
 /// le decodage : de quoi tenir un tres grand jeu d'UTXO, jamais l'infini.
