@@ -337,6 +337,13 @@ pub enum AdoptionError {
     /// Les en-tetes ne menent pas a la tete de confiance, a la hauteur annoncee,
     /// depuis la vraie genese : la chaine d'en-tetes n'authentifie pas la tete.
     EntetesInauthentiques,
+    /// Un en-tete ne porte pas la difficulte que la regle impose a sa position.
+    /// Sans ce controle, une chaine fabriquee garderait la difficulte plancher
+    /// de bout en bout et ne couterait presque rien a produire.
+    DifficulteInvalide { hauteur: u64 },
+    /// Un en-tete ne satisfait pas sa propre cible : le travail annonce n'a pas
+    /// ete fourni.
+    TravailInvalide { hauteur: u64 },
     /// La construction de la chaine a echoue (reseau, genese, hors chaine).
     Reprise(RepriseError),
 }
@@ -357,6 +364,16 @@ impl std::fmt::Display for AdoptionError {
                 f,
                 "les en-tetes ne menent pas a la tete de confiance a la hauteur \
                  annoncee : la tete n'est pas authentifiee"
+            ),
+            AdoptionError::DifficulteInvalide { hauteur } => write!(
+                f,
+                "l'en-tete de hauteur {hauteur} ne porte pas la difficulte imposee \
+                 par la regle : cette chaine d'en-tetes est fabriquee"
+            ),
+            AdoptionError::TravailInvalide { hauteur } => write!(
+                f,
+                "l'en-tete de hauteur {hauteur} ne satisfait pas sa cible : le \
+                 travail annonce n'a pas ete fourni"
             ),
             AdoptionError::Reprise(e) => write!(f, "reprise impossible : {e}"),
         }
@@ -676,14 +693,47 @@ impl Chain {
     ///   et les en-tetes doivent y mener, a la hauteur annoncee, depuis la vraie
     ///   genese.
     ///
-    /// # Pourquoi la preuve de travail n'est pas reverifiee
+    /// # Pourquoi la preuve de travail **est** reverifiee
     ///
-    /// Un enchainement structurel jusqu'a une tete de confiance authentifie
-    /// **toute** la chaine : le condensat de chaque en-tete est fige par le champ
-    /// `prev_block` du suivant, jusqu'a la tete. Un seul en-tete falsifie romprait
-    /// la chaine. La confiance descend donc de la tete vers la genese sans qu'on
-    /// ait a recalculer une seule preuve de travail — ce qui serait aussi couteux
-    /// que la synchronisation qu'on cherche a eviter.
+    /// Une version precedente s'en dispensait, au motif que l'enchainement
+    /// structurel jusqu'a la tete de confiance authentifie toute la chaine : le
+    /// condensat de chaque en-tete est fige par le `prev_block` du suivant, donc
+    /// un seul en-tete falsifie romprait la chaine.
+    ///
+    /// Le raisonnement est exact, et il ne suffit pas. Il prouve que les
+    /// ancetres sont authentiques **etant donne que la tete l'est**. Or c'est
+    /// precisement la question : la tete ne vient que d'une chaine hexadecimale
+    /// que l'operateur a recopiee. Qui la controle — explorateur usurpe,
+    /// interception, miroir malveillant, simple faute de frappe — peut fabriquer
+    /// de toutes pieces une chaine d'en-tetes coherente, sans le moindre calcul,
+    /// se terminant sur sa propre tete, et un jeu d'UTXO de son choix dont
+    /// l'empreinte correspond a sa propre valeur. Les trois premiers controles
+    /// passent tous. Le noeud adopte alors un etat monetaire entierement
+    /// invente, pour un cout d'attaque nul.
+    ///
+    /// Le travail est la seule chose qu'on puisse verifier **sans faire
+    /// confiance a personne** — c'est tout le propos de la preuve de travail. On
+    /// le reverifie donc de la genese a la tete, et l'attaque cesse d'etre
+    /// gratuite : il faut refaire le travail de toute la chaine.
+    ///
+    /// Deux controles, indissociables :
+    ///
+    /// - **la difficulte** de chaque en-tete doit etre celle que la regle impose
+    ///   a sa position, et non celle qu'il revendique. Sans cela, une chaine
+    ///   fabriquee resterait a la difficulte plancher de bout en bout ;
+    /// - **le travail** de chaque en-tete doit satisfaire cette cible.
+    ///
+    /// # Le cout, mesure plutot que suppose
+    ///
+    /// L'objection d'origine — « ce serait aussi couteux que la synchronisation
+    /// qu'on cherche a eviter » — confond deux choses. Une synchronisation
+    /// complete valide les **corps** : chaque transaction, chaque signature,
+    /// chaque mouvement d'UTXO. Ici on ne verifie que des en-tetes, par le
+    /// chemin *leger* de la preuve memory-hard, celui qui n'emploie que le cache
+    /// et jamais la table. Et comme on avance par hauteurs croissantes, le cache
+    /// d'une epoque n'est construit qu'une fois. C'est deux ordres de grandeur
+    /// en dessous d'une validation complete, et cela ne se paie qu'une fois, a
+    /// l'adoption.
     pub fn adopter_instantane(
         network: Network,
         instantane: Snapshot,
@@ -707,6 +757,9 @@ impl Chain {
             headers.iter().map(|h| (h.block_id(), h)).collect();
         let mut courant = tete_de_confiance;
         let mut hauteur = instantane.height;
+        // On retient le chemin au passage : c'est exactement la chaine dont il
+        // faut ensuite verifier le travail, et la reparcourir serait du gachis.
+        let mut chemin: Vec<BlockHeader> = Vec::with_capacity(instantane.height as usize + 1);
         loop {
             let Some(h) = par_id.get(&courant) else {
                 return Err(AdoptionError::EntetesInauthentiques);
@@ -714,6 +767,7 @@ impl Chain {
             if h.height != hauteur {
                 return Err(AdoptionError::EntetesInauthentiques);
             }
+            chemin.push(**h);
             if hauteur == 0 {
                 if courant != genesis_id(network) {
                     return Err(AdoptionError::EntetesInauthentiques);
@@ -723,8 +777,53 @@ impl Chain {
             courant = h.prev_block;
             hauteur -= 1;
         }
-        // 4. La construction : positionnement, index, fenetre a rejouer.
+        // 4. Le travail. C'est ce qui rend l'attaque couteuse au lieu de
+        //    gratuite : voir la note de tete.
+        chemin.reverse(); // de la genese vers la tete
+        Self::verifier_le_travail(network, &chemin)?;
+
+        // 5. La construction : positionnement, index, fenetre a rejouer.
         Chain::from_snapshot(network, instantane, headers).map_err(AdoptionError::Reprise)
+    }
+
+    /// Verifie, de la genese a la tete, que chaque en-tete porte la difficulte
+    /// imposee par la regle **et** le travail qui satisfait cette cible.
+    ///
+    /// `active` est ordonne par hauteurs croissantes, `active[0]` etant la
+    /// genese. L'ordre n'est pas un detail de confort : il permet au cache de
+    /// l'epoque de n'etre construit qu'une seule fois, la ou un parcours
+    /// desordonne le reconstruirait sans cesse.
+    fn verifier_le_travail(network: Network, active: &[BlockHeader]) -> Result<(), AdoptionError> {
+        let moteur = Q21Pow::new(network);
+        for (i, entete) in active.iter().enumerate() {
+            // La genese est une constante du reseau, deja confrontee a
+            // `genesis_id` : elle n'a pas de difficulte a justifier.
+            if i == 0 {
+                continue;
+            }
+            // 1. La difficulte imposee, pas celle revendiquee. Le reseau de
+            //    regression la fige au minimum, comme partout ailleurs.
+            let attendu = if network == Network::Regtest {
+                INITIAL_BITS
+            } else {
+                let debut = (i - 1).saturating_sub(LWMA_WINDOW);
+                next_bits(&active[debut..i])
+            };
+            if entete.bits != attendu {
+                return Err(AdoptionError::DifficulteInvalide {
+                    hauteur: entete.height,
+                });
+            }
+            // 2. Le travail lui-meme, par le chemin de verification exact du
+            //    consensus — surtout pas une seconde implementation, qui
+            //    finirait par diverger de la premiere.
+            moteur
+                .check(entete)
+                .map_err(|_| AdoptionError::TravailInvalide {
+                    hauteur: entete.height,
+                })?;
+        }
+        Ok(())
     }
 
     pub fn from_snapshot(
