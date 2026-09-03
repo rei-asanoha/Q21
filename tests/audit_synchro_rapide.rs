@@ -115,6 +115,86 @@ fn une_mauvaise_empreinte_fait_ecarter_le_pair() {
     );
 }
 
+/// Une chaine d'en-tetes **fabriquee**, sans le moindre travail, ne doit pas
+/// etre adoptee — meme si tous les ancrages « correspondent ».
+///
+/// # L'attaque, telle qu'elle etait possible
+///
+/// L'adoption verifiait trois choses : l'empreinte egale la valeur de confiance,
+/// la tete egale la tete de confiance, et les en-tetes menent structurellement
+/// de cette tete a la vraie genese. Le raisonnement etait qu'un enchainement
+/// jusqu'a la tete authentifie toute la chaine.
+///
+/// Il prouve que les ancetres sont authentiques *etant donne que la tete l'est*.
+/// Or la tete ne vient que d'une chaine hexadecimale recopiee par l'operateur.
+/// Qui la controle — explorateur usurpe, interception, miroir malveillant, faute
+/// de frappe — fabrique une chaine d'en-tetes coherente **sans aucun calcul**,
+/// se terminant sur sa propre tete, et fournit ses propres valeurs de confiance.
+/// Les trois controles passaient. Le noeud adoptait un etat invente, pour un
+/// cout d'attaque nul.
+///
+/// La preuve de travail est la seule chose verifiable sans faire confiance a
+/// personne. On la reverifie donc, et l'attaque cesse d'etre gratuite.
+#[test]
+fn une_chaine_d_entetes_fabriquee_n_est_pas_adoptee() {
+    use q21_core::block::BlockHeader;
+    use q21_core::chain::AdoptionError;
+
+    let dir = rep("fabriquee");
+    let (chain, _archive) = chaine_minee(&dir, 30);
+    // Recul d'un seul bloc : l'instantane est haut, donc la chaine que
+    // l'attaquant doit fabriquer est longue. Avec un instantane « en retrait »
+    // complet elle ne ferait qu'un en-tete, et un unique en-tete non mine passe
+    // la cible tres permissive du reseau de regression une fois sur 256 — le
+    // test ne prouverait alors rien.
+    let instantane_honnete = chain.snapshot_at_depth(1).expect("instantane");
+    assert!(
+        instantane_honnete.height >= 25,
+        "la chaine fabriquee doit etre assez longue pour que le controle morde"
+    );
+
+    // L'attaquant part de la vraie genese — sinon le controle de genese le
+    // demasque immediatement — puis empile des en-tetes sans miner.
+    let genese = genesis_block(RESEAU);
+    let mut entetes: Vec<BlockHeader> = vec![genese.header];
+    let mut prev = genese.header.block_id();
+    for h in 1..=instantane_honnete.height {
+        let e = BlockHeader {
+            version: 1,
+            prev_block: prev,
+            merkle_root: Hash256([0x11; 32]),
+            uncles_root: Hash256::ZERO,
+            miner: Hash256([0x66; 32]),
+            time: horodatage(h),
+            bits: genese.header.bits,
+            height: h,
+            // Aucun minage : c'est tout l'interet de l'attaque.
+            nonce: 0,
+        };
+        prev = e.block_id();
+        entetes.push(e);
+    }
+    let tete_fabriquee = prev;
+
+    // L'attaquant fournit ses propres ancrages, parfaitement coherents entre
+    // eux : c'est exactement ce qu'un explorateur usurpe afficherait.
+    let mut instantane = instantane_honnete;
+    instantane.tip = tete_fabriquee;
+    let empreinte = instantane.muhash;
+
+    let r = Chain::adopter_instantane(RESEAU, instantane, &entetes, tete_fabriquee, empreinte);
+
+    assert!(
+        matches!(
+            r,
+            Err(AdoptionError::TravailInvalide { .. })
+                | Err(AdoptionError::DifficulteInvalide { .. })
+        ),
+        "une chaine d'en-tetes sans travail a ete adoptee : l'etat monetaire \
+         d'un noeud neuf se fabrique alors gratuitement"
+    );
+}
+
 /// Le paquet recu par le reseau s'adopte : un noeud neuf en tire le meme etat
 /// engage qu'un noeud complet. La boucle entiere, du fil a l'adoption.
 #[test]
