@@ -41,6 +41,11 @@ COMMANDES
     block <hauteur>          Detaille un bloc
     utxo                     Resume du jeu de sorties non depensees
     emission [annee]         Courbe d'emission theorique
+    revalider [--corps <f>] [--reseau <n>]
+                             Rejoue toute l'histoire depuis la genese et verifie
+                             qu'elle reproduit l'etat adopte. Rend un noeud
+                             parti d'une amorce entierement autonome.
+
     instantane <action>      Instantane portable de l'etat de la monnaie
                              exporter <fichier> [--reseau <nom>]
                                                   ecrit un instantane portable
@@ -289,6 +294,7 @@ fn main() {
             reste.iter().any(|a| a == "--sans-table"),
         ),
         "genese" | "genesis" => cmd_genese(reste.get(1).map(|s| s.as_str())),
+        "revalider" => cmd_revalider(&datadir, &reste[1..]),
         "securite" => cmd_securite(),
         "help" | "--help" | "-h" => {
             print!("{AIDE}");
@@ -792,6 +798,81 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
 
 fn chemin_etat(d: &Path) -> PathBuf {
     d.join("state.dat")
+}
+
+/// Fiche d'adoption : ce que le noeud a **cru sur parole**, et s'il l'a verifie
+/// lui-meme depuis.
+///
+/// # Pourquoi ce fichier existe
+///
+/// Un noeud parti d'une amorce n'a pas valide l'histoire d'avant l'instantane :
+/// il a fait confiance a une empreinte. C'est un compromis assume — il est
+/// utilisable en minutes au lieu de jours — mais un noeud qui a fait confiance
+/// et un noeud qui a verifie ne sont pas la meme chose, et rien ne les
+/// distinguait. Le second oubli est le plus grave : sans trace ecrite, la
+/// confiance accordee un jour devient invisible pour toujours.
+///
+/// On l'inscrit donc, et le noeud le dit tant que ce n'est pas verifie.
+fn chemin_adoption(d: &Path) -> PathBuf {
+    d.join("adoption.txt")
+}
+
+struct FicheAdoption {
+    hauteur: u64,
+    tete: Hash256,
+    empreinte: Hash256,
+    revalide: bool,
+}
+
+fn ecrire_fiche_adoption(d: &Path, f: &FicheAdoption) -> Result<(), String> {
+    let texte = format!(
+        "hauteur={}\ntete={}\nempreinte={}\nrevalide={}\n",
+        f.hauteur,
+        f.tete.to_hex(),
+        f.empreinte.to_hex(),
+        if f.revalide { "oui" } else { "non" }
+    );
+    std::fs::write(chemin_adoption(d), texte).map_err(|e| e.to_string())
+}
+
+fn lire_fiche_adoption(d: &Path) -> Option<FicheAdoption> {
+    let texte = std::fs::read_to_string(chemin_adoption(d)).ok()?;
+    let champ = |cle: &str| -> Option<String> {
+        texte
+            .lines()
+            .find_map(|l| l.strip_prefix(cle).map(|v| v.trim().to_string()))
+    };
+    let hash = |cle: &str| -> Option<Hash256> {
+        let v = champ(cle)?;
+        let o = hex_en_octets(&v)?;
+        if o.len() != 32 {
+            return None;
+        }
+        let mut t = [0u8; 32];
+        t.copy_from_slice(&o);
+        Some(Hash256(t))
+    };
+    Some(FicheAdoption {
+        hauteur: champ("hauteur=")?.parse().ok()?,
+        tete: hash("tete=")?,
+        empreinte: hash("empreinte=")?,
+        revalide: champ("revalide=").as_deref() == Some("oui"),
+    })
+}
+
+/// L'avertissement qu'un noeud non revalide doit afficher — partout, tant qu'il
+/// n'a pas verifie lui-meme.
+fn avertir_si_non_revalide(datadir: &Path) {
+    if let Some(f) = lire_fiche_adoption(datadir) {
+        if !f.revalide {
+            eprintln!(
+                "  ! etat adopte a la hauteur {} et NON revalide : l'histoire d'avant\n    \
+                 cette hauteur a ete crue sur parole, pas verifiee. Pour la verifier :\n    \
+                 q21 --datadir <ici> revalider --corps <blocks.dat d'un noeud complet>",
+                f.hauteur
+            );
+        }
+    }
 }
 
 /// Magasin d'en-tetes. Sa presence marque un dossier **adopte** : un noeud qui
@@ -1515,6 +1596,8 @@ fn cmd_balance(datadir: &Path) -> Result<(), String> {
     // adresse recoit deux paiements, une seule des deux pieces est depensable.
     // Taire la seconde ferait disparaitre des fonds sans explication. On la
     // nomme, et on dit quoi faire pour que cela ne se reproduise pas.
+    avertir_si_non_revalide(datadir);
+
     let fige = e.wallet.montant_fige(&e.chain.utxo, h);
     if fige.units() > 0 {
         let reutilisees = e.wallet.adresses_reutilisees(&e.chain.utxo, h);
@@ -2004,6 +2087,20 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
             StateStore::new_scelle(chemin_etat(datadir), clef)
                 .save(&snap)
                 .map_err(|e| format!("ecriture de l'etat : {e}"))?;
+
+            // La trace de ce qu'on vient de croire sur parole — comme pour
+            // l'adoption depuis un pair. Les deux chemins doivent la laisser :
+            // un dossier adopte sans fiche serait un dossier qui a oublie qu'il
+            // avait fait confiance.
+            ecrire_fiche_adoption(
+                datadir,
+                &FicheAdoption {
+                    hauteur: snap.height,
+                    tete,
+                    empreinte,
+                    revalide: false,
+                },
+            )?;
 
             println!(
                 "Instantane adopte dans {} a la hauteur {}.",
@@ -2530,7 +2627,145 @@ fn stager_amorce_adoptee(
     StateStore::new_scelle(chemin_etat(datadir), clef)
         .save(&snap)
         .map_err(|e| e.to_string())?;
+
+    // La trace de ce qu'on vient de croire sur parole. Sans elle, la confiance
+    // accordee aujourd'hui serait invisible demain.
+    ecrire_fiche_adoption(
+        datadir,
+        &FicheAdoption {
+            hauteur: snap.height,
+            tete,
+            empreinte,
+            revalide: false,
+        },
+    )?;
     Ok((snap.height, snap.muhash))
+}
+
+/// Revalide un dossier adopte : rejoue toute l'histoire depuis la genese et
+/// confronte le resultat a l'empreinte qu'on avait crue sur parole.
+///
+/// # Ce que cette commande apporte
+///
+/// L'adoption d'une amorce est un pret de confiance. La reverification du
+/// travail et les ancrages compiles le rendent tres difficile a trahir, mais ils
+/// ne remplacent pas la seule preuve qui vaille vraiment : refaire soi-meme le
+/// calcul. C'est ce que fait cette commande — et c'est ce qui rend la
+/// synchronisation rapide honnete. Elle n'est plus un acte de foi permanent,
+/// seulement un raccourci qu'on finit par verifier.
+///
+/// Un desaccord n'est jamais silencieux : la fiche n'est pas marquee, et la
+/// commande echoue bruyamment. Un noeud dont l'etat adopte ne se reproduit pas
+/// est un noeud qu'on a trompe.
+fn cmd_revalider(datadir: &Path, args: &[String]) -> Result<(), String> {
+    use q21_core::store::BlockArchive;
+
+    let Some(fiche) = lire_fiche_adoption(datadir) else {
+        println!(
+            "Ce dossier n'est pas issu d'une adoption : il a valide toute son\n\
+             histoire lui-meme. Rien a revalider."
+        );
+        return Ok(());
+    };
+    if fiche.revalide {
+        println!(
+            "Deja revalide : l'histoire jusqu'a la hauteur {} a ete rejouee et\n\
+             reproduit bien l'empreinte adoptee.",
+            fiche.hauteur
+        );
+        return Ok(());
+    }
+
+    // Les corps : ceux du dossier, ou ceux qu'on nous designe. Un noeud adopte
+    // n'a justement pas l'histoire d'avant l'instantane ; il faut la lui donner.
+    let corps = match args.iter().position(|a| a == "--corps") {
+        Some(i) => PathBuf::from(
+            args.get(i + 1)
+                .ok_or("usage : q21 revalider [--corps <chemin/blocks.dat>]")?,
+        ),
+        None => chemin_blocs(datadir),
+    };
+    let reseau = match args.iter().position(|a| a == "--reseau") {
+        Some(i) => reseau_depuis_nom(
+            args.get(i + 1)
+                .ok_or("usage : --reseau <mainnet|testnet|regtest>")?,
+        )?,
+        // Sans indication, on demande au dossier lui-meme — ce qui suppose un
+        // portefeuille. Un noeud sans portefeuille doit nommer son reseau.
+        None => charger_avec(datadir, None)
+            .map(|e| e.chain.network)
+            .map_err(|_| {
+                "impossible de deduire le reseau de ce dossier : precisez \
+                 --reseau <mainnet|testnet|regtest>"
+                    .to_string()
+            })?,
+    };
+
+    println!("Revalidation depuis la genese, avec {}", corps.display());
+    let (archive, entetes, _) =
+        BlockArchive::open(&corps, reseau).map_err(|e| format!("fichier de blocs : {e:?}"))?;
+    let archive = std::sync::Arc::new(archive);
+
+    let ordre =
+        Chain::arborescence(&entetes).map_err(|e| format!("index des blocs illisible : {e:?}"))?;
+    if (ordre.active.len() as u64) <= fiche.hauteur {
+        return Err(format!(
+            "ces corps ne vont qu'a la hauteur {} : il en faut au moins {} pour\n\
+             revalider. Fournissez le fichier de blocs d'un noeud complet avec\n\
+             --corps.",
+            ordre.active.len().saturating_sub(1),
+            fiche.hauteur
+        ));
+    }
+
+    let genese = archive
+        .read(&ordre.active[0])
+        .ok_or("le bloc de genese est absent du fichier")?;
+    let mut c = Chain::new(reseau, genese);
+    c.set_body_source(archive.clone());
+    for id in ordre.active.iter().skip(1).take(fiche.hauteur as usize) {
+        let b = archive
+            .read(id)
+            .ok_or_else(|| format!("corps manquant pour {}", id.to_hex()))?;
+        let t = b.header.time;
+        c.connect(&b, t + 1)
+            .map_err(|e| format!("bloc {} refuse a la revalidation : {e:?}", b.header.height))?;
+    }
+
+    // Le verdict : l'etat recalculé doit reproduire, au bit pres, celui qu'on
+    // avait adopte sur parole.
+    let tete = c.tip_id();
+    let empreinte = c.utxo_commitment();
+    if tete != fiche.tete || empreinte != fiche.empreinte {
+        return Err(format!(
+            "REVALIDATION EN ECHEC — l'etat adopte ne se reproduit pas.\n\
+             \n  hauteur      {}\n  tete   attendue {}\n         obtenue  {}\n\
+             \n  empreinte attendue {}\n            obtenue  {}\n\
+             \nCe noeud a ete trompe lors de son adoption : son etat monetaire ne\n\
+             correspond pas a l'histoire reelle. Ne vous en servez pas. Repartez\n\
+             d'un dossier vide, avec une amorce et une empreinte sures.",
+            fiche.hauteur,
+            fiche.tete.to_hex(),
+            tete.to_hex(),
+            fiche.empreinte.to_hex(),
+            empreinte.to_hex()
+        ));
+    }
+
+    ecrire_fiche_adoption(
+        datadir,
+        &FicheAdoption {
+            revalide: true,
+            ..fiche
+        },
+    )?;
+    println!(
+        "Revalidation reussie : l'histoire rejouee depuis la genese reproduit\n\
+         exactement l'etat adopte a la hauteur {}.\n\
+         Ce noeud ne fait plus confiance a personne pour son etat.",
+        c.height()
+    );
+    Ok(())
 }
 
 /// Telecharge une amorce depuis l'un des pairs donnes, la premiere qui repond et
@@ -2853,6 +3088,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 
     if !silencieux {
         println!("Noeud Q21 — reseau {reseau:?}, hauteur {hauteur_depart}");
+        // Un noeud parti d'une amorce le dit tant qu'il n'a pas verifie
+        // lui-meme. Le taire reviendrait a laisser croire qu'il a valide une
+        // histoire qu'il a seulement crue.
+        avertir_si_non_revalide(datadir);
     }
 
     if let Some(a) = &ecoute {
