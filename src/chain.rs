@@ -1367,9 +1367,36 @@ impl Chain {
             return Ok(Accept::Prolonge);
         }
 
-        // Branche laterale. Deux controles avant toute insertion dans l'index.
+        // Branche laterale. Quatre controles avant toute insertion dans l'index,
+        // ranges du moins cher au plus cher : ce qui coute le plus a verifier
+        // doit etre ce qu'on verifie en dernier.
         //
-        // 1. La difficulte annoncee doit etre celle qu'impose la chaine a cette
+        // 1. La branche est-elle seulement adoptable un jour ?
+        //
+        //    La finalite glissante refuse deja toute reorganisation dont le
+        //    point de fourche est a plus de `MAX_REORG_DEPTH` sous la tete. Une
+        //    branche qui bifurque plus bas ne peut donc JAMAIS l'emporter :
+        //    l'indexer, garder son corps et la consigner au journal est un cout
+        //    pur — et sans borne, puisque l'index n'est jamais elague.
+        //
+        //    C'etait le levier du deni de service : la difficulte plancher des
+        //    premiers blocs rend un frere de la genese quasi gratuit (quelques
+        //    centaines de condensats), et rien ne bornait le nombre de freres
+        //    retenus. Chacun achetait une entree permanente en memoire et un
+        //    enregistrement sur disque.
+        //
+        //    Ce refus ne change aucune regle de consensus : il rejette plus tot
+        //    exactement ce que `try_reorg` rejetait deja plus tard. Le pair qui
+        //    insiste voit son score de mauvaise conduite monter.
+        let profondeur_fourche = self.height().saturating_sub(parent_height);
+        if profondeur_fourche > MAX_REORG_DEPTH {
+            return Err(ChainError::FinaliteDepassee {
+                profondeur: profondeur_fourche,
+                max: MAX_REORG_DEPTH,
+            });
+        }
+
+        // 2. La difficulte annoncee doit etre celle qu'impose la chaine a cette
         //    position. Sans ce controle, `pow.check` verifiait le travail contre
         //    `header.bits` — un champ que l'emetteur remplit. Avec une cible
         //    quasi maximale, n'importe qui produisait une infinite d'en-tetes
@@ -1386,7 +1413,30 @@ impl Chain {
             ));
         }
 
-        // 2. Le travail lui-meme.
+        // 3. La forme et la taille — les controles qui ne demandent aucun
+        //    contexte, et que Bitcoin nomme `CheckBlock`.
+        //
+        //    Ils ne s'executaient que sur le chemin de connexion. Une branche
+        //    laterale entrait donc dans l'index et sur le disque sans qu'on ait
+        //    verifie que son corps correspond a son en-tete : la racine de
+        //    Merkle n'etait jamais recalculee. Un en-tete au travail authentique
+        //    pouvait ainsi trainer un corps arbitraire — que le noeud stockait,
+        //    puis **servait a ses pairs**.
+        //
+        //    Refuser ici ne peut ecarter aucun bloc valide : un corps qui echoue
+        //    ces controles echouerait de toute facon a la connexion.
+        block
+            .check_shape()
+            .map_err(|e| ChainError::Validation(e.into()))?;
+        let taille = block.encode().len();
+        if taille > MAX_BLOCK_SIZE {
+            return Err(ChainError::Validation(ValidationError::BlocTropGros {
+                max: MAX_BLOCK_SIZE,
+                recu: taille,
+            }));
+        }
+
+        // 4. Le travail lui-meme — le plus couteux, donc le dernier.
         self.pow
             .check(&block.header)
             .map_err(|e| ChainError::Validation(ValidationError::PreuveDeTravail(e)))?;

@@ -337,6 +337,79 @@ fn une_branche_laterale_sans_travail_est_refusee() {
     );
 }
 
+/// Un corps qui ne correspond pas à son en-tête ne doit jamais être stocké.
+///
+/// `check_block` — forme, taille, racines de Merkle — ne s'exécutait que sur le
+/// chemin de connexion. Une branche latérale entrait donc dans l'index **et sur
+/// le disque** avec un en-tête au travail authentique mais un corps arbitraire :
+/// le nœud stockait ce corps, puis le **servait à ses pairs**. Bitcoin applique
+/// `CheckBlock` à tout bloc avant de le stocker ; Q21 différait strictement plus.
+#[test]
+fn un_corps_incoherent_n_entre_pas_dans_l_index_sur_une_branche_laterale() {
+    let mut c = chaine(5);
+
+    // Une chaîne sœur qui partage les deux premiers blocs, pour produire un
+    // bloc de hauteur 3 authentique sur une branche latérale.
+    let c2 = chaine(2);
+    let t = horodatage(3);
+    let mut bloc = c2
+        .mine_block(Hash256([0x33; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
+        .expect("minage du frère");
+
+    // L'en-tête reste authentique : bonne difficulté, vrai travail. Seul le
+    // corps est remplacé — la racine de Merkle ne le couvre donc plus.
+    bloc.transactions.clear();
+
+    let connus_avant = c.known_blocks();
+    assert!(
+        c.submit(&bloc, t + 1).is_err(),
+        "un corps qui ne correspond pas à son en-tête ne doit jamais être stocké"
+    );
+    assert_eq!(
+        c.known_blocks(),
+        connus_avant,
+        "l'index a grossi malgré un corps incohérent"
+    );
+}
+
+/// Une branche qu'on ne pourra **jamais** adopter ne doit pas être retenue.
+///
+/// La finalité glissante refuse déjà toute réorganisation dont le point de
+/// fourche est à plus de `MAX_REORG_DEPTH` sous la tête. Mais l'admission, elle,
+/// acceptait ces branches : elle les indexait, gardait leur corps et les
+/// consignait au journal — pour toujours, l'index n'étant jamais élagué.
+///
+/// C'était le levier du déni de service : la difficulté plancher des premiers
+/// blocs rend un frère de la genèse quasi gratuit, et rien ne bornait le nombre
+/// de frères retenus. Quelques centaines de condensats achetaient une entrée
+/// permanente en mémoire **et** un enregistrement sur disque.
+#[test]
+fn une_branche_hors_de_portee_de_la_finalite_est_refusee() {
+    // Une chaîne assez longue pour que la genèse sorte de la fenêtre.
+    let mut c = chaine(MAX_REORG_DEPTH + 5);
+
+    // Un frère authentique du bloc 2, bifurquant tout en bas.
+    let c2 = chaine(1);
+    let t = horodatage(2);
+    let bloc = c2
+        .mine_block(Hash256([0x44; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
+        .expect("minage du frère");
+
+    let connus_avant = c.known_blocks();
+    assert!(
+        matches!(
+            c.submit(&bloc, horodatage(MAX_REORG_DEPTH + 6)),
+            Err(ChainError::FinaliteDepassee { .. })
+        ),
+        "une branche hors de portée de la finalité ne doit pas entrer dans l'index"
+    );
+    assert_eq!(
+        c.known_blocks(),
+        connus_avant,
+        "l'index a grossi pour une branche qui ne pourra jamais l'emporter"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6. `disconnect` ne corrompt rien quand il refuse
 // ---------------------------------------------------------------------------
@@ -394,29 +467,26 @@ fn une_reorganisation_impossible_echoue_au_lieu_de_boucler() {
         }
         assert_eq!(c.undo_window(), 1, "fenêtre d'annulation d'un seul bloc");
 
+        // La branche concurrente doit être faite de blocs **authentiques** :
+        // depuis que l'admission applique `check_shape`, un corps sans coinbase
+        // serait écarté sur sa forme et n'atteindrait jamais `try_reorg` — la
+        // boucle qu'on veut éprouver ici. On mine donc une vraie chaîne sœur qui
+        // bifurque à la hauteur 3 et prend l'avantage.
         let parent = c.active_at(3).expect("ancêtre");
+        let mut soeur = chaine(3);
+        assert_eq!(
+            soeur.tip_id(),
+            parent,
+            "la sœur doit partager les trois premiers blocs"
+        );
+
         let mut branche = Vec::new();
-        let mut prev = parent;
         for h in 4..=8u64 {
-            let mut b = Block {
-                header: BlockHeader {
-                    version: 1,
-                    prev_block: prev,
-                    merkle_root: Hash256::ZERO,
-                    uncles_root: Hash256::ZERO,
-                    miner: Hash256([0xdd; 32]),
-                    time: horodatage(h) + 1,
-                    bits: INITIAL_BITS,
-                    height: h,
-                    nonce: 0,
-                },
-                transactions: vec![],
-                uncles: vec![],
-            };
-            b.header.nonce = 0;
-            let t = PowTable::build(TableParams::for_network(RESEAU), epoch_of(h));
-            pow::mine_with_table(&mut b.header, &t, ESSAIS).expect("minage");
-            prev = b.header.block_id();
+            let t = horodatage(h);
+            let b = soeur
+                .mine_block(Hash256([0xdd; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
+                .expect("minage de la branche");
+            soeur.connect(&b, t + 1).expect("connexion de la branche");
             branche.push(b);
         }
 
