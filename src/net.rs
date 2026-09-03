@@ -99,6 +99,11 @@ struct Peer {
     /// places depuis une seule IP et **supprimer tout appel sortant** : le
     /// carnet anti-eclipse ne serait alors jamais consulte. On les distingue.
     sortant: bool,
+    /// Vrai des qu'un message `Version` valide a ete recu de ce pair. La
+    /// poignee de main n'est complete (`handshaked`) qu'apres `Version` **puis**
+    /// `VerAck` : un `VerAck` seul, sans `Version`, ne doit pas ouvrir l'acces
+    /// aux messages couteux ni sauter le controle de nonce anti-boucle.
+    version_recue: bool,
     handshaked: bool,
     ban_score: u32,
     /// Hauteur annoncee par le pair a la poignee de main.
@@ -569,6 +574,7 @@ impl Node {
                     addr,
                     sortie: sortie.clone(),
                     sortant,
+                    version_recue: false,
                     handshaked: false,
                     ban_score: 0,
                     start_height: 0,
@@ -699,6 +705,7 @@ impl Node {
                     if nonce == nonce_local {
                         couper = true;
                     } else if let Some(p) = g.peers.get_mut(&id) {
+                        p.version_recue = true;
                         p.start_height = start_height;
                         envois.push(Envoi {
                             peer: id,
@@ -726,11 +733,15 @@ impl Node {
                         let hauteur = g.chain.height();
                         let p = g.peers.get_mut(&id);
                         match p {
-                            Some(p) => {
+                            // Un `VerAck` ne complete la poignee de main que si
+                            // un `Version` l'a precede. Sinon on l'ignore : pas
+                            // d'acces aux messages couteux, et le controle de
+                            // nonce (connexion a soi-meme) n'est pas contourne.
+                            Some(p) if p.version_recue => {
                                 p.handshaked = true;
                                 (p.start_height > hauteur, g.chain.locator())
                             }
-                            None => (false, Vec::new()),
+                            _ => (false, Vec::new()),
                         }
                     };
                     if retard {
@@ -758,14 +769,21 @@ impl Node {
                 Message::Pong(_) => {}
 
                 Message::GetHeaders { locator, stop } => {
-                    let h = g
-                        .chain
-                        .headers_from(&locator, stop, crate::wire::MAX_HEADERS);
-                    if !h.is_empty() {
-                        envois.push(Envoi {
-                            peer: id,
-                            message: Message::Headers(h),
-                        });
+                    // Comme tout service, la reponse aux en-tetes exige la
+                    // poignee de main : la synchronisation ne demande jamais
+                    // d'en-tetes avant elle (voir le bras VerAck), donc rien
+                    // d'honnete n'est perdu, et une connexion anonyme ne peut
+                    // plus declencher de travail de service.
+                    if handshaked {
+                        let h = g
+                            .chain
+                            .headers_from(&locator, stop, crate::wire::MAX_HEADERS);
+                        if !h.is_empty() {
+                            envois.push(Envoi {
+                                peer: id,
+                                message: Message::Headers(h),
+                            });
+                        }
                     }
                 }
 
@@ -1024,31 +1042,37 @@ impl Node {
                         .filter(|i| deja.insert(*i))
                         .collect();
 
-                    if let Some(b) = g.chain.block_by_id(&block) {
-                        let mut txs = Vec::new();
-                        let mut budget = if handshaked { BUDGET_REPONSE_OCTETS } else { 0 };
-                        let mut valide = true;
-                        for i in &uniques {
-                            match b.transactions.get(*i as usize) {
-                                Some(t) => {
-                                    let taille = t.encode().len();
-                                    if taille > budget {
+                    // Le chargement du bloc (ouverture de fichier, lecture,
+                    // clone) precedait la poignee de main : un pair anonyme
+                    // faisait faire au noeud une lecture disque sous le verrou
+                    // global pour zero octet servi. On l'exige d'abord.
+                    if handshaked {
+                        if let Some(b) = g.chain.block_by_id(&block) {
+                            let mut txs = Vec::new();
+                            let mut budget = if handshaked { BUDGET_REPONSE_OCTETS } else { 0 };
+                            let mut valide = true;
+                            for i in &uniques {
+                                match b.transactions.get(*i as usize) {
+                                    Some(t) => {
+                                        let taille = t.encode().len();
+                                        if taille > budget {
+                                            break;
+                                        }
+                                        budget -= taille;
+                                        txs.push(t.clone());
+                                    }
+                                    None => {
+                                        valide = false;
                                         break;
                                     }
-                                    budget -= taille;
-                                    txs.push(t.clone());
-                                }
-                                None => {
-                                    valide = false;
-                                    break;
                                 }
                             }
-                        }
-                        if valide && !txs.is_empty() {
-                            envois.push(Envoi {
-                                peer: id,
-                                message: Message::BlockTxn { block, txs },
-                            });
+                            if valide && !txs.is_empty() {
+                                envois.push(Envoi {
+                                    peer: id,
+                                    message: Message::BlockTxn { block, txs },
+                                });
+                            }
                         }
                     }
                 }
@@ -1523,6 +1547,38 @@ mod tests {
         );
         a.shutdown();
         b.shutdown();
+    }
+
+    /// Un `VerAck` seul, sans `Version` prealable, ne doit pas completer la
+    /// poignee de main : sinon un pair sauterait la negociation et le controle
+    /// de nonce, et ouvrirait l'acces aux messages couteux avec une seule trame.
+    #[test]
+    fn un_verack_seul_ne_complete_pas_la_poignee() {
+        use std::io::Write;
+        let a = noeud();
+        let addr = a.listen("127.0.0.1:0").expect("ecoute");
+        let magie = magic_for(RESEAU);
+
+        let mut s = std::net::TcpStream::connect(addr).expect("connexion");
+        s.write_all(&Message::VerAck.frame(magie)).unwrap();
+        s.flush().unwrap();
+
+        assert!(
+            attendre(|| a.peer_count() == 1, 5),
+            "la connexion TCP doit etre acceptee"
+        );
+        // Mais jamais marquee handshaked sur un verack orphelin.
+        assert!(
+            !attendre(
+                || {
+                    let g = a.partage.lock().unwrap();
+                    g.peers.values().any(|p| p.handshaked)
+                },
+                2
+            ),
+            "un verack sans version ne doit pas completer la poignee de main"
+        );
+        a.shutdown();
     }
 
     #[test]
