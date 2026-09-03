@@ -1110,9 +1110,23 @@ impl Chain {
     ///
     /// Rend au plus `max` en-tetes. S'arrete a `stop` s'il est atteint.
     pub fn headers_from(&self, locator: &[Hash256], stop: Hash256, max: usize) -> Vec<BlockHeader> {
+        // Point de fourche par recherche dans l'index (une lecture de table par
+        // entree du localisateur), et non par balayage lineaire de la chaine
+        // active. Un pair pouvait sinon envoyer 64 hachages absents et forcer
+        // 64 balayages complets de la chaine — des dizaines de millions de
+        // comparaisons par requete de 2 Kio, le tout sous le verrou global. On
+        // retient la premiere entree du localisateur qui est bien sur la chaine
+        // active, a sa hauteur.
         let depart = locator
             .iter()
-            .find_map(|id| self.active.iter().position(|x| x == id))
+            .find_map(|id| {
+                let h = self.index.get(id)?.header.height as usize;
+                if self.active.get(h) == Some(id) {
+                    Some(h)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
 
         let mut v = Vec::new();
