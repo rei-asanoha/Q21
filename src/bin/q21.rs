@@ -378,15 +378,90 @@ fn phrase_secrete(
 /// Sans cela, `wallet.dat` etait ecrit avec les droits par defaut — souvent
 /// lisible par tout le monde sur une machine partagee. Chiffrer un fichier que
 /// n'importe qui peut copier ne protege que contre la paresse.
-fn restreindre_acces(chemin: &Path) {
+/// Le nom de compte a passer a `icacls`, a partir des variables d'environnement
+/// de Windows.
+///
+/// Sur une machine reliee a un domaine, le nom d'utilisateur seul peut designer
+/// deux comptes differents ; on le qualifie donc du domaine quand il est connu.
+/// Sans nom d'utilisateur, on ne peut accorder l'acces a personne — et il vaut
+/// mieux le dire que poser une regle au hasard.
+///
+/// Cette fonction n'est pas propre a Windows : c'est du calcul de chaine, et
+/// elle est donc eprouvable partout, y compris la ou le reste ne compile pas.
+/// Elle n'est compilee que la ou elle sert — sous Windows, et sous l'epreuve.
+#[cfg(any(windows, test))]
+fn nom_de_compte_windows(utilisateur: Option<&str>, domaine: Option<&str>) -> Option<String> {
+    let u = utilisateur?.trim();
+    if u.is_empty() {
+        return None;
+    }
+    match domaine.map(str::trim) {
+        Some(d) if !d.is_empty() => Some(format!("{d}\\{u}")),
+        _ => Some(u.to_string()),
+    }
+}
+
+/// Restreint l'acces d'un fichier a son seul proprietaire. Rend `false` si la
+/// restriction n'a pas pu etre posee.
+///
+/// # Le trou que cette fonction avait
+///
+/// Sous Unix, elle posait le mode `0600` — lisible par le seul proprietaire.
+/// Sous Windows, elle ne faisait **rien du tout** : le fichier heritait des
+/// droits de son dossier, donc de tout ce que ce dossier laisse passer. Or
+/// c'est le systeme de la plupart des utilisateurs, et ce fichier porte la
+/// graine : celle qui refabrique le portefeuille entier, fonds compris. Quand
+/// l'utilisateur a de surcroit refuse une phrase secrete, la graine y est en
+/// clair.
+///
+/// Windows n'a pas de « mode 0600 » : les droits y sont des listes de controle
+/// d'acces. L'equivalent tient en deux gestes — **couper l'heritage** venu du
+/// dossier, puis n'accorder l'acces qu'au **compte courant**. C'est ce que fait
+/// `icacls`, present sur toute version de Windows depuis Vista.
+///
+/// # Pourquoi le resultat est rendu plutot qu'ignore
+///
+/// La restriction peut echouer legitimement : un portefeuille pose sur une cle
+/// USB en FAT32 n'a pas d'ACL du tout. Le silence serait alors le pire des
+/// choix — l'utilisateur croirait son fichier protege. On rend donc l'echec,
+/// pour que l'appelant puisse le dire.
+#[must_use]
+fn restreindre_acces(chemin: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(chemin, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(chemin, std::fs::Permissions::from_mode(0o600)).is_ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Sans ce drapeau, une fenetre de console noire clignote a chaque
+        // enregistrement : le portefeuille est lance depuis une interface, pas
+        // depuis un terminal.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        // Le compte a qui accorder l'acces.
+        let Some(compte) = nom_de_compte_windows(
+            std::env::var("USERNAME").ok().as_deref(),
+            std::env::var("USERDOMAIN").ok().as_deref(),
+        ) else {
+            return false;
+        };
+
+        std::process::Command::new("icacls")
+            .arg(chemin)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{compte}:F"))
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|s| s.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = chemin;
+        false
     }
 }
 
@@ -449,7 +524,9 @@ fn enregistrer_serie(d: &Path, serie: u64) {
     let chemin = chemin_serie(d);
     let tmp = chemin.with_extension("tmp");
     if std::fs::write(&tmp, serie.to_string()).is_ok() && std::fs::rename(&tmp, &chemin).is_ok() {
-        restreindre_acces(&chemin);
+        // Ce fichier ne porte qu'un compteur : son echec ne merite pas un
+        // avertissement, contrairement a celui qui porte la graine.
+        let _ = restreindre_acces(&chemin);
     }
 }
 
@@ -547,9 +624,25 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     // ne l'avait pas.
     let tmp = chemin.with_extension("tmp");
     std::fs::write(&tmp, &octets).map_err(|e| e.to_string())?;
-    restreindre_acces(&tmp);
+    // Le temporaire porte deja la graine : on le restreint avant meme qu'il
+    // prenne son nom definitif.
+    let _ = restreindre_acces(&tmp);
     std::fs::rename(&tmp, &chemin).map_err(|e| e.to_string())?;
-    restreindre_acces(&chemin);
+
+    // --- Le fichier qui porte les fonds.
+    //
+    // Si ses droits n'ont pas pu etre restreints, le taire serait le pire des
+    // choix : l'utilisateur croirait proteges des octets qui ne le sont pas.
+    // Le cas se produit pour de vrai — une cle USB en FAT32 n'a pas d'ACL.
+    if !restreindre_acces(&chemin) {
+        eprintln!(
+            "avertissement : les droits d'acces de {} n'ont pas pu etre restreints.",
+            chemin.display()
+        );
+        eprintln!("  Ce fichier porte la graine de votre portefeuille. Evitez de le laisser");
+        eprintln!("  sur un disque partage ou une cle USB, et protegez-le par une phrase");
+        eprintln!("  secrete si ce n'est pas deja fait.");
+    }
     // La marque de serie n'est posee qu'apres l'ecriture reussie : sinon une
     // coupure entre les deux rendrait le portefeuille reel « trop ancien ».
     enregistrer_serie(d, serie);
@@ -4393,5 +4486,45 @@ mod tests {
         assert_eq!(hex_en_octets("abc"), None, "longueur impaire");
         assert_eq!(hex_en_octets("zz"), None, "hors de l'alphabet");
         assert_eq!(hex_en_octets(""), Some(Vec::new()));
+    }
+
+    /// Le nom de compte transmis a `icacls` decide qui pourra lire le fichier
+    /// qui porte la graine. Une erreur ici n'est pas une coquetterie : accorder
+    /// l'acces au mauvais compte, ou a un compte vide, laisserait le fichier
+    /// sans protection reelle.
+    ///
+    /// Ce calcul est volontairement separe du code propre a Windows, pour etre
+    /// eprouve meme la ou le reste ne se compile pas.
+    #[test]
+    fn le_nom_de_compte_windows_se_qualifie_du_domaine() {
+        // Cas courant : machine personnelle, domaine = nom de la machine.
+        assert_eq!(
+            nom_de_compte_windows(Some("Tibou"), Some("DESKTOP-PC")),
+            Some("DESKTOP-PC\\Tibou".to_string())
+        );
+        // Sans domaine connu, le nom seul suffit.
+        assert_eq!(
+            nom_de_compte_windows(Some("Tibou"), None),
+            Some("Tibou".to_string())
+        );
+        // Un domaine vide ne doit pas produire un « \\Tibou » bancal.
+        assert_eq!(
+            nom_de_compte_windows(Some("Tibou"), Some("")),
+            Some("Tibou".to_string())
+        );
+        assert_eq!(
+            nom_de_compte_windows(Some("Tibou"), Some("   ")),
+            Some("Tibou".to_string())
+        );
+        // Les espaces parasites ne doivent pas entrer dans une regle d'acces.
+        assert_eq!(
+            nom_de_compte_windows(Some("  Tibou  "), Some("  DOM  ")),
+            Some("DOM\\Tibou".to_string())
+        );
+        // Sans utilisateur, on n'accorde rien a personne : mieux vaut echouer
+        // franchement que poser une regle au hasard.
+        assert_eq!(nom_de_compte_windows(None, Some("DOM")), None);
+        assert_eq!(nom_de_compte_windows(Some(""), Some("DOM")), None);
+        assert_eq!(nom_de_compte_windows(Some("   "), None), None);
     }
 }
