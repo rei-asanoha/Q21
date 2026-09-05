@@ -7,7 +7,7 @@
 use q21_core::block::Block;
 use q21_core::chain::{genesis_block, Chain};
 use q21_core::net::{magic_for, Node};
-use q21_core::wire::{InvItem, InvKind, Message, MAX_BLOCK_TXN, MAX_INV};
+use q21_core::wire::{InvItem, InvKind, Message, MAX_BLOCK_TXN, MAX_INV, PROTOCOL_VERSION};
 use q21_core::Network;
 
 use std::io::{Read, Write};
@@ -214,7 +214,7 @@ fn un_bloc_compact_orphelin_ne_declenche_aucun_travail() {
     // l'attaquant, celui d'un pair legitime.
     s.write_all(
         &Message::Version {
-            version: 1,
+            version: PROTOCOL_VERSION,
             timestamp: 0,
             nonce: 0xdead_beef,
             user_agent: "epreuve".into(),
@@ -229,7 +229,7 @@ fn un_bloc_compact_orphelin_ne_declenche_aucun_travail() {
     // Deux cents annonces compactes dont le parent n'existe pas.
     for k in 0..200u8 {
         let entete = BlockHeader {
-            version: 1,
+            version: PROTOCOL_VERSION,
             prev_block: Hash256([k; 32]), // parent inconnu
             merkle_root: Hash256([1u8; 32]),
             uncles_root: Hash256::ZERO,

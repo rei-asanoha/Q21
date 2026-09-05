@@ -31,7 +31,8 @@ use crate::hash::Hash256;
 use crate::mempool::Mempool;
 use crate::tx::Transaction;
 use crate::wire::{
-    InvItem, InvKind, Message, WireError, HEADER_LEN, MAX_PAYLOAD, PROTOCOL_VERSION,
+    InvItem, InvKind, Message, WireError, HEADER_LEN, MAX_PAYLOAD, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -666,7 +667,7 @@ impl Node {
                 version: PROTOCOL_VERSION,
                 timestamp: maintenant(),
                 nonce,
-                user_agent: "q21:0.1".into(),
+                user_agent: "q21:0.2".into(),
                 start_height: hauteur,
             };
             let _ = ecrire(&sortie, &v, self.magie);
@@ -767,12 +768,16 @@ impl Node {
 
             match msg {
                 Message::Version {
+                    version,
                     nonce,
                     start_height,
                     ..
                 } => {
-                    // Connexion a soi-meme : on coupe sans ceremonie.
-                    if nonce == nonce_local {
+                    // Connexion a soi-meme : on coupe sans ceremonie. Un pair
+                    // d'une autre epoque du protocole aussi : il ne validerait
+                    // pas les memes regles, et chacun punirait l'autre pour
+                    // des blocs que l'autre tient pour justes.
+                    if nonce == nonce_local || version < MIN_PROTOCOL_VERSION {
                         couper = true;
                     } else if let Some(p) = g.peers.get_mut(&id) {
                         p.version_recue = true;
@@ -791,7 +796,7 @@ impl Node {
                                 version: PROTOCOL_VERSION,
                                 timestamp: maintenant(),
                                 nonce: nonce_local,
-                                user_agent: "q21:0.1".into(),
+                                user_agent: "q21:0.2".into(),
                                 start_height: hauteur,
                             },
                         });
@@ -1757,6 +1762,45 @@ mod tests {
                 2
             ),
             "un verack sans version ne doit pas completer la poignee de main"
+        );
+        a.shutdown();
+    }
+
+    /// Un pair d'une version anterieure du protocole est coupe a la poignee
+    /// de main : il ne valide pas les memes regles, et l'echanger avec lui
+    /// ne produirait que des refus mutuels.
+    #[test]
+    fn un_pair_d_une_version_anterieure_est_coupe_a_la_poignee() {
+        use std::io::Write;
+        let a = noeud();
+        let addr = a.listen("127.0.0.1:0").expect("ecoute");
+        let magie = magic_for(RESEAU);
+
+        let mut s = std::net::TcpStream::connect(addr).expect("connexion");
+        let ancien = Message::Version {
+            version: MIN_PROTOCOL_VERSION - 1,
+            timestamp: maintenant(),
+            nonce: 0x1234_5678,
+            user_agent: "q21:0.1".into(),
+            start_height: 0,
+        };
+        s.write_all(&ancien.frame(magie)).unwrap();
+        s.flush().unwrap();
+
+        // Le pair est accepte au niveau TCP puis coupe : il ne reste pas.
+        assert!(
+            attendre(|| a.peer_count() == 0, 5) && {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                a.peer_count() == 0
+            },
+            "un pair d'une version anterieure doit etre coupe"
+        );
+        assert!(
+            !{
+                let g = a.partage.lock().unwrap();
+                g.peers.values().any(|p| p.handshaked)
+            },
+            "et jamais marque handshaked"
         );
         a.shutdown();
     }
