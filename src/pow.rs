@@ -161,6 +161,41 @@ impl PowEngine for Q21Pow {
     }
 }
 
+/// Verification employant un cache d'epoque **deja construit**.
+///
+/// # Pourquoi ce moteur existe
+///
+/// [`Q21Pow`] passe par le registre global des caches a chaque en-tete : un
+/// verrou, puis une recherche. C'est sans consequence pour un bloc isole, mais
+/// une adoption d'amorce verifie toute une chaine — des centaines de milliers
+/// d'en-tetes — et le fait en parallele. Ce registre deviendrait alors le
+/// goulot : un verrou pris des millions de fois, que tous les fils se
+/// disputeraient.
+///
+/// Ce moteur emprunte le cache par reference. Il ne redefinit **que** le
+/// condensat : la comparaison a la cible reste celle du trait, donc il n'existe
+/// toujours qu'une seule regle de validite du travail, impossible a faire
+/// diverger.
+pub struct Q21PowAvecCache<'a> {
+    params: crate::memhard::TableParams,
+    cache: &'a crate::memhard::PowCache,
+}
+
+impl<'a> Q21PowAvecCache<'a> {
+    pub fn new(
+        params: crate::memhard::TableParams,
+        cache: &'a crate::memhard::PowCache,
+    ) -> Q21PowAvecCache<'a> {
+        Q21PowAvecCache { params, cache }
+    }
+}
+
+impl PowEngine for Q21PowAvecCache<'_> {
+    fn hash(&self, header: &BlockHeader) -> Hash256 {
+        crate::memhard::hash_verify_avec_cache(header, self.params, self.cache)
+    }
+}
+
 /// Minage avec table precalculee.
 ///
 /// C'est le chemin du mineur. Recalculer les elements a chaque nonce, comme le

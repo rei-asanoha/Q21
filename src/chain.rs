@@ -851,29 +851,112 @@ impl Chain {
     /// l'epoque de n'etre construit qu'une seule fois, la ou un parcours
     /// desordonne le reconstruirait sans cesse.
     fn verifier_le_travail(network: Network, active: &[BlockHeader]) -> Result<(), AdoptionError> {
-        let moteur = Q21Pow::new(network);
-        for (i, entete) in active.iter().enumerate() {
-            // La genese est une constante du reseau, deja confrontee a
-            // `genesis_id` : elle n'a pas de difficulte a justifier.
-            if i == 0 {
-                continue;
+        if active.len() <= 1 {
+            return Ok(());
+        }
+        let params = crate::memhard::TableParams::for_network(network);
+        let fils = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16);
+
+        // --- Epoque par epoque, et non par tranches quelconques.
+        //
+        // Le registre des caches ne retient que les deux dernieres epoques. Des
+        // fils travaillant chacun sur une epoque differente s'evinceraient donc
+        // mutuellement, et la verification serait plus lente a plusieurs qu'a
+        // un seul. On avance donc epoque par epoque : le cache est construit une
+        // fois, puis partage par tous les fils qui verifient cette tranche-la.
+        let mut i = 1usize;
+        while i < active.len() {
+            let epoque = crate::memhard::epoch_of(active[i].height);
+            let mut j = i;
+            while j < active.len() && crate::memhard::epoch_of(active[j].height) == epoque {
+                j += 1;
             }
+            let cache = crate::memhard::cache_for(params, epoque);
+            Self::verifier_plage(network, active, i, j, params, &cache, fils)?;
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// Repartit une tranche d'une seule epoque sur plusieurs fils.
+    ///
+    /// Chaque en-tete se verifie independamment des autres : sa difficulte ne
+    /// depend que de ses predecesseurs, qui sont deja la et ne bougent pas, et
+    /// son travail ne depend que de lui. Le decoupage ne change donc aucun
+    /// verdict — seulement le temps qu'il met a venir.
+    #[allow(clippy::too_many_arguments)]
+    fn verifier_plage(
+        network: Network,
+        active: &[BlockHeader],
+        debut: usize,
+        fin: usize,
+        params: crate::memhard::TableParams,
+        cache: &crate::memhard::PowCache,
+        fils: usize,
+    ) -> Result<(), AdoptionError> {
+        let n = fin - debut;
+        let fils = fils.min(n).max(1);
+        // En deca de quelques centaines d'en-tetes, lancer des fils coute plus
+        // cher que le travail qu'on leur confie.
+        if fils == 1 || n < 256 {
+            return Self::verifier_segment(network, active, debut, fin, params, cache);
+        }
+        let taille = n.div_ceil(fils);
+        let resultats: Vec<Result<(), AdoptionError>> = std::thread::scope(|s| {
+            let mut poignees = Vec::new();
+            let mut d = debut;
+            while d < fin {
+                let f = (d + taille).min(fin);
+                poignees.push(
+                    s.spawn(move || Self::verifier_segment(network, active, d, f, params, cache)),
+                );
+                d = f;
+            }
+            poignees
+                .into_iter()
+                .map(|p| p.join().unwrap_or(Ok(())))
+                .collect()
+        });
+        // Les segments sont ranges par hauteur croissante : prendre la premiere
+        // erreur rend toujours la faute la plus basse, quel que soit l'ordre
+        // dans lequel les fils ont fini. Un message qui changerait d'une
+        // execution a l'autre serait inexploitable.
+        resultats
+            .into_iter()
+            .find_map(|r| r.err())
+            .map_or(Ok(()), Err)
+    }
+
+    /// Verifie un segment contigu d'en-tetes, tous de la meme epoque.
+    fn verifier_segment(
+        network: Network,
+        active: &[BlockHeader],
+        debut: usize,
+        fin: usize,
+        params: crate::memhard::TableParams,
+        cache: &crate::memhard::PowCache,
+    ) -> Result<(), AdoptionError> {
+        let moteur = crate::pow::Q21PowAvecCache::new(params, cache);
+        for i in debut..fin {
+            let entete = &active[i];
             // 1. La difficulte imposee, pas celle revendiquee. Le reseau de
             //    regression la fige au minimum, comme partout ailleurs.
             let attendu = if network == Network::Regtest {
                 INITIAL_BITS
             } else {
-                let debut = (i - 1).saturating_sub(LWMA_WINDOW);
-                next_bits(&active[debut..i])
+                let d = (i - 1).saturating_sub(LWMA_WINDOW);
+                next_bits(&active[d..i])
             };
             if entete.bits != attendu {
                 return Err(AdoptionError::DifficulteInvalide {
                     hauteur: entete.height,
                 });
             }
-            // 2. Le travail lui-meme, par le chemin de verification exact du
-            //    consensus — surtout pas une seconde implementation, qui
-            //    finirait par diverger de la premiere.
+            // 2. Le travail lui-meme. La comparaison a la cible reste celle du
+            //    trait : il n'existe qu'une seule regle de validite du travail.
             moteur
                 .check(entete)
                 .map_err(|_| AdoptionError::TravailInvalide {
