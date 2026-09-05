@@ -19,7 +19,8 @@
 # - le condensat SHA-256 de chaque fichier, publie avec lui ;
 # - une **attestation de provenance** signee par GitHub, qui lie chaque archive
 #   au commit et a l'execution qui l'ont produite. Elle se verifie avec
-#   `gh attestation verify <archive> --repo <proprietaire>/<depot>` ;
+#   `gh attestation verify <archive> --repo <proprietaire>/<depot>`. GitHub
+#   ne l'offre qu'aux depots publics : sur un depot prive, l'etape est sautee ;
 # - si le depot detient une clef `MINISIGN_KEY`, une signature `minisign` du
 #   fichier `SHA256SUMS`, verifiable hors ligne avec la clef publique publiee
 #   dans le README. Sans cette clef, l'etape est simplement sautee.
@@ -163,7 +164,13 @@ jobs:
       # L'attestation lie l'archive a ce commit et a cette execution, signee
       # par GitHub. Quiconque la verifie sait que le fichier a ete construit
       # ici, a partir de ces sources, et non deposee a la main.
+      #
+      # GitHub ne l'offre pas aux depots prives d'un compte personnel : elle
+      # ne s'execute donc que si le depot est public, et n'empeche jamais la
+      # livraison — le condensat et la signature restent la dans tous les cas.
       - name: Attestation de provenance
+        if: ${{ !github.event.repository.private }}
+        continue-on-error: true
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ matrix.archive }}
