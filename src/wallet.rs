@@ -743,6 +743,54 @@ impl Wallet {
         Amount::from_units(total)
     }
 
+    /// Ce qui appartient au portefeuille mais n'est pas encore mur, et la
+    /// hauteur a laquelle la **prochaine** part se liberera.
+    ///
+    /// # Pourquoi passer par l'index
+    ///
+    /// L'interface interrogeait ce montant en parcourant **tout** le jeu d'UTXO,
+    /// et le faisait toutes les six secondes, sous le verrou global — celui qui
+    /// sert aussi a valider les blocs. Sur une chaine mure, chaque portefeuille
+    /// ouvert aurait donc fige la validation a intervalle regulier, sans que
+    /// personne ne fasse le rapprochement : c'est son propre portefeuille qui
+    /// ralentit son propre noeud.
+    ///
+    /// Le portefeuille connait ses adresses, et le jeu d'UTXO sait les retrouver
+    /// par son index. Le prix passe de la taille du jeu entier au nombre de
+    /// sorties reellement detenues.
+    ///
+    /// # Ce que la seconde valeur apporte
+    ///
+    /// « Quand ? » est la question qu'on pose devant un solde bloque. Rendre la
+    /// hauteur de la prochaine liberation et le montant qu'elle porte permet
+    /// d'afficher un compte a rebours plutot qu'un mystere. A hauteur egale les
+    /// montants se cumulent : plusieurs sorties d'un meme bloc se liberent
+    /// ensemble.
+    pub fn immature(&self, utxo: &UtxoSet, hauteur: u64) -> (Amount, Option<(u64, Amount)>) {
+        let mut total: u64 = 0;
+        let mut prochaine: Option<(u64, u64)> = None;
+        for empreinte in self.connues.keys() {
+            for (_, e) in utxo.sorties_de(empreinte) {
+                if !e.is_coinbase || hauteur >= e.height + COINBASE_MATURITY {
+                    continue;
+                }
+                let valeur = e.output.value.units();
+                total = total.saturating_add(valeur);
+                let libre_a = e.height + COINBASE_MATURITY;
+                prochaine = match prochaine {
+                    Some((h, m)) if h == libre_a => Some((h, m.saturating_add(valeur))),
+                    // On garde toujours la liberation la plus proche.
+                    Some((h, m)) if h < libre_a => Some((h, m)),
+                    _ => Some((libre_a, valeur)),
+                };
+            }
+        }
+        (
+            Amount::from_units(total),
+            prochaine.map(|(h, m)| (h, Amount::from_units(m))),
+        )
+    }
+
     /// Adresses ayant recu plus d'un paiement, avec le nombre de pieces.
     ///
     /// C'est la cause, la ou [`Wallet::montant_fige`] en donne le montant : elle
@@ -1787,5 +1835,65 @@ mod tests {
         let long = w.etiquette(1).expect("nom pose");
         assert_eq!(long.chars().count(), Wallet::ETIQUETTE_MAX);
         assert!(long.chars().all(|c| c == 'é'));
+    }
+
+    /// Le montant immature rendu par l'index doit coincider exactement avec un
+    /// balayage complet — montant **et** hauteur de la prochaine liberation.
+    ///
+    /// C'est la contrepartie d'une optimisation : elle ne vaut que si elle ne
+    /// change pas la reponse. Un mineur qui verrait un compte a rebours faux
+    /// preferait encore l'ancien balayage lent.
+    #[test]
+    fn le_montant_immature_coincide_avec_le_balayage() {
+        fn balayage(w: &Wallet, utxo: &UtxoSet, hauteur: u64) -> (u64, Option<(u64, u64)>) {
+            let mut immature = 0u64;
+            let mut prochaine: Option<(u64, u64)> = None;
+            for (_, e) in utxo.iter() {
+                if e.is_coinbase
+                    && hauteur < e.height + COINBASE_MATURITY
+                    && w.owns(&e.output.pubkey_hash)
+                {
+                    immature += e.output.value.units();
+                    let libre_a = e.height + COINBASE_MATURITY;
+                    match prochaine {
+                        Some((h, m)) if h == libre_a => {
+                            prochaine = Some((h, m + e.output.value.units()))
+                        }
+                        Some((h, _)) if h < libre_a => {}
+                        _ => prochaine = Some((libre_a, e.output.value.units())),
+                    }
+                }
+            }
+            (immature, prochaine)
+        }
+
+        let mut w = portefeuille();
+        let c = chaine_avec_fonds(&mut w);
+
+        // A plusieurs hauteurs : avant maturite, pendant, et bien apres. Les
+        // trois cas font varier a la fois le montant et la prochaine echeance.
+        for h in [
+            0u64,
+            1,
+            c.height() / 2,
+            c.height(),
+            c.height() + COINBASE_MATURITY,
+        ] {
+            let attendu = balayage(&w, &c.utxo, h);
+            let (m, p) = w.immature(&c.utxo, h);
+            let obtenu = (m.units(), p.map(|(x, y)| (x, y.units())));
+            assert_eq!(
+                obtenu, attendu,
+                "l'index diverge du balayage a la hauteur {h}"
+            );
+        }
+
+        // Et il doit exister au moins une hauteur ou la reponse n'est pas vide,
+        // sans quoi l'epreuve ne prouverait rien.
+        let (m, p) = w.immature(&c.utxo, c.height());
+        assert!(
+            m.units() > 0 && p.is_some(),
+            "le montage doit produire des fonds immatures"
+        );
     }
 }
