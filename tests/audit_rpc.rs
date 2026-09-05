@@ -681,7 +681,7 @@ fn faille_sendtoaddress_debordement_par_les_frais() {
         let r = post_rpc(
             h.addr,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"sendtoaddress","params":{{"adresse":"{dest}","unites":1,"frais":{frais}}}}}"#
+                r#"{{"jsonrpc":"2.0","id":1,"method":"sendtoaddress","params":{{"adresse":"{dest}","unites":10000,"frais":{frais}}}}}"#
             ),
         );
         assert!(
@@ -711,7 +711,7 @@ fn faille_sendtoaddress_debordement_par_les_frais() {
         let c = corps_de(&post_rpc(
             h.addr,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"sendtoaddress","params":{{"adresse":"{dest}","unites":1,"frais":{frais}}}}}"#
+                r#"{{"jsonrpc":"2.0","id":1,"method":"sendtoaddress","params":{{"adresse":"{dest}","unites":10000,"frais":{frais}}}}}"#
             ),
         ))
         .to_string();
@@ -724,9 +724,9 @@ fn faille_sendtoaddress_debordement_par_les_frais() {
     // Absent ou nul : le defaut s'applique, et c'est legitime.
     for frais in ["null", ""] {
         let params = if frais.is_empty() {
-            format!(r#"{{"adresse":"{dest}","unites":1}}"#)
+            format!(r#"{{"adresse":"{dest}","unites":10000}}"#)
         } else {
-            format!(r#"{{"adresse":"{dest}","unites":1,"frais":{frais}}}"#)
+            format!(r#"{{"adresse":"{dest}","unites":10000,"frais":{frais}}}"#)
         };
         let c = corps_de(&post_rpc(
             h.addr,
@@ -2265,7 +2265,7 @@ fn faille_l_erreur_de_fonds_revele_le_solde_exact() {
         ))
         .to_string()
     };
-    let petit = refus(1);
+    let petit = refus(10_000);
     let gros = refus(1_000_000_000_000);
 
     assert!(petit.contains("\"code\":-3"), "{petit}");

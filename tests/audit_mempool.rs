@@ -8,7 +8,7 @@
 //! se rouvrait. Les tests de cout (t02, t03, t08) restent des mesures.
 
 use q21_core::amount::Amount;
-use q21_core::consensus::WITNESS_DISCOUNT;
+use q21_core::consensus::{MIN_OUTPUT_VALUE, WITNESS_DISCOUNT};
 use q21_core::hash::Hash256;
 use q21_core::lamport;
 use q21_core::mempool::{Mempool, MempoolError, MEMPOOL_MAX_BYTES, MIN_FEE_RATE};
@@ -195,7 +195,7 @@ fn t02_cout_mldsa_reel_et_amplification() {
             &u,
             10,
             &da,
-            Amount::from_units(1_000),
+            Amount::from_units(50_000),
             Amount::from_units(100),
         )
         .expect("construction");
@@ -504,17 +504,20 @@ fn t06_le_retrait_en_paquet_est_lineaire() {
 #[test]
 fn t11_select_for_block_ne_rehashe_pas_a_chaque_comparaison() {
     const N: u32 = 400;
-    const SORTIES: usize = 8_000; // corps lourd a hasher, mais minable (poids < 2 M)
+    // Corps lourd a hasher, mais minable : chaque sortie pese desormais
+    // POIDS_PAR_SORTIE en plus de ses octets, et vaut au moins la poussiere.
+    const SORTIES: usize = 3_000;
 
     let mut m = Mempool::new();
     let mut u = UtxoSet::new();
     for i in 0..N {
-        let (uu, ops) = utxo_synthetique(1, 1_000_000, 2_000_000 + i);
+        let (uu, ops) = utxo_synthetique(1, 100_000_000, 2_000_000 + i);
         for (o, _) in &ops {
             u.insert(*o, *uu.get(o).unwrap());
         }
-        let mut outs: Vec<TxOut> = (0..SORTIES).map(|_| sortie(0, puits(11))).collect();
-        outs[0] = sortie(1, puits(11));
+        let outs: Vec<TxOut> = (0..SORTIES)
+            .map(|_| sortie(MIN_OUTPUT_VALUE, puits(11)))
+            .collect();
         let tx = tx_signee(&ops, outs, i as u64);
         if m.accept(&tx, &u, RESEAU, 10).is_err() {
             break;
@@ -563,7 +566,7 @@ fn t12_l_eviction_detruit_les_enfants_bien_payants_avec_leur_parent() {
             },
             3_000_001,
         )],
-        vec![sortie(1, puits(12))],
+        vec![sortie(MIN_OUTPUT_VALUE, puits(12))],
         0,
     );
     let id_enfant = m.accept(&enfant, &u, RESEAU, 10).unwrap();

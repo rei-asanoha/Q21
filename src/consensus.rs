@@ -218,6 +218,45 @@ pub const POIDS_BLOC_CIBLE: u64 = 2_000_000;
 /// presque entierement dicte par sa signature post-quantique.
 pub const WITNESS_DISCOUNT: u64 = 4;
 
+/// Poids ajoute a une transaction pour **chaque sortie qu'elle cree**.
+///
+/// # Ce que cela tarife
+///
+/// Une sortie ne coute pas que ses 41 octets sur le fil : elle entre dans le
+/// jeu d'UTXO de tous les noeuds, en memoire vive, et y reste tant qu'elle
+/// n'est pas depensee — potentiellement pour toujours. Un octet de temoin,
+/// lui, est oublie des que le bloc est enfoui. Tarifer les deux au meme prix
+/// revenait a offrir la ressource la plus rare du reseau au prix de la plus
+/// abondante : un bloc plein de sorties minuscules coutait quelques centaines
+/// d'unites et imposait vingt gigaoctets par jour a chaque noeud.
+///
+/// Quatre cents unites de poids, c'est l'equivalent d'une centaine d'octets
+/// d'ossature : creer une sorte coute desormais plus que la transporter. Ce
+/// n'est pas une regle de consensus mais une politique de relais et
+/// d'assemblage ; la regle de consensus qui protege les mineurs d'eux-memes
+/// est [`MIN_OUTPUT_VALUE`].
+pub const POIDS_PAR_SORTIE: u64 = 400;
+
+/// Valeur minimale d'une sortie, en unites : la **poussiere** est refusee.
+///
+/// # Pourquoi c'est une regle de consensus, et pas seulement de relais
+///
+/// Bitcoin refuse la poussiere au relais seulement. Ici, la regle doit tenir
+/// aussi contre un mineur qui remplirait ses propres blocs : les frais qu'il
+/// paie lui reviennent, donc aucune tarification ne le freine. Ce qui le
+/// freine, c'est le capital immobilise : a 10 000 unites par sortie, soixante
+/// millions de sorties — une journee de blocs pleins — immobilisent six mille
+/// Q21, a une epoque ou le reseau entier en emet dix mille par jour. Et ces
+/// unites ne sont pas perdues pour lui : les regrouper ensuite lui coute des
+/// frais et du temps, ce qui est exactement le prix qu'on voulait faire payer.
+///
+/// 10 000 unites = 0,0001 Q21. Un paiement legitime plus petit n'a pas de sens
+/// : il ne couvrirait pas les frais de sa propre depense.
+///
+/// La genese est exempte : sa coinbase porte l'unite qui fait passer le
+/// plafond de 21 000 000 a 21 000 001, et cette unite est indepensable.
+pub const MIN_OUTPUT_VALUE: u64 = 10_000;
+
 // ---------------------------------------------------------------------------
 // Difficulte
 // ---------------------------------------------------------------------------

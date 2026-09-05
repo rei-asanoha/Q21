@@ -122,6 +122,10 @@ fn message_portefeuille(e: &crate::wallet::WalletError) -> &'static str {
             "incoherence entre la clef derivee et la sortie a depenser : rien \
              n'a ete signe"
         }
+        W::MontantSousLePlancher { .. } => {
+            "montant trop petit : une sortie doit valoir au moins 0,0001 Q21 \
+             (10 000 unites), sans quoi le reseau la refuse comme poussiere"
+        }
         W::EnregistrementImpossible => {
             "le portefeuille n'a pas pu etre enregistre avant la signature : rien \
              n'a ete signe, verifiez le disque"
@@ -1946,7 +1950,7 @@ impl RpcContext {
             let sorties = if monnaie > 0 { 2 } else { 1 };
             let ossature = 8 + n * 48 + sorties * 41;
             let temoin = n * (schema.pubkey_len() as u64 + schema.sig_len() as u64);
-            let poids = ossature * WITNESS_DISCOUNT + temoin;
+            let poids = ossature * WITNESS_DISCOUNT + temoin + sorties * POIDS_PAR_SORTIE;
             // Arrondi vers le haut : sous le plancher, la transaction n'est pas
             // relayee du tout.
             let calcules = poids.saturating_mul(taux).div_ceil(1000).max(1);
@@ -2026,7 +2030,8 @@ impl RpcContext {
         let ossature = 8 + entrees * 48 + sorties * 41;
         let temoin = entrees * (schema.pubkey_len() as u64 + schema.sig_len() as u64);
         let taille = ossature + temoin;
-        let poids = ossature * WITNESS_DISCOUNT + temoin;
+        // Chaque sortie creee pese en plus : elle occupe le jeu d'UTXO.
+        let poids = ossature * WITNESS_DISCOUNT + temoin + sorties * POIDS_PAR_SORTIE;
 
         let (taux_reservoir, en_attente) = self.node.with_mempool(|m| {
             let n = m.len() as u64;
@@ -2806,7 +2811,7 @@ mod tests {
         let a2 = autre.new_address().to_string_bech32();
 
         let params = format!(
-            r#"{{"destinations":[{{"adresse":"{a1}","unites":1000}},{{"adresse":"{a2}","unites":2000}}]}}"#
+            r#"{{"destinations":[{{"adresse":"{a1}","unites":100000}},{{"adresse":"{a2}","unites":200000}}]}}"#
         );
         let r = resultat(&c, "sendmany", &params);
 
@@ -2832,7 +2837,7 @@ mod tests {
             })
             .collect();
         assert!(
-            unites.contains(&1000) && unites.contains(&2000),
+            unites.contains(&100_000) && unites.contains(&200_000),
             "les deux montants demandes doivent figurer parmi les sorties : {unites:?}"
         );
     }

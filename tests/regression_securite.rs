@@ -607,3 +607,144 @@ fn le_nombre_de_transactions_par_bloc_est_borne_par_la_taille_du_bloc() {
     // qu'il envoie : six octets d'identifiant court par entrée annoncée.
     const _: () = assert!(MAX_TX_PAR_BLOC <= 100_000);
 }
+
+// ---------------------------------------------------------------------------
+// 9. La poussiere est refusee, coinbase comprise
+// ---------------------------------------------------------------------------
+
+/// Creer une sortie ne coutait rien : ni plancher de valeur, ni tarif au-dela
+/// d'une unite par millier d'unites de poids. Un bloc plein de sorties
+/// minuscules imposait vingt gigaoctets de memoire vive par jour a chaque
+/// noeud, pour quelques milliers d'unites. Et un mineur, qui se paie ses
+/// propres frais, n'etait freine par rien.
+///
+/// Le plancher [`MIN_OUTPUT_VALUE`] est une regle de consensus, appliquee aux
+/// transactions ordinaires comme a la coinbase. Ici, un mineur eclate sa
+/// recompense en une sortie de poussiere : le bloc est refuse ; la meme
+/// recompense eclatee au-dessus du plancher passe.
+#[test]
+fn une_coinbase_qui_seme_de_la_poussiere_est_refusee() {
+    let mut c = chaine(2);
+    let hauteur = c.height() + 1;
+    let t = horodatage(hauteur);
+    let b = c
+        .mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
+        .expect("minage");
+    let recompense = b.transactions[0].outputs[0].value.units();
+    assert!(
+        recompense > 2 * MIN_OUTPUT_VALUE,
+        "fixture : recompense trop faible"
+    );
+
+    // Une sortie de poussiere, prelevee sur la recompense.
+    let mut poussiere = b.clone();
+    let principale = &mut poussiere.transactions[0].outputs[0];
+    principale.value = q21_core::amount::Amount::from_units(recompense - (MIN_OUTPUT_VALUE - 1));
+    let modele = *principale;
+    poussiere.transactions[0].outputs.push(q21_core::tx::TxOut {
+        value: q21_core::amount::Amount::from_units(MIN_OUTPUT_VALUE - 1),
+        ..modele
+    });
+    remine(&mut poussiere);
+    assert!(
+        matches!(
+            c.connect(&poussiere, t + 1),
+            Err(ValidationError::SortiePoussiere { .. })
+        ),
+        "une sortie sous le plancher doit faire refuser le bloc"
+    );
+}
+
+/// Le meme plancher pour une transaction ordinaire : un paiement d'une unite
+/// sous le plancher est refuse par la validation, un paiement au plancher
+/// passe. Et le portefeuille ne rend jamais une monnaie de poussiere : quand
+/// le reste tombe sous le plancher, il va aux frais.
+#[test]
+fn un_paiement_de_poussiere_est_refuse_et_la_monnaie_de_poussiere_va_aux_frais() {
+    use q21_core::amount::Amount;
+    use q21_core::wallet::Wallet;
+
+    let mut w = Wallet::from_seed([0x77; 32], RESEAU);
+    let mut c = Chain::new(RESEAU, genesis_block(RESEAU));
+    let mut miner = |c: &mut Chain, w: &mut Wallet, de: u64, a: u64| {
+        for i in de..=a {
+            let adresse = w.new_address();
+            let t = horodatage(i);
+            let b = c
+                .mine_block(adresse.hash, SchemeId::LamportOts, &[], t, ESSAIS)
+                .expect("minage");
+            c.connect(&b, t + 1).expect("connexion");
+        }
+    };
+    // Une seule piece mure pour commencer : celle du bloc 1.
+    miner(&mut c, &mut w, 1, COINBASE_MATURITY + 1);
+    let mut dest = Wallet::from_seed([0x78; 32], RESEAU);
+    let a = dest.new_address();
+    let frais = Amount::from_units(1_000);
+
+    let valider = |c: &Chain, tx: &q21_core::tx::Transaction| {
+        let mut vues = HashSet::new();
+        validate::check_transaction(tx, &c.utxo, RESEAU, c.height() + 1, &mut vues)
+    };
+
+    // 1. Monnaie de poussiere : un montant qui laisse, sur l'unique piece
+    //    mure, un reste d'une unite sous le plancher. Il doit aller aux frais,
+    //    pas dans une sortie.
+    let pieces = w.spendable(&c.utxo, c.height());
+    assert_eq!(pieces.len(), 1, "fixture : une seule piece mure attendue");
+    let piece = pieces[0].1.value.units();
+    let montant = piece - frais.units() - (MIN_OUTPUT_VALUE - 1);
+    let tx = w
+        .create_transaction(&c.utxo, c.height(), &a, Amount::from_units(montant), frais)
+        .expect("construction");
+    let f = valider(&c, &tx).expect("valide");
+    assert_eq!(
+        tx.outputs.len(),
+        1,
+        "aucune sortie de monnaie sous le plancher ne doit etre creee"
+    );
+    assert_eq!(
+        f.units(),
+        frais.units() + (MIN_OUTPUT_VALUE - 1),
+        "le reste sous le plancher va aux frais"
+    );
+
+    // Deux pieces de plus (blocs 2 et 3) : chaque construction consomme la
+    // clef a usage unique de la piece qu'elle depense.
+    miner(&mut c, &mut w, COINBASE_MATURITY + 2, COINBASE_MATURITY + 3);
+
+    // 2. Un paiement d'une unite sous le plancher : le portefeuille refuse
+    //    avant de signer — il ne brule pas une clef pour une transaction que
+    //    le reseau rejettera.
+    let r = w.create_transaction(
+        &c.utxo,
+        c.height(),
+        &a,
+        Amount::from_units(MIN_OUTPUT_VALUE - 1),
+        frais,
+    );
+    assert!(matches!(
+        r,
+        Err(q21_core::wallet::WalletError::MontantSousLePlancher { .. })
+    ));
+
+    // 3. Au plancher : legitime. Et si l'on force la poussiere dans une
+    //    transaction signee, la validation la refuse **avant** meme de
+    //    regarder la signature — le controle bon marche vient d'abord.
+    let au_plancher = w
+        .create_transaction(
+            &c.utxo,
+            c.height(),
+            &a,
+            Amount::from_units(MIN_OUTPUT_VALUE),
+            frais,
+        )
+        .expect("construction");
+    valider(&c, &au_plancher).expect("un paiement au plancher est legitime");
+    let mut forcee = au_plancher.clone();
+    forcee.outputs[0].value = Amount::from_units(MIN_OUTPUT_VALUE - 1);
+    assert!(matches!(
+        valider(&c, &forcee),
+        Err(ValidationError::SortiePoussiere { .. })
+    ));
+}
