@@ -66,6 +66,73 @@ pub const PING_APRES: Duration = Duration::from_secs(45);
 /// qui repond a autre chose reste vivant.
 pub const SILENCE_MAX: Duration = Duration::from_secs(100);
 
+/// Debit soutenu accorde a un pair pour le service d'amorce, en octets par
+/// seconde.
+pub const AMORCE_DEBIT_PAR_SEC: u64 = 2 * 1024 * 1024;
+
+/// Reserve accordee d'emblee, en octets. Elle permet a un nouveau venu honnete
+/// de demarrer sans attendre, tout en bornant ce qu'un pair peut extraire d'un
+/// coup.
+pub const AMORCE_SEAU_MAX: u64 = 8 * 1024 * 1024;
+
+/// Seau a jetons bornant ce qu'un pair peut se faire servir d'amorce.
+///
+/// # Le defaut que ceci ferme
+///
+/// Les autres bras de service comptent leurs octets ; celui de l'amorce ne
+/// comptait rien. Un pair ayant passe la poignee de main pouvait donc demander
+/// **la meme tranche** en boucle : chaque demande de neuf octets faisait copier
+/// jusqu'a un mebioctet, **sous le verrou global** — celui qui sert aussi a
+/// valider les blocs. Le rapport entre le cout de la demande et celui de la
+/// reponse est ce qui definit un vecteur de deni de service.
+///
+/// Un debit soutenu de deux mebioctets par seconde laisse un nouveau venu
+/// honnete telecharger son amorce sans gene — c'est une operation qu'il ne fait
+/// qu'une fois — tout en ramenant l'abus a un filet.
+///
+/// # Pourquoi l'instant est un parametre
+///
+/// Une horloge cachee rend une regle de debit impossible a eprouver autrement
+/// qu'en dormant, donc mal eprouvee. Ici l'appelant fournit l'instant : les
+/// epreuves controlent le temps, et la regle se verifie exactement.
+#[derive(Debug, Clone, Copy)]
+pub struct SeauAmorce {
+    jetons: u64,
+    dernier: Instant,
+}
+
+impl SeauAmorce {
+    pub fn new(maintenant: Instant) -> SeauAmorce {
+        SeauAmorce {
+            jetons: AMORCE_SEAU_MAX,
+            dernier: maintenant,
+        }
+    }
+
+    /// Autorise `octets` si le seau les contient, et les retire. Le seau se
+    /// remplit d'abord au prorata du temps ecoule, sans jamais depasser sa
+    /// contenance.
+    pub fn autoriser(&mut self, octets: u64, maintenant: Instant) -> bool {
+        let ecoule = maintenant
+            .saturating_duration_since(self.dernier)
+            .as_millis() as u64;
+        // Le remplissage se calcule en millisecondes : sous la milliseconde, on
+        // ne credite rien et on ne deplace pas le repere, faute de quoi une
+        // rafale de demandes tres rapprochees ne crediterait jamais rien.
+        let gain = ecoule.saturating_mul(AMORCE_DEBIT_PAR_SEC) / 1000;
+        if gain > 0 {
+            self.jetons = self.jetons.saturating_add(gain).min(AMORCE_SEAU_MAX);
+            self.dernier = maintenant;
+        }
+        if self.jetons >= octets {
+            self.jetons -= octets;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Delai maximal d'une ecriture vers un pair.
 ///
 /// Plus court que la lecture : un pair peut legitimement rester silencieux deux
@@ -110,6 +177,8 @@ struct Peer {
     start_height: u64,
     /// Reconstructions de blocs compacts en attente de transactions.
     en_attente: HashMap<Hash256, (CompactBlock, Vec<u32>)>,
+    /// Ce que ce pair peut encore se faire servir d'amorce. Voir [`SeauAmorce`].
+    seau_amorce: SeauAmorce,
     /// Instant de la derniere trame recue de ce pair.
     ///
     /// # Le defaut que ce champ repare
@@ -574,6 +643,7 @@ impl Node {
                     addr,
                     sortie: sortie.clone(),
                     sortant,
+                    seau_amorce: SeauAmorce::new(Instant::now()),
                     version_recue: false,
                     handshaked: false,
                     ban_score: 0,
@@ -1201,9 +1271,22 @@ impl Node {
                 Message::GetAmorceTranche { index } => {
                     if handshaked {
                         rafraichir_amorce(&mut g);
-                        if let Some(c) = &g.amorce_cache {
-                            let tr = crate::synchro_rapide::tranche(&c.octets, index);
-                            if !tr.is_empty() {
+                        // On mesure d'abord, on copie ensuite : le seau doit
+                        // etre consulte **avant** le mebioctet de copie, sinon
+                        // il ne protegerait de rien.
+                        let taille = g
+                            .amorce_cache
+                            .as_ref()
+                            .map(|c| crate::synchro_rapide::tranche(&c.octets, index).len())
+                            .unwrap_or(0);
+                        let autorise = taille > 0
+                            && g.peers
+                                .get_mut(&id)
+                                .map(|p| p.seau_amorce.autoriser(taille as u64, Instant::now()))
+                                .unwrap_or(false);
+                        if autorise {
+                            if let Some(c) = &g.amorce_cache {
+                                let tr = crate::synchro_rapide::tranche(&c.octets, index);
                                 envois.push(Envoi {
                                     peer: id,
                                     message: Message::AmorceTranche {
@@ -1213,6 +1296,8 @@ impl Node {
                                 });
                             }
                         }
+                        // Au-dela du debit accorde, on ne sert rien et on ne
+                        // coupe pas : un client honnete ralentit et reprend.
                     }
                 }
                 // Un serveur ne recoit pas de reponses d'amorce : on les ignore.
@@ -1547,6 +1632,92 @@ mod tests {
         );
         a.shutdown();
         b.shutdown();
+    }
+
+    /// Le seau borne ce qu'un pair extrait du service d'amorce.
+    ///
+    /// Le temps est fourni par l'epreuve, jamais lu d'une horloge : une regle de
+    /// debit qu'on ne peut eprouver qu'en dormant est une regle mal eprouvee.
+    #[test]
+    fn le_seau_d_amorce_borne_le_debit() {
+        let t0 = Instant::now();
+        let mut seau = SeauAmorce::new(t0);
+
+        // La reserve initiale se sert d'un coup, et pas un octet de plus.
+        assert!(
+            seau.autoriser(AMORCE_SEAU_MAX, t0),
+            "la reserve initiale doit etre servie"
+        );
+        assert!(
+            !seau.autoriser(1, t0),
+            "au-dela de la reserve, plus rien n'est servi sans attendre"
+        );
+
+        // Une seconde ecoulee credite exactement le debit accorde.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(
+            seau.autoriser(AMORCE_DEBIT_PAR_SEC, t1),
+            "une seconde doit crediter le debit d'une seconde"
+        );
+        assert!(!seau.autoriser(1, t1), "et rien de plus");
+
+        // Le seau ne deborde pas : une longue absence ne donne pas un credit
+        // illimite, sinon il suffirait d'attendre pour tout reprendre d'un coup.
+        let t2 = t1 + Duration::from_secs(3600);
+        assert!(seau.autoriser(AMORCE_SEAU_MAX, t2), "la contenance est due");
+        assert!(
+            !seau.autoriser(1, t2),
+            "mais jamais plus que la contenance, quelle que soit l'attente"
+        );
+    }
+
+    /// Un nouveau venu honnete ne doit pas etre gene : telecharger une amorce
+    /// entiere est une operation qu'il ne fait qu'une fois.
+    #[test]
+    fn le_seau_laisse_passer_un_telechargement_honnete() {
+        let t0 = Instant::now();
+        let mut seau = SeauAmorce::new(t0);
+        let tranche = crate::synchro_rapide::TAILLE_TRANCHE as u64;
+
+        // Une amorce de 64 Mio, demandee tranche par tranche au rythme ou le
+        // reseau les livre : tout passe.
+        let mut servies = 0u32;
+        let mut t = t0;
+        for _ in 0..64 {
+            if seau.autoriser(tranche, t) {
+                servies += 1;
+            }
+            // Un demi-seconde entre deux tranches : le debit reel d'un lien
+            // ordinaire, largement sous la limite accordee.
+            t += Duration::from_millis(500);
+        }
+        assert_eq!(servies, 64, "un telechargement honnete ne doit rien perdre");
+    }
+
+    /// L'abus, lui, est ramene au debit accorde : la boucle serree ne rapporte
+    /// plus rien.
+    #[test]
+    fn le_seau_etrangle_une_boucle_serree() {
+        let t0 = Instant::now();
+        let mut seau = SeauAmorce::new(t0);
+        let tranche = crate::synchro_rapide::TAILLE_TRANCHE as u64;
+
+        // Mille demandes dans le meme instant, comme le ferait un attaquant.
+        let mut servies = 0u32;
+        for _ in 0..1_000 {
+            if seau.autoriser(tranche, t0) {
+                servies += 1;
+            }
+        }
+        let plafond = (AMORCE_SEAU_MAX / tranche) as u32;
+        assert_eq!(
+            servies, plafond,
+            "une boucle serree ne doit obtenir que la reserve, soit {plafond} tranches"
+        );
+        assert!(
+            servies < 1_000,
+            "sans le seau, les mille demandes auraient toutes ete servies"
+        );
     }
 
     /// Un `VerAck` seul, sans `Version` prealable, ne doit pas completer la
