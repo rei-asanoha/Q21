@@ -459,8 +459,30 @@ pub const REORG_PENALTY_MAX_PCT: u64 = 25;
 // Oncles
 // ---------------------------------------------------------------------------
 
-/// Nombre maximal d'oncles rattaches a un bloc.
-pub const MAX_UNCLES: usize = 2;
+/// Nombre maximal d'oncles rattaches a un bloc : **zero**, le mecanisme est
+/// retire.
+///
+/// # Pourquoi il est retire
+///
+/// La part d'un oncle etait prelevee sur la subvention du bloc qui
+/// l'incluait — jamais ajoutee, pour que l'emission reste exactement celle du
+/// calendrier. Un mineur qui incluait un oncle cedait donc un quart de sa
+/// recompense a un concurrent sans rien recevoir en echange : aucun mineur
+/// rationnel ne le faisait, et le mineur du binaire ne l'a jamais fait. Le
+/// mecanisme ne servait qu'a une chose : offrir a un attaquant une surface de
+/// validation supplementaire — trois defauts y ont deja ete trouves et
+/// corriges, dont un qui faisait diverger un noeud repris sur instantane
+/// d'un noeud complet.
+///
+/// Le faire fonctionner demanderait de payer les oncles **en plus** de la
+/// subvention, comme Ethereum, donc de renoncer a une emission exactement
+/// previsible ; ce n'est pas un echange que ce projet veut faire. A deux
+/// minutes par bloc et avec les annonces compactes, les blocs orphelins sont
+/// rares ; les payer ne vaut pas ce qu'il en coute.
+///
+/// Le format du bloc conserve sa liste d'oncles et sa racine, vides : rien ne
+/// change sur le fil. Un bloc qui en porte est refuse.
+pub const MAX_UNCLES: usize = 0;
 
 /// Anciennete maximale d'un oncle, en blocs.
 ///

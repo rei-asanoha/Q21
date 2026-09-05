@@ -98,39 +98,54 @@ fn chaine_avec_oncle(n: u64) -> (Chain, BlockHeader) {
 /// L'exploit d'origine : `pow.check(oncle)` validait le travail contre
 /// `oncle.bits`, un champ que son auteur remplit. Avec une cible quasi
 /// maximale, un en-tête à nonce zéro passait — et se faisait payer.
+/// Depuis le retrait du mecanisme, **tout** oncle est refuse — l'authentique
+/// comme le forge. La surface de validation qui avait porte trois defauts
+/// n'est plus atteignable.
 #[test]
-fn un_oncle_sans_travail_est_refuse() {
-    let mut c = chaine(4);
+fn tout_oncle_est_refuse_l_authentique_comme_le_forge() {
+    // Un oncle authentique : du vrai travail, sur une vraie branche.
+    let (mut c, authentique) = chaine_avec_oncle(4);
     let hauteur = c.height() + 1;
-    let parent = c.tip_id();
-
-    let oncles: Vec<BlockHeader> = (0..MAX_UNCLES as u8)
-        .map(|k| faux_oncle(parent, hauteur - 1, k))
-        .collect();
-
-    // La preuve de travail « passe » toujours contre la cible que l'attaquant a
-    // choisie : c'est bien la comparaison de difficulté qui protège, pas elle.
-    assert!(
-        Q21Pow::new(RESEAU).check(&oncles[0]).is_ok(),
-        "le montage de l'attaque doit rester valide"
-    );
-
     let t = horodatage(hauteur);
     let b = c
         .mine_block_with_uncles(
             Hash256([2u8; 32]),
             SchemeId::LamportOts,
             &[],
-            &oncles,
+            &[authentique],
             t,
             ESSAIS,
         )
         .expect("minage");
+    assert!(
+        matches!(
+            c.connect(&b, t + 1),
+            Err(ValidationError::TropDOncles { max: 0, .. })
+        ),
+        "un oncle authentique doit etre refuse comme les autres"
+    );
 
-    match c.connect(&b, t + 1) {
-        Err(ValidationError::DifficulteDOncleInvalide { .. }) => {}
-        autre => panic!("l'oncle sans travail aurait dû être refusé : {autre:?}"),
-    }
+    // Un oncle forge : cible choisie par l'attaquant, aucun travail.
+    let parent = c.tip_id();
+    let forge = faux_oncle(parent, hauteur - 1, 0);
+    assert!(
+        Q21Pow::new(RESEAU).check(&forge).is_ok(),
+        "le montage de l'attaque doit rester valide contre sa propre cible"
+    );
+    let b = c
+        .mine_block_with_uncles(
+            Hash256([2u8; 32]),
+            SchemeId::LamportOts,
+            &[],
+            &[forge],
+            t,
+            ESSAIS,
+        )
+        .expect("minage");
+    assert!(matches!(
+        c.connect(&b, t + 1),
+        Err(ValidationError::TropDOncles { max: 0, .. })
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -153,32 +168,24 @@ fn un_bloc_emet_exactement_sa_subvention_meme_avec_des_oncles() {
     }
 }
 
-/// La même propriété, mesurée sur une chaîne réelle avec un oncle authentique.
+/// La même propriété, mesurée sur une chaîne réelle.
 #[test]
 fn l_emission_reelle_ne_depasse_jamais_la_subvention() {
-    let (mut c, oncle) = chaine_avec_oncle(4);
+    let mut c = chaine(4);
 
     let hauteur = c.height() + 1;
     let avant = c.total_issued().units();
     let t = horodatage(hauteur);
     let b = c
-        .mine_block_with_uncles(
-            Hash256([2u8; 32]),
-            SchemeId::LamportOts,
-            &[],
-            &[oncle],
-            t,
-            ESSAIS,
-        )
+        .mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
         .expect("minage");
-    c.connect(&b, t + 1)
-        .expect("un oncle authentique est valide");
+    c.connect(&b, t + 1).expect("connexion");
 
     let emis = c.total_issued().units() - avant;
     assert_eq!(
         emis,
         block_subsidy(hauteur).units(),
-        "un bloc avec oncle a émis {emis} au lieu de sa subvention"
+        "un bloc a émis {emis} au lieu de sa subvention"
     );
 }
 
@@ -516,34 +523,26 @@ fn une_reorganisation_impossible_echoue_au_lieu_de_boucler() {
 /// Après une reprise sur instantané ils sont absents : l'ensemble des oncles
 /// déjà réclamés était incomplet, et un nœud fraîchement redémarré acceptait ce
 /// qu'un nœud complet refusait. Deux nœuds honnêtes, deux verdicts — scission.
+/// Un nœud repris sur instantané rend le même verdict qu'un nœud complet
+/// face à un bloc qui porte un oncle. C'est ici que l'ancien mécanisme avait
+/// fait diverger deux nœuds honnêtes ; le refus doit être identique des deux
+/// côtés, quel que soit ce que chacun a en mémoire.
 #[test]
-fn un_oncle_deja_paye_reste_refuse_apres_une_reprise() {
-    // Une chaîne où l'oncle de hauteur 4 a été réclamé par le bloc 5.
+fn un_noeud_repris_refuse_un_oncle_comme_un_noeud_complet() {
     let (mut complete, oncle) = chaine_avec_oncle(4);
     let t5 = horodatage(5);
     let b5 = complete
-        .mine_block_with_uncles(
-            Hash256([2u8; 32]),
-            SchemeId::LamportOts,
-            &[],
-            &[oncle],
-            t5,
-            ESSAIS,
-        )
+        .mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t5, ESSAIS)
         .expect("minage");
-    complete
-        .connect(&b5, t5 + 1)
-        .expect("le bloc 5 paie l'oncle");
-
+    complete.connect(&b5, t5 + 1).expect("connexion");
     let t6 = horodatage(6);
     let b6 = complete
         .mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t6, ESSAIS)
         .expect("minage");
     complete.connect(&b6, t6 + 1).expect("connexion");
 
-    // Le nœud complet refuse de repayer le même oncle.
     let t7 = horodatage(7);
-    let rejoue = complete
+    let avec_oncle = complete
         .mine_block_with_uncles(
             Hash256([2u8; 32]),
             SchemeId::LamportOts,
@@ -553,13 +552,10 @@ fn un_oncle_deja_paye_reste_refuse_apres_une_reprise() {
             ESSAIS,
         )
         .expect("minage");
-    assert!(
-        matches!(
-            complete.connect(&rejoue, t7 + 1),
-            Err(ValidationError::OncleDejaReclame(_))
-        ),
-        "le nœud complet doit refuser de repayer un oncle"
-    );
+    assert!(matches!(
+        complete.connect(&avec_oncle, t7 + 1),
+        Err(ValidationError::TropDOncles { .. })
+    ));
 
     // Un nœud repris sur instantané doit rendre le MÊME verdict.
     let instantane = complete.snapshot_at_depth(1).expect("instantané");
@@ -581,8 +577,8 @@ fn un_oncle_deja_paye_reste_refuse_apres_une_reprise() {
     }
     assert_eq!(repris.height(), complete.height());
 
-    match repris.connect(&rejoue, t7 + 1) {
-        Err(ValidationError::OncleDejaReclame(_)) => {}
+    match repris.connect(&avec_oncle, t7 + 1) {
+        Err(ValidationError::TropDOncles { .. }) => {}
         autre => panic!(
             "un nœud repris a rendu un verdict différent d'un nœud complet : {autre:?} \
              — c'est exactement ainsi qu'une chaîne se scinde"
