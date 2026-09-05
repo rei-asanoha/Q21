@@ -14,8 +14,18 @@
 # suivre est documentee dans le fichier joint a chaque livraison.
 #
 # Un logiciel qui garde des clefs privees ne devrait pas etre installe sans
-# verification. Le condensat SHA-256 de chaque fichier est publie avec lui :
-# c'est ce qui permet de verifier qu'on a bien recu ce qui a ete construit ici.
+# verification. Trois choses le permettent :
+#
+# - le condensat SHA-256 de chaque fichier, publie avec lui ;
+# - une **attestation de provenance** signee par GitHub, qui lie chaque archive
+#   au commit et a l'execution qui l'ont produite. Elle se verifie avec
+#   `gh attestation verify <archive> --repo <proprietaire>/<depot>` ;
+# - si le depot detient une clef `MINISIGN_KEY`, une signature `minisign` du
+#   fichier `SHA256SUMS`, verifiable hors ligne avec la clef publique publiee
+#   dans le README. Sans cette clef, l'etape est simplement sautee.
+#
+# La chaine d'outils est celle de `rust-toolchain.toml` : deux compilations
+# du meme commit produisent le meme binaire.
 
 name: Livraison
 
@@ -42,6 +52,10 @@ jobs:
   construire:
     name: ${{ matrix.nom }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -82,8 +96,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Chaine Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           targets: ${{ matrix.cible }}
 
       - name: Cache
@@ -106,6 +121,7 @@ jobs:
           cargo test --locked --features mldsa,audit --test audit_muhash
           cargo test --locked --features mldsa,audit --test audit_synchro_rapide
           cargo test --locked --features mldsa,audit --test fuzz_decodeurs
+          cargo test --locked --features mldsa,audit --test audit_difficulte
 
       - name: Compilation
         run: cargo build --locked --release --features mldsa --target ${{ matrix.cible }}
@@ -144,6 +160,14 @@ jobs:
           fi
           cat "${{ matrix.archive }}.sha256"
 
+      # L'attestation lie l'archive a ce commit et a cette execution, signee
+      # par GitHub. Quiconque la verifie sait que le fichier a ete construit
+      # ici, a partir de ces sources, et non deposee a la main.
+      - name: Attestation de provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ matrix.archive }}
+
       - name: Depot du resultat
         uses: actions/upload-artifact@v4
         with:
@@ -164,6 +188,39 @@ jobs:
         with:
           path: livraisons
           merge-multiple: true
+
+      # Un seul fichier de condensats pour toutes les archives : c'est lui
+      # que l'on signe, et lui que l'on compare.
+      - name: SHA256SUMS
+        shell: bash
+        run: |
+          set -eu
+          cd livraisons
+          rm -f SHA256SUMS
+          sha256sum q21-*.tar.gz q21-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      # Signature hors ligne, si le depot detient la clef. `minisign` tient en
+      # un fichier et n'exige aucune infrastructure ; la clef publique est
+      # publiee dans le README et son empreinte par un second canal.
+      - name: Signature minisign
+        shell: bash
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "${MINISIGN_KEY:-}" ]; then
+            echo "aucune clef MINISIGN_KEY : signature sautee"
+            exit 0
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s\n' "$MINISIGN_KEY" > minisign.key
+          chmod 600 minisign.key
+          printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s minisign.key \
+            -m livraisons/SHA256SUMS -t "Q21 ${GITHUB_REF_NAME}"
+          rm -f minisign.key
+          cat livraisons/SHA256SUMS.minisig
 
       - name: Publier la version
         uses: softprops/action-gh-release@v2
@@ -221,10 +278,19 @@ jobs:
             Windows affichera un avertissement SmartScreen. « Informations
             complementaires », puis « Executer quand meme ».
 
-            Signer ces fichiers demande un compte Apple Developer payant et un
-            certificat Authenticode. Tant que ce n'est pas fait, verifiez le
-            condensat SHA-256 joint : il vous dit que vous avez bien recu ce qui
-            a ete construit ici.
+            Signer ces fichiers pour macOS et Windows demande un compte Apple
+            Developer payant et un certificat Authenticode. Tant que ce n'est
+            pas fait, trois verifications restent possibles, de la plus simple
+            a la plus forte :
+
+            1. le condensat SHA-256 joint (`.sha256`, et `SHA256SUMS` pour
+               toutes les archives) : vous avez bien recu ce qui a ete
+               construit ici ;
+            2. l'attestation de provenance : `gh attestation verify
+               <archive> --repo <proprietaire>/<depot>` prouve que l'archive
+               sort de cette execution, a partir de ce commit ;
+            3. la signature `SHA256SUMS.minisig`, quand elle est jointe :
+               `minisign -Vm SHA256SUMS -P <clef publique du README>`.
 
             ### Avertissement
 

@@ -30,9 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # La version vient de `rust-toolchain.toml` : la meme que la livraison.
       - name: Chaine Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.95.0
           components: clippy, rustfmt
 
       - name: Cache
