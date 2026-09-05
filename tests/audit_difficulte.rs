@@ -711,23 +711,35 @@ fn a4_divergence_minage_verification() {
         memhard::hash_verify(&h_debut_epoque, p)
     );
 
-    // (c) `hash_verify_avec_cache` ne verifie PAS que le cache est celui de
-    //     l'epoque de l'en-tete. Un noeud qui se trompe de cache calcule une
-    //     autre preuve de travail — et accepte/refuse a l'inverse de ses pairs.
+    // (c) `hash_verify_avec_cache` controle que le cache est celui de l'epoque
+    //     de l'en-tete. C'etait un defaut : un cache d'une autre epoque etait
+    //     accepte sans un mot, et le noeud calculait une autre preuve de
+    //     travail que ses pairs. Depuis la correction, un cache etranger est
+    //     ignore et la verification retombe sur le calcul complet : les trois
+    //     chemins — table, cache de la bonne epoque, cache d'une mauvaise
+    //     epoque — donnent la meme valeur.
     let cache0 = memhard::cache_for(p, 0);
     let cache1 = memhard::cache_for(p, 1);
+    let reference = memhard::hash_verify(&h_debut_epoque, p);
     let bon = memhard::hash_verify_avec_cache(&h_debut_epoque, p, &cache1);
     let mauvais = memhard::hash_verify_avec_cache(&h_debut_epoque, p, &cache0);
     println!(
-        "\nhash_verify_avec_cache(hauteur {}, cache e0) == (…, cache e1) ? {}",
+        "\nhash_verify_avec_cache(hauteur {}, cache e1) == hash_verify ? {} ; \
+         avec le cache e0 (etranger) ? {}",
         POW_EPOCH_BLOCKS,
-        bon == mauvais
+        bon == reference,
+        mauvais == reference
     );
-    println!(
-        "-> memhard.rs:613 accepte n'importe quel cache sans controler `cache.epoch()`. \
-         Aucun `assert`, aucune erreur : divergence silencieuse."
+    assert_eq!(bon, reference, "le cache de la bonne epoque doit concorder");
+    assert_eq!(
+        mauvais, reference,
+        "un cache d'une autre epoque doit etre ignore, jamais utilise"
     );
-    assert_ne!(bon, mauvais);
+    assert_eq!(
+        memhard::hash_mining(&h_debut_epoque, &table1),
+        reference,
+        "le chemin de minage doit concorder avec la verification"
+    );
 
     // (d) Cas limites de taille de table.
     println!("\n--- cas limites de dimensionnement ---");
