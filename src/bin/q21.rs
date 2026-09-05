@@ -2721,6 +2721,10 @@ fn stager_amorce_adoptee(
         .map_err(|e| format!("instantane invalide : {e}"))?;
     Chain::adopter_instantane(reseau, snap.clone(), entetes, tete, empreinte)
         .map_err(|e| format!("adoption refusee : {e}"))?;
+    // Les corps aussi, avant le moindre octet sur le disque : un serveur
+    // d'amorce pouvait livrer les vrais en-tetes et des corps arbitraires.
+    q21_core::synchro_rapide::verifier_les_corps(reseau, entetes, corps)
+        .map_err(|e| format!("adoption refusee : {e}"))?;
 
     if chemin_blocs(datadir).exists()
         || chemin_etat(datadir).exists()
