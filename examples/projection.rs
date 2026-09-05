@@ -169,8 +169,14 @@ fn main() {
         "  signature ML-DSA-87        {:>10} octets   (ECDSA : 71)",
         SchemeId::MlDsa87.sig_len()
     );
-    println!("  clef publique              {:>10} octets", SchemeId::MlDsa87.pubkey_len());
-    println!("  transaction 1 vers 1       {:>10} octets   (mesuree)", TX_OCTETS);
+    println!(
+        "  clef publique              {:>10} octets",
+        SchemeId::MlDsa87.pubkey_len()
+    );
+    println!(
+        "  transaction 1 vers 1       {:>10} octets   (mesuree)",
+        TX_OCTETS
+    );
     println!("  taille maximale d'un bloc  {:>10} octets", MAX_BLOCK_SIZE);
     println!();
     println!("  transactions par bloc      {:>10}", par_bloc);

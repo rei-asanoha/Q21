@@ -221,7 +221,10 @@ mod tests {
         // Le dernier bloc emetteur recoit un reliquat partiel, jamais plus que
         // le plancher : c'est l'ecretage qui le taille.
         let reliquat = block_subsidy(fin - 1).units();
-        assert!(reliquat > 0 && reliquat <= TAIL_REWARD, "reliquat : {reliquat}");
+        assert!(
+            reliquat > 0 && reliquat <= TAIL_REWARD,
+            "reliquat : {reliquat}"
+        );
     }
 
     /// Le plancher prend le relais quand la geometrique passe dessous — et pas

@@ -668,7 +668,12 @@ mod tests {
     fn aucun_stockage_qui_survit_a_l_onglet() {
         // Cette page manipule la phrase secrete et la graine. Rien de ce qu'elle
         // touche ne doit pouvoir etre relu apres la fermeture.
-        for interdit in ["localStorage", "sessionStorage", "document.cookie", "indexedDB"] {
+        for interdit in [
+            "localStorage",
+            "sessionStorage",
+            "document.cookie",
+            "indexedDB",
+        ] {
             assert!(
                 !script().contains(interdit),
                 "{interdit} n'a rien a faire dans la page d'installation"
@@ -687,8 +692,16 @@ mod tests {
         // Elle ne doit voyager qu'en corps de POST. Une phrase dans une requete
         // entre dans l'historique du navigateur et dans les journaux.
         assert!(script().contains("method: \"POST\""));
-        for interdit in ["?phrase=", "phrase=\" +", "+ phrase", "encodeURIComponent(p"] {
-            assert!(!script().contains(interdit), "phrase dans une adresse : {interdit}");
+        for interdit in [
+            "?phrase=",
+            "phrase=\" +",
+            "+ phrase",
+            "encodeURIComponent(p",
+        ] {
+            assert!(
+                !script().contains(interdit),
+                "phrase dans une adresse : {interdit}"
+            );
         }
     }
 
@@ -735,7 +748,12 @@ mod tests {
     #[test]
     fn tout_ce_qui_vient_du_noeud_est_echappe() {
         // Les messages d'erreur, le code et l'adresse traversent `ech`.
-        for brut in ["ech(message)", "ech(code.slice", "ech(adresse)", "ech(erreur)"] {
+        for brut in [
+            "ech(message)",
+            "ech(code.slice",
+            "ech(adresse)",
+            "ech(erreur)",
+        ] {
             assert!(script().contains(brut), "non echappe : {brut}");
         }
     }
