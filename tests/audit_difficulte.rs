@@ -193,9 +193,17 @@ fn bits_pour_difficulte(d: f64) -> u32 {
 // 1. Manipulation d'horodatage
 // ---------------------------------------------------------------------------
 
+/// Aucune manipulation d'horodatage ne fait plus baisser la difficulte.
+///
+/// Historique : avec une borne non signee `[1, 6T]`, un mineur a 20 % faisait
+/// chuter la difficulte de 97 % ; avec la borne signee symetrique `[-6T, +6T]`,
+/// la moitie de la puissance obtenait encore 25 % de chute et un tiers de
+/// blocs en plus. Avec la borne dissymetrique `[-6T, +4T]`, le bloc honnete
+/// retire plus que l'attaquant n'injecte : toute strategie **augmente** la
+/// difficulte, donc coute a son auteur.
 #[test]
-fn a1_manipulation_horodatage_fait_chuter_la_difficulte() {
-    println!("\n=== A1 — manipulation d'horodatage (LWMA, clamp [1, 6T]) ===");
+fn a1_manipulation_horodatage_ne_fait_plus_chuter_la_difficulte() {
+    println!("\n=== A1 — manipulation d'horodatage (LWMA, clamp [-6T, +4T]) ===");
     println!(
         "MAX_FUTURE_TIME = {} s, 6T = {} s, T = {} s, fenetre = {} blocs",
         MAX_FUTURE_TIME,
@@ -241,9 +249,14 @@ fn a1_manipulation_horodatage_fait_chuter_la_difficulte() {
     }
     println!();
     println!("chute maximale observee : {:.1} %", chute_max * 100.0);
+    // Avant la borne dissymetrique, la strategie « precedent + 6T » faisait
+    // encore chuter la difficulte de 25 % avec la moitie de la puissance, soit
+    // un tiers de blocs en plus. Plus aucune strategie ne doit y parvenir : le
+    // temps avance est plus que rendu par le bloc honnete qui suit.
     assert!(
-        chute_max > 0.20,
-        "aucune chute significative : la faille serait absente"
+        chute_max <= 0.0,
+        "une manipulation d'horodatage fait encore chuter la difficulte de {:.1} %",
+        chute_max * 100.0
     );
 }
 

@@ -168,7 +168,8 @@ pub fn next_bits(entetes_recents: &[BlockHeader]) -> u32 {
     let k = recents.len() - 1;
 
     let t_cible = TARGET_BLOCK_SECS;
-    let max_solvetime = 6 * t_cible;
+    let avance_max = LWMA_AVANCE_MAX * t_cible;
+    let retard_max = LWMA_RETARD_MAX * t_cible;
 
     // --- Le temps de resolution est SIGNE, et c'est tout le sujet.
     //
@@ -192,17 +193,24 @@ pub fn next_bits(entetes_recents: &[BlockHeader]) -> u32 {
     // difficulte tombe a son plancher et la chaine appartient a l'attaquant.
     // Vingt pour cent, ce n'est pas cinquante-et-un.
     //
-    // La correction est celle de LWMA-1 de Zawy : borner symetriquement, a
-    // `[-6T, +6T]`. Le temps qu'un mineur avance est alors rendu par le bloc
-    // suivant, et l'injection s'annule. La somme ponderee est plancheree pour
-    // qu'une suite d'horodatages reculés ne puisse pas la rendre nulle ou
-    // negative.
+    // La premiere correction etait celle de LWMA-1 de Zawy : borner
+    // symetriquement, a `[-6T, +6T]`, pour que le temps avance par un mineur
+    // soit rendu par le bloc suivant. Il l'etait, mais pas entierement : le
+    // bloc honnete est contraint par la mediane et ne peut pas reculer
+    // autant que l'attaquant a avance. Il restait un solde — 33 % de blocs en
+    // plus pour une moitie de la puissance.
+    //
+    // La borne est desormais **dissymetrique** : `[-6T, +4T]`. Le bloc
+    // honnete retire plus que l'attaquant n'a pu injecter, et la manipulation
+    // se retourne contre son auteur (voir `LWMA_AVANCE_MAX`). La somme
+    // ponderee reste plancheree pour qu'une suite d'horodatages recules ne
+    // puisse pas la rendre nulle ou negative.
     let mut somme_ponderee: i128 = 0;
     let mut somme_cibles = U256::ZERO;
 
     for i in 0..k {
         let brut = recents[i + 1].time as i128 - recents[i].time as i128;
-        let solvetime = brut.clamp(-(max_solvetime as i128), max_solvetime as i128);
+        let solvetime = brut.clamp(-(retard_max as i128), avance_max as i128);
         somme_ponderee += solvetime * (i as i128 + 1);
 
         match pow::target_from_compact(recents[i + 1].bits) {
