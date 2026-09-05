@@ -1054,6 +1054,17 @@ fn chemin_pairs(d: &Path) -> PathBuf {
 /// L'echec n'est jamais fatal : un instantane absent coute un demarrage lent,
 /// pas une chaine perdue.
 fn ecrire_instantane(datadir: &Path, chain: &Chain) {
+    if let Some(i) = chain.snapshot() {
+        ecrire_instantane_pris(datadir, &i);
+    }
+}
+
+/// Ecrit un instantane deja pris : l'encodage, le scellement et l'ecriture
+/// se font **hors du verrou de la chaine**. Seule la prise de l'instantane —
+/// une copie du jeu d'UTXO et le rejeu des annulations — a besoin du verrou ;
+/// le reste, qui coute le plus a mesure que l'etat grossit, n'a besoin que de
+/// la copie.
+fn ecrire_instantane_pris(datadir: &Path, i: &q21_core::state::Snapshot) {
     let clef = match q21_core::state::clef_de_repertoire(datadir) {
         Ok(k) => k,
         Err(e) => {
@@ -1061,10 +1072,8 @@ fn ecrire_instantane(datadir: &Path, chain: &Chain) {
             return;
         }
     };
-    if let Some(i) = chain.snapshot() {
-        if let Err(e) = StateStore::new_scelle(chemin_etat(datadir), clef).save(&i) {
-            eprintln!("avertissement : instantane non ecrit : {e}");
-        }
+    if let Err(e) = StateStore::new_scelle(chemin_etat(datadir), clef).save(i) {
+        eprintln!("avertissement : instantane non ecrit : {e}");
     }
 }
 
@@ -3506,13 +3515,24 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // ecrire souvent n'entame pas la capacite a reorganiser.
     const PERIODE_INSTANTANE: std::time::Duration = std::time::Duration::from_secs(300);
     let mut dernier_instantane = std::time::Instant::now();
+    // La hauteur du dernier instantane ecrit : un noeud au repos n'a aucune
+    // raison de reecrire cent mega-octets identiques toutes les cinq minutes,
+    // et une carte SD de Raspberry a un nombre d'ecritures compte.
+    let mut hauteur_instantane: Option<u64> = None;
 
     loop {
         if duree > 0 && debut.elapsed().as_secs() >= duree {
             break;
         }
         if dernier_instantane.elapsed() >= PERIODE_INSTANTANE {
-            node.with_chain(|c| ecrire_instantane(datadir, c));
+            // Pris sous le verrou, ecrit dehors : voir `ecrire_instantane_pris`.
+            let pris = node.with_chain(|c| c.snapshot());
+            if let Some(i) = pris {
+                if hauteur_instantane != Some(i.height) {
+                    ecrire_instantane_pris(datadir, &i);
+                    hauteur_instantane = Some(i.height);
+                }
+            }
             dernier_instantane = std::time::Instant::now();
         }
         // Ctrl-C : on sort de la boucle plutot que de se faire tuer sur place.
@@ -3838,7 +3858,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
     // L'instantane est ecrit a l'arret, pas a chaque bloc : c'est une economie
     // de demarrage, pas une donnee dont la perte couterait quoi que ce soit.
-    node.with_chain(|c| ecrire_instantane(datadir, c));
+    let pris = node.with_chain(|c| c.snapshot());
+    if let Some(i) = pris {
+        ecrire_instantane_pris(datadir, &i);
+    }
     println!();
     println!("Arret. Hauteur finale : {}", node.height());
     // Sur Windows, le gestionnaire de console attend ce signal avant de laisser
