@@ -115,6 +115,52 @@ pub fn ancrages_integres(reseau: Network) -> &'static [Ancrage] {
     }
 }
 
+/// Verifie que les corps d'une amorce sont bien ceux que ses en-tetes
+/// designent, avant qu'un seul octet n'atteigne le disque.
+///
+/// # Ce que cela ferme
+///
+/// L'adoption reverifiait le travail des en-tetes et l'empreinte de
+/// l'instantane, puis ecrivait les corps **tels quels**. Un serveur d'amorce
+/// pouvait donc livrer les vrais en-tetes, le vrai instantane — et des corps
+/// arbitraires : le noeud les stockait, les servait a ses pairs, et s'y
+/// heurtait a la premiere reorganisation pres de la tete. Il n'en sortait
+/// qu'en effacant son dossier.
+///
+/// Chaque corps doit : avoir une forme valide (racines de Merkle recalculees
+/// et concordantes), porter l'identifiant de l'en-tete de meme hauteur dans la
+/// liste, et la genese doit etre celle du reseau. Deux corps pour une meme
+/// hauteur sont refuses.
+pub fn verifier_les_corps(
+    reseau: Network,
+    entetes: &[BlockHeader],
+    corps: &[Block],
+) -> Result<(), String> {
+    let mut vues = std::collections::HashSet::with_capacity(corps.len());
+    for b in corps {
+        let h = b.header.height;
+        let attendu = entetes
+            .get(h as usize)
+            .filter(|e| e.height == h)
+            .ok_or_else(|| format!("un corps de hauteur {h} n'a pas d'en-tete dans l'amorce"))?;
+        let id = b.header.block_id();
+        if id != attendu.block_id() {
+            return Err(format!(
+                "le corps de hauteur {h} ne correspond pas a l'en-tete de l'amorce"
+            ));
+        }
+        if !vues.insert(id) {
+            return Err(format!("deux corps pour la hauteur {h}"));
+        }
+        b.check_shape()
+            .map_err(|e| format!("corps de hauteur {h} malforme : {e:?}"))?;
+        if h == 0 && id != crate::chain::genesis_id(reseau) {
+            return Err("la genese de l'amorce n'est pas celle de ce reseau".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Plafond du telechargement complet d'une amorce, cote client. Meme borne que
 /// le decodage : de quoi tenir un tres grand jeu d'UTXO, jamais l'infini.
 const MAX_AMORCE_OCTETS: usize = 2 * 1024 * 1024 * 1024;
@@ -500,6 +546,51 @@ mod tests {
             entetes: (0..5).map(entete).collect(),
             corps: vec![genesis_block(Network::Regtest)],
         }
+    }
+
+    /// Les corps sont confrontes aux en-tetes avant toute ecriture : un corps
+    /// etranger, un corps retouche, une genese d'un autre reseau, un doublon —
+    /// tous refuses ; les vrais corps passent.
+    #[test]
+    fn les_corps_d_une_amorce_sont_confrontes_a_ses_entetes() {
+        use crate::chain::Chain;
+        use crate::consensus::TARGET_BLOCK_SECS;
+        use crate::sig::SchemeId;
+
+        let reseau = Network::Regtest;
+        let mut c = Chain::new(reseau, genesis_block(reseau));
+        for _ in 0..4 {
+            let t = c.tip().time + TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
+                .expect("minage");
+            c.connect(&b, t + 1).expect("connexion");
+        }
+        let entetes = c.headers();
+        let corps: Vec<Block> = (0..=4).map(|h| c.block_at(h).unwrap()).collect();
+        verifier_les_corps(reseau, &entetes, &corps).expect("les vrais corps passent");
+
+        // Un corps retouche : meme en-tete annonce, contenu different.
+        let mut retouche = corps.clone();
+        retouche[2].transactions[0].outputs[0].pubkey_hash = Hash256([9u8; 32]);
+        assert!(verifier_les_corps(reseau, &entetes, &retouche).is_err());
+
+        // Un corps dont l'en-tete n'est pas dans l'amorce.
+        let mut etranger = corps.clone();
+        etranger[3].header.nonce ^= 1;
+        assert!(verifier_les_corps(reseau, &entetes, &etranger).is_err());
+
+        // Un doublon.
+        let mut double = corps.clone();
+        double.push(corps[1].clone());
+        assert!(verifier_les_corps(reseau, &entetes, &double).is_err());
+
+        // Une genese d'un autre reseau, avec ses en-tetes.
+        let autre = genesis_block(Network::Testnet);
+        assert!(verifier_les_corps(reseau, &[autre.header], &[autre]).is_err());
+
+        // Un corps au-dela des en-tetes fournis.
+        assert!(verifier_les_corps(reseau, &entetes[..3], &corps).is_err());
     }
 
     #[test]
