@@ -748,3 +748,93 @@ fn un_paiement_de_poussiere_est_refuse_et_la_monnaie_de_poussiere_va_aux_frais()
         Err(ValidationError::SortiePoussiere { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// 10. Une branche laterale respecte l'horodatage
+// ---------------------------------------------------------------------------
+
+/// Les controles d'horodatage — mediane des onze ancetres, tolerance vers le
+/// futur — ne s'appliquaient qu'a la connexion. Une branche laterale pouvait
+/// donc porter des horodatages tres etales, faire baisser la difficulte LWMA
+/// le long de sa branche, et faire produire a bon compte des corps que le
+/// noeud conservait et servait. Le meme bloc, avec un horodatage recevable,
+/// entre normalement.
+#[test]
+fn une_branche_laterale_a_l_horodatage_hors_bornes_est_refusee() {
+    let mut c = chaine(12);
+    let parent = c.active_at(8).expect("ancetre");
+    let hauteur = 9;
+    let maintenant = horodatage(13);
+    let connus_avant = c.known_blocks();
+
+    let bits = c.next_bits_after(parent);
+    let bloc_avec = |time: u64, sel: u8| {
+        let mut b = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: parent,
+                merkle_root: Hash256::ZERO,
+                uncles_root: Hash256::ZERO,
+                miner: Hash256([0xcc; 32]),
+                time,
+                bits,
+                height: hauteur,
+                nonce: 0,
+            },
+            transactions: vec![q21_core::tx::Transaction {
+                version: 1,
+                inputs: vec![q21_core::tx::TxIn::coinbase(
+                    [hauteur.to_le_bytes().as_slice(), &[sel]].concat(),
+                )],
+                outputs: vec![q21_core::tx::TxOut {
+                    value: q21_core::amount::Amount::from_units(MIN_OUTPUT_VALUE),
+                    scheme: SchemeId::LamportOts,
+                    pubkey_hash: Hash256([0xcc; 32]),
+                }],
+                lock_time: 0,
+            }],
+            uncles: vec![],
+        };
+        remine(&mut b);
+        b
+    };
+
+    // Trop loin dans le futur.
+    let futur = bloc_avec(maintenant + MAX_FUTURE_TIME + 1, 1);
+    assert!(
+        matches!(
+            c.submit(&futur, maintenant),
+            Err(ChainError::Validation(
+                ValidationError::HorodatageDansLeFutur { .. }
+            ))
+        ),
+        "une branche laterale dans le futur ne doit pas entrer dans l'index"
+    );
+
+    // Pas plus tard que la mediane de ses ancetres.
+    let ancien = bloc_avec(horodatage(3), 2);
+    assert!(
+        matches!(
+            c.submit(&ancien, maintenant),
+            Err(ChainError::Validation(
+                ValidationError::HorodatageTropAncien { .. }
+            ))
+        ),
+        "une branche laterale anterieure a la mediane ne doit pas entrer dans l'index"
+    );
+    assert_eq!(
+        c.known_blocks(),
+        connus_avant,
+        "l'index a grossi malgre le refus"
+    );
+
+    // Le meme bloc, a une date recevable : branche laterale ordinaire.
+    let bon = bloc_avec(horodatage(hauteur) + 30, 3);
+    assert!(
+        matches!(
+            c.submit(&bon, maintenant),
+            Ok(q21_core::chain::Accept::BrancheLaterale)
+        ),
+        "un horodatage recevable doit entrer comme branche laterale"
+    );
+}
