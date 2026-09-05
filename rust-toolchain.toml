@@ -1,0 +1,10 @@
+# Chaine d'outils figee.
+#
+# Deux compilations du meme commit, a des mois d'intervalle et sur deux
+# machines, doivent produire le meme binaire. Sans cette epingle, « stable »
+# designe une version differente chaque six semaines, et la livraison n'est
+# plus reproductible. La version est celle avec laquelle les epreuves ont ete
+# passees ; la relever est une decision, pas un accident.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]
