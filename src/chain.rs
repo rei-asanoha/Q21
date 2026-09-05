@@ -1225,11 +1225,14 @@ impl Chain {
     ///
     /// Sur le reseau de regression elle reste figee au minimum : miner dix blocs
     /// d'affilee ferait sinon grimper la cible d'un facteur 4 a chaque bloc.
+    ///
+    /// Passe par [`Self::next_bits_after`] : `next_bits(&self.headers())`
+    /// recopiait **tous** les en-tetes depuis la genese a chaque bloc connecte,
+    /// pour n'en lire que les 91 derniers. A cinq cent mille blocs, c'etait
+    /// des dizaines de millisecondes sous verrou par bloc, et une
+    /// synchronisation initiale quadratique.
     pub fn next_bits(&self) -> u32 {
-        if self.network == Network::Regtest {
-            return INITIAL_BITS;
-        }
-        next_bits(&self.headers())
+        self.next_bits_after(self.tip_id())
     }
 
     fn recent_times(&self) -> Vec<u64> {
@@ -2387,5 +2390,49 @@ mod tests {
             c.connect(&b, t + 1),
             Err(ValidationError::OncleEstUnAncetre)
         );
+    }
+
+    /// La difficulte ne regarde que la fenetre, jamais toute l'histoire.
+    ///
+    /// C'est la propriete dont depend `Chain::next_bits` : calculer sur les
+    /// `LWMA_WINDOW + 1` derniers en-tetes remontes depuis la tete donne
+    /// exactement ce que donnait la copie de tous les en-tetes depuis la
+    /// genese. Si quelqu'un elargit un jour la lecture au-dela de la fenetre,
+    /// cette epreuve le dira avant que les deux chemins divergent.
+    #[test]
+    fn la_difficulte_ne_depend_que_de_la_fenetre() {
+        let mut entetes: Vec<BlockHeader> = Vec::new();
+        let mut t = GENESIS_TIME;
+        let mut bits = INITIAL_BITS;
+        for h in 0..(3 * LWMA_WINDOW as u64 + 17) {
+            // Des intervalles irreguliers, pour que la fenetre compte vraiment.
+            // Plus rapides que la cible en moyenne, pour que la difficulte
+            // decolle du plancher et que la comparaison ait un sens.
+            t += match h % 5 {
+                0 => 40,
+                1 => 100,
+                2 => 120,
+                3 => 15,
+                _ => 90,
+            };
+            entetes.push(BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                uncles_root: Hash256::ZERO,
+                miner: Hash256::ZERO,
+                time: t,
+                bits,
+                height: h,
+                nonce: 0,
+            });
+            bits = next_bits(&entetes);
+        }
+        let n = entetes.len();
+        let fenetre = &entetes[n - (LWMA_WINDOW + 1)..];
+        assert_eq!(next_bits(&entetes), next_bits(fenetre));
+        // Et un en-tete de moins dans la fenetre change bel et bien le resultat :
+        // la fenetre est la bonne, ni plus large ni plus etroite.
+        assert_ne!(next_bits(&entetes), next_bits(&entetes[n - LWMA_WINDOW..]));
     }
 }
