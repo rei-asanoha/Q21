@@ -161,11 +161,38 @@ pub const COINBASE_MATURITY: u64 = 200;
 /// difficulte de 70 % — et de 97 % avec une variante. Le seuil d'effondrement
 /// total se situait a 20,7 % de la puissance.
 ///
-/// Vingt minutes suffisent largement a absorber la derive d'horloge d'une
-/// machine ordinaire, et reduisent d'un facteur six la surface de cette attaque.
-/// La defense principale reste toutefois le temps de resolution **signe** de
-/// `next_bits`, pas cette borne.
-pub const MAX_FUTURE_TIME: u64 = 20 * 60;
+/// Dix minutes suffisent largement a absorber la derive d'horloge d'une
+/// machine ordinaire — les systemes courants se synchronisent a la seconde —
+/// et reduisent d'un facteur douze la surface de cette attaque. La borne
+/// etait de vingt minutes ; la moitie suffit, et chaque minute de tolerance
+/// est une minute de levier. La defense principale reste toutefois le temps
+/// de resolution **signe** et **dissymetrique** de `next_bits`, pas cette
+/// borne.
+pub const MAX_FUTURE_TIME: u64 = 10 * 60;
+
+/// Borne haute du temps de resolution dans LWMA : un intervalle ne compte
+/// jamais pour plus de ce multiple de la cible, si long qu'il paraisse.
+///
+/// # Pourquoi elle est plus basse que la borne de retard
+///
+/// Avec une borne symetrique a 6T, un mineur qui inscrit `parent + 6T`
+/// injectait 6T ; le bloc honnete suivant, contraint par la mediane, n'en
+/// retirait qu'une partie : il restait un solde positif, donc une baisse de
+/// difficulte, donc une emission acceleree — 33 % de blocs en plus pour une
+/// moitie de la puissance. Avec 4T a l'avance et 6T au retard, le bloc
+/// honnete retire plus que l'attaquant n'a injecte : la manipulation
+/// **augmente** la difficulte, et un mineur rationnel n'y gagne rien. Mesure
+/// par l'epreuve `a1` : plus aucune strategie ne fait baisser la difficulte.
+///
+/// Le prix pour le reseau honnete : apres une chute brutale de puissance, un
+/// intervalle reel de dix minutes ne compte que pour huit ; la difficulte
+/// redescend un peu moins vite. Sur une fenetre de 90 blocs, c'est
+/// negligeable.
+pub const LWMA_AVANCE_MAX: u64 = 4;
+
+/// Borne basse du temps de resolution dans LWMA, en multiples de la cible :
+/// un horodatage recule ne retire jamais plus que cela.
+pub const LWMA_RETARD_MAX: u64 = 6;
 
 /// Taille de la fenetre du temps median passe.
 ///
