@@ -1244,6 +1244,28 @@ impl Chain {
             .collect()
     }
 
+    /// Horodatages des ancetres d'un bloc, en remontant l'index depuis
+    /// `parent` : le pendant de [`Self::next_bits_after`] pour la mediane, qui
+    /// vaut donc pour n'importe quelle branche. Du plus ancien au plus recent.
+    fn recent_times_after(&self, parent: Hash256) -> Vec<u64> {
+        let mut v = Vec::with_capacity(MEDIAN_TIME_SPAN);
+        let mut courant = parent;
+        for _ in 0..MEDIAN_TIME_SPAN {
+            match self.index.get(&courant) {
+                Some(b) => {
+                    v.push(b.header.time);
+                    if b.header.height == 0 {
+                        break;
+                    }
+                    courant = b.header.prev_block;
+                }
+                None => break,
+            }
+        }
+        v.reverse();
+        v
+    }
+
     /// Identifiants des ancetres recents, tete comprise.
     fn recent_ancestors(&self) -> Vec<Hash256> {
         let n = self.active.len();
@@ -1652,6 +1674,37 @@ impl Chain {
                 ValidationError::DifficulteIncorrecte {
                     attendu,
                     recu: block.header.bits,
+                },
+            ));
+        }
+
+        // 2 bis. L'horodatage, aux memes conditions que sur la chaine active :
+        //    posterieur a la mediane des onze ancetres **de sa branche**, et
+        //    pas au-dela de la tolerance vers le futur.
+        //
+        //    Ces deux controles ne s'appliquaient qu'a la connexion. Une
+        //    branche laterale pouvait donc porter des horodatages tres etales
+        //    — la difficulte LWMA baissait le long de la branche, jusqu'a six
+        //    fois grace a la borne de 6T par intervalle — et faire produire a
+        //    bon compte des corps de 4 Mio que le noeud conservait et servait.
+        //    Refuser ici n'ecarte aucun bloc valide : la connexion l'aurait
+        //    refuse de toute facon, pour la meme raison.
+        let temps = self.recent_times_after(block.header.prev_block);
+        let mediane = validate::median_time(&temps);
+        if !temps.is_empty() && block.header.time <= mediane {
+            return Err(ChainError::Validation(
+                ValidationError::HorodatageTropAncien {
+                    median: mediane,
+                    recu: block.header.time,
+                },
+            ));
+        }
+        let limite = now + MAX_FUTURE_TIME;
+        if block.header.time > limite {
+            return Err(ChainError::Validation(
+                ValidationError::HorodatageDansLeFutur {
+                    limite,
+                    recu: block.header.time,
                 },
             ));
         }
