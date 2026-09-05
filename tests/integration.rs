@@ -147,7 +147,7 @@ fn une_double_depense_dans_le_meme_bloc_est_refusee() {
             &c.utxo,
             c.height(),
             &a,
-            Amount::from_units(1_000),
+            Amount::from_units(100_000),
             Amount::ZERO,
         )
         .expect("construction");
@@ -184,7 +184,7 @@ fn une_signature_falsifiee_est_refusee() {
             &c.utxo,
             c.height(),
             &a,
-            Amount::from_units(1_000),
+            Amount::from_units(100_000),
             Amount::ZERO,
         )
         .expect("construction");
@@ -225,7 +225,7 @@ fn on_ne_peut_pas_depenser_la_sortie_d_autrui() {
             sequence: u32::MAX,
         }],
         outputs: vec![TxOut {
-            value: Amount::from_units(1_000),
+            value: Amount::from_units(100_000),
             scheme: SchemeId::LamportOts,
             pubkey_hash: addr_mallory.hash,
         }],
@@ -262,7 +262,7 @@ fn une_coinbase_immature_ne_peut_pas_etre_depensee() {
         &c.utxo,
         c.height(),
         &a,
-        Amount::from_units(1_000),
+        Amount::from_units(100_000),
         Amount::ZERO,
     );
     assert!(r.is_err(), "aucune sortie ne devrait etre depensable");
@@ -283,7 +283,7 @@ fn une_coinbase_immature_ne_peut_pas_etre_depensee() {
             sequence: u32::MAX,
         }],
         outputs: vec![TxOut {
-            value: Amount::from_units(1),
+            value: Amount::from_units(MIN_OUTPUT_VALUE),
             scheme: SchemeId::LamportOts,
             pubkey_hash: a.hash,
         }],
@@ -380,7 +380,7 @@ fn le_temoin_domine_la_taille_des_transactions() {
             &c.utxo,
             c.height(),
             &a,
-            Amount::from_units(1_000),
+            Amount::from_units(100_000),
             Amount::ZERO,
         )
         .unwrap();

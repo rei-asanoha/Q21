@@ -63,6 +63,14 @@ pub enum WalletError {
     /// Aucune somme legitime ne depasse le plafond d'emission. Refuser ici
     /// evite une addition qui deborde — et, en release, un arret du processus.
     MontantHorsBornes,
+    /// Un montant sous le plancher de poussiere ([`crate::consensus::MIN_OUTPUT_VALUE`]).
+    ///
+    /// Le reseau refuserait la transaction ; la construire aurait consomme une
+    /// clef a usage unique pour rien. On refuse avant.
+    MontantSousLePlancher {
+        minimum: u64,
+        recu: u64,
+    },
     /// L'enregistrement des indices consommes a echoue **avant** la signature.
     ///
     /// Rien n'a ete signe : les indices sont reserves en memoire, mais aucune
@@ -993,6 +1001,12 @@ impl Wallet {
             if montant.units() == 0 {
                 return Err(WalletError::MontantNul);
             }
+            if montant.units() < crate::consensus::MIN_OUTPUT_VALUE {
+                return Err(WalletError::MontantSousLePlancher {
+                    minimum: crate::consensus::MIN_OUTPUT_VALUE,
+                    recu: montant.units(),
+                });
+            }
             total_sortant = total_sortant
                 .checked_add(montant.units())
                 .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
@@ -1014,7 +1028,10 @@ impl Wallet {
             .collect();
 
         let monnaie = total - besoin;
-        if monnaie > 0 {
+        // Une monnaie sous le plancher de poussiere serait refusee par le
+        // reseau : on la laisse aux frais plutot que de creer une sortie que
+        // personne ne pourrait jamais depenser utilement.
+        if monnaie >= crate::consensus::MIN_OUTPUT_VALUE {
             // La monnaie part sur une adresse neuve : reutiliser l'adresse
             // d'origine reemploierait une clef Lamport deja consommee.
             let rendu = self.new_address();
@@ -1513,7 +1530,7 @@ mod tests {
                 &c.utxo,
                 c.height(),
                 &a1,
-                Amount::from_units(1_000),
+                Amount::from_units(50_000),
                 Amount::ZERO,
             )
             .expect("premiere depense");
@@ -1641,7 +1658,7 @@ mod tests {
                 &c.utxo,
                 c.height(),
                 &a,
-                Amount::from_units(1_000),
+                Amount::from_units(50_000),
                 Amount::ZERO,
             )
             .expect("construction");

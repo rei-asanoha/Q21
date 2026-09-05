@@ -282,7 +282,10 @@ impl Transaction {
     /// sans lui, une signature ML-DSA de 3 309 octets ferait payer au reste de la
     /// transaction le prix de la cryptographie qu'elle transporte.
     ///
-    /// PROVISOIRE : le facteur doit etre cale sur les mesures du reseau de test.
+    /// Chaque sortie creee ajoute [`crate::consensus::POIDS_PAR_SORTIE`] : une
+    /// sortie occupe le jeu d'UTXO de tous les noeuds tant qu'elle vit, la ou
+    /// un octet de temoin est oublie des que le bloc est enfoui. Le poids
+    /// tarife donc la ressource rare, pas seulement les octets sur le fil.
     pub fn weight(&self, witness_discount: u64) -> u64 {
         let base = self.encode_without_witness().len() as u64;
         let witness: u64 = self
@@ -290,7 +293,8 @@ impl Transaction {
             .iter()
             .map(|i| (i.witness.pubkey.len() + i.witness.signature.len()) as u64)
             .sum();
-        base * witness_discount + witness
+        let sorties = self.outputs.len() as u64 * crate::consensus::POIDS_PAR_SORTIE;
+        base * witness_discount + witness + sorties
     }
 }
 

@@ -746,7 +746,7 @@ fn o_cache_forge_brule_une_clef_lamport() {
         &utxo,
         1_000,
         &dest,
-        Amount::from_units(1_000),
+        Amount::from_units(50_000),
         Amount::from_units(100),
     );
     // Le portefeuille doit refuser AVANT de signer, et ne rien consommer.

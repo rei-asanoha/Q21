@@ -119,6 +119,14 @@ pub enum ValidationError {
     ClefNeCorrespondPasAuVerrou,
     SchemaInterditSurCeReseau(SchemeId),
     Signature(VerifyError),
+
+    // --- Poussiere ---
+    /// Une sortie sous [`MIN_OUTPUT_VALUE`] : elle occuperait le jeu d'UTXO de
+    /// tous les noeuds sans jamais valoir le prix de sa propre depense.
+    SortiePoussiere {
+        minimum: u64,
+        recu: u64,
+    },
 }
 
 impl From<BlockError> for ValidationError {
@@ -312,6 +320,23 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
 ) -> Result<Amount, ValidationError> {
     tx.check_shape()?;
 
+    // --- Regle : les sorties doivent utiliser un schema autorise, et ne pas
+    //     etre de la poussiere.
+    //
+    // Avant les entrees : ces controles ne coutent rien, la verification des
+    // signatures coute cher. On refuse le bon marche d'abord.
+    for sortie in &tx.outputs {
+        if !sortie.scheme.allowed_on(network) {
+            return Err(ValidationError::SchemaInterditSurCeReseau(sortie.scheme));
+        }
+        if sortie.value.units() < MIN_OUTPUT_VALUE {
+            return Err(ValidationError::SortiePoussiere {
+                minimum: MIN_OUTPUT_VALUE,
+                recu: sortie.value.units(),
+            });
+        }
+    }
+
     let mut total_entrees: u64 = 0;
 
     for (i, entree) in tx.inputs.iter().enumerate() {
@@ -356,13 +381,6 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
         total_entrees = total_entrees
             .checked_add(e.output.value.units())
             .ok_or(ValidationError::FraisDebordent)?;
-    }
-
-    // --- Regle : les sorties doivent utiliser un schema autorise.
-    for sortie in &tx.outputs {
-        if !sortie.scheme.allowed_on(network) {
-            return Err(ValidationError::SchemaInterditSurCeReseau(sortie.scheme));
-        }
     }
 
     // --- Regle : conservation de la valeur. On ne cree pas de monnaie.
@@ -457,6 +475,22 @@ pub fn check_block<E: PowEngine>(
     // reorganiser des blocs mais jamais en creer davantage.
     let coinbase = &block.transactions[0];
     let recompenses = uncle_rewards(ctx.height, block.uncles.len());
+
+    // --- Regle : pas de poussiere dans la coinbase non plus.
+    //
+    // Un mineur qui paie des frais se les paie a lui-meme : seule
+    // l'immobilisation de capital le freine, et elle passe par ce plancher.
+    // La genese est exempte — elle porte l'unite indepensable du plafond.
+    if ctx.height > 0 {
+        for sortie in &coinbase.outputs {
+            if sortie.value.units() < MIN_OUTPUT_VALUE {
+                return Err(ValidationError::SortiePoussiere {
+                    minimum: MIN_OUTPUT_VALUE,
+                    recu: sortie.value.units(),
+                });
+            }
+        }
+    }
 
     // --- Regle : la coinbase commet sa hauteur.
     //
@@ -590,7 +624,7 @@ mod tests {
                 sequence: 0,
             }],
             outputs: vec![crate::tx::TxOut {
-                value: Amount::from_units(1),
+                value: Amount::from_units(MIN_OUTPUT_VALUE),
                 scheme: SchemeId::LamportOts,
                 pubkey_hash: Hash256::ZERO,
             }],

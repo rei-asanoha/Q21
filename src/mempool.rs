@@ -49,9 +49,13 @@ pub const MEMPOOL_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Taux de frais minimal accepte, en unites par millier d'unites de poids.
 ///
-/// Filtre le bruit gratuit. Volontairement bas : le but est d'ecarter l'inondation
-/// a cout nul, pas de fixer un marche des frais.
-pub const MIN_FEE_RATE: u64 = 1;
+/// Filtre le bruit gratuit. Le but est d'ecarter l'inondation a cout nul, pas
+/// de fixer un marche des frais : a dix unites par millier, une transaction
+/// ML-DSA-87 ordinaire paie environ 80 unites, soit un millionieme de Q21.
+/// La premiere valeur, 1, laissait saturer le reservoir pour quelques
+/// milliers d'unites ; le poids par sortie ([`crate::consensus::POIDS_PAR_SORTIE`])
+/// fait le reste contre l'inondation en sorties.
+pub const MIN_FEE_RATE: u64 = 10;
 
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
@@ -971,8 +975,8 @@ mod tests_chaines {
                 &c.utxo,
                 c.height(),
                 &a1,
-                Amount::from_units(1_000),
-                Amount::from_units(500),
+                Amount::from_units(100_000),
+                Amount::from_units(5_000),
             )
             .expect("premiere");
         let id1 = m
@@ -1000,8 +1004,8 @@ mod tests_chaines {
                 &c.utxo,
                 c.height(),
                 &a2,
-                Amount::from_units(1_000),
-                Amount::from_units(500),
+                Amount::from_units(100_000),
+                Amount::from_units(5_000),
             )
             .expect("seconde");
         m.accept(&tx2, &c.utxo, RESEAU, c.height())
@@ -1024,8 +1028,8 @@ mod tests_chaines {
                     &c.utxo,
                     c.height(),
                     &a,
-                    Amount::from_units(1_000),
-                    Amount::from_units(500),
+                    Amount::from_units(100_000),
+                    Amount::from_units(5_000),
                 )
                 .expect("construction");
             ids.push(
@@ -1059,8 +1063,8 @@ mod tests_chaines {
                     &c.utxo,
                     c.height(),
                     &a,
-                    Amount::from_units(1_000),
-                    Amount::from_units(500),
+                    Amount::from_units(100_000),
+                    Amount::from_units(5_000),
                 )
                 .expect("construction");
             ordre_arrivee.push(
@@ -1102,8 +1106,8 @@ mod tests_chaines {
                 &c.utxo,
                 c.height(),
                 &a,
-                Amount::from_units(1_000),
-                Amount::from_units(500),
+                Amount::from_units(100_000),
+                Amount::from_units(5_000),
             )
             .expect("construction");
         let consommee = tx.inputs[0].prev_out;
@@ -1140,8 +1144,8 @@ mod tests_chaines {
                     &c.utxo,
                     c.height(),
                     &a,
-                    Amount::from_units(1_000),
-                    Amount::from_units(500),
+                    Amount::from_units(100_000),
+                    Amount::from_units(5_000),
                 )
                 .expect("construction");
             m.accept(&tx, &c.utxo, RESEAU, c.height())
