@@ -568,8 +568,14 @@ pub const HRP_TESTNET: &str = "tq21";
 pub const HRP_REGTEST: &str = "rq21";
 
 /// Magie reseau, prefixe de chaque message du protocole p2p.
+///
+/// Le dernier octet du reseau de test compte ses generations : `0x74` etait
+/// le premier reseau de test, `0x75` est celui qui a suivi la revue de
+/// septembre 2026 — nouvelle preuve de travail, nouveau condensat signe,
+/// nouvelle genese. Deux generations ne se parlent pas : un ancien noeud voit
+/// une magie inconnue et coupe, au lieu d'echanger des blocs qu'il refuserait.
 pub const NETWORK_MAGIC_MAINNET: [u8; 4] = [0x51, 0x32, 0x31, 0x01];
-pub const NETWORK_MAGIC_TESTNET: [u8; 4] = [0x51, 0x32, 0x31, 0x74];
+pub const NETWORK_MAGIC_TESTNET: [u8; 4] = [0x51, 0x32, 0x31, 0x75];
 
 // ---------------------------------------------------------------------------
 // Invariants verifies a la compilation

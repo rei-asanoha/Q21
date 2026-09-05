@@ -29,8 +29,20 @@ use crate::ser::{ReadError, Reader, Writer};
 use crate::sha256::sha256;
 use crate::tx::Transaction;
 
-/// Version du protocole.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version du protocole, annoncee a la poignee de main.
+///
+/// 1 : lancement. 2 : revue de septembre 2026 — nouvelle preuve de travail,
+/// condensat signe engageant le reseau et la sortie depensee, feuille de
+/// Merkle engageant le temoin, poussiere refusee, oncles retires.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Version minimale acceptee d'un pair.
+///
+/// Un pair plus ancien valide d'autres regles : chaque bloc qu'il enverrait
+/// serait refuse, chaque bloc qu'on lui enverrait le serait aussi, et les
+/// deux se puniraient mutuellement. On coupe a la poignee de main, sans
+/// penalite : ce n'est pas une faute, c'est une autre epoque.
+pub const MIN_PROTOCOL_VERSION: u32 = 2;
 
 /// Taille maximale d'une charge utile, en octets.
 ///
@@ -654,7 +666,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             timestamp: 1_755_000_000,
             nonce: 0xdead_beef,
-            user_agent: "q21:0.1".into(),
+            user_agent: "q21:0.2".into(),
             start_height: 12_345,
         });
         aller_retour(Message::Reject {
