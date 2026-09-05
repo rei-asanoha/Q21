@@ -2092,6 +2092,82 @@ mod tests {
         );
     }
 
+    /// Un redemarrage ne repart jamais sur une branche abandonnee, et ne
+    /// perd pas la capacite de la rejoindre si elle finit par l'emporter.
+    ///
+    /// Une branche laterale indexee avant l'arret est retenue par les
+    /// en-tetes ; au redemarrage, la tete doit etre celle de la chaine la plus
+    /// lourde, pas la derniere ecrite. Et si la branche laterale est ensuite
+    /// prolongee jusqu'a depasser la chaine active, la reorganisation doit
+    /// aboutir — les corps de la branche etant fournis — exactement comme
+    /// elle l'aurait fait sans redemarrage.
+    #[test]
+    fn un_redemarrage_ne_repart_pas_sur_une_branche_abandonnee() {
+        let mut c = chaine();
+        mine(&mut c, 40);
+        let fourche_hauteur = 37u64;
+        let fourche = c.active[fourche_hauteur as usize];
+
+        // La branche laterale : deux blocs a partir de la hauteur 37, donc
+        // moins de travail que la chaine active (40).
+        let mut rivale = Chain::new(RESEAU, genesis_block(RESEAU));
+        for id in &c.active[1..=fourche_hauteur as usize] {
+            let b = c.block_by_id(id).expect("corps");
+            rivale.connect(&b, b.header.time + 1).expect("meme prefixe");
+        }
+        let mut laterale = Vec::new();
+        for _ in 0..2 {
+            let t = rivale.tip().time + TARGET_BLOCK_SECS + 7;
+            let b = rivale
+                .mine_block(Hash256([9u8; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
+                .expect("minage rival");
+            rivale.connect(&b, t + 1).expect("connexion rivale");
+            laterale.push(b);
+        }
+        assert_eq!(laterale[0].header.prev_block, fourche);
+        for b in &laterale {
+            assert_eq!(
+                c.submit(b, b.header.time + 1).expect("branche laterale"),
+                Accept::BrancheLaterale
+            );
+        }
+        let tete_active = c.tip_id();
+
+        // Redemarrage : la tete est celle de la chaine active, pas la
+        // derniere branche ecrite.
+        let mut rc = reprendre(&c);
+        assert_eq!(
+            rc.tip_id(),
+            tete_active,
+            "la reprise repart sur la branche abandonnee"
+        );
+        assert_eq!(rc.height(), 40);
+
+        // La branche laterale l'emporte ensuite : la reorganisation aboutit.
+        for _ in 0..3 {
+            let t = rivale.tip().time + TARGET_BLOCK_SECS + 7;
+            let b = rivale
+                .mine_block(Hash256([9u8; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
+                .expect("minage rival");
+            rivale.connect(&b, t + 1).expect("connexion rivale");
+            laterale.push(b);
+        }
+        let mut bascule = false;
+        for b in &laterale[2..] {
+            if let Accept::Reorganise { .. } = rc.submit(b, b.header.time + 1).expect("soumission")
+            {
+                bascule = true;
+            }
+        }
+        assert!(bascule, "la branche devenue la plus lourde doit l'emporter");
+        assert_eq!(rc.tip_id(), rivale.tip_id());
+        assert_eq!(rc.height(), rivale.height());
+        assert_eq!(
+            rc.utxo, rivale.utxo,
+            "l'etat rejoint celui de la branche gagnante"
+        );
+    }
+
     /// Une branche sans ancetre commun se nomme pour ce qu'elle est.
     ///
     /// Elle etait signalee comme `FinaliteDepassee { profondeur: u64::MAX }`.
