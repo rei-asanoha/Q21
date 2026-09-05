@@ -1,0 +1,34 @@
+# Politique des dependances, appliquee par `cargo deny check` en integration
+# continue.
+#
+# Le projet n'a qu'une dependance directe (`ml-dsa`) et ses sources sont
+# vendorisees. Ce fichier verrouille ce que cela signifie : aucune faille
+# publiee sans qu'on le sache, aucune licence inattendue, aucune source hors
+# de crates.io, aucune dependance en double.
+
+[graph]
+all-features = true
+
+[advisories]
+# Une faille publiee (base RustSec) sur une dependance fait echouer la
+# verification. Les avis « non maintenu » et « non fiable » sont signales.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "deny"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+# Deux versions d'un meme paquet, c'est deux fois la surface a auditer.
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
