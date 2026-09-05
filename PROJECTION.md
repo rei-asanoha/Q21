@@ -209,24 +209,21 @@ prétendre à quinze millions d'utilisateurs, et pas après.
 ## 3 · Ce que le mineur doit détenir, année par année
 
 La table de preuve de travail grandit de 5 % par époque de 71,1 jours, jusqu'à un
-plafond de 8 Gio.
+plafond de 4 Gio.
 
 | Année | Époque | Table (mineur) | Cache (tout nœud) |
 |---:|---:|---:|---:|
 | 0 | 0 | 2,00 Gio | 64 Mio |
 | 1 | 5 | 2,55 Gio | 82 Mio |
 | 2 | 10 | 3,26 Gio | 104 Mio |
-| 3 | 15 | 4,16 Gio | 133 Mio |
-| 4 | 20 | 5,31 Gio | 170 Mio |
-| 5 | 25 | 6,77 Gio | 217 Mio |
-| **6** | 30 | **8,00 Gio** | **256 Mio** |
-| 10 et au-delà | — | 8,00 Gio | 256 Mio |
+| **3** | 15 | **4,00 Gio** | **128 Mio** |
+| 10 et au-delà | — | 4,00 Gio | 128 Mio |
 
 Deux lectures :
 
-- **Une machine à 8 Go de mémoire vive devient juste vers la quatrième année**,
-  et insuffisante vers la sixième. Qui veut miner sur dix ans prend 16 Go.
-- **Un nœud qui ne mine pas n'atteint jamais que 256 Mio.** Vérifier reste à la
+- **Une machine à 8 Go de mémoire vive suffit pour toujours.** La table cesse
+  de grandir à 4 Gio, ce qui laisse autant au système et au reste.
+- **Un nœud qui ne mine pas n'atteint jamais que 128 Mio.** Vérifier reste à la
   portée de n'importe quoi, y compris d'un Raspberry Pi, pour toujours.
 
 C'est une asymétrie voulue : le coût d'entrée du minage monte, celui de la
@@ -241,7 +238,7 @@ chaîne dont plus personne ne vérifie.
 |---|---|---|
 | **L'amorçage** | 28 premiers jours | La rampe : la récompense monte linéairement de zéro sur 20 000 blocs. Personne ne peut se précipiter sur une émission facile |
 | **La jeunesse** | Jusqu'à 4 ans | La moitié des Q21 est émise. La subvention paie tout ; les frais ne comptent pas |
-| **La maturité** | 4 à 14 ans | 90 % émis. La table atteint son plafond de 8 Gio à l'année 6. Les frais commencent à peser dans le revenu du mineur |
+| **La maturité** | 4 à 14 ans | 90 % émis. La table a atteint son plafond de 4 Gio dès l'année 3. Les frais commencent à peser dans le revenu du mineur |
 | **La longue queue** | 14 à 91 ans | Les 10 % restants s'étalent. Le revenu du mineur bascule progressivement vers les frais |
 | **La queue au plancher** | 42 à 100 ans | La décroissance est passée sous 0,01 Q21 : le plancher paie, constant, jusqu'au plafond |
 | **Après la subvention** | Au-delà de 99,91 ans | Plus un seul Q21 créé. 21 000 001 en circulation, exactement. La sécurité repose entièrement sur les frais — question ouverte, ici comme ailleurs |

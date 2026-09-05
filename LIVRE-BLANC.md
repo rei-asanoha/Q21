@@ -184,8 +184,10 @@ reste.
 ### La table grandit
 
 Sa taille croît de **5 % par époque** — une époque vaut 51 200 blocs, soit
-environ 71 jours. Elle part de 2 Gio et plafonne à 8 Gio, atteints vers cinq ou
-six ans.
+environ 71 jours. Elle part de 2 Gio et plafonne à 4 Gio, atteints vers la troisième
+année. Le plafond a été ramené de 8 à 4 Gio : au-delà, la table pesait sur le
+particulier — un Raspberry Pi 5 ou un portable de 8 Go — plus que sur le
+silicium dédié, qui achète de la mémoire à volonté.
 
 Un circuit conçu autour d'une quantité de mémoire fixe devient médiocre dès que
 la table la dépasse. **Le matériel dédié se périme donc tout seul**, sans qu'on

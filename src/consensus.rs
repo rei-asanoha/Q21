@@ -280,7 +280,16 @@ pub const POW_TABLE_N0_TESTNET: u32 = 1 << 20; // 32 Mio
 pub const POW_TABLE_N0_REGTEST: u32 = 1 << 10; // 32 Kio
 
 /// Plafond de croissance de la table, par reseau.
-pub const POW_TABLE_NMAX_MAINNET: u32 = 1 << 28; // 8 Gio, atteint vers 5-6 ans
+///
+/// Reseau principal : 2^27 elements x 32 o = **4 Gio**, atteints a la
+/// quinzieme epoque, soit vers la troisieme annee. Le plafond etait de 8 Gio ;
+/// c'est la promesse « minable par tout le monde » qui l'a ramene a 4. Un
+/// Raspberry Pi 5 possede 8 Go en tout, un portable courant 8 ou 16 : une
+/// table de 8 Gio les excluait vers la sixieme annee, pour un gain marginal
+/// contre du materiel dedie, qui achete de la memoire a volonte. La table
+/// doit peser sur le silicium, pas sur le particulier. A reevaluer dans cinq
+/// ans, quand 16 Go seront le bas de gamme.
+pub const POW_TABLE_NMAX_MAINNET: u32 = 1 << 27; // 4 Gio, atteint vers 3 ans
 pub const POW_TABLE_NMAX_TESTNET: u32 = 1 << 22;
 pub const POW_TABLE_NMAX_REGTEST: u32 = 1 << 12;
 
