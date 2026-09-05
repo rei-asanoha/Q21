@@ -943,6 +943,10 @@ impl RpcContext {
                         "penalite_pourcent_par_bloc",
                         Json::u64(REORG_PENALTY_PCT_PER_BLOCK),
                     )
+                    .set(
+                        "penalite_plafond_pourcent",
+                        Json::u64(REORG_PENALTY_MAX_PCT),
+                    )
                     .set("recompenses_oncles", Json::Bool(true))
                     .set("pow_memory_hard", Json::Bool(true))
                     .build(),

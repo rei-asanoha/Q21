@@ -984,7 +984,8 @@ fn seuil_de_reorg(travail_courant: U256, profondeur: u64) -> U256 {
     if profondeur <= REORG_PENALTY_FROM_DEPTH {
         return travail_courant;
     }
-    let exces = (profondeur - REORG_PENALTY_FROM_DEPTH) * REORG_PENALTY_PCT_PER_BLOCK;
+    let exces = ((profondeur - REORG_PENALTY_FROM_DEPTH) * REORG_PENALTY_PCT_PER_BLOCK)
+        .min(REORG_PENALTY_MAX_PCT);
     travail_courant
         .mul_div(100 + exces, 100)
         .unwrap_or(travail_courant)
@@ -1249,4 +1250,91 @@ fn a6c_demonstration_sur_une_vraie_chaine() {
         "   prevision du modele : {} blocs.",
         longueur_minimale(H as u64, D as u64).unwrap()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Partition reseau : le plafond de la majoration
+// ---------------------------------------------------------------------------
+
+/// Une partition reseau doit se resorber quand elle prend fin.
+///
+/// # Ce que cette epreuve fige
+///
+/// Sans plafond, la majoration atteignait 100 % a la profondeur 106 et plus
+/// de 700 % a la profondeur maximale. Deux moities du reseau minant chacune de
+/// leur cote se voyaient donc majorees l'une contre l'autre, et au bout de
+/// deux heures aucune ne pouvait plus rejoindre l'autre : la coupure Internet
+/// devenait une scission definitive, la ou la documentation annoncait
+/// vingt-quatre heures.
+///
+/// On simule deux branches minees a difficulte egale avec la regle reelle
+/// (`seuil_de_reorg`, reproduite ci-dessus), et l'on cherche, pour chaque
+/// partage de puissance, le dernier moment ou la minorite peut encore
+/// basculer sur la majorite. Avec le plafond, une majorite de 60 % reunifie
+/// toujours dans la fenetre de finalite ; sans lui, elle ne le pouvait plus
+/// apres quelques heures.
+#[test]
+fn a7_une_partition_a_60_40_se_reunifie_toujours() {
+    /// Un noeud sur la branche `a` bascule sur `b` si le travail de `b` depuis
+    /// la fourche depasse le seuil calcule sur le travail de `a`.
+    fn bascule_possible(a: u64, b: u64) -> bool {
+        let seuil = seuil_de_reorg(U256::from_u64(a), a);
+        U256::from_u64(b) > seuil
+    }
+    let horizon = MAX_REORG_DEPTH;
+    let mut rng = Rng::new(21);
+    println!("\n=== A7 — reunification apres partition (plafond {REORG_PENALTY_MAX_PCT} %) ===");
+    for minorite in [0.5f64, 0.45, 0.40, 0.30] {
+        let essais = 400;
+        let mut jamais = 0;
+        let mut dernieres: Vec<u64> = Vec::new();
+        for _ in 0..essais {
+            let (mut a, mut b) = (0u64, 0u64);
+            let mut derniere = None;
+            for _ in 0..horizon {
+                if rng.unit() < minorite {
+                    a += 1;
+                } else {
+                    b += 1;
+                }
+                // La minorite (a) peut-elle rejoindre b, ou l'inverse ?
+                if bascule_possible(a, b) || bascule_possible(b, a) {
+                    derniere = Some(a + b);
+                }
+            }
+            match derniere {
+                Some(n) => dernieres.push(n),
+                None => jamais += 1,
+            }
+        }
+        dernieres.sort_unstable();
+        let mediane = dernieres.get(dernieres.len() / 2).copied().unwrap_or(0);
+        let reunifie_a_la_fin = dernieres.iter().filter(|n| **n >= horizon - 1).count();
+        println!(
+            "minorite {:>3.0} % : derniere reunification possible, mediane {mediane} blocs ; \
+             encore possible au bloc {horizon} dans {} cas sur {essais} ; jamais possible : {jamais}",
+            minorite * 100.0,
+            reunifie_a_la_fin
+        );
+        assert_eq!(
+            jamais, 0,
+            "la reunification doit toujours avoir ete possible"
+        );
+        if minorite <= 0.40 {
+            // A 60/40 le rapport des travaux vaut 1,5 en esperance, contre un
+            // seuil de 1,25 : seule une fluctuation a plus de deux ecarts-types
+            // sur 720 blocs peut encore l'emporter, soit environ 1 % des cas.
+            assert!(
+                reunifie_a_la_fin as f64 >= 0.97 * essais as f64,
+                "a 60/40, la reunification doit rester possible au bout de la fenetre \
+                 dans au moins 97 % des cas ({reunifie_a_la_fin}/{essais})"
+            );
+        }
+        if minorite <= 0.30 {
+            assert_eq!(
+                reunifie_a_la_fin, essais,
+                "a 70/30, la reunification doit rester possible au bout de la fenetre"
+            );
+        }
+    }
 }

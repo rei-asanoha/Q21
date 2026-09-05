@@ -369,6 +369,26 @@ pub const REORG_PENALTY_FROM_DEPTH: u64 = 6;
 /// de [`REORG_PENALTY_FROM_DEPTH`].
 pub const REORG_PENALTY_PCT_PER_BLOCK: u64 = 1;
 
+/// Plafond de la majoration, en pourcentage du travail produit depuis la
+/// fourche.
+///
+/// # Pourquoi un plafond
+///
+/// Sans lui, la majoration atteignait 100 % a la profondeur 106 et plus de
+/// 700 % a la profondeur maximale. Une partition reseau ordinaire — deux
+/// pays, deux fournisseurs — minant a puissance egale des deux cotes
+/// devenait alors **definitive en deux heures** (simulation : derniere
+/// reunification possible a 66 blocs en mediane pour une minorite a 50 %,
+/// 153 blocs pour une minorite a 40 %), la ou la documentation annoncait
+/// vingt-quatre heures. Chaque cote se voyait majore, et aucun ne rejoignait
+/// jamais l'autre.
+///
+/// Avec 25 %, toute majorite superieure a 56 % de la puissance reunifie le
+/// reseau dans la fenetre de [`MAX_REORG_DEPTH`], et une reorganisation
+/// profonde par un attaquant reste plus chere d'un quart — ce qui, joint a la
+/// profondeur maximale, suffit a l'objectif de depart.
+pub const REORG_PENALTY_MAX_PCT: u64 = 25;
+
 // ---------------------------------------------------------------------------
 // Oncles
 // ---------------------------------------------------------------------------

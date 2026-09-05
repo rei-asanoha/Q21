@@ -1567,7 +1567,8 @@ impl Chain {
         if profondeur <= REORG_PENALTY_FROM_DEPTH {
             return total;
         }
-        let exces = (profondeur - REORG_PENALTY_FROM_DEPTH) * REORG_PENALTY_PCT_PER_BLOCK;
+        let exces = ((profondeur - REORG_PENALTY_FROM_DEPTH) * REORG_PENALTY_PCT_PER_BLOCK)
+            .min(REORG_PENALTY_MAX_PCT);
         // `commun + (1 + exces%) * travail_de_la_branche_active_depuis_la_fourche`
         let majore = depuis_fourche
             .mul_div(100 + exces, 100)
