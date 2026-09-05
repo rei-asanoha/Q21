@@ -522,3 +522,107 @@ Et cet audit a été mené par des auditeurs que j'ai instruits, sur du code que
 j'ai écrit. Il a trouvé onze failles réelles, ce qui prouve son utilité — et ne
 prouve rien sur ce qu'il n'a pas trouvé. **Un audit humain externe reste
 nécessaire avant qu'un seul Q21 ait la moindre valeur.**
+
+---
+
+## Troisième vague — la revue de septembre 2026
+
+Relecture complète, en lecture seule d'abord : toute la suite d'épreuves
+rejouée, deux simulations écrites à côté pour chiffrer ce que les épreuves ne
+mesuraient pas, puis un bilan classé par gravité. Les corrections ont suivi,
+une par commit, chacune avec son épreuve. Le réseau vivant étant le réseau de
+test, les règles ont changé sans activation différée : nouvelle genèse,
+nouvelle magie réseau, protocole version 2.
+
+### Ce qui touchait le cœur du projet
+
+**Le parcours mémoire de la preuve de travail tenait sur 32 bits.** L'indice
+de chaque lecture venait des 32 bits bas de l'accumulateur, et l'addition n'y
+faisait jamais remonter de retenue : les trente-deux lectures d'une tentative
+ne dépendaient que d'un mot de 32 bits. Une table de 2³² sommes — 128 Gio,
+calculée une fois par époque — remplaçait le parcours par une seule lecture,
+et la croissance de la table ne protégeait plus de rien. Vérifié par
+simulation : sur mille paires d'états de mêmes bits bas, aucune ne divergeait.
+L'indice dépend désormais des quatre mots de l'état, et chaque lecture est
+suivie de quatre tours de Feistel sur la finalisation de SplitMix64 — une
+vingtaine de nanosecondes, pour un accès DRAM qui en coûte une centaine.
+Épreuves : `deux_etats_de_memes_bits_bas_ne_parcourent_pas_les_memes_adresses`,
+`une_lecture_se_diffuse_sur_tout_l_etat`.
+
+**Une partition à puissance égale devenait définitive en deux heures.** La
+majoration de réorganisation croissait sans plafond ; chaque moitié du réseau
+se voyait majorée contre l'autre. Simulation avec la règle réelle : dernière
+réunification possible à 66 blocs en médiane pour une minorité à 50 %, 153 à
+40 % — la documentation annonçait vingt-quatre heures. Plafond à 25 % : toute
+majorité au-delà de 56 % réunifie dans la fenêtre. Épreuve `a7`.
+
+**Créer une sortie ne coûtait rien.** Ni plancher, ni tarif au-delà d'une
+unité par millier d'unités de poids : vingt gigaoctets de mémoire vive par
+jour imposés à chaque nœud pour quelques milliers d'unités, et un mineur, qui
+se paie ses propres frais, n'était freiné par rien. Plancher de consensus à
+10 000 unités par sortie, coinbase comprise ; 400 unités de poids par sortie
+créée au relais ; plancher de relais à 10 ; le portefeuille refuse la
+poussière avant de signer et laisse aux frais une monnaie sous le plancher.
+
+**La table plafonne à 4 Gio, plus 8.** Une machine à 8 Go suffit pour
+toujours ; c'était la promesse.
+
+### Ce qui figeait ou trompait le nœud
+
+- Chaque transaction reçue et chaque bloc connecté **recopiaient tout le jeu
+  d'UTXO** sous le verrou global. Le réservoir lit une référence.
+- L'empreinte MuHash était **recalculée intégralement** — une multiplication
+  de 3 072 bits par sortie, 19 µs chacune — à chaque affichage de
+  l'explorateur public et à chaque instantané. Tenue au fil de l'eau ;
+  `commitment()` coûte une division, quelle que soit la taille.
+- La difficulté du bloc suivant recopiait **tous les en-têtes depuis la
+  genèse** à chaque connexion. Elle lit la fenêtre.
+- Le mineur **minait sous le verrou de la chaîne**, deux millions d'essais
+  par tour, et y construisait sa table au changement d'époque : des secondes,
+  puis des minutes, sans un bloc traité ni un pair servi. Il mine dehors.
+- Une branche latérale n'était **pas contrôlée sur l'horodatage** : la
+  difficulté baissait le long de la branche, et des corps de 4 Mio entraient
+  à bon compte. Même contrôle que sur la chaîne active.
+- Les corps d'une amorce adoptée **atteignaient le disque sans être
+  confrontés aux en-têtes**. Ils le sont, avant le moindre octet écrit.
+- La borne symétrique des temps de résolution laissait encore **un tiers de
+  blocs en plus** à qui avançait ses horodatages avec la moitié de la
+  puissance. Borne dissymétrique `[-6T, +4T]` : la manipulation augmente la
+  difficulté et coûte à son auteur ; tolérance future ramenée à dix minutes.
+
+### Ce qui touchait le portefeuille
+
+- Une **confirmation de phrase qui différait** était traitée comme « pas de
+  phrase » : graine en clair pour une faute de frappe. Redemandée, puis refus.
+- Les indices Lamport consommés étaient écrits **après** la signature et via
+  un rappel sans résultat : une coupure au mauvais moment faisait resigner
+  avec une clef morte. Écriture anticipée, `fsync`, refus si le disque refuse.
+- Le message signé n'engageait **ni le réseau ni la sortie dépensée** : une
+  signature du réseau de test valait sur l'autre. Le condensat engage les
+  deux, comme BIP-143.
+- La feuille de Merkle n'engageait que le `txid` : une signature pouvait
+  être **remplacée en transit**. Elle engage aussi le `wtxid`.
+- Secrets effacés à leur destruction, `Q21_PASSPHRASE` retirée de
+  l'environnement après lecture, aucun vidage mémoire sous Unix.
+
+### Ce qui a été retiré
+
+**Les oncles.** Leur part était prélevée sur le mineur qui les incluait :
+personne ne le faisait, le mineur du binaire ne l'a jamais fait, et le
+mécanisme avait déjà porté trois défauts. Un bloc qui en porte est refusé.
+
+### La chaîne de livraison
+
+Chaîne d'outils figée (`rust-toolchain.toml`), attestation de provenance
+signée par GitHub pour chaque archive, `SHA256SUMS` unique signé par
+`minisign` quand le dépôt détient la clef, `cargo deny` sur chaque poussée.
+L'épreuve `audit_difficulte`, entièrement verte depuis la réécriture de son
+dernier constat périmé, bloque désormais la livraison comme les autres.
+
+### Ce qui reste
+
+**La preuve de travail n'a toujours reçu aucune cryptanalyse externe.** Sa
+boucle de mélange vient d'être refaite ; c'est une raison de plus, pas une de
+moins. Les ancrages compilés sont vides tant qu'aucune chaîne n'a assez
+d'histoire pour en mériter un. Et cette revue, comme les précédentes, ne
+prouve rien sur ce qu'elle n'a pas trouvé.
