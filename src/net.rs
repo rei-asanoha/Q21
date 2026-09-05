@@ -1174,8 +1174,16 @@ impl Node {
                 Message::Tx(t) => {
                     self.stats.tx_recues.fetch_add(1, Ordering::Relaxed);
                     let hauteur = g.chain.height();
-                    let utxo = g.chain.utxo.clone();
-                    match g.mempool.accept(&t, &utxo, magie_reseau, hauteur) {
+                    // Sur une reference, jamais sur une copie : dupliquer le jeu
+                    // d'UTXO a chaque transaction recue coutait des centaines de
+                    // mebioctets par message sur une chaine reelle, sous le
+                    // verrou global — un pair bavard suffisait a figer le noeud.
+                    // Le reemprunt `&mut *g` separe les champs de la garde.
+                    let partage = &mut *g;
+                    match partage
+                        .mempool
+                        .accept(&t, &partage.chain.utxo, magie_reseau, hauteur)
+                    {
                         Ok(txid) => {
                             let autres: Vec<u64> =
                                 g.peers.keys().copied().filter(|p| *p != id).collect();
@@ -1363,8 +1371,9 @@ impl Node {
                 }
                 g.mempool.on_block_connected(b);
                 let hauteur = g.chain.height();
-                let utxo = g.chain.utxo.clone();
-                g.mempool.revalidate(&utxo, g.network, hauteur);
+                // Meme regle qu'a la reception d'une transaction : le reservoir
+                // lit le jeu d'UTXO en place, il ne le recopie pas.
+                g.mempool.revalidate(&g.chain.utxo, g.network, hauteur);
 
                 // Diffusion : annonce compacte, pas le bloc entier.
                 //

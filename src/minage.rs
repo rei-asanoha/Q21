@@ -138,7 +138,10 @@ impl Minage {
 
     /// Les dernieres trouvailles, la plus recente en tete.
     pub fn trouves(&self) -> Vec<BlocTrouve> {
-        self.trouves.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.trouves
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Total verse au mineur depuis le lancement, en unites.
@@ -182,7 +185,11 @@ mod tests {
         let m = Minage::new(true);
         m.compter(10_000);
         // La fenetre dure une seconde : rien ne doit encore etre annonce.
-        assert_eq!(m.debit(), 0.0, "un debit tire d'un instant n'est pas un debit");
+        assert_eq!(
+            m.debit(),
+            0.0,
+            "un debit tire d'un instant n'est pas un debit"
+        );
         assert_eq!(m.essais_total(), 10_000);
     }
 
@@ -193,7 +200,10 @@ mod tests {
         std::thread::sleep(FENETRE + std::time::Duration::from_millis(60));
         m.compter(1_000);
         let d = m.debit();
-        assert!(d > 500.0 && d < 4_000.0, "debit hors de tout bon sens : {d}");
+        assert!(
+            d > 500.0 && d < 4_000.0,
+            "debit hors de tout bon sens : {d}"
+        );
     }
 
     #[test]
@@ -233,7 +243,11 @@ mod tests {
         m.bloc_trouve(trouvaille(1, 100));
         m.bloc_trouve(trouvaille(2, 250));
         assert_eq!(m.blocs(), 2);
-        assert_eq!(m.essais_total(), 0, "un bloc trouve n'est pas un essai compte");
+        assert_eq!(
+            m.essais_total(),
+            0,
+            "un bloc trouve n'est pas un essai compte"
+        );
         // Le gain s'accumule, et la trouvaille la plus recente est en tete :
         // c'est elle qu'on cherche des yeux quand l'ecran s'anime.
         assert_eq!(m.gagne_total(), 350);
@@ -254,6 +268,10 @@ mod tests {
         assert_eq!(m.trouves().len(), TROUVES_GARDES);
         assert_eq!(m.blocs(), 200);
         assert_eq!(m.gagne_total(), 2_000);
-        assert_eq!(m.trouves()[0].hauteur, 199, "la plus recente doit etre en tete");
+        assert_eq!(
+            m.trouves()[0].hauteur,
+            199,
+            "la plus recente doit etre en tete"
+        );
     }
 }
