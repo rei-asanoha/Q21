@@ -53,6 +53,24 @@ pub struct UtxoSet {
     /// de deux jeux d'UTXO : deux ensembles identiques restent identiques quel
     /// que soit l'ordre dans lequel ils ont ete construits.
     par_empreinte: HashMap<crate::hash::Hash256, HashSet<OutPoint>>,
+    /// Empreinte MuHash tenue **au fil de l'eau**.
+    ///
+    /// # Pourquoi elle est ici
+    ///
+    /// `commitment()` reconstruisait l'empreinte depuis zero — une
+    /// multiplication modulaire de 3 072 bits **par sortie** — a chaque appel.
+    /// Or elle est appelee par l'explorateur public a chaque affichage de sa
+    /// page, et par l'instantane toutes les cinq minutes, sous le verrou de la
+    /// chaine. A un million de sorties, chaque visite figeait le noeud
+    /// plusieurs secondes : un rafraichissement en boucle suffisait a le
+    /// mettre hors service.
+    ///
+    /// MuHash est fait pour l'incrementiel : inserer multiplie le numerateur,
+    /// retirer multiplie le denominateur, et l'empreinte finale ne coute qu'une
+    /// division. Chaque `insert` et chaque `remove` la tiennent a jour ; c'est
+    /// le meme choix que Bitcoin Core. Comme l'index par empreinte, elle est
+    /// entierement derivee de `map` et n'entre pas dans l'egalite.
+    empreinte: crate::muhash::MuHash,
 }
 
 /// L'index derive ne participe pas a l'egalite : seul l'ensemble des sorties
@@ -99,11 +117,14 @@ impl UtxoSet {
     pub fn insert(&mut self, o: OutPoint, e: UtxoEntry) {
         let empreinte = e.output.pubkey_hash;
         if let Some(ancien) = self.map.insert(o, e) {
-            // Remplacement : l'ancienne empreinte ne designe plus cette sortie.
+            // Remplacement : l'ancienne piece sort de l'empreinte, et
+            // l'ancienne clef ne designe plus cette sortie.
+            self.empreinte.remove(&piece_serialisee(&o, &ancien));
             if ancien.output.pubkey_hash != empreinte {
                 self.desindexer(&ancien.output.pubkey_hash, &o);
             }
         }
+        self.empreinte.insert(&piece_serialisee(&o, &e));
         self.par_empreinte.entry(empreinte).or_default().insert(o);
     }
 
@@ -119,6 +140,7 @@ impl UtxoSet {
     pub fn remove(&mut self, o: &OutPoint) -> Option<UtxoEntry> {
         let e = self.map.remove(o);
         if let Some(v) = &e {
+            self.empreinte.remove(&piece_serialisee(o, v));
             let empreinte = v.output.pubkey_hash;
             self.desindexer(&empreinte, o);
         }
@@ -157,7 +179,23 @@ impl UtxoSet {
     /// ([`crate::state`]) : point de sortie, valeur, schema, empreinte de clef,
     /// hauteur, caractere de coinbase. Ce format est fige : le changer changerait
     /// toutes les empreintes.
+    ///
+    /// # Ce qu'elle coute
+    ///
+    /// Une division modulaire, quelle que soit la taille de l'ensemble :
+    /// l'accumulateur est tenu a jour par `insert` et `remove`. La version qui
+    /// reparcourt tout est [`Self::commitment_recalculee`] ; elle ne sert qu'a
+    /// prouver que les deux coincident.
     pub fn commitment(&self) -> crate::hash::Hash256 {
+        self.empreinte.digest()
+    }
+
+    /// L'empreinte recalculee depuis zero, sortie par sortie.
+    ///
+    /// C'est la definition ; [`Self::commitment`] en est la tenue incrementale.
+    /// Lineaire en la taille de l'ensemble : reservee aux epreuves et aux
+    /// verifications explicites, jamais au chemin chaud.
+    pub fn commitment_recalculee(&self) -> crate::hash::Hash256 {
         let mut mu = crate::muhash::MuHash::new();
         for (o, e) in self.map.iter() {
             mu.insert(&piece_serialisee(o, e));
@@ -414,6 +452,98 @@ mod tests {
 
         // Une empreinte inconnue n'a ni solde ni sortie.
         assert_eq!(u.solde_de(&Hash256([42; 32])), (0, 0));
+    }
+
+    /// L'empreinte tenue au fil de l'eau coincide avec l'empreinte recalculee,
+    /// en toute circonstance : creations, depenses, annulations, remplacement
+    /// d'une sortie sous le meme point, et retrait d'une sortie inconnue.
+    ///
+    /// C'est le contrat qui autorise `commitment()` a ne plus parcourir
+    /// l'ensemble. La moindre derive entre les deux chemins ferait refuser un
+    /// instantane valide — ou accepter un instantane faux — par tout le reseau.
+    #[test]
+    fn l_empreinte_incrementale_coincide_toujours_avec_le_recalcul() {
+        fn verifier(u: &UtxoSet, etape: &str) {
+            assert_eq!(
+                u.commitment(),
+                u.commitment_recalculee(),
+                "{etape} : l'empreinte incrementale diverge du recalcul"
+            );
+        }
+
+        let mut u = UtxoSet::new();
+        verifier(&u, "vide");
+        let vide = u.commitment();
+
+        let a1 = coinbase(5_000, 1);
+        let a2 = coinbase(3_000, 1);
+        let b1 = coinbase(7_000, 2);
+        let mut undo1 = UndoRecord::default();
+        u.apply_transaction(&a1, 1, &mut undo1);
+        verifier(&u, "une creation");
+        u.apply_transaction(&a2, 1, &mut undo1);
+        u.apply_transaction(&b1, 1, &mut undo1);
+        verifier(&u, "trois creations");
+        let trois = u.commitment();
+        assert_ne!(trois, vide);
+
+        let depense = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: a1.txid(),
+                    index: 0,
+                },
+                witness: Witness::default(),
+                sequence: 0,
+            }],
+            outputs: vec![sortie(4_000, 3), sortie(900, 4)],
+            lock_time: 0,
+        };
+        let mut undo2 = UndoRecord::default();
+        u.apply_transaction(&depense, 2, &mut undo2);
+        verifier(&u, "apres depense");
+
+        // L'annulation ramene exactement a l'empreinte d'avant : ce n'est pas
+        // seulement « coherent avec le recalcul », c'est la meme valeur.
+        u.undo(&undo2);
+        verifier(&u, "apres annulation");
+        assert_eq!(u.commitment(), trois);
+
+        // Remplacement sous le meme point de sortie : l'ancienne piece doit
+        // sortir de l'empreinte avant que la nouvelle y entre.
+        let point = OutPoint {
+            txid: b1.txid(),
+            index: 0,
+        };
+        u.insert(
+            point,
+            UtxoEntry {
+                output: sortie(7_000, 9),
+                height: 1,
+                is_coinbase: true,
+            },
+        );
+        verifier(&u, "apres remplacement");
+        assert_ne!(u.commitment(), trois);
+
+        // Retirer une sortie inconnue ne touche a rien.
+        let avant = u.commitment();
+        assert!(u
+            .remove(&OutPoint {
+                txid: Hash256([0xEE; 32]),
+                index: 7,
+            })
+            .is_none());
+        assert_eq!(u.commitment(), avant);
+        verifier(&u, "apres retrait inconnu");
+
+        // Tout annuler ramene a l'ensemble vide, et a son empreinte.
+        u.undo(&undo1);
+        u.remove(&point);
+        assert!(u.is_empty());
+        verifier(&u, "vide a nouveau");
+        assert_eq!(u.commitment(), vide);
     }
 
     #[test]
