@@ -63,6 +63,14 @@ pub enum WalletError {
     /// Aucune somme legitime ne depasse le plafond d'emission. Refuser ici
     /// evite une addition qui deborde — et, en release, un arret du processus.
     MontantHorsBornes,
+    /// L'enregistrement des indices consommes a echoue **avant** la signature.
+    ///
+    /// Rien n'a ete signe : les indices sont reserves en memoire, mais aucune
+    /// signature n'existe, donc aucune clef n'est exposee. Disque plein,
+    /// fichier verrouille, support retire — la depense est refusee plutot que
+    /// de risquer, au prochain envoi, de resigner avec une clef que le disque
+    /// croit encore vierge.
+    EnregistrementImpossible,
 }
 
 /// En deca de ce nombre d'adresses, un cache est resonde **integralement**.
@@ -931,6 +939,33 @@ impl Wallet {
         destinations: &[(Address, Amount)],
         frais: Amount,
     ) -> Result<Transaction, WalletError> {
+        self.create_transaction_multi_gardee(utxo, hauteur, destinations, frais, &mut |_| Ok(()))
+    }
+
+    /// Comme [`Self::create_transaction_multi`], avec une **ecriture anticipee**.
+    ///
+    /// # L'ordre des operations, et pourquoi il compte
+    ///
+    /// Avant, l'ordre etait : signer, placer dans le reservoir, enregistrer,
+    /// annoncer. La transaction existait — et pouvait etre minee par ce noeud
+    /// meme — avant que le disque sache que ses clefs avaient servi. Une
+    /// coupure de courant ou un disque plein entre les deux, et le prochain
+    /// envoi resignait avec une clef a usage unique deja employee : deux
+    /// signatures Lamport d'une meme clef suffisent a en forger une troisieme.
+    ///
+    /// L'ordre est desormais : reserver les indices, **enregistrer**, puis
+    /// signer. `garde` recoit le portefeuille avec les indices deja marques et
+    /// doit les mettre sur le disque de facon durable ; s'il echoue, rien n'est
+    /// signe et la depense est refusee. Un indice reserve pour rien est perdu,
+    /// ce qui ne coute qu'une derivation ; une clef reutilisee coute les fonds.
+    pub fn create_transaction_multi_gardee(
+        &mut self,
+        utxo: &UtxoSet,
+        hauteur: u64,
+        destinations: &[(Address, Amount)],
+        frais: Amount,
+        garde: &mut dyn FnMut(&Wallet) -> Result<(), String>,
+    ) -> Result<Transaction, WalletError> {
         if destinations.is_empty() {
             return Err(WalletError::MontantNul);
         }
@@ -1026,6 +1061,17 @@ impl Wallet {
             clefs.push(pubkey);
         }
 
+        // Ecriture anticipee : les indices sont marques consommes et mis sur le
+        // disque **avant** que la moindre signature existe.
+        for (_, _, index) in &choisies {
+            if !self.consommes.contains(index) {
+                self.consommes.push(*index);
+            }
+        }
+        if garde(&*self).is_err() {
+            return Err(WalletError::EnregistrementImpossible);
+        }
+
         // Signature : le condensat couvre la transaction depouillee, donc il ne
         // change pas a mesure qu'on remplit les temoins.
         for (i, ((_, _, index), pubkey)) in choisies.iter().zip(clefs).enumerate() {
@@ -1034,10 +1080,6 @@ impl Wallet {
                 pubkey,
                 signature: self.sign_at(*index, &message),
             };
-        }
-
-        for (_, _, index) in &choisies {
-            self.consommes.push(*index);
         }
 
         Ok(tx)
@@ -1178,6 +1220,69 @@ mod tests {
         )
         .expect("la transaction devrait valider");
         assert_eq!(frais, Amount::from_units(1_000));
+    }
+
+    /// L'ecriture anticipee : les indices sont sur le disque **avant** la
+    /// signature, et un disque qui refuse empeche la signature.
+    ///
+    /// La garde joue le disque. Elle verifie qu'au moment ou elle est appelee,
+    /// les indices des pieces choisies sont deja marques consommes et
+    /// qu'aucune signature n'existe encore ; puis elle refuse. Rien ne doit
+    /// avoir ete signe, et les indices doivent rester reserves — un indice
+    /// perdu ne coute qu'une derivation, une clef resignee coute les fonds.
+    #[test]
+    fn les_indices_sont_enregistres_avant_de_signer_et_un_disque_qui_refuse_bloque() {
+        let mut w = portefeuille();
+        let c = chaine_avec_fonds(&mut w);
+        let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
+        let a = dest.new_address();
+        let avant: Vec<u32> = w.indices_consommes();
+
+        let mut vus_par_la_garde: Vec<u32> = Vec::new();
+        let r = w.create_transaction_multi_gardee(
+            &c.utxo,
+            c.height(),
+            &[(a, Amount::from_units(50_000))],
+            Amount::from_units(1_000),
+            &mut |portefeuille| {
+                vus_par_la_garde = portefeuille.indices_consommes();
+                Err("disque plein".to_string())
+            },
+        );
+        assert_eq!(r, Err(WalletError::EnregistrementImpossible));
+        assert!(
+            vus_par_la_garde.len() > avant.len(),
+            "la garde doit voir les indices deja consommes"
+        );
+        assert_eq!(
+            w.indices_consommes(),
+            vus_par_la_garde,
+            "les indices reserves restent reserves apres le refus"
+        );
+
+        // Le meme envoi, avec un disque qui accepte : les indices vus par la
+        // garde sont exactement ceux qui signent.
+        let mut vus: Vec<u32> = Vec::new();
+        let tx = w
+            .create_transaction_multi_gardee(
+                &c.utxo,
+                c.height(),
+                &[(a, Amount::from_units(50_000))],
+                Amount::from_units(1_000),
+                &mut |portefeuille| {
+                    vus = portefeuille.indices_consommes();
+                    Ok(())
+                },
+            )
+            .expect("le disque accepte");
+        for entree in &tx.inputs {
+            let h = pubkey_hash(w.scheme(), &entree.witness.pubkey);
+            let index = *w.connues.get(&h).expect("clef du portefeuille");
+            assert!(
+                vus.contains(&index),
+                "l'indice {index} a signe sans avoir ete enregistre d'abord"
+            );
+        }
     }
 
     /// Epreuves du portefeuille ML-DSA — le chemin qui sera celui du reseau

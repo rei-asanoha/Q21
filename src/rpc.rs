@@ -122,6 +122,10 @@ fn message_portefeuille(e: &crate::wallet::WalletError) -> &'static str {
             "incoherence entre la clef derivee et la sortie a depenser : rien \
              n'a ete signe"
         }
+        W::EnregistrementImpossible => {
+            "le portefeuille n'a pas pu etre enregistre avant la signature : rien \
+             n'a ete signe, verifiez le disque"
+        }
     }
 }
 
@@ -189,7 +193,11 @@ pub const ERR_PORTEFEUILLE: i64 = -3;
 /// excuse pour laisser le trou.
 ///
 /// Le rappel est fourni par l'appelant, qui seul sait ou vit le fichier.
-pub type SurChangement = Arc<dyn Fn(&Wallet) + Send + Sync>;
+/// Rappel d'enregistrement du portefeuille.
+///
+/// Rend un resultat : quand il sert d'ecriture anticipee avant une signature,
+/// un echec doit **empecher** la signature, pas seulement etre affiche.
+pub type SurChangement = Arc<dyn Fn(&Wallet) -> Result<(), String> + Send + Sync>;
 
 pub struct RpcContext {
     pub node: Arc<Node>,
@@ -960,9 +968,15 @@ impl RpcContext {
     /// Silencieux si aucun rappel n'est fourni — le cas des epreuves en
     /// memoire. En production l'absence de rappel serait un defaut, et le
     /// lanceur en fournit toujours un.
-    fn enregistrer(&self, w: &Wallet) {
-        if let Some(f) = &self.sur_changement {
-            f(w);
+    /// Enregistre le portefeuille apres une modification.
+    ///
+    /// Un echec est rendu a l'appelant ; les modifications qui ne mettent pas
+    /// de clef en jeu (une etiquette, une adresse neuve) peuvent se contenter
+    /// de le signaler, une depense doit s'arreter dessus.
+    fn enregistrer(&self, w: &Wallet) -> Result<(), String> {
+        match &self.sur_changement {
+            Some(f) => f(w),
+            None => Ok(()),
         }
     }
 
@@ -1569,7 +1583,9 @@ impl RpcContext {
             ));
         }
         g.etiqueter(indice, &texte);
-        self.enregistrer(&g);
+        if let Err(e) = self.enregistrer(&g) {
+            eprintln!("ALERTE : etiquette non enregistree : {e}");
+        }
         Ok(Json::obj()
             .set("indice", Json::u64(indice as u64))
             .set(
@@ -2348,8 +2364,14 @@ impl RpcContext {
             .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
         let a = g.new_address();
         // Le compteur d'indices vient d'avancer : sans ecriture, un redemarrage
-        // redistribuerait la meme adresse.
-        self.enregistrer(&g);
+        // redistribuerait la meme adresse. On ne la donne donc pas si le disque
+        // ne l'a pas vue.
+        self.enregistrer(&g).map_err(|e| {
+            erreur(
+                ERR_PORTEFEUILLE,
+                &format!("adresse non enregistree, donc non distribuee : {e}"),
+            )
+        })?;
         Ok(Json::obj()
             .set("adresse", Json::str(a.to_string_bech32()))
             .set("schema", Json::str(a.scheme.name()))
@@ -2409,12 +2431,12 @@ impl RpcContext {
                 .lock()
                 .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
             let resultat = self.node.with_chain_and_mempool(|c, m| {
-                let tx = g.create_transaction(
+                let tx = g.create_transaction_multi_gardee(
                     &c.utxo,
                     c.height(),
-                    &dest,
-                    Amount::from_units(unites),
+                    &[(dest, Amount::from_units(unites))],
                     Amount::from_units(frais),
+                    &mut |w| self.enregistrer(w),
                 );
                 match tx {
                     Ok(tx) => {
@@ -2424,9 +2446,12 @@ impl RpcContext {
                     Err(e) => Err(e),
                 }
             });
-            // La clef vient peut-etre d'etre consommee : cela doit atteindre le
-            // disque, que la suite reussisse ou non.
-            self.enregistrer(&g);
+            // Les indices sont deja sur le disque (ecriture anticipee, avant
+            // la signature). On enregistre encore pour ce qui a pu bouger
+            // depuis — l'adresse de monnaie, par exemple.
+            if let Err(e) = self.enregistrer(&g) {
+                eprintln!("ALERTE : portefeuille non enregistre apres l'envoi : {e}");
+            }
             let (tx, accepte) =
                 resultat.map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
             let txid = accepte.map_err(|e| erreur(ERR_PORTEFEUILLE, &message_reservoir(&e)))?;
@@ -2502,11 +2527,12 @@ impl RpcContext {
                 .lock()
                 .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
             let resultat = self.node.with_chain_and_mempool(|c, m| {
-                let tx = g.create_transaction_multi(
+                let tx = g.create_transaction_multi_gardee(
                     &c.utxo,
                     c.height(),
                     &destinations,
                     Amount::from_units(frais),
+                    &mut |w| self.enregistrer(w),
                 );
                 match tx {
                     Ok(tx) => {
@@ -2516,7 +2542,9 @@ impl RpcContext {
                     Err(e) => Err(e),
                 }
             });
-            self.enregistrer(&g);
+            if let Err(e) = self.enregistrer(&g) {
+                eprintln!("ALERTE : portefeuille non enregistre apres l'envoi : {e}");
+            }
             let (tx, accepte) =
                 resultat.map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
             let txid = accepte.map_err(|e| erreur(ERR_PORTEFEUILLE, &message_reservoir(&e)))?;
