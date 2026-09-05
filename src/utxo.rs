@@ -256,6 +256,25 @@ impl UtxoSet {
         (somme, nombre)
     }
 
+    /// Toutes les sorties non depensees d'une empreinte, **maturite comprise**.
+    ///
+    /// [`UtxoSet::spendable_for`] ecarte les coinbases trop jeunes ; il faut
+    /// parfois justement celles-la — pour dire a un mineur quand sa recompense
+    /// se liberera. Passer par l'index evite de parcourir tout le jeu pour
+    /// retrouver les quelques sorties d'une seule adresse.
+    pub fn sorties_de(&self, pubkey_hash: &crate::hash::Hash256) -> Vec<(OutPoint, UtxoEntry)> {
+        let Some(points) = self.par_empreinte.get(pubkey_hash) else {
+            return Vec::new();
+        };
+        let mut v: Vec<(OutPoint, UtxoEntry)> = points
+            .iter()
+            .filter_map(|o| self.map.get(o).map(|e| (*o, *e)))
+            .collect();
+        // Ordre deterministe : deux executions doivent rendre la meme reponse.
+        v.sort_by_key(|(o, _)| *o);
+        v
+    }
+
     /// Filtre la maturite des coinbases : une recompense de bloc fraiche n'est
     /// pas depensable.
     pub fn spendable_for(

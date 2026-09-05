@@ -2274,35 +2274,22 @@ impl RpcContext {
                 let hauteur = c.height();
                 let solde = g.balance(&c.utxo, hauteur);
                 let sorties = g.spendable(&c.utxo, hauteur).len();
-                let mut immature = 0u64;
                 // --- « Quand ? » est la question qu'on pose devant un solde bloque.
                 //
                 // Le portefeuille annoncait une somme en attente de maturite sans
                 // jamais dire a quelle date elle se libererait. Un mineur voyait
                 // donc son gain monter et son solde disponible rester a zero,
                 // pendant des heures, sans le moindre reperage. Plusieurs y ont vu
-                // une panne. On rend donc la hauteur de la **prochaine** liberation
-                // et le montant qu'elle porte : de quoi afficher un compte a
-                // rebours plutot qu'un mystere.
-                let mut prochaine: Option<(u64, u64)> = None;
-                for (_, e) in c.utxo.iter() {
-                    if e.is_coinbase
-                        && hauteur < e.height + COINBASE_MATURITY
-                        && g.owns(&e.output.pubkey_hash)
-                    {
-                        immature += e.output.value.units();
-                        let libre_a = e.height + COINBASE_MATURITY;
-                        match prochaine {
-                            // A hauteur egale, on cumule : plusieurs sorties d'un
-                            // meme bloc se liberent ensemble.
-                            Some((h, m)) if h == libre_a => {
-                                prochaine = Some((h, m + e.output.value.units()))
-                            }
-                            Some((h, _)) if h < libre_a => {}
-                            _ => prochaine = Some((libre_a, e.output.value.units())),
-                        }
-                    }
-                }
+                // une panne. On rend donc la hauteur de la **prochaine**
+                // liberation et le montant qu'elle porte.
+                //
+                // Le calcul passe par l'index d'empreintes du jeu d'UTXO : cette
+                // requete revient toutes les six secondes, et un balayage complet
+                // sous le verrou de consensus aurait fait figer la validation des
+                // blocs au rythme du rafraichissement de l'interface.
+                let (immature_montant, prochaine_amount) = g.immature(&c.utxo, hauteur);
+                let immature = immature_montant.units();
+                let prochaine: Option<(u64, u64)> = prochaine_amount.map(|(h, m)| (h, m.units()));
                 // Ce qu'une adresse reutilisee a immobilise. Une clef a usage unique
                 // ne signe qu'une fois : la seconde piece recue sur une meme adresse
                 // ne sera jamais depensable. La taire ferait disparaitre des fonds
