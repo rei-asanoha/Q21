@@ -61,6 +61,30 @@
 //! quatre ruptures de chaine defensives entre 2018 et 2019 pour obtenir le meme
 //! effet a la main ; on prefere l'automatiser.
 //!
+//! # Ce que la revue de septembre 2026 a corrige
+//!
+//! La boucle de melange derivait l'indice de la prochaine lecture des **32
+//! bits de poids faible** de l'accumulateur, et l'accumulation etait une
+//! addition dont la retenue ne remonte jamais dans ces bits. Tout le parcours
+//! — les [`POW_K`] lectures — ne dependait donc que d'un mot de 32 bits, quel
+//! que soit le reste de l'etat. Une table de 2^32 entrees (128 Gio), calculee
+//! une fois par epoque, remplacait les 32 lectures dependantes par une seule :
+//! un gain de bande passante x32 pour une machine a memoire HBM, et une
+//! croissance de la table devenue sans effet, puisque l'etat restait sur 32
+//! bits quelle que soit sa taille. La faiblesse etait mathematique, pas
+//! statistique : deux etats qui ne different que par leurs 224 bits hauts
+//! parcouraient exactement les memes adresses.
+//!
+//! L'indice se derive desormais d'un melange des **quatre** mots de l'etat, et
+//! chaque lecture est suivie d'une diffusion sur toute la largeur — quatre
+//! tours de Feistel batis sur la finalisation de SplitMix64. Apres une seule
+//! iteration, chaque bit de l'etat depend de chaque bit de la lecture et de
+//! l'etat precedent ; il n'existe plus de sous-etat court dont le parcours
+//! dependrait. Le cout est d'une dizaine de nanosecondes, contre une centaine
+//! pour l'acces a la DRAM qu'il suit : la memoire reste le goulot, ce qui est
+//! tout l'objet. La meme correction s'applique a la generation des elements
+//! depuis le cache.
+//!
 //! # Avertissement que ce fichier se doit de porter
 //!
 //! Concevoir une fonction de preuve de travail est un exercice ou l'on se trompe
@@ -286,8 +310,8 @@ pub fn element(cache: &PowCache, i: u32) -> Hash256 {
         tagged_hash_parts(TAG_ELEM, &[cache.seed.as_bytes(), &i.to_le_bytes()]).as_bytes(),
     );
     for _ in 0..POW_J {
-        let idx = (acc.0[0] as u32) % cache.c;
-        acc = acc.wrapping_add(cache.lire(idx));
+        let idx = index_from(&acc, cache.c);
+        acc = absorber(acc, cache.lire(idx));
     }
     tagged_hash_parts(TAG_ELEM_FINAL, &[&acc.to_be_bytes()])
 }
@@ -368,13 +392,58 @@ fn seed_of_header(header: &BlockHeader) -> Hash256 {
     tagged_hash_parts(TAG_SEED, &[&header.encode()])
 }
 
+/// Finalisation de SplitMix64 : une bijection de 64 bits ou chaque bit de
+/// sortie depend de chaque bit d'entree. Trois decalages, deux multiplications.
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 /// Derive l'indice du prochain acces depuis l'accumulateur courant.
 ///
 /// Cree la dependance sequentielle : impossible de savoir ou lire ensuite avant
 /// d'avoir integre la lecture precedente.
+///
+/// Les **quatre** mots de l'etat entrent dans l'indice. La version qui ne
+/// lisait que le mot bas rendait le parcours entier fonction de 32 bits — voir
+/// la note de tete du module. Les bits de poids fort du melange sont retenus :
+/// ce sont ceux que les multiplications ont le mieux brasses.
 #[inline]
 fn index_from(acc: &U256, n: u32) -> u32 {
-    (acc.0[0] as u32) % n
+    let m = mix64(
+        acc.0[0] ^ acc.0[1].rotate_left(17) ^ acc.0[2].rotate_left(34) ^ acc.0[3].rotate_left(51),
+    );
+    ((m >> 32) as u32) % n
+}
+
+/// Integre une lecture a l'etat, puis diffuse sur toute la largeur.
+///
+/// L'addition modulo 2^256 conserve la chaine de retenues. Suivent quatre
+/// tours de Feistel sur les quatre mots, deux mots modifies par tour a partir
+/// de deux mots laisses intacts : chaque tour est une bijection par
+/// construction, et les deux operations d'un tour sont independantes, donc
+/// le processeur les execute de front. Apres le quatrieme tour, chaque mot de
+/// sortie depend de chacun des quatre mots d'entree — c'est ce qui manquait.
+/// L'etat reste uniformement distribue, et deux etats distincts ne peuvent
+/// pas se rejoindre autrement que par une collision de la lecture elle-meme.
+/// Une quinzaine de nanosecondes de latence, pour une lecture DRAM qui en
+/// coute une centaine.
+#[inline]
+fn absorber(acc: U256, lecture: U256) -> U256 {
+    let mut s = acc.wrapping_add(lecture).0;
+    s[1] ^= mix64(s[0]);
+    s[3] ^= mix64(s[2]);
+    s[0] ^= mix64(s[3]);
+    s[2] ^= mix64(s[1]);
+    s[1] ^= mix64(s[0]);
+    s[3] ^= mix64(s[2]);
+    s[0] ^= mix64(s[1]);
+    s[2] ^= mix64(s[3]);
+    U256(s)
 }
 
 /// Boucle de melange.
@@ -388,8 +457,9 @@ fn index_from(acc: &U256, n: u32) -> u32 {
 /// au lieu de le lire ne coutait donc presque rien, et la memoire n'etait pas le
 /// goulot d'etranglement — la promesse anti-ASIC etait vide.
 ///
-/// La boucle ne fait plus qu'une addition modulo 2^256 par acces. Le cout d'une
-/// iteration devient celui de la lecture memoire, et rien d'autre.
+/// La boucle ne fait qu'une addition modulo 2^256 et une diffusion de quelques
+/// nanosecondes par acces ([`absorber`]). Le cout d'une iteration reste celui
+/// de la lecture memoire, et presque rien d'autre.
 ///
 /// Le condensat n'intervient plus qu'aux deux extremites, comme dans
 /// Autolykos v2 : une fois pour derouler la graine, une fois pour produire la
@@ -399,7 +469,7 @@ fn melange(depart: Hash256, mut lire: impl FnMut(u32) -> U256, n: u32) -> Hash25
     let mut acc = U256::from_be_bytes(depart.as_bytes());
     for _ in 0..POW_K {
         let idx = index_from(&acc, n);
-        acc = acc.wrapping_add(lire(idx));
+        acc = absorber(acc, lire(idx));
     }
     tagged_hash_parts(TAG_FINAL, &[&acc.to_be_bytes()])
 }
@@ -832,5 +902,101 @@ mod tests {
              la derivation est trop bon marche et le compromis temps-memoire \
              redevient favorable a l'attaquant"
         );
+    }
+
+    /// Le parcours en memoire ne depend plus d'un sous-etat court.
+    ///
+    /// # Le defaut que cette epreuve fige
+    ///
+    /// L'indice de lecture venait des 32 bits bas de l'accumulateur, et
+    /// l'addition n'y faisait jamais remonter de retenue : deux etats qui ne
+    /// differaient que par leurs 224 bits hauts lisaient exactement les memes
+    /// adresses, dans le meme ordre, et la somme des lectures etait la meme.
+    /// Une table de 2^32 sommes (128 Gio) par epoque remplacait alors les
+    /// trente-deux lectures dependantes par une seule.
+    ///
+    /// On rejoue mille paires d'etats de memes bits bas ; aucune ne doit
+    /// partager son parcours.
+    #[test]
+    fn deux_etats_de_memes_bits_bas_ne_parcourent_pas_les_memes_adresses() {
+        fn parcours(depart: U256, n: u32) -> Vec<u32> {
+            let mut acc = depart;
+            let mut v = Vec::with_capacity(POW_K);
+            for _ in 0..POW_K {
+                let idx = index_from(&acc, n);
+                v.push(idx);
+                // Une « table » synthetique : l'element ne depend que de son
+                // indice, comme une vraie table.
+                let lecture = U256::from_be_bytes(
+                    tagged_hash_parts("Q21/test/elem", &[&idx.to_le_bytes()]).as_bytes(),
+                );
+                acc = absorber(acc, lecture);
+            }
+            v
+        }
+        let n = 1u32 << 26;
+        let mut graine = 0x9E37_79B9_7F4A_7C15u64;
+        let mut suivant = move || {
+            graine = mix64(graine.wrapping_add(0x1234_5678_9ABC_DEF1));
+            graine
+        };
+        let mut identiques = 0;
+        for _ in 0..1000 {
+            let bas = suivant() & 0xFFFF_FFFF;
+            let a = U256([suivant() << 32 | bas, suivant(), suivant(), suivant()]);
+            let b = U256([suivant() << 32 | bas, suivant(), suivant(), suivant()]);
+            assert_eq!(
+                a.0[0] as u32, b.0[0] as u32,
+                "meme mot bas par construction"
+            );
+            if parcours(a, n) == parcours(b, n) {
+                identiques += 1;
+            }
+        }
+        assert_eq!(
+            identiques, 0,
+            "{identiques} paires sur 1000 partagent leur parcours : le parcours depend d'un \
+             sous-etat court"
+        );
+    }
+
+    /// Chaque bit de l'etat comme de la lecture se diffuse sur toute la largeur.
+    ///
+    /// Inverser un seul bit en entree de `absorber` doit changer environ la
+    /// moitie des 256 bits de sortie — le critere d'avalanche. On l'exige entre
+    /// un quart et trois quarts pour chacun des 512 bits d'entree, ce qui
+    /// exclut toute lane independante : c'est exactement ce qui manquait.
+    #[test]
+    fn une_lecture_se_diffuse_sur_tout_l_etat() {
+        fn poids(a: U256, b: U256) -> u32 {
+            (0..4).map(|i| (a.0[i] ^ b.0[i]).count_ones()).sum()
+        }
+        let acc = U256([
+            0x0123_4567_89AB_CDEF,
+            0xFEDC_BA98_7654_3210,
+            0x0F1E_2D3C_4B5A_6978,
+            0x8796_A5B4_C3D2_E1F0,
+        ]);
+        let lecture = U256([
+            0xDEAD_BEEF_CAFE_F00D,
+            0x1357_9BDF_2468_ACE0,
+            0x0000_0000_0000_0001,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ]);
+        let reference = absorber(acc, lecture);
+        for bit in 0..512u32 {
+            let (mut a, mut l) = (acc, lecture);
+            if bit < 256 {
+                a.0[(bit / 64) as usize] ^= 1u64 << (bit % 64);
+            } else {
+                let b = bit - 256;
+                l.0[(b / 64) as usize] ^= 1u64 << (b % 64);
+            }
+            let p = poids(reference, absorber(a, l));
+            assert!(
+                (64..=192).contains(&p),
+                "le bit {bit} ne change que {p} bits de sortie sur 256"
+            );
+        }
     }
 }
