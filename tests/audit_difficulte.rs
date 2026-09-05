@@ -224,7 +224,7 @@ fn a1_manipulation_horodatage_fait_chuter_la_difficulte() {
             let infl = base.intervalle_reel_moyen / r.intervalle_reel_moyen;
             chute_max = chute_max.max(chute);
             println!(
-                "{:>6.1} {:>10} {:>14.1} {:>13.1}% {:>10.1} {:>11.2}x",
+                "{:>6.1} {:>10} {:>14.1} {:>13.1}% {:>10.1} {:>11.2}x  ({} horodatage(s) refuse(s))",
                 part * 100.0,
                 match strat {
                     Strategie::FuturMax => "futur+2h",
@@ -234,7 +234,8 @@ fn a1_manipulation_horodatage_fait_chuter_la_difficulte() {
                 r.difficulte_moyenne,
                 chute * 100.0,
                 r.intervalle_reel_moyen,
-                infl
+                infl,
+                r.horodatages_refuses
             );
         }
     }

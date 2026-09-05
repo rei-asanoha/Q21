@@ -666,7 +666,7 @@ fn un_paiement_de_poussiere_est_refuse_et_la_monnaie_de_poussiere_va_aux_frais()
 
     let mut w = Wallet::from_seed([0x77; 32], RESEAU);
     let mut c = Chain::new(RESEAU, genesis_block(RESEAU));
-    let mut miner = |c: &mut Chain, w: &mut Wallet, de: u64, a: u64| {
+    let miner = |c: &mut Chain, w: &mut Wallet, de: u64, a: u64| {
         for i in de..=a {
             let adresse = w.new_address();
             let t = horodatage(i);
