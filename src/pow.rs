@@ -1,19 +1,34 @@
 //! Preuve de travail.
 //!
-//! # Ce module est un echafaudage, et il faut le dire clairement
+//! # Ce que la chaine emploie reellement
 //!
-//! La preuve de travail definitive de Q21 est *memory-hard* a table croissante :
-//! c'est le levier A de la section 5 du livre blanc, celui qui aplatit la courbe
-//! d'efficacite entre un processeur ordinaire et du materiel dedie. Elle releve
-//! de la phase 3.
+//! La preuve de travail de Q21 est [`Q21Pow`] : *memory-hard* a deux niveaux et
+//! a table croissante, decrite en detail dans [`crate::memhard`]. C'est elle que
+//! la chaine emploie pour valider comme pour miner, et c'est le levier
+//! anti-ASIC du projet — celui qui aplatit la courbe d'efficacite entre un
+//! processeur ordinaire et du materiel dedie, et donc ce qui decide si Q21 sera
+//! minable par des gens ou par des fonderies.
 //!
-//! Ce fichier fournit en attendant une preuve de travail SHA-256 classique, qui
-//! permet a la chaine de fonctionner et d'etre testee. **Elle n'a aucune
-//! propriete anti-ASIC.** Deployer Q21 avec cette fonction reviendrait a
-//! reproduire exactement la centralisation industrielle que le projet combat.
+//! [`Sha256Pow`] existe encore, mais ne sert qu'aux epreuves qui n'ont rien a
+//! voir avec la memoire — miner deux cents blocs de regression sans construire
+//! de table. **Elle n'a aucune propriete anti-ASIC et n'est branchee sur aucune
+//! chaine.**
 //!
-//! Le decoupage derriere [`PowEngine`] existe pour que la phase 3 remplace
-//! l'algorithme sans toucher a la validation ni a la chaine.
+//! Cette note disait l'inverse jusqu'ici : elle presentait ce fichier comme un
+//! echafaudage fournissant « en attendant » une preuve SHA-256, et avertissait
+//! qu'un deploiement reproduirait la centralisation industrielle que le projet
+//! combat. C'etait vrai avant que [`crate::memhard`] existe ; ce ne l'est plus
+//! depuis. Une documentation qui decrit le contraire du code est pire qu'une
+//! documentation absente — surtout sur la propriete dont depend la philosophie
+//! du projet, et que tout lecteur du depot vient verifier ici en premier.
+//!
+//! # Ce que le decoupage par [`PowEngine`] apporte encore
+//!
+//! Le trait ne porte que le condensat ; la comparaison a la cible est commune a
+//! tous ses implementeurs. Il n'existe donc qu'une seule regle de validite du
+//! travail, et changer d'algorithme ne peut pas la faire deriver. C'est ce qui
+//! permet a [`Q21PowAvecCache`] d'accelerer la verification d'une chaine
+//! entiere sans reecrire cette regle.
 //!
 //! # Cible compacte
 //!
