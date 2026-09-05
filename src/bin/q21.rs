@@ -623,11 +623,25 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     // `wallet.seq` avait deja cette precaution ; le fichier qui porte les fonds
     // ne l'avait pas.
     let tmp = chemin.with_extension("tmp");
-    std::fs::write(&tmp, &octets).map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(&octets).map_err(|e| e.to_string())?;
+        // Jusqu'au disque, pas seulement jusqu'au cache du systeme : ce fichier
+        // sert d'ecriture anticipee avant une signature a usage unique, et une
+        // coupure de courant juste apres le renommage ne doit pas rendre un
+        // indice que l'on vient de consommer.
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
     // Le temporaire porte deja la graine : on le restreint avant meme qu'il
     // prenne son nom definitif.
     let _ = restreindre_acces(&tmp);
     std::fs::rename(&tmp, &chemin).map_err(|e| e.to_string())?;
+    // Le renommage lui-meme doit atteindre le disque : sans cela, le repertoire
+    // peut encore designer l'ancien fichier apres une coupure.
+    if let Ok(dir) = std::fs::File::open(d) {
+        let _ = dir.sync_all();
+    }
 
     // --- Le fichier qui porte les fonds.
     //
@@ -1840,9 +1854,16 @@ fn cmd_send(
     let valeur = parse_montant(montant)?;
     let frais = Amount::from_units(1_000);
 
+    let datadir = e.datadir.clone();
     let tx = e
         .wallet
-        .create_transaction(&e.chain.utxo, e.chain.height(), &dest, valeur, frais)
+        .create_transaction_multi_gardee(
+            &e.chain.utxo,
+            e.chain.height(),
+            &[(dest, valeur)],
+            frais,
+            &mut |w| ecrire_portefeuille(&datadir, w),
+        )
         .map_err(|x| match x {
             q21_core::wallet::WalletError::FondsInsuffisants {
                 disponible,
@@ -3348,9 +3369,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 None
             } else {
                 Some(std::sync::Arc::new(move |w: &Wallet| {
-                    if let Err(e) = ecrire_portefeuille(&dossier, w) {
+                    ecrire_portefeuille(&dossier, w).map_err(|e| {
                         eprintln!("ALERTE : portefeuille non enregistre apres modification : {e}");
-                    }
+                        e
+                    })
                 }))
             },
         };
