@@ -3631,12 +3631,53 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // Les transactions du mempool entrent dans le bloc, dans l'ordre
             // topologique impose par la selection.
             let selection = node.with_mempool(|m| m.select_for_block(2_000_000));
-            // La variante comptante : le debit affiche a l'ecran doit etre une
-            // mesure, pas une estimation tiree du plafond d'essais.
-            let (bloc, essais) = node.with_chain(|c| {
+            // Le candidat s'assemble sous le verrou ; le minage se fait
+            // dehors. Miner sous le verrou figeait le noeud plusieurs secondes
+            // par tour — aucun bloc recu, aucun pair servi — et la construction
+            // de la table, au changement d'epoque, le figeait des minutes.
+            let (mut candidat, epoque, params, table_prete, fils) = node.with_chain(|c| {
                 let t = maintenant().max(c.tip().time + 1);
-                c.mine_block_comptant(beneficiaire, schema, &selection, t, 2_000_000)
+                let b = c.candidat_de_minage(beneficiaire, schema, &selection, t);
+                let epoque = q21_core::memhard::epoch_of(b.header.height);
+                (
+                    b,
+                    epoque,
+                    c.pow_params(),
+                    c.table_si_prete(epoque),
+                    c.mining_threads(),
+                )
             });
+            let table = match table_prete {
+                Some(t) => t,
+                None => {
+                    let mio = q21_core::memhard::table_size(params, epoque) as u64
+                        * q21_core::consensus::POW_ELEMENT_SIZE as u64
+                        / (1024 * 1024);
+                    println!(
+                        "  minage : construction de la table de l'epoque {epoque} ({}), \
+                         le noeud reste en service pendant ce temps",
+                        if mio == 0 {
+                            "moins d'un Mio".to_string()
+                        } else {
+                            format!("{mio} Mio")
+                        }
+                    );
+                    let t = std::sync::Arc::new(q21_core::memhard::PowTable::build(params, epoque));
+                    node.with_chain(|c| c.adopter_table(t.clone()));
+                    t
+                }
+            };
+            // Le debit affiche a l'ecran est une mesure : `essai` est l'indice
+            // du gagnant, donc `essai + 1` tentatives ont eu lieu.
+            let (bloc, essais) = match q21_core::pow::mine_with_table_parallel(
+                &mut candidat.header,
+                &table,
+                2_000_000,
+                fils,
+            ) {
+                Ok(essai) => (Some(candidat), essai.saturating_add(1)),
+                Err(faits) => (None, faits),
+            };
             minage.compter(essais);
             if let Some(b) = bloc {
                 let ok = node.with_chain(|c| c.connect(&b, maintenant()).is_ok());

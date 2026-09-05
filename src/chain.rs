@@ -1114,6 +1114,48 @@ impl Chain {
         f(&t)
     }
 
+    /// La table de l'epoque, si elle est deja construite. Ne construit rien :
+    /// c'est a l'appelant de le faire **hors du verrou** et de la rendre par
+    /// [`Self::adopter_table`].
+    pub fn table_si_prete(&self, epoch: u64) -> Option<std::sync::Arc<PowTable>> {
+        self.table
+            .borrow()
+            .as_ref()
+            .filter(|t| t.epoch() == epoch)
+            .cloned()
+    }
+
+    /// Retient une table construite ailleurs, pour que le mineur ne la
+    /// reconstruise pas.
+    pub fn adopter_table(&self, table: std::sync::Arc<PowTable>) {
+        *self.table.borrow_mut() = Some(table);
+    }
+
+    /// Le bloc candidat du prochain minage, sans preuve de travail.
+    ///
+    /// # Pourquoi le minage ne se fait plus ici
+    ///
+    /// Le minage comptant assemblait **et minait** sous le verrou de la
+    /// chaine — donc sous le verrou du noeud entier : deux millions d'essais
+    /// par tour, plusieurs secondes sur un petit processeur, pendant lesquelles
+    /// aucun bloc recu n'etait traite, aucune transaction relayee, aucun pair
+    /// servi. Et au changement d'epoque, la construction de la table — des
+    /// minutes — figeait le noeud de la meme facon.
+    ///
+    /// Le noeud assemble le candidat ici, rend le verrou, mine dehors avec la
+    /// table qu'il detient, puis revient connecter le bloc. Si la tete a bouge
+    /// entre-temps, la connexion echoue proprement et le tour suivant repart
+    /// du bon parent.
+    pub fn candidat_de_minage(
+        &self,
+        beneficiaire: Hash256,
+        scheme: SchemeId,
+        mempool: &[Transaction],
+        horodatage: u64,
+    ) -> Block {
+        self.assembler_candidat(beneficiaire, scheme, mempool, &[], horodatage)
+    }
+
     /// Table de l'epoque demandee, construite si besoin, partageable entre fils.
     fn table_for(&self, epoch: u64) -> std::sync::Arc<PowTable> {
         let mut cache = self.table.borrow_mut();
@@ -1902,9 +1944,9 @@ impl Chain {
 
     /// Le bloc candidat, complet et coherent, mais sans preuve de travail.
     ///
-    /// Extrait de [`Self::mine_block_with_uncles`] pour que le minage comptant
-    /// puisse le reutiliser : deux facons d'assembler un candidat, c'est deux
-    /// facons de se tromper sur la coinbase.
+    /// Extrait de [`Self::mine_block_with_uncles`] pour que le minage du noeud
+    /// ([`Self::candidat_de_minage`]) le reutilise : deux facons d'assembler un
+    /// candidat, c'est deux facons de se tromper sur la coinbase.
     fn assembler_candidat(
         &self,
         beneficiaire: Hash256,
@@ -1974,30 +2016,6 @@ impl Chain {
         b.header.merkle_root = b.compute_merkle_root();
         b.header.uncles_root = b.compute_uncles_root();
         b
-    }
-
-    /// Comme [`Self::mine_block`], mais rend aussi le nombre d'essais consommes.
-    ///
-    /// Le compte est indispensable pour afficher un debit qui soit une mesure.
-    /// L'estimer — « si aucun bloc n'est sorti, c'est que `max_essais` ont ete
-    /// faits » — surevalue chaque tour gagnant, et un mineur qui trouve souvent
-    /// verrait un chiffre faux precisement quand il regarde.
-    pub fn mine_block_comptant(
-        &self,
-        beneficiaire: Hash256,
-        scheme: SchemeId,
-        mempool: &[Transaction],
-        horodatage: u64,
-        max_essais: u64,
-    ) -> (Option<Block>, u64) {
-        let hauteur = self.height() + 1;
-        let mut b = self.assembler_candidat(beneficiaire, scheme, mempool, &[], horodatage);
-        let table = self.table_for(crate::memhard::epoch_of(hauteur));
-        match pow::mine_with_table_parallel(&mut b.header, &table, max_essais, self.fils_minage) {
-            // `essai` est l'indice du gagnant : il y a eu `essai + 1` tentatives.
-            Ok(essai) => (Some(b), essai.saturating_add(1)),
-            Err(faits) => (None, faits),
-        }
     }
 }
 
