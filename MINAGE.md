@@ -128,10 +128,18 @@ précisément ce document qui explique pourquoi il est important.)*
 C'est tout. Pas de matériel à acheter, pas de machine dédiée. L'ordinateur sur
 lequel vous lisez cette page convient probablement.
 
-> ⚠️ **Prévoyez de la mémoire pour l'avenir.** Le dictionnaire monte à 8 Go en
-> cinq à six ans. Une machine à 8 Go de mémoire vive suffira longtemps, mais pas
-> éternellement. Une machine qui ne mine pas, elle, n'aura jamais besoin que du
-> petit carnet — 64 Mo aujourd'hui, 256 Mo au maximum.
+> ⚠️ **Prévoyez de la mémoire pour l'avenir.** Le dictionnaire grandit de 5 %
+> tous les 71 jours et **plafonne à 4 Go**, atteints vers la troisième année.
+> Une machine à 8 Go de mémoire vive suffit donc pour toujours. Une machine qui
+> ne mine pas, elle, n'aura jamais besoin que du petit carnet — 64 Mo
+> aujourd'hui, 128 Mo au maximum.
+>
+> | Quand | Taille du dictionnaire |
+> |---|---|
+> | au lancement | 2,0 Go |
+> | après 1 an | 2,6 Go |
+> | après 2 ans | 3,3 Go |
+> | à partir de 3 ans | 4,0 Go — et plus jamais davantage |
 
 ### Est-ce que ma machine peut miner ? Cas par cas
 
@@ -143,7 +151,8 @@ lequel vous lisez cette page convient probablement.
 | **Mac Intel** | ✅ oui | Un binaire lui est destiné |
 | **PC sous Linux** | ✅ oui | Binaire `q21-linux-x86_64` |
 | **Raspberry Pi 5, 16 Go** | ⚠️ oui, mais lentement | Voir plus bas |
-| **Raspberry Pi 5, 8 Go ou moins** | ⚠️ pour un temps | La table dépasse 8 Go vers la sixième année |
+| **Raspberry Pi 5, 8 Go** | ⚠️ oui, mais lentement | 4 Go de table, 4 Go pour le reste : ça tient, pour toujours |
+| **Raspberry Pi 5, 4 Go ou moins** | ❌ non | La table seule remplit toute la mémoire |
 | **Raspberry Pi 4 ou antérieur** | ❌ non | 8 Go maximum, et une mémoire bien trop lente |
 | **Windows XP, Vista, 7, 8** | ❌ non | Deux raisons, toutes deux définitives — voir plus bas |
 | **Un téléphone** | ❌ non | Ni la mémoire, ni le refroidissement, ni l'autorisation du système |
@@ -182,7 +191,7 @@ Mais soyons précis sur ce qu'il faut en attendre :
   de son plafond de 8 Gio, vers la sixième année, et deviendra alors inutilisable
   pour le minage.
 - **En revanche, pour faire tourner un nœud qui ne mine pas, un Pi est parfait**,
-  et le restera : un vérificateur n'a jamais besoin que du petit carnet, 256 Mo
+  et le restera : un vérificateur n'a jamais besoin que du petit carnet, 128 Mo
   au maximum, pour toujours.
 
 C'est d'ailleurs le meilleur usage d'un Pi dans ce réseau : un point de
