@@ -68,6 +68,7 @@ jobs:
           cargo test --locked --features mldsa,audit --test audit_muhash
           cargo test --locked --features mldsa,audit --test audit_synchro_rapide
           cargo test --locked --features mldsa,audit --test fuzz_decodeurs
+          cargo test --locked --features mldsa,audit --test audit_difficulte
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --features mldsa,audit
@@ -77,35 +78,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
 
   # ---------------------------------------------------------------------------
-  # Les constats encore ouverts
+  # Les dependances
   # ---------------------------------------------------------------------------
   #
-  # Deux fichiers d'audit — difficulte, reservoir — signalent
-  # leurs trouvailles **en echouant**. C'est leur convention : un test qui tombe
-  # y decrit un defaut vivant, pas une regression.
-  #
-  # Les faire bloquer la livraison reviendrait a les supprimer, et les supprimer
-  # reviendrait a oublier ce qu'ils disent. Ils tournent donc a part, sans
-  # bloquer, et leur sortie est publiee : quiconque ouvre cette execution voit
-  # exactement ce qui reste ouvert.
-  #
-  # Ils rejoignent les epreuves bloquantes au fur et a mesure des corrections,
-  # comme l'ont fait `audit_persistance`, `audit_rpc`, `audit_arith`, et
-  # maintenant `audit_mempool` — dont les quatorze controles d'engorgement
-  # passent tous, une fois l'anti-engorgement en place.
-  constats:
-    name: Constats encore ouverts
+  # Une seule dependance directe, vendorisee — mais une faille publiee sur
+  # l'une de ses dependances transitives doit se voir le jour meme, pas au
+  # prochain audit. `cargo deny` confronte `Cargo.lock` a la base RustSec, et
+  # applique la politique de `deny.toml` : licences, doublons, sources.
+  dependances:
+    name: Dependances (RustSec, licences, sources)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Audits diagnostiques
-        continue-on-error: true
-        run: |
-          for f in audit_difficulte; do
-            echo "::group::$f"
-            cargo test --locked --features mldsa,audit --no-fail-fast --test "$f" || true
-            echo "::endgroup::"
-          done
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          arguments: --all-features
