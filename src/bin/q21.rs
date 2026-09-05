@@ -955,6 +955,51 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     Ok(w)
 }
 
+/// Range les fichiers d'une chaine d'une autre genese dans un sous-dossier.
+///
+/// Rien n'est efface. Le portefeuille, sa serie, son cache d'adresses et la
+/// clef du noeud restent en place : ce sont les fichiers de la personne, pas
+/// ceux de la chaine.
+fn ranger_l_ancienne_chaine(datadir: &Path, genese_vue: Hash256) -> Result<(), String> {
+    let hex = genese_vue.to_hex();
+    let dossier = datadir.join(format!("ancienne-chaine-{}", &hex[..12]));
+    std::fs::create_dir_all(&dossier).map_err(|e| e.to_string())?;
+    let a_ranger = [
+        chemin_blocs(datadir),
+        chemin_etat(datadir),
+        chemin_entetes(datadir),
+        chemin_index(datadir),
+        chemin_pairs(datadir),
+        chemin_reservoir(datadir),
+        chemin_adoption(datadir),
+    ];
+    let mut ranges = 0;
+    for f in a_ranger {
+        if f.exists() {
+            let nom = f.file_name().ok_or("nom de fichier vide")?;
+            std::fs::rename(&f, dossier.join(nom)).map_err(|e| {
+                format!(
+                    "impossible de ranger {} dans {} : {e}",
+                    f.display(),
+                    dossier.display()
+                )
+            })?;
+            ranges += 1;
+        }
+    }
+    println!();
+    println!("  Le reseau est reparti d'une nouvelle genese.");
+    println!(
+        "  Les {ranges} fichier(s) de l'ancienne chaine ({}...) sont ranges dans",
+        &hex[..12]
+    );
+    println!("      {}", dossier.display());
+    println!("  Votre portefeuille n'a pas bouge. La nouvelle chaine se synchronise");
+    println!("  depuis le reseau ; l'ancien solde appartenait a l'ancienne chaine.");
+    println!();
+    Ok(())
+}
+
 fn chemin_etat(d: &Path) -> PathBuf {
     d.join("state.dat")
 }
@@ -1126,12 +1171,33 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
 
     // 1. Balayage des en-tetes : une lecture sequentielle, aucun corps decode.
     //
-    // Un dossier vide n'est pas une erreur quand on sait de quel reseau il
-    // s'agit : la genese est deterministe, chacun peut donc l'ecrire lui-meme.
-    // C'est ce qui permet a quelqu'un de rejoindre le reseau sans recevoir de
-    // fichier de personne — et donc sans avoir a faire confiance a personne
-    // pour la racine de la chaine.
-    if reseau_impose.is_some() && !chemin_blocs(datadir).exists() {
+    // Un dossier sans fichier de blocs n'est pas une erreur quand on sait de
+    // quel reseau il s'agit : la genese est deterministe, chacun peut donc
+    // l'ecrire lui-meme. C'est ce qui permet a quelqu'un de rejoindre le
+    // reseau sans recevoir de fichier de personne — et donc sans avoir a faire
+    // confiance a personne pour la racine de la chaine. Le reseau est connu
+    // ici dans tous les cas : par le portefeuille, ou par l'option.
+
+    // --- Une chaine d'une autre genese : le reseau est reparti de zero.
+    //
+    // Le reseau de test change de genese a chaque changement de regle. Le
+    // fichier de blocs qu'on trouve ici appartient alors a l'ancienne chaine :
+    // on ne l'efface pas, on le range, avec tout ce qui en dependait, dans un
+    // sous-dossier nomme d'apres sa genese. Le portefeuille — graine, indices,
+    // carnet — n'est pas touche ; seul son compteur de verification est remis a
+    // zero, puisque les hauteurs de l'ancienne chaine ne designent plus rien.
+    if chemin_blocs(datadir).exists() {
+        if let Err(q21_core::store::StoreError::GeneseEtrangere { vu, .. }) =
+            BlockArchive::open(chemin_blocs(datadir), reseau)
+        {
+            ranger_l_ancienne_chaine(datadir, vu)?;
+            wallet.oublier_la_verification();
+            if !sans_portefeuille {
+                ecrire_portefeuille(datadir, &wallet)?;
+            }
+        }
+    }
+    if !chemin_blocs(datadir).exists() {
         std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
         let genese = genesis_block(reseau);
         q21_core::store::BlockStore::new(chemin_blocs(datadir))

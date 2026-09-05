@@ -621,6 +621,14 @@ impl Wallet {
         self.verifie_jusqu_a = self.verifie_jusqu_a.max(hauteur);
     }
 
+    /// Oublie jusqu'ou la chaine a ete verifiee : a n'employer que lorsque la
+    /// chaine elle-meme a change — un reseau de test reparti d'une nouvelle
+    /// genese. Les hauteurs de l'ancienne chaine n'y designent plus rien, et
+    /// les garder ferait sauter le balayage des premiers blocs de la nouvelle.
+    pub fn oublier_la_verification(&mut self) {
+        self.verifie_jusqu_a = 0;
+    }
+
     /// Declare des indices comme deja employes.
     ///
     /// Sert au rechargement depuis le disque et a l'observation de la chaine.
