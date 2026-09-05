@@ -223,14 +223,15 @@ subvention (chaque nœud vérifie la coinbase, seul) ; relever le plafond ; chan
 une règle.
 
 **Q21 ajoute** : choix par travail cumulé jamais par longueur, finalité glissante
-à 720 blocs, pénalité de profondeur (+1 % de travail par bloc au-delà de 6),
-récompenses d'oncles, et une preuve de travail pour laquelle aucun marché de
-location de puissance n'existe.
+à 720 blocs, pénalité de profondeur (+1 % de travail par bloc au-delà de 6,
+plafonnée à +25 %), récompenses d'oncles, et une preuve de travail pour laquelle
+aucun marché de location de puissance n'existe.
 
 **Le coût, dit franchement** : la finalité glissante ne supprime pas l'attaque,
 elle en change la nature. Une partition réseau de plus de 24 h produit deux
-chaînes irréconciliables. On échange une réécriture silencieuse contre une
-scission visible — qui se diagnostique et se répare.
+chaînes irréconciliables ; en deçà, la moitié qui porte plus de 56 % de la
+puissance réabsorbe l'autre quand le lien revient. On échange une réécriture
+silencieuse contre une scission visible — qui se diagnostique et se répare.
 
 ---
 
