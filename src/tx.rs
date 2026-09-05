@@ -15,6 +15,7 @@
 //! une necessite de dimensionnement : le temoin represente l'essentiel du poids
 //! d'une transaction, et doit pouvoir etre pondere a part.
 
+use crate::address::Network;
 use crate::amount::Amount;
 use crate::hash::{tagged_hash, tags, Hash256};
 use crate::merkle::leaf_hash;
@@ -229,12 +230,26 @@ impl Transaction {
 
     /// Condensat signe par le depensier.
     ///
-    /// Couvre la transaction depouillee ainsi que l'indice de l'entree signee,
-    /// pour qu'une signature ne puisse pas etre rejouee sur une autre entree.
-    pub fn sighash(&self, input_index: u32) -> Hash256 {
+    /// Couvre la transaction depouillee et l'indice de l'entree signee — pour
+    /// qu'une signature ne puisse pas etre rejouee sur une autre entree — et
+    /// deux choses de plus, apprises de BIP-143 :
+    ///
+    /// - **le reseau**, par son prefixe d'adresse : une transaction signee sur
+    ///   le reseau de test n'est valide que la, et reciproquement. Sans cela,
+    ///   les memes clefs employees sur deux reseaux — ou sur les deux branches
+    ///   d'une scission — rendaient chaque signature rejouable sur l'autre ;
+    /// - **la sortie depensee** (valeur, schema, verrou) : un signataire qui ne
+    ///   voit pas la chaine — materiel, hors ligne — sait ainsi exactement ce
+    ///   qu'il depense, donc quels frais il paie, et sa signature ne vaut que
+    ///   pour cette sortie-la.
+    pub fn sighash(&self, input_index: u32, network: Network, depensee: &TxOut) -> Hash256 {
         let mut w = Writer::new();
+        w.var_bytes(network.hrp().as_bytes());
         w.bytes(&self.encode_without_witness());
         w.u32(input_index);
+        w.u64(depensee.value.units());
+        w.u8(depensee.scheme.as_u8());
+        w.bytes(depensee.pubkey_hash.as_bytes());
         tagged_hash(tags::SIGHASH, w.as_slice())
     }
 
@@ -272,8 +287,19 @@ impl Transaction {
     }
 
     /// Condensat de feuille, pour l'arbre de Merkle d'un bloc.
+    /// Feuille de Merkle : engage l'identifiant **et** le temoin.
+    ///
+    /// Le `txid` ignore le temoin, et c'est voulu — un tiers ne doit pas
+    /// pouvoir changer l'identifiant d'une transaction en retouchant sa
+    /// signature. Mais si la racine de Merkle n'engageait que le `txid`, ce
+    /// meme tiers pouvait remplacer une signature par une autre, valide, dans
+    /// un bloc en transit, sans que l'en-tete le voie. La feuille engage donc
+    /// les deux, comme l'engagement de temoin de SegWit.
     pub fn merkle_leaf(&self) -> Hash256 {
-        leaf_hash(self.txid().as_bytes())
+        let mut w = Writer::with_capacity(64);
+        w.bytes(self.txid().as_bytes());
+        w.bytes(self.wtxid().as_bytes());
+        leaf_hash(w.as_slice())
     }
 
     /// Poids de la transaction, temoin pondere a part.
@@ -371,20 +397,71 @@ mod tests {
         assert_ne!(a.txid(), b.txid());
     }
 
+    fn depensee() -> TxOut {
+        TxOut {
+            value: Amount::from_units(70_000),
+            scheme: SchemeId::LamportOts,
+            pubkey_hash: Hash256([7u8; 32]),
+        }
+    }
+
     #[test]
     fn le_sighash_lie_la_signature_a_son_entree() {
         let tx = tx_simple();
+        let d = depensee();
         assert_ne!(
-            tx.sighash(0),
-            tx.sighash(1),
+            tx.sighash(0, Network::Regtest, &d),
+            tx.sighash(1, Network::Regtest, &d),
             "sinon une signature se rejoue d'une entree sur l'autre"
         );
+    }
+
+    /// Le condensat signe engage le reseau : une signature du reseau de test
+    /// ne vaut rien sur le reseau principal, ni sur l'autre branche d'une
+    /// scission. Il engage aussi la sortie depensee : sa valeur, son schema
+    /// et son verrou.
+    #[test]
+    fn le_sighash_engage_le_reseau_et_la_sortie_depensee() {
+        let tx = tx_simple();
+        let d = depensee();
+        let reference = tx.sighash(0, Network::Testnet, &d);
+        assert_ne!(reference, tx.sighash(0, Network::Mainnet, &d));
+        assert_ne!(reference, tx.sighash(0, Network::Regtest, &d));
+
+        let mut autre_valeur = d;
+        autre_valeur.value = Amount::from_units(70_001);
+        assert_ne!(reference, tx.sighash(0, Network::Testnet, &autre_valeur));
+
+        let mut autre_verrou = d;
+        autre_verrou.pubkey_hash = Hash256([8u8; 32]);
+        assert_ne!(reference, tx.sighash(0, Network::Testnet, &autre_verrou));
+
+        let mut autre_schema = d;
+        autre_schema.scheme = SchemeId::MlDsa87;
+        assert_ne!(reference, tx.sighash(0, Network::Testnet, &autre_schema));
+
+        // Et il reste deterministe.
+        assert_eq!(reference, tx.sighash(0, Network::Testnet, &d));
     }
 
     #[test]
     fn le_sighash_differe_du_txid() {
         let tx = tx_simple();
-        assert_ne!(tx.sighash(0).as_bytes(), tx.txid().as_bytes());
+        assert_ne!(
+            tx.sighash(0, Network::Regtest, &depensee()).as_bytes(),
+            tx.txid().as_bytes()
+        );
+    }
+
+    /// La feuille de Merkle engage le temoin : retoucher une signature change
+    /// la racine, donc l'en-tete refuse le bloc. Le txid, lui, ne bouge pas.
+    #[test]
+    fn la_feuille_de_merkle_engage_le_temoin() {
+        let a = tx_simple();
+        let mut b = a.clone();
+        b.inputs[0].witness.signature = vec![0xaa; 3309];
+        assert_eq!(a.txid(), b.txid());
+        assert_ne!(a.merkle_leaf(), b.merkle_leaf());
     }
 
     #[test]

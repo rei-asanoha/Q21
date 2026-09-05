@@ -231,7 +231,8 @@ fn on_ne_peut_pas_depenser_la_sortie_d_autrui() {
         }],
         lock_time: 0,
     };
-    let msg = tx.sighash(0);
+    let depensee = c.utxo.get(&cible).expect("sortie visee").output;
+    let msg = tx.sighash(0, RESEAU, &depensee);
     tx.inputs[0].witness = q21_core::tx::Witness {
         pubkey: sk.public_key(),
         signature: sk.sign(&msg),
@@ -289,7 +290,8 @@ fn une_coinbase_immature_ne_peut_pas_etre_depensee() {
         }],
         lock_time: 0,
     };
-    let msg = tx.sighash(0);
+    let depensee = c.utxo.get(&cible).expect("sortie visee").output;
+    let msg = tx.sighash(0, RESEAU, &depensee);
     tx.inputs[0].witness = q21_core::tx::Witness {
         pubkey: sk.public_key(),
         signature: sk.sign(&msg),
