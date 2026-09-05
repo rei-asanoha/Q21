@@ -95,20 +95,50 @@ pub fn lire_phrase(invite: &str) -> io::Result<(String, bool)> {
 /// Une phrase secrete mal tapee a la creation rend le portefeuille
 /// definitivement illisible, et l'erreur ne se manifeste qu'a la premiere
 /// reouverture — souvent des mois plus tard.
+///
+/// # Une confirmation qui echoue n'est pas une absence de phrase
+///
+/// La premiere version rendait `None` quand les deux saisies differaient —
+/// exactement ce qu'elle rendait pour une phrase vide. L'appelant creait alors
+/// un portefeuille **sans protection**, la graine en clair sur le disque,
+/// avec un avertissement a l'ecran qu'un debutant ne relit pas. Une faute de
+/// frappe au moment le plus important exposait tout.
+///
+/// Une saisie qui differe est desormais dite, puis redemandee, trois fois au
+/// plus ; au-dela, on abandonne avec une erreur explicite. Seule une premiere
+/// saisie **vide** signifie « pas de phrase ».
 pub fn lire_phrase_confirmee(invite: &str) -> io::Result<Option<String>> {
-    let (a, masque) = lire_phrase(invite)?;
-    if !masque {
-        eprintln!("  avertissement : l'echo du terminal n'a pas pu etre coupe.");
-        eprintln!("  Ce qui a ete tape reste visible a l'ecran et dans l'historique.");
+    confirmer_avec(invite, lire_phrase)
+}
+
+/// La logique de confirmation, separee de la lecture du terminal pour pouvoir
+/// etre eprouvee avec des saisies scriptees.
+fn confirmer_avec<L>(invite: &str, mut lire: L) -> io::Result<Option<String>>
+where
+    L: FnMut(&str) -> io::Result<(String, bool)>,
+{
+    const ESSAIS: usize = 3;
+    for essai in 1..=ESSAIS {
+        let (a, masque) = lire(invite)?;
+        if !masque {
+            eprintln!("  avertissement : l'echo du terminal n'a pas pu etre coupe.");
+            eprintln!("  Ce qui a ete tape reste visible a l'ecran et dans l'historique.");
+        }
+        if a.is_empty() {
+            return Ok(None);
+        }
+        let (b, _) = lire("Confirmez la phrase secrete : ")?;
+        if a == b {
+            return Ok(Some(a));
+        }
+        if essai < ESSAIS {
+            eprintln!("  Les deux saisies different. Recommencez.");
+        }
     }
-    if a.is_empty() {
-        return Ok(None);
-    }
-    let (b, _) = lire_phrase("Confirmez la phrase secrete : ")?;
-    if a != b {
-        return Ok(None);
-    }
-    Ok(Some(a))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "les deux saisies de la phrase secrete n'ont jamais concorde : aucun portefeuille cree",
+    ))
 }
 
 #[cfg(unix)]
@@ -160,4 +190,54 @@ fn echo(actif: bool) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn echo(_actif: bool) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Une suite de reponses scriptees, dans l'ordre ou le terminal les
+    /// donnerait.
+    fn scenario(reponses: &[&str]) -> impl FnMut(&str) -> io::Result<(String, bool)> {
+        let file: Vec<String> = reponses.iter().map(|s| s.to_string()).collect();
+        let mut i = 0;
+        move |_invite| {
+            let r = file.get(i).cloned().unwrap_or_default();
+            i += 1;
+            Ok((r, true))
+        }
+    }
+
+    #[test]
+    fn deux_saisies_identiques_donnent_la_phrase() {
+        let r = confirmer_avec("? ", scenario(&["abc", "abc"])).unwrap();
+        assert_eq!(r, Some("abc".to_string()));
+    }
+
+    #[test]
+    fn une_premiere_saisie_vide_signifie_aucune_phrase() {
+        let r = confirmer_avec("? ", scenario(&[""])).unwrap();
+        assert_eq!(r, None);
+    }
+
+    /// Le defaut que cette epreuve fige : une confirmation qui differe ne doit
+    /// **jamais** se confondre avec « pas de phrase ».
+    #[test]
+    fn une_confirmation_differente_ne_vaut_jamais_absence_de_phrase() {
+        // Trois echecs de suite : une erreur, pas `Ok(None)`.
+        let r = confirmer_avec("? ", scenario(&["a", "b", "a", "b", "a", "b"]));
+        assert!(r.is_err(), "trois desaccords doivent etre une erreur");
+
+        // Un echec puis une reussite : la phrase confirmee est rendue.
+        let r = confirmer_avec("? ", scenario(&["a", "b", "bon", "bon"])).unwrap();
+        assert_eq!(r, Some("bon".to_string()));
+    }
+
+    /// Une phrase vide en confirmation d'une phrase non vide est un desaccord,
+    /// pas un renoncement.
+    #[test]
+    fn une_confirmation_vide_est_un_desaccord() {
+        let r = confirmer_avec("? ", scenario(&["a", "", "a", "", "a", ""]));
+        assert!(r.is_err());
+    }
 }

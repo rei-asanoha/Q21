@@ -1537,10 +1537,13 @@ fn cmd_init_avec(
                     .to_string(),
             );
         }
+        // Une erreur de saisie (confirmations qui ne concordent jamais,
+        // terminal ferme) arrete la creation : la transformer en « pas de
+        // phrase » ecrirait la graine en clair a la place de l'utilisateur.
         let saisie = q21_core::prompt::lire_phrase_confirmee(
             "Phrase secrete du portefeuille (vide = aucune protection) : ",
         )
-        .unwrap_or(None);
+        .map_err(|e| format!("phrase secrete : {e}"))?;
         retenir_phrase(saisie);
     }
     if phrase_courante().is_none() {
