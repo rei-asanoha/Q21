@@ -153,6 +153,7 @@ dependencies = [
 name = "q21-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ml-dsa",
 ]
 

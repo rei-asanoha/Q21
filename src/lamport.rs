@@ -47,12 +47,20 @@ const TAG_COMMIT: &str = "Q21/lamport/commit";
 ///
 /// On ne stocke jamais les 16 Ko de preimages : ils se recalculent a la demande.
 /// La sauvegarde du portefeuille se reduit ainsi a 32 octets plus un compteur.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecretKey {
     seed: [u8; 32],
     /// Indice de la clef dans le portefeuille. Deux indices donnent deux clefs
     /// independantes issues de la meme graine maitre.
     index: u32,
+}
+
+/// La graine derivee est effacee a la destruction de la clef ; voir
+/// [`crate::kdf::effacer`].
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        crate::kdf::effacer(&mut self.seed);
+    }
 }
 
 impl core::fmt::Debug for SecretKey {

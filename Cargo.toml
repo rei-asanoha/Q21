@@ -46,6 +46,14 @@ path = "src/lib.rs"
 [dependencies]
 ml-dsa = { version = "0.1.1", optional = true, default-features = false, features = ["alloc"] }
 
+# Une seule fonction en est tiree : `setrlimit`, pour interdire les vidages
+# memoire d'un processus qui garde une graine. `libc` est deja dans le graphe
+# de dependances (par `getrandom`), vendorise comme le reste ; le declarer ici
+# n'ajoute rien a compiler. Le declarer a la main avec `extern "C"` obligerait
+# a reproduire la disposition de `rlimit`, qui differe d'un systeme a l'autre.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 mldsa = ["dep:ml-dsa"]
