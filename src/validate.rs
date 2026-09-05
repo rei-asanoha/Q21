@@ -369,7 +369,7 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
         }
 
         // --- Regle : la signature doit verifier sur le condensat de cette entree.
-        let message = tx.sighash(i as u32);
+        let message = tx.sighash(i as u32, network, &e.output);
         sig::verify(
             e.output.scheme,
             &entree.witness.pubkey,

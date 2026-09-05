@@ -67,7 +67,7 @@ pub mod tags {
     pub const MERKLE_LEAF: &str = "Q21/merkle/leaf";
     pub const MERKLE_BRANCH: &str = "Q21/merkle/branch";
     pub const ADDRESS: &str = "Q21/address";
-    pub const SIGHASH: &str = "Q21/sighash";
+    pub const SIGHASH: &str = "Q21/sighash/2";
     /// Derivation des clefs de portefeuille. Purement local : aucune regle de
     /// consensus n'en depend, mais changer ce tag change toutes les adresses
     /// derivees d'une graine existante.

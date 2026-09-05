@@ -1091,8 +1091,8 @@ impl Wallet {
 
         // Signature : le condensat couvre la transaction depouillee, donc il ne
         // change pas a mesure qu'on remplit les temoins.
-        for (i, ((_, _, index), pubkey)) in choisies.iter().zip(clefs).enumerate() {
-            let message = tx.sighash(i as u32);
+        for (i, ((_, depensee, index), pubkey)) in choisies.iter().zip(clefs).enumerate() {
+            let message = tx.sighash(i as u32, self.network, depensee);
             tx.inputs[i].witness = Witness {
                 pubkey,
                 signature: self.sign_at(*index, &message),

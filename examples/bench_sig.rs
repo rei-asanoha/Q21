@@ -52,7 +52,8 @@ fn main() {
             )
             .expect("transaction");
         let entree = &tx.inputs[0];
-        let m = tx.sighash(0);
+        let depensee = utxo.get(&entree.prev_out).expect("sortie depensee").output;
+        let m = tx.sighash(0, Network::Regtest, &depensee);
 
         let n = 3_000;
         let t = std::time::Instant::now();

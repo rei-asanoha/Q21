@@ -36,7 +36,7 @@ fn clef(i: u32) -> (lamport::SecretKey, Vec<u8>, Hash256) {
 
 /// Jeu d'UTXO synthetique : `n` sorties de `valeur` unites, chacune verrouillee
 /// par une clef Lamport distincte. Rend aussi la liste des points de sortie.
-fn utxo_synthetique(n: u32, valeur: u64, depart: u32) -> (UtxoSet, Vec<(OutPoint, u32)>) {
+fn utxo_synthetique(n: u32, valeur: u64, depart: u32) -> (UtxoSet, Vec<(OutPoint, u32, TxOut)>) {
     let mut u = UtxoSet::new();
     let mut v = Vec::new();
     for i in 0..n {
@@ -58,18 +58,25 @@ fn utxo_synthetique(n: u32, valeur: u64, depart: u32) -> (UtxoSet, Vec<(OutPoint
                 is_coinbase: false,
             },
         );
-        v.push((o, idx));
+        v.push((o, idx, u.get(&o).unwrap().output));
     }
     (u, v)
 }
 
 /// Construit et signe une transaction depensant `entrees` vers `sorties`.
-fn tx_signee(entrees: &[(OutPoint, u32)], sorties: Vec<TxOut>, lock_time: u64) -> Transaction {
+///
+/// Chaque entree porte la sortie qu'elle depense : le condensat signe
+/// l'engage, comme le reseau.
+fn tx_signee(
+    entrees: &[(OutPoint, u32, TxOut)],
+    sorties: Vec<TxOut>,
+    lock_time: u64,
+) -> Transaction {
     let mut tx = Transaction {
         version: 1,
         inputs: entrees
             .iter()
-            .map(|(o, _)| TxIn {
+            .map(|(o, _, _)| TxIn {
                 prev_out: *o,
                 witness: Witness::default(),
                 sequence: 0xffff_ffff,
@@ -79,9 +86,9 @@ fn tx_signee(entrees: &[(OutPoint, u32)], sorties: Vec<TxOut>, lock_time: u64) -
         lock_time,
     };
     // Le sighash ne couvre pas les temoins : on peut signer apres coup.
-    for (i, (_, idx)) in entrees.iter().enumerate() {
+    for (i, (_, idx, depensee)) in entrees.iter().enumerate() {
         let (sk, pk, _) = clef(*idx);
-        let m = tx.sighash(i as u32);
+        let m = tx.sighash(i as u32, RESEAU, depensee);
         tx.inputs[i].witness = Witness {
             pubkey: pk,
             signature: sk.sign(&m),
@@ -202,7 +209,8 @@ fn t02_cout_mldsa_reel_et_amplification() {
 
     let pk = tx.inputs[0].witness.pubkey.clone();
     let sg = tx.inputs[0].witness.signature.clone();
-    let msg = tx.sighash(0);
+    let depensee = u.get(&tx.inputs[0].prev_out).unwrap().output;
+    let msg = tx.sighash(0, RESEAU, &depensee);
     assert!(verify(SchemeId::MlDsa65, &pk, &msg, &sg).is_ok());
 
     const N: u32 = 200;
@@ -420,7 +428,7 @@ fn chaine_mempool(n: u32, m: &mut Mempool, base: u32) -> Hash256 {
         if i == 0 {
             racine = id;
         }
-        courant = (OutPoint { txid: id, index: 0 }, idx);
+        courant = (OutPoint { txid: id, index: 0 }, idx, tx.outputs[0]);
     }
     racine
 }
@@ -512,7 +520,7 @@ fn t11_select_for_block_ne_rehashe_pas_a_chaque_comparaison() {
     let mut u = UtxoSet::new();
     for i in 0..N {
         let (uu, ops) = utxo_synthetique(1, 100_000_000, 2_000_000 + i);
-        for (o, _) in &ops {
+        for (o, _, _) in &ops {
             u.insert(*o, *uu.get(o).unwrap());
         }
         let outs: Vec<TxOut> = (0..SORTIES)
@@ -565,6 +573,7 @@ fn t12_l_eviction_detruit_les_enfants_bien_payants_avec_leur_parent() {
                 index: 0,
             },
             3_000_001,
+            parent.outputs[0],
         )],
         vec![sortie(MIN_OUTPUT_VALUE, puits(12))],
         0,
