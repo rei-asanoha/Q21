@@ -156,6 +156,13 @@ AVERTISSEMENT
 ";
 
 fn main() {
+    // Aucun vidage memoire : un processus qui garde une graine ne doit pas
+    // pouvoir l'ecrire dans un fichier `core` a la premiere panne.
+    interdire_les_vidages_memoire();
+    // La variable d'environnement est lue une fois, puis retiree : elle ne
+    // doit ni passer aux processus fils, ni rester lisible dans
+    // `/proc/<pid>/environ` par un autre compte de la machine.
+    let _ = phrase_d_environnement();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut datadir = PathBuf::from("q21-data");
     let mut reste: Vec<String> = Vec::new();
@@ -339,6 +346,42 @@ fn chemin_blocs(d: &Path) -> PathBuf {
     d.join("blocks.dat")
 }
 
+/// La phrase fournie par `Q21_PASSPHRASE`, lue une seule fois au demarrage
+/// puis retiree de l'environnement du processus.
+fn phrase_d_environnement() -> Option<String> {
+    static ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
+        let p = std::env::var("Q21_PASSPHRASE")
+            .ok()
+            .filter(|p| !p.is_empty());
+        // Sur : appele au tout debut de `main`, avant tout fil d'execution.
+        unsafe { std::env::remove_var("Q21_PASSPHRASE") };
+        p
+    })
+    .clone()
+}
+
+/// Interdit les fichiers de vidage memoire pour ce processus.
+///
+/// Sous Unix, la limite `RLIMIT_CORE` a zero. Une panne n'ecrit alors rien sur
+/// le disque : ni graine, ni phrase, ni clef derivee. Sous Windows, il n'y a
+/// pas d'equivalent simple ; la protection reste le chiffrement du fichier de
+/// portefeuille et l'effacement des tampons.
+fn interdire_les_vidages_memoire() {
+    #[cfg(unix)]
+    {
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // Sur : `rlimit` est une structure C ordinaire, passee par reference,
+        // et `setrlimit` ne retient pas le pointeur.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        }
+    }
+}
+
 /// Phrase secrete du portefeuille, telle que l'utilisateur l'a fournie.
 ///
 /// Trois sources, dans cet ordre : l'option explicite, un fichier, la variable
@@ -357,10 +400,8 @@ fn phrase_secrete(
         }
         return Ok(Some(p));
     }
-    if let Ok(p) = std::env::var("Q21_PASSPHRASE") {
-        if !p.is_empty() {
-            return Ok(Some(p));
-        }
+    if let Some(p) = phrase_d_environnement() {
+        return Ok(Some(p));
     }
     if !interactif {
         return Ok(None);
@@ -690,18 +731,29 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
 /// La valeur exterieure distingue « personne n'a encore rien dit » de « on sait
 /// qu'il n'y a pas de phrase », qui ne sont pas la meme chose : la seconde
 /// autorise a ecrire un portefeuille en clair, la premiere non.
-static PHRASE: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+static PHRASE: std::sync::Mutex<Option<Option<Secret>>> = std::sync::Mutex::new(None);
+
+/// Une chaine effacee a sa destruction : la phrase secrete ne doit pas
+/// survivre dans le tas quand on l'oublie ou qu'on la remplace.
+struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        // Sur : on n'ecrit que des zeros, qui sont de l'UTF-8 valide.
+        q21_core::kdf::effacer(unsafe { self.0.as_bytes_mut() });
+    }
+}
 
 fn phrase_courante() -> Option<String> {
     PHRASE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .flatten()
+        .as_ref()
+        .and_then(|p| p.as_ref().map(|s| s.0.clone()))
 }
 
 fn retenir_phrase(p: Option<String>) {
-    *PHRASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+    *PHRASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.map(Secret));
 }
 
 /// Oublie la phrase retenue, sans decider qu'il n'y en a pas.
@@ -3880,7 +3932,7 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     // C'est ce qui remplace les deux commandes de terminal d'avant : `init`
     // pour creer, puis la question « Phrase secrete du portefeuille : » posee
     // sur une ligne nue. Les deux se font maintenant dans des ecrans.
-    let phrase_deja_fournie = std::env::var("Q21_PASSPHRASE").is_ok_and(|p| !p.is_empty());
+    let phrase_deja_fournie = phrase_d_environnement().is_some();
     let existe = chemin_portefeuille(datadir).exists();
     let scelle = existe
         && q21_core::kdf::est_scelle(
@@ -4382,7 +4434,7 @@ fn cmd_explorateur(datadir: &Path, args: &[String]) -> Result<(), String> {
     // mais il a besoin de cette reponse — et le fichier est scelle d'un seul
     // tenant. D'ou la phrase secrete, meme ici.
     if q21_core::kdf::est_scelle(&std::fs::read(chemin_portefeuille(datadir)).unwrap_or_default())
-        && !std::env::var("Q21_PASSPHRASE").is_ok_and(|p| !p.is_empty())
+        && phrase_d_environnement().is_none()
     {
         println!("  Ce dossier contient un portefeuille protege par une phrase secrete.");
         println!("  L'explorateur n'y touche pas : il a seulement besoin d'y lire");

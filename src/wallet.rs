@@ -138,11 +138,7 @@ pub struct Wallet {
 /// vidage apres un plantage. C'est peu et ce n'est pas rien.
 impl Drop for Wallet {
     fn drop(&mut self) {
-        for o in self.seed.iter_mut() {
-            // `write_volatile` : sans cela, l'optimiseur a parfaitement le droit
-            // de supprimer une ecriture dont plus personne ne lit le resultat.
-            unsafe { std::ptr::write_volatile(o, 0) };
-        }
+        crate::kdf::effacer(&mut self.seed);
     }
 }
 

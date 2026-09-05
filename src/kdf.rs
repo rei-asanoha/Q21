@@ -149,10 +149,35 @@ pub fn egal_temps_constant(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Met a zero un tampon sensible, d'une facon que l'optimiseur ne peut pas
+/// supprimer.
+///
+/// Une ecriture ordinaire dont personne ne lit le resultat est un code mort
+/// aux yeux du compilateur, et il l'enleve. `write_volatile` la rend
+/// obligatoire. Cela ne protege ni d'un lecteur de la memoire vive pendant
+/// l'execution, ni d'une page echangee sur disque ; cela evite qu'un secret
+/// survive dans un tas reutilise, puis dans un fichier de vidage.
+pub fn effacer(tampon: &mut [u8]) {
+    for o in tampon.iter_mut() {
+        // Sur : chaque pointeur vient d'un element valide du tampon.
+        unsafe { std::ptr::write_volatile(o, 0) };
+    }
+}
+
 /// Deux clefs independantes derivees d'une phrase secrete.
+///
+/// Effacees a la destruction : une clef de chiffrement de portefeuille qui
+/// traine dans le tas vaut la phrase elle-meme.
 struct Clefs {
     chiffrement: [u8; 32],
     authentification: [u8; 32],
+}
+
+impl Drop for Clefs {
+    fn drop(&mut self) {
+        effacer(&mut self.chiffrement);
+        effacer(&mut self.authentification);
+    }
 }
 
 fn deriver(phrase: &[u8], sel: &[u8; 16], iterations: u32) -> Clefs {
@@ -164,6 +189,7 @@ fn deriver(phrase: &[u8], sel: &[u8; 16], iterations: u32) -> Clefs {
     let mut authentification = [0u8; 32];
     chiffrement.copy_from_slice(&brut[..32]);
     authentification.copy_from_slice(&brut[32..]);
+    effacer(&mut brut);
     Clefs {
         chiffrement,
         authentification,
