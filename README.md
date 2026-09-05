@@ -267,6 +267,17 @@ pas.
 chaîne coûte une demi-heure de preuve de travail — moins que la vérification des
 signatures de la même période. C'est le compromis exact qu'a fait Ethereum.
 
+**Troisième fois.** L'addition modulo 2²⁵⁶ ne faisait jamais remonter de
+retenue dans les 32 bits bas de l'état, et c'est de ces 32 bits seuls que
+venait l'indice de la lecture suivante : tout le parcours mémoire d'une
+tentative dépendait d'un mot de 32 bits. Une table de 2³² sommes — 128 Gio,
+une fois par époque — remplaçait les trente-deux lectures par une seule.
+Vérifié par simulation : sur mille paires d'états de mêmes bits bas, aucune ne
+divergeait. L'indice dépend désormais des quatre mots de l'état, et chaque
+lecture est suivie de quatre tours de Feistel bâtis sur la finalisation de
+SplitMix64 — une vingtaine de nanosecondes, contre une centaine pour l'accès
+DRAM qu'ils suivent. Le détail est en tête de `memhard.rs`.
+
 `q21 pow mainnet` refait toute la mesure sur votre machine ; `q21 pow mainnet
 --sans-table` ne mesure que le coût côté nœud. Le détail est dans `PHASE6.md`.
 
