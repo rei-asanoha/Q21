@@ -84,10 +84,9 @@ fn reculer_les_horodatages_ne_fait_pas_exploser_la_difficulte() {
 #[test]
 fn la_tolerance_d_horodatage_futur_est_adaptee_a_un_ajustement_par_bloc() {
     assert_eq!(MAX_FUTURE_TIME, 20 * 60);
-    assert!(
-        MAX_FUTURE_TIME < 6 * TARGET_BLOCK_SECS * 2,
-        "la tolérance doit rester du même ordre que la borne de résolution"
-    );
+    // Verifie a la compilation : la tolerance doit rester du meme ordre que la
+    // borne de resolution.
+    const _: () = assert!(MAX_FUTURE_TIME < 6 * TARGET_BLOCK_SECS * 2);
 }
 
 // ---------------------------------------------------------------------------

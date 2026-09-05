@@ -356,7 +356,7 @@ fn f_un_fichier_de_blocs_etranger_est_adopte_comme_genese() {
     // arbitraire vers l'attaquant.
     let mut faux = genesis_block(RESEAU);
     faux.transactions[0].outputs[0].pubkey_hash = Hash256([0x99; 32]);
-    faux.transactions[0].outputs[0].value = q21_core::amount::Amount::from_units(21_000_000_000_00);
+    faux.transactions[0].outputs[0].value = q21_core::amount::Amount::from_units(2_100_000_000_000);
     faux.header.merkle_root = faux.compute_merkle_root();
     faux.header.nonce = 1; // preuve de travail volontairement fausse
 
@@ -503,13 +503,7 @@ fn j_sans_fournisseur_de_corps_un_noeud_repris_refuse_tout() {
         .unwrap();
     // Le nœud repris n'a pas rejoué : il est à la hauteur de l'instantané.
     // On lui soumet le bloc qui prolonge SA tête.
-    let hauteur = sans_source.height();
-    let bb = if hauteur + 1 == b.header.height {
-        b.clone()
-    } else {
-        b.clone()
-    };
-    let v = sans_source.connect(&bb, t + 1);
+    let v = sans_source.connect(&b, t + 1);
     eprintln!("verdict sans fournisseur : {v:?}");
     assert!(v.is_err(), "refus attendu, pas d'acceptation aveugle");
 }
@@ -1467,15 +1461,15 @@ fn bg_restauration_de_reorg_ratee() {
     }
     // Les blocs suivants doivent pointer sur le bloc corrompu.
     let mut prev = branche[1].header.block_id();
-    for i in 2..branche.len() {
-        branche[i].header.prev_block = prev;
-        branche[i].header.nonce = 0;
+    for bloc in branche.iter_mut().skip(2) {
+        bloc.header.prev_block = prev;
+        bloc.header.nonce = 0;
         let t = q21_core::memhard::PowTable::build(
             q21_core::memhard::TableParams::for_network(RESEAU),
-            q21_core::memhard::epoch_of(branche[i].header.height),
+            q21_core::memhard::epoch_of(bloc.header.height),
         );
-        q21_core::pow::mine_with_table(&mut branche[i].header, &t, ESSAIS).unwrap();
-        prev = branche[i].header.block_id();
+        q21_core::pow::mine_with_table(&mut bloc.header, &t, ESSAIS).unwrap();
+        prev = bloc.header.block_id();
     }
 
     let avant = complet.tip_id();

@@ -398,10 +398,12 @@ fn u256_differentiel_contre_u128() {
         } else {
             assert!(a < b, "checked_sub a refuse {a}-{b}");
         }
-        if b != 0 {
-            let (q, r) = ua.div_rem(ub).expect("div_rem");
-            assert_eq!(u128_de_u256(q), Some(a / b), "div {a}/{b}");
-            assert_eq!(u128_de_u256(r), Some(a % b), "rem {a}%{b}");
+        match ua.div_rem(ub) {
+            Some((q, r)) => {
+                assert_eq!(u128_de_u256(q), Some(a / b), "div {a}/{b}");
+                assert_eq!(u128_de_u256(r), Some(a % b), "rem {a}%{b}");
+            }
+            None => assert_eq!(b, 0, "div_rem ne refuse que la division par zero"),
         }
         let s = xorshift(&mut g);
         if let Some(p) = ua.checked_mul_u64(s) {
