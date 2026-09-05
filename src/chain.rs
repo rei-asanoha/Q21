@@ -2448,10 +2448,12 @@ mod tests {
                 ESSAIS,
             )
             .unwrap();
-        assert_eq!(
+        // Depuis le retrait des oncles, tout oncle est refuse avant meme
+        // d'etre examine : la tricherie n'a plus de porte.
+        assert!(matches!(
             c.connect(&b, t + 1),
-            Err(ValidationError::OncleEstUnAncetre)
-        );
+            Err(ValidationError::TropDOncles { .. })
+        ));
     }
 
     /// La difficulte ne regarde que la fenetre, jamais toute l'histoire.

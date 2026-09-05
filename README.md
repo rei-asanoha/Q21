@@ -137,8 +137,7 @@ courses → il touche PLUS que sa part de puissance → centralisation
 ```
 
 C'est le rendement super-linéaire que le levier C du livre blanc cherche à
-supprimer. Les récompenses d'oncles en pansent la conséquence ; **le relais
-compact en attaque la cause.**
+supprimer. **Le relais compact en attaque la cause.**
 
 Le principe : un pair a déjà, dans son mempool, l'essentiel des transactions du
 bloc qu'on lui annonce. On lui envoie donc l'en-tête et, par transaction, un
@@ -224,7 +223,7 @@ une règle.
 
 **Q21 ajoute** : choix par travail cumulé jamais par longueur, finalité glissante
 à 720 blocs, pénalité de profondeur (+1 % de travail par bloc au-delà de 6,
-plafonnée à +25 %), récompenses d'oncles, et une preuve de travail pour laquelle
+plafonnée à +25 %), et une preuve de travail pour laquelle
 aucun marché de location de puissance n'existe.
 
 **Le coût, dit franchement** : la finalité glissante ne supprime pas l'attaque,
@@ -534,7 +533,7 @@ du fichier scellé : tous sont détectés.
 - **ML-DSA repose sur un crate non audité formellement.** `ml-dsa` 0.1.1 est une version 0.x. Elle passe les vecteurs de la référence, mais aucune revue de canaux auxiliaires publique ne la couvre. Le côté signature vit dans le portefeuille, pas dans le consensus, ce qui limite l'exposition — mais ne l'annule pas.
 - **SPHINCS+ est déclaré et non implémenté.** Le parachute n'existe pour l'instant que dans la table des identifiants. Un portefeuille qui le demande est refusé à la construction, pas à la dépense.
 - **PBKDF2 n'est pas memory-hard.** Un attaquant équipé de circuits dédiés teste les phrases secrètes bien plus vite qu'un processeur. La vraie défense reste la longueur de la phrase.
-- **L'incitation à inclure les oncles est faible.** Dans une monnaie à plafond fixe, une récompense d'oncle est soit inflationniste, soit prélevée sur le mineur. Le plafond est le projet ; c'est une question économique ouverte.
+- **Les récompenses d'oncles ont été retirées.** Dans une monnaie à plafond fixe, une récompense d'oncle est soit inflationniste, soit prélevée sur le mineur — et personne n'inclut un oncle à ses frais. Le plafond est le projet ; le mécanisme ne servait plus qu'à offrir une surface d'attaque, et un bloc qui porte un oncle est désormais refusé.
 - **Aucun nœud d'amorçage n'est câblé.** La découverte de pairs fonctionne, mais la première adresse doit venir de `--connect`. Ce sera une décision de lancement, pas de code.
 - **L'archive de blocs ne s'élague pas.** La mémoire est bornée depuis la phase 7, le disque ne l'est pas encore.
 - **Pas de limite par groupe réseau sur les connexions entrantes.** La diversité est imposée aux connexions sortantes seulement.

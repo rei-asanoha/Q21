@@ -245,10 +245,12 @@ Deux mesures :
   transactions d'un bloc dans son réservoir ; on ne lui envoie que ce qui
   manque. Mesuré sur trois nœuds réels : 200 blocs relayés sur 219 annonces sans
   aucun aller-retour.
-- **Les récompenses d'oncle** pansent la conséquence : un bloc valide arrivé
-  second est référencé par un bloc suivant, et son mineur reçoit **25 %** de la
-  subvention. Cette part est **prélevée sur** la subvention, jamais ajoutée : le
-  plafond ne bouge pas.
+- **Les récompenses d'oncle** ont été essayées, puis retirées. Un bloc arrivé
+  second aurait été payé 25 % de la subvention, part **prélevée** sur le mineur
+  qui l'incluait pour que le plafond ne bouge pas — et personne n'inclut un
+  oncle à ses frais. Le mécanisme ne servait plus qu'à offrir une surface
+  d'attaque ; un bloc qui porte un oncle est désormais refusé. Le relais compact
+  suffit : à deux minutes par bloc, les blocs orphelins sont rares.
 
 ---
 
