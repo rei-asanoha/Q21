@@ -23,8 +23,11 @@ fn noeud() -> Node {
 
 /// Lit du flux pendant `secs` au plus, rend tout ce qui est arrive.
 fn aspirer(mut s: TcpStream, secs: u64) -> Vec<u8> {
-    s.set_read_timeout(Some(Duration::from_millis(400)))
-        .unwrap();
+    // Poser un delai sur une socket dont l'autre bout vient de fermer rend
+    // EINVAL sur macOS. Ce n'est pas une erreur d'epreuve : c'est le cas
+    // normal quand le noeud a coupe le pair, et la lecture qui suit rendra
+    // simplement zero octet.
+    let _ = s.set_read_timeout(Some(Duration::from_millis(400)));
     let debut = std::time::Instant::now();
     let mut tout = Vec::new();
     let mut buf = [0u8; 64 * 1024];
@@ -376,13 +379,20 @@ fn le_budget_de_transactions_par_pair_finit_par_couper() {
             break;
         }
     }
-    // Le pair doit avoir ete coupe : la connexion tombe.
-    let recu = aspirer(s.try_clone().unwrap(), 6);
-    let _ = recu;
-    std::thread::sleep(Duration::from_millis(300));
+    // Le pair doit avoir ete coupe. On le demande au **noeud**, pas a la
+    // socket : selon la vitesse de la machine, celle-ci est deja morte quand
+    // on l'interroge, et l'epreuve mesurerait alors le systeme plutot que la
+    // regle.
+    let mut restants = a.peer_count();
+    for _ in 0..80 {
+        if restants == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        restants = a.peer_count();
+    }
     assert_eq!(
-        a.peer_count(),
-        0,
+        restants, 0,
         "un pair qui insiste au-dela de son budget doit etre coupe"
     );
     a.shutdown();
