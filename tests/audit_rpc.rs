@@ -2309,11 +2309,14 @@ fn faille_l_erreur_de_fonds_revele_le_solde_exact() {
 fn faille_iterations_attaquant_avant_verification_du_mac() {
     use q21_core::kdf;
 
-    let scelle = kdf::sceller(b"phrase", b"seed=00\nnext_index=0\n", 1).expect("scellage");
+    let scelle =
+        kdf::sceller(b"phrase", b"seed=00\nnext_index=0\n", kdf::COUT_EPREUVE).expect("scellage");
 
-    let mesure = |iterations: u32| {
+    // Le format courant annonce sa memoire en Kio aux octets 8..12 : c'est
+    // le champ qu'un attaquant reecrirait pour imposer le travail.
+    let mesure = |memoire_kib: u32| {
         let mut faux = scelle.clone();
-        faux[8..12].copy_from_slice(&iterations.to_le_bytes());
+        faux[8..12].copy_from_slice(&memoire_kib.to_le_bytes());
         let t = Instant::now();
         let r = kdf::desceller(b"phrase", &faux);
         (t.elapsed(), r)
@@ -2322,12 +2325,12 @@ fn faille_iterations_attaquant_avant_verification_du_mac() {
     // Le champ reste lu avant d'etre authentifie — c'est inevitable, il faut ce
     // nombre pour deriver la clef qui verifie le MAC. Ce qui a change : il est
     // **borne** avant la derivation.
-    let (rapide, _) = mesure(1);
+    let (rapide, _) = mesure(64);
     let (absurde, r) = mesure(u32::MAX);
-    eprintln!("iterations=1 : {rapide:?} ; iterations=2^32-1 : {absurde:?}");
+    eprintln!("memoire=64 Kio : {rapide:?} ; memoire=2^32-1 Kio : {absurde:?}");
     assert!(
-        matches!(r, Err(q21_core::kdf::ScelleError::IterationsAberrantes(_))),
-        "un nombre d'iterations aberrant doit etre refuse : {r:?}"
+        matches!(r, Err(q21_core::kdf::ScelleError::CoutAberrant { .. })),
+        "un cout aberrant doit etre refuse : {r:?}"
     );
     assert!(
         absurde < Duration::from_millis(50),
@@ -2359,8 +2362,8 @@ fn faille_rejeu_d_un_ancien_fichier_de_portefeuille() {
              next_index={next}\nnetwork=regtest\nscheme=1\nserie={serie}\nconsommes=\n"
         )
     };
-    let ancien = kdf::sceller(b"phrase", contenu(3, 0).as_bytes(), 1).unwrap();
-    let recent = kdf::sceller(b"phrase", contenu(4, 9).as_bytes(), 1).unwrap();
+    let ancien = kdf::sceller(b"phrase", contenu(3, 0).as_bytes(), kdf::COUT_EPREUVE).unwrap();
+    let recent = kdf::sceller(b"phrase", contenu(4, 9).as_bytes(), kdf::COUT_EPREUVE).unwrap();
 
     let a = String::from_utf8(kdf::desceller(b"phrase", &ancien).unwrap()).unwrap();
     let r = String::from_utf8(kdf::desceller(b"phrase", &recent).unwrap()).unwrap();
@@ -2447,7 +2450,7 @@ fn faille_le_garde_fou_anti_reutilisation_lamport_ne_survit_pas_au_redemarrage()
 #[test]
 fn faille_troncature_et_mauvaise_phrase_ne_donnent_pas_le_meme_message() {
     use q21_core::kdf::{self, ScelleError};
-    let scelle = kdf::sceller(b"phrase", b"seed=00\n", 1).unwrap();
+    let scelle = kdf::sceller(b"phrase", b"seed=00\n", kdf::COUT_EPREUVE).unwrap();
 
     let mauvaise = kdf::desceller(b"autre", &scelle).unwrap_err();
     assert_eq!(mauvaise, ScelleError::AuthentificationEchouee);
@@ -2464,9 +2467,10 @@ fn faille_troncature_et_mauvaise_phrase_ne_donnent_pas_le_meme_message() {
         assert_eq!(tronque.to_string(), mauvaise.to_string());
     }
 
-    // Un en-tete altere autrement que par la magie : meme message encore.
+    // Un en-tete altere autrement que par la magie ou le cout — ici le sel,
+    // aux octets 16..32 du format courant : meme message encore.
     let mut sel_change = scelle.clone();
-    sel_change[14] ^= 0x01;
+    sel_change[20] ^= 0x01;
     assert_eq!(
         kdf::desceller(b"phrase", &sel_change).unwrap_err(),
         mauvaise
@@ -2490,25 +2494,41 @@ fn faille_troncature_et_mauvaise_phrase_ne_donnent_pas_le_meme_message() {
     );
 }
 
-/// `iterations = 0` est refuse — la protection ne peut pas etre annulee.
+/// Un cout nul est refuse — la protection ne peut pas etre annulee. Les
+/// passes sont aux octets 12..16 du format courant, la memoire aux octets
+/// 8..12.
 #[test]
-fn ok_iterations_nulles_sont_refusees() {
+fn ok_un_cout_nul_est_refuse() {
     use q21_core::kdf;
-    let scelle = kdf::sceller(b"phrase", b"x", 1).unwrap();
+    let scelle = kdf::sceller(b"phrase", b"x", kdf::COUT_EPREUVE).unwrap();
+    let mut faux = scelle.clone();
+    faux[12..16].copy_from_slice(&0u32.to_le_bytes());
+    assert!(kdf::desceller(b"phrase", &faux).is_err());
     let mut faux = scelle.clone();
     faux[8..12].copy_from_slice(&0u32.to_le_bytes());
     assert!(kdf::desceller(b"phrase", &faux).is_err());
 }
 
-/// Le MAC couvre bien l'en-tete : on ne peut pas abaisser les iterations.
+/// Le MAC couvre bien l'en-tete : on ne peut pas abaisser le cout.
 #[test]
-fn ok_le_mac_couvre_le_nombre_d_iterations() {
+fn ok_le_mac_couvre_le_cout() {
     use q21_core::kdf;
-    let scelle = kdf::sceller(b"phrase", b"seed=aa\n", 200_000).unwrap();
+    let scelle = kdf::sceller(
+        b"phrase",
+        b"seed=aa\n",
+        kdf::Cout {
+            memoire_kib: 1024,
+            passes: 2,
+        },
+    )
+    .unwrap();
     let mut faux = scelle.clone();
-    faux[8..12].copy_from_slice(&1u32.to_le_bytes());
+    faux[12..16].copy_from_slice(&1u32.to_le_bytes());
     assert!(
         kdf::desceller(b"phrase", &faux).is_err(),
-        "abaisser les iterations doit casser le MAC"
+        "abaisser le cout doit casser le MAC"
     );
+    let mut faux = scelle.clone();
+    faux[8..12].copy_from_slice(&64u32.to_le_bytes());
+    assert!(kdf::desceller(b"phrase", &faux).is_err());
 }
