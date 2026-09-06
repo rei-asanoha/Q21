@@ -19,3 +19,6 @@
 # Archives de travail
 *.tar.gz
 *.zip
+
+# Donnees de noeud locales
+/q21-data/

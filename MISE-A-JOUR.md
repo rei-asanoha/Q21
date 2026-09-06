@@ -54,7 +54,7 @@ Clique sur **Commit to main**, puis sur **Push origin** en haut.
 
 ## 3 · Relance la fabrication
 
-Sur `github.com/golboy03/Q21` :
+Sur `github.com/VOTRE-COMPTE/VOTRE-DEPOT` :
 
 **Actions** → **Livraison** (colonne de gauche) → **Run workflow** ▾ → bouton vert **Run workflow**
 

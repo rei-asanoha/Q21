@@ -4952,27 +4952,27 @@ mod tests {
     fn le_nom_de_compte_windows_se_qualifie_du_domaine() {
         // Cas courant : machine personnelle, domaine = nom de la machine.
         assert_eq!(
-            nom_de_compte_windows(Some("Tibou"), Some("DESKTOP-PC")),
-            Some("DESKTOP-PC\\Tibou".to_string())
+            nom_de_compte_windows(Some("utilisateur"), Some("DESKTOP-PC")),
+            Some("DESKTOP-PC\\utilisateur".to_string())
         );
         // Sans domaine connu, le nom seul suffit.
         assert_eq!(
-            nom_de_compte_windows(Some("Tibou"), None),
-            Some("Tibou".to_string())
+            nom_de_compte_windows(Some("utilisateur"), None),
+            Some("utilisateur".to_string())
         );
-        // Un domaine vide ne doit pas produire un « \\Tibou » bancal.
+        // Un domaine vide ne doit pas produire un « \\utilisateur » bancal.
         assert_eq!(
-            nom_de_compte_windows(Some("Tibou"), Some("")),
-            Some("Tibou".to_string())
+            nom_de_compte_windows(Some("utilisateur"), Some("")),
+            Some("utilisateur".to_string())
         );
         assert_eq!(
-            nom_de_compte_windows(Some("Tibou"), Some("   ")),
-            Some("Tibou".to_string())
+            nom_de_compte_windows(Some("utilisateur"), Some("   ")),
+            Some("utilisateur".to_string())
         );
         // Les espaces parasites ne doivent pas entrer dans une regle d'acces.
         assert_eq!(
-            nom_de_compte_windows(Some("  Tibou  "), Some("  DOM  ")),
-            Some("DOM\\Tibou".to_string())
+            nom_de_compte_windows(Some("  utilisateur  "), Some("  DOM  ")),
+            Some("DOM\\utilisateur".to_string())
         );
         // Sans utilisateur, on n'accorde rien a personne : mieux vaut echouer
         // franchement que poser une regle au hasard.

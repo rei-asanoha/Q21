@@ -9,9 +9,9 @@ serveur et le domaine existent déjà, et le certificat est gratuit.
 Écrit pour quelqu'un qui n'a jamais publié un site. Chaque commande dit ce
 qu'elle fait et ce que vous devez voir en retour.
 
-> **Les deux fenêtres.** Quand l'invite affiche `ubuntu@vps-92a55479:~$`, vous
+> **Les deux fenêtres.** Quand l'invite affiche `ubuntu@vps-XXXXXXXX:~$`, vous
 > êtes **sur le serveur** — j'écris FENÊTRE SERVEUR. Quand elle affiche
-> `PS C:\Users\Tibou>`, vous êtes **sur votre PC** — j'écris FENÊTRE PC.
+> `PS C:\Users\VotreNom>`, vous êtes **sur votre PC** — j'écris FENÊTRE PC.
 
 ---
 
@@ -121,7 +121,7 @@ l'option `--rpc-public`. Sans cette étape, l'étape 3 échouera.
 Dans une **FENÊTRE PC**, décompressez (adaptez le chemin) :
 
 ```powershell
-cd "C:\Users\Tibou\Documents\Q21\Serveur\serveur linux"
+cd "C:\Users\VotreNom\Documents\Q21\Serveur\serveur linux"
 ```
 
 ```powershell

@@ -198,7 +198,7 @@ Répondez **Yes** à la question posée.
 On n'administre pas en `root` au quotidien.
 
 ```bash
-adduser --gecos "" titi
+adduser --gecos "" q21op
 ```
 
 Il demande un mot de passe — **mettez-en un solide et notez-le**. Il ne servira
@@ -208,8 +208,8 @@ d'administration.
 Donnez-lui le droit d'administrer, et recopiez-lui votre clé :
 
 ```bash
-usermod -aG sudo titi
-rsync --archive --chown=titi:titi ~/.ssh /home/titi/
+usermod -aG sudo q21op
+rsync --archive --chown=q21op:q21op ~/.ssh /home/q21op/
 ```
 
 ### Le compte du service
@@ -234,17 +234,17 @@ C'est l'étape où l'on peut se verrouiller dehors. **Suivez l'ordre exactement.
 Dans la nouvelle :
 
 ```bash
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 sudo -v
 ```
 
-Il demande la phrase de votre clé, puis le mot de passe de `titi` pour `sudo`.
+Il demande la phrase de votre clé, puis le mot de passe de `q21op` pour `sudo`.
 Si les deux passent, continuez. **Si l'un des deux échoue, arrêtez-vous ici** et
 corrigez depuis la première fenêtre, encore ouverte en `root`.
 
 ### 7.2 — Interdire le mot de passe et la connexion root
 
-Dans la deuxième fenêtre, en tant que `titi` :
+Dans la deuxième fenêtre, en tant que `q21op` :
 
 ```bash
 sudo nano /etc/ssh/sshd_config.d/99-q21.conf
@@ -276,7 +276,7 @@ sudo systemctl restart ssh
 ### 7.4 — Vérifier depuis une TROISIÈME fenêtre
 
 ```bash
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 ```
 
 Doit passer. Et :
@@ -332,7 +332,7 @@ le serveur ne peut pas faire), puis se pousse vers le serveur.
 
 ### Sur le Mac
 
-Sur `github.com/golboy03/Q21` → **Actions** → **Livraison** → la dernière
+Sur `github.com/VOTRE-COMPTE/VOTRE-DEPOT` → **Actions** → **Livraison** → la dernière
 exécution verte → section **Artifacts** → **`q21-linux-x86_64.tar.gz`**.
 
 Décompressez-le (double-clic, éventuellement deux fois). Vous obtenez un dossier
@@ -342,13 +342,13 @@ Dans le Terminal, placez-vous dans ce dossier — tapez `cd ` puis glissez le
 dossier depuis le Finder — et envoyez :
 
 ```bash
-scp q21 titi@VOTRE_IP:~/
+scp q21 q21op@VOTRE_IP:~/
 ```
 
 ### Sur le serveur
 
 ```bash
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 sudo mv ~/q21 /opt/q21/q21
 sudo chown q21:q21 /opt/q21/q21
 sudo chmod +x /opt/q21/q21
@@ -520,7 +520,7 @@ n'ont plus besoin d'être sur le même réseau local.
 # Surveiller, au quotidien
 
 ```bash
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 
 sudo systemctl status q21      # est-il vivant ?
 sudo journalctl -u q21 -n 50   # les 50 dernieres lignes
@@ -531,7 +531,7 @@ Pour consulter l'explorateur du serveur sans ouvrir aucun port, ouvrez un
 **tunnel** depuis le Mac :
 
 ```bash
-ssh -L 21080:127.0.0.1:21080 titi@VOTRE_IP
+ssh -L 21080:127.0.0.1:21080 q21op@VOTRE_IP
 ```
 
 Tant que cette fenêtre reste ouverte, `http://127.0.0.1:21080` sur votre Mac
