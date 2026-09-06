@@ -464,7 +464,7 @@ fn poignee(hauteur: u64) -> Message {
             .map(|d| d.as_secs())
             .unwrap_or(0),
         nonce,
-        user_agent: "q21:0.2".into(),
+        user_agent: "q21:0.3".into(),
         start_height: hauteur,
     }
 }

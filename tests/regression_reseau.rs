@@ -279,3 +279,137 @@ fn un_bloc_compact_orphelin_ne_declenche_aucun_travail() {
     );
     a.shutdown();
 }
+
+/// Un bloc ou une transaction poussee avant la poignee de main n'est pas lue.
+///
+/// Tous les messages de service exigeaient la poignee de main ; les deux
+/// messages pousses — `Tx` et `Block` — ne l'exigeaient pas. Une transaction
+/// a signature fausse depensant sa propre sortie forcait une verification
+/// post-quantique complete sous le verrou global, sur une simple connexion
+/// anonyme, sans sanction ni budget : une soixantaine par seconde suffisait a
+/// figer le noeud.
+#[test]
+fn rien_n_est_lu_avant_la_poignee_de_main_meme_pousse() {
+    use std::sync::atomic::Ordering;
+    let a = noeud();
+    let addr = a.listen("127.0.0.1:0").expect("ecoute");
+    let magie = magic_for(RESEAU);
+    let genese = genesis_block(RESEAU);
+
+    let mut s = TcpStream::connect(addr).expect("connexion");
+    // Un bloc (la genese, deja connue) et une transaction (la coinbase de la
+    // genese), pousses sans aucun `Version`.
+    s.write_all(&Message::Block(Box::new(genese.clone())).frame(magie))
+        .expect("envoi bloc");
+    s.write_all(&Message::Tx(Box::new(genese.transactions[0].clone())).frame(magie))
+        .expect("envoi tx");
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert_eq!(
+        a.stats.blocs_recus.load(Ordering::Relaxed),
+        0,
+        "un bloc pousse sans poignee de main a ete lu"
+    );
+    assert_eq!(
+        a.stats.tx_recues.load(Ordering::Relaxed),
+        0,
+        "une transaction poussee sans poignee de main a ete lue"
+    );
+    a.shutdown();
+}
+
+/// Le budget de transactions inedites par pair mord, et l'insistance coupe.
+///
+/// Apres la poignee de main, un pair dispose d'une reserve de `TX_SEAU_MAX`
+/// transactions inedites, puis de `TX_DEBIT_PAR_SEC` par seconde. Au-dela,
+/// le message n'est pas lu, et le pair perd des points a chaque envoi.
+#[test]
+fn le_budget_de_transactions_par_pair_finit_par_couper() {
+    use q21_core::net::TX_SEAU_MAX;
+    use q21_core::tx::{Transaction, TxIn, TxOut, Witness};
+    use q21_core::amount::Amount;
+    use q21_core::hash::Hash256;
+    use q21_core::sig::SchemeId;
+    use q21_core::tx::OutPoint;
+
+    let a = noeud();
+    let addr = a.listen("127.0.0.1:0").expect("ecoute");
+    let magie = magic_for(RESEAU);
+
+    let mut s = TcpStream::connect(addr).expect("connexion");
+    s.write_all(
+        &Message::Version {
+            version: PROTOCOL_VERSION,
+            timestamp: 0,
+            nonce: 0xbeef_cafe,
+            user_agent: "epreuve".into(),
+            start_height: 0,
+        }
+        .frame(magie),
+    )
+    .expect("version");
+    s.write_all(&Message::VerAck.frame(magie)).expect("verack");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Des transactions inedites, toutes invalides (entree inconnue) — chacune
+    // distincte par sa sortie. Bien plus que la reserve.
+    let n = TX_SEAU_MAX as u32 + 200;
+    for k in 0..n {
+        let t = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([7u8; 32]),
+                    index: k,
+                },
+                witness: Witness::default(),
+                sequence: 0,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_units(10_000),
+                scheme: SchemeId::LamportOts,
+                pubkey_hash: Hash256([(k % 251) as u8; 32]),
+            }],
+            lock_time: 0,
+        };
+        if s.write_all(&Message::Tx(Box::new(t)).frame(magie)).is_err() {
+            break;
+        }
+    }
+    // Le pair doit avoir ete coupe : la connexion tombe.
+    let recu = aspirer(s.try_clone().unwrap(), 6);
+    let _ = recu;
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        a.peer_count(),
+        0,
+        "un pair qui insiste au-dela de son budget doit etre coupe"
+    );
+    a.shutdown();
+}
+
+/// L'ecoute garde des places pour nos propres appels, et borne chaque groupe.
+///
+/// Trente-deux connexions depuis une seule adresse prenaient les trente-deux
+/// places ; le carnet anti-eclipse n'etait alors plus jamais consulte.
+#[test]
+fn l_ecoute_reserve_des_places_aux_sortantes() {
+    use q21_core::net::{MAX_PEERS, PLACES_SORTANTES_RESERVEES};
+    let a = noeud();
+    let addr = a.listen("127.0.0.1:0").expect("ecoute");
+    let mut gardees = Vec::new();
+    for _ in 0..(MAX_PEERS + 4) {
+        if let Ok(s) = TcpStream::connect(addr) {
+            gardees.push(s);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let n = a.peer_count();
+    assert!(
+        n <= MAX_PEERS - PLACES_SORTANTES_RESERVEES,
+        "{n} entrantes admises : les places sortantes ne sont pas reservees"
+    );
+    drop(gardees);
+    a.shutdown();
+}

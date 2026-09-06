@@ -31,11 +31,17 @@ jobs:
       - uses: actions/checkout@v4
 
       # La version vient de `rust-toolchain.toml` : la meme que la livraison.
+      # Installee par `rustup` directement, et non par une action tierce
+      # suivie sur une branche mouvante : le programme qui compile le
+      # portefeuille ne doit dependre de rien que quelqu'un puisse reecrire
+      # entre deux executions.
       - name: Chaine Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95.0
-          components: clippy, rustfmt
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt --no-self-update
+          rustup default 1.95.0
+          rustc --version
 
       - name: Cache
         uses: Swatinem/rust-cache@v2

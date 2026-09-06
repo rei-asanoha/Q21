@@ -656,3 +656,36 @@ sous un seul verrou.
 toutes les dix minutes ; figée trente minutes, ou RPC muet, le service est
 relancé et le téléphone prévenu. Rien de plus qu'un script et un minuteur —
 mais c'est la différence entre un réseau et un projet.
+
+## Quatrième vague — l'audit adverse, et ses correctifs
+
+Une revue menée en attaquant, sur cinq axes lus ligne à ligne — consensus,
+réseau, portefeuille, preuve de travail et disque, exploitation — avec des
+épreuves écrites pour reproduire chaque piste. Le verdict d'abord : **aucune
+voie d'inflation, de double dépense ni d'exfiltration de clé à distance** ;
+les invariants monétaires tiennent, et les décodeurs, le scellement, le
+sighash, la difficulté et l'instantané ont résisté. Les failles étaient
+ailleurs, et toutes sont fermées par cette vague.
+
+| Faille | Ce qui est fermé, et comment on le sait |
+|---|---|
+| Une transaction à signature fausse, poussée par un inconnu sans poignée de main, forçait une vérification post-quantique **sous le verrou global** : soixante par seconde figeaient un nœud | `Tx` et `Block` exigent la poignée de main ; budget par pair (64, puis 8/s) ; une transaction invalide en soi coûte des points. Épreuves `rien_n_est_lu_avant_la_poignee_de_main_meme_pousse`, `le_budget_de_transactions_par_pair_finit_par_couper` |
+| Une chaîne parent→enfant dans un même bloc était refusée par le validateur mais empaquetée par le mineur : bloc invalide, travail perdu, production figée | `check_block` valide contre une vue superposant les sorties créées plus tôt dans le bloc. `regression_chainage.rs` : la chaîne passe, la double dépense et l'enfant-avant-parent restent refusés |
+| Le jeton du portefeuille passait par la ligne de commande du navigateur, lisible par tout compte de la machine | Sous Linux, le compte qui tient l'autre bout de chaque connexion locale est demandé au noyau ; tout autre compte est refusé. Épreuve `la_connexion_locale_est_attribuee_a_notre_compte` |
+| Une seule IP occupait les trente-deux places | Huit places réservées aux sortantes, quatre entrantes par groupe `/16`. Épreuve `l_ecoute_reserve_des_places_aux_sortantes` |
+| Des adresses muettes glissées dans le carnet faisaient durer un tour de boucle plus d'une minute, et le nœud se coupait de tous ses pairs — la veille était déduite de la durée du tour | Le détecteur de veille vit sur son propre fil et ne regarde que l'horloge murale ; connexion bornée à quatre secondes |
+| La réparation d'une queue tronquée jetait jusqu'à 64 Mio — un bit retourné au milieu du fichier effaçait des dizaines de blocs valides | Bornée à un bloc du consensus ; ce qui est coupé est copié à côté. Épreuves `une_queue_plus_longue_qu_un_bloc_n_est_pas_coupee`, copie vérifiée |
+| Un arrêt brutal pendant le minage laissait `next_index` en retard sur la chaîne : des récompenses invisibles, sans réparation | Portefeuille écrit après chaque bloc trouvé ; **rattrapage** au chargement des adresses distribuées au-delà du fichier ; balayage des clés à usage unique relancé après toute découverte. Épreuve `le_rattrapage_retrouve_les_adresses_distribuees_apres_la_derniere_ecriture` |
+| Reconstructions compactes en attente sans borne ; corps demandés jamais surveillés | Quatre en vol par pair ; un corps non livré en soixante secondes est redemandé ailleurs et coûte cinquante points |
+| Scans de deux mille corps sous le verrou, sans jeton, en mode public | Budget de balayages : trente, puis douze par minute, toutes requêtes confondues |
+| Livraison non signée ; action de chaîne d'outils suivie sur une branche mouvante | Signature `minisign` à chaque livraison, **obligatoire** ; `rustup` à la place de l'action ; script d'épinglage des actions par empreinte |
+| Genèse abîmée rangée comme chaîne étrangère ; corps corrompu hors queue rendant tout démarrage impossible ; corps non `fsync` ; borne Argon2id à 1 Gio ; fichier de veille dans `/var/tmp` | Genèse canonique recopiée ; coupe au dernier bloc sain ; `sync_all` ; 256 Mio ; `RuntimeDirectory` et lien symbolique refusé |
+
+Ce que la vague ne change pas, et qu'elle a redit : la propriété anti-ASIC
+reste une hypothèse tant que la preuve de travail n'a pas reçu de
+cryptanalyse externe — le commentaire de `POW_K` qui parlait de latence
+« sans avantage décisif » a été ramené à ce que la construction garantit,
+la bande passante mémoire. Et sur une machine qui lit sa phrase dans un
+fichier, le scellement ne protège pas contre le vol du support : c'est un
+compromis à connaître, écrit dans `DURCISSEMENT.md`, pas un défaut à
+corriger.

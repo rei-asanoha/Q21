@@ -314,9 +314,18 @@ pub const MAX_TARGET_CHANGE: u64 = 4;
 /// Nombre d'acces a la table par tentative de minage.
 ///
 /// Ces acces sont **sequentiellement dependants** : l'indice du suivant se
-/// deduit du resultat du precedent. Un circuit ne peut donc ni les paralleliser
-/// ni les prefetcher, et se retrouve limite par la latence de la DRAM — une
-/// grandeur physique sur laquelle personne n'a d'avantage decisif.
+/// deduit du resultat du precedent. A l'interieur d'une tentative, rien ne
+/// se prefetche ni ne se parallelise.
+///
+/// Ce que cela protege, dit exactement : un circuit ne parallelise pas *une*
+/// tentative, mais il en entrelace des milliers, comme tout mineur. La
+/// grandeur qui borne alors le debit n'est pas la latence d'un acces mais la
+/// **bande passante memoire** et la capacite a tenir la table — les memes
+/// que pour Ethash, et les seules qu'un circuit achete au meme prix que tout
+/// le monde. Une premiere redaction parlait de latence « sur laquelle
+/// personne n'a d'avantage decisif » ; c'etait plus fort que ce que la
+/// construction garantit, et l'anti-ASIC reste une hypothese tant que la
+/// preuve de travail n'a pas recu de cryptanalyse externe.
 pub const POW_K: usize = 32;
 
 /// Taille d'un element de table, en octets.

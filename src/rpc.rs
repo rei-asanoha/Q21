@@ -227,6 +227,67 @@ pub struct RpcContext {
     /// Absent en memoire pure (epreuves). En production il **doit** etre
     /// fourni : sans lui, une depense n'est pas enregistree.
     pub sur_changement: Option<SurChangement>,
+    /// Budget des balayages de chaine, quand ce service est expose au public.
+    ///
+    /// Absent en local : celui qui interroge son propre noeud peut le faire
+    /// attendre. Present en mode public : voir [`SeauBalayages`].
+    pub balayages: Option<Arc<Mutex<SeauBalayages>>>,
+}
+
+/// Balayages de chaine qu'un service public accorde, toutes requetes
+/// confondues.
+///
+/// # Le defaut que ceci ferme
+///
+/// `getmontant`, `getadresse` sans index et `gettransaction` sans resultat
+/// d'index relisent jusqu'a [`MAX_BLOCS_BALAYES`] corps depuis le disque,
+/// **sous le verrou global** — celui qui sert a valider les blocs. En mode
+/// public, ces methodes repondent sans jeton, et un lot en autorise cent :
+/// un visiteur anonyme, en boucle sur des identifiants inexistants, gelait
+/// la validation du seul point d'entree public. Le mandataire peut limiter
+/// le debit par adresse ; le noeud, lui, ne connait pas l'adresse derriere
+/// le mandataire. Il borne donc le total : une reserve, puis un debit
+/// soutenu. Au-dela, la reponse dit de reessayer — et le noeud, lui,
+/// continue de valider.
+pub struct SeauBalayages {
+    jetons: u32,
+    dernier: std::time::Instant,
+}
+
+/// Balayages accordes d'emblee.
+pub const BALAYAGES_RESERVE: u32 = 30;
+/// Balayages regagnes par minute.
+pub const BALAYAGES_PAR_MINUTE: u32 = 12;
+
+impl Default for SeauBalayages {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SeauBalayages {
+    pub fn new() -> SeauBalayages {
+        SeauBalayages {
+            jetons: BALAYAGES_RESERVE,
+            dernier: std::time::Instant::now(),
+        }
+    }
+
+    /// Accorde un balayage, ou non.
+    pub fn autoriser(&mut self, maintenant: std::time::Instant) -> bool {
+        let ecoule = maintenant.saturating_duration_since(self.dernier).as_secs();
+        let gain = (ecoule as u32).saturating_mul(BALAYAGES_PAR_MINUTE) / 60;
+        if gain > 0 {
+            self.jetons = self.jetons.saturating_add(gain).min(BALAYAGES_RESERVE);
+            self.dernier = maintenant;
+        }
+        if self.jetons > 0 {
+            self.jetons -= 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl RpcContext {
@@ -239,6 +300,27 @@ impl RpcContext {
             index: None,
             minage: None,
             sur_changement: None,
+            balayages: None,
+        }
+    }
+
+    /// Un balayage de chaine est-il accorde ? Toujours en local ; au budget
+    /// en mode public.
+    fn autoriser_balayage(&self) -> Result<(), Json> {
+        let Some(seau) = &self.balayages else {
+            return Ok(());
+        };
+        let accorde = seau
+            .lock()
+            .map(|mut s| s.autoriser(std::time::Instant::now()))
+            .unwrap_or(false);
+        if accorde {
+            Ok(())
+        } else {
+            Err(erreur(
+                ERR_REQUETE,
+                "trop de recherches en cours sur ce service public : reessayez dans une minute",
+            ))
         }
     }
 }
@@ -763,6 +845,7 @@ impl RpcContext {
         // Sinon, dans la chaine. Balayage arriere : une transaction cherchee
         // est presque toujours recente. Sans index, on reste honnete sur le
         // cout — et sur la borne.
+        self.autoriser_balayage()?;
         let mut fond_atteint = false;
         let trouve = self.node.with_chain(|c| {
             let mut h = c.height() as i64;
@@ -1288,6 +1371,7 @@ impl RpcContext {
             }
             None => {
                 // Balayage arriere borne. La reponse le dira.
+                self.autoriser_balayage()?;
                 let plancher = hauteur.saturating_sub(MAX_BLOCS_BALAYES);
                 let v = self.node.with_chain(|c| {
                     let mut v: Vec<(u64, u32)> = Vec::new();
@@ -1424,6 +1508,7 @@ impl RpcContext {
             })
             .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'unites' ou 'montant' attendu"))?;
 
+        self.autoriser_balayage()?;
         let (resultats, hauteur, depuis, plafonne) = self.node.with_chain(|c| {
             let hauteur = c.height();
             let depuis = hauteur.saturating_sub(MAX_BLOCS_BALAYES);
@@ -2614,6 +2699,7 @@ mod tests {
         let node = Arc::new(Node::new(RESEAU, Chain::new(RESEAU, g)));
         RpcContext {
             sur_changement: None,
+            balayages: None,
             index: None,
             // Les epreuves du RPC voient un minage possible : c'est ce qui
             // permet de verifier que l'interrupteur repond, et que sans
@@ -2652,6 +2738,7 @@ mod tests {
         }
         RpcContext {
             sur_changement: None,
+            balayages: None,
             index: None,
             minage: Some(Arc::new(crate::minage::Minage::new(false))),
             node: Arc::new(Node::new(RESEAU, c)),
@@ -3277,6 +3364,7 @@ mod tests {
         let node = Arc::new(Node::new(RESEAU, chaine));
         let c = RpcContext {
             sur_changement: None,
+            balayages: None,
             index: None,
             minage: None,
             node,

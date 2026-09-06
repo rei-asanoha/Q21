@@ -99,6 +99,26 @@ impl std::fmt::Display for StoreError {
 /// une allocation delirante.
 const MAX_BLOC_SERIALISE: u32 = 64 * 1024 * 1024;
 
+/// Ou la queue coupee d'un fichier de blocs est conservee.
+fn chemin_de_la_coupe(chemin: &Path) -> PathBuf {
+    let mut nom = chemin.as_os_str().to_os_string();
+    nom.push(".coupe");
+    PathBuf::from(nom)
+}
+
+/// Copie `longueur` octets a partir de `depuis` dans le fichier de coupe,
+/// avant qu'ils ne soient retires. Une copie precedente est ecrasee : elle
+/// concernait une reparation deja passee.
+fn copier_la_queue(chemin: &Path, depuis: u64, longueur: u64) -> std::io::Result<()> {
+    let mut f = File::open(chemin)?;
+    f.seek(SeekFrom::Start(depuis))?;
+    let mut octets = Vec::with_capacity(longueur as usize);
+    f.take(longueur).read_to_end(&mut octets)?;
+    let mut sortie = File::create(chemin_de_la_coupe(chemin))?;
+    sortie.write_all(&octets)?;
+    sortie.sync_all()
+}
+
 /// Position d'un enregistrement dans le fichier.
 ///
 /// `offset` designe le debut du **corps**, apres les quatre octets de longueur.
@@ -141,6 +161,12 @@ impl BlockStore {
             f.write_all(&donnees)?;
             f.flush()?;
         }
+        // Jusqu'au disque, comme les en-tetes et l'instantane : sans cela, une
+        // coupure de courant pouvait perdre le dernier corps alors que son
+        // en-tete, lui, avait ete force sur le disque — l'instantane se
+        // retrouvait en avance sur le fichier de blocs. Un bloc toutes les
+        // deux minutes : le cout est invisible.
+        fichier.sync_all()?;
         Ok(RecordRef {
             offset: debut + 4,
             len: donnees.len() as u32,
@@ -322,6 +348,16 @@ impl BlockArchive {
         chemin: P,
         reseau: crate::address::Network,
     ) -> Result<(BlockArchive, Vec<BlockHeader>, Option<StoreError>), StoreError> {
+        Self::ouvrir(chemin.as_ref(), reseau, true)
+    }
+
+    /// `reparer_la_genese` n'est vrai qu'a la premiere tentative : une
+    /// reparation qui ne changerait rien ne doit pas boucler.
+    fn ouvrir(
+        chemin: &Path,
+        reseau: crate::address::Network,
+        reparer_la_genese: bool,
+    ) -> Result<(BlockArchive, Vec<BlockHeader>, Option<StoreError>), StoreError> {
         let store = BlockStore::new(chemin);
         let (entetes, souci) = store.scan_headers()?;
 
@@ -337,10 +373,41 @@ impl BlockArchive {
         // L'identifiant de la genese est une constante du reseau. On la compare
         // ici, une fois, a l'endroit ou toute chaine sur disque entre dans le
         // programme.
-        if let Some((premier, _)) = entetes.first() {
+        if let Some((premier, ref_premier)) = entetes.first() {
             let attendu = crate::chain::genesis_id(reseau);
             let vu = premier.block_id();
             if vu != attendu {
+                // --- Une genese abimee n'est pas une genese etrangere.
+                //
+                // La genese est une constante du reseau, reecrite sans etat.
+                // Si le **second** enregistrement s'enchaine sur la vraie
+                // genese, le premier n'est pas celui d'une autre chaine : ce
+                // sont quelques octets retournes sur la carte. Les ranger
+                // comme « ancienne chaine » abandonnait toute l'histoire
+                // locale pour un bit ; on recopie la genese canonique a sa
+                // place, si elle y tient.
+                let suivant_s_enchaine = entetes
+                    .get(1)
+                    .map(|(h, _)| h.prev_block == attendu)
+                    .unwrap_or(false);
+                let canonique = crate::chain::genesis_block(reseau).encode();
+                if reparer_la_genese
+                    && suivant_s_enchaine
+                    && canonique.len() as u32 == ref_premier.len
+                {
+                    let mut f = OpenOptions::new().write(true).open(store.path())?;
+                    f.seek(SeekFrom::Start(ref_premier.offset))?;
+                    f.write_all(&canonique)?;
+                    f.sync_all()?;
+                    eprintln!(
+                        "  fichier des blocs repare : l'enregistrement de la genese etait abime, \
+                         la genese du reseau a ete recopiee a sa place"
+                    );
+                    // On relit : la suite du chargement doit voir le fichier tel
+                    // qu'il est maintenant.
+                    drop(f);
+                    return Self::ouvrir(store.path(), reseau, false);
+                }
                 return Err(StoreError::GeneseEtrangere { attendu, vu });
             }
         }
@@ -376,8 +443,17 @@ impl BlockArchive {
         //    aurait donc efface tout le fichier. L'epreuve d'audit
         //    `aa_taille_mensongere` l'a vu ; la relecture, non.
         // 3. **Jamais plus qu'un bloc.** Ce qu'on jette doit avoir la taille
-        //    d'une ecriture interrompue. Au-dela, on ne comprend plus ce qu'on
-        //    voit, et on s'abstient.
+        //    d'une ecriture interrompue — donc au plus un bloc du consensus,
+        //    `MAX_BLOCK_SIZE`, et non la borne d'allocation de la lecture, qui
+        //    en vaut seize. Un seul bit retourne dans un prefixe de longueur
+        //    au milieu du fichier fait pointer un enregistrement au-dela de la
+        //    fin, et se presente comme une queue tronquee : avec la borne
+        //    large, la reparation effacait tout ce qui suivait — des dizaines
+        //    de blocs valides — en annoncant une reparation reussie. Au-dela
+        //    d'un bloc, on ne comprend plus ce qu'on voit, et on s'abstient.
+        // 4. **Rien n'est jete sans copie.** Ce qui est coupe est d'abord
+        //    ecrit a cote du fichier, dans `blocks.dat.coupe` : si la
+        //    reparation s'est trompee, rien n'est perdu pour de bon.
         let mut souci = souci;
         if matches!(souci, Some(StoreError::FichierTronque { .. })) && !entetes.is_empty() {
             let fin = entetes
@@ -388,19 +464,27 @@ impl BlockArchive {
                 .map(|m| m.len())
                 .unwrap_or(0);
             let jete = taille.saturating_sub(fin);
-            if fin > 0 && jete <= MAX_BLOC_SERIALISE as u64 + 4 {
-                match std::fs::OpenOptions::new().write(true).open(store.path()) {
+            if fin > 0 && jete <= crate::consensus::MAX_BLOCK_SIZE as u64 + 4 {
+                let copie = copier_la_queue(store.path(), fin, jete);
+                match copie.and_then(|_| std::fs::OpenOptions::new().write(true).open(store.path())) {
                     Ok(f) => match f.set_len(fin) {
                         Ok(()) => {
                             souci = None;
                             eprintln!(
-                                "  fichier des blocs repare : {jete} octet(s) d'ecriture interrompue coupes"
+                                "  fichier des blocs repare : {jete} octet(s) d'ecriture interrompue coupes \
+                                 (copie gardee dans {})",
+                                chemin_de_la_coupe(store.path()).display()
                             );
                         }
                         Err(e) => eprintln!("avertissement : queue abimee non coupee ({e})"),
                     },
                     Err(e) => eprintln!("avertissement : queue abimee non coupee ({e})"),
                 }
+            } else if fin > 0 {
+                eprintln!(
+                    "avertissement : {jete} octet(s) au-dela du dernier enregistrement complet, \
+                     plus qu'un bloc : ce n'est pas une ecriture interrompue, rien n'est coupe"
+                );
             }
         }
 
@@ -919,6 +1003,10 @@ mod tests {
             sain,
             "le fichier doit etre revenu a la fin du dernier enregistrement complet"
         );
+        // Rien n'est jete sans copie : les six octets coupes sont a cote.
+        let coupe = std::fs::read(chemin_de_la_coupe(&p)).expect("la copie de la queue coupee");
+        assert_eq!(coupe, vec![0x40, 0x01, 0x00, 0x00, 0xaa, 0xbb]);
+        let _ = std::fs::remove_file(chemin_de_la_coupe(&p));
 
         // Et surtout : ce qu'on ecrit ensuite est relu au redemarrage suivant.
         s.append(&g).unwrap();
@@ -930,6 +1018,77 @@ mod tests {
             "un bloc ecrit apres la reparation doit se relire"
         );
         assert!(souci2.is_none());
+        s.remove().unwrap();
+    }
+
+    /// Une queue plus longue qu'un bloc n'est pas une ecriture interrompue :
+    /// rien n'est coupe, et l'incident reste signale.
+    #[test]
+    fn une_queue_plus_longue_qu_un_bloc_n_est_pas_coupee() {
+        let p = chemin_temporaire("queue-trop-longue");
+        let s = BlockStore::new(&p);
+        let g = crate::chain::genesis_block(crate::address::Network::Regtest);
+        s.append(&g).unwrap();
+        let sain = std::fs::metadata(&p).unwrap().len();
+        {
+            // Un prefixe de longueur qui promet un enregistrement geant, suivi
+            // de plus d'un bloc d'octets : ce n'est pas une queue tronquee.
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(&(MAX_BLOC_SERIALISE - 1).to_le_bytes()).unwrap();
+            let bourrage = vec![0u8; crate::consensus::MAX_BLOCK_SIZE + 64];
+            f.write_all(&bourrage).unwrap();
+        }
+        let (_a, entetes, souci) =
+            BlockArchive::open(&p, crate::address::Network::Regtest).unwrap();
+        assert_eq!(entetes.len(), 1);
+        assert!(souci.is_some(), "l'incident doit rester signale");
+        assert!(
+            std::fs::metadata(&p).unwrap().len() > sain,
+            "rien ne doit avoir ete coupe"
+        );
+        s.remove().unwrap();
+    }
+
+    /// Une genese dont un octet a ete retourne est recopiee, pas rangee comme
+    /// une chaine etrangere.
+    #[test]
+    fn une_genese_abimee_est_recopiee() {
+        use crate::address::Network::Regtest;
+        let p = chemin_temporaire("genese-abimee");
+        let s = BlockStore::new(&p);
+        let g = crate::chain::genesis_block(Regtest);
+        s.append(&g).unwrap();
+        // Un second bloc qui s'enchaine sur la vraie genese.
+        let c = crate::chain::Chain::new(Regtest, g.clone());
+        let b = c
+            .mine_block(
+                crate::hash::Hash256([3u8; 32]),
+                crate::sig::SchemeId::LamportOts,
+                &[],
+                g.header.time + 120,
+                5_000_000,
+            )
+            .expect("minage");
+        s.append(&b).unwrap();
+
+        // Un octet retourne dans le nonce de la genese (dans le corps, pas
+        // dans le prefixe de longueur).
+        {
+            let mut f = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            let encode = g.encode();
+            // Le nonce est a la fin de l'en-tete : on retourne l'octet 4 + 100.
+            let position = 4 + (BlockHeader::SIZE as u64 - 1);
+            f.seek(SeekFrom::Start(position)).unwrap();
+            let mut octet = [0u8; 1];
+            f.read_exact(&mut octet).unwrap();
+            f.seek(SeekFrom::Start(position)).unwrap();
+            f.write_all(&[octet[0] ^ 0x01]).unwrap();
+            assert!(encode.len() > 4);
+        }
+        let (_a, entetes, souci) = BlockArchive::open(&p, Regtest).expect("reparation");
+        assert!(souci.is_none());
+        assert_eq!(entetes.len(), 2);
+        assert_eq!(entetes[0].block_id(), crate::chain::genesis_id(Regtest));
         s.remove().unwrap();
     }
 

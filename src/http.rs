@@ -315,6 +315,26 @@ where
                 Ok(f) => f,
                 Err(_) => break,
             };
+            // --- Defense : un autre compte de la meme machine.
+            //
+            // Le jeton voyage dans le fragment de l'adresse ouverte par le
+            // navigateur — et cette adresse est passee au lanceur en argument
+            // de ligne de commande, que tout compte de la machine peut lire
+            // dans `/proc/<pid>/cmdline`. Un jeton lu la suffisait, depuis un
+            // client non navigateur, a deplacer les fonds. Sur Linux, on
+            // demande donc au noyau **qui** tient l'autre bout de la
+            // connexion locale, et on refuse tout compte autre que le notre.
+            // Le mode public, servi par un mandataire sous un autre compte,
+            // n'est pas concerne : il n'a pas de portefeuille.
+            if hote.is_none() && !autre_compte_admis(&flux) {
+                let _ = flux.set_write_timeout(Some(Duration::from_secs(2)));
+                let _ = ecrire_reponse(
+                    &mut flux,
+                    &Response::text(403, "connexion depuis un autre compte de cette machine : refusee"),
+                );
+                let _ = flux.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
             if en_cours.load(Ordering::Relaxed) >= MAX_CONNEXIONS {
                 // Refus franc, sans fil : le client sait a quoi s'en tenir et le
                 // noeud ne paie rien.
@@ -348,6 +368,124 @@ where
     });
 
     Ok(ServerHandle { addr: local, arret })
+}
+
+/// La connexion locale vient-elle de notre propre compte ?
+///
+/// Rend `true` quand on ne peut pas le savoir — autre systeme, `/proc`
+/// absent, connexion non locale — pour ne jamais fermer la porte par erreur ;
+/// `false` seulement quand le noyau designe clairement un autre compte.
+fn autre_compte_admis(flux: &TcpStream) -> bool {
+    let (Ok(local), Ok(distant)) = (flux.local_addr(), flux.peer_addr()) else {
+        return true;
+    };
+    if !distant.ip().is_loopback() {
+        return true;
+    }
+    match proprietaire_de_la_connexion(local, distant) {
+        Some(uid) => uid == compte_courant(),
+        None => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn compte_courant() -> u32 {
+    // Sur : `geteuid` ne peut pas echouer.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn compte_courant() -> u32 {
+    0
+}
+
+/// Le compte qui possede la socket cliente d'une connexion locale, d'apres
+/// `/proc/net/tcp` et `/proc/net/tcp6`.
+///
+/// Chaque ligne y decrit une socket : son adresse locale, son adresse
+/// distante et son proprietaire. La socket **cliente** de notre connexion a
+/// pour adresse locale `distant` (ce que nous voyons comme pair) et pour
+/// adresse distante `local` (notre port d'ecoute).
+#[cfg(target_os = "linux")]
+fn proprietaire_de_la_connexion(local: SocketAddr, distant: SocketAddr) -> Option<u32> {
+    fn hex_de(a: &SocketAddr) -> Option<String> {
+        match a {
+            SocketAddr::V4(v) => {
+                let o = v.ip().octets();
+                // Le noyau ecrit chaque mot de 32 bits en petit-boutiste.
+                Some(format!(
+                    "{:02X}{:02X}{:02X}{:02X}:{:04X}",
+                    o[3],
+                    o[2],
+                    o[1],
+                    o[0],
+                    v.port()
+                ))
+            }
+            SocketAddr::V6(v) => {
+                let o = v.ip().octets();
+                let mut s = String::with_capacity(32);
+                for mot in o.chunks(4) {
+                    for b in mot.iter().rev() {
+                        s.push_str(&format!("{b:02X}"));
+                    }
+                }
+                Some(format!("{s}:{:04X}", v.port()))
+            }
+        }
+    }
+    let fichier = if distant.is_ipv4() {
+        "/proc/net/tcp"
+    } else {
+        "/proc/net/tcp6"
+    };
+    let contenu = std::fs::read_to_string(fichier).ok()?;
+    let cherche_local = hex_de(&distant)?;
+    let cherche_distant = hex_de(&local)?;
+    for ligne in contenu.lines().skip(1) {
+        let mut champs = ligne.split_whitespace();
+        let _sl = champs.next()?;
+        let adr_locale = champs.next()?;
+        let adr_distante = champs.next()?;
+        if adr_locale != cherche_local || adr_distante != cherche_distant {
+            continue;
+        }
+        // st tx_queue:rx_queue tr:tm->when retrnsmt uid ...
+        let uid = champs.nth(4)?;
+        return uid.parse().ok();
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proprietaire_de_la_connexion(_local: SocketAddr, _distant: SocketAddr) -> Option<u32> {
+    None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod compte_local {
+    use super::*;
+
+    /// Le noyau designe bien notre compte pour une connexion que nous ouvrons
+    /// nous-memes, en IPv4 comme en IPv6.
+    #[test]
+    fn la_connexion_locale_est_attribuee_a_notre_compte() {
+        for ecoute in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(l) = TcpListener::bind(ecoute) else {
+                continue;
+            };
+            let adr = l.local_addr().unwrap();
+            let client = TcpStream::connect(adr).unwrap();
+            let (serveur, _) = l.accept().unwrap();
+            let uid = proprietaire_de_la_connexion(
+                serveur.local_addr().unwrap(),
+                serveur.peer_addr().unwrap(),
+            );
+            assert_eq!(uid, Some(compte_courant()), "sur {ecoute}");
+            assert!(autre_compte_admis(&serveur));
+            drop(client);
+        }
+    }
 }
 
 fn traiter_connexion<F>(
