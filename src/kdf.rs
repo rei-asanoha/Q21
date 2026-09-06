@@ -24,26 +24,65 @@
 //! au-dessus d'une fonction de hachage eprouvee n'en est pas une : c'est ce que
 //! font HKDF, PBKDF2 et le mode CTR depuis trente ans.
 //!
-//! # Les limites, dites franchement
+//! # La derivation de clef : Argon2id
 //!
-//! **PBKDF2 n'est pas memory-hard.** Un attaquant equipe de circuits dedies
-//! teste les mots de passe bien plus vite qu'un processeur. Argon2 ou scrypt
-//! seraient meilleurs — et les ecrire soi-meme serait exactement le genre
-//! d'initiative que ce projet refuse. Le nombre d'iterations est donc eleve, et
-//! la vraie defense reste la **longueur de la phrase secrete**. Le module le
-//! dit plutot que de le taire.
+//! La premiere version derivait la clef par PBKDF2, en le disant franchement :
+//! PBKDF2 n'est pas resistant a la memoire, et un attaquant equipe de circuits
+//! dedies teste les phrases bien plus vite qu'un processeur. La seule defense
+//! etait la longueur de la phrase.
+//!
+//! La derivation est desormais **Argon2id** ([`crate::argon2`], RFC 9106) :
+//! 64 Mio de memoire et trois passes par essai, ce qui coute a un circuit
+//! dedie a peu pres ce que cela coute a l'utilisateur — un tiers de seconde
+//! sur un processeur de bureau, une seconde sur un Raspberry. Ce n'est pas une
+//! primitive inventee ici : c'est la norme, implementee d'apres son texte et
+//! verifiee contre ses trois vecteurs, comme SHA-256 l'est contre FIPS 180-4.
+//!
+//! Les fichiers scelles par PBKDF2 (magie `Q21SCEL1`) restent lisibles ; ils
+//! sont rescelles en Argon2id (magie `Q21SCEL2`) a leur prochaine ecriture, ce
+//! qui arrive des la premiere adresse tiree ou la premiere depense.
 
 use crate::sha256::{sha256, Sha256};
 
 /// Taille de bloc de SHA-256, en octets. C'est elle qui gouverne HMAC.
 const BLOC: usize = 64;
 
-/// Iterations par defaut de la derivation.
+/// Iterations PBKDF2 des fichiers de l'ancien format (`Q21SCEL1`).
 ///
-/// Environ une demi-seconde sur un processeur de bureau. Assez pour rendre une
-/// recherche exhaustive couteuse, assez peu pour qu'ouvrir son portefeuille ne
-/// soit pas une epreuve.
+/// Ne sert plus qu'a les relire et aux epreuves ; les nouveaux fichiers sont
+/// scelles par Argon2id avec [`COUT_DEFAUT`].
 pub const ITERATIONS_DEFAUT: u32 = 600_000;
+
+/// Cout d'une derivation Argon2id : memoire et passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cout {
+    pub memoire_kib: u32,
+    pub passes: u32,
+}
+
+/// Le cout par defaut : 64 Mio, trois passes, une lane.
+///
+/// C'est le reglage « conservateur » du RFC 9106 pour un usage interactif.
+/// Mesure : 0,30 s sur un petit processeur de serveur, donc moins sur un PC
+/// et environ une seconde sur un Raspberry — moins que les 600 000
+/// iterations de PBKDF2 qu'il remplace, pour une resistance sans commune
+/// mesure face au materiel dedie.
+pub const COUT_DEFAUT: Cout = Cout {
+    memoire_kib: 64 * 1024,
+    passes: 3,
+};
+
+/// Le cout des epreuves : le meme algorithme, en une fraction de seconde.
+pub const COUT_EPREUVE: Cout = Cout {
+    memoire_kib: 64,
+    passes: 1,
+};
+
+/// Plafonds acceptes a la lecture, pour les memes raisons que
+/// [`MAX_ITERATIONS`] : un en-tete reecrit ne doit pas pouvoir imposer un
+/// gibioctet et des heures de calcul avant le moindre rejet.
+pub const MAX_MEMOIRE_KIB: u32 = 1024 * 1024;
+pub const MAX_PASSES: u32 = 32;
 
 /// HMAC-SHA256, tel que decrit par le RFC 2104.
 pub fn hmac_sha256(clef: &[u8], message: &[u8]) -> [u8; 32] {
@@ -185,11 +224,33 @@ fn deriver(phrase: &[u8], sel: &[u8; 16], iterations: u32) -> Clefs {
     // doublerait le cout pour l'utilisateur sans rien ajouter a l'attaquant.
     let mut brut = [0u8; 64];
     pbkdf2(phrase, sel, iterations, &mut brut);
+    let clefs = couper(&brut);
+    effacer(&mut brut);
+    clefs
+}
+
+/// La derivation Argon2id du format courant.
+fn deriver_argon2(phrase: &[u8], sel: &[u8; 16], cout: Cout) -> Clefs {
+    let p = crate::argon2::Parametres {
+        variante: crate::argon2::Variante::Id,
+        memoire_kib: cout.memoire_kib,
+        passes: cout.passes,
+        lanes: 1,
+    };
+    let mut brut = crate::argon2::deriver(p, phrase, sel, &[], &[], 64);
+    let mut tampon = [0u8; 64];
+    tampon.copy_from_slice(&brut);
+    let clefs = couper(&tampon);
+    effacer(&mut brut);
+    effacer(&mut tampon);
+    clefs
+}
+
+fn couper(brut: &[u8; 64]) -> Clefs {
     let mut chiffrement = [0u8; 32];
     let mut authentification = [0u8; 32];
     chiffrement.copy_from_slice(&brut[..32]);
     authentification.copy_from_slice(&brut[32..]);
-    effacer(&mut brut);
     Clefs {
         chiffrement,
         authentification,
@@ -206,6 +267,9 @@ pub enum ScelleError {
     /// L'en-tete annonce un nombre d'iterations qu'aucun reglage honnete ne
     /// produit. Refuse **avant** la derivation, donc sans en payer le cout.
     IterationsAberrantes(u32),
+    /// L'en-tete du format courant annonce un cout Argon2id hors bornes.
+    /// Refuse de la meme facon, avant toute derivation.
+    CoutAberrant { memoire_kib: u32, passes: u32 },
 }
 
 impl std::fmt::Display for ScelleError {
@@ -223,11 +287,22 @@ impl std::fmt::Display for ScelleError {
                 "ce fichier annonce {n} iterations, au-dela du plafond de \
                  {MAX_ITERATIONS} : il a ete altere"
             ),
+            ScelleError::CoutAberrant {
+                memoire_kib,
+                passes,
+            } => write!(
+                f,
+                "ce fichier annonce {memoire_kib} Kio et {passes} passe(s), hors des \
+                 bornes (8 a {MAX_MEMOIRE_KIB} Kio, 1 a {MAX_PASSES} passes) : il a ete altere"
+            ),
         }
     }
 }
 
+/// Magie de l'ancien format : PBKDF2. Lu, jamais ecrit.
 const MAGIE: &[u8; 8] = b"Q21SCEL1";
+/// Magie du format courant : Argon2id.
+const MAGIE2: &[u8; 8] = b"Q21SCEL2";
 
 /// Plafond du nombre d'iterations accepte a la lecture.
 ///
@@ -238,25 +313,23 @@ pub const MAX_ITERATIONS: u32 = 50_000_000;
 
 /// Chiffre puis authentifie.
 ///
-/// Format : `MAGIE(8) || iterations(4) || sel(16) || chiffre(n) || mac(32)`.
+/// Format : `MAGIE2(8) || memoire_kib(4) || passes(4) || sel(16) || chiffre(n)
+/// || mac(32)`.
 ///
 /// L'authentificateur couvre **tout ce qui precede**, en-tete compris : sans
-/// cela, un attaquant pourrait ramener le nombre d'iterations a un et
-/// transformer la protection en formalite.
+/// cela, un attaquant pourrait ramener le cout a rien et transformer la
+/// protection en formalite.
 ///
 /// L'ordre est chiffrer-**puis**-authentifier : on ne dechiffre jamais quoi que
 /// ce soit avant d'avoir verifie que cela vient bien du detenteur de la phrase.
-pub fn sceller(
-    phrase: &[u8],
-    clair: &[u8],
-    iterations: u32,
-) -> Result<Vec<u8>, crate::rng::RngError> {
+pub fn sceller(phrase: &[u8], clair: &[u8], cout: Cout) -> Result<Vec<u8>, crate::rng::RngError> {
     let sel: [u8; 16] = crate::rng::octets()?;
-    let k = deriver(phrase, &sel, iterations);
+    let k = deriver_argon2(phrase, &sel, cout);
 
-    let mut sortie = Vec::with_capacity(8 + 4 + 16 + clair.len() + 32);
-    sortie.extend_from_slice(MAGIE);
-    sortie.extend_from_slice(&iterations.to_le_bytes());
+    let mut sortie = Vec::with_capacity(8 + 4 + 4 + 16 + clair.len() + 32);
+    sortie.extend_from_slice(MAGIE2);
+    sortie.extend_from_slice(&cout.memoire_kib.to_le_bytes());
+    sortie.extend_from_slice(&cout.passes.to_le_bytes());
     sortie.extend_from_slice(&sel);
 
     let debut_chiffre = sortie.len();
@@ -274,6 +347,11 @@ pub fn sceller(
 /// une invite nue, sans rien qui l'annonce, ressemble a une panne. On ne devine
 /// jamais — soit le fichier porte la magie, soit il n'est pas scelle.
 pub fn est_scelle(contenu: &[u8]) -> bool {
+    contenu.starts_with(MAGIE) || contenu.starts_with(MAGIE2)
+}
+
+/// Ce scelle est-il de l'ancien format, a resceller ?
+pub fn est_ancien_format(contenu: &[u8]) -> bool {
     contenu.starts_with(MAGIE)
 }
 
@@ -291,7 +369,13 @@ pub fn desceller(phrase: &[u8], scelle: &[u8]) -> Result<Vec<u8>, ScelleError> {
     // rien dire a un attaquant : **la magie**. Absente, ce fichier n'est pas un
     // portefeuille Q21, et le dire ne renseigne personne. Presente mais le
     // reste illisible, c'est le meme message qu'une phrase fausse.
-    if scelle.len() < 8 || &scelle[..8] != MAGIE {
+    if scelle.len() < 8 {
+        return Err(ScelleError::FormatInvalide);
+    }
+    if &scelle[..8] == MAGIE2 {
+        return desceller_argon2(phrase, scelle);
+    }
+    if &scelle[..8] != MAGIE {
         return Err(ScelleError::FormatInvalide);
     }
     if scelle.len() < 8 + 4 + 16 + 32 {
@@ -329,6 +413,43 @@ pub fn desceller(phrase: &[u8], scelle: &[u8]) -> Result<Vec<u8>, ScelleError> {
     }
 
     let mut clair = corps[28..].to_vec();
+    flot_xor(&k.chiffrement, &mut clair);
+    Ok(clair)
+}
+
+/// Le format courant. Meme discipline que l'ancien : le cout est lu avant
+/// d'etre authentifie — il le faut pour deriver la clef — donc borne avant
+/// toute derivation ; le MAC est verifie avant tout dechiffrement.
+fn desceller_argon2(phrase: &[u8], scelle: &[u8]) -> Result<Vec<u8>, ScelleError> {
+    const ENTETE: usize = 8 + 4 + 4 + 16;
+    if scelle.len() < ENTETE + 32 {
+        return Err(ScelleError::AuthentificationEchouee);
+    }
+    let memoire_kib = u32::from_le_bytes([scelle[8], scelle[9], scelle[10], scelle[11]]);
+    let passes = u32::from_le_bytes([scelle[12], scelle[13], scelle[14], scelle[15]]);
+    if !(8..=MAX_MEMOIRE_KIB).contains(&memoire_kib) || !(1..=MAX_PASSES).contains(&passes) {
+        return Err(ScelleError::CoutAberrant {
+            memoire_kib,
+            passes,
+        });
+    }
+    let mut sel = [0u8; 16];
+    sel.copy_from_slice(&scelle[16..32]);
+
+    let (corps, mac_recu) = scelle.split_at(scelle.len() - 32);
+    let k = deriver_argon2(
+        phrase,
+        &sel,
+        Cout {
+            memoire_kib,
+            passes,
+        },
+    );
+    let mac = hmac_sha256(&k.authentification, corps);
+    if !egal_temps_constant(&mac, mac_recu) {
+        return Err(ScelleError::AuthentificationEchouee);
+    }
+    let mut clair = corps[ENTETE..].to_vec();
     flot_xor(&k.chiffrement, &mut clair);
     Ok(clair)
 }
@@ -439,13 +560,13 @@ mod tests {
     #[test]
     fn aller_retour_sur_le_scellement() {
         let clair = b"graine tres secrete de trente-deux";
-        let s = sceller(b"ma phrase secrete", clair, 1_000).unwrap();
+        let s = sceller(b"ma phrase secrete", clair, COUT_EPREUVE).unwrap();
         assert_eq!(desceller(b"ma phrase secrete", &s).unwrap(), clair);
     }
 
     #[test]
     fn une_mauvaise_phrase_est_refusee() {
-        let s = sceller(b"bonne", b"secret", 1_000).unwrap();
+        let s = sceller(b"bonne", b"secret", COUT_EPREUVE).unwrap();
         assert_eq!(
             desceller(b"mauvaise", &s),
             Err(ScelleError::AuthentificationEchouee)
@@ -456,7 +577,7 @@ mod tests {
     #[test]
     fn le_clair_n_apparait_pas_dans_le_scelle() {
         let clair = b"MOTIF-RECONNAISSABLE-0123456789";
-        let s = sceller(b"phrase", clair, 1_000).unwrap();
+        let s = sceller(b"phrase", clair, COUT_EPREUVE).unwrap();
         assert!(
             !s.windows(clair.len()).any(|f| f == clair),
             "le clair figure tel quel dans le scelle"
@@ -467,8 +588,8 @@ mod tests {
     /// sinon, un observateur apprend que rien n'a change.
     #[test]
     fn deux_scellements_du_meme_clair_different() {
-        let a = sceller(b"phrase", b"identique", 1_000).unwrap();
-        let b = sceller(b"phrase", b"identique", 1_000).unwrap();
+        let a = sceller(b"phrase", b"identique", COUT_EPREUVE).unwrap();
+        let b = sceller(b"phrase", b"identique", COUT_EPREUVE).unwrap();
         assert_ne!(a, b, "le sel doit etre neuf a chaque scellement");
         assert_eq!(desceller(b"phrase", &a).unwrap(), b"identique");
         assert_eq!(desceller(b"phrase", &b).unwrap(), b"identique");
@@ -479,9 +600,9 @@ mod tests {
     /// d'iterations a un.
     #[test]
     fn un_octet_modifie_fait_echouer_l_ouverture() {
-        // Peu d'iterations : ce test en fait une par octet du scelle, et c'est
-        // la propriete qu'on verifie, pas le cout de la derivation.
-        let s = sceller(b"phrase", b"secret bien garde", 4).unwrap();
+        // Le cout d'epreuve : ce test fait une derivation par octet du scelle,
+        // et c'est la propriete qu'on verifie, pas le cout de la derivation.
+        let s = sceller(b"phrase", b"secret bien garde", COUT_EPREUVE).unwrap();
         for pos in 0..s.len() {
             let mut altere = s.clone();
             altere[pos] ^= 0x01;
@@ -494,10 +615,66 @@ mod tests {
 
     #[test]
     fn un_scelle_tronque_est_refuse() {
-        let s = sceller(b"phrase", b"secret", 1_000).unwrap();
+        let s = sceller(b"phrase", b"secret", COUT_EPREUVE).unwrap();
         for n in 0..s.len() {
             assert!(desceller(b"phrase", &s[..n]).is_err());
         }
+    }
+
+    /// Un scelle de l'ancien format (PBKDF2) s'ouvre toujours : personne ne
+    /// doit perdre l'acces a son portefeuille parce que la derivation a
+    /// change. Il se reconnait comme ancien, pour etre rescelle.
+    #[test]
+    fn un_scelle_de_l_ancien_format_s_ouvre_encore() {
+        // Reproduction exacte de l'ancien `sceller`, avec un sel fixe.
+        let phrase = b"phrase d'avant";
+        let clair = b"seed=deadbeef\nnext_index=3\n";
+        let iterations = 1_000u32;
+        let sel = [7u8; 16];
+        let k = deriver(phrase, &sel, iterations);
+        let mut ancien = Vec::new();
+        ancien.extend_from_slice(MAGIE);
+        ancien.extend_from_slice(&iterations.to_le_bytes());
+        ancien.extend_from_slice(&sel);
+        let debut = ancien.len();
+        ancien.extend_from_slice(clair);
+        flot_xor(&k.chiffrement, &mut ancien[debut..]);
+        let mac = hmac_sha256(&k.authentification, &ancien);
+        ancien.extend_from_slice(&mac);
+
+        assert!(est_scelle(&ancien));
+        assert!(est_ancien_format(&ancien));
+        assert_eq!(desceller(phrase, &ancien).unwrap(), clair);
+        assert!(desceller(b"autre", &ancien).is_err());
+
+        // Et le format courant n'est pas « ancien ».
+        let neuf = sceller(phrase, clair, COUT_EPREUVE).unwrap();
+        assert!(est_scelle(&neuf));
+        assert!(!est_ancien_format(&neuf));
+        assert_eq!(desceller(phrase, &neuf).unwrap(), clair);
+    }
+
+    /// Un cout reecrit dans l'en-tete est refuse avant toute derivation :
+    /// un attaquant qui ecrit huit octets ne doit pas pouvoir imposer un
+    /// gibioctet de calcul avant le moindre rejet.
+    #[test]
+    fn un_cout_aberrant_est_refuse_avant_de_deriver() {
+        let s = sceller(b"phrase", b"secret", COUT_EPREUVE).unwrap();
+        let mut memoire = s.clone();
+        memoire[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let t = std::time::Instant::now();
+        assert!(matches!(
+            desceller(b"phrase", &memoire),
+            Err(ScelleError::CoutAberrant { .. })
+        ));
+        assert!(t.elapsed() < std::time::Duration::from_millis(50));
+
+        let mut passes = s.clone();
+        passes[12..16].copy_from_slice(&1_000u32.to_le_bytes());
+        assert!(matches!(
+            desceller(b"phrase", &passes),
+            Err(ScelleError::CoutAberrant { .. })
+        ));
     }
 
     #[test]

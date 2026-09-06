@@ -576,9 +576,9 @@ fn enregistrer_serie(d: &Path, serie: u64) {
 /// # Le defaut que ce verrou repare
 ///
 /// `ecrire_portefeuille` lit le numero de serie, scelle le contenu, ecrit
-/// `wallet.dat`, puis ecrit `wallet.seq`. Le scellement coute six cent mille
-/// iterations de PBKDF2 : plusieurs centaines de millisecondes pendant
-/// lesquelles le numero de serie lu au depart vieillit.
+/// `wallet.dat`, puis ecrit `wallet.seq`. Le scellement coute une derivation
+/// Argon2id : quelques centaines de millisecondes pendant lesquelles le numero
+/// de serie lu au depart vieillit.
 ///
 /// Deux ecritures concurrentes — le fil du RPC apres une depense, le fil
 /// principal a l'arret — s'entrelacent alors ainsi :
@@ -648,7 +648,7 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
         Some(phrase) => q21_core::kdf::sceller(
             phrase.as_bytes(),
             contenu.as_bytes(),
-            q21_core::kdf::ITERATIONS_DEFAUT,
+            q21_core::kdf::COUT_DEFAUT,
         )
         .map_err(|e| e.to_string())?,
         None => contenu.into_bytes(),
@@ -838,7 +838,8 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
 
     // Un portefeuille scelle se reconnait a sa magie. On ne devine jamais : soit
     // le fichier annonce qu'il est chiffre, soit il ne l'est pas.
-    let contenu = if brut.starts_with(b"Q21SCEL1") {
+    let ancien_format = q21_core::kdf::est_ancien_format(&brut);
+    let contenu = if q21_core::kdf::est_scelle(&brut) {
         let phrase = match phrase_courante() {
             Some(p) => p,
             None => {
@@ -950,6 +951,16 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
         w.rescan(next_index);
         if next_index > 0 {
             let _ = cache.save(scheme, &w.known_hashes(), &clef_cache);
+        }
+    }
+    // Un fichier scelle par l'ancienne derivation (PBKDF2) est rescelle tout
+    // de suite par la nouvelle (Argon2id), avec la phrase qu'on vient de
+    // verifier : le contenu ne change pas, seule la serrure est remplacee.
+    // Un echec n'empeche pas d'ouvrir — le fichier reste tel qu'il etait.
+    if ancien_format {
+        match ecrire_portefeuille(d, &w) {
+            Ok(()) => println!("  Portefeuille rescelle avec la nouvelle protection (Argon2id)."),
+            Err(e) => eprintln!("avertissement : portefeuille non rescelle ({e})"),
         }
     }
     Ok(w)
