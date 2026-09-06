@@ -64,7 +64,17 @@ sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 La première commande doit dire `Signature and comment signature verified`,
-et son commentaire porte l'étiquette et le commit de la construction. La
+et son commentaire de confiance porte l'étiquette, le commit de la
+construction et le nom qui signe le projet :
+
+```
+Trusted comment: Q21 main <empreinte du commit> -- Rei Asanoha
+```
+
+Ce commentaire est **couvert par la signature** : il ne peut être ni réécrit
+ni usurpé sans la clé secrète. Le nom ne confère aucune autorité — Q21 n'a pas
+de gouvernance — il atteste seulement d'une origine constante d'une livraison
+à l'autre. La
 seconde doit dire `OK` pour l'archive que vous avez téléchargée. **Si l'une
 des deux échoue, n'installez pas** : ce n'est pas votre livraison.
 
