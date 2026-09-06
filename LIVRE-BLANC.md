@@ -2,7 +2,9 @@
 
 **Une chaîne de blocs à signatures post-quantiques, minable par des gens.**
 
-Version de travail. Code de recherche, non audité par un tiers. Aucun Q21
+Version de travail. L'édition de référence — en anglais, en français et en
+japonais, avec le protocole tel qu'il tourne aujourd'hui — est dans
+[`livre-blanc/`](livre-blanc/Q21-White-Paper.html). Code de recherche, non audité par un tiers. Aucun Q21
 n'a de valeur, et n'en aura aucune avant que ce document cesse de porter cet
 avertissement.
 

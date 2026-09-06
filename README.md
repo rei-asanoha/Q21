@@ -389,6 +389,8 @@ PROJECTION.md    La vie de la chaîne, calculée par le code de consensus :
 AUDIT-2026.md    La chaîne face à l'état de l'art 2026 : où elle est devant,
                  où est le mur de la vitesse, et les axes classés par horizon
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
+livre-blanc/     Le livre blanc de référence, édition de septembre 2026 :
+                 une page (anglais, français, japonais) et trois PDF
 
 outils/
   verif-mldsa/   Programme jetable pour découvrir l'API réelle du crate ml-dsa
