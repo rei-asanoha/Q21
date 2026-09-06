@@ -626,3 +626,16 @@ boucle de mélange vient d'être refaite ; c'est une raison de plus, pas une de
 moins. Les ancrages compilés sont vides tant qu'aucune chaîne n'a assez
 d'histoire pour en mériter un. Et cette revue, comme les précédentes, ne
 prouve rien sur ce qu'elle n'a pas trouvé.
+
+### Suite immédiate — la serrure du portefeuille
+
+Le fichier de portefeuille était scellé par PBKDF2, qui ne coûte que du
+calcul : le README le disait depuis la phase 8, et le bilan de septembre le
+classait parmi ce qui protège directement les gens. La dérivation est
+désormais **Argon2id** (RFC 9106, 64 Mio, trois passes), écrite d'après la
+norme avec BLAKE2b (RFC 7693), vérifiée contre les trois vecteurs officiels
+puis contre-vérifiée par une implémentation indépendante sur la forme exacte
+qu'emploie le portefeuille. Les fichiers de l'ancien format s'ouvrent et sont
+rescellés à l'ouverture ; ouvrir un portefeuille coûte 0,19 s sur un petit
+processeur, moins qu'avant, pour une résistance sans commune mesure face au
+matériel dédié.
