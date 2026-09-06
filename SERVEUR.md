@@ -541,6 +541,51 @@ atteint le serveur. Rien n'est exposé à personne d'autre.
 `--rpc 127.0.0.1:21080 --rpc-token <secret>`. À faire seulement si vous en avez
 besoin.)*
 
+## Être prévenu sans regarder
+
+Un nœud qui s'arrête à trois heures du matin ne prévient personne. Le script
+`outils/surveiller.sh` du dépôt lit la hauteur sur le RPC local toutes les
+dix minutes ; si elle n'a pas bougé depuis trente minutes, ou si le RPC ne
+répond plus, il relance le service et — si vous lui donnez un **sujet ntfy** —
+envoie une notification sur votre téléphone. [ntfy](https://ntfy.sh) est
+gratuit et sans compte : installez l'application, abonnez-vous à un sujet de
+votre choix (long et imprévisible, par exemple `q21-serveur-k8s2m7x`), et
+mettez le même nom ci-dessous.
+
+Le script a besoin d'un RPC local : le service doit porter `--rpc
+127.0.0.1:21080` (c'est le cas d'un explorateur public, voir
+`EXPLORATEUR-PUBLIC.md`).
+
+```bash
+sudo cp outils/surveiller.sh /opt/q21/surveiller.sh && sudo chmod +x /opt/q21/surveiller.sh
+sudo tee /etc/systemd/system/q21-surveillance.service > /dev/null <<'EOF'
+[Unit]
+Description=Surveillance du noeud Q21
+
+[Service]
+Type=oneshot
+Environment=Q21_RPC=127.0.0.1:21080
+Environment=Q21_NTFY=
+ExecStart=/opt/q21/surveiller.sh
+EOF
+sudo tee /etc/systemd/system/q21-surveillance.timer > /dev/null <<'EOF'
+[Unit]
+Description=Surveillance du noeud Q21, toutes les dix minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable --now q21-surveillance.timer
+```
+
+`Q21_NTFY=` vide : le script relance seulement, et l'écrit dans le journal
+(`journalctl -t q21-surveillance`). Avec un sujet, vous recevez aussi le
+message.
+
 ---
 
 # Ce que ce serveur ne risque pas, et ce qu'il risque

@@ -639,3 +639,20 @@ qu'emploie le portefeuille. Les fichiers de l'ancien format s'ouvrent et sont
 rescellés à l'ouverture ; ouvrir un portefeuille coûte 0,19 s sur un petit
 processeur, moins qu'avant, pour une résistance sans commune mesure face au
 matériel dédié.
+
+### Suite immédiate — le disque, et la veille
+
+**Le fichier de blocs s'élague** (`node --elaguer`) : un nœud qui valide pour
+lui ne garde que la genèse et les six mille derniers corps — la fenêtre
+d'historique du portefeuille plus la fenêtre de réorganisation, huit jours —
+et résume le reste dans l'instantané, comme un nœud parti d'une amorce.
+L'ordre des écritures est prouvé par une épreuve qui élague une chaîne puis
+la redémarre exactement comme le fait le binaire : même tête, même jeu
+d'UTXO, même émission, et elle continue. Un nœud élagué refuse de servir
+d'explorateur. L'archive sérialise désormais ajouts, lectures et réécriture
+sous un seul verrou.
+
+**Une veille sans regarder** (`outils/surveiller.sh`) : la hauteur est relue
+toutes les dix minutes ; figée trente minutes, ou RPC muet, le service est
+relancé et le téléphone prévenu. Rien de plus qu'un script et un minuteur —
+mais c'est la différence entre un réseau et un projet.
