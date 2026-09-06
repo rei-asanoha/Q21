@@ -351,7 +351,9 @@ src/
   addr.rs        Carnet d'adresses par groupe réseau, défense anti-éclipse
   rng.rs         Entropie du système, multiplateforme — échoue plutôt que
                  de rendre un aléa de qualité inconnue
-  kdf.rs         HMAC-SHA256, PBKDF2, chiffrement authentifié du portefeuille
+  kdf.rs         HMAC-SHA256, Argon2id, chiffrement authentifié du portefeuille
+  argon2.rs      Argon2 (RFC 9106), vérifié contre ses trois vecteurs
+  blake2b.rs     BLAKE2b (RFC 7693), pour Argon2
   prompt.rs      Saisie de phrase secrète sans écho
   wallet.rs      Clés déterministes, construction et signature
   json.rs        JSON minimal. Aucun flottant, par choix.
@@ -532,10 +534,13 @@ Un test substitue chaque caractère du code par sept autres : les 400 fautes de
 frappe sont détectées, aucune ne passe. `q21 restore <code>` reconstitue le
 portefeuille — vérifié de bout en bout.
 
-Le chiffrement n'invente aucune primitive : PBKDF2-HMAC-SHA256 et un flot HMAC en
-mode compteur, au-dessus d'un SHA-256 vérifié. HMAC passe quatre vecteurs
-officiels du RFC 4231, PBKDF2 celui du RFC 7914. Un test modifie **chaque octet**
-du fichier scellé : tous sont détectés.
+Le chiffrement n'invente aucune primitive : **Argon2id** (RFC 9106, 64 Mio,
+trois passes) dérive la clef, un flot HMAC en mode compteur chiffre, un HMAC
+authentifie — au-dessus d'un SHA-256 et d'un BLAKE2b vérifiés. HMAC passe
+quatre vecteurs officiels du RFC 4231, BLAKE2b ceux du RFC 7693, Argon2 les
+trois du RFC 9106 (d, i, id). Un test modifie **chaque octet** du fichier
+scellé : tous sont détectés. Les fichiers scellés par l'ancienne dérivation
+(PBKDF2) s'ouvrent toujours et sont rescellés à l'ouverture.
 
 ---
 
@@ -543,7 +548,7 @@ du fichier scellé : tous sont détectés.
 
 - **ML-DSA repose sur un crate non audité formellement.** `ml-dsa` 0.1.1 est une version 0.x. Elle passe les vecteurs de la référence, mais aucune revue de canaux auxiliaires publique ne la couvre. Le côté signature vit dans le portefeuille, pas dans le consensus, ce qui limite l'exposition — mais ne l'annule pas.
 - **SPHINCS+ est déclaré et non implémenté.** Le parachute n'existe pour l'instant que dans la table des identifiants. Un portefeuille qui le demande est refusé à la construction, pas à la dépense.
-- **PBKDF2 n'est pas memory-hard.** Un attaquant équipé de circuits dédiés teste les phrases secrètes bien plus vite qu'un processeur. La vraie défense reste la longueur de la phrase.
+- **La dérivation de clef est résistante à la mémoire depuis la v8** (Argon2id). La longueur de la phrase secrète reste ce qui compte le plus : aucune dérivation ne protège une phrase de quatre lettres.
 - **Les récompenses d'oncles ont été retirées.** Dans une monnaie à plafond fixe, une récompense d'oncle est soit inflationniste, soit prélevée sur le mineur — et personne n'inclut un oncle à ses frais. Le plafond est le projet ; le mécanisme ne servait plus qu'à offrir une surface d'attaque, et un bloc qui porte un oncle est désormais refusé.
 - **Aucun nœud d'amorçage n'est câblé.** La découverte de pairs fonctionne, mais la première adresse doit venir de `--connect`. Ce sera une décision de lancement, pas de code.
 - **L'archive de blocs ne s'élague pas.** La mémoire est bornée depuis la phase 7, le disque ne l'est pas encore.
