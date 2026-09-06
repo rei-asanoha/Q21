@@ -55,6 +55,7 @@ fn serveur(avec_portefeuille: bool, token: Option<&str>) -> ServerHandle {
     let node = Arc::new(Node::new(RESEAU, Chain::new(RESEAU, g)));
     let ctx = RpcContext {
         sur_changement: None,
+        balayages: None,
         node,
         wallet: if avec_portefeuille {
             Some(Arc::new(Mutex::new(Wallet::from_seed([7u8; 32], RESEAU))))
@@ -134,6 +135,7 @@ fn serveur_et_noeud() -> (ServerHandle, Arc<Node>) {
         index: None,
         minage: None,
         sur_changement: None,
+        balayages: None,
     };
     let h = http::serve("127.0.0.1:0", None, move |req| routeur(&ctx, req))
         .expect("demarrage du serveur");
@@ -2337,8 +2339,9 @@ fn faille_iterations_attaquant_avant_verification_du_mac() {
         "le refus a coute {absurde:?} : la derivation a ete engagee malgre tout"
     );
 
-    // Un reglage legitime, lui, passe et coute ce qu'il doit couter.
-    let (lent, r2) = mesure(400_000);
+    // Un reglage legitime — renforce, sous la borne de 256 Mio —, lui, passe
+    // et coute ce qu'il doit couter.
+    let (lent, r2) = mesure(200_000);
     assert!(r2.is_err(), "le MAC doit finir par echouer");
     assert!(lent > absurde, "un reglage legitime derive bien");
 }

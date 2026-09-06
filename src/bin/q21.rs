@@ -397,6 +397,23 @@ fn phrase_secrete(
     interactif: bool,
 ) -> Result<Option<String>, String> {
     if let Some(chemin) = depuis_fichier {
+        // Un fichier de phrase lisible par d'autres comptes vaut une phrase
+        // affichee : on le dit, sans refuser — refuser bloquerait un service
+        // qui demarre sans personne pour corriger, et le fichier, lui, ne
+        // devient pas plus secret parce qu'on ne l'a pas lu.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(m) = std::fs::metadata(chemin) {
+                if m.permissions().mode() & 0o077 != 0 {
+                    eprintln!(
+                        "  avertissement : {chemin} est lisible par d'autres comptes de cette \
+                         machine (droits {:o}). Restreignez-le : chmod 600 {chemin}",
+                        m.permissions().mode() & 0o777
+                    );
+                }
+            }
+        }
         let brut = std::fs::read_to_string(chemin)
             .map_err(|e| format!("phrase secrete illisible dans {chemin} : {e}"))?;
         let p = brut.trim_end_matches(['\n', '\r']).to_string();
@@ -1332,10 +1349,19 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
             // ce qui reconstruit les enregistrements d'annulation, donc la
             // capacite a reorganiser.
             for id in &r.a_rejouer {
-                let b = archive.read(id).ok_or("corps manquant au rejeu")?;
+                let Some(b) = archive.read(id) else {
+                    couper_l_archive_a(&archive, c.height() + 1, "corps manquant au rejeu")?;
+                    break;
+                };
                 let now = b.header.time + MAX_FUTURE_TIME;
-                c.connect(&b, now)
-                    .map_err(|e| format!("bloc {} refuse au rejeu : {e:?}", b.header.height))?;
+                if let Err(e) = c.connect(&b, now) {
+                    couper_l_archive_a(
+                        &archive,
+                        b.header.height,
+                        &format!("bloc {} refuse au rejeu : {e:?}", b.header.height),
+                    )?;
+                    break;
+                }
             }
             c
         }
@@ -1395,16 +1421,23 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
             let mut c = Chain::new(reseau, corps_genese);
             c.set_body_source(archive.clone());
             for id in ordre.active.iter().skip(1) {
-                let b = archive
-                    .read(id)
-                    .ok_or_else(|| format!("corps du bloc {id} absent du fichier"))?;
+                let Some(b) = archive.read(id) else {
+                    couper_l_archive_a(
+                        &archive,
+                        c.height() + 1,
+                        &format!("corps du bloc {id} absent du fichier"),
+                    )?;
+                    break;
+                };
                 let now = b.header.time + MAX_FUTURE_TIME;
-                c.connect(&b, now).map_err(|e| {
-                    format!(
-                        "bloc {} refuse a la reconstruction : {e:?}",
-                        b.header.height
-                    )
-                })?;
+                if let Err(e) = c.connect(&b, now) {
+                    couper_l_archive_a(
+                        &archive,
+                        b.header.height,
+                        &format!("bloc {} refuse a la reconstruction : {e:?}", b.header.height),
+                    )?;
+                    break;
+                }
             }
             // Les branches laterales sont reinjectees ensuite, une fois la
             // chaine active en place. Chacune est alors une simple branche
@@ -1434,51 +1467,6 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
         eprintln!("[chrono] chaine prete {:.2} s", t0.elapsed().as_secs_f64());
     }
     chain.set_body_source(archive.clone());
-
-    // --- Clefs a usage unique : la chaine a le dernier mot.
-    //
-    // Un fichier de portefeuille peut etre remplace par une version anterieure ;
-    // la chaine, non. Si ce portefeuille annonce des adresses distribuees mais
-    // aucune clef consommee, l'etat est suspect — restauration depuis un code
-    // de sauvegarde, sauvegarde ancienne, fichier perdu. Sur un schema a usage
-    // unique, repartir d'une ardoise vierge revient a publier une clef privee au
-    // premier paiement.
-    //
-    // On balaie alors la chaine pour retrouver les signatures deja emises. C'est
-    // couteux, et c'est exactement pour cela qu'on ne le fait pas a chaque
-    // demarrage — seulement quand l'ardoise est vierge alors qu'elle ne devrait
-    // pas l'etre.
-    if wallet.scheme().est_a_usage_unique()
-        && wallet.next_index() > 0
-        && wallet.verifie_jusqu_a() < chain.height()
-    {
-        eprintln!(
-            "verification des clefs a usage unique : aucune consommation connue \n             pour {} adresse(s) distribuee(s). Balayage de la chaine...",
-            wallet.next_index()
-        );
-        let mut trouves = 0usize;
-        for h in 1..=chain.height() {
-            if let Some(id) = chain.active_at(h) {
-                if let Some(b) = archive.read(&id) {
-                    trouves += wallet.noter_depenses(&b);
-                }
-            }
-        }
-        if trouves > 0 {
-            eprintln!(
-                "             {trouves} clef(s) deja employee(s) retrouvee(s) dans la chaine : \n             elles ne resserviront pas."
-            );
-        } else {
-            eprintln!("             aucune signature de ce portefeuille dans la chaine.");
-        }
-        // Le balayage est note : il ne recommencera qu'a partir d'ici. Sans
-        // cela, un portefeuille qui ne depense jamais relisait toute la chaine
-        // a chaque commande — un cout qui croit avec la hauteur, paye pour rien.
-        wallet.noter_verification(chain.height());
-        if !sans_portefeuille {
-            let _ = ecrire_portefeuille(datadir, &wallet);
-        }
-    }
 
     // --- La restauration retrouve ses adresses, ou elle ne restaure rien.
     //
@@ -1520,6 +1508,85 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
                 "  restauration : {trouvees} sortie(s) retrouvee(s) sur la chaine, \n               {} adresse(s) rederivee(s)",
                 wallet.next_index().saturating_sub(avant)
             );
+            // Des adresses nouvelles pour ce fichier : le balayage des clefs
+            // a usage unique, plus bas, doit les couvrir.
+            if wallet.scheme().est_a_usage_unique() {
+                wallet.oublier_la_verification();
+            }
+            let _ = ecrire_portefeuille(datadir, &wallet);
+        }
+    }
+
+    // --- Le rattrapage : ce qui a ete distribue apres la derniere ecriture.
+    //
+    // Voir `Wallet::rattraper`. Il ne suffit pas de chercher quand on ne voit
+    // rien ; il faut aussi chercher **au-dela** de ce qu'on croit avoir
+    // distribue, parce qu'un arret brutal pendant le minage laisse le fichier
+    // en retard sur la chaine.
+    if !sans_portefeuille && !chain.utxo.is_empty() {
+        let avant = wallet.next_index();
+        let rattrapees = {
+            let u = &chain.utxo;
+            wallet.rattraper(|h| u.connait(h))
+        };
+        if rattrapees > 0 {
+            println!(
+                "  rattrapage : {rattrapees} sortie(s) retrouvee(s) au-dela des adresses \n               enregistrees, {} adresse(s) reconnue(s)",
+                wallet.next_index().saturating_sub(avant)
+            );
+            if wallet.scheme().est_a_usage_unique() {
+                wallet.oublier_la_verification();
+            }
+            let _ = ecrire_portefeuille(datadir, &wallet);
+        }
+    }
+
+    // --- Clefs a usage unique : la chaine a le dernier mot.
+    //
+    // Un fichier de portefeuille peut etre remplace par une version anterieure ;
+    // la chaine, non. Si ce portefeuille annonce des adresses distribuees mais
+    // aucune clef consommee, l'etat est suspect — restauration depuis un code
+    // de sauvegarde, sauvegarde ancienne, fichier perdu. Sur un schema a usage
+    // unique, repartir d'une ardoise vierge revient a publier une clef privee au
+    // premier paiement.
+    //
+    // On balaie alors la chaine pour retrouver les signatures deja emises. C'est
+    // couteux, et c'est exactement pour cela qu'on ne le fait pas a chaque
+    // demarrage — seulement quand l'ardoise est vierge alors qu'elle ne devrait
+    // pas l'etre.
+    //
+    // Ce balayage vient **apres** la decouverte et le rattrapage : il ne
+    // marque comme consommes que des indices que le portefeuille connait, et
+    // c'est la decouverte qui les lui apprend. Dans l'ordre inverse, une
+    // adresse retrouvee qui avait deja signe une fois pouvait resigner.
+    if wallet.scheme().est_a_usage_unique()
+        && wallet.next_index() > 0
+        && wallet.verifie_jusqu_a() < chain.height()
+    {
+        eprintln!(
+            "verification des clefs a usage unique : aucune consommation connue \n             pour {} adresse(s) distribuee(s). Balayage de la chaine...",
+            wallet.next_index()
+        );
+        let mut trouves = 0usize;
+        for h in 1..=chain.height() {
+            if let Some(id) = chain.active_at(h) {
+                if let Some(b) = archive.read(&id) {
+                    trouves += wallet.noter_depenses(&b);
+                }
+            }
+        }
+        if trouves > 0 {
+            eprintln!(
+                "             {trouves} clef(s) deja employee(s) retrouvee(s) dans la chaine : \n             elles ne resserviront pas."
+            );
+        } else {
+            eprintln!("             aucune signature de ce portefeuille dans la chaine.");
+        }
+        // Le balayage est note : il ne recommencera qu'a partir d'ici. Sans
+        // cela, un portefeuille qui ne depense jamais relisait toute la chaine
+        // a chaque commande — un cout qui croit avec la hauteur, paye pour rien.
+        wallet.noter_verification(chain.height());
+        if !sans_portefeuille {
             let _ = ecrire_portefeuille(datadir, &wallet);
         }
     }
@@ -1531,6 +1598,32 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
         datadir: datadir.to_path_buf(),
         sans_portefeuille,
     })
+}
+
+/// Un corps illisible ou refuse au rejeu : on s'arrete au dernier bloc sain.
+///
+/// # Le defaut que ceci ferme
+///
+/// Une corruption d'un corps qui n'etait pas en queue du fichier — un bit
+/// retourne sur une carte SD — rendait tout demarrage impossible, avec un
+/// message qui ne disait pas quoi faire. Rien n'etait faux dans ce refus :
+/// mieux vaut ne pas demarrer qu'adopter un etat faux. Mais un noeud complet
+/// sait exactement quoi faire de ce cas : garder ce qui precede, retirer ce
+/// qui suit, et redemander le reste au reseau. C'est ce qu'on fait ici — la
+/// reecriture passe par le meme chemin que l'elagage, sur, et ce qui est
+/// retire etait de toute facon inutilisable.
+fn couper_l_archive_a(
+    archive: &std::sync::Arc<BlockArchive>,
+    hauteur: u64,
+    raison: &str,
+) -> Result<(), String> {
+    eprintln!(
+        "  fichier des blocs : {raison}.\n               Les corps a partir de la hauteur {hauteur} sont retires ; le reseau \n               fournira le reste."
+    );
+    archive
+        .elaguer(|h| h.height < hauteur)
+        .map(|_| ())
+        .map_err(|e| format!("impossible de couper le fichier des blocs : {e}"))
 }
 
 fn maintenant() -> u64 {
@@ -1729,7 +1822,7 @@ fn cmd_init_avec(
         // proposees fonctionnent sans terminal.
         if !q21_core::prompt::entree_interactive() {
             return Err(
-                "aucun terminal pour demander une phrase secrete.\n\n                   Creer un portefeuille sans protection ecrirait la graine en clair\n                   sur le disque, et ce n'est pas une decision a prendre a votre place.\n\n                   Deux facons de fournir la phrase sans terminal :\n\n                       q21 --phrase-fichier <chemin> init testnet\n                       Q21_PASSPHRASE='...' q21 init testnet\n\n                   Et si vous voulez reellement un portefeuille sans protection —\n                   sur un reseau de test, par exemple — lancez cette commande depuis\n                   un terminal et laissez la phrase vide."
+                "aucun terminal pour demander une phrase secrete.\n\n                   Creer un portefeuille sans protection ecrirait la graine en clair\n                   sur le disque, et ce n'est pas une decision a prendre a votre place.\n\n                   Deux facons de fournir la phrase sans terminal :\n\n                       q21 --phrase-fichier <chemin> init testnet\n                           (un fichier a vous seul : chmod 600)\n\n                       read -rs Q21_PASSPHRASE && export Q21_PASSPHRASE\n                       q21 init testnet\n                           (jamais `Q21_PASSPHRASE=... q21` sur une seule ligne :\n                            la phrase resterait dans l'historique du terminal)\n\n                   Et si vous voulez reellement un portefeuille sans protection —\n                   sur un reseau de test, par exemple — lancez cette commande depuis\n                   un terminal et laissez la phrase vide."
                     .to_string(),
             );
         }
@@ -1941,6 +2034,7 @@ fn cmd_mine(datadir: &Path, n: Option<&str>) -> Result<(), String> {
     let debut = std::time::Instant::now();
     let mut total_essais = 0u64;
 
+    let mut derniere_ecriture = std::time::Instant::now();
     for i in 0..n {
         let addr = e.wallet.new_address();
         // Le schema du beneficiaire doit etre celui de son adresse, sinon
@@ -1993,8 +2087,13 @@ fn cmd_mine(datadir: &Path, n: Option<&str>) -> Result<(), String> {
             );
         }
 
-        if i + 1 == n {
+        // Le portefeuille suit la chaine sur le disque : au dernier bloc, et
+        // en route toutes les trente secondes. Un arret brutal ne laisse plus
+        // que quelques adresses en retard — que le rattrapage du chargement
+        // retrouve de toute facon.
+        if i + 1 == n || derniere_ecriture.elapsed() >= std::time::Duration::from_secs(30) {
             ecrire_portefeuille(&e.datadir, &e.wallet)?;
+            derniere_ecriture = std::time::Instant::now();
         }
     }
     ecrire_instantane(&e.datadir, &e.chain);
@@ -3579,6 +3678,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     })
                 }))
             },
+            // Le budget de balayages ne vaut que pour un service public.
+            balayages: rpc_public.as_ref().map(|_| {
+                std::sync::Arc::new(std::sync::Mutex::new(q21_core::rpc::SeauBalayages::new()))
+            }),
         };
         // La coquille de l'explorateur est servie sans jeton : elle ne porte
         // aucune donnee, et c'est elle qui demande le jeton a l'utilisateur.
@@ -3636,7 +3739,34 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let debut = std::time::Instant::now();
     let mut dernier_rapport = std::time::Instant::now();
     let mut derniere_hauteur = node.height();
-    let mut dernier_tour = std::time::Instant::now();
+    // --- Le detecteur de veille, sur son propre fil.
+    //
+    // Il dort une seconde, regarde l'horloge murale, et recommence. Si entre
+    // deux reveils l'horloge a saute de plus d'une minute, la machine a dormi
+    // — quoi qu'ait fait la boucle principale pendant ce temps. C'est ce qui
+    // distingue une vraie veille d'un tour de boucle long : la construction
+    // d'une table, un lot de connexions qui expirent, un bloc long a miner
+    // n'y ressemblent plus. Voir la boucle, plus bas.
+    let veille_detectee = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let drapeau = veille_detectee.clone();
+        std::thread::Builder::new()
+            .name("veille".into())
+            .spawn(move || {
+                let mut precedent = std::time::SystemTime::now();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let maintenant = std::time::SystemTime::now();
+                    if let Ok(ecart) = maintenant.duration_since(precedent) {
+                        if ecart >= std::time::Duration::from_secs(60) {
+                            drapeau.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    precedent = maintenant;
+                }
+            })
+            .map_err(|e| format!("fil de veille : {e}"))?;
+    }
     let mut derniere_recherche = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(60))
         .unwrap_or_else(std::time::Instant::now);
@@ -3715,16 +3845,22 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // detenant une seule plage d'occuper toutes les places. Voir `addr`.
         // --- La machine s'est-elle endormie ?
         //
-        // Cette boucle tourne toutes les deux cents millisecondes. Un tour qui
-        // dure une minute ne peut pas etre du travail : la machine a ete mise
-        // en veille, et pendant ce temps toutes ses liaisons TCP sont mortes —
-        // le routeur a oublie sa table, le pair d'en face a renonce.
+        // Pendant une veille, toutes les liaisons TCP sont mortes — le routeur
+        // a oublie sa table, le pair d'en face a renonce. Attendre le delai de
+        // silence ferait perdre deux minutes de plus a quelqu'un qui vient
+        // simplement de rouvrir son portable. On coupe donc tout de suite, et
+        // on redemande les amorces au tour suivant. Se tromper ne coute qu'une
+        // reconnexion.
         //
-        // Attendre le delai de silence ferait perdre deux minutes de plus a
-        // quelqu'un qui vient simplement de rouvrir son portable. On coupe donc
-        // tout de suite, et on redemande les amorces au tour suivant. Se
-        // tromper ne coute qu'une reconnexion.
-        if dernier_tour.elapsed() >= std::time::Duration::from_secs(60) {
+        // La veille etait auparavant deduite de la duree d'un tour de cette
+        // boucle. Or un tour peut durer longtemps sans que la machine ait
+        // dormi : huit connexions vers des adresses qui n'accueillent pas le
+        // SYN, a dix secondes chacune, faisaient quatre-vingts secondes — et
+        // le noeud se coupait alors de **tous** ses pairs, honnetes compris, a
+        // chaque tour. Un pair qui glissait de telles adresses dans le carnet
+        // isolait le noeud en boucle. Le detecteur vit desormais sur son
+        // propre fil et ne regarde que l'horloge murale.
+        if veille_detectee.swap(false, std::sync::atomic::Ordering::SeqCst) {
             let n = node.couper_tous_les_pairs();
             if n > 0 {
                 println!("  reveil apres veille : {n} liaison(s) coupee(s), on recommence");
@@ -3733,7 +3869,6 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 .checked_sub(std::time::Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now);
         }
-        dernier_tour = std::time::Instant::now();
 
         if derniere_recherche.elapsed().as_secs() >= 15 {
             derniere_recherche = std::time::Instant::now();
@@ -3882,6 +4017,18 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     // La recompense est encaissee : l'adresse a servi, la
                     // suivante en aura une autre.
                     beneficiaire_minage = None;
+                    // Et le portefeuille est ecrit tout de suite : un bloc
+                    // toutes les deux minutes, un scellement de quelques
+                    // dixiemes de seconde. Sans cela, un arret brutal faisait
+                    // reculer `next_index` sur le disque et les recompenses
+                    // suivantes devenaient invisibles.
+                    if !sans_portefeuille {
+                        if let Ok(w) = wallet.lock() {
+                            if let Err(e) = ecrire_portefeuille(datadir, &w) {
+                                eprintln!("avertissement : portefeuille non ecrit apres le bloc : {e}");
+                            }
+                        }
+                    }
                     node.with_mempool(|m| m.on_block_connected(&b));
                     // L'ecriture passe par le journal, comme pour tout bloc
                     // accepte : une seule voie vers le disque, donc un seul

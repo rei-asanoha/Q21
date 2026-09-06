@@ -143,7 +143,7 @@ dir
 Vous devez voir un fichier **`q21`**, sans extension. Envoyez-le :
 
 ```powershell
-scp .\q21 ubuntu@92.222.86.135:~/q21-neuf
+scp .\q21 ubuntu@ADRESSE-IPV4-DU-SERVEUR:~/q21-neuf
 ```
 
 ### Sur le serveur
@@ -187,7 +187,7 @@ onglet **Zone DNS**.
 | Champ | Valeur |
 |---|---|
 | Sous-domaine | `explorateur` |
-| Cible (IPv4) | `92.222.86.135` |
+| Cible (IPv4) | `ADRESSE-IPV4-DU-SERVEUR` |
 | TTL | par défaut |
 
 ### 1.2 — Les autorités autorisées
@@ -218,7 +218,7 @@ Dans une **FENÊTRE PC** :
 Resolve-DnsName explorateur.q21.dev -Type A
 ```
 
-La colonne `IPAddress` doit afficher **`92.222.86.135`**.
+La colonne `IPAddress` doit afficher **`ADRESSE-IPV4-DU-SERVEUR`**.
 
 ```powershell
 Resolve-DnsName q21.dev -Type CAA
@@ -612,3 +612,17 @@ sudo ufw delete allow 80/tcp && sudo ufw delete allow 443/tcp
 
 Le serveur d'accueil retrouve exactement son état d'avant, et le réseau Q21
 continue sans s'en apercevoir.
+
+---
+
+## Ce que le nœud borne de lui-même
+
+Les recherches sans résultat d'index — un montant, une transaction
+inconnue, une adresse sans index — relisent jusqu'à deux mille blocs sous
+le verrou de la chaîne. Exposées sans jeton, elles étaient le moyen le moins
+cher de figer le point d'entrée : un visiteur en boucle sur des identifiants
+inexistants. En mode public, le nœud accorde désormais un **budget de
+balayages** — une réserve de trente, puis douze par minute, toutes requêtes
+confondues — et répond « réessayez dans une minute » au-delà, sans cesser de
+valider. Une limite par adresse côté mandataire reste un complément utile,
+pas une condition.

@@ -389,6 +389,8 @@ PROJECTION.md    La vie de la chaîne, calculée par le code de consensus :
 AUDIT-2026.md    La chaîne face à l'état de l'art 2026 : où elle est devant,
                  où est le mur de la vitesse, et les axes classés par horizon
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
+SIGNATURE.md     Signer chaque livraison, et vérifier avant d'installer
+DURCISSEMENT.md  La machine qui garde des Q21 : Raspberry, serveur, poste partagé
 livre-blanc/     Le livre blanc de référence, édition de septembre 2026 :
                  une page (anglais, français, japonais) et trois PDF
 
@@ -566,3 +568,15 @@ Code de recherche. Non audité. Ne protège aucune valeur réelle. Le réseau
 principal n'existe pas et `q21 init mainnet` refuse volontairement de le créer.
 
 Licence : MIT OR Apache-2.0.
+
+---
+
+## Clé publique des livraisons
+
+Chaque livraison est signée avec `minisign` (voir `SIGNATURE.md`). La clé
+publique qui vérifie ces signatures est celle-ci — à comparer avec la copie
+publiée par un second canal avant de s'y fier :
+
+```
+<clé publique minisign, ligne RW…, à coller ici après la création de la clé>
+```

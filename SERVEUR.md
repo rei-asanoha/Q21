@@ -556,16 +556,28 @@ Le script a besoin d'un RPC local : le service doit porter `--rpc
 127.0.0.1:21080` (c'est le cas d'un explorateur public, voir
 `EXPLORATEUR-PUBLIC.md`).
 
+Le sujet ntfy est un secret partagé faible — qui le connaît lit vos alertes
+et peut en publier de fausses. Il ne va donc pas dans le fichier d'unité, que
+tout le monde peut lire, mais dans un fichier d'environnement à `root` seul.
+
 ```bash
 sudo cp outils/surveiller.sh /opt/q21/surveiller.sh && sudo chmod +x /opt/q21/surveiller.sh
+sudo mkdir -p /etc/q21 && sudo tee /etc/q21/surveillance.env > /dev/null <<'EOF'
+Q21_RPC=127.0.0.1:21080
+Q21_NTFY=
+EOF
+sudo chmod 600 /etc/q21/surveillance.env
 sudo tee /etc/systemd/system/q21-surveillance.service > /dev/null <<'EOF'
 [Unit]
 Description=Surveillance du noeud Q21
 
 [Service]
 Type=oneshot
-Environment=Q21_RPC=127.0.0.1:21080
-Environment=Q21_NTFY=
+EnvironmentFile=/etc/q21/surveillance.env
+RuntimeDirectory=q21-surveillance
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=true
 ExecStart=/opt/q21/surveiller.sh
 EOF
 sudo tee /etc/systemd/system/q21-surveillance.timer > /dev/null <<'EOF'
@@ -584,7 +596,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now q21-surveillance.tim
 
 `Q21_NTFY=` vide : le script relance seulement, et l'écrit dans le journal
 (`journalctl -t q21-surveillance`). Avec un sujet, vous recevez aussi le
-message.
+message. Le fichier d'état vit dans `/run/q21-surveillance/`, que systemd
+crée pour ce service seul : personne d'autre ne peut y déposer quoi que ce
+soit.
 
 ---
 

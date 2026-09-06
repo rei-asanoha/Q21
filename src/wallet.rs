@@ -435,6 +435,56 @@ impl Wallet {
         trouvees
     }
 
+    /// Rattrape les adresses distribuees mais jamais enregistrees.
+    ///
+    /// # Le defaut que ceci ferme
+    ///
+    /// Le minage derive une adresse par bloc trouve, et le portefeuille
+    /// n'etait ecrit qu'a l'arret propre. Apres une coupure — courant, `kill`,
+    /// carte SD retiree — `next_index` reculait sur le disque, et les
+    /// recompenses des blocs trouves depuis restaient invisibles : le
+    /// portefeuille voyait *des* fonds, donc la decouverte de restauration ne
+    /// se declenchait pas, et rien ne se reparait jamais. Mesure : 16 Q21
+    /// affiches pour 803 reellement detenus.
+    ///
+    /// Ici on ne repart pas de zero : on derive une fenetre **au-dela** de
+    /// `next_index`, et on avance tant qu'on y trouve quelque chose. Quand
+    /// rien ne manque, c'est une fenetre de clefs derivee pour rien — quelques
+    /// dizaines de millisecondes, une fois par demarrage.
+    pub fn rattraper<F>(&mut self, possede: F) -> usize
+    where
+        F: Fn(&Hash256) -> bool,
+    {
+        let mut trouvees = 0usize;
+        let mut dernier: Option<u32> = None;
+        let mut i: u32 = self.next_index;
+        while let Some(fin) = i.checked_add(Self::ECART_DECOUVERTE) {
+            let mut vu = false;
+            for index in i..fin {
+                let h = pubkey_hash(self.scheme, &self.public_key(index));
+                if possede(&h) {
+                    self.connues.insert(h, index);
+                    trouvees += 1;
+                    dernier = Some(index);
+                    vu = true;
+                }
+            }
+            if !vu {
+                break;
+            }
+            i = fin;
+        }
+        if let Some(d) = dernier {
+            // Les indices intermediaires, eux aussi distribues, sont reconnus.
+            for index in self.next_index..=d {
+                let h = pubkey_hash(self.scheme, &self.public_key(index));
+                self.connues.insert(h, index);
+            }
+            self.next_index = self.next_index.max(d + 1);
+        }
+        trouvees
+    }
+
     /// Empreintes deja derivees, dans l'ordre des indices.
     pub fn known_hashes(&self) -> Vec<Hash256> {
         let mut v: Vec<(u32, Hash256)> = self.connues.iter().map(|(h, i)| (*i, *h)).collect();
@@ -1139,6 +1189,31 @@ mod tests {
 
     fn portefeuille() -> Wallet {
         Wallet::from_seed([0x11; 32], Network::Regtest)
+    }
+
+    /// Un fichier en retard sur la chaine — arret brutal pendant le minage —
+    /// est rattrape : les adresses distribuees au-dela de `next_index` sont
+    /// reconnues, et l'indice suivant repart apres la derniere qui a servi.
+    #[test]
+    fn le_rattrapage_retrouve_les_adresses_distribuees_apres_la_derniere_ecriture() {
+        // Le portefeuille « d'avant la coupure » a distribue les indices 0 a 9.
+        let mut avant = portefeuille();
+        let servies: Vec<Hash256> = (0..10).map(|_| avant.new_address().hash).collect();
+        // Le fichier relu n'en connait que trois.
+        let mut apres = portefeuille();
+        for _ in 0..3 {
+            let _ = apres.new_address();
+        }
+        assert_eq!(apres.next_index(), 3);
+        let n = apres.rattraper(|h| servies.contains(h));
+        assert_eq!(n, 7, "les sept adresses distribuees apres l'ecriture");
+        assert_eq!(apres.next_index(), 10);
+        for h in &servies {
+            assert!(apres.connues.contains_key(h), "chaque adresse servie est reconnue");
+        }
+        // Rien de plus a rattraper : une fenetre vide, et l'indice ne bouge pas.
+        assert_eq!(apres.rattraper(|h| servies.contains(h)), 0);
+        assert_eq!(apres.next_index(), 10);
     }
 
     /// Prepare une chaine ou `w` detient des fonds mûrs.

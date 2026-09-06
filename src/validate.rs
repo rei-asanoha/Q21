@@ -395,6 +395,51 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
     Ok(Amount::from_units(total_entrees - total_sorties))
 }
 
+/// Le jeu d'UTXO tel que le voit la `n`-ieme transaction d'un bloc : le jeu
+/// confirme, plus les sorties creees par les transactions precedentes du
+/// bloc, moins celles qu'elles ont consommees.
+struct VueDuBloc<'a> {
+    confirme: &'a UtxoSet,
+    creees: HashMap<OutPoint, crate::utxo::UtxoEntry>,
+    consommees: HashSet<OutPoint>,
+}
+
+impl VueDuBloc<'_> {
+    /// Applique une transaction validee : ses entrees disparaissent, ses
+    /// sorties apparaissent pour les transactions suivantes du bloc.
+    fn appliquer(&mut self, tx: &Transaction, hauteur: u64) {
+        for e in &tx.inputs {
+            self.consommees.insert(e.prev_out);
+        }
+        let id = tx.txid();
+        for (i, o) in tx.outputs.iter().enumerate() {
+            self.creees.insert(
+                OutPoint {
+                    txid: id,
+                    index: i as u32,
+                },
+                crate::utxo::UtxoEntry {
+                    output: *o,
+                    height: hauteur,
+                    is_coinbase: false,
+                },
+            );
+        }
+    }
+}
+
+impl UtxoView for VueDuBloc<'_> {
+    fn lookup(&self, o: &OutPoint) -> Option<crate::utxo::UtxoEntry> {
+        if self.consommees.contains(o) {
+            return None;
+        }
+        self.creees
+            .get(o)
+            .copied()
+            .or_else(|| self.confirme.lookup(o))
+    }
+}
+
 /// Valide un bloc complet.
 pub fn check_block<E: PowEngine>(
     block: &Block,
@@ -402,10 +447,13 @@ pub fn check_block<E: PowEngine>(
     ctx: &BlockContext<'_>,
     pow: &E,
 ) -> Result<Amount, ValidationError> {
-    // --- Regle : structure, coinbase unique, racines de Merkle.
-    block.check_shape()?;
-
     // --- Regle : taille.
+    //
+    // Du moins cher au plus cher : la taille, le chainage, la difficulte, les
+    // horodatages et la preuve de travail se verifient en microsecondes ; la
+    // forme — qui rehache tout le corps pour les racines de Merkle — vient
+    // ensuite, et les signatures en dernier. Un bloc sans preuve de travail
+    // ne fait donc plus hacher quatre mebioctets.
     let taille = block.encode().len();
     if taille > MAX_BLOCK_SIZE {
         return Err(ValidationError::BlocTropGros {
@@ -454,14 +502,34 @@ pub fn check_block<E: PowEngine>(
     // --- Regle : preuve de travail.
     pow.check(&block.header)?;
 
+    // --- Regle : structure, coinbase unique, racines de Merkle.
+    block.check_shape()?;
+
     // --- Regle : chaque transaction valide, aucune double depense.
+    //
+    // Les transactions sont validees **dans l'ordre**, contre une vue qui
+    // superpose au jeu confirme les sorties creees plus tot dans ce bloc. Sans
+    // cette vue, une transaction qui depensait la sortie d'une transaction
+    // precedente du meme bloc — le paiement puis la depense de sa monnaie
+    // rendue, que le reservoir accepte et que la selection empaquette dans
+    // l'ordre parent-avant-enfant — etait refusee (`EntreeIntrouvable`) : le
+    // mineur fabriquait un bloc invalide, perdait son travail, et le
+    // refabriquait au tour suivant. L'ordre reste impose : une sortie creee
+    // plus loin dans le bloc n'existe pas encore, et une sortie deja consommee
+    // par une transaction precedente n'existe plus.
     let mut deja_vues: HashSet<OutPoint> = HashSet::new();
     let mut frais_totaux: u64 = 0;
+    let mut vue = VueDuBloc {
+        confirme: utxo,
+        creees: HashMap::new(),
+        consommees: HashSet::new(),
+    };
     for tx in &block.transactions[1..] {
-        let f = check_transaction(tx, utxo, ctx.network, ctx.height, &mut deja_vues)?;
+        let f = check_transaction(tx, &vue, ctx.network, ctx.height, &mut deja_vues)?;
         frais_totaux = frais_totaux
             .checked_add(f.units())
             .ok_or(ValidationError::FraisDebordent)?;
+        vue.appliquer(tx, ctx.height);
     }
 
     // --- Regle : les oncles sont valides.

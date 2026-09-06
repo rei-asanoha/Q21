@@ -79,10 +79,17 @@ pub const COUT_EPREUVE: Cout = Cout {
 };
 
 /// Plafonds acceptes a la lecture, pour les memes raisons que
-/// [`MAX_ITERATIONS`] : un en-tete reecrit ne doit pas pouvoir imposer un
-/// gibioctet et des heures de calcul avant le moindre rejet.
-pub const MAX_MEMOIRE_KIB: u32 = 1024 * 1024;
-pub const MAX_PASSES: u32 = 32;
+/// [`MAX_ITERATIONS`] : un en-tete reecrit ne doit pas pouvoir imposer une
+/// allocation enorme et des minutes de calcul avant le moindre rejet.
+///
+/// Les parametres se lisent **avant** de verifier le MAC — il le faut pour
+/// deriver la clef — donc c'est cette borne, et elle seule, qui limite ce
+/// qu'un fichier reecrit coute a l'ouverture. Quatre fois le reglage par
+/// defaut en memoire, un peu plus de trois fois en passes : assez pour un
+/// reglage renforce, pas pour une allocation d'un gibioctet qui, sur une
+/// petite machine, tuait le processus avant l'echec d'authentification.
+pub const MAX_MEMOIRE_KIB: u32 = 256 * 1024;
+pub const MAX_PASSES: u32 = 10;
 
 /// HMAC-SHA256, tel que decrit par le RFC 2104.
 pub fn hmac_sha256(clef: &[u8], message: &[u8]) -> [u8; 32] {

@@ -52,6 +52,44 @@ pub const MISCONDUCT_BAD_BLOCK: u32 = 50;
 /// Nombre maximal de pairs simultanes.
 pub const MAX_PEERS: usize = 32;
 
+/// Places que l'ecoute laisse toujours libres pour nos connexions sortantes.
+///
+/// Sans cette reserve, un flot d'entrantes remplissait les `MAX_PEERS` places
+/// et le noeud ne pouvait plus appeler personne depuis son carnet — le
+/// carnet anti-eclipse n'etait alors jamais consulte.
+pub const PLACES_SORTANTES_RESERVEES: usize = 8;
+
+/// Reconstructions de blocs compacts qu'un pair peut laisser en attente.
+///
+/// Sans borne, un pair annoncait des blocs compacts incomplets a la chaine
+/// et ne repondait jamais a la demande des transactions manquantes : chaque
+/// annonce restait en memoire, sans limite ni echeance. Une reconstruction en
+/// vol par pair est ce que le protocole demande ; quatre laissent de la marge
+/// a deux blocs trouves coup sur coup.
+pub const RECONSTRUCTIONS_EN_ATTENTE_MAX: usize = 4;
+
+/// Delai accorde a un pair pour livrer un corps de bloc qu'on lui a demande.
+///
+/// # Le defaut que ceci ferme
+///
+/// Les corps manquants etaient demandes au pair qui avait annonce les
+/// en-tetes, et rien ne surveillait la reponse : un pair qui repondait aux
+/// pings mais retenait les corps figeait la synchronisation pour toujours.
+/// Passe ce delai, la demande est refaite a un autre pair et le retenteur
+/// perd des points ; un noeud amorce par une unique adresse malveillante
+/// finit au moins par la couper.
+pub const DELAI_CORPS: Duration = Duration::from_secs(60);
+
+/// Cout d'un corps demande et jamais livre. Deux suffisent a couper.
+pub const MISCONDUCT_CORPS_RETENU: u32 = 50;
+
+/// Connexions entrantes admises depuis un meme groupe reseau (/16).
+///
+/// Une seule adresse pouvait occuper les trente-deux places ; quatre par
+/// groupe laissent une machine ou un petit reseau entrer plusieurs fois, sans
+/// qu'une seule plage puisse fermer la porte aux autres.
+pub const ENTRANTS_PAR_GROUPE: usize = 4;
+
 /// Delai de lecture. Un pair muet finit par etre libere.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -75,6 +113,29 @@ pub const AMORCE_DEBIT_PAR_SEC: u64 = 2 * 1024 * 1024;
 /// de demarrer sans attendre, tout en bornant ce qu'un pair peut extraire d'un
 /// coup.
 pub const AMORCE_SEAU_MAX: u64 = 8 * 1024 * 1024;
+
+/// Cout d'une transaction invalide en soi — signature fausse, clef qui ne
+/// correspond pas au verrou, forme incorrecte, valeur non conservee. Cinq
+/// suffisent a couper : une transaction ainsi faite ne peut venir que d'un
+/// pair qui la fabrique, jamais d'un relais honnete.
+pub const MISCONDUCT_BAD_TX: u32 = 20;
+
+/// Transactions inedites qu'un pair peut pousser d'emblee.
+pub const TX_SEAU_MAX: u64 = 64;
+
+/// Debit soutenu de transactions inedites accorde a un pair, par seconde.
+///
+/// # Le defaut que ceci ferme
+///
+/// Une transaction poussee coute au recepteur, dans le pire cas, une
+/// verification de signature post-quantique **sous le verrou global** — de
+/// l'ordre de seize millisecondes pour ML-DSA-87. Sans budget, une seule
+/// connexion poussant une soixantaine de transactions par seconde a signature
+/// fausse suffisait a tenir le verrou en permanence : plus un bloc valide,
+/// plus un pair servi. Huit par seconde, c'est deux ordres de grandeur
+/// au-dessus de ce qu'un usage reel produit, et un ordre de grandeur en
+/// dessous de ce qui gene.
+pub const TX_DEBIT_PAR_SEC: u64 = 8;
 
 /// Seau a jetons bornant ce qu'un pair peut se faire servir d'amorce.
 ///
@@ -114,17 +175,32 @@ impl SeauAmorce {
     /// remplit d'abord au prorata du temps ecoule, sans jamais depasser sa
     /// contenance.
     pub fn autoriser(&mut self, octets: u64, maintenant: Instant) -> bool {
+        self.autoriser_avec(octets, maintenant, AMORCE_SEAU_MAX, AMORCE_DEBIT_PAR_SEC)
+    }
+
+    /// Un seau de transactions : meme regle, en unites et non en octets.
+    pub fn pour_transactions(maintenant: Instant) -> SeauAmorce {
+        SeauAmorce {
+            jetons: TX_SEAU_MAX,
+            dernier: maintenant,
+        }
+    }
+
+    /// Autorise `cout` unites au titre d'un seau de contenance `max` et de
+    /// debit `debit` par seconde.
+    pub fn autoriser_avec(&mut self, cout: u64, maintenant: Instant, max: u64, debit: u64) -> bool {
         let ecoule = maintenant
             .saturating_duration_since(self.dernier)
             .as_millis() as u64;
         // Le remplissage se calcule en millisecondes : sous la milliseconde, on
         // ne credite rien et on ne deplace pas le repere, faute de quoi une
         // rafale de demandes tres rapprochees ne crediterait jamais rien.
-        let gain = ecoule.saturating_mul(AMORCE_DEBIT_PAR_SEC) / 1000;
+        let gain = ecoule.saturating_mul(debit) / 1000;
         if gain > 0 {
-            self.jetons = self.jetons.saturating_add(gain).min(AMORCE_SEAU_MAX);
+            self.jetons = self.jetons.saturating_add(gain).min(max);
             self.dernier = maintenant;
         }
+        let octets = cout;
         if self.jetons >= octets {
             self.jetons -= octets;
             true
@@ -180,6 +256,11 @@ struct Peer {
     en_attente: HashMap<Hash256, (CompactBlock, Vec<u32>)>,
     /// Ce que ce pair peut encore se faire servir d'amorce. Voir [`SeauAmorce`].
     seau_amorce: SeauAmorce,
+    /// Les transactions inedites que ce pair peut encore pousser. Voir
+    /// [`TX_DEBIT_PAR_SEC`].
+    seau_tx: SeauAmorce,
+    /// Corps de blocs demandes a ce pair, et quand. Voir [`DELAI_CORPS`].
+    corps_demandes: HashMap<Hash256, Instant>,
     /// Instant de la derniere trame recue de ce pair.
     ///
     /// # Le defaut que ce champ repare
@@ -460,6 +541,46 @@ impl Node {
     /// maintien doit ramener a la cible : sinon un flot de connexions entrantes
     /// depuis une seule IP suffit a nous empecher d'aller chercher des pairs
     /// diversifies, et la defense anti-eclipse tombe.
+    /// Une connexion entrante a-t-elle sa place ?
+    ///
+    /// Trois bornes : le total, la reserve des sortantes, et la part d'un
+    /// meme groupe reseau. Voir [`PLACES_SORTANTES_RESERVEES`] et
+    /// [`ENTRANTS_PAR_GROUPE`].
+    fn admettre_entrant(&self, flux: &TcpStream) -> bool {
+        let g = self.partage.lock().unwrap();
+        let total = g.peers.len();
+        if total >= MAX_PEERS {
+            return false;
+        }
+        let entrants = g.peers.values().filter(|p| !p.sortant).count();
+        if entrants + PLACES_SORTANTES_RESERVEES >= MAX_PEERS {
+            return false;
+        }
+        // La boucle locale n'est pas un groupe : plusieurs noeuds d'une meme
+        // machine (regtest, epreuves) ne s'eclipsent pas entre eux.
+        let groupe = match flux.peer_addr() {
+            Ok(SocketAddr::V4(a)) if !a.ip().is_loopback() => {
+                Some(crate::addr::groupe(a.ip().octets()))
+            }
+            _ => None,
+        };
+        if let Some(gr) = groupe {
+            let memes = g
+                .peers
+                .values()
+                .filter(|p| !p.sortant)
+                .filter(|p| match p.addr {
+                    SocketAddr::V4(a) => crate::addr::groupe(a.ip().octets()) == gr,
+                    _ => false,
+                })
+                .count();
+            if memes >= ENTRANTS_PAR_GROUPE {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn peer_count_sortants(&self) -> usize {
         self.partage
             .lock()
@@ -522,9 +643,59 @@ impl Node {
         let mut a_pinger: Vec<(u64, Arc<Mutex<TcpStream>>)> = Vec::new();
         let mut morts: Vec<u64> = Vec::new();
         let magie = self.magie;
+        let mut a_redemander: Vec<(u64, Vec<InvItem>)> = Vec::new();
         let nonce = {
             let mut g = self.partage.lock().unwrap();
-            for (id, p) in g.peers.iter_mut() {
+            let Partage {
+                ref chain,
+                ref mut peers,
+                ..
+            } = *g;
+            // --- Les corps demandes : livres, en attente, ou retenus ?
+            let mut retenus: Vec<Hash256> = Vec::new();
+            for (id, p) in peers.iter_mut() {
+                let mut en_retard = 0u32;
+                p.corps_demandes.retain(|h, depuis| {
+                    if chain.has_block(h) {
+                        return false;
+                    }
+                    if maintenant.duration_since(*depuis) >= DELAI_CORPS {
+                        en_retard += 1;
+                        retenus.push(*h);
+                        return false;
+                    }
+                    true
+                });
+                if en_retard > 0 {
+                    p.ban_score += MISCONDUCT_CORPS_RETENU;
+                    if p.ban_score >= BAN_THRESHOLD {
+                        self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                        morts.push(*id);
+                    }
+                }
+            }
+            if !retenus.is_empty() {
+                // A un autre pair — presente, et pas celui qui retient.
+                let autre = peers
+                    .iter()
+                    .filter(|(id, p)| p.handshaked && !morts.contains(id))
+                    .map(|(id, _)| *id)
+                    .next();
+                if let Some(id) = autre {
+                    let items = retenus
+                        .iter()
+                        .map(|h| InvItem {
+                            kind: InvKind::CompactBlock,
+                            hash: *h,
+                        })
+                        .collect();
+                    a_redemander.push((id, items));
+                }
+            }
+            for (id, p) in peers.iter_mut() {
+                if morts.contains(id) {
+                    continue;
+                }
                 let silence = maintenant.duration_since(p.derniere_reception);
                 if silence >= SILENCE_MAX {
                     morts.push(*id);
@@ -535,6 +706,9 @@ impl Node {
             }
             g.nonce
         };
+        for (id, items) in a_redemander {
+            self.envoyer_a(id, &Message::GetData(items));
+        }
         // L'ecriture se fait hors du verrou : une socket bouchee bloquerait
         // sinon tout le noeud pendant le delai d'ecriture.
         for (_, sortie) in a_pinger {
@@ -599,7 +773,7 @@ impl Node {
                 }
                 match flux {
                     Ok(s) => {
-                        if node.peer_count() >= MAX_PEERS {
+                        if !node.admettre_entrant(&s) {
                             continue;
                         }
                         node.demarrer_pair(s, false);
@@ -613,7 +787,10 @@ impl Node {
 
     /// Se connecte a un pair et lance la poignee de main.
     pub fn connect(&self, addr: SocketAddr) -> std::io::Result<u64> {
-        let flux = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
+        // Quatre secondes : assez pour une liaison lente, pas assez pour
+        // qu'un lot d'adresses muettes tienne la boucle de maintien une
+        // minute.
+        let flux = TcpStream::connect_timeout(&addr, Duration::from_secs(4))?;
         Ok(self.demarrer_pair(flux, true))
     }
 
@@ -645,6 +822,8 @@ impl Node {
                     sortie: sortie.clone(),
                     sortant,
                     seau_amorce: SeauAmorce::new(Instant::now()),
+                    seau_tx: SeauAmorce::pour_transactions(Instant::now()),
+                    corps_demandes: HashMap::new(),
                     version_recue: false,
                     handshaked: false,
                     ban_score: 0,
@@ -667,7 +846,7 @@ impl Node {
                 version: PROTOCOL_VERSION,
                 timestamp: maintenant(),
                 nonce,
-                user_agent: "q21:0.2".into(),
+                user_agent: "q21:0.3".into(),
                 start_height: hauteur,
             };
             let _ = ecrire(&sortie, &v, self.magie);
@@ -733,6 +912,23 @@ impl Node {
         }
     }
 
+    /// Une transaction que seul son auteur a pu rendre invalide.
+    fn transaction_invalide_en_soi(e: &crate::mempool::MempoolError) -> bool {
+        use crate::mempool::MempoolError as M;
+        use crate::validate::ValidationError as V;
+        matches!(
+            e,
+            M::Validation(
+                V::Signature(_)
+                    | V::ClefNeCorrespondPasAuVerrou
+                    | V::Transaction(_)
+                    | V::ValeurNonConservee { .. }
+                    | V::SchemaInterditSurCeReseau(_)
+                    | V::SortiePoussiere { .. }
+            )
+        )
+    }
+
     fn sanctionner(&self, id: u64, points: u32) -> bool {
         let mut g = self.partage.lock().unwrap();
         if let Some(p) = g.peers.get_mut(&id) {
@@ -796,7 +992,7 @@ impl Node {
                                 version: PROTOCOL_VERSION,
                                 timestamp: maintenant(),
                                 nonce: nonce_local,
-                                user_agent: "q21:0.2".into(),
+                                user_agent: "q21:0.3".into(),
                                 start_height: hauteur,
                             },
                         });
@@ -1021,8 +1217,16 @@ impl Node {
                 }
 
                 Message::Block(b) => {
-                    self.stats.blocs_recus.fetch_add(1, Ordering::Relaxed);
-                    couper = !Self::integrer(&mut g, &b, &self.stats, &mut envois, id);
+                    // --- Defense : un bloc pousse par un inconnu.
+                    //
+                    // Tous les messages de service exigent la poignee de
+                    // main ; un bloc pousse ne l'exigeait pas, et se faisait
+                    // hacher, verifier et connecter sur une simple connexion
+                    // TCP anonyme. Meme regle pour tous.
+                    if handshaked {
+                        self.stats.blocs_recus.fetch_add(1, Ordering::Relaxed);
+                        couper = !Self::integrer(&mut g, &b, &self.stats, &mut envois, id);
+                    }
                 }
 
                 Message::CmpctBlock(c) => {
@@ -1076,6 +1280,20 @@ impl Node {
                             Ok(r) => {
                                 let indices = r.missing().to_vec();
                                 if let Some(p) = g.peers.get_mut(&id) {
+                                    // Au-dela de la borne, la plus ancienne
+                                    // cede la place : on ne garde jamais plus
+                                    // que ce que le pair peut honnetement
+                                    // avoir en vol.
+                                    if p.en_attente.len() >= RECONSTRUCTIONS_EN_ATTENTE_MAX {
+                                        let plus_ancienne = p
+                                            .en_attente
+                                            .iter()
+                                            .min_by_key(|(_, (cb, _))| cb.header.height)
+                                            .map(|(k, _)| *k);
+                                        if let Some(k) = plus_ancienne {
+                                            p.en_attente.remove(&k);
+                                        }
+                                    }
                                     p.en_attente.insert(bid, (*c.clone(), indices.clone()));
                                 }
                                 envois.push(Envoi {
@@ -1176,8 +1394,46 @@ impl Node {
                     }
                 }
 
+                Message::Tx(t) if !handshaked => {
+                    // Une transaction poussee avant la poignee de main ne
+                    // coute rien : elle n'est pas lue. Voir `Message::Block`.
+                    let _ = t;
+                }
+
                 Message::Tx(t) => {
                     self.stats.tx_recues.fetch_add(1, Ordering::Relaxed);
+                    // --- Defense : le budget de transactions du pair.
+                    //
+                    // Une transaction deja connue n'est pas comptee : la
+                    // relayer plusieurs fois est le comportement normal du
+                    // reseau. Ce qui est compte, c'est ce qui force une
+                    // verification — donc tout ce qui est inedit.
+                    let txid = t.txid();
+                    let inedite = !g.mempool.contains(&txid);
+                    let lire = !inedite
+                        || g
+                            .peers
+                            .get_mut(&id)
+                            .map(|p| {
+                                p.seau_tx.autoriser_avec(
+                                    1,
+                                    Instant::now(),
+                                    TX_SEAU_MAX,
+                                    TX_DEBIT_PAR_SEC,
+                                )
+                            })
+                            .unwrap_or(false);
+                    if !lire {
+                        // Au-dela du budget, on ne lit pas : c'est le pair
+                        // qui attend, pas le noeud. Insister coute des points.
+                        if let Some(p) = g.peers.get_mut(&id) {
+                            p.ban_score += MISCONDUCT_MALFORMED;
+                            if p.ban_score >= BAN_THRESHOLD {
+                                self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                                couper = true;
+                            }
+                        }
+                    }
                     let hauteur = g.chain.height();
                     // Sur une reference, jamais sur une copie : dupliquer le jeu
                     // d'UTXO a chaque transaction recue coutait des centaines de
@@ -1185,10 +1441,15 @@ impl Node {
                     // verrou global — un pair bavard suffisait a figer le noeud.
                     // Le reemprunt `&mut *g` separe les champs de la garde.
                     let partage = &mut *g;
-                    match partage
-                        .mempool
-                        .accept(&t, &partage.chain.utxo, magie_reseau, hauteur)
-                    {
+                    let resultat = if lire {
+                        partage
+                            .mempool
+                            .accept(&t, &partage.chain.utxo, magie_reseau, hauteur)
+                    } else {
+                        // Non lue : rien a relayer, rien a sanctionner de plus.
+                        Err(crate::mempool::MempoolError::DejaPresent)
+                    };
+                    match resultat {
                         Ok(txid) => {
                             let autres: Vec<u64> =
                                 g.peers.keys().copied().filter(|p| *p != id).collect();
@@ -1202,9 +1463,23 @@ impl Node {
                                 });
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
                             // Une transaction refusee n'est pas forcement une
-                            // agression : elle peut simplement etre deja connue.
+                            // agression : elle peut etre deja connue, ou
+                            // depasser une sortie qu'un bloc vient de
+                            // consommer. Mais une signature fausse, une clef
+                            // qui ne correspond pas au verrou, une forme
+                            // incorrecte ou une valeur non conservee ne
+                            // viennent que d'un pair qui l'a fabriquee.
+                            if Self::transaction_invalide_en_soi(&e) {
+                                if let Some(p) = g.peers.get_mut(&id) {
+                                    p.ban_score += MISCONDUCT_BAD_TX;
+                                    if p.ban_score >= BAN_THRESHOLD {
+                                        self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                                        couper = true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1320,7 +1595,16 @@ impl Node {
 
         for e in envois {
             let sortie = {
-                let g = self.partage.lock().unwrap();
+                let mut g = self.partage.lock().unwrap();
+                // Un corps demande est note, pour qu'on sache s'il arrive.
+                if let Message::GetData(items) = &e.message {
+                    let maintenant = Instant::now();
+                    if let Some(p) = g.peers.get_mut(&e.peer) {
+                        for i in items.iter().filter(|i| i.kind == InvKind::CompactBlock) {
+                            p.corps_demandes.entry(i.hash).or_insert(maintenant);
+                        }
+                    }
+                }
                 g.peers.get(&e.peer).map(|p| p.sortie.clone())
             };
             if let Some(s) = sortie {
@@ -1460,6 +1744,26 @@ impl Node {
     }
 
     /// Diffuse une transaction locale.
+    /// Envoie un message a un pair, hors du verrou, en notant les corps
+    /// demandes comme le fait `traiter`.
+    fn envoyer_a(&self, id: u64, m: &Message) {
+        let sortie = {
+            let mut g = self.partage.lock().unwrap();
+            if let Message::GetData(items) = m {
+                let maintenant = Instant::now();
+                if let Some(p) = g.peers.get_mut(&id) {
+                    for i in items.iter().filter(|i| i.kind == InvKind::CompactBlock) {
+                        p.corps_demandes.entry(i.hash).or_insert(maintenant);
+                    }
+                }
+            }
+            g.peers.get(&id).map(|p| p.sortie.clone())
+        };
+        if let Some(s) = sortie {
+            let _ = ecrire(&s, m, self.magie);
+        }
+    }
+
     pub fn announce_tx(&self, txid: Hash256) {
         let cibles: Vec<Arc<Mutex<TcpStream>>> = {
             let g = self.partage.lock().unwrap();
