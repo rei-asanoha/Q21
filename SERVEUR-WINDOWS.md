@@ -426,7 +426,7 @@ serveur ne peut pas faire), puis se pousse vers le serveur.
 
 ### Sur le PC
 
-Sur `github.com/VOTRE-COMPTE/VOTRE-DEPOT` → **Actions** → **Livraison** → la dernière
+Sur `github.com/reiasanoha/q21` → **Actions** → **Livraison** → la dernière
 exécution verte → section **Artifacts** → **`q21-linux-x86_64.tar.gz`**.
 
 ⚠️ **Bien celui-là** : `linux`, pas `windows`. C'est le programme du serveur.

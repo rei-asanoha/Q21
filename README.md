@@ -580,3 +580,20 @@ publiée par un second canal avant de s'y fier :
 ```
 <clé publique minisign, ligne RW…, à coller ici après la création de la clé>
 ```
+
+Le commentaire de confiance de chaque signature porte le nom qui signe le
+projet, et ce commentaire est **couvert par la signature** : il ne se réécrit
+pas sans la clé secrète.
+
+```
+Trusted comment: Q21 main <empreinte du commit> -- Rei Asanoha
+```
+
+C'est tout ce que ce nom garantit — une origine constante d'une livraison à la
+suivante. Il ne confère aucune autorité : Q21 n'a ni vote, ni conseil, ni clé
+d'arrêt, et aucune règle du protocole ne dépend de qui l'a écrite. Le jour où
+ce nom se tait, la chaîne continue sans lui.
+
+---
+
+**Rei Asanoha** — septembre 2026

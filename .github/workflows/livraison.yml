@@ -231,7 +231,7 @@ jobs:
           printf '%s\n' "$MINISIGN_KEY" > minisign.key
           chmod 600 minisign.key
           printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s minisign.key \
-            -m livraisons/SHA256SUMS -t "Q21 ${GITHUB_REF_NAME} ${GITHUB_SHA}"
+            -m livraisons/SHA256SUMS -t "Q21 ${GITHUB_REF_NAME} ${GITHUB_SHA} -- Rei Asanoha"
           rm -f minisign.key
           cat livraisons/SHA256SUMS.minisig
 

@@ -99,10 +99,10 @@ Clique **Publish repository**.
 Ça prend une à deux minutes : il y a 1 140 fichiers à envoyer.
 
 > **Si GitHub dit que le nom `Q21` est déjà pris**, c'est ton dépôt vide de tout
-> à l'heure. Va sur https://github.com/VOTRE-COMPTE/VOTRE-DEPOT → **Settings** → tout en bas
+> à l'heure. Va sur https://github.com/reiasanoha/q21 → **Settings** → tout en bas
 > → **Delete this repository**. Puis recommence l'étape 5.
 
-**C'est fait.** Ton code est sur GitHub. Va voir : https://github.com/VOTRE-COMPTE/VOTRE-DEPOT
+**C'est fait.** Ton code est sur GitHub. Va voir : https://github.com/reiasanoha/q21
 
 ---
 
