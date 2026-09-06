@@ -281,7 +281,7 @@ Répondez **Yes** à la question posée.
 On n'administre pas en `root` au quotidien.
 
 ```bash
-adduser --gecos "" titi
+adduser --gecos "" q21op
 ```
 
 Il demande un mot de passe — **mettez-en un solide et notez-le**. Il ne servira
@@ -291,8 +291,8 @@ d'administration.
 Donnez-lui le droit d'administrer, et recopiez-lui votre clé :
 
 ```bash
-usermod -aG sudo titi
-rsync --archive --chown=titi:titi ~/.ssh /home/titi/
+usermod -aG sudo q21op
+rsync --archive --chown=q21op:q21op ~/.ssh /home/q21op/
 ```
 
 ### Le compte du service
@@ -318,7 +318,7 @@ la première, qui est encore connectée en `root` : c'est votre filet.
 Dans la nouvelle :
 
 ```powershell
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 ```
 
 puis, une fois dessus :
@@ -327,13 +327,13 @@ puis, une fois dessus :
 sudo -v
 ```
 
-Il demande le mot de passe de `titi`. Si la connexion **et** le `sudo` passent,
+Il demande le mot de passe de `q21op`. Si la connexion **et** le `sudo` passent,
 continuez. **Si l'un des deux échoue, arrêtez-vous ici** et corrigez depuis la
 première fenêtre, encore ouverte en `root`.
 
 ### 7.2 — Interdire le mot de passe et la connexion root
 
-Dans la deuxième fenêtre, en tant que `titi` :
+Dans la deuxième fenêtre, en tant que `q21op` :
 
 ```bash
 sudo nano /etc/ssh/sshd_config.d/99-q21.conf
@@ -369,7 +369,7 @@ sudo systemctl restart ssh
 Ouvrez une troisième fenêtre PowerShell :
 
 ```powershell
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 ```
 
 Doit passer. Et :
@@ -426,7 +426,7 @@ serveur ne peut pas faire), puis se pousse vers le serveur.
 
 ### Sur le PC
 
-Sur `github.com/golboy03/Q21` → **Actions** → **Livraison** → la dernière
+Sur `github.com/VOTRE-COMPTE/VOTRE-DEPOT` → **Actions** → **Livraison** → la dernière
 exécution verte → section **Artifacts** → **`q21-linux-x86_64.tar.gz`**.
 
 ⚠️ **Bien celui-là** : `linux`, pas `windows`. C'est le programme du serveur.
@@ -451,7 +451,7 @@ dir
 Envoyez-le :
 
 ```powershell
-scp .\q21 titi@VOTRE_IP:~/
+scp .\q21 q21op@VOTRE_IP:~/
 ```
 
 Une barre de progression s'affiche, puis `100%`.
@@ -459,7 +459,7 @@ Une barre de progression s'affiche, puis `100%`.
 ### Sur le serveur
 
 ```powershell
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 ```
 
 ```bash
@@ -651,7 +651,7 @@ n'ont plus besoin d'être sur le même réseau local.
 # Surveiller, au quotidien
 
 ```powershell
-ssh titi@VOTRE_IP
+ssh q21op@VOTRE_IP
 ```
 
 ```bash
@@ -664,7 +664,7 @@ Pour consulter l'explorateur du serveur sans ouvrir aucun port, ouvrez un
 **tunnel** depuis le PC :
 
 ```powershell
-ssh -L 21080:127.0.0.1:21080 titi@VOTRE_IP
+ssh -L 21080:127.0.0.1:21080 q21op@VOTRE_IP
 ```
 
 Tant que cette fenêtre reste ouverte, `http://127.0.0.1:21080` dans votre

@@ -30,13 +30,13 @@ Décompresse `q21-depot.tar.gz`, puis, dans le dossier obtenu :
 
 ```bash
 cd q21
-git remote set-url origin https://github.com/golboy03/Q21.git
+git remote set-url origin https://github.com/VOTRE-COMPTE/VOTRE-DEPOT.git
 git push -u origin main
 ```
 
 Git demandera :
 
-- **Username** : `golboy03`
+- **Username** : `VOTRE-COMPTE`
 - **Password** : **le jeton**, pas ton mot de passe GitHub
 
 > GitHub n'accepte plus les mots de passe pour ce genre d'opération depuis 2021.
@@ -56,11 +56,11 @@ git push origin v0.1.0
 ```
 
 C'est cette étiquette qui lance la chaîne de livraison. Va ensuite sur
-**https://github.com/golboy03/Q21/actions** : tu verras quatre compilations
+**https://github.com/VOTRE-COMPTE/VOTRE-DEPOT/actions** : tu verras quatre compilations
 démarrer.
 
 Compter environ dix à quinze minutes. À la fin, sur
-**https://github.com/golboy03/Q21/releases**, quatre archives :
+**https://github.com/VOTRE-COMPTE/VOTRE-DEPOT/releases**, quatre archives :
 
 | Fichier | Pour |
 |---|---|
