@@ -551,7 +551,7 @@ scellé : tous sont détectés. Les fichiers scellés par l'ancienne dérivation
 - **La dérivation de clef est résistante à la mémoire depuis la v8** (Argon2id). La longueur de la phrase secrète reste ce qui compte le plus : aucune dérivation ne protège une phrase de quatre lettres.
 - **Les récompenses d'oncles ont été retirées.** Dans une monnaie à plafond fixe, une récompense d'oncle est soit inflationniste, soit prélevée sur le mineur — et personne n'inclut un oncle à ses frais. Le plafond est le projet ; le mécanisme ne servait plus qu'à offrir une surface d'attaque, et un bloc qui porte un oncle est désormais refusé.
 - **Aucun nœud d'amorçage n'est câblé.** La découverte de pairs fonctionne, mais la première adresse doit venir de `--connect`. Ce sera une décision de lancement, pas de code.
-- **L'archive de blocs ne s'élague pas.** La mémoire est bornée depuis la phase 7, le disque ne l'est pas encore.
+- **L'archive de blocs s'élague sur demande** (`node --elaguer`) : le disque ne garde que les corps que le nœud peut encore relire ou afficher — environ huit jours — et le reste se résume dans l'instantané. Un nœud élagué redémarre comme un nœud parti d'une amorce, et ne peut pas servir d'explorateur. Sans l'option, tout est gardé.
 - **Pas de limite par groupe réseau sur les connexions entrantes.** La diversité est imposée aux connexions sortantes seulement.
 - **PoW sans cryptanalyse externe.** La phase 6 a mesuré 2 Gio et corrigé une faille réelle, mais la mesure reste celle de son auteur, sur une machine, contre une implémentation de référence — pas contre une implémentation optimisée par quelqu'un dont le métier est de la battre.
 - **Minage en rafale.** Au-delà de ~7 200 blocs d'un coup, les horodatages dépassent la tolérance de 2 h.

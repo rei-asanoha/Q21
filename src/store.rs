@@ -282,6 +282,14 @@ impl BlockStore {
 // Archive : magasin + index des positions
 // ---------------------------------------------------------------------------
 
+/// Ce qu'un elagage a fait.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Elagage {
+    pub conserves: usize,
+    pub retires: usize,
+    pub octets_liberes: u64,
+}
+
 /// Le fichier de blocs, plus l'index de leurs positions.
 ///
 /// # Le defaut que ce type corrige
@@ -423,17 +431,114 @@ impl BlockArchive {
     ///
     /// Les deux ne doivent jamais etre separes : un bloc ecrit mais non indexe
     /// est un bloc que ce noeud ne saura plus servir.
+    ///
+    /// Le verrou des positions est pris **avant** l'ecriture : il serialise
+    /// les ajouts avec l'elagage ([`Self::elaguer`]), qui reecrit le fichier.
+    /// Sans cela, un bloc ecrit pendant la reecriture atterrirait dans
+    /// l'ancien fichier, et sa position, dans l'index du nouveau.
     pub fn append(&self, block: &Block) -> Result<(), StoreError> {
+        let mut g = self.positions.lock().unwrap_or_else(|e| e.into_inner());
         let r = self.store.append(block)?;
-        if let Ok(mut g) = self.positions.lock() {
-            g.insert(block.header.block_id(), r);
-        }
+        g.insert(block.header.block_id(), r);
         Ok(())
     }
 
+    /// Relit un bloc. Le verrou est tenu pendant la lecture, pour la meme
+    /// raison que dans [`Self::append`] : une position lue avant un elagage ne
+    /// designe plus rien apres.
     pub fn read(&self, id: &crate::hash::Hash256) -> Option<Block> {
-        let r = *self.positions.lock().ok()?.get(id)?;
+        let g = self.positions.lock().ok()?;
+        let r = *g.get(id)?;
         self.store.read_at(r).ok()
+    }
+
+    /// Reecrit le fichier en ne gardant que les blocs que `garder` retient.
+    ///
+    /// # Pourquoi
+    ///
+    /// Le fichier de blocs ne faisait que grossir. Un noeud qui ne mine que
+    /// pour lui n'a pourtant besoin que de ce qu'il peut encore defaire (la
+    /// fenetre de reorganisation) et de ce que son historique affiche : tout
+    /// ce qui precede se resume dans l'instantane. Une carte SD de Raspberry
+    /// ne tient pas dix ans de corps ; elle tient dix ans d'instantanes.
+    ///
+    /// # Ce qui est garanti
+    ///
+    /// - L'ordre des enregistrements est conserve, la genese reste le premier :
+    ///   le controle de racine de [`Self::open`] continue de s'appliquer.
+    /// - Le nouveau fichier est ecrit a cote, synchronise sur le disque, puis
+    ///   renomme par-dessus l'ancien : a tout instant, le chemin designe un
+    ///   fichier complet — l'ancien ou le nouveau, jamais un melange.
+    /// - Le verrou des positions est tenu du debut a la fin : aucun ajout ni
+    ///   aucune lecture ne s'intercale, et l'index est reconstruit avant que
+    ///   quiconque le consulte.
+    ///
+    /// L'appelant est responsable de ce que `garder` retient : au minimum, la
+    /// genese et tout ce que la chaine peut encore avoir a relire.
+    pub fn elaguer(&self, garder: impl Fn(&BlockHeader) -> bool) -> Result<Elagage, StoreError> {
+        let mut positions = self.positions.lock().unwrap_or_else(|e| e.into_inner());
+        let chemin = self.store.path().to_path_buf();
+        if !chemin.exists() {
+            return Ok(Elagage::default());
+        }
+        let tmp = chemin.with_extension("elagage");
+        let mut bilan = Elagage::default();
+        let mut nouvelles: std::collections::HashMap<crate::hash::Hash256, RecordRef> =
+            std::collections::HashMap::new();
+        {
+            let mut lecture = BufReader::new(File::open(&chemin)?);
+            let sortie = File::create(&tmp)?;
+            let mut ecriture = BufWriter::new(&sortie);
+            let mut position_sortie = 0u64;
+            loop {
+                let mut prefixe = [0u8; 4];
+                match lecture.read_exact(&mut prefixe) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(StoreError::Io(e)),
+                }
+                let taille = u32::from_le_bytes(prefixe);
+                if taille < BlockHeader::SIZE as u32 || taille > MAX_BLOC_SERIALISE {
+                    // Un enregistrement qu'on ne comprend pas : on s'arrete la,
+                    // comme le balayage. Ce qui precede est sain.
+                    break;
+                }
+                let mut brut = vec![0u8; taille as usize];
+                if lecture.read_exact(&mut brut).is_err() {
+                    break; // queue tronquee : coupee, comme a l'ouverture
+                }
+                let entete = match BlockHeader::decode(&brut[..BlockHeader::SIZE]) {
+                    Ok(h) => h,
+                    Err(_) => break,
+                };
+                if garder(&entete) {
+                    ecriture.write_all(&prefixe)?;
+                    ecriture.write_all(&brut)?;
+                    nouvelles.insert(
+                        entete.block_id(),
+                        RecordRef {
+                            offset: position_sortie + 4,
+                            len: taille,
+                        },
+                    );
+                    position_sortie += 4 + u64::from(taille);
+                    bilan.conserves += 1;
+                } else {
+                    bilan.retires += 1;
+                    bilan.octets_liberes += 4 + u64::from(taille);
+                }
+            }
+            ecriture.flush()?;
+            sortie.sync_all()?;
+        }
+        std::fs::rename(&tmp, &chemin)?;
+        if let Some(parent) = chemin.parent() {
+            if let Ok(d) = File::open(parent) {
+                let _ = d.sync_all();
+            }
+        }
+        *positions = nouvelles;
+        Ok(bilan)
     }
 
     pub fn store(&self) -> &BlockStore {
@@ -663,6 +768,81 @@ mod tests {
         let (blocs, err) = s.load_all().unwrap();
         assert!(blocs.is_empty());
         assert!(err.is_none());
+    }
+
+    /// L'elagage garde ce qu'on lui dit de garder, dans l'ordre, la genese
+    /// en tete ; ce qui reste se relit, se complete, et se rouvre.
+    #[test]
+    fn l_elagage_garde_la_genese_et_la_fenetre_et_le_fichier_se_rouvre() {
+        let p = chemin_temporaire("elagage");
+        let g = bloc();
+        // Des « blocs » distincts : la genese modifiee dans son nonce et sa
+        // hauteur. Ce module ne verifie pas la preuve de travail.
+        let mut blocs = vec![g.clone()];
+        for h in 1..=20u64 {
+            let mut b = g.clone();
+            b.header.height = h;
+            b.header.nonce = 1000 + h;
+            b.header.prev_block = blocs[(h - 1) as usize].header.block_id();
+            blocs.push(b);
+        }
+        let (archive, _, _) = BlockArchive::open(&p, Network::Regtest).unwrap();
+        for b in &blocs {
+            archive.append(b).unwrap();
+        }
+        let avant = std::fs::metadata(&p).unwrap().len();
+
+        // On ne garde que la genese et les blocs de hauteur >= 15.
+        let bilan = archive
+            .elaguer(|h| h.height == 0 || h.height >= 15)
+            .unwrap();
+        assert_eq!(bilan.conserves, 7);
+        assert_eq!(bilan.retires, 14);
+        assert!(bilan.octets_liberes > 0);
+        assert!(std::fs::metadata(&p).unwrap().len() < avant);
+        assert!(
+            !p.with_extension("elagage").exists(),
+            "pas de temporaire oublie"
+        );
+
+        // Ce qui est garde se relit ; ce qui est retire ne se lit plus.
+        assert_eq!(
+            archive.read(&blocs[0].header.block_id()),
+            Some(blocs[0].clone())
+        );
+        assert_eq!(
+            archive.read(&blocs[20].header.block_id()),
+            Some(blocs[20].clone())
+        );
+        assert_eq!(
+            archive.read(&blocs[15].header.block_id()),
+            Some(blocs[15].clone())
+        );
+        assert_eq!(archive.read(&blocs[14].header.block_id()), None);
+        assert_eq!(archive.len(), 7);
+
+        // On peut continuer a ecrire apres.
+        let mut suite = g.clone();
+        suite.header.height = 21;
+        suite.header.nonce = 1021;
+        archive.append(&suite).unwrap();
+        assert_eq!(archive.read(&suite.header.block_id()), Some(suite.clone()));
+
+        // Et rouvrir : la genese est toujours la premiere, l'ordre est celui
+        // des hauteurs, et rien n'est signale.
+        let (rouverte, entetes, souci) = BlockArchive::open(&p, Network::Regtest).unwrap();
+        assert!(souci.is_none());
+        assert_eq!(entetes.len(), 8);
+        assert_eq!(entetes[0].height, 0);
+        assert_eq!(
+            entetes.iter().map(|h| h.height).collect::<Vec<_>>(),
+            vec![0, 15, 16, 17, 18, 19, 20, 21]
+        );
+        assert_eq!(
+            rouverte.read(&blocs[18].header.block_id()),
+            Some(blocs[18].clone())
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

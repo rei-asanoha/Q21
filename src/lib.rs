@@ -51,6 +51,7 @@ pub mod block;
 pub mod chain;
 pub mod compact;
 pub mod consensus;
+pub mod elagage;
 pub mod emission;
 pub mod explorer;
 pub mod hash;
