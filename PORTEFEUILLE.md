@@ -135,8 +135,8 @@ méritent d'être racontés parce qu'ils illustrent la même erreur.
 
 Écrire le portefeuille se fait en quatre temps : lire le numéro de série,
 sceller le contenu, écrire `wallet.dat`, écrire `wallet.seq`. Le scellement
-coûte six cent mille itérations de PBKDF2 — plusieurs centaines de
-millisecondes pendant lesquelles le numéro lu au départ vieillit. Deux
+coûte une dérivation Argon2id — quelques centaines de millisecondes
+pendant lesquelles le numéro lu au départ vieillit. Deux
 écritures concurrentes s'entrelacent alors ainsi :
 
 ```text
