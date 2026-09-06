@@ -187,9 +187,13 @@ Mais soyons précis sur ce qu'il faut en attendre :
   quelques gigaoctets par seconde, là où un PC de bureau récent en fait dix fois
   plus. Or c'est exactement la ressource que la devinette consomme. Un Pi minera
   donc, mais **plusieurs fois moins vite** qu'un PC ordinaire.
-- **Prenez le modèle 16 Go.** Le 8 Go tiendra jusqu'à ce que la table s'approche
-  de son plafond de 8 Gio, vers la sixième année, et deviendra alors inutilisable
-  pour le minage.
+- **8 Go suffisent, pour toujours.** La table plafonne à 4 Gio dès la
+  troisième année, ce qui laisse autant au système et au reste.
+- **Sa carte SD n'est pas infinie.** Lancez-le avec **`--elaguer`** : le
+  disque ne garde alors que les huit derniers jours de blocs, et le reste se
+  résume dans un instantané. Le nœud vérifie toujours tout ; il ne garde
+  simplement pas ce qu'il ne relira jamais. Un explorateur, lui, doit tout
+  garder — c'est le rôle du serveur, pas du Pi.
 - **En revanche, pour faire tourner un nœud qui ne mine pas, un Pi est parfait**,
   et le restera : un vérificateur n'a jamais besoin que du petit carnet, 128 Mo
   au maximum, pour toujours.

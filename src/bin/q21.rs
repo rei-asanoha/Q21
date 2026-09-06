@@ -96,6 +96,11 @@ COMMANDES
                                                   accompagne l'empreinte
                              --index-adresses     index de recherche (voir
                                                   EXPLORATEUR.md)
+                             --elaguer            ne garde sur disque que les
+                                                  corps recents (~8 jours) ;
+                                                  le reste se resume dans
+                                                  l'instantane. Incompatible
+                                                  avec un explorateur
                              --mine               mine en continu
                              --rpc <ip:port>      API JSON-RPC + explorateur web
                              --rpc-token <jeton>  exige un jeton (obligatoire
@@ -966,6 +971,43 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     Ok(w)
 }
 
+/// Elague le fichier de blocs si assez de blocs se sont accumules.
+///
+/// La politique et sa preuve sont dans [`q21_core::elagage`] ; ici, on ne
+/// fait que la brancher sur le dossier et en rendre compte a l'ecran.
+fn elaguer_si_utile(
+    datadir: &Path,
+    reseau: Network,
+    node: &q21_core::net::Node,
+    archive: &q21_core::store::BlockArchive,
+    hauteur_instantane: u64,
+    derniere: &mut u64,
+) {
+    let entetes = q21_core::store::HeaderStore::new(chemin_entetes(datadir));
+    let politique = q21_core::elagage::POLITIQUE_DEFAUT;
+    let resultat = node.with_chain(|c| {
+        q21_core::elagage::elaguer(
+            c,
+            archive,
+            &entetes,
+            reseau,
+            hauteur_instantane,
+            politique,
+            derniere,
+        )
+    });
+    match resultat {
+        Ok(Some(bilan)) if bilan.retires > 0 => println!(
+            "  elagage : {} corps retires, {} conserves, {} Mio liberes",
+            bilan.retires,
+            bilan.conserves,
+            bilan.octets_liberes / (1024 * 1024)
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("avertissement : pas d'elagage ({e}) — le fichier est intact"),
+    }
+}
+
 /// Range les fichiers d'une chaine d'une autre genese dans un sous-dossier.
 ///
 /// Rien n'est efface. Le portefeuille, sa serie, son cache d'adresses et la
@@ -1303,8 +1345,10 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
             // inexploitable, c'est une erreur franche, pas un repli silencieux.
             if adopte {
                 return Err(
-                    "dossier adopte, mais l'instantane est illisible ou incoherent : \
-                     rien a revalider. Re-adoptez depuis une amorce saine."
+                    "ce dossier n'a pas toute l'histoire (adopte depuis une amorce, ou \
+                     elague), et son instantane est illisible ou incoherent : rien a \
+                     rejouer. Resynchronisez depuis le reseau dans un dossier vide, ou \
+                     re-adoptez depuis une amorce saine."
                         .into(),
                 );
             }
@@ -3099,6 +3143,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut cible_pairs: usize = 8;
     let mut silencieux = false;
     let mut index_adresses = false;
+    let mut elaguer = false;
     let mut reseau_impose: Option<Network> = None;
     let mut sans_amorces = false;
     let mut adopter_empreinte: Option<String> = None;
@@ -3176,6 +3221,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // sait lesquelles. Voir `q21_core::index`.
             "--index-adresses" => {
                 index_adresses = true;
+                i += 1;
+            }
+            // L'elagage garde sur disque ce que le noeud peut encore relire —
+            // la fenetre de reorganisation et celle de l'historique — et
+            // resume le reste dans l'instantane. Voir `elaguer_si_utile`.
+            "--elaguer" => {
+                elaguer = true;
                 i += 1;
             }
             // Un noeud d'amorcage n'a pas de portefeuille : il faut donc lui
@@ -3280,6 +3332,16 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // les sorties consommees, donc plus de disque et une nouvelle facon de se
     // tromper. Reconstruire coute le prix d'un balayage — celui que le
     // portefeuille paie deja — et ne peut pas mentir.
+    // Un noeud elague ne peut pas servir d'explorateur : l'index d'adresses
+    // et la recherche renvoient a des corps qu'il n'a plus. On refuse au
+    // demarrage, plutot que de servir des reponses trouees.
+    if elaguer && (index_adresses || rpc_public.is_some()) {
+        return Err(
+            "--elaguer ne se combine ni avec --index-adresses ni avec --rpc-public : \
+                    un explorateur doit garder toute l'histoire."
+                .into(),
+        );
+    }
     let index = if index_adresses {
         let mut i = q21_core::index::Index::ouvrir(&chemin_index(datadir));
         let (hauteur, id_sommet) = node.with_chain(|c| (c.height(), c.active_at(c.height())));
@@ -3596,6 +3658,18 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // raison de reecrire cent mega-octets identiques toutes les cinq minutes,
     // et une carte SD de Raspberry a un nombre d'ecritures compte.
     let mut hauteur_instantane: Option<u64> = None;
+    // Hauteur de la tete au dernier elagage : on ne reecrit pas le fichier
+    // toutes les cinq minutes pour quelques blocs.
+    let mut derniere_hauteur_elaguee: u64 = 0;
+    if elaguer {
+        let p = q21_core::elagage::POLITIQUE_DEFAUT;
+        println!(
+            "  elagage actif : le disque ne garde que les {} derniers corps \
+             (environ {} jours), le reste se resume dans l'instantane",
+            p.corps_conserves,
+            p.corps_conserves * q21_core::consensus::TARGET_BLOCK_SECS / 86_400
+        );
+    }
 
     loop {
         if duree > 0 && debut.elapsed().as_secs() >= duree {
@@ -3608,6 +3682,16 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 if hauteur_instantane != Some(i.height) {
                     ecrire_instantane_pris(datadir, &i);
                     hauteur_instantane = Some(i.height);
+                    if elaguer {
+                        elaguer_si_utile(
+                            datadir,
+                            reseau,
+                            &node,
+                            archive.as_ref(),
+                            i.height,
+                            &mut derniere_hauteur_elaguee,
+                        );
+                    }
                 }
             }
             dernier_instantane = std::time::Instant::now();
