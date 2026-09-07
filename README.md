@@ -596,4 +596,12 @@ ce nom se tait, la chaîne continue sans lui.
 
 ---
 
+Une faille — dans la preuve de travail, dans le consensus, dans le
+portefeuille — se signale à l'adresse ci-dessous, de préférence avant d'être
+publiée. Il n'y a ni prime, ni contrat, ni délai imposé : seulement une réponse,
+un correctif, et une épreuve de non-régression qui portera votre trouvaille.
+
+---
+
 **Rei Asanoha** — septembre 2026
+<reiasanoha@posteo.net>
