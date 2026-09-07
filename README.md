@@ -604,4 +604,4 @@ un correctif, et une épreuve de non-régression qui portera votre trouvaille.
 ---
 
 **Rei Asanoha** — septembre 2026
-<reiasanoha@posteo.net>
+<reiasanoha@tutanota.com>
