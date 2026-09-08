@@ -300,13 +300,29 @@ function retenirJeton(v){
   try { if (v) sessionStorage.setItem(CLEF_SESSION, v); } catch (e) {}
 }
 
+// Ce que le lanceur met dans le fragment est une amorce a usage unique, pas le
+// jeton : l'adresse passe par la ligne de commande du navigateur, lisible par
+// d'autres comptes. La page l'echange contre le jeton de session, et les
+// appels attendent que ce soit fait. Si l'echange echoue — lien deja servi —
+// le 401 qui suit ouvre le panneau de saisie, comme pour une ouverture a la
+// main.
+let echange = null;
+
+async function echangerAmorce(amorce){
+  try {
+    const r = await fetch("/session", {method:"POST",
+      headers:{"Content-Type":"application/json", "Authorization":"Bearer " + amorce}});
+    if (r.ok){ const d = await r.json(); retenirJeton(d.jeton); }
+  } catch (e) {}
+}
+
 (function lireJeton(){
   const f = location.hash.slice(1);
   if (f && !f.startsWith("/")){
     // On efface aussitot : une capture d'ecran ou un partage d'onglet ne
     // doivent pas emporter le secret.
     history.replaceState(null, "", location.pathname + "#/");
-    retenirJeton(decodeURIComponent(f));
+    echange = echangerAmorce(decodeURIComponent(f));
     return;
   }
   try { const g = sessionStorage.getItem(CLEF_SESSION); if (g) jeton = g; } catch (e) {}
@@ -340,6 +356,7 @@ function demanderJeton(){
 }
 
 async function appel(methode, params){
+  if (echange){ await echange; echange = null; }
   const r = await fetch(RPC, {
     method:"POST",
     headers: entetes(),
@@ -913,6 +930,26 @@ mod tests {
         // Et le fragment est efface aussitot lu : une capture d'ecran ou un
         // partage d'onglet ne doivent pas emporter le secret.
         assert!(PAGE.contains("history.replaceState"));
+    }
+
+    /// Le fragment est une amorce a usage unique, echangee avant tout appel.
+    ///
+    /// Meme regle que pour le portefeuille : ce que le lanceur met dans
+    /// l'adresse passe par la ligne de commande du navigateur, et ne doit
+    /// donc valoir qu'une fois.
+    #[test]
+    fn le_fragment_est_une_amorce_echangee_avant_tout_appel() {
+        assert!(PAGE.contains("echange = echangerAmorce(decodeURIComponent(f));"));
+        assert!(!PAGE.contains("retenirJeton(decodeURIComponent(f));"));
+        assert!(PAGE.contains("fetch(\"/session\""));
+        let attente = PAGE
+            .find("if (echange){ await echange; echange = null; }")
+            .expect("attente");
+        let appel = PAGE.find("async function appel(").expect("appel");
+        assert!(
+            attente > appel && attente - appel < 80,
+            "l'attente doit ouvrir `appel`"
+        );
     }
 
     /// Le jeton se demande dans la page, pas par une fenetre du navigateur.

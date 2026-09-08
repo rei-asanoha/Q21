@@ -113,12 +113,16 @@ Le reste est dans `SERVEUR.md` : compte dédié, unité durcie, clé SSH,
 
 Deux points viennent de l'audit :
 
-- **Les recherches coûteuses sont budgétées.** Une recherche de montant ou de
-  transaction sans résultat d'index relit jusqu'à deux mille blocs sous le
-  verrou de la chaîne. En mode public, le nœud n'en accorde qu'un nombre
-  borné par minute, toutes requêtes confondues ; au-delà, il répond de
-  réessayer, et continue de valider. Un mandataire peut ajouter une limite
-  par adresse ; ce n'est plus indispensable.
+- **Les recherches coûteuses sont budgétées, par adresse.** Une recherche de
+  montant ou de transaction sans résultat d'index relit jusqu'à deux mille
+  blocs sous le verrou de la chaîne. En mode public, le nœud n'en accorde
+  qu'un nombre borné par minute **à chaque adresse** que le portier lui
+  transmet, plus un filet pour l'ensemble ; au-delà, il répond de réessayer,
+  et continue de valider. Le premier budget était commun à tous : un seul
+  visiteur le vidait pour tout le monde. Le portier, lui, doit borner les
+  connexions par adresse — `EXPLORATEUR-PUBLIC.md`, étape 4.2 bis — parce
+  que le nœud ne borne que ce qu'on lui fait calculer, pas ce qu'on lui fait
+  attendre.
 - **La veille ne partage rien.** Son fichier d'état vit dans un répertoire
   que systemd crée pour elle seule, et son sujet de notification dans un
   fichier à `root` seul. Voir `SERVEUR.md`, « Être prévenu sans regarder ».
@@ -127,18 +131,33 @@ Deux points viennent de l'audit :
 
 ## Le portefeuille sur un poste partagé
 
-Le portefeuille écoute sur la boucle locale et exige un jeton. Ce jeton
-voyage dans l'adresse que le programme donne au navigateur — et cette
-adresse passe par la ligne de commande du lanceur, que **tout compte de la
-machine** peut lire sous Linux (`/proc/<pid>/cmdline`).
+Le portefeuille écoute sur la boucle locale et exige un jeton. L'adresse que
+le programme donne au navigateur passe par la ligne de commande du lanceur,
+que **tout compte de la machine** peut lire — `/proc/<pid>/cmdline` sous
+Linux, `ps` sous macOS — et qui y reste tant que le navigateur vit.
 
-Depuis cet audit, sous Linux, le nœud demande au noyau **quel compte** tient
-l'autre bout de chaque connexion locale, et refuse tout compte autre que le
-sien : un jeton lu ailleurs ne sert plus à rien. Sur macOS et Windows, cette
-information n'est pas disponible de la même façon : le jeton reste la seule
-barrière, et la règle est celle de tout logiciel qui garde des clés — **un
-compte par personne, et pas de portefeuille sur un poste où d'autres ont un
-compte**.
+Deux défenses, indépendantes :
+
+- **Ce qui est dans l'adresse ne vaut qu'une fois.** Le fragment ne porte
+  plus le jeton de session, mais un jeton d'*amorçage* : la page l'échange
+  au premier chargement contre le vrai jeton, qui ne quitte jamais le
+  programme ni l'onglet, et l'amorce est détruite. Elle expire d'elle-même
+  au bout de dix minutes si personne ne l'a ouverte. Ce qui traîne ensuite
+  dans la ligne de commande n'ouvre plus rien, sur tous les systèmes. Un
+  autre compte qui l'aurait lue avant la page ne gagne qu'une course d'une
+  seconde — et s'il la gagne, la page légitime affiche « ce lien a déjà
+  servi » au lieu de fonctionner à côté d'un intrus silencieux.
+- **Sous Linux, le nœud refuse les autres comptes.** Il demande au noyau
+  quel compte tient l'autre bout de chaque connexion locale, et refuse tout
+  compte autre que le sien — ce qui ferme aussi la course ci-dessus. Cette
+  garde est fermée : une connexion locale que la table du noyau ne liste pas
+  est refusée, elle n'est plus admise « dans le doute ». Elle ne s'ouvre que
+  là où il n'y a rien à lire — macOS, Windows —, et le programme le dit à
+  l'écran.
+
+Sur macOS et Windows, le lien à usage unique est donc la barrière, et la
+règle reste celle de tout logiciel qui garde des clés — **un compte par
+personne, et pas de portefeuille sur un poste où d'autres ont un compte**.
 
 ---
 

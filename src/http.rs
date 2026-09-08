@@ -54,6 +54,16 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// un refus franc vaut mieux qu'un fil de plus.
 pub const MAX_CONNEXIONS: usize = 64;
 
+/// Duree de validite d'un jeton d'amorcage qui n'a pas encore servi.
+///
+/// Il ne vit que le temps d'ouvrir une page. Dix minutes couvrent le cas de
+/// celui qui recopie l'adresse a la main depuis le terminal ; au-dela, ce qui
+/// traine dans la ligne de commande d'un navigateur n'ouvre plus rien.
+pub const AMORCE_VALIDITE: Duration = Duration::from_secs(10 * 60);
+
+/// Chemin de l'echange du jeton d'amorcage contre le jeton de session.
+pub const CHEMIN_SESSION: &str = "/session";
+
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
@@ -61,7 +71,72 @@ pub struct Request {
     pub query: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
     pub body: String,
+    /// L'adresse du client, telle que le serveur peut la connaitre.
+    ///
+    /// Celle de la connexion TCP — sauf derriere le mandataire local, ou c'est
+    /// la premiere adresse de `X-Forwarded-For`. Voir [`adresse_client`]. Elle
+    /// sert a ce que le budget d'un client ne soit pas celui de tous.
+    pub client: Option<IpAddr>,
 }
+
+/// L'adresse du client d'une requete.
+///
+/// # Pourquoi l'en-tete n'est cru que depuis la boucle locale
+///
+/// En mode public, le noeud n'ecoute que sur la boucle locale et c'est le
+/// mandataire qui lui parle : toutes les connexions viennent de `127.0.0.1`,
+/// et sans l'en-tete `X-Forwarded-For` que le mandataire pose, tous les
+/// visiteurs seraient un seul et meme client. On lit donc la **premiere**
+/// adresse de cet en-tete — celle du client, le mandataire ayant efface ce
+/// qu'il aurait pu recevoir avant de poser la sienne.
+///
+/// Un `X-Forwarded-For` qui arrive d'ailleurs que de la boucle locale n'est
+/// pas celui du mandataire : c'est un client qui l'ecrit lui-meme. Le croire
+/// laisserait ce client choisir son identite, donc son budget, et en changer a
+/// chaque requete. On garde alors l'adresse de la connexion, et rien d'autre.
+///
+/// Une valeur illisible ne fait pas echouer la requete : on retombe sur
+/// l'adresse de la connexion, et le client est traite avec le mandataire.
+pub fn adresse_client(pair: Option<IpAddr>, headers: &BTreeMap<String, String>) -> Option<IpAddr> {
+    let pair = pair?;
+    if !pair.is_loopback() {
+        return Some(pair);
+    }
+    let Some(transmis) = headers.get("x-forwarded-for") else {
+        return Some(pair);
+    };
+    let premier = transmis.split(',').next().unwrap_or("").trim();
+    match premier.parse::<IpAddr>() {
+        Ok(ip) => Some(ip),
+        Err(_) => Some(pair),
+    }
+}
+
+/// Un jeton d'amorcage : echange **une seule fois** contre le jeton de session.
+///
+/// # Ce que cela ferme
+///
+/// Le lanceur ouvre le navigateur sur une adresse dont le fragment porte un
+/// secret. Cette adresse est passee au lanceur en **argument de ligne de
+/// commande** — lisible par tout compte de la machine dans `/proc/<pid>/cmdline`
+/// sous Linux, par `ps` sous macOS — et elle y reste tant que le processus du
+/// navigateur vit. Sous Linux, la garde de `/proc/net/tcp` refuse les autres
+/// comptes ; ailleurs, ce secret etait la seule barriere, et il valait pour
+/// toute la session.
+///
+/// Le fragment ne porte donc plus le jeton de session. Il porte ce jeton-ci,
+/// court, que la page echange au premier chargement contre le vrai jeton par
+/// un `POST` — puis il est detruit. Ce qui traine ensuite dans `argv` ne vaut
+/// plus rien. Un autre compte qui l'aurait lu avant la page ne gagne qu'une
+/// course d'une seconde ; s'il la gagne, la page legitime echoue a s'ouvrir et
+/// le dit, au lieu de fonctionner a cote d'un intrus silencieux.
+struct Amorce {
+    secret: String,
+    nee: std::time::Instant,
+}
+
+/// Une amorce configuree, consommee ou non. `None` a l'interieur : deja servie.
+type AmorcePartagee = Arc<std::sync::Mutex<Option<Amorce>>>;
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -227,7 +302,33 @@ pub fn serve_avec_public<F>(
 where
     F: Fn(Request) -> Response + Send + Sync + 'static,
 {
-    serve_complet(adresse, token, chemins_publics, None, handler)
+    serve_complet(adresse, token, chemins_publics, None, None, handler)
+}
+
+/// Comme [`serve_avec_public`], avec un jeton d'amorcage a usage unique.
+///
+/// `amorce` est ce que le lanceur met dans l'adresse ouverte par le navigateur.
+/// La page l'echange contre `token` par un `POST` sur [`CHEMIN_SESSION`], une
+/// seule fois et dans les [`AMORCE_VALIDITE`] ; voir [`Amorce`] pour ce que
+/// cela ferme. `token` reste le seul jeton qui ouvre quoi que ce soit d'autre.
+pub fn serve_avec_amorce<F>(
+    adresse: &str,
+    token: String,
+    amorce: String,
+    chemins_publics: &'static [&'static str],
+    handler: F,
+) -> Result<ServerHandle, HttpError>
+where
+    F: Fn(Request) -> Response + Send + Sync + 'static,
+{
+    serve_complet(
+        adresse,
+        Some(token),
+        chemins_publics,
+        None,
+        Some(amorce),
+        handler,
+    )
 }
 
 /// Comme [`serve_avec_public`], mais pour un service **destine a etre public**.
@@ -259,7 +360,7 @@ pub fn serve_public_web<F>(
 where
     F: Fn(Request) -> Response + Send + Sync + 'static,
 {
-    serve_complet(adresse, None, &[], Some(hote_public), handler)
+    serve_complet(adresse, None, &[], Some(hote_public), None, handler)
 }
 
 fn serve_complet<F>(
@@ -267,6 +368,7 @@ fn serve_complet<F>(
     token: Option<String>,
     chemins_publics: &'static [&'static str],
     hote_public: Option<String>,
+    amorce: Option<String>,
     handler: F,
 ) -> Result<ServerHandle, HttpError>
 where
@@ -302,6 +404,12 @@ where
     let arret_fil = arret.clone();
     let handler = Arc::new(handler);
     let token = Arc::new(token);
+    let amorce: Option<AmorcePartagee> = amorce.map(|secret| {
+        Arc::new(std::sync::Mutex::new(Some(Amorce {
+            secret,
+            nee: std::time::Instant::now(),
+        })))
+    });
     // Compteur de connexions en cours : sans lui, une connexion valait un fil
     // systeme, sans plafond.
     let en_cours = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -317,23 +425,22 @@ where
             };
             // --- Defense : un autre compte de la meme machine.
             //
-            // Le jeton voyage dans le fragment de l'adresse ouverte par le
-            // navigateur — et cette adresse est passee au lanceur en argument
-            // de ligne de commande, que tout compte de la machine peut lire
-            // dans `/proc/<pid>/cmdline`. Un jeton lu la suffisait, depuis un
-            // client non navigateur, a deplacer les fonds. Sur Linux, on
-            // demande donc au noyau **qui** tient l'autre bout de la
-            // connexion locale, et on refuse tout compte autre que le notre.
-            // Le mode public, servi par un mandataire sous un autre compte,
-            // n'est pas concerne : il n'a pas de portefeuille.
-            if hote.is_none() && !autre_compte_admis(&flux) {
-                let _ = flux.set_write_timeout(Some(Duration::from_secs(2)));
-                let _ = ecrire_reponse(
-                    &mut flux,
-                    &Response::text(403, "connexion depuis un autre compte de cette machine : refusee"),
-                );
-                let _ = flux.shutdown(std::net::Shutdown::Both);
-                continue;
+            // L'adresse ouverte par le navigateur est passee au lanceur en
+            // argument de ligne de commande, que tout compte de la machine
+            // peut lire dans `/proc/<pid>/cmdline`. Le jeton d'amorcage a
+            // usage unique (voir `Amorce`) rend cette lecture inutile apres
+            // la premiere ouverture ; cette garde-ci ferme aussi la course
+            // d'avant. Sur Linux, on demande au noyau **qui** tient l'autre
+            // bout de la connexion locale, et on refuse tout compte autre que
+            // le notre. Le mode public, servi par un mandataire sous un autre
+            // compte, n'est pas concerne : il n'a pas de portefeuille.
+            if hote.is_none() {
+                if let Err(raison) = autre_compte_admis(&flux) {
+                    let _ = flux.set_write_timeout(Some(Duration::from_secs(2)));
+                    let _ = ecrire_reponse(&mut flux, &Response::text(403, raison));
+                    let _ = flux.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
             }
             if en_cours.load(Ordering::Relaxed) >= MAX_CONNEXIONS {
                 // Refus franc, sans fil : le client sait a quoi s'en tenir et le
@@ -351,6 +458,7 @@ where
             let c = en_cours.clone();
             let pubs = chemins_publics;
             let hp = hote.clone();
+            let am = amorce.clone();
             c.fetch_add(1, Ordering::Relaxed);
             let lance = std::thread::Builder::new().spawn(move || {
                 // Le delai de lecture ne doit pas pouvoir survivre a l'echeance
@@ -358,7 +466,14 @@ where
                 // meme qu'on la consulte.
                 let _ = flux.set_read_timeout(Some(REQUEST_TIMEOUT));
                 let _ = flux.set_write_timeout(Some(READ_TIMEOUT));
-                traiter_connexion(flux, &*h, t.as_ref().as_deref(), pubs, hp.as_deref());
+                traiter_connexion(
+                    flux,
+                    &*h,
+                    t.as_ref().as_deref(),
+                    pubs,
+                    hp.as_deref(),
+                    am.as_ref(),
+                );
                 c.fetch_sub(1, Ordering::Relaxed);
             });
             if lance.is_err() {
@@ -370,21 +485,60 @@ where
     Ok(ServerHandle { addr: local, arret })
 }
 
+/// Ce que le noyau sait du compte qui tient l'autre bout d'une connexion.
+#[derive(Debug, PartialEq, Eq)]
+enum Proprietaire {
+    /// Le compte designe par la table des sockets.
+    Compte(u32),
+    /// La table a ete lue, et la connexion n'y figure pas.
+    Absent,
+    /// Aucune table lisible : autre systeme, ou `/proc` inaccessible.
+    Inconnu,
+}
+
 /// La connexion locale vient-elle de notre propre compte ?
 ///
-/// Rend `true` quand on ne peut pas le savoir — autre systeme, `/proc`
-/// absent, connexion non locale — pour ne jamais fermer la porte par erreur ;
-/// `false` seulement quand le noyau designe clairement un autre compte.
-fn autre_compte_admis(flux: &TcpStream) -> bool {
+/// # Ferme quand on sait, ouvert seulement quand on ne peut pas savoir
+///
+/// Trois reponses, et trois verdicts distincts :
+///
+/// - le noyau designe un compte : on l'admet s'il est le notre, et lui seul ;
+/// - la table des sockets se lit mais **ne contient pas** cette connexion :
+///   on refuse. La premiere version admettait ce cas, par crainte de fermer
+///   la porte par erreur. Mais une connexion de bouclage que la table du
+///   noyau ne liste pas n'a pas d'explication legitime — les deux bouts sont
+///   dans le meme espace de noms reseau que nous —, et un « je ne trouve
+///   pas » qui vaut « entrez » est une garde qu'un defaut d'analyse suffit a
+///   desarmer sans qu'aucune epreuve le voie ;
+/// - aucune table n'est lisible — macOS, Windows, un `/proc` masque : on
+///   admet, parce qu'il n'y a rien a lire et que refuser rendrait le
+///   portefeuille inutilisable. Sur ces systemes, le jeton d'amorcage a usage
+///   unique est la barriere, et le lanceur le dit.
+///
+/// Une connexion qui ne vient pas de la boucle locale n'est pas concernee :
+/// ce n'est pas un autre compte de cette machine, et c'est le jeton qui la
+/// garde.
+fn autre_compte_admis(flux: &TcpStream) -> Result<(), &'static str> {
     let (Ok(local), Ok(distant)) = (flux.local_addr(), flux.peer_addr()) else {
-        return true;
+        return Ok(());
     };
     if !distant.ip().is_loopback() {
-        return true;
+        return Ok(());
     }
-    match proprietaire_de_la_connexion(local, distant) {
-        Some(uid) => uid == compte_courant(),
-        None => true,
+    verdict(proprietaire_de_la_connexion(local, distant))
+}
+
+/// Le verdict de la garde, separe de la lecture pour etre eprouve seul.
+fn verdict(p: Proprietaire) -> Result<(), &'static str> {
+    match p {
+        Proprietaire::Compte(uid) if uid == compte_courant() => Ok(()),
+        Proprietaire::Compte(_) => {
+            Err("connexion depuis un autre compte de cette machine : refusee")
+        }
+        Proprietaire::Absent => {
+            Err("connexion locale que le noyau n'attribue a aucun compte : refusee")
+        }
+        Proprietaire::Inconnu => Ok(()),
     }
 }
 
@@ -407,7 +561,25 @@ fn compte_courant() -> u32 {
 /// pour adresse locale `distant` (ce que nous voyons comme pair) et pour
 /// adresse distante `local` (notre port d'ecoute).
 #[cfg(target_os = "linux")]
-fn proprietaire_de_la_connexion(local: SocketAddr, distant: SocketAddr) -> Option<u32> {
+fn proprietaire_de_la_connexion(local: SocketAddr, distant: SocketAddr) -> Proprietaire {
+    let fichier = if distant.is_ipv4() {
+        "/proc/net/tcp"
+    } else {
+        "/proc/net/tcp6"
+    };
+    match std::fs::read_to_string(fichier) {
+        Ok(contenu) => proprietaire_dans(&contenu, local, distant),
+        Err(_) => Proprietaire::Inconnu,
+    }
+}
+
+/// Cherche la socket cliente dans le contenu d'une table `/proc/net/tcp*`.
+///
+/// Separe de la lecture du fichier pour que l'epreuve puisse presenter une
+/// table qui ne contient pas la connexion — ce qu'on ne peut pas provoquer
+/// avec une vraie socket.
+#[cfg(target_os = "linux")]
+fn proprietaire_dans(contenu: &str, local: SocketAddr, distant: SocketAddr) -> Proprietaire {
     fn hex_de(a: &SocketAddr) -> Option<String> {
         match a {
             SocketAddr::V4(v) => {
@@ -434,32 +606,35 @@ fn proprietaire_de_la_connexion(local: SocketAddr, distant: SocketAddr) -> Optio
             }
         }
     }
-    let fichier = if distant.is_ipv4() {
-        "/proc/net/tcp"
-    } else {
-        "/proc/net/tcp6"
+    let (Some(cherche_local), Some(cherche_distant)) = (hex_de(&distant), hex_de(&local)) else {
+        return Proprietaire::Inconnu;
     };
-    let contenu = std::fs::read_to_string(fichier).ok()?;
-    let cherche_local = hex_de(&distant)?;
-    let cherche_distant = hex_de(&local)?;
     for ligne in contenu.lines().skip(1) {
         let mut champs = ligne.split_whitespace();
-        let _sl = champs.next()?;
-        let adr_locale = champs.next()?;
-        let adr_distante = champs.next()?;
+        let (Some(_sl), Some(adr_locale), Some(adr_distante)) =
+            (champs.next(), champs.next(), champs.next())
+        else {
+            continue;
+        };
         if adr_locale != cherche_local || adr_distante != cherche_distant {
             continue;
         }
         // st tx_queue:rx_queue tr:tm->when retrnsmt uid ...
-        let uid = champs.nth(4)?;
-        return uid.parse().ok();
+        return match champs.nth(4).and_then(|u| u.parse().ok()) {
+            Some(uid) => Proprietaire::Compte(uid),
+            // La ligne est la mais son compte est illisible : la table etait
+            // lisible et n'attribue cette connexion a personne. On refuse,
+            // comme pour une ligne absente — la garde ne s'ouvre pas sur un
+            // defaut d'analyse.
+            None => Proprietaire::Absent,
+        };
     }
-    None
+    Proprietaire::Absent
 }
 
 #[cfg(not(target_os = "linux"))]
-fn proprietaire_de_la_connexion(_local: SocketAddr, _distant: SocketAddr) -> Option<u32> {
-    None
+fn proprietaire_de_la_connexion(_local: SocketAddr, _distant: SocketAddr) -> Proprietaire {
+    Proprietaire::Inconnu
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -481,10 +656,67 @@ mod compte_local {
                 serveur.local_addr().unwrap(),
                 serveur.peer_addr().unwrap(),
             );
-            assert_eq!(uid, Some(compte_courant()), "sur {ecoute}");
-            assert!(autre_compte_admis(&serveur));
+            assert_eq!(uid, Proprietaire::Compte(compte_courant()), "sur {ecoute}");
+            assert!(autre_compte_admis(&serveur).is_ok());
             drop(client);
         }
+    }
+
+    /// Une connexion locale que la table du noyau ne liste pas est refusee.
+    ///
+    /// La garde admettait ce cas : « on ne trouve pas » valait « entrez ».
+    /// Une table lisible qui ne contient pas la connexion n'a pas
+    /// d'explication legitime, et une garde qui s'ouvre sur un defaut
+    /// d'analyse n'en est pas une.
+    #[test]
+    fn une_connexion_locale_absente_de_proc_est_refusee() {
+        let local: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let distant: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        // Le vrai fichier, avec un 4-uplet qui n'y est pas.
+        assert_eq!(
+            proprietaire_de_la_connexion(local, distant),
+            Proprietaire::Absent
+        );
+        assert!(verdict(Proprietaire::Absent).is_err());
+
+        // Une table fabriquee : l'en-tete seul, puis une ligne d'une autre
+        // connexion, puis la bonne ligne avec un autre compte, puis le notre.
+        let entete = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let autre = "   0: 0100007F:0003 0100007F:0001 01 00000000:00000000 00:00000000 00000000  1000        0 0 1 0 100 0 0 10 0\n";
+        let bonne = |uid: u32| {
+            format!(
+            "   1: 0100007F:0002 0100007F:0001 01 00000000:00000000 00:00000000 00000000  {uid}        0 0 1 0 100 0 0 10 0\n"
+        )
+        };
+        assert_eq!(
+            proprietaire_dans(entete, local, distant),
+            Proprietaire::Absent
+        );
+        assert_eq!(
+            proprietaire_dans(&format!("{entete}{autre}"), local, distant),
+            Proprietaire::Absent
+        );
+        let etranger = compte_courant().wrapping_add(1);
+        assert_eq!(
+            proprietaire_dans(
+                &format!("{entete}{autre}{}", bonne(etranger)),
+                local,
+                distant
+            ),
+            Proprietaire::Compte(etranger)
+        );
+        assert!(verdict(Proprietaire::Compte(etranger)).is_err());
+        assert_eq!(
+            proprietaire_dans(
+                &format!("{entete}{}", bonne(compte_courant())),
+                local,
+                distant
+            ),
+            Proprietaire::Compte(compte_courant())
+        );
+        assert!(verdict(Proprietaire::Compte(compte_courant())).is_ok());
+        // Sans table du tout, on ne sait pas : c'est le seul cas ouvert.
+        assert!(verdict(Proprietaire::Inconnu).is_ok());
     }
 }
 
@@ -494,14 +726,17 @@ fn traiter_connexion<F>(
     token: Option<&str>,
     chemins_publics: &[&str],
     hote_public: Option<&str>,
+    amorce: Option<&AmorcePartagee>,
 ) where
     F: Fn(Request) -> Response,
 {
     // Echeance globale : la somme des lectures d'une requete est bornee, pas
     // seulement chaque lecture prise a part.
     let echeance = std::time::Instant::now() + REQUEST_TIMEOUT;
+    let pair = flux.peer_addr().ok().map(|a| a.ip());
     let reponse = match lire_requete(&flux, echeance) {
-        Ok(req) => {
+        Ok(mut req) => {
+            req.client = adresse_client(pair, &req.headers);
             let libre = chemins_publics.contains(&req.path.as_str());
             // Une coquille statique demandee en GET est une page vide de
             // donnees et sans effet. Elle seule tolere qu'on y arrive depuis un
@@ -509,6 +744,12 @@ fn traiter_connexion<F>(
             let coquille = libre && req.method == "GET";
             match garde_navigateur(&req, coquille, hote_public) {
                 Some(raison) => Response::text(403, raison),
+                // L'echange d'amorce est servi ici, avant le jeton : c'est
+                // lui qui le donne. Il passe la garde du navigateur comme
+                // tout POST, et n'est jamais un chemin public.
+                None if req.method == "POST" && req.path == CHEMIN_SESSION && amorce.is_some() => {
+                    echanger_amorce(&req, token, amorce)
+                }
                 None => {
                     if let Some(attendu) = token.filter(|_| !libre) {
                         if !autorise(&req, attendu) {
@@ -526,6 +767,54 @@ fn traiter_connexion<F>(
     };
     let _ = ecrire_reponse(&mut flux, &reponse);
     let _ = flux.shutdown(std::net::Shutdown::Both);
+}
+
+/// Echange le jeton d'amorcage contre le jeton de session, une seule fois.
+///
+/// L'amorce arrive en `Authorization: Bearer`, comme un jeton — c'est ce que
+/// la page sait envoyer. Elle est retiree de sa case **avant** que la reponse
+/// parte : deux echanges concurrents ne peuvent pas reussir tous les deux, la
+/// case est sous verrou. Une amorce perimee est retiree de meme, sans avoir
+/// servi. Tout refus a la meme forme : un `401` sans detail, parce que dire
+/// « deja servie » a qui ne devrait pas la connaitre reviendrait a lui
+/// confirmer qu'elle a existe.
+fn echanger_amorce(
+    req: &Request,
+    token: Option<&str>,
+    amorce: Option<&AmorcePartagee>,
+) -> Response {
+    let refus = || Response::text(401, "jeton d'amorcage invalide, deja servi ou perime");
+    let (Some(token), Some(case)) = (token, amorce) else {
+        return refus();
+    };
+    let Some(presente) = req
+        .headers
+        .get("authorization")
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .map(|v| v.trim().to_string())
+    else {
+        return refus();
+    };
+    let Ok(mut garde) = case.lock() else {
+        return refus();
+    };
+    let Some(a) = garde.as_ref() else {
+        return refus();
+    };
+    if a.nee.elapsed() > AMORCE_VALIDITE {
+        *garde = None;
+        return refus();
+    }
+    if !egal_temps_constant(&presente, &a.secret) {
+        return refus();
+    }
+    *garde = None;
+    Response::json(
+        crate::json::Json::obj()
+            .set("jeton", crate::json::Json::str(token))
+            .build()
+            .encode(),
+    )
 }
 
 /// Refuse ce qu'un navigateur ne devrait jamais pouvoir envoyer ici.
@@ -857,6 +1146,8 @@ fn lire_requete(flux: &TcpStream, echeance: std::time::Instant) -> Result<Reques
         query,
         headers,
         body,
+        // Pose par l'appelant, qui seul connait la connexion.
+        client: None,
     })
 }
 
@@ -1607,6 +1898,132 @@ mod tests {
         let r = get(h.addr, "/j");
         assert!(r.contains("script-src 'none'"), "{r}");
         assert!(!r.contains("nonce-"), "{r}");
+        h.shutdown();
+    }
+
+    /// L'adresse du client vient de la connexion — sauf derriere le
+    /// mandataire local, ou elle vient de `X-Forwarded-For`. Un
+    /// `X-Forwarded-For` qui n'arrive pas de la boucle locale est un client
+    /// qui se deguise : il est ignore.
+    #[test]
+    fn l_adresse_du_client_ne_se_forge_pas() {
+        let bouclage: IpAddr = "127.0.0.1".parse().unwrap();
+        let lointain: IpAddr = "203.0.113.9".parse().unwrap();
+        let visiteur: IpAddr = "198.51.100.7".parse().unwrap();
+        let mut h = BTreeMap::new();
+
+        // Sans en-tete : l'adresse de la connexion, quelle qu'elle soit.
+        assert_eq!(adresse_client(Some(bouclage), &h), Some(bouclage));
+        assert_eq!(adresse_client(Some(lointain), &h), Some(lointain));
+        assert_eq!(adresse_client(None, &h), None);
+
+        // Depuis la boucle locale, l'en-tete est celui du mandataire : on lit
+        // la premiere adresse, meme si une chaine suit.
+        h.insert("x-forwarded-for".into(), "198.51.100.7, 10.0.0.1".into());
+        assert_eq!(adresse_client(Some(bouclage), &h), Some(visiteur));
+
+        // Depuis ailleurs, le meme en-tete est une forgerie : ignore.
+        assert_eq!(adresse_client(Some(lointain), &h), Some(lointain));
+
+        // Illisible : on retombe sur la connexion, sans echouer.
+        h.insert("x-forwarded-for".into(), "pas-une-adresse".into());
+        assert_eq!(adresse_client(Some(bouclage), &h), Some(bouclage));
+    }
+
+    /// Le serveur pose `client` sur la requete qu'il transmet, d'apres la
+    /// connexion et l'en-tete du mandataire — et l'en-tete n'est lu que sur
+    /// une connexion locale, ce qui est le cas de toutes celles d'ici.
+    #[test]
+    fn la_requete_transmise_porte_l_adresse_du_client() {
+        let h = serve("127.0.0.1:0", None, |r: Request| {
+            Response::text(200, &format!("client={:?}", r.client))
+        })
+        .expect("demarrage");
+        let r = get(h.addr, "/x");
+        assert!(r.contains("client=Some(127.0.0.1)"), "{r}");
+        let r = requete(
+            h.addr,
+            "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Forwarded-For: 198.51.100.7\r\n\
+             Connection: close\r\n\r\n",
+        );
+        assert!(r.contains("client=Some(198.51.100.7)"), "{r}");
+        h.shutdown();
+    }
+
+    /// Le jeton d'amorcage s'echange une fois, puis ne vaut plus rien.
+    ///
+    /// C'est ce qui ferme A2 hors Linux : ce qui traine dans la ligne de
+    /// commande du navigateur est l'amorce, pas le jeton de session, et
+    /// apres la premiere ouverture elle n'ouvre plus rien — ni le RPC, ni un
+    /// second echange.
+    #[test]
+    fn le_jeton_d_amorcage_ne_sert_qu_une_fois() {
+        let h = serve_avec_amorce(
+            "127.0.0.1:0",
+            "jeton-de-session".into(),
+            "am0rce".into(),
+            &["/portefeuille"],
+            echo(),
+        )
+        .expect("demarrage");
+        let bearer = |methode: &str, chemin: &str, secret: &str| {
+            requete(
+                h.addr,
+                &format!(
+                    "{methode} {chemin} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                     Content-Type: application/json\r\nContent-Length: 0\r\n\
+                     Authorization: Bearer {secret}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+        };
+
+        // 1. L'amorce n'ouvre rien d'autre que l'echange.
+        let r = bearer("POST", "/rpc", "am0rce");
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+
+        // 2. Une amorce fausse n'obtient rien.
+        let r = bearer("POST", CHEMIN_SESSION, "am0rcf");
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+
+        // 3. L'echange rend le jeton de session, une fois.
+        let r = bearer("POST", CHEMIN_SESSION, "am0rce");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(r.contains(r#"{"jeton":"jeton-de-session"}"#), "{r}");
+
+        // 4. Ce qui etait dans argv ne vaut plus rien : ni un second echange,
+        //    ni le RPC.
+        let r = bearer("POST", CHEMIN_SESSION, "am0rce");
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+        let r = bearer("POST", "/rpc", "am0rce");
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+
+        // 5. Le jeton de session, lui, ouvre le RPC — et n'est pas une amorce.
+        let r = bearer("POST", "/rpc", "jeton-de-session");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let r = bearer("POST", CHEMIN_SESSION, "jeton-de-session");
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+
+        // 6. L'echange est un POST JSON comme un autre : la garde du
+        //    navigateur s'y applique.
+        let r = requete(
+            h.addr,
+            &format!(
+                "POST {CHEMIN_SESSION} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Origin: http://mechant.example\r\nContent-Type: application/json\r\n\
+                 Content-Length: 0\r\nAuthorization: Bearer am0rce\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        h.shutdown();
+    }
+
+    /// Sans amorce configuree, le chemin d'echange n'existe pas : il tombe
+    /// sur le jeton, puis sur le routeur, comme n'importe quel chemin.
+    #[test]
+    fn sans_amorce_le_chemin_d_echange_n_est_qu_un_chemin() {
+        let h = serve("127.0.0.1:0", Some("s".into()), echo()).expect("demarrage");
+        let r = post(h.addr, CHEMIN_SESSION, "{}");
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
         h.shutdown();
     }
 }

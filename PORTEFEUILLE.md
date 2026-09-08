@@ -54,6 +54,14 @@ navigateur le garde pour lui. La page le lit, l'efface aussitôt de la barre
 d'adresse, et l'envoie ensuite en `Authorization`. Il ne laisse aucune trace
 ailleurs que dans la mémoire de l'onglet.
 
+Ce fragment n'est pas le jeton lui-même. L'adresse passe par la ligne de
+commande du lanceur de navigateur, que d'autres comptes de la machine peuvent
+lire ; ce qui s'y trouve est donc un **jeton d'amorçage à usage unique**, que
+la page échange au chargement contre le jeton de session, et que le nœud
+détruit aussitôt. Ouvert une seconde fois, le lien ne donne rien : relancez
+le programme pour en obtenir un neuf. Voir `DURCISSEMENT.md`, « Le
+portefeuille sur un poste partagé ».
+
 Ni `localStorage`, ni cookie : les deux survivent à la fermeture du navigateur, et
 un jeton qui survit à la session qu'il ouvrait est un jeton de trop. Le jeton vit
 dans une variable JavaScript, doublée de `sessionStorage` — cloisonné par port,

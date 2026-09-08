@@ -40,12 +40,18 @@
 //! Ce qui est fait pour reduire la surface :
 //!
 //! - le serveur n'ecoute que sur la boucle locale, et exige le jeton de la
-//!   session pour tout ce qui n'est pas la coquille HTML ;
+//!   session pour tout ce qui n'est pas la coquille HTML ; ce jeton n'est
+//!   jamais dans l'adresse ouverte par le navigateur — celle-ci porte une
+//!   amorce a usage unique, echangee au chargement (voir
+//!   `http::serve_avec_amorce`) ;
 //! - la phrase ne part qu'en corps de requete `POST`, jamais dans une adresse ;
 //! - la page interdit `localStorage`, `sessionStorage`, les cookies : rien de ce
 //!   qu'elle manipule ne survit a l'onglet ;
 //! - les champs portent `autocomplete="off"`, pour que le gestionnaire de mots
 //!   de passe du navigateur ne propose pas d'enregistrer la phrase ;
+//! - le code de sauvegarde ne s'affiche qu'a l'ecran, pour etre recopie sur
+//!   papier : aucun bouton ne l'envoie au presse-papier, dont l'historique
+//!   survit a la page et se synchronise parfois entre appareils ;
 //! - le code de sauvegarde est efface de la page des qu'il a ete confirme.
 //!
 //! Ce qui ne serait resolu que par une vraie fenetre native, avec une
@@ -172,11 +178,8 @@ button:focus-visible{outline:3px solid var(--accent-fond);outline-offset:1px}
 /* --- Le code de sauvegarde -------------------------------------------- */
 .code{background:var(--fond);border:1.5px dashed var(--bord-fort);border-radius:9px;
   padding:1.1rem;margin:1rem 0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  font-size:1.02rem;line-height:1.75;word-break:break-all;letter-spacing:.02em;
-  -webkit-user-select:all;user-select:all}
+  font-size:1.02rem;line-height:1.75;word-break:break-all;letter-spacing:.02em}
 .code b{color:var(--accent);font-weight:600}
-.sous-code{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;
-  font-size:.82rem;color:var(--tenu)}
 
 /* --- Divers ----------------------------------------------------------- */
 .coche{display:flex;gap:.6rem;align-items:flex-start;margin:1.1rem 0;
@@ -207,7 +210,7 @@ button:focus-visible{outline:3px solid var(--accent-fond);outline-offset:1px}
 // Ce qui transite ici est la phrase secrete et la graine ; rien de tout cela ne
 // doit pouvoir etre relu apres la fermeture de l'onglet.
 
-var JETON = "", ETAT = null, PHRASE = null, CODE = null;
+var JETON = "", AMORCE = "", ETAT = null, PHRASE = null, CODE = null;
 
 function $(id){ return document.getElementById(id); }
 function ech(s){
@@ -216,12 +219,25 @@ function ech(s){
   });
 }
 
-// Le jeton arrive dans le fragment. Il en est efface aussitot : un secret dans
-// une barre d'adresse est un secret qu'on peut photographier.
+// Le fragment porte une amorce, pas le jeton : l'adresse est passee au
+// navigateur en argument de ligne de commande, que d'autres comptes de la
+// machine peuvent lire. L'amorce s'echange une fois contre le jeton de
+// session, puis ne vaut plus rien. Elle est effacee de la barre d'adresse
+// aussitot lue : un secret qu'on peut photographier n'en est plus un.
 (function(){
   var f = location.hash.slice(1);
-  if(f){ JETON = f; history.replaceState(null, "", location.pathname); }
+  if(f){ AMORCE = f; history.replaceState(null, "", location.pathname); }
 })();
+
+function echanger(){
+  return fetch("/session", {
+    method: "POST",
+    headers: {"Content-Type":"application/json","Authorization":"Bearer " + AMORCE}
+  }).then(function(r){
+    if(!r.ok) throw new Error("lien déjà servi ou expiré");
+    return r.json();
+  }).then(function(d){ JETON = d.jeton; AMORCE = ""; });
+}
 
 function appel(m, p){
   return fetch("/installation", {
@@ -436,19 +452,11 @@ function ecranCode(code, adresse){
   + 'disparaît. Il ne sera plus jamais affiché.</p>'
   + '<div class="code" id="lecode">' + ech(code.slice(0, m)) + '<br>'
   + ech(code.slice(m)) + '</div>'
-  + '<div class="sous-code"><button class="lien" id="copier">Copier dans le presse-papier</button>'
-  + '<span id="copie"></span></div>'
-  + '<div class="note avert"><p><b>Le papier vaut mieux que l\'écran.</b> Un fichier '
-  + 'sur cette machine disparaît avec elle, et un fichier dans un nuage se lit à '
-  + 'distance. Ce code donne les fonds à qui le détient.</p></div>'
+  + '<div class="note avert"><p><b>Sur papier, à la main, et nulle part ailleurs.</b> '
+  + 'Un fichier sur cette machine disparaît avec elle, un fichier dans un nuage se lit '
+  + 'à distance, et le presse-papier garde un historique — parfois synchronisé entre '
+  + 'vos appareils. Ce code donne les fonds à qui le détient.</p></div>'
   + '<div class="actions"><button class="p" id="suite">Je l\'ai recopié</button></div>';
-  $("copier").onclick = function(){
-    navigator.clipboard.writeText(code).then(function(){
-      $("copie").textContent = "copié — pensez à vider le presse-papier ensuite";
-    }).catch(function(){
-      $("copie").textContent = "copie refusée par le navigateur — recopiez à la main";
-    });
-  };
   $("suite").onclick = function(){ ecranVerif(code, adresse); };
 }
 
@@ -478,9 +486,9 @@ function ecranRetrouve(code, adresse){
 // --- Ecran : verification de la recopie ---------------------------------
 //
 // Demander de retaper le code entier serait plus sur, et personne ne le ferait :
-// on cliquerait « copier », on collerait, et la verification n'aurait rien
-// verifie. Les huit derniers caracteres suffisent a prouver qu'on a la feuille
-// sous les yeux, et se retapent sans lassitude.
+// on le selectionnerait a l'ecran, on le collerait, et la verification n'aurait
+// rien verifie. Les huit derniers caracteres suffisent a prouver qu'on a la
+// feuille sous les yeux, et se retapent sans lassitude.
 function ecranVerif(code, adresse){
   fil(etapes(false), 1);
   var n = 8, fin = code.slice(-n);
@@ -558,7 +566,10 @@ function termine(adresse){
   + '<div class="attente"><span class="rotor"></span>'
   + '<span id="ou">Démarrage du nœud…</span></div>';
 
-  var cible = "http://127.0.0.1:" + ETAT.port_noeud + "/portefeuille#" + JETON;
+  // Le nœud a sa propre amorce, recue par `etat` : c'est elle qui va dans le
+  // fragment, jamais le jeton de session. La page du portefeuille l'echangera
+  // a son tour, une fois.
+  var cible = "http://127.0.0.1:" + ETAT.port_noeud + "/portefeuille#" + ETAT.amorce_noeud;
 
   // --- Pourquoi on ne sonde pas le nœud directement.
   //
@@ -620,14 +631,23 @@ function demarrer(){
   });
 }
 
-if(!JETON){
+function lienInutilisable(titre, texte){
   fil(null);
   $("carte").innerHTML =
-    '<div class="marque">Q21</div><h1>Jeton manquant</h1>'
-  + '<p>Cette page s\'ouvre depuis le programme, avec un jeton dans l\'adresse. '
-  + 'Fermez cet onglet et relancez le portefeuille.</p>';
+    '<div class="marque">Q21</div><h1>' + ech(titre) + '</h1>'
+  + '<p>' + ech(texte) + ' Fermez cet onglet et relancez le portefeuille.</p>';
+}
+
+if(!AMORCE){
+  lienInutilisable("Jeton manquant",
+    "Cette page s'ouvre depuis le programme, avec un jeton dans l'adresse.");
 }else{
-  demarrer();
+  // L'amorce ne vaut qu'une fois : si l'echange echoue, c'est que ce lien a
+  // deja servi — ou qu'il a expire. Recommencer ne servirait a rien, on le dit.
+  echanger().then(demarrer).catch(function(){
+    lienInutilisable("Ce lien a déjà servi",
+      "Le lien d'ouverture ne vaut qu'une fois, et il a été utilisé — ou il a expiré.");
+  });
 }
 </script>
 </body>
@@ -734,6 +754,48 @@ mod tests {
         // verification existe, et le bouton final en depend.
         assert!(script().contains("function ecranVerif"));
         assert!(script().contains("code.slice(-n)"));
+    }
+
+    /// Le code de sauvegarde ne part jamais dans le presse-papier.
+    ///
+    /// Un bouton « Copier » l'y envoyait, avec le conseil de le vider ensuite.
+    /// Vider le presse-papier courant ne retire rien de son historique —
+    /// Win+V, Klipper, le presse-papier universel d'Apple — ni de ce que le
+    /// « presse-papier dans le nuage » de Windows a deja synchronise. La page
+    /// dit « sur papier » ; un bouton qui la contredisait n'existe plus.
+    #[test]
+    fn le_code_de_sauvegarde_ne_passe_pas_par_le_presse_papier() {
+        assert!(
+            !PAGE.contains("clipboard"),
+            "la page ecrit dans le presse-papier"
+        );
+        assert!(!PAGE.contains("execCommand"), "copie par l'ancienne API");
+        // Et la consigne reste : sur papier, et rien d'autre.
+        assert!(script().contains("Sur papier"));
+        assert!(script().contains("presse-papier garde un historique"));
+    }
+
+    /// Le fragment porte une amorce, echangee une fois contre le jeton.
+    ///
+    /// L'adresse ouverte par le lanceur passe par la ligne de commande du
+    /// navigateur ; ce qu'elle porte ne doit valoir qu'une fois. La page
+    /// n'appelle rien avant l'echange, et renvoie vers le nœud avec l'amorce
+    /// du nœud, jamais avec le jeton de session.
+    #[test]
+    fn le_fragment_est_une_amorce_echangee_avant_tout_appel() {
+        let s = script();
+        assert!(
+            s.contains("AMORCE = f;"),
+            "le fragment doit etre lu comme amorce"
+        );
+        assert!(
+            !s.contains("JETON = f;"),
+            "le fragment ne doit plus etre le jeton"
+        );
+        assert!(s.contains("fetch(\"/session\""));
+        assert!(s.contains("echanger().then(demarrer)"));
+        assert!(s.contains("/portefeuille#\" + ETAT.amorce_noeud"));
+        assert!(!s.contains("/portefeuille#\" + JETON"));
     }
 
     #[test]

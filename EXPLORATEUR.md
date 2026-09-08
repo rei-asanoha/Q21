@@ -118,10 +118,14 @@ tronqué, octet modifié, hauteurs qui sautent, réorganisation.
 
 ## Le jeton, et le fragment qu'il partage avec le routage
 
-Le nœud exige un jeton sur toute méthode RPC. Il arrive dans le **fragment** de
-l'adresse — ce qui suit le `#` — que le navigateur ne transmet jamais au
-serveur. La page le lit, l'efface aussitôt de la barre d'adresse, et l'envoie
-ensuite en `Authorization: Bearer`.
+Le nœud exige un jeton sur toute méthode RPC. Le lanceur met dans le
+**fragment** de l'adresse — ce qui suit le `#`, que le navigateur ne transmet
+jamais au serveur — un jeton d'amorçage à usage unique ; la page l'efface
+aussitôt de la barre d'adresse, l'échange contre le jeton de session, et
+envoie ensuite celui-ci en `Authorization: Bearer`. Le lien ne vaut donc
+qu'une fois — c'est voulu, l'adresse passe par la ligne de commande du
+navigateur, lisible par d'autres comptes. Sans lanceur (`q21 node
+--rpc-token`), la page demande le jeton dans un champ.
 
 Ce même fragment sert au routage des quatre vues. Les deux ne se confondent
 pas : **une route commence toujours par une barre oblique, un jeton jamais.**

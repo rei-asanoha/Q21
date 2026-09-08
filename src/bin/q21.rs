@@ -787,6 +787,30 @@ fn retenir_phrase(p: Option<String>) {
     *PHRASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.map(Secret));
 }
 
+/// Le jeton d'amorcage du serveur du noeud, quand un lanceur en a tire un.
+///
+/// # Pourquoi il ne passe pas par les arguments de `cmd_node`
+///
+/// Le lanceur (`wallet`, `explorer`) ouvre le navigateur sur une adresse dont
+/// le fragment est ce jeton, puis appelle `cmd_node` dans le meme processus.
+/// Il aurait pu le lui passer en pseudo-argument, comme le jeton de session ;
+/// mais un pseudo-argument devient un jour un vrai argument documente, et un
+/// jeton d'amorcage qu'on peut fournir soi-meme sur une ligne de commande
+/// n'a plus de sens — il existe precisement pour ne jamais y figurer. Il vit
+/// donc ici, pose une fois avant le demarrage, lu une fois au montage du
+/// serveur. Voir `q21_core::http::serve_avec_amorce`.
+static AMORCE_NOEUD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Un jeton d'amorcage : seize octets du generateur, en hexadecimal.
+///
+/// Il ne vaut qu'une fois et dix minutes ; seize octets suffisent a ce qu'on
+/// ne le devine pas dans ce delai, et il reste court dans un terminal.
+fn tirer_amorce() -> Result<String, String> {
+    let brut: [u8; 16] = q21_core::rng::octets()
+        .map_err(|_| "generateur d'alea du systeme inaccessible".to_string())?;
+    Ok(brut.iter().map(|o| format!("{o:02x}")).collect())
+}
+
 /// Oublie la phrase retenue, sans decider qu'il n'y en a pas.
 ///
 /// Sert au seul cas ou une phrase s'est revelee fausse : on revient a l'etat
@@ -3718,12 +3742,25 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 servir(&ctx, req, true)
             })
             .map_err(|e| e.to_string())?,
-            None => {
-                q21_core::http::serve_avec_public(adresse, rpc_token.clone(), PUBLICS, move |req| {
-                    servir(&ctx, req, false)
-                })
-                .map_err(|e| e.to_string())?
-            }
+            // Lance par `wallet` ou `explorer` : le navigateur a recu un
+            // jeton d'amorcage, pas le jeton de session. Le serveur
+            // l'echange une fois, puis il ne vaut plus rien.
+            None => match (rpc_token.clone(), AMORCE_NOEUD.get()) {
+                (Some(jeton), Some(amorce)) => q21_core::http::serve_avec_amorce(
+                    adresse,
+                    jeton,
+                    amorce.clone(),
+                    PUBLICS,
+                    move |req| servir(&ctx, req, false),
+                )
+                .map_err(|e| e.to_string())?,
+                (jeton, _) => {
+                    q21_core::http::serve_avec_public(adresse, jeton, PUBLICS, move |req| {
+                        servir(&ctx, req, false)
+                    })
+                    .map_err(|e| e.to_string())?
+                }
+            },
         };
 
         // En mode silencieux, le lanceur a deja tout dit : repeter l'adresse et
@@ -4228,7 +4265,10 @@ fn servir(
         ("GET", "/portefeuille") | ("GET", "/portefeuille.html") if !public => {
             Response::html(q21_core::wallet_ui::PAGE.to_string())
         }
-        ("POST", "/rpc") => Response::json(ctx.handle(&req.body)),
+        // L'adresse du client suit la requete : en mode public, c'est elle
+        // qui donne a chacun son budget de balayages au lieu d'un seul pour
+        // tous. Elle n'est ni journalisee ni rendue.
+        ("POST", "/rpc") => Response::json(ctx.handle_de(&req.body, req.client)),
         ("GET", "/rpc") => Response::text(
             405,
             "L'API JSON-RPC attend une requete POST. Exemple :\n\n  \
@@ -4268,6 +4308,17 @@ fn servir(
 /// navigateur le garde pour lui. La page le lit, l'efface aussitot de la barre
 /// d'adresse, et l'envoie ensuite en `Authorization`. Il ne laisse donc aucune
 /// trace ailleurs que dans la memoire de l'onglet.
+///
+/// # Ce que le fragment porte, et pourquoi ce n'est plus le jeton
+///
+/// L'adresse est passee au lanceur de navigateur en **argument**, que tout
+/// compte de la machine peut lire dans `/proc/<pid>/cmdline` ou par `ps`, et
+/// qui y reste tant que le navigateur vit. Le fragment porte donc un jeton
+/// d'**amorcage**, court et a usage unique : la page l'echange au chargement
+/// contre le jeton de session, qui ne quitte jamais le processus ni l'onglet.
+/// Ce qui traine ensuite dans `argv` n'ouvre plus rien. Sous Linux, le noeud
+/// refuse de surcroit les connexions d'un autre compte ; ailleurs, l'amorce
+/// est la barriere, et le lanceur le dit.
 fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut port: u16 = 0;
     let mut sans_navigateur = false;
@@ -4319,6 +4370,14 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         .map_err(|_| "generateur d'alea du systeme inaccessible".to_string())?;
     let jeton: String = brut.iter().map(|o| format!("{o:02x}")).collect();
 
+    // 2 bis. Le jeton d'amorcage du noeud : c'est lui, et non le jeton de
+    //    session, qui va dans l'adresse ouverte par le navigateur — donc dans
+    //    la ligne de commande du lanceur, lisible par d'autres comptes. La
+    //    page l'echange une fois contre le jeton de session ; ce qui traine
+    //    ensuite dans `argv` n'ouvre plus rien. Voir `http::serve_avec_amorce`.
+    let amorce_noeud = tirer_amorce()?;
+    let _ = AMORCE_NOEUD.set(amorce_noeud.clone());
+
     // 3. L'installation, si le portefeuille n'existe pas encore ou s'il est
     //    scelle et qu'aucune phrase n'a ete fournie autrement.
     //
@@ -4334,7 +4393,14 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     let installation_necessaire = !existe || (scelle && !phrase_deja_fournie);
 
     if installation_necessaire {
-        installer(datadir, &jeton, port, sans_navigateur, existe && scelle)?;
+        installer(
+            datadir,
+            &jeton,
+            &amorce_noeud,
+            port,
+            sans_navigateur,
+            existe && scelle,
+        )?;
     }
 
     // 4. Le portefeuille se lit maintenant sans rien demander : ou bien
@@ -4343,7 +4409,7 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     lire_portefeuille(datadir)?;
 
     let adresse = format!("127.0.0.1:{port}");
-    let url = format!("http://{adresse}/portefeuille#{jeton}");
+    let url = format!("http://{adresse}/portefeuille#{amorce_noeud}");
 
     println!();
 
@@ -4362,9 +4428,24 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     println!();
     println!("      {url}");
     println!();
-    println!("  Le jeton est apres le « # ». Il n'est jamais envoye au serveur");
-    println!("  dans l'adresse : le navigateur le garde, la page le lit, puis");
-    println!("  l'efface de la barre d'adresse.");
+    // --- Ce qui suit le « # » n'est plus le jeton de session.
+    //
+    // C'est un jeton d'amorcage : la page l'echange une fois contre le vrai,
+    // et il est detruit. Le dire evite qu'on le recopie en croyant garder une
+    // clef, et explique le refus quand on ouvre le lien une seconde fois.
+    println!("  Ce lien ne sert qu'une fois : la page qu'il ouvre echange ce qui");
+    println!("  suit le « # » contre le jeton de la session, puis il ne vaut plus");
+    println!("  rien. Pour ouvrir le portefeuille ailleurs, relancez le programme.");
+    if !cfg!(target_os = "linux") {
+        // Sur Linux, le noyau dit quel compte tient chaque connexion locale
+        // et le noeud refuse les autres. Ici, cette information n'existe pas :
+        // le lien a usage unique est la barriere, et il faut le savoir.
+        println!();
+        println!("  Sur ce systeme, le noeud ne peut pas savoir quel compte de la");
+        println!("  machine se connecte a lui : le lien a usage unique est la seule");
+        println!("  barriere. N'ouvrez pas ce portefeuille sur un poste ou d'autres");
+        println!("  personnes ont un compte.");
+    }
     println!();
 
     // Le navigateur est deja ouvert si l'installation vient de le faire : la
@@ -4445,6 +4526,7 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
 fn installer(
     datadir: &Path,
     jeton: &str,
+    amorce_noeud: &str,
     port_noeud: u16,
     sans_navigateur: bool,
     scelle: bool,
@@ -4475,11 +4557,19 @@ fn installer(
     // commande, ou vont ceux qui en ont besoin.
     let reseau = Network::Testnet;
 
+    let amorce_noeud_page = amorce_noeud.to_string();
     let repondre = move |req: q21_core::http::Request| -> Response {
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/bienvenue") => Response::html(q21_core::installation::PAGE.to_string()),
             ("POST", "/installation") => {
-                let r = traiter_installation(&datadir, reseau, port_noeud, &req.body, &fini_h);
+                let r = traiter_installation(
+                    &datadir,
+                    reseau,
+                    port_noeud,
+                    &amorce_noeud_page,
+                    &req.body,
+                    &fini_h,
+                );
                 Response::json(r.encode())
             }
             _ => Response::not_found(),
@@ -4490,14 +4580,24 @@ fn installer(
     // pas se charger pour en demander un. Elle ne porte aucune donnee : c'est
     // la meme regle que pour l'explorateur, et la liste reste nommee chemin par
     // chemin.
-    let serveur = q21_core::http::serve_avec_public(
+    //
+    // Ce serveur a son propre jeton d'amorcage : c'est lui qui va dans
+    // l'adresse ouverte par le navigateur, et la page l'echange une fois
+    // contre le jeton de session. Celui du noeud, la page le recevra par
+    // `etat`, une fois authentifiee, pour y renvoyer a la fin.
+    let amorce_installation = tirer_amorce()?;
+    let serveur = q21_core::http::serve_avec_amorce(
         "127.0.0.1:0",
-        Some(jeton.to_string()),
+        jeton.to_string(),
+        amorce_installation.clone(),
         &["/bienvenue"],
         repondre,
     )
     .map_err(|e| format!("le serveur d'installation n'a pas demarre : {e:?}"))?;
-    let url = format!("http://127.0.0.1:{}/bienvenue#{jeton}", serveur.addr.port());
+    let url = format!(
+        "http://127.0.0.1:{}/bienvenue#{amorce_installation}",
+        serveur.addr.port()
+    );
 
     if scelle {
         println!("  Ce portefeuille est protege par une phrase secrete.");
@@ -4554,6 +4654,7 @@ fn traiter_installation(
     datadir: &Path,
     reseau: Network,
     port_noeud: u16,
+    amorce_noeud: &str,
     corps: &str,
     fini: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> q21_core::json::Json {
@@ -4591,6 +4692,10 @@ fn traiter_installation(
                 .set("portefeuille", Json::str(quoi))
                 .set("reseau", Json::str(nom_de_reseau(reseau)))
                 .set("port_noeud", Json::u64(port_noeud as u64))
+                // Le jeton d'amorcage du noeud, pour y renvoyer a la fin. Il
+                // n'est rendu qu'ici, a une page qui a deja prouve qu'elle
+                // tenait le jeton de session ; il ne vaudra qu'une fois.
+                .set("amorce_noeud", Json::str(amorce_noeud))
                 .build()
         }
 
@@ -4849,15 +4954,20 @@ fn cmd_explorateur(datadir: &Path, args: &[String]) -> Result<(), String> {
     let brut: [u8; 32] = q21_core::rng::octets()
         .map_err(|_| "generateur d'alea du systeme inaccessible".to_string())?;
     let jeton: String = brut.iter().map(|o| format!("{o:02x}")).collect();
+    // Meme regle que pour le portefeuille : le navigateur recoit un jeton
+    // d'amorcage a usage unique, jamais le jeton de session.
+    let amorce = tirer_amorce()?;
+    let _ = AMORCE_NOEUD.set(amorce.clone());
     let adresse = format!("127.0.0.1:{port}");
-    let url = format!("http://{adresse}/#{jeton}");
+    let url = format!("http://{adresse}/#{amorce}");
 
     println!();
     println!("  Si le navigateur ne s'ouvre pas, ouvrez cette adresse :");
     println!();
     println!("      {url}");
     println!();
-    println!("  Aucune methode de portefeuille n'est servie par ce processus.");
+    println!("  Ce lien ne sert qu'une fois. Aucune methode de portefeuille n'est");
+    println!("  servie par ce processus.");
     println!();
 
     if !sans_navigateur {

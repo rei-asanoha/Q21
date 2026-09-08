@@ -234,8 +234,8 @@ pub struct RpcContext {
     pub balayages: Option<Arc<Mutex<SeauBalayages>>>,
 }
 
-/// Balayages de chaine qu'un service public accorde, toutes requetes
-/// confondues.
+/// Balayages de chaine qu'un service public accorde : un budget **par
+/// client**, et un filet pour l'ensemble.
 ///
 /// # Le defaut que ceci ferme
 ///
@@ -244,20 +244,101 @@ pub struct RpcContext {
 /// **sous le verrou global** — celui qui sert a valider les blocs. En mode
 /// public, ces methodes repondent sans jeton, et un lot en autorise cent :
 /// un visiteur anonyme, en boucle sur des identifiants inexistants, gelait
-/// la validation du seul point d'entree public. Le mandataire peut limiter
-/// le debit par adresse ; le noeud, lui, ne connait pas l'adresse derriere
-/// le mandataire. Il borne donc le total : une reserve, puis un debit
-/// soutenu. Au-dela, la reponse dit de reessayer — et le noeud, lui,
-/// continue de valider.
+/// la validation du seul point d'entree public.
+///
+/// # Ce que la premiere version ne fermait pas
+///
+/// Elle bornait le total, toutes requetes confondues, parce que le noeud ne
+/// voyait que le mandataire. Un seul visiteur vidait donc la reserve en une
+/// requete, et **tous les autres** lisaient « reessayez dans une minute » —
+/// un deni de service de la recherche, anonyme et gratuit, qui remplacait le
+/// gel de la validation par une privation de tout le monde.
+///
+/// Le mandataire connait l'adresse du client et la transmet ; le serveur
+/// HTTP la pose sur la requete (voir `http::adresse_client`, qui ne croit
+/// l'en-tete que depuis la boucle locale). Chaque client a donc sa reserve
+/// et son regain, dans une table bornee ou le plus ancien cede sa place. Le
+/// seau global demeure, plus large, en filet : contre mille adresses qui
+/// s'y mettent ensemble, il borne encore ce que le verrou subit, et le
+/// noeud continue de valider.
+///
+/// Un client sans adresse connue — un appel direct sans serveur HTTP — ne
+/// passe que par le filet.
 pub struct SeauBalayages {
+    global: Seau,
+    clients: Vec<(ClefClient, Seau, std::time::Instant)>,
+}
+
+/// Un seau a jetons : une reserve, un regain.
+struct Seau {
     jetons: u32,
     dernier: std::time::Instant,
 }
 
-/// Balayages accordes d'emblee.
+/// Balayages accordes d'emblee a chaque client.
 pub const BALAYAGES_RESERVE: u32 = 30;
-/// Balayages regagnes par minute.
+/// Balayages regagnes par minute, par client.
 pub const BALAYAGES_PAR_MINUTE: u32 = 12;
+/// Reserve du filet global : cinq clients pleins d'un coup.
+pub const BALAYAGES_GLOBAL_RESERVE: u32 = 150;
+/// Regain du filet global par minute : un balayage par seconde, soutenu.
+pub const BALAYAGES_GLOBAL_PAR_MINUTE: u32 = 60;
+/// Clients suivis a la fois. Au-dela, le moins recemment vu cede sa place —
+/// il repart alors avec une reserve neuve, ce qui ne coute rien au filet.
+pub const MAX_CLIENTS_SUIVIS: usize = 1024;
+
+/// Ce qui identifie un client dans la table.
+///
+/// Une adresse IPv4 telle quelle. Une adresse IPv6 ramenee a son `/64` : un
+/// abonne en recoit un entier, et compter chacune de ses 2^64 adresses pour
+/// un client different lui donnerait autant de reserves. Une IPv4 portee en
+/// IPv6 (`::ffff:a.b.c.d`) est ramenee a l'IPv4.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClefClient {
+    V4(std::net::Ipv4Addr),
+    V6([u8; 8]),
+}
+
+impl ClefClient {
+    fn de(ip: std::net::IpAddr) -> ClefClient {
+        match ip {
+            std::net::IpAddr::V4(a) => ClefClient::V4(a),
+            std::net::IpAddr::V6(a) => match a.to_ipv4_mapped() {
+                Some(v4) => ClefClient::V4(v4),
+                None => {
+                    let o = a.octets();
+                    let mut p = [0u8; 8];
+                    p.copy_from_slice(&o[..8]);
+                    ClefClient::V6(p)
+                }
+            },
+        }
+    }
+}
+
+impl Seau {
+    fn plein(reserve: u32, maintenant: std::time::Instant) -> Seau {
+        Seau {
+            jetons: reserve,
+            dernier: maintenant,
+        }
+    }
+
+    fn autoriser(&mut self, reserve: u32, par_minute: u32, maintenant: std::time::Instant) -> bool {
+        let ecoule = maintenant.saturating_duration_since(self.dernier).as_secs();
+        let gain = (ecoule.min(u32::MAX as u64) as u32).saturating_mul(par_minute) / 60;
+        if gain > 0 {
+            self.jetons = self.jetons.saturating_add(gain).min(reserve);
+            self.dernier = maintenant;
+        }
+        if self.jetons > 0 {
+            self.jetons -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 impl Default for SeauBalayages {
     fn default() -> Self {
@@ -268,25 +349,61 @@ impl Default for SeauBalayages {
 impl SeauBalayages {
     pub fn new() -> SeauBalayages {
         SeauBalayages {
-            jetons: BALAYAGES_RESERVE,
-            dernier: std::time::Instant::now(),
+            global: Seau::plein(BALAYAGES_GLOBAL_RESERVE, std::time::Instant::now()),
+            clients: Vec::new(),
         }
     }
 
-    /// Accorde un balayage, ou non.
-    pub fn autoriser(&mut self, maintenant: std::time::Instant) -> bool {
-        let ecoule = maintenant.saturating_duration_since(self.dernier).as_secs();
-        let gain = (ecoule as u32).saturating_mul(BALAYAGES_PAR_MINUTE) / 60;
-        if gain > 0 {
-            self.jetons = self.jetons.saturating_add(gain).min(BALAYAGES_RESERVE);
-            self.dernier = maintenant;
+    /// Accorde un balayage a ce client, ou non.
+    ///
+    /// Le seau du client est consulte d'abord : un client a sec est refuse
+    /// sans toucher au filet, pour qu'il ne le vide pas pour les autres. Le
+    /// filet n'est debite que d'un balayage qui va reellement avoir lieu.
+    pub fn autoriser(
+        &mut self,
+        client: Option<std::net::IpAddr>,
+        maintenant: std::time::Instant,
+    ) -> bool {
+        if let Some(ip) = client {
+            if !self.autoriser_client(ClefClient::de(ip), maintenant) {
+                return false;
+            }
         }
-        if self.jetons > 0 {
-            self.jetons -= 1;
-            true
-        } else {
-            false
+        self.global.autoriser(
+            BALAYAGES_GLOBAL_RESERVE,
+            BALAYAGES_GLOBAL_PAR_MINUTE,
+            maintenant,
+        )
+    }
+
+    fn autoriser_client(&mut self, clef: ClefClient, maintenant: std::time::Instant) -> bool {
+        if let Some(entree) = self.clients.iter_mut().find(|(c, _, _)| *c == clef) {
+            entree.2 = maintenant;
+            return entree
+                .1
+                .autoriser(BALAYAGES_RESERVE, BALAYAGES_PAR_MINUTE, maintenant);
         }
+        if self.clients.len() >= MAX_CLIENTS_SUIVIS {
+            // Le moins recemment vu s'en va. Une table pleine de clients
+            // actifs reste bornee : c'est le filet qui tient alors.
+            if let Some((i, _)) = self
+                .clients
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, vu))| *vu)
+            {
+                self.clients.swap_remove(i);
+            }
+        }
+        let mut seau = Seau::plein(BALAYAGES_RESERVE, maintenant);
+        let accorde = seau.autoriser(BALAYAGES_RESERVE, BALAYAGES_PAR_MINUTE, maintenant);
+        self.clients.push((clef, seau, maintenant));
+        accorde
+    }
+
+    /// Nombre de clients suivis en ce moment. Pour les epreuves.
+    pub fn clients_suivis(&self) -> usize {
+        self.clients.len()
     }
 }
 
@@ -304,15 +421,15 @@ impl RpcContext {
         }
     }
 
-    /// Un balayage de chaine est-il accorde ? Toujours en local ; au budget
-    /// en mode public.
-    fn autoriser_balayage(&self) -> Result<(), Json> {
+    /// Un balayage de chaine est-il accorde a ce client ? Toujours en local ;
+    /// au budget en mode public.
+    fn autoriser_balayage(&self, client: Option<std::net::IpAddr>) -> Result<(), Json> {
         let Some(seau) = &self.balayages else {
             return Ok(());
         };
         let accorde = seau
             .lock()
-            .map(|mut s| s.autoriser(std::time::Instant::now()))
+            .map(|mut s| s.autoriser(client, std::time::Instant::now()))
             .unwrap_or(false);
         if accorde {
             Ok(())
@@ -465,8 +582,18 @@ fn bloc_json(b: &Block, reseau: Network) -> Json {
 }
 
 impl RpcContext {
-    /// Traite un document JSON-RPC et rend la reponse encodee.
+    /// Traite un document JSON-RPC et rend la reponse encodee, sans client
+    /// identifie : en mode public, seul le filet global s'applique alors.
     pub fn handle(&self, corps: &str) -> String {
+        self.handle_de(corps, None)
+    }
+
+    /// Traite un document JSON-RPC venu de `client`, et rend la reponse.
+    ///
+    /// L'adresse ne sert qu'au budget de balayages : elle n'est ni
+    /// journalisee, ni rendue. Le serveur HTTP la fournit (voir
+    /// `http::Request::client`) ; un appel direct passe `None`.
+    pub fn handle_de(&self, corps: &str, client: Option<std::net::IpAddr>) -> String {
         let requete = match parse(corps) {
             Ok(v) => v,
             Err(_) => {
@@ -509,7 +636,7 @@ impl RpcContext {
             let mut reponses: Vec<Json> = Vec::with_capacity(lot.len());
             let mut octets = 0usize;
             for r in lot {
-                let rep = self.une(r);
+                let rep = self.une(r, client);
                 octets += rep.encode().len();
                 if octets > MAX_REPONSE_LOT {
                     reponses.push(
@@ -528,10 +655,10 @@ impl RpcContext {
             }
             return Json::array(reponses).encode();
         }
-        self.une(&requete).encode()
+        self.une(&requete, client).encode()
     }
 
-    fn une(&self, requete: &Json) -> Json {
+    fn une(&self, requete: &Json, client: Option<std::net::IpAddr>) -> Json {
         let id = requete.get("id").cloned().unwrap_or(Json::Null);
         let methode = match requete.get("method").and_then(|m| m.as_str()) {
             Some(m) => m.to_string(),
@@ -545,7 +672,7 @@ impl RpcContext {
         };
         let params = requete.get("params").cloned().unwrap_or(Json::Null);
 
-        match self.dispatch(&methode, &params) {
+        match self.dispatch(&methode, &params, client) {
             Ok(r) => Json::obj()
                 .set("jsonrpc", Json::str("2.0"))
                 .set("id", id)
@@ -643,13 +770,18 @@ impl RpcContext {
         ]
     }
 
-    fn dispatch(&self, methode: &str, params: &Json) -> Result<Json, Json> {
+    fn dispatch(
+        &self,
+        methode: &str,
+        params: &Json,
+        client: Option<std::net::IpAddr>,
+    ) -> Result<Json, Json> {
         match methode {
             "getinfo" => Ok(self.getinfo()),
             "getempreinteutxo" => Ok(self.getempreinteutxo()),
             "getblock" => self.getblock(params, true),
             "getblockheader" => self.getblock(params, false),
-            "gettransaction" => self.gettransaction(params),
+            "gettransaction" => self.gettransaction(params, client),
             "getmempool" => Ok(self.getmempool()),
             "getpeers" => Ok(self.getpeers()),
             "getemission" => self.getemission(params),
@@ -683,8 +815,8 @@ impl RpcContext {
             "setminage" => self.setminage(params),
             "arreter" => self.arreter(),
             "rechercher" => self.rechercher(params),
-            "getadresse" => self.getadresse(params),
-            "getmontant" => self.getmontant(params),
+            "getadresse" => self.getadresse(params, client),
+            "getmontant" => self.getmontant(params, client),
             autre => Err(erreur(
                 ERR_METHODE,
                 &format!("methode inconnue : {autre}. Essayez listmethods."),
@@ -808,7 +940,11 @@ impl RpcContext {
         }
     }
 
-    fn gettransaction(&self, params: &Json) -> Result<Json, Json> {
+    fn gettransaction(
+        &self,
+        params: &Json,
+        client: Option<std::net::IpAddr>,
+    ) -> Result<Json, Json> {
         let txid = params
             .get("txid")
             .and_then(|v| v.as_str())
@@ -845,7 +981,7 @@ impl RpcContext {
         // Sinon, dans la chaine. Balayage arriere : une transaction cherchee
         // est presque toujours recente. Sans index, on reste honnete sur le
         // cout — et sur la borne.
-        self.autoriser_balayage()?;
+        self.autoriser_balayage(client)?;
         let mut fond_atteint = false;
         let trouve = self.node.with_chain(|c| {
             let mut h = c.height() as i64;
@@ -1331,7 +1467,7 @@ impl RpcContext {
     /// balayage borne — et jusqu'ou elle a cherche. Une reponse incomplete qui
     /// se presenterait comme complete serait pire qu'une absence de reponse :
     /// elle ferait conclure a tort qu'une adresse est vide.
-    fn getadresse(&self, params: &Json) -> Result<Json, Json> {
+    fn getadresse(&self, params: &Json, client: Option<std::net::IpAddr>) -> Result<Json, Json> {
         let brut = params
             .get("adresse")
             .and_then(|v| v.as_str())
@@ -1371,7 +1507,7 @@ impl RpcContext {
             }
             None => {
                 // Balayage arriere borne. La reponse le dira.
-                self.autoriser_balayage()?;
+                self.autoriser_balayage(client)?;
                 let plancher = hauteur.saturating_sub(MAX_BLOCS_BALAYES);
                 let v = self.node.with_chain(|c| {
                     let mut v: Vec<(u64, u32)> = Vec::new();
@@ -1495,7 +1631,7 @@ impl RpcContext {
     ///
     /// Les resultats sont plafonnes : personne ne lit mille lignes, et un
     /// plafond protege le service autant que le lecteur.
-    fn getmontant(&self, params: &Json) -> Result<Json, Json> {
+    fn getmontant(&self, params: &Json, client: Option<std::net::IpAddr>) -> Result<Json, Json> {
         const MAX_RESULTATS: usize = 100;
         let unites = params
             .get("unites")
@@ -1508,7 +1644,7 @@ impl RpcContext {
             })
             .ok_or_else(|| erreur(ERR_PARAMS, "parametre 'unites' ou 'montant' attendu"))?;
 
-        self.autoriser_balayage()?;
+        self.autoriser_balayage(client)?;
         let (resultats, hauteur, depuis, plafonne) = self.node.with_chain(|c| {
             let hauteur = c.height();
             let depuis = hauteur.saturating_sub(MAX_BLOCS_BALAYES);
@@ -2889,6 +3025,147 @@ mod tests {
                 == Some(val.as_str())),
             "toutes les sorties rendues doivent valoir exactement le montant cherche"
         );
+    }
+
+    /// Un contexte public : sans portefeuille, avec le budget de balayages.
+    fn contexte_public() -> RpcContext {
+        let mut c = contexte(false);
+        c.balayages = Some(Arc::new(Mutex::new(SeauBalayages::new())));
+        c
+    }
+
+    fn ip(s: &str) -> Option<std::net::IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    fn balayage_refuse(c: &RpcContext, client: Option<std::net::IpAddr>) -> bool {
+        let corps = r#"{"jsonrpc":"2.0","id":1,"method":"getmontant","params":{"montant":"1.0"}}"#;
+        c.handle_de(corps, client).contains("trop de recherches")
+    }
+
+    /// Un client qui vide son budget ne vide pas celui des autres.
+    ///
+    /// Le seau etait unique : un visiteur anonyme en boucle sur `getmontant`
+    /// privait tout l'explorateur public de sa recherche. Chaque adresse a
+    /// maintenant la sienne.
+    #[test]
+    fn un_client_ne_vide_pas_le_seau_des_autres() {
+        let c = contexte_public();
+        let (a, b) = (ip("198.51.100.7"), ip("203.0.113.9"));
+        let mut n = 0;
+        while !balayage_refuse(&c, a) {
+            n += 1;
+            assert!(n <= BALAYAGES_RESERVE, "le client A n'est jamais refuse");
+        }
+        assert_eq!(n, BALAYAGES_RESERVE, "A dispose exactement de sa reserve");
+        // A est a sec ; B n'a rien depense.
+        assert!(!balayage_refuse(&c, b), "B est prive par la boucle de A");
+        // Et A reste a sec : refuser B n'a rien rendu a A.
+        assert!(balayage_refuse(&c, a));
+        // Un lot de A, plein de `getmontant`, ne perce pas davantage.
+        let lot = format!(
+            "[{}]",
+            std::iter::repeat_n(
+                r#"{"jsonrpc":"2.0","id":1,"method":"getmontant","params":{"montant":"1.0"}}"#,
+                MAX_LOT
+            )
+            .collect::<Vec<_>>()
+            .join(",")
+        );
+        let r = c.handle_de(&lot, a);
+        assert_eq!(r.matches("trop de recherches").count(), MAX_LOT);
+        assert!(!balayage_refuse(&c, b), "B est prive par le lot de A");
+    }
+
+    /// Le seau meme : reserve par client, `/64` en IPv6, table bornee avec
+    /// eviction du moins recemment vu, et filet global qui tient seul.
+    #[test]
+    fn le_seau_distingue_les_clients_et_reste_borne() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut s = SeauBalayages::new();
+        let a = ip("198.51.100.7").unwrap();
+        let b = ip("203.0.113.9").unwrap();
+
+        // Chacun sa reserve.
+        for _ in 0..BALAYAGES_RESERVE {
+            assert!(s.autoriser(Some(a), t0));
+        }
+        assert!(!s.autoriser(Some(a), t0));
+        assert!(s.autoriser(Some(b), t0));
+
+        // Le regain est par client : une minute rend a A son quota.
+        let t1 = t0 + Duration::from_secs(60);
+        for _ in 0..BALAYAGES_PAR_MINUTE {
+            assert!(s.autoriser(Some(a), t1));
+        }
+        assert!(!s.autoriser(Some(a), t1));
+
+        // Deux adresses du meme /64 IPv6 partagent un seau ; deux /64
+        // distincts, non.
+        let v6a = ip("2001:db8:1:2::1").unwrap();
+        let v6b = ip("2001:db8:1:2:ffff::9").unwrap();
+        let v6c = ip("2001:db8:1:3::1").unwrap();
+        for _ in 0..BALAYAGES_RESERVE {
+            assert!(s.autoriser(Some(v6a), t1));
+        }
+        assert!(!s.autoriser(Some(v6b), t1), "meme /64 : meme seau");
+        assert!(s.autoriser(Some(v6c), t1), "autre /64 : autre seau");
+        // Une IPv4 portee en IPv6 est l'IPv4.
+        assert!(!s.autoriser(ip("::ffff:198.51.100.7"), t1));
+
+        // La table est bornee : le moins recemment vu s'en va. On parle ici a
+        // la table seule — le filet, plus etroit que la table, refuserait
+        // avant qu'elle soit pleine, et c'est son role.
+        let mut s = SeauBalayages::new();
+        let clef = |ip: std::net::IpAddr| ClefClient::de(ip);
+        for i in 0..MAX_CLIENTS_SUIVIS {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, (i >> 8) as u8, i as u8, 1));
+            assert!(s.autoriser_client(clef(ip), t0 + Duration::from_millis(i as u64)));
+        }
+        assert_eq!(s.clients_suivis(), MAX_CLIENTS_SUIVIS);
+        let premier = ip("10.0.0.1").unwrap();
+        // Le premier venu a deja depense un jeton.
+        assert!(s.autoriser_client(clef(premier), t0));
+        let nouveau = ip("192.0.2.1").unwrap();
+        assert!(s.autoriser_client(clef(nouveau), t0 + Duration::from_secs(1)));
+        assert_eq!(
+            s.clients_suivis(),
+            MAX_CLIENTS_SUIVIS,
+            "la table ne grandit pas"
+        );
+        // Le premier venu, moins recemment vu, est parti : il revient avec une
+        // reserve neuve — la preuve qu'il a bien ete evince.
+        for _ in 0..BALAYAGES_RESERVE {
+            assert!(s.autoriser_client(clef(premier), t0 + Duration::from_secs(1)));
+        }
+        assert!(!s.autoriser_client(clef(premier), t0 + Duration::from_secs(1)));
+
+        // Le filet global tient seul face a des clients toujours nouveaux.
+        let mut s = SeauBalayages::new();
+        let mut accordes = 0u32;
+        for i in 0..(BALAYAGES_GLOBAL_RESERVE + 50) {
+            let ip =
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 16, (i >> 8) as u8, i as u8));
+            if s.autoriser(Some(ip), t0) {
+                accordes += 1;
+            }
+        }
+        assert_eq!(
+            accordes, BALAYAGES_GLOBAL_RESERVE,
+            "le filet doit borner le total"
+        );
+        // Un client sans adresse ne passe que par le filet, deja a sec.
+        assert!(!s.autoriser(None, t0));
+        // Un client a sec ne debite pas le filet : il est refuse avant.
+        let mut s = SeauBalayages::new();
+        for _ in 0..BALAYAGES_RESERVE {
+            assert!(s.autoriser(Some(a), t0));
+        }
+        for _ in 0..1000 {
+            assert!(!s.autoriser(Some(a), t0));
+        }
+        assert!(s.autoriser(Some(b), t0), "les refus de A ont vide le filet");
     }
 
     /// Un seul envoi paie plusieurs destinataires : la transaction porte bien
