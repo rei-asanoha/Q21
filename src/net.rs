@@ -34,7 +34,7 @@ use crate::wire::{
     InvItem, InvKind, Message, WireError, HEADER_LEN, MAX_PAYLOAD, MIN_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -83,12 +83,121 @@ pub const DELAI_CORPS: Duration = Duration::from_secs(60);
 /// Cout d'un corps demande et jamais livre. Deux suffisent a couper.
 pub const MISCONDUCT_CORPS_RETENU: u32 = 50;
 
-/// Connexions entrantes admises depuis un meme groupe reseau (/16).
+/// Corps de blocs qu'on accepte d'avoir demandes a un meme pair sans les
+/// avoir encore recus.
+///
+/// # Le defaut que ceci ferme
+///
+/// La table des corps demandes n'avait pas de plafond : sa seule purge etait
+/// temporelle, a [`DELAI_CORPS`]. Or les en-tetes qui font demander un corps
+/// ne sont verifies qu'en **chainage**, pas en travail — les verifier en
+/// travail sur deux mille en-tetes couterait plus que ce qu'on protege, la
+/// preuve de Q21 etant a cout memoire. Fabriquer hors ligne une suite
+/// d'en-tetes parfaitement chainee sur notre tete ne coute donc rien, et
+/// chaque lot de deux mille faisait inscrire deux mille jetons de plus, sans
+/// borne, pendant la minute que dure le delai de livraison.
+///
+/// La borne de surete de la synchronisation par en-tetes est donc ce plafond,
+/// pas un controle de travail : quoi qu'un pair annonce, il ne nous fait
+/// jamais demander plus de seize corps a la fois. Le reste attend dans une
+/// file, elle-meme bornee ([`CORPS_EN_ATTENTE_MAX`]), et n'est demande qu'a
+/// mesure que les corps arrivent. Seize suffisent a garder une liaison
+/// occupee : un corps demande n'attend jamais le suivant pour partir.
+pub const CORPS_EN_VOL_MAX: usize = 16;
+
+/// Corps de blocs qu'un pair peut nous laisser a demander, en attendant qu'une
+/// place en vol se libere.
+///
+/// Un lot d'en-tetes en contient au plus [`crate::wire::MAX_HEADERS`] ; la
+/// file d'un pair est remplacee a chaque lot, et ne depasse donc jamais un
+/// lot. Ce sont des identifiants, pas des en-tetes : soixante-quatre kibioctets
+/// au plus par pair.
+pub const CORPS_EN_ATTENTE_MAX: usize = crate::wire::MAX_HEADERS;
+
+/// Annonces de blocs compacts non sollicitees qu'un pair peut pousser
+/// d'emblee.
+///
+/// Un pair honnete n'annonce que ce qu'il vient d'accepter : quelques blocs
+/// par minute au plus, et les corps que **nous** lui avons demandes ne sont pas
+/// comptes ici. Huit laissent passer deux blocs trouves coup sur coup et une
+/// petite reorganisation.
+pub const CMPCT_SEAU_MAX: u64 = 8;
+
+/// Debit soutenu d'annonces compactes non sollicitees accorde a un pair, par
+/// seconde.
+///
+/// # Le defaut que ceci ferme
+///
+/// Une annonce compacte dont le parent est connu declenchait, **sous le verrou
+/// global**, un balayage du reservoir avec un SipHash par transaction et une
+/// allocation de la taille annoncee — jusqu'a soixante-cinq mille
+/// emplacements — avant que la moindre verification ne la rejette. `tx` et
+/// l'amorce avaient un seau ; les annonces compactes n'en avaient pas, et rien
+/// ne sanctionnait un pair qui en poussait deux cents a la suite. Un bloc par
+/// seconde en regime soutenu, c'est encore soixante fois la cadence du reseau.
+pub const CMPCT_DEBIT_PAR_SEC: u64 = 1;
+
+/// Cout d'une annonce compacte refusee : au-dela du seau, ou rejetee par la
+/// reconstruction elle-meme (coinbase absente, indice hors du bloc, nombre
+/// absurde de transactions — des formes que seul l'emetteur a pu produire).
+/// Dix suffisent a couper, comme pour les trames illisibles.
+pub const MISCONDUCT_CMPCT_REFUSE: u32 = 10;
+
+/// Connexions entrantes admises depuis un meme groupe reseau (/16 en IPv4,
+/// /64 en IPv6 — voir [`groupe_entrant`]).
 ///
 /// Une seule adresse pouvait occuper les trente-deux places ; quatre par
 /// groupe laissent une machine ou un petit reseau entrer plusieurs fois, sans
 /// qu'une seule plage puisse fermer la porte aux autres.
 pub const ENTRANTS_PAR_GROUPE: usize = 4;
+
+/// Groupe reseau d'une connexion entrante, pour la diversite des places.
+///
+/// Deux familles, deux granularites : en IPv4 le `/16` du carnet, en IPv6 le
+/// `/64` — c'est le prefixe qu'un hebergeur donne a une seule machine, donc
+/// l'unite au-dessous de laquelle des adresses distinctes ne coutent rien.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GroupeReseau {
+    V4([u8; 2]),
+    V6([u8; 8]),
+}
+
+/// Groupe d'une adresse entrante, ou `None` si elle n'en a pas.
+///
+/// # Le defaut que ceci ferme
+///
+/// La diversite de groupe n'etait calculee que pour les adresses IPv4 : toute
+/// connexion IPv6 tombait dans le cas « pas de groupe » et echappait a
+/// [`ENTRANTS_PAR_GROUPE`]. Un seul `/64` — le lot de n'importe quel serveur
+/// loue — pouvait alors occuper toutes les places entrantes, pour peu que le
+/// noeud ecoute en IPv6. Le `/64` est la reponse : c'est l'equivalent admis
+/// du `/16` v4.
+///
+/// Une adresse IPv4 presentee sous sa forme IPv6 (`::ffff:a.b.c.d`, ce que
+/// donne une ecoute sur `[::]`) est rangee avec les IPv4 : la traiter comme un
+/// `/64` mettrait tout l'Internet v4 dans un seul groupe.
+///
+/// La boucle locale n'est pas un groupe : plusieurs noeuds d'une meme machine
+/// (regtest, epreuves) ne s'eclipsent pas entre eux.
+pub fn groupe_entrant(adresse: SocketAddr) -> Option<GroupeReseau> {
+    match adresse {
+        SocketAddr::V4(a) if !a.ip().is_loopback() => {
+            Some(GroupeReseau::V4(crate::addr::groupe(a.ip().octets())))
+        }
+        SocketAddr::V4(_) => None,
+        SocketAddr::V6(a) => match a.ip().to_ipv4_mapped() {
+            Some(v4) if v4.is_loopback() => None,
+            Some(v4) => Some(GroupeReseau::V4(crate::addr::groupe(v4.octets()))),
+            None if a.ip().is_loopback() => None,
+            None => {
+                let o = a.ip().octets();
+                let mut prefixe = [0u8; 8];
+                prefixe.copy_from_slice(&o[..8]);
+                Some(GroupeReseau::V6(prefixe))
+            }
+        },
+    }
+}
 
 /// Delai de lecture. Un pair muet finit par etre libere.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -186,6 +295,14 @@ impl SeauAmorce {
         }
     }
 
+    /// Un seau d'annonces compactes : meme regle, en annonces non sollicitees.
+    pub fn pour_annonces_compactes(maintenant: Instant) -> SeauAmorce {
+        SeauAmorce {
+            jetons: CMPCT_SEAU_MAX,
+            dernier: maintenant,
+        }
+    }
+
     /// Autorise `cout` unites au titre d'un seau de contenance `max` et de
     /// debit `debit` par seconde.
     pub fn autoriser_avec(&mut self, cout: u64, maintenant: Instant, max: u64, debit: u64) -> bool {
@@ -248,6 +365,10 @@ struct Peer {
     /// `VerAck` : un `VerAck` seul, sans `Version`, ne doit pas ouvrir l'acces
     /// aux messages couteux ni sauter le controle de nonce anti-boucle.
     version_recue: bool,
+    /// Vrai des que **nous** avons envoye notre `Version` a ce pair — a la
+    /// connexion pour une sortante, en reponse au sien pour une entrante. On
+    /// ne se presente qu'une fois : voir le bras `Version`.
+    version_envoyee: bool,
     handshaked: bool,
     ban_score: u32,
     /// Hauteur annoncee par le pair a la poignee de main.
@@ -259,8 +380,20 @@ struct Peer {
     /// Les transactions inedites que ce pair peut encore pousser. Voir
     /// [`TX_DEBIT_PAR_SEC`].
     seau_tx: SeauAmorce,
+    /// Les annonces compactes non sollicitees que ce pair peut encore pousser.
+    /// Voir [`CMPCT_DEBIT_PAR_SEC`].
+    seau_cmpct: SeauAmorce,
     /// Corps de blocs demandes a ce pair, et quand. Voir [`DELAI_CORPS`].
+    /// Jamais plus de [`CORPS_EN_VOL_MAX`] entrees : voir
+    /// [`Peer::noter_corps_demande`].
     corps_demandes: HashMap<Hash256, Instant>,
+    /// Corps que ce pair nous a fait connaitre et qu'on n'a pas encore
+    /// demandes, faute de place en vol. Servis dans l'ordre de la chaine.
+    /// Voir [`CORPS_EN_ATTENTE_MAX`].
+    corps_a_demander: VecDeque<Hash256>,
+    /// Le dernier lot d'en-tetes de ce pair etait plein : il en a d'autres, a
+    /// redemander quand la file et les corps en vol seront ecoules.
+    suite_attendue: bool,
     /// Instant de la derniere trame recue de ce pair.
     ///
     /// # Le defaut que ce champ repare
@@ -295,6 +428,100 @@ struct Peer {
     /// reellement deux noeuds, invisible en test unitaire parce que les deux y
     /// partageaient la meme genese.
     orphelins_consecutifs: u32,
+}
+
+impl Peer {
+    /// Note un corps demande a ce pair, si la place en vol le permet.
+    ///
+    /// C'est l'unique porte d'entree de `corps_demandes` : quelle que soit la
+    /// voie par laquelle un identifiant arrive — en-tetes, `inv`, redemande
+    /// apres retention — la table ne depasse jamais [`CORPS_EN_VOL_MAX`].
+    /// Rend vrai si le corps est en vol (nouvellement note, ou deja).
+    fn noter_corps_demande(&mut self, h: Hash256, maintenant: Instant) -> bool {
+        if self.corps_demandes.contains_key(&h) {
+            return true;
+        }
+        if self.corps_demandes.len() >= CORPS_EN_VOL_MAX {
+            return false;
+        }
+        self.corps_demandes.insert(h, maintenant);
+        true
+    }
+
+    /// Range un corps a demander plus tard, si la file a de la place.
+    fn mettre_en_attente(&mut self, h: Hash256) {
+        if self.corps_a_demander.len() < CORPS_EN_ATTENTE_MAX {
+            self.corps_a_demander.push_back(h);
+        }
+    }
+
+    /// Fait avancer la synchronisation avec ce pair.
+    ///
+    /// Libere les places des corps arrives, remplit celles qui restent depuis
+    /// la file d'attente, et — quand il n'y a plus rien ni en vol ni en
+    /// attente — redemande des en-tetes si le pair en a annonce davantage.
+    ///
+    /// # Pourquoi la redemande d'en-tetes attend ce moment
+    ///
+    /// Elle partait auparavant des la reception d'un lot plein, avec un
+    /// localisateur qui ne contenait encore aucun des blocs du lot : le pair
+    /// repondait le meme lot une seconde fois. Ici elle part quand les corps
+    /// sont arrives, avec un localisateur a jour, et demande ce qui suit.
+    ///
+    /// `apres_progres` dit si un bloc de ce pair vient d'etre accepte. Ce
+    /// n'est qu'alors que la hauteur annoncee a la poignee de main autorise
+    /// une redemande : sur un simple lot d'en-tetes tous connus, elle ferait
+    /// tourner en boucle deux noeuds dont l'un tient l'autre pour une branche
+    /// laterale. Un lot plein, lui, autorise toujours la suite — la suite est
+    /// autre chose que ce lot, puisque le localisateur le contient desormais.
+    fn poursuivre_synchro(
+        &mut self,
+        id: u64,
+        chain: &Chain,
+        envois: &mut Vec<Envoi>,
+        maintenant: Instant,
+        apres_progres: bool,
+    ) {
+        if !self.handshaked {
+            return;
+        }
+        self.corps_demandes.retain(|h, _| !chain.has_block(h));
+        let mut items = Vec::new();
+        while self.corps_demandes.len() < CORPS_EN_VOL_MAX {
+            let Some(h) = self.corps_a_demander.pop_front() else {
+                break;
+            };
+            if chain.has_block(&h) || self.corps_demandes.contains_key(&h) {
+                continue;
+            }
+            if self.noter_corps_demande(h, maintenant) {
+                items.push(InvItem {
+                    kind: InvKind::CompactBlock,
+                    hash: h,
+                });
+            }
+        }
+        if !items.is_empty() {
+            envois.push(Envoi {
+                peer: id,
+                message: Message::GetData(items),
+            });
+            return;
+        }
+        let epuise = self.corps_a_demander.is_empty() && self.corps_demandes.is_empty();
+        let en_a_plus =
+            self.suite_attendue || (apres_progres && self.start_height > chain.height());
+        if epuise && en_a_plus {
+            self.suite_attendue = false;
+            envois.push(Envoi {
+                peer: id,
+                message: Message::GetHeaders {
+                    locator: chain.locator(),
+                    stop: Hash256::ZERO,
+                },
+            });
+        }
+    }
 }
 
 /// Etat partage du noeud.
@@ -388,6 +615,12 @@ pub struct Stats {
     pub compacts_recus: AtomicU64,
     /// Blocs compacts reconstruits sans aucun aller-retour.
     pub compacts_sans_aller_retour: AtomicU64,
+    /// Annonces compactes pour lesquelles une reconstruction a ete entamee —
+    /// balayage du reservoir et allocation, sous le verrou. C'est la depense
+    /// que le seau borne ; voir [`CMPCT_DEBIT_PAR_SEC`].
+    pub compacts_reconstruits: AtomicU64,
+    /// Annonces compactes refusees par le seau, sans reconstruction.
+    pub compacts_refuses: AtomicU64,
     pub pairs_bannis: AtomicU64,
     /// Blocs dont on ignorait le parent au moment de leur arrivee.
     ///
@@ -544,9 +777,12 @@ impl Node {
     /// Une connexion entrante a-t-elle sa place ?
     ///
     /// Trois bornes : le total, la reserve des sortantes, et la part d'un
-    /// meme groupe reseau. Voir [`PLACES_SORTANTES_RESERVEES`] et
-    /// [`ENTRANTS_PAR_GROUPE`].
-    fn admettre_entrant(&self, flux: &TcpStream) -> bool {
+    /// meme groupe reseau — IPv4 et IPv6 confondus, voir [`groupe_entrant`].
+    /// Voir [`PLACES_SORTANTES_RESERVEES`] et [`ENTRANTS_PAR_GROUPE`].
+    ///
+    /// Prend l'adresse plutot que le flux : la regle s'eprouve ainsi sur des
+    /// adresses qu'une machine sans IPv6 ne saurait ouvrir.
+    fn admettre_entrant(&self, adresse: Option<SocketAddr>) -> bool {
         let g = self.partage.lock().unwrap();
         let total = g.peers.len();
         if total >= MAX_PEERS {
@@ -556,23 +792,12 @@ impl Node {
         if entrants + PLACES_SORTANTES_RESERVEES >= MAX_PEERS {
             return false;
         }
-        // La boucle locale n'est pas un groupe : plusieurs noeuds d'une meme
-        // machine (regtest, epreuves) ne s'eclipsent pas entre eux.
-        let groupe = match flux.peer_addr() {
-            Ok(SocketAddr::V4(a)) if !a.ip().is_loopback() => {
-                Some(crate::addr::groupe(a.ip().octets()))
-            }
-            _ => None,
-        };
-        if let Some(gr) = groupe {
+        if let Some(gr) = adresse.and_then(groupe_entrant) {
             let memes = g
                 .peers
                 .values()
                 .filter(|p| !p.sortant)
-                .filter(|p| match p.addr {
-                    SocketAddr::V4(a) => crate::addr::groupe(a.ip().octets()) == gr,
-                    _ => false,
-                })
+                .filter(|p| groupe_entrant(p.addr) == Some(gr))
                 .count();
             if memes >= ENTRANTS_PAR_GROUPE {
                 return false;
@@ -643,7 +868,7 @@ impl Node {
         let mut a_pinger: Vec<(u64, Arc<Mutex<TcpStream>>)> = Vec::new();
         let mut morts: Vec<u64> = Vec::new();
         let magie = self.magie;
-        let mut a_redemander: Vec<(u64, Vec<InvItem>)> = Vec::new();
+        let mut a_redemander: Vec<Envoi> = Vec::new();
         let nonce = {
             let mut g = self.partage.lock().unwrap();
             let Partage {
@@ -653,6 +878,7 @@ impl Node {
             } = *g;
             // --- Les corps demandes : livres, en attente, ou retenus ?
             let mut retenus: Vec<Hash256> = Vec::new();
+            let mut retenteurs: Vec<u64> = Vec::new();
             for (id, p) in peers.iter_mut() {
                 let mut en_retard = 0u32;
                 p.corps_demandes.retain(|h, depuis| {
@@ -667,6 +893,7 @@ impl Node {
                     true
                 });
                 if en_retard > 0 {
+                    retenteurs.push(*id);
                     p.ban_score += MISCONDUCT_CORPS_RETENU;
                     if p.ban_score >= BAN_THRESHOLD {
                         self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
@@ -675,21 +902,23 @@ impl Node {
                 }
             }
             if !retenus.is_empty() {
-                // A un autre pair — presente, et pas celui qui retient.
+                // A un autre pair — presente, et pas celui qui retient. Par sa
+                // file d'attente : la redemande obeit au meme plafond de corps
+                // en vol que toute autre demande.
                 let autre = peers
                     .iter()
-                    .filter(|(id, p)| p.handshaked && !morts.contains(id))
+                    .filter(|(id, p)| {
+                        p.handshaked && !morts.contains(id) && !retenteurs.contains(id)
+                    })
                     .map(|(id, _)| *id)
                     .next();
                 if let Some(id) = autre {
-                    let items = retenus
-                        .iter()
-                        .map(|h| InvItem {
-                            kind: InvKind::CompactBlock,
-                            hash: *h,
-                        })
-                        .collect();
-                    a_redemander.push((id, items));
+                    if let Some(p) = peers.get_mut(&id) {
+                        for h in retenus {
+                            p.mettre_en_attente(h);
+                        }
+                        p.poursuivre_synchro(id, chain, &mut a_redemander, maintenant, false);
+                    }
                 }
             }
             for (id, p) in peers.iter_mut() {
@@ -706,8 +935,8 @@ impl Node {
             }
             g.nonce
         };
-        for (id, items) in a_redemander {
-            self.envoyer_a(id, &Message::GetData(items));
+        for e in a_redemander {
+            self.envoyer_a(e.peer, &e.message);
         }
         // L'ecriture se fait hors du verrou : une socket bouchee bloquerait
         // sinon tout le noeud pendant le delai d'ecriture.
@@ -773,7 +1002,7 @@ impl Node {
                 }
                 match flux {
                     Ok(s) => {
-                        if !node.admettre_entrant(&s) {
+                        if !node.admettre_entrant(s.peer_addr().ok()) {
                             continue;
                         }
                         node.demarrer_pair(s, false);
@@ -823,8 +1052,12 @@ impl Node {
                     sortant,
                     seau_amorce: SeauAmorce::new(Instant::now()),
                     seau_tx: SeauAmorce::pour_transactions(Instant::now()),
+                    seau_cmpct: SeauAmorce::pour_annonces_compactes(Instant::now()),
                     corps_demandes: HashMap::new(),
+                    corps_a_demander: VecDeque::new(),
+                    suite_attendue: false,
                     version_recue: false,
+                    version_envoyee: sortant,
                     handshaked: false,
                     ban_score: 0,
                     start_height: 0,
@@ -975,27 +1208,43 @@ impl Node {
                     // des blocs que l'autre tient pour justes.
                     if nonce == nonce_local || version < MIN_PROTOCOL_VERSION {
                         couper = true;
-                    } else if let Some(p) = g.peers.get_mut(&id) {
-                        p.version_recue = true;
-                        p.start_height = start_height;
-                        envois.push(Envoi {
-                            peer: id,
-                            message: Message::VerAck,
-                        });
-                    }
-                    if !couper {
+                    } else {
                         let hauteur = g.chain.height();
-                        // Le repondant se presente a son tour.
-                        envois.push(Envoi {
-                            peer: id,
-                            message: Message::Version {
-                                version: PROTOCOL_VERSION,
-                                timestamp: maintenant(),
-                                nonce: nonce_local,
-                                user_agent: "q21:0.3".into(),
-                                start_height: hauteur,
-                            },
-                        });
+                        if let Some(p) = g.peers.get_mut(&id) {
+                            // --- Un `Version` par pair, et un seul en retour.
+                            //
+                            // Chaque `Version` recu faisait renvoyer un
+                            // `Version`, y compris a celui qui nous l'avait
+                            // envoye en reponse au notre : deux noeuds
+                            // s'echangeaient donc `Version`/`VerAck`/
+                            // `GetAddr`/`Addr` sans fin, des dizaines de
+                            // milliers de trames par seconde, et chaque tour
+                            // relancait une demande d'en-tetes. Le repondant
+                            // se presente une fois, avant son `VerAck` pour
+                            // que l'autre bout ait notre `Version` quand
+                            // l'accuse lui parvient ; un doublon est ignore.
+                            if !p.version_recue {
+                                p.version_recue = true;
+                                p.start_height = start_height;
+                                if !p.version_envoyee {
+                                    p.version_envoyee = true;
+                                    envois.push(Envoi {
+                                        peer: id,
+                                        message: Message::Version {
+                                            version: PROTOCOL_VERSION,
+                                            timestamp: maintenant(),
+                                            nonce: nonce_local,
+                                            user_agent: "q21:0.3".into(),
+                                            start_height: hauteur,
+                                        },
+                                    });
+                                }
+                                envois.push(Envoi {
+                                    peer: id,
+                                    message: Message::VerAck,
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -1060,8 +1309,19 @@ impl Node {
 
                 Message::Headers(v) if v.is_empty() => {}
 
+                Message::Headers(v) if !handshaked => {
+                    // Meme regle que `getheaders` : la synchronisation ne
+                    // recoit d'en-tetes qu'en reponse a sa propre demande, qui
+                    // part apres la poignee de main (bras VerAck). Rien
+                    // d'honnete n'est perdu, et une connexion anonyme ne fait
+                    // plus hacher deux mille en-tetes ni demander un seul
+                    // corps. Le message « pousse » franchissait la porte que
+                    // le message « demande » gardait fermee.
+                    let _ = v;
+                }
+
                 Message::Headers(v) => {
-                    // --- Synchronisation par en-tetes, version stricte.
+                    // --- Synchronisation par en-tetes, stricte en chainage.
                     //
                     // On ne demande **jamais** un corps de bloc avant d'avoir
                     // verifie que la suite d'en-tetes se rattache a la chaine
@@ -1070,6 +1330,15 @@ impl Node {
                     // blocs orphelins : c'est le defaut observe en lancant deux
                     // noeuds aux geneses differentes, 29 850 blocs recus pour
                     // une hauteur restee a zero.
+                    //
+                    // Stricte en chainage, pas en travail : la preuve de
+                    // travail n'est pas verifiee ici — elle est a cout memoire,
+                    // et la verifier sur deux mille en-tetes couterait plus que
+                    // ce qu'elle protegerait. Une suite chainee sur notre tete
+                    // se fabrique donc hors ligne, gratuitement. Ce qui borne
+                    // ce qu'elle peut nous faire faire, c'est le plafond de
+                    // corps en vol par pair (`CORPS_EN_VOL_MAX`) : le travail
+                    // n'est verifie qu'a l'arrivee du corps, seize a la fois.
                     let rattache = g.chain.has_block(&v[0].prev_block);
 
                     let mut continu = rattache;
@@ -1099,52 +1368,64 @@ impl Node {
                             couper = true;
                         }
                     } else {
-                        if let Some(p) = g.peers.get_mut(&id) {
+                        let Partage {
+                            ref chain,
+                            ref mut peers,
+                            ..
+                        } = *g;
+                        if let Some(p) = peers.get_mut(&id) {
                             p.orphelins_consecutifs = 0;
-                        }
-                        let manquants: Vec<InvItem> = v
-                            .iter()
-                            .map(|h| h.block_id())
-                            .filter(|bid| !g.chain.has_block(bid))
-                            .map(|hash| InvItem {
-                                kind: InvKind::CompactBlock,
-                                hash,
-                            })
-                            .collect();
-                        if !manquants.is_empty() {
-                            envois.push(Envoi {
-                                peer: id,
-                                message: Message::GetData(manquants),
-                            });
-                        }
-                        if v.len() >= crate::wire::MAX_HEADERS {
-                            envois.push(Envoi {
-                                peer: id,
-                                message: Message::GetHeaders {
-                                    locator: g.chain.locator(),
-                                    stop: Hash256::ZERO,
-                                },
-                            });
+                            // Le lot remplace la file : un pair ne repond des
+                            // en-tetes qu'a notre demande, et on ne demande la
+                            // suite qu'une fois la file ecoulee. C'est ce qui
+                            // borne la file a un lot, quoi que le pair pousse.
+                            p.corps_a_demander.clear();
+                            p.corps_a_demander.extend(
+                                v.iter()
+                                    .map(|h| h.block_id())
+                                    .filter(|bid| !chain.has_block(bid))
+                                    .take(CORPS_EN_ATTENTE_MAX),
+                            );
+                            p.suite_attendue = v.len() >= crate::wire::MAX_HEADERS;
+                            p.poursuivre_synchro(id, chain, &mut envois, Instant::now(), false);
                         }
                     }
                 }
 
                 Message::Inv(v) => {
                     let mut voulus = Vec::new();
+                    let mut blocs = Vec::new();
                     for i in v {
                         match i.kind {
                             InvKind::Block | InvKind::CompactBlock => {
                                 if !g.chain.has_block(&i.hash) {
-                                    voulus.push(InvItem {
-                                        kind: InvKind::CompactBlock,
-                                        hash: i.hash,
-                                    });
+                                    blocs.push(i.hash);
                                 }
                             }
                             InvKind::Tx => {
                                 if !g.mempool.contains(&i.hash) {
                                     voulus.push(i);
                                 }
+                            }
+                        }
+                    }
+                    // Les blocs passent par le meme plafond que les en-tetes :
+                    // ce qui n'a pas de place en vol attend dans la file, et
+                    // un `inv` de cinquante mille identifiants n'inscrit rien
+                    // de plus qu'un lot d'en-tetes.
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        let maintenant = Instant::now();
+                        for h in blocs {
+                            if p.corps_demandes.contains_key(&h) {
+                                continue;
+                            }
+                            if p.noter_corps_demande(h, maintenant) {
+                                voulus.push(InvItem {
+                                    kind: InvKind::CompactBlock,
+                                    hash: h,
+                                });
+                            } else {
+                                p.mettre_en_attente(h);
                             }
                         }
                     }
@@ -1233,7 +1514,18 @@ impl Node {
                     self.stats.compacts_recus.fetch_add(1, Ordering::Relaxed);
                     let bid = c.header.block_id();
                     if g.chain.has_block(&bid) {
-                        // Deja connu : rien a faire.
+                        // Deja connu : rien a reconstruire. Mais si c'etait un
+                        // corps demande a ce pair, sa place en vol se libere.
+                        let Partage {
+                            ref chain,
+                            ref mut peers,
+                            ..
+                        } = *g;
+                        if let Some(p) = peers.get_mut(&id) {
+                            if p.corps_demandes.contains_key(&bid) {
+                                p.poursuivre_synchro(id, chain, &mut envois, Instant::now(), true);
+                            }
+                        }
                     } else if !handshaked || !g.chain.has_block(&c.header.prev_block) {
                         // --- Defense : travail impose par un inconnu.
                         //
@@ -1248,70 +1540,125 @@ impl Node {
                         // on ignore le parent ne serait de toute facon pas
                         // rattachable.
                     } else {
-                        let dispo = Self::reservoir_utile(&g.mempool, &c);
-                        match Reconstruction::depuis(&c, &dispo) {
-                            Ok(r) if r.is_complete() => {
-                                self.stats
-                                    .compacts_sans_aller_retour
-                                    .fetch_add(1, Ordering::Relaxed);
-                                match r.finish() {
-                                    Ok(b) => {
-                                        couper = !Self::integrer(
-                                            &mut g,
-                                            &b,
-                                            &self.stats,
-                                            &mut envois,
-                                            id,
-                                        );
-                                    }
-                                    Err(_) => {
-                                        // Reconstruction plausible mais fausse :
-                                        // on redemande le bloc entier.
-                                        envois.push(Envoi {
-                                            peer: id,
-                                            message: Message::GetData(vec![InvItem {
-                                                kind: InvKind::Block,
-                                                hash: bid,
-                                            }]),
-                                        });
-                                    }
+                        // --- Defense : le budget d'annonces du pair.
+                        //
+                        // Un corps que nous avons demande a ce pair n'est pas
+                        // une annonce : il arrive parce qu'on l'a voulu, et le
+                        // plafond de corps en vol borne deja ce qu'on veut.
+                        // Tout le reste est une annonce spontanee, et un pair
+                        // honnete n'en fait que quelques-unes par minute. Au-
+                        // dela, on ne reconstruit pas — ni balayage, ni
+                        // allocation — et l'insistance coute des points.
+                        let sollicite = g
+                            .peers
+                            .get(&id)
+                            .map(|p| p.corps_demandes.contains_key(&bid))
+                            .unwrap_or(false);
+                        let permis = sollicite
+                            || g.peers
+                                .get_mut(&id)
+                                .map(|p| {
+                                    p.seau_cmpct.autoriser_avec(
+                                        1,
+                                        Instant::now(),
+                                        CMPCT_SEAU_MAX,
+                                        CMPCT_DEBIT_PAR_SEC,
+                                    )
+                                })
+                                .unwrap_or(false);
+                        if !permis {
+                            self.stats.compacts_refuses.fetch_add(1, Ordering::Relaxed);
+                            if let Some(p) = g.peers.get_mut(&id) {
+                                p.ban_score += MISCONDUCT_CMPCT_REFUSE;
+                                if p.ban_score >= BAN_THRESHOLD {
+                                    self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                                    couper = true;
                                 }
                             }
-                            Ok(r) => {
-                                let indices = r.missing().to_vec();
-                                if let Some(p) = g.peers.get_mut(&id) {
-                                    // Au-dela de la borne, la plus ancienne
-                                    // cede la place : on ne garde jamais plus
-                                    // que ce que le pair peut honnetement
-                                    // avoir en vol.
-                                    if p.en_attente.len() >= RECONSTRUCTIONS_EN_ATTENTE_MAX {
-                                        let plus_ancienne = p
-                                            .en_attente
-                                            .iter()
-                                            .min_by_key(|(_, (cb, _))| cb.header.height)
-                                            .map(|(k, _)| *k);
-                                        if let Some(k) = plus_ancienne {
-                                            p.en_attente.remove(&k);
+                        } else {
+                            self.stats
+                                .compacts_reconstruits
+                                .fetch_add(1, Ordering::Relaxed);
+                            let dispo = Self::reservoir_utile(&g.mempool, &c);
+                            match Reconstruction::depuis(&c, &dispo) {
+                                Ok(r) if r.is_complete() => {
+                                    self.stats
+                                        .compacts_sans_aller_retour
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    match r.finish() {
+                                        Ok(b) => {
+                                            couper = !Self::integrer(
+                                                &mut g,
+                                                &b,
+                                                &self.stats,
+                                                &mut envois,
+                                                id,
+                                            );
+                                        }
+                                        Err(_) => {
+                                            // Reconstruction plausible mais fausse :
+                                            // on redemande le bloc entier.
+                                            envois.push(Envoi {
+                                                peer: id,
+                                                message: Message::GetData(vec![InvItem {
+                                                    kind: InvKind::Block,
+                                                    hash: bid,
+                                                }]),
+                                            });
                                         }
                                     }
-                                    p.en_attente.insert(bid, (*c.clone(), indices.clone()));
                                 }
-                                envois.push(Envoi {
-                                    peer: id,
-                                    message: Message::GetBlockTxn {
-                                        block: bid,
-                                        indices,
-                                    },
-                                });
-                            }
-                            Err(_) => {
-                                envois.push(Envoi {
-                                    peer: id,
-                                    message: Message::GetData(vec![InvItem {
-                                        kind: InvKind::Block,
-                                        hash: bid,
-                                    }]),
-                                });
+                                Ok(r) => {
+                                    let indices = r.missing().to_vec();
+                                    if let Some(p) = g.peers.get_mut(&id) {
+                                        // Au-dela de la borne, la plus ancienne
+                                        // cede la place : on ne garde jamais plus
+                                        // que ce que le pair peut honnetement
+                                        // avoir en vol.
+                                        if p.en_attente.len() >= RECONSTRUCTIONS_EN_ATTENTE_MAX {
+                                            let plus_ancienne = p
+                                                .en_attente
+                                                .iter()
+                                                .min_by_key(|(_, (cb, _))| cb.header.height)
+                                                .map(|(k, _)| *k);
+                                            if let Some(k) = plus_ancienne {
+                                                p.en_attente.remove(&k);
+                                            }
+                                        }
+                                        p.en_attente.insert(bid, (*c.clone(), indices.clone()));
+                                    }
+                                    envois.push(Envoi {
+                                        peer: id,
+                                        message: Message::GetBlockTxn {
+                                            block: bid,
+                                            indices,
+                                        },
+                                    });
+                                }
+                                Err(_) => {
+                                    // Rejetee avant meme de chercher les
+                                    // transactions : coinbase absente, indice hors
+                                    // du bloc, nombre absurde. Une annonce ainsi
+                                    // faite ne vient que du pair qui l'a
+                                    // fabriquee — a la difference d'une racine de
+                                    // Merkle fausse, qui peut naitre d'une
+                                    // collision d'identifiants courts. On redemande
+                                    // le bloc entier, et le pair perd des points.
+                                    if let Some(p) = g.peers.get_mut(&id) {
+                                        p.ban_score += MISCONDUCT_CMPCT_REFUSE;
+                                        if p.ban_score >= BAN_THRESHOLD {
+                                            self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                                            couper = true;
+                                        }
+                                    }
+                                    envois.push(Envoi {
+                                        peer: id,
+                                        message: Message::GetData(vec![InvItem {
+                                            kind: InvKind::Block,
+                                            hash: bid,
+                                        }]),
+                                    });
+                                }
                             }
                         }
                     }
@@ -1596,12 +1943,13 @@ impl Node {
         for e in envois {
             let sortie = {
                 let mut g = self.partage.lock().unwrap();
-                // Un corps demande est note, pour qu'on sache s'il arrive.
+                // Un corps demande est note, pour qu'on sache s'il arrive —
+                // dans la limite des places en vol, comme partout.
                 if let Message::GetData(items) = &e.message {
                     let maintenant = Instant::now();
                     if let Some(p) = g.peers.get_mut(&e.peer) {
                         for i in items.iter().filter(|i| i.kind == InvKind::CompactBlock) {
-                            p.corps_demandes.entry(i.hash).or_insert(maintenant);
+                            p.noter_corps_demande(i.hash, maintenant);
                         }
                     }
                 }
@@ -1648,6 +1996,7 @@ impl Node {
     ) -> bool {
         let bid = b.header.block_id();
         if g.chain.has_block(&bid) {
+            Self::corps_arrive(g, source, envois);
             return true;
         }
         match g.chain.submit(b, maintenant()) {
@@ -1684,6 +2033,7 @@ impl Node {
                         }]),
                     });
                 }
+                Self::corps_arrive(g, source, envois);
                 true
             }
             Ok(Accept::BrancheLaterale) => {
@@ -1693,9 +2043,13 @@ impl Node {
                 if let Some(j) = &g.journal {
                     j.consigner(b);
                 }
+                Self::corps_arrive(g, source, envois);
                 true
             }
-            Ok(_) => true,
+            Ok(_) => {
+                Self::corps_arrive(g, source, envois);
+                true
+            }
             Err(crate::chain::ChainError::ParentInconnu(_)) => {
                 stats.blocs_orphelins.fetch_add(1, Ordering::Relaxed);
                 // Un bloc dont on ignore le parent ne devrait plus arriver : la
@@ -1717,6 +2071,22 @@ impl Node {
                 }
                 true
             }
+        }
+    }
+
+    /// Un corps est arrive d'un pair : sa place en vol se libere, et la
+    /// synchronisation avec ce pair reprend la ou elle en etait.
+    ///
+    /// C'est le pendant du plafond de corps en vol : sans cette reprise, une
+    /// synchronisation s'arreterait apres les seize premiers corps.
+    fn corps_arrive(g: &mut Partage, source: u64, envois: &mut Vec<Envoi>) {
+        let Partage {
+            ref chain,
+            ref mut peers,
+            ..
+        } = *g;
+        if let Some(p) = peers.get_mut(&source) {
+            p.poursuivre_synchro(source, chain, envois, Instant::now(), true);
         }
     }
 
@@ -1753,7 +2123,7 @@ impl Node {
                 let maintenant = Instant::now();
                 if let Some(p) = g.peers.get_mut(&id) {
                     for i in items.iter().filter(|i| i.kind == InvKind::CompactBlock) {
-                        p.corps_demandes.entry(i.hash).or_insert(maintenant);
+                        p.noter_corps_demande(i.hash, maintenant);
                     }
                 }
             }
@@ -2283,6 +2653,126 @@ mod tests {
         );
         a.shutdown();
         b.shutdown();
+    }
+
+    /// Le plafond de corps en vol ne doit pas arreter la synchronisation.
+    ///
+    /// Avec seize corps en vol au plus par pair, un rattrapage de plus de
+    /// seize blocs ne tient que si chaque corps recu fait demander le suivant.
+    /// Trois plafonds et demi : assez pour traverser plusieurs vagues, et pour
+    /// que la redemande d'en-tetes a file ecoulee soit exercee aussi.
+    #[test]
+    fn la_synchro_se_poursuit_au_dela_des_corps_en_vol() {
+        let (a, b) = paire();
+        let cible = CORPS_EN_VOL_MAX * 3 + CORPS_EN_VOL_MAX / 2;
+        miner(&a, cible);
+        assert_eq!(a.height(), cible as u64);
+
+        let addr = a.listen("127.0.0.1:0").expect("ecoute");
+        b.connect(addr).expect("connexion");
+
+        assert!(
+            attendre(|| b.height() == cible as u64, 30),
+            "b est reste a la hauteur {} sur {cible} : la synchronisation \
+             s'est arretee au plafond de corps en vol",
+            b.height()
+        );
+        assert_eq!(b.tip_id(), a.tip_id(), "les tetes doivent coincider");
+        // Et jamais plus que le plafond en vol vers ce pair.
+        let en_vol = {
+            let g = b.partage.lock().unwrap();
+            g.peers
+                .values()
+                .map(|p| p.corps_demandes.len())
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(en_vol <= CORPS_EN_VOL_MAX, "{en_vol} corps en vol");
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// Un pair factice, pour eprouver l'admission sur des adresses qu'une
+    /// machine sans IPv6 ne peut pas ouvrir. La socket est reelle — un
+    /// `Peer` en tient une — mais l'adresse est celle qu'on veut.
+    fn pair_factice(n: &Node, id: u64, addr: SocketAddr, sortant: bool) {
+        let ecoute = TcpListener::bind("127.0.0.1:0").expect("ecoute");
+        let flux = TcpStream::connect(ecoute.local_addr().unwrap()).expect("socket");
+        let mut g = n.partage.lock().unwrap();
+        g.peers.insert(
+            id,
+            Peer {
+                addr,
+                sortie: Arc::new(Mutex::new(flux)),
+                sortant,
+                seau_amorce: SeauAmorce::new(Instant::now()),
+                seau_tx: SeauAmorce::pour_transactions(Instant::now()),
+                seau_cmpct: SeauAmorce::pour_annonces_compactes(Instant::now()),
+                corps_demandes: HashMap::new(),
+                corps_a_demander: VecDeque::new(),
+                suite_attendue: false,
+                version_recue: false,
+                version_envoyee: sortant,
+                handshaked: false,
+                ban_score: 0,
+                start_height: 0,
+                en_attente: HashMap::new(),
+                orphelins_consecutifs: 0,
+                derniere_reception: Instant::now(),
+                ping_en_attente: None,
+            },
+        );
+    }
+
+    /// La diversite de groupe s'applique aussi aux entrants IPv6.
+    ///
+    /// Le plafond par groupe n'etait calcule que pour l'IPv4 : un seul `/64`
+    /// pouvait occuper toutes les places entrantes d'un noeud ecoutant en
+    /// IPv6. Le bac a sable n'ouvre pas de socket IPv6 : on eprouve la regle
+    /// d'admission sur des pairs a l'adresse choisie.
+    #[test]
+    fn l_admission_borne_aussi_les_entrants_ipv6() {
+        let a = noeud();
+        let meme_64 =
+            |k: u16| -> SocketAddr { format!("[2001:db8:1:2::{k:x}]:21021").parse().unwrap() };
+        for k in 0..ENTRANTS_PAR_GROUPE as u16 {
+            assert!(
+                a.admettre_entrant(Some(meme_64(k + 1))),
+                "la {}e connexion du /64 doit passer",
+                k + 1
+            );
+            pair_factice(&a, 100 + u64::from(k), meme_64(k + 1), false);
+        }
+        assert!(
+            !a.admettre_entrant(Some(meme_64(0x99))),
+            "un /64 entier doit etre borne a {ENTRANTS_PAR_GROUPE} entrants, \
+             comme un /16 en IPv4"
+        );
+        // Un autre /64 du meme /48 est un autre groupe.
+        let autre_64: SocketAddr = "[2001:db8:1:3::1]:21021".parse().unwrap();
+        assert!(
+            a.admettre_entrant(Some(autre_64)),
+            "un autre /64 doit rester admis"
+        );
+        // Une IPv4 presentee en IPv6 compte avec les IPv4 de son /16, pas dans
+        // un /64 commun a tout l'Internet v4.
+        for k in 0..ENTRANTS_PAR_GROUPE as u16 {
+            let v4: SocketAddr = format!("203.0.113.{}:21021", k + 1).parse().unwrap();
+            pair_factice(&a, 200 + u64::from(k), v4, false);
+        }
+        let mappee: SocketAddr = "[::ffff:203.0.113.77]:21021".parse().unwrap();
+        assert!(
+            !a.admettre_entrant(Some(mappee)),
+            "une IPv4 mappee doit etre comptee dans son /16"
+        );
+        let mappee_ailleurs: SocketAddr = "[::ffff:198.51.100.1]:21021".parse().unwrap();
+        assert!(
+            a.admettre_entrant(Some(mappee_ailleurs)),
+            "une IPv4 mappee d'un autre /16 doit passer"
+        );
+        // Et la boucle locale reste hors groupe, en v6 comme en v4.
+        assert_eq!(groupe_entrant("[::1]:1".parse().unwrap()), None);
+        a.shutdown();
     }
 
     #[test]
