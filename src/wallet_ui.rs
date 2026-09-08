@@ -1134,13 +1134,31 @@ function oublierJeton(){
   try { sessionStorage.removeItem(CLEF_SESSION); } catch (e) { /* rien a faire */ }
 }
 
+// --- Le fragment ne porte plus le jeton : il porte une amorce.
+//
+// L'adresse ouverte par le lanceur passe par la ligne de commande du
+// navigateur, que d'autres comptes de la machine peuvent lire. Ce qui s'y
+// trouve ne vaut donc qu'une fois : la page l'echange, ici, contre le jeton
+// de session, et le noeud la detruit. Tant que l'echange n'est pas fini, les
+// appels attendent — sans cela, le premier partirait sans jeton.
+let echange = null;
+
+async function echangerAmorce(amorce){
+  try {
+    const r = await fetch("/session", {method:"POST",
+      headers:{"Content-Type":"application/json", "Authorization":"Bearer " + amorce}});
+    if (r.ok){ const d = await r.json(); retenirJeton(d.jeton); return; }
+  } catch (e) { /* le noeud ne repond pas encore : le 401 qui suit ouvrira le panneau */ }
+  signalerErreur("Ce lien a déjà servi, ou a expiré. Relancez le portefeuille pour en obtenir un neuf.");
+}
+
 (function lireJeton(){
   const f = location.hash.slice(1);
   if (f) {
     history.replaceState(null, "", location.pathname);
     let v = f;
     try { v = decodeURIComponent(f); } catch (e) { v = f; }
-    retenirJeton(v);
+    echange = echangerAmorce(v);
     return;
   }
   // Pas de fragment : un rafraichissement, ou une ouverture a la main.
@@ -1173,6 +1191,7 @@ function corpsRequete(methode, params){
 }
 
 async function appel(methode, params){
+  if (echange){ await echange; echange = null; }
   const r = await fetch(RPC, {method:"POST", headers: entetes(), body: corpsRequete(methode, params)});
   // Un 401 rend du texte brut, pas du JSON : le lire comme du JSON masquerait
   // la vraie cause derriere une erreur d'analyse.
@@ -2697,6 +2716,31 @@ mod tests {
         assert!(
             effacement > lecture && effacement - lecture < 120,
             "l'effacement du fragment ne suit pas immediatement sa lecture"
+        );
+    }
+
+    /// Le fragment est une amorce a usage unique, echangee avant tout appel.
+    ///
+    /// Ce que le lanceur met dans l'adresse passe par la ligne de commande
+    /// du navigateur : ce n'est donc plus le jeton de session, mais une
+    /// amorce que la page echange une fois. Aucun appel ne part avant que
+    /// l'echange soit fini, sans quoi le premier partirait sans jeton.
+    #[test]
+    fn le_fragment_est_une_amorce_echangee_avant_tout_appel() {
+        let s = script();
+        assert!(s.contains("echange = echangerAmorce(v);"));
+        assert!(
+            !s.contains("retenirJeton(v);\n    return;"),
+            "le fragment ne doit plus etre retenu tel quel"
+        );
+        assert!(s.contains("fetch(\"/session\""));
+        let attente = s
+            .find("if (echange){ await echange; echange = null; }")
+            .expect("attente");
+        let appel = s.find("async function appel(").expect("appel");
+        assert!(
+            attente > appel && attente - appel < 80,
+            "l'attente doit ouvrir `appel`"
         );
     }
 

@@ -411,6 +411,131 @@ Chaque bloc, et sa raison :
 | `max_size 1MB` | La même borne que celle du nœud, un cran plus tôt |
 | `@interdit … 404` | Deuxième serrure sur la porte du portefeuille |
 
+Le portier transmet au nœud l'adresse de chaque visiteur dans l'en-tête
+`X-Forwarded-For` — c'est son comportement par défaut, et il efface ce qu'un
+visiteur aurait pu y écrire lui-même. Le nœud s'en sert pour donner à
+**chaque adresse** son propre budget de recherches (voir « Ce que le nœud
+borne de lui-même », plus bas). Ne mettez pas de `header_up X-Forwarded-For`
+dans ce bloc : vous remplaceriez cette adresse par une valeur fixe, et tous
+les visiteurs redeviendraient un seul client.
+
+### 4.2 bis — Limiter les connexions par adresse
+
+Le Caddyfile ci-dessus ne limite ni le nombre de connexions ni le débit d'une
+adresse. Le nœud, derrière, n'accepte que soixante-quatre connexions à la
+fois, une par fil : une seule machine qui en ouvre autant, lentement, laisse
+les autres visiteurs sur un `503`. Le budget de recherches du nœud borne ce
+qu'une adresse peut lui faire **calculer** ; il ne borne pas ce qu'elle peut
+lui faire **attendre**. Cette limite-là se pose un cran plus tôt.
+
+Caddy tel qu'il est installé par le paquet **n'a pas** de limitation de
+débit : la directive `rate_limit` vient d'un module tiers, absent du binaire
+standard. Deux voies, du plus simple au plus fin.
+
+**Voie A — le pare-feu, sans rien installer.** `ufw` accepte des règles
+ajoutées à la main dans `/etc/ufw/before.rules`. Elles comptent les
+connexions par adresse d'origine et les nouvelles connexions par minute, et
+n'ont aucune idée de ce qui passe dedans — c'est exactement le niveau où l'on
+veut arrêter une inondation de connexions.
+
+```bash
+sudo cp /etc/ufw/before.rules /etc/ufw/before.rules.avant && sudo nano /etc/ufw/before.rules
+```
+
+Trouvez la ligne `# End required lines` et ajoutez **juste après** :
+
+```
+# Q21 — explorateur : au plus 32 connexions ouvertes par adresse,
+# et au plus 60 connexions nouvelles par minute et par adresse (rafale de 120).
+-A ufw-before-input -p tcp --dport 443 --syn -m connlimit --connlimit-above 32 --connlimit-mask 32 -j REJECT --reject-with tcp-reset
+-A ufw-before-input -p tcp --dport 443 --syn -m hashlimit --hashlimit-name q21-https --hashlimit-mode srcip --hashlimit-above 60/minute --hashlimit-burst 120 -j DROP
+```
+
+**Ctrl + O**, **Entrée**, **Ctrl + X**. Puis la même chose pour IPv6, où l'on
+compte par bloc `/64` — c'est ce qu'un fournisseur d'accès attribue à un
+abonné, et compter chacune de ses adresses séparément ne limiterait rien :
+
+```bash
+sudo cp /etc/ufw/before6.rules /etc/ufw/before6.rules.avant && sudo nano /etc/ufw/before6.rules
+```
+
+Après `# End required lines` :
+
+```
+# Q21 — explorateur, IPv6 : mêmes bornes, par bloc /64.
+-A ufw6-before-input -p tcp --dport 443 --syn -m connlimit --connlimit-above 32 --connlimit-mask 64 -j REJECT --reject-with tcp-reset
+-A ufw6-before-input -p tcp --dport 443 --syn -m hashlimit --hashlimit-name q21-https6 --hashlimit-mode srcip --hashlimit-srcmask 64 --hashlimit-above 60/minute --hashlimit-burst 120 -j DROP
+```
+
+Puis :
+
+```bash
+sudo ufw reload && sudo ufw status verbose
+```
+
+Si `ufw reload` refuse, une ligne est mal recopiée : remettez la sauvegarde
+(`sudo cp /etc/ufw/before.rules.avant /etc/ufw/before.rules`) et recommencez.
+Les chiffres sont larges pour un humain — un navigateur ouvre une poignée de
+connexions, jamais trente — et étroits pour un programme qui en ouvre des
+centaines.
+
+**Voie B — le module `rate_limit`, pour compter les requêtes.** Le pare-feu
+compte des connexions ; en HTTP/2, une seule connexion porte des milliers de
+requêtes. Pour limiter les **requêtes** par adresse, il faut le module
+`caddy-ratelimit`, donc un binaire Caddy construit avec. C'est plus fin, et
+plus de travail : à faire une fois que la voie A est en place, pas à sa place.
+
+Construire le binaire demande l'outil `xcaddy` et une chaîne Go, **sur une
+autre machine** de préférence — le serveur d'accueil n'a pas besoin d'un
+compilateur. Puis, sur le serveur, le paquet Debian prévoit qu'on lui
+substitue un binaire sans casser les mises à jour :
+
+```bash
+xcaddy build --with github.com/mholt/caddy-ratelimit
+```
+
+```bash
+sudo dpkg-divert --divert /usr/bin/caddy.default --rename /usr/bin/caddy
+sudo mv ./caddy /usr/bin/caddy.custom
+sudo update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.default 10
+sudo update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.custom 50
+```
+
+Et dans le Caddyfile — la directive n'a pas d'ordre par défaut, il faut le lui
+donner dans le bloc global, puis la poser dans le site :
+
+```
+{
+	order rate_limit before basicauth
+	servers {
+		protocols h1 h2
+		timeouts {
+			read_header 5s
+			read_body   10s
+			idle        30s
+		}
+	}
+}
+
+explorateur.q21.dev {
+	rate_limit {
+		zone visiteurs {
+			key    {client_ip}
+			events 120
+			window 1m
+		}
+	}
+	# … le reste du bloc, inchangé
+}
+```
+
+Cent vingt requêtes par minute et par adresse : un explorateur qui se
+rafraîchit toutes les cinq secondes en fait une douzaine. Au-delà, le portier
+répond `429` sans déranger le nœud. Vérifiez avec `caddy version` que le
+binaire actif est bien le vôtre, et avec `sudo caddy validate` que la
+directive est reconnue — si elle ne l'est pas, c'est le binaire standard qui
+tourne encore.
+
 ### 4.3 — Vérifier la configuration AVANT de l'appliquer
 
 ```bash
@@ -621,8 +746,20 @@ Les recherches sans résultat d'index — un montant, une transaction
 inconnue, une adresse sans index — relisent jusqu'à deux mille blocs sous
 le verrou de la chaîne. Exposées sans jeton, elles étaient le moyen le moins
 cher de figer le point d'entrée : un visiteur en boucle sur des identifiants
-inexistants. En mode public, le nœud accorde désormais un **budget de
-balayages** — une réserve de trente, puis douze par minute, toutes requêtes
-confondues — et répond « réessayez dans une minute » au-delà, sans cesser de
-valider. Une limite par adresse côté mandataire reste un complément utile,
-pas une condition.
+inexistants. En mode public, le nœud accorde un **budget de balayages**, et
+répond « réessayez dans une minute » au-delà, sans cesser de valider.
+
+Ce budget est **par adresse de visiteur** : une réserve de trente, puis
+douze par minute, pour chaque adresse que le portier transmet dans
+`X-Forwarded-For` (un bloc `/64` compte pour une adresse en IPv6). La
+première version ne tenait qu'un compte pour tout le monde : un seul
+visiteur en boucle le vidait, et tous les autres lisaient « réessayez dans
+une minute ». Un filet global demeure — cent cinquante d'un coup, puis
+soixante par minute, toutes adresses confondues — pour qu'un millier
+d'adresses coordonnées ne fassent pas au verrou ce qu'une seule ne peut
+plus lui faire. Le nœud ne croit cet en-tête que sur une connexion venue de
+la boucle locale, c'est-à-dire du portier : un visiteur qui l'écrirait
+lui-même n'en changerait pas de budget.
+
+Ce que ce budget ne fait pas : borner le nombre de connexions ou de requêtes
+d'une adresse. C'est l'objet de l'étape 4.2 bis.
