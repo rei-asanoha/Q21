@@ -341,10 +341,17 @@ impl Message {
         /// occuper. Zero signifie « inconnu » et desactive le controle — a
         /// n'employer que si aucune borne inferieure n'existe.
         fn borne_avec(r: &mut Reader<'_>, max: usize, minimum: usize) -> Result<usize, WireError> {
-            let n = r.varint()? as usize;
-            if n > max {
-                return Err(WireError::TropDElements { max, recu: n });
+            // La comparaison se fait en u64, avant toute conversion : sur une
+            // cible 32 bits, `as usize` aurait tronque un compte de plus de
+            // quatre milliards en un petit nombre accepte. `recu` n'est
+            // qu'un chiffre de diagnostic ; s'il ne tient pas dans `usize`,
+            // il est plafonne.
+            let annonce = r.varint()?;
+            let recu = usize::try_from(annonce).unwrap_or(usize::MAX);
+            if annonce > max as u64 {
+                return Err(WireError::TropDElements { max, recu });
             }
+            let n = recu;
             if let Some(tenable) = r.remaining().checked_div(minimum) {
                 if n > tenable {
                     return Err(WireError::TropDElements {

@@ -183,7 +183,9 @@ impl Index {
     /// Identifiant du bloc indexe a cette hauteur.
     pub fn identifiant(&self, hauteur: u64) -> Option<Hash256> {
         let (premiere, _) = *self.blocs.first()?;
-        let decalage = hauteur.checked_sub(premiere)? as usize;
+        // `try_from` : sur 32 bits, une hauteur absurde tronquee en `usize`
+        // designerait un autre bloc au lieu d'aucun.
+        let decalage = usize::try_from(hauteur.checked_sub(premiere)?).ok()?;
         self.blocs.get(decalage).map(|(_, id)| *id)
     }
 

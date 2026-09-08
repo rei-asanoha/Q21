@@ -1044,13 +1044,21 @@ fn z_fichier_de_blocs_vide() {
 }
 
 /// Un enregistrement dont la taille annoncée déborde du fichier : le balayage
-/// doit s'arrêter, pas lire au-delà.
+/// doit s'arrêter, pas lire au-delà — et surtout ne rien couper.
+///
+/// Depuis le second audit (P4), le cas précis du **premier** enregistrement
+/// est réparé : la genèse est une constante du réseau, son en-tête est intact
+/// à l'octet 4, donc l'enregistrement entier est recopié, préfixe compris.
+/// Ce que l'épreuve vérifie reste le même : rien n'est lu au-delà du fichier
+/// et rien n'est perdu. Elle exige maintenant en plus que les cinq blocs se
+/// relisent.
 #[test]
 fn aa_taille_mensongere_dans_le_fichier_de_blocs() {
     let d = rep("taille-menteuse");
     let (_c, _a) = chaine_sur_disque(&d, 4);
     let chemin = d.join("blocks.dat");
-    let mut donnees = std::fs::read(&chemin).unwrap();
+    let saines = std::fs::read(&chemin).unwrap();
+    let mut donnees = saines.clone();
     // On ment sur la taille du premier enregistrement.
     let faux = 1_000_000u32.to_le_bytes();
     donnees[..4].copy_from_slice(&faux);
@@ -1058,7 +1066,13 @@ fn aa_taille_mensongere_dans_le_fichier_de_blocs() {
 
     let (_, entetes, souci) = BlockArchive::open(&chemin, RESEAU).unwrap();
     eprintln!("en-tetes {} souci {souci:?}", entetes.len());
-    assert!(souci.is_some(), "l'incident doit etre signale");
+    assert!(souci.is_none(), "le prefixe de la genese est repare");
+    assert_eq!(entetes.len(), 5, "aucun bloc n'est perdu");
+    assert_eq!(
+        std::fs::read(&chemin).unwrap(),
+        saines,
+        "le fichier est restaure a l'identique"
+    );
 }
 
 /// Un instantané pris à la tête (recul nul) : `snapshot()` doit le refuser,

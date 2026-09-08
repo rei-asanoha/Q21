@@ -135,8 +135,18 @@ impl<'a> Reader<'a> {
     /// `minimum` est le nombre d'octets qu'un element ne peut pas ne pas
     /// occuper. Le sous-estimer affaiblit le controle ; le surestimer ferait
     /// refuser des donnees valides. Dans le doute, on sous-estime.
+    ///
+    /// # Pourquoi `try_from` et non `as`
+    ///
+    /// Le compte arrive en `u64`. Sur une cible 32 bits, `as usize` tronque :
+    /// `(1 << 32) + 1` devenait `1`, et un compte que tout noeud 64 bits
+    /// refuse etait lu comme un seul element par un noeud 32 bits. Un meme
+    /// bloc valide pour les uns et invalide pour les autres, c'est une
+    /// scission de la chaine par architecture. Un compte qui ne tient pas
+    /// dans `usize` ne peut pas tenir dans l'entree : il est refuse avec la
+    /// meme erreur que sur 64 bits, ou le controle de contenance le refuse.
     pub fn compte(&mut self, minimum: usize) -> Result<usize, ReadError> {
-        let n = self.varint()? as usize;
+        let n = usize::try_from(self.varint()?).map_err(|_| ReadError::ValeurInvalide)?;
         // `checked_div` rend None quand `minimum` vaut zero, ce qui desactive
         // le controle — c'est exactement la convention voulue.
         if let Some(tenable) = self.remaining().checked_div(minimum) {
@@ -215,8 +225,14 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
+    /// Sequence d'octets prefixee de sa longueur.
+    ///
+    /// Meme regle que [`Self::compte`] : une longueur qui ne tient pas dans
+    /// `usize` ne peut pas etre servie par l'entree, et se solde par la
+    /// meme fin prematuree que `take` rendrait sur 64 bits — jamais par une
+    /// troncature silencieuse qui lirait une longueur differente.
     pub fn var_bytes(&mut self) -> Result<&'a [u8], ReadError> {
-        let n = self.varint()? as usize;
+        let n = usize::try_from(self.varint()?).map_err(|_| ReadError::FinPrematuree)?;
         self.take(n)
     }
 
@@ -299,6 +315,54 @@ mod tests {
         assert_eq!(
             Reader::new(&[0xff, 1, 0, 0, 0, 0, 0, 0, 0]).varint(),
             Err(ReadError::VarintNonCanonique)
+        );
+    }
+
+    /// Un compte qui ne tient pas dans 32 bits est refuse de la meme facon
+    /// sur toutes les cibles.
+    ///
+    /// # Le defaut que cette epreuve fige
+    ///
+    /// `compte` et `var_bytes` convertissaient le varint par `as usize`. Sur
+    /// une cible 32 bits, `(1 << 32) + 1` devenait `1` : un noeud ARMv7
+    /// lisait « un element » la ou un noeud x86_64 refusait la trame. Le
+    /// varint est construit a la main, octet par octet, pour que l'epreuve
+    /// ne depende pas de l'encodeur : `ff` puis les huit octets
+    /// petit-boutistes de `0x1_0000_0001`.
+    #[test]
+    fn un_compte_au_dela_de_32_bits_est_refuse_sur_toute_cible() {
+        let forme_longue = [0xffu8, 0x01, 0, 0, 0, 0x01, 0, 0, 0];
+        // Le varint seul se lit bien : c'est un u64 canonique.
+        assert_eq!(Reader::new(&forme_longue).varint(), Ok(0x1_0000_0001));
+
+        // Un compte suivi d'un seul octet de charge : quelle que soit la
+        // largeur de `usize`, la reponse est ValeurInvalide.
+        let mut trame = forme_longue.to_vec();
+        trame.push(0xaa);
+        for minimum in [1usize, 40, 160] {
+            assert_eq!(
+                Reader::new(&trame).compte(minimum),
+                Err(ReadError::ValeurInvalide),
+                "minimum {minimum}"
+            );
+        }
+        // Une sequence d'octets annoncee a plus de 4 Gio : fin prematuree,
+        // jamais une lecture d'un seul octet.
+        assert_eq!(
+            Reader::new(&trame).var_bytes(),
+            Err(ReadError::FinPrematuree)
+        );
+        // Et la valeur maximale, pour la forme.
+        let mut extreme = vec![0xffu8];
+        extreme.extend_from_slice(&u64::MAX.to_le_bytes());
+        extreme.push(0xaa);
+        assert_eq!(
+            Reader::new(&extreme).compte(1),
+            Err(ReadError::ValeurInvalide)
+        );
+        assert_eq!(
+            Reader::new(&extreme).var_bytes(),
+            Err(ReadError::FinPrematuree)
         );
     }
 

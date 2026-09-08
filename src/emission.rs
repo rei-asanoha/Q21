@@ -80,40 +80,98 @@ pub fn block_subsidy(height: u64) -> Amount {
     Amount::from_units(apres - avant)
 }
 
+/// Recompense de base de l'epoque suivante : une multiplication u128 puis
+/// une division entiere, arrondie vers le bas.
+fn base_suivante(base: u64) -> u64 {
+    ((base as u128 * DECAY_NUM) / DECAY_DEN) as u64
+}
+
+/// Ajoute a `total` ce qu'emettent les blocs `start..=end` d'une meme epoque
+/// dont la recompense de base est `base`.
+///
+/// C'est **la** definition de ce qu'une epoque emet : la table de
+/// memoisation et le calcul de la tranche courante passent tous deux par
+/// ici, ce qui interdit qu'ils divergent d'une unite.
+fn ajouter_l_epoque(total: u64, base: u64, start: u64, end: u64) -> u64 {
+    let paye = base.max(TAIL_REWARD);
+    if start < SLOW_START_BLOCKS {
+        // La rampe est encore active : chaque bloc vaut une valeur differente.
+        let mut t = total;
+        for h in start..=end {
+            t = t.saturating_add(apply_slow_start(paye, h));
+        }
+        t
+    } else {
+        let n = end - start + 1;
+        total.saturating_add(paye.saturating_mul(n))
+    }
+}
+
+/// Etat du calendrier au debut de chaque epoque : (total deja emis, recompense
+/// de base de l'epoque). La derniere entree est la premiere epoque dont le
+/// total de depart atteint le plafond.
+///
+/// # Pourquoi une table
+///
+/// `cumulative_emission` reparcourait le calendrier depuis le bloc 0 a chaque
+/// appel — la rampe bloc par bloc (20 000 iterations), puis une iteration par
+/// epoque. `block_subsidy` l'appelle deux fois, et le validateur appelle
+/// `block_subsidy` pour chaque bloc connecte, sous le verrou de la chaine :
+/// 300 a 500 microsecondes par bloc, autant qu'une verification de signature
+/// ML-DSA-87, pour un resultat qui ne depend que de la hauteur. Sur une
+/// synchronisation initiale de millions de blocs, des dizaines de minutes de
+/// pur recalcul ; sur une reorganisation de 720 blocs, pres d'une seconde
+/// verrou tenu.
+///
+/// La table est construite une fois, par le meme code que la version
+/// iterative (memes entiers, meme ordre d'operations, memes saturations) :
+/// quelque six mille entrees, moins de 100 Kio. Le resultat est bit a bit
+/// celui de l'ancienne fonction — l'epreuve
+/// `la_memoisation_rend_exactement_la_reference` le verifie contre une copie
+/// de l'ancienne implementation.
+fn debuts_d_epoque() -> &'static [(u64, u64)] {
+    static TABLE: std::sync::OnceLock<Vec<(u64, u64)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = Vec::new();
+        let mut total: u64 = 0;
+        let mut base: u64 = INITIAL_REWARD;
+        let mut epoch: u64 = 0;
+        loop {
+            table.push((total, base));
+            if total >= EMISSION_CAP {
+                break;
+            }
+            let start = epoch * DECAY_EPOCH_BLOCKS;
+            total = ajouter_l_epoque(total, base, start, start + DECAY_EPOCH_BLOCKS - 1);
+            base = base_suivante(base);
+            epoch += 1;
+        }
+        table
+    })
+}
+
 /// Total emis par le minage, du bloc 0 au bloc `height` inclus.
 ///
-/// Hors piece de genese. Parcourt les epoques plutot que les blocs, sauf sur la
-/// rampe ou chaque bloc a une valeur propre.
+/// Hors piece de genese. Lit dans [`debuts_d_epoque`] l'etat au debut de
+/// l'epoque de `height`, puis n'ajoute que les blocs de cette epoque — sur la
+/// rampe bloc par bloc, sinon d'une multiplication.
 ///
 /// La recompense d'epoque est bornee en dessous par [`TAIL_REWARD`], et le
 /// total est ecrete a [`EMISSION_CAP`] : c'est cette paire — plancher puis
 /// ecretage — qui fait atteindre le plafond exactement, en temps fini.
 pub fn cumulative_emission(height: u64) -> Amount {
-    let mut total: u64 = 0;
-    let mut epoch: u64 = 0;
-    let mut base: u64 = INITIAL_REWARD;
-
-    loop {
-        let start = epoch * DECAY_EPOCH_BLOCKS;
-        if start > height || total >= EMISSION_CAP {
-            break;
-        }
-        let end = core::cmp::min(height, start + DECAY_EPOCH_BLOCKS - 1);
-        let paye = base.max(TAIL_REWARD);
-
-        if start < SLOW_START_BLOCKS {
-            // La rampe est encore active : chaque bloc vaut une valeur differente.
-            for h in start..=end {
-                total = total.saturating_add(apply_slow_start(paye, h));
-            }
-        } else {
-            let n = end - start + 1;
-            total = total.saturating_add(paye.saturating_mul(n));
-        }
-
-        base = ((base as u128 * DECAY_NUM) / DECAY_DEN) as u64;
-        epoch += 1;
+    let table = debuts_d_epoque();
+    let epoch = height / DECAY_EPOCH_BLOCKS;
+    // Au-dela de la table, le calendrier iteratif se serait arrete a la
+    // derniere entree, dont le total atteint deja le plafond.
+    let Some(&(total, base)) = usize::try_from(epoch).ok().and_then(|e| table.get(e)) else {
+        return Amount::from_units(EMISSION_CAP);
+    };
+    if total >= EMISSION_CAP {
+        return Amount::from_units(EMISSION_CAP);
     }
+    let start = epoch * DECAY_EPOCH_BLOCKS;
+    let total = ajouter_l_epoque(total, base, start, height);
 
     // L'ecretage. Avant le plancher, cette ligne etait un garde-fou qui ne
     // servait jamais ; elle est desormais la regle qui termine l'emission, et
@@ -151,6 +209,132 @@ pub fn total_supply_at(height: u64) -> Amount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L'implementation d'origine de `cumulative_emission`, conservee telle
+    /// quelle comme reference : elle reparcourt le calendrier depuis le bloc 0
+    /// a chaque appel. C'est la definition du consensus ; la version
+    /// memoisee doit lui etre egale bit a bit.
+    fn cumulative_emission_reference(height: u64) -> Amount {
+        let mut total: u64 = 0;
+        let mut epoch: u64 = 0;
+        let mut base: u64 = INITIAL_REWARD;
+
+        loop {
+            let start = epoch * DECAY_EPOCH_BLOCKS;
+            if start > height || total >= EMISSION_CAP {
+                break;
+            }
+            let end = core::cmp::min(height, start + DECAY_EPOCH_BLOCKS - 1);
+            let paye = base.max(TAIL_REWARD);
+
+            if start < SLOW_START_BLOCKS {
+                for h in start..=end {
+                    total = total.saturating_add(apply_slow_start(paye, h));
+                }
+            } else {
+                let n = end - start + 1;
+                total = total.saturating_add(paye.saturating_mul(n));
+            }
+
+            base = ((base as u128 * DECAY_NUM) / DECAY_DEN) as u64;
+            epoch += 1;
+        }
+
+        Amount::from_units(total.min(EMISSION_CAP))
+    }
+
+    /// L'implementation d'origine de `block_subsidy`, sur la reference.
+    fn block_subsidy_reference(height: u64) -> Amount {
+        if height == 0 {
+            return Amount::from_units(0);
+        }
+        let apres = cumulative_emission_reference(height).units();
+        let avant = cumulative_emission_reference(height - 1).units();
+        Amount::from_units(apres - avant)
+    }
+
+    /// Dernier bloc emetteur, tel que le calendrier le fixe.
+    const DERNIER_BLOC_EMETTEUR: u64 = 26_273_578;
+
+    /// La memoisation rend exactement ce que rendait l'ancienne fonction.
+    ///
+    /// Echantillon : toutes les hauteurs de 0 a 100 000 (rampe comprise,
+    /// premieres frontieres d'epoque), puis chaque frontiere d'epoque et ses
+    /// voisines jusqu'au-dela du dernier bloc emetteur, plus les bornes du
+    /// calendrier (fin d'emission, tres loin devant, `u64::MAX`).
+    #[test]
+    fn la_memoisation_rend_exactement_la_reference() {
+        let mut hauteurs: Vec<u64> = (0..=100_000).collect();
+        let fin = hauteur_de_fin_d_emission();
+        assert_eq!(fin - 1, DERNIER_BLOC_EMETTEUR);
+        let mut e = 0u64;
+        while e * DECAY_EPOCH_BLOCKS <= fin + 2 * DECAY_EPOCH_BLOCKS {
+            let s = e * DECAY_EPOCH_BLOCKS;
+            hauteurs.extend([s.saturating_sub(1), s, s + 1, s + DECAY_EPOCH_BLOCKS / 2]);
+            e += 1;
+        }
+        hauteurs.extend([
+            SLOW_START_BLOCKS - 1,
+            SLOW_START_BLOCKS,
+            SLOW_START_BLOCKS + 1,
+            fin - 2,
+            fin - 1,
+            fin,
+            fin + 1,
+            fin + BLOCKS_PER_YEAR * 100,
+            BLOCKS_PER_YEAR * 500,
+            u64::MAX / DECAY_EPOCH_BLOCKS,
+            u64::MAX - 1,
+            u64::MAX,
+        ]);
+        for h in hauteurs {
+            assert_eq!(
+                cumulative_emission(h),
+                cumulative_emission_reference(h),
+                "cumul a la hauteur {h}"
+            );
+            assert_eq!(
+                block_subsidy(h),
+                block_subsidy_reference(h),
+                "subvention a la hauteur {h}"
+            );
+        }
+    }
+
+    /// Mesure indicative, imprimee : la memoisation ramene `block_subsidy`
+    /// de quelques centaines de microsecondes a quelques dizaines de
+    /// nanosecondes. Pas d'assertion sur le temps — une machine chargee ne
+    /// doit pas faire echouer la suite — seulement sur l'egalite.
+    #[test]
+    fn mesure_de_la_subvention_avant_et_apres_memoisation() {
+        let hauteurs = [
+            10_000u64,
+            100_000,
+            1_000_000,
+            5_000_000,
+            DERNIER_BLOC_EMETTEUR,
+        ];
+        let _ = block_subsidy(1);
+        for h in hauteurs {
+            let tours = 200u32;
+            let t = std::time::Instant::now();
+            for _ in 0..tours {
+                std::hint::black_box(block_subsidy_reference(std::hint::black_box(h)));
+            }
+            let d_ref = t.elapsed();
+            let t = std::time::Instant::now();
+            for _ in 0..(tours * 1000) {
+                std::hint::black_box(block_subsidy(std::hint::black_box(h)));
+            }
+            let d_memo = t.elapsed();
+            assert_eq!(block_subsidy(h), block_subsidy_reference(h));
+            eprintln!(
+                "block_subsidy(h={h}) : reference {:.1} us/appel, memoise {:.1} ns/appel",
+                d_ref.as_secs_f64() * 1e6 / f64::from(tours),
+                d_memo.as_secs_f64() * 1e9 / f64::from(tours * 1000)
+            );
+        }
+    }
 
     #[test]
     fn le_bloc_de_genese_n_emet_rien_par_le_minage() {
