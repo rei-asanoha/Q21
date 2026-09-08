@@ -1620,7 +1620,10 @@ impl RpcContext {
                 let mut o = Json::obj()
                     .set("indice", Json::u64(i as u64))
                     .set("adresse", Json::str(a.to_string_bech32()))
-                    .set("consommee", Json::Bool(consommees.contains(&(i as u32))));
+                    .set("consommee", Json::Bool(consommees.contains(&(i as u32))))
+                    // Demandee par le porteur, ou derivee par le minage : c'est
+                    // ce qui decide de la montrer en premier ou de la ranger.
+                    .set("demandee", Json::Bool(g.est_demandee(i as u32)));
                 // L'etiquette n'est presente que si elle existe : une chaine
                 // vide dans la reponse obligerait chaque appelant a distinguer
                 // « sans nom » de « nomme par du vide ».
@@ -2456,7 +2459,7 @@ impl RpcContext {
         let mut g = w
             .lock()
             .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
-        let a = g.new_address();
+        let a = g.demander_adresse();
         // Le compteur d'indices vient d'avancer : sans ecriture, un redemarrage
         // redistribuerait la meme adresse. On ne la donne donc pas si le disque
         // ne l'a pas vue.
@@ -3170,6 +3173,34 @@ mod tests {
         assert!(liste.as_array().expect("tableau")[0]
             .get("etiquette")
             .is_none());
+    }
+
+    /// `listaddresses` dit lesquelles le porteur a demandees.
+    ///
+    /// L'interface range les adresses derivees par le minage et ne montre en
+    /// premier que celles que le porteur a reellement distribuees. Elle ne
+    /// peut le faire que si le noeud le lui dit.
+    #[test]
+    fn la_liste_distingue_les_adresses_demandees_de_celles_du_minage() {
+        let c = contexte(true);
+        // Une adresse derivee sans passer par `getnewaddress` : celle du minage.
+        {
+            let w = c.wallet.as_ref().expect("portefeuille");
+            let mut g = w.lock().expect("verrou");
+            let _ = g.new_address();
+        }
+        let _ = resultat(&c, "getnewaddress", "{}");
+        let liste = resultat(&c, "listaddresses", "{}");
+        let a = liste.as_array().expect("tableau d'adresses");
+        assert_eq!(a.len(), 2);
+        assert!(
+            matches!(a[0].get("demandee"), Some(Json::Bool(false))),
+            "l'adresse du minage n'est pas demandee"
+        );
+        assert!(
+            matches!(a[1].get("demandee"), Some(Json::Bool(true))),
+            "l'adresse de `getnewaddress` est demandee"
+        );
     }
 
     /// On ne nomme pas une adresse qui n'existe pas.

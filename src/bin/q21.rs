@@ -651,8 +651,16 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     // graine. L'hexadecimal ne contient aucun de ces caracteres, par
     // construction.
     let etiquettes = etiquettes_en_texte(w.etiquettes());
+    // Les adresses que le porteur a demandees lui-meme, pour les distinguer
+    // des centaines que le minage derive. Ce n'est qu'un ordre de
+    // presentation : perdre cette ligne ne perd ni une clef ni un fond.
+    let demandees: Vec<String> = w
+        .indices_demandes()
+        .iter()
+        .map(|i| i.to_string())
+        .collect();
     let contenu = format!(
-        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserie={}\nverifie_jusqu_a={}\nconsommes={}\netiquettes={}\n",
+        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserie={}\nverifie_jusqu_a={}\nconsommes={}\netiquettes={}\ndemandees={}\n",
         w.seed_hex(),
         w.next_index(),
         reseau,
@@ -660,7 +668,8 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
         serie,
         w.verifie_jusqu_a(),
         consommes.join(","),
-        etiquettes
+        etiquettes,
+        demandees.join(",")
     );
     // Le portefeuille est scelle si une phrase secrete est connue de cette
     // session. La graine ne doit jamais toucher le disque en clair quand
@@ -884,6 +893,7 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     let mut serie = 0u64;
     let mut consommes: Vec<u32> = Vec::new();
     let mut etiquettes: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut demandees: Vec<u32> = Vec::new();
     let mut verifie_jusqu_a = 0u64;
     let mut reseau = Network::Regtest;
     // Absent des portefeuilles ecrits avant l'arrivee de ML-DSA : on retombe
@@ -911,6 +921,16 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
             // malformee est ignoree seule, sans emporter les autres — perdre un
             // nom est ennuyeux, perdre le portefeuille ne l'est pas.
             "etiquettes" => etiquettes = texte_en_etiquettes(valeur),
+            // Absent des portefeuilles anterieurs : leurs adresses passent
+            // toutes pour derivees par le minage, ce qui n'est qu'un ordre de
+            // presentation.
+            "demandees" => {
+                demandees = valeur
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse().ok())
+                    .collect()
+            }
             "scheme" => {
                 scheme = valeur
                     .parse::<u8>()
@@ -968,6 +988,7 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     };
     w.marquer_consommes(&consommes);
     w.charger_etiquettes(etiquettes);
+    w.charger_demandees(&demandees);
     w.noter_verification(verifie_jusqu_a);
     if !adopte {
         w.rescan(next_index);
@@ -1929,7 +1950,7 @@ fn cmd_info(datadir: &Path) -> Result<(), String> {
 
 fn cmd_address(datadir: &Path) -> Result<(), String> {
     let mut e = charger(datadir)?;
-    let a = e.wallet.new_address();
+    let a = e.wallet.demander_adresse();
     ecrire_portefeuille(&e.datadir, &e.wallet)?;
     println!("{a}");
     println!();
@@ -4638,7 +4659,7 @@ fn traiter_installation(
             retenir_phrase(Some(phrase));
             match lire_portefeuille(datadir) {
                 Ok(mut w) => {
-                    let adresse = w.new_address().to_string();
+                    let adresse = w.demander_adresse().to_string();
                     Json::obj().set("adresse", Json::str(adresse)).build()
                 }
                 Err(_) => {
