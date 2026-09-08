@@ -26,7 +26,7 @@ use crate::lamport::SecretKey;
 use crate::sig::{pubkey_hash, SchemeId};
 use crate::tx::{OutPoint, Transaction, TxIn, TxOut, Witness};
 use crate::utxo::UtxoSet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum WalletError {
@@ -128,6 +128,22 @@ pub struct Wallet {
     /// reste du portefeuille quand une phrase secrete existe — « pour Mathis »
     /// en dit long sur qui l'on frequente, et cela ne regarde personne.
     etiquettes: HashMap<u32, String>,
+    /// Indices que le porteur a **demandes** lui-meme : par le bouton
+    /// « Nouvelle adresse », par `q21 address`, par `getnewaddress`.
+    ///
+    /// # Pourquoi cette distinction existe
+    ///
+    /// Le minage derive une adresse par bloc trouve, et c'est la bonne
+    /// granularite : elle evite de relier publiquement toutes les recompenses
+    /// entre elles. Mais au bout de quelques jours, un mineur possede un
+    /// millier d'adresses qu'il n'a jamais demandees et n'a aucune raison de
+    /// distribuer. Les lui presenter comme « ses adresses » noie les deux ou
+    /// trois qu'il a reellement donnees a quelqu'un.
+    ///
+    /// L'ensemble ne change rien au solde ni a la securite : toutes les
+    /// adresses derivees restent reconnues et depensables. Il ne sert qu'a
+    /// savoir lesquelles montrer en premier.
+    demandees: BTreeSet<u32>,
 }
 
 /// Efface la graine a la destruction du portefeuille.
@@ -153,6 +169,7 @@ impl Wallet {
             consommes: Vec::new(),
             verifie_jusqu_a: 0,
             etiquettes: HashMap::new(),
+            demandees: BTreeSet::new(),
         }
     }
 
@@ -182,6 +199,7 @@ impl Wallet {
             consommes: Vec::new(),
             verifie_jusqu_a: 0,
             etiquettes: HashMap::new(),
+            demandees: BTreeSet::new(),
         })
     }
 
@@ -358,6 +376,39 @@ impl Wallet {
             scheme: self.scheme,
             hash: h,
         }
+    }
+
+    /// Produit une adresse neuve **a la demande du porteur**, et s'en souvient.
+    ///
+    /// C'est la seule difference avec [`Wallet::new_address`] : l'indice est
+    /// note comme demande, pour que l'interface la presente parmi les adresses
+    /// que le porteur a reellement distribuees, et non parmi les centaines que
+    /// le minage derive tout seul.
+    pub fn demander_adresse(&mut self) -> Address {
+        let a = self.new_address();
+        self.demandees.insert(self.next_index - 1);
+        a
+    }
+
+    /// Cette adresse a-t-elle ete demandee par le porteur, plutot que derivee
+    /// par le minage ou par une restauration ?
+    pub fn est_demandee(&self, indice: u32) -> bool {
+        self.demandees.contains(&indice)
+    }
+
+    /// Indices demandes par le porteur, tries, pour l'ecriture du portefeuille.
+    pub fn indices_demandes(&self) -> Vec<u32> {
+        self.demandees.iter().copied().collect()
+    }
+
+    /// Reinstalle les indices demandes lus dans le fichier.
+    ///
+    /// Un fichier ecrit avant l'arrivee de cette distinction n'a pas la ligne :
+    /// toutes ses adresses passent alors pour derivees par le minage, et le
+    /// porteur les retrouve en les cherchant ou en les nommant. Rien n'est
+    /// perdu, seul l'ordre de presentation change.
+    pub fn charger_demandees(&mut self, indices: &[u32]) {
+        self.demandees.extend(indices.iter().copied());
     }
 
     /// Rejoue la derivation pour retrouver les adresses apres un redemarrage.
@@ -1184,6 +1235,37 @@ mod mldsa_wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le minage derive des adresses ; seules celles que le porteur demande
+    /// sont notees comme telles, et la note survit au rechargement.
+    ///
+    /// Un mineur possede vite un millier d'adresses qu'il n'a jamais
+    /// distribuees : les presenter au meme rang que les deux qu'il a donnees
+    /// noie ces deux-la. La distinction ne touche ni au solde ni aux clefs.
+    #[test]
+    fn seules_les_adresses_demandees_sont_notees_comme_telles() {
+        let mut w = Wallet::from_seed([7u8; 32], Network::Regtest);
+        let minage = w.new_address();
+        let donnee = w.demander_adresse();
+        let _ = w.new_address();
+        assert!(!w.est_demandee(0), "une adresse de minage n'est pas demandee");
+        assert!(w.est_demandee(1), "une adresse demandee l'est");
+        assert!(!w.est_demandee(2));
+        assert_ne!(minage.hash, donnee.hash);
+        assert_eq!(w.indices_demandes(), vec![1]);
+        // Les deux restent reconnues comme siennes : rien ne change au solde.
+        assert!(w.owns(&minage.hash));
+        assert!(w.owns(&donnee.hash));
+
+        // Rechargement depuis le fichier : la note revient, et un fichier
+        // anterieur sans la ligne donne simplement un ensemble vide.
+        let mut r = Wallet::from_seed([7u8; 32], Network::Regtest);
+        r.rescan(3);
+        assert!(!r.est_demandee(1), "sans la ligne, rien n'est demande");
+        r.charger_demandees(&w.indices_demandes());
+        assert!(r.est_demandee(1));
+        assert_eq!(r.indices_demandes(), vec![1]);
+    }
     use crate::chain::{genesis_block, Chain, GENESIS_TIME};
     use crate::consensus::TARGET_BLOCK_SECS;
 
