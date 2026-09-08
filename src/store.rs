@@ -106,17 +106,133 @@ fn chemin_de_la_coupe(chemin: &Path) -> PathBuf {
     PathBuf::from(nom)
 }
 
+/// Lit au plus `longueur` octets a partir de `depuis` ; moins si le fichier
+/// finit avant.
+fn lire_a(chemin: &Path, depuis: u64, longueur: u64) -> std::io::Result<Vec<u8>> {
+    let mut f = File::open(chemin)?;
+    // On ne reserve que ce que le fichier peut fournir : la borne demandee
+    // peut valoir des dizaines de mebioctets pour quelques centaines lus.
+    let disponible = f.metadata()?.len().saturating_sub(depuis);
+    f.seek(SeekFrom::Start(depuis))?;
+    let mut octets = Vec::with_capacity(usize::try_from(longueur.min(disponible)).unwrap_or(0));
+    f.take(longueur).read_to_end(&mut octets)?;
+    Ok(octets)
+}
+
 /// Copie `longueur` octets a partir de `depuis` dans le fichier de coupe,
 /// avant qu'ils ne soient retires. Une copie precedente est ecrasee : elle
 /// concernait une reparation deja passee.
 fn copier_la_queue(chemin: &Path, depuis: u64, longueur: u64) -> std::io::Result<()> {
-    let mut f = File::open(chemin)?;
-    f.seek(SeekFrom::Start(depuis))?;
-    let mut octets = Vec::with_capacity(longueur as usize);
-    f.take(longueur).read_to_end(&mut octets)?;
+    let octets = lire_a(chemin, depuis, longueur)?;
     let mut sortie = File::create(chemin_de_la_coupe(chemin))?;
     sortie.write_all(&octets)?;
     sortie.sync_all()
+}
+
+/// Combien de prefixes de longueur une ouverture accepte de reparer avant de
+/// s'arreter et de laisser l'incident signale. Chaque reparation relance le
+/// balayage entier ; une carte qui a retourne plus de bits que cela n'est
+/// plus un support sur lequel reparer quoi que ce soit.
+const MAX_REPARATIONS_DE_PREFIXE: u32 = 64;
+
+/// Jusqu'ou remonter, depuis la fin, pour retrouver le dernier enregistrement
+/// dont le corps se relit. Un prefixe trop court fait accepter au balayage un
+/// ou deux enregistrements fantomes derriere lui, rarement plus ; au-dela, ce
+/// n'est plus un prefixe abime.
+const MAX_RECUL: usize = 64;
+
+/// Un prefixe de longueur a reecrire.
+struct PrefixeAReparer {
+    /// Position des quatre octets du prefixe dans le fichier.
+    position: u64,
+    /// Index de l'enregistrement, tel que le balayage le compte.
+    index: usize,
+    /// Ce que le prefixe annonce.
+    lu: u32,
+    /// Ce que le bloc occupe reellement.
+    reel: u32,
+    hauteur: u64,
+}
+
+/// Le bloc complet qui commence `octets`, s'il y en a un **et** s'il se
+/// rattache a ce fichier ; avec la longueur reelle de son enregistrement.
+///
+/// # Pourquoi deux conditions
+///
+/// Qu'un bloc se decode ne suffit pas : cent soixante-deux octets nuls sont
+/// un bloc parfaitement decodable (en-tete nul, zero transaction, zero
+/// oncle), et une queue de zeros est precisement ce qu'un systeme de fichiers
+/// laisse apres une coupure de courant. On exige donc en plus que le bloc se
+/// **rattache** : son parent est un enregistrement deja lu, ou l'enregistrement
+/// qui le suit s'enchaine sur lui. Une ecriture interrompue ne satisfait ni
+/// l'une ni l'autre ; un enregistrement au prefixe abime satisfait au moins
+/// l'une des deux — y compris le premier bloc d'une fenetre elaguee, dont le
+/// parent n'est plus dans le fichier mais dont le successeur y est.
+///
+/// Le reencodage doit rendre exactement les octets lus : l'encodage est
+/// canonique, et c'est ce qui interdit d'accepter une longueur qui ne serait
+/// pas celle que `append` a ecrite.
+fn enregistrement_rattache(
+    octets: &[u8],
+    connus: &std::collections::HashSet<crate::hash::Hash256>,
+) -> Option<(BlockHeader, usize)> {
+    let (bloc, reel) = Block::decode_en_tete_de(octets).ok()?;
+    if reel < BlockHeader::SIZE || reel > MAX_BLOC_SERIALISE as usize {
+        return None;
+    }
+    if bloc.encode() != octets[..reel] {
+        return None;
+    }
+    let id = bloc.header.block_id();
+    let parent_connu = connus.contains(&bloc.header.prev_block);
+    let suivant_s_enchaine = octets.len() >= reel + 4 + BlockHeader::SIZE && {
+        let taille = u32::from_le_bytes([
+            octets[reel],
+            octets[reel + 1],
+            octets[reel + 2],
+            octets[reel + 3],
+        ]);
+        (BlockHeader::SIZE as u32..=MAX_BLOC_SERIALISE).contains(&taille)
+            && BlockHeader::decode(&octets[reel + 4..reel + 4 + BlockHeader::SIZE])
+                .map(|h| h.prev_block == id)
+                .unwrap_or(false)
+    };
+    if parent_connu || suivant_s_enchaine {
+        Some((bloc.header, reel))
+    } else {
+        None
+    }
+}
+
+/// La genese est-elle reconnaissable en tete du fichier, malgre des octets
+/// abimes ? Deux indices suffisent, chacun seul : l'en-tete a l'octet 4 est
+/// celui de la genese (prefixe de longueur faux, contenu intact), ou
+/// l'enregistrement place juste apres la longueur canonique s'enchaine sur
+/// la genese (prefixe ou contenu faux, la suite du fichier est bien la
+/// notre). Rend `false` si l'enregistrement est deja canonique : il n'y a
+/// alors rien a recopier, et le mal est ailleurs.
+fn la_genese_est_reconnaissable(
+    chemin: &Path,
+    canonique: &[u8],
+    attendu: crate::hash::Hash256,
+) -> std::io::Result<bool> {
+    let l = canonique.len();
+    let octets = lire_a(chemin, 0, (4 + l + 4 + BlockHeader::SIZE) as u64)?;
+    if octets.len() >= 4 + l
+        && octets[..4] == (l as u32).to_le_bytes()
+        && octets[4..4 + l] == *canonique
+    {
+        return Ok(false);
+    }
+    let entete_intact = octets.len() >= 4 + BlockHeader::SIZE
+        && BlockHeader::decode(&octets[4..4 + BlockHeader::SIZE])
+            .map(|h| h.block_id() == attendu)
+            .unwrap_or(false);
+    let suivant_s_enchaine = octets.len() >= 4 + l + 4 + BlockHeader::SIZE
+        && BlockHeader::decode(&octets[4 + l + 4..4 + l + 4 + BlockHeader::SIZE])
+            .map(|h| h.prev_block == attendu)
+            .unwrap_or(false);
+    Ok(entete_intact || suivant_s_enchaine)
 }
 
 /// Position d'un enregistrement dans le fichier.
@@ -336,6 +452,10 @@ pub struct Elagage {
 pub struct BlockArchive {
     store: BlockStore,
     positions: std::sync::Mutex<std::collections::HashMap<crate::hash::Hash256, RecordRef>>,
+    /// Corps deja signales comme illisibles : un seul avertissement par bloc,
+    /// pas un par lecture — un pair qui redemande le meme bloc ne doit pas
+    /// remplir le journal.
+    illisibles_signales: std::sync::Mutex<std::collections::HashSet<crate::hash::Hash256>>,
 }
 
 impl BlockArchive {
@@ -348,18 +468,26 @@ impl BlockArchive {
         chemin: P,
         reseau: crate::address::Network,
     ) -> Result<(BlockArchive, Vec<BlockHeader>, Option<StoreError>), StoreError> {
-        Self::ouvrir(chemin.as_ref(), reseau, true)
+        Self::ouvrir(chemin.as_ref(), reseau, true, 0)
     }
 
     /// `reparer_la_genese` n'est vrai qu'a la premiere tentative : une
     /// reparation qui ne changerait rien ne doit pas boucler.
+    /// `prefixes_repares` compte les prefixes de longueur deja reecrits par
+    /// cette ouverture, pour la meme raison.
     fn ouvrir(
         chemin: &Path,
         reseau: crate::address::Network,
         reparer_la_genese: bool,
+        prefixes_repares: u32,
     ) -> Result<(BlockArchive, Vec<BlockHeader>, Option<StoreError>), StoreError> {
         let store = BlockStore::new(chemin);
         let (entetes, souci) = store.scan_headers()?;
+        let taille_fichier = if store.exists() {
+            std::fs::metadata(store.path())?.len()
+        } else {
+            0
+        };
 
         // --- La racine, avant tout le reste.
         //
@@ -373,42 +501,120 @@ impl BlockArchive {
         // L'identifiant de la genese est une constante du reseau. On la compare
         // ici, une fois, a l'endroit ou toute chaine sur disque entre dans le
         // programme.
-        if let Some((premier, ref_premier)) = entetes.first() {
-            let attendu = crate::chain::genesis_id(reseau);
-            let vu = premier.block_id();
-            if vu != attendu {
-                // --- Une genese abimee n'est pas une genese etrangere.
-                //
-                // La genese est une constante du reseau, reecrite sans etat.
-                // Si le **second** enregistrement s'enchaine sur la vraie
-                // genese, le premier n'est pas celui d'une autre chaine : ce
-                // sont quelques octets retournes sur la carte. Les ranger
-                // comme « ancienne chaine » abandonnait toute l'histoire
-                // locale pour un bit ; on recopie la genese canonique a sa
-                // place, si elle y tient.
-                let suivant_s_enchaine = entetes
-                    .get(1)
-                    .map(|(h, _)| h.prev_block == attendu)
-                    .unwrap_or(false);
-                let canonique = crate::chain::genesis_block(reseau).encode();
-                if reparer_la_genese
-                    && suivant_s_enchaine
-                    && canonique.len() as u32 == ref_premier.len
-                {
-                    let mut f = OpenOptions::new().write(true).open(store.path())?;
-                    f.seek(SeekFrom::Start(ref_premier.offset))?;
-                    f.write_all(&canonique)?;
-                    f.sync_all()?;
-                    eprintln!(
-                        "  fichier des blocs repare : l'enregistrement de la genese etait abime, \
-                         la genese du reseau a ete recopiee a sa place"
-                    );
-                    // On relit : la suite du chargement doit voir le fichier tel
-                    // qu'il est maintenant.
-                    drop(f);
-                    return Self::ouvrir(store.path(), reseau, false);
+        //
+        // --- Une genese abimee n'est pas une genese etrangere.
+        //
+        // La genese est une constante du reseau, reecrite sans etat. Si
+        // l'en-tete a l'octet 4 est le sien, ou si l'enregistrement qui suit
+        // sa longueur canonique s'enchaine sur elle, le premier enregistrement
+        // n'est pas celui d'une autre chaine : ce sont quelques octets
+        // retournes sur la carte. Les ranger comme « ancienne chaine »
+        // abandonnait toute l'histoire locale pour un bit. Une premiere
+        // version ne recopiait que le **contenu**, a la longueur annoncee :
+        // un bit dans le **prefixe de longueur** de la genese la laissait
+        // hors d'atteinte — le balayage se desalignait ou ne rendait rien, et
+        // le noeud mourait en conseillant `q21 init`. On recopie desormais
+        // l'enregistrement entier, prefixe compris, quel que soit le prefixe
+        // lu.
+        let attendu = crate::chain::genesis_id(reseau);
+        let canonique = crate::chain::genesis_block(reseau).encode();
+        let premier_sain = entetes
+            .first()
+            .map(|(h, r)| h.block_id() == attendu && r.len as usize == canonique.len())
+            .unwrap_or(false);
+        if !premier_sain && taille_fichier > 0 {
+            if reparer_la_genese && la_genese_est_reconnaissable(store.path(), &canonique, attendu)?
+            {
+                let mut f = OpenOptions::new().write(true).open(store.path())?;
+                f.seek(SeekFrom::Start(0))?;
+                f.write_all(&(canonique.len() as u32).to_le_bytes())?;
+                f.write_all(&canonique)?;
+                f.sync_all()?;
+                eprintln!(
+                    "  fichier des blocs repare : l'enregistrement de la genese etait abime \
+                     (prefixe de longueur ou contenu), la genese du reseau a ete recopiee \
+                     a sa place"
+                );
+                // On relit : la suite du chargement doit voir le fichier tel
+                // qu'il est maintenant.
+                drop(f);
+                return Self::ouvrir(store.path(), reseau, false, prefixes_repares);
+            }
+            match entetes.first() {
+                Some((premier, _)) if premier.block_id() != attendu => {
+                    return Err(StoreError::GeneseEtrangere {
+                        attendu,
+                        vu: premier.block_id(),
+                    });
                 }
-                return Err(StoreError::GeneseEtrangere { attendu, vu });
+                // La genese est reconnue mais sa longueur annoncee est fausse
+                // et la recopie a deja eu lieu : la reparation de prefixe
+                // ci-dessous a le dernier mot.
+                Some(_) => {}
+                None => eprintln!(
+                    "avertissement : le fichier des blocs ({taille_fichier} octet(s)) ne commence \
+                     par aucun enregistrement lisible, et rien n'y ressemble a la genese de ce \
+                     reseau : il est illisible ou n'est pas un fichier de blocs Q21 \
+                     ({})",
+                    souci.as_ref().map(|s| s.to_string()).unwrap_or_default()
+                ),
+            }
+        }
+
+        // --- Un prefixe de longueur abime se reecrit, il ne se coupe pas.
+        //
+        // Chaque enregistrement est precede de sa longueur sur quatre octets.
+        // Un bit retourne la-dedans, et le balayage ne comprend plus la suite :
+        // trop long, il pointe au-dela du fichier (« ecriture interrompue »)
+        // ou au milieu de l'enregistrement suivant ; trop court, le balayage
+        // accepte le bloc avec une longueur fausse puis lit n'importe quoi
+        // derriere. Dans les deux cas, **tous les octets du bloc sont la**.
+        //
+        // La premiere version traitait le cas « trop long, pres de la fin »
+        // comme une ecriture interrompue et coupait tout ce qui suivait le
+        // dernier enregistrement complet — jusqu'a `MAX_BLOCK_SIZE` octets,
+        // soit des milliers de blocs vides : un bit effacait trois semaines de
+        // chaine en annoncant une reparation reussie, et l'instantane, pris
+        // sous la tete, ne designait plus rien. Le cas « au milieu » coutait
+        // une revalidation depuis la genese et le retelechargement de tout ce
+        // qui suivait.
+        //
+        // Un bloc s'encode de facon canonique et se delimite lui-meme : on
+        // retrouve sa longueur reelle en le decodant, et l'on exige qu'il se
+        // rattache au fichier (parent connu, ou successeur qui s'enchaine).
+        // Alors, et seulement alors, le prefixe est reecrit avec la longueur
+        // reelle et le balayage est relance. Rien n'est coupe.
+        let mut prefixe_abime = false;
+        if souci.is_some() && !entetes.is_empty() {
+            if let Some(p) = Self::prefixe_a_reparer(&store, &entetes, taille_fichier)? {
+                if prefixes_repares < MAX_REPARATIONS_DE_PREFIXE {
+                    let mut f = OpenOptions::new().write(true).open(store.path())?;
+                    f.seek(SeekFrom::Start(p.position))?;
+                    f.write_all(&p.reel.to_le_bytes())?;
+                    f.sync_all()?;
+                    drop(f);
+                    eprintln!(
+                        "  fichier des blocs repare : le prefixe de longueur de l'enregistrement {} \
+                         (bloc de hauteur {}) annoncait {} octet(s) au lieu de {} ; il a ete \
+                         reecrit, aucun bloc n'a ete coupe",
+                        p.index, p.hauteur, p.lu, p.reel
+                    );
+                    return Self::ouvrir(
+                        store.path(),
+                        reseau,
+                        reparer_la_genese,
+                        prefixes_repares + 1,
+                    );
+                }
+                // Le budget est epuise : on sait qu'un bloc complet suit, donc
+                // on ne coupera rien, mais on ne relance plus le balayage.
+                prefixe_abime = true;
+                eprintln!(
+                    "avertissement : plus de {MAX_REPARATIONS_DE_PREFIXE} prefixes de longueur \
+                     abimes dans le fichier des blocs ; la reparation s'arrete a \
+                     l'enregistrement {}, le reste n'est pas touche",
+                    p.index
+                );
             }
         }
 
@@ -454,19 +660,28 @@ impl BlockArchive {
         // 4. **Rien n'est jete sans copie.** Ce qui est coupe est d'abord
         //    ecrit a cote du fichier, dans `blocks.dat.coupe` : si la
         //    reparation s'est trompee, rien n'est perdu pour de bon.
+        // 5. **Jamais un bloc complet.** La borne en octets du point 3 n'est
+        //    pas une borne en blocs : quatre mebioctets, ce sont quinze mille
+        //    blocs vides. Si un bloc complet qui se rattache au fichier
+        //    commence apres le dernier enregistrement valide, ce n'est pas une
+        //    ecriture interrompue mais un prefixe abime — traite plus haut,
+        //    par reecriture. On n'arrive ici que s'il n'y en a pas : ce qui
+        //    reste est bien un fragment.
         let mut souci = souci;
-        if matches!(souci, Some(StoreError::FichierTronque { .. })) && !entetes.is_empty() {
+        if matches!(souci, Some(StoreError::FichierTronque { .. }))
+            && !entetes.is_empty()
+            && !prefixe_abime
+        {
             let fin = entetes
                 .last()
                 .map(|(_, r)| r.offset + r.len as u64)
                 .unwrap_or(0);
-            let taille = std::fs::metadata(store.path())
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let taille = taille_fichier;
             let jete = taille.saturating_sub(fin);
             if fin > 0 && jete <= crate::consensus::MAX_BLOCK_SIZE as u64 + 4 {
                 let copie = copier_la_queue(store.path(), fin, jete);
-                match copie.and_then(|_| std::fs::OpenOptions::new().write(true).open(store.path())) {
+                match copie.and_then(|_| std::fs::OpenOptions::new().write(true).open(store.path()))
+                {
                     Ok(f) => match f.set_len(fin) {
                         Ok(()) => {
                             souci = None;
@@ -497,10 +712,91 @@ impl BlockArchive {
             BlockArchive {
                 store,
                 positions: std::sync::Mutex::new(positions),
+                illisibles_signales: std::sync::Mutex::new(std::collections::HashSet::new()),
             },
             seuls,
             souci,
         ))
+    }
+
+    /// Cherche, la ou le balayage s'est arrete, un prefixe de longueur dont
+    /// la valeur ne correspond pas au bloc qu'il precede.
+    ///
+    /// # La methode
+    ///
+    /// On remonte depuis le dernier enregistrement accepte jusqu'au dernier
+    /// dont le **corps** se relit : c'est le dernier point sur. Le suspect est
+    /// l'enregistrement qui le suit — soit accepte par le balayage avec une
+    /// longueur qui ne le laisse pas se relire (prefixe trop court, ou trop
+    /// long mais encore dans le fichier), soit refuse par le balayage
+    /// (prefixe qui pointe hors du fichier ou hors des bornes). Dans les deux
+    /// cas, ses octets commencent juste apres le dernier corps sain, et
+    /// [`enregistrement_rattache`] dit s'ils forment un bloc complet qui
+    /// appartient a ce fichier, et combien d'octets il occupe.
+    ///
+    /// Ne fait rien — et ne laisse rien faire — si le prefixe lu est deja la
+    /// longueur reelle : le mal est alors ailleurs, et ce n'est pas a cette
+    /// fonction de l'inventer.
+    fn prefixe_a_reparer(
+        store: &BlockStore,
+        entetes: &[(BlockHeader, RecordRef)],
+        taille_fichier: u64,
+    ) -> Result<Option<PrefixeAReparer>, StoreError> {
+        // Le dernier enregistrement dont le corps se relit.
+        let mut sains = entetes.len();
+        let mut recul = 0usize;
+        while sains > 0 && recul < MAX_RECUL {
+            if store.read_at(entetes[sains - 1].1).is_ok() {
+                break;
+            }
+            sains -= 1;
+            recul += 1;
+        }
+        if recul >= MAX_RECUL {
+            return Ok(None);
+        }
+        let connus: std::collections::HashSet<crate::hash::Hash256> =
+            entetes[..sains].iter().map(|(h, _)| h.block_id()).collect();
+
+        // Le suspect : la ou commencent ses octets, et ce que son prefixe dit.
+        let (debut, lu) = if sains < entetes.len() {
+            let r = entetes[sains].1;
+            (r.offset, r.len)
+        } else {
+            let fin = entetes
+                .last()
+                .map(|(_, r)| r.offset + u64::from(r.len))
+                .unwrap_or(0);
+            if fin == 0 || taille_fichier < fin + 4 + BlockHeader::SIZE as u64 {
+                return Ok(None);
+            }
+            let prefixe = lire_a(store.path(), fin, 4)?;
+            if prefixe.len() < 4 {
+                return Ok(None);
+            }
+            (
+                fin + 4,
+                u32::from_le_bytes([prefixe[0], prefixe[1], prefixe[2], prefixe[3]]),
+            )
+        };
+        let octets = lire_a(
+            store.path(),
+            debut,
+            u64::from(MAX_BLOC_SERIALISE) + 4 + BlockHeader::SIZE as u64,
+        )?;
+        let Some((entete, reel)) = enregistrement_rattache(&octets, &connus) else {
+            return Ok(None);
+        };
+        if reel as u64 == u64::from(lu) {
+            return Ok(None);
+        }
+        Ok(Some(PrefixeAReparer {
+            position: debut - 4,
+            index: sains,
+            lu,
+            reel: reel as u32,
+            hauteur: entete.height,
+        }))
     }
 
     pub fn len(&self) -> usize {
@@ -530,10 +826,39 @@ impl BlockArchive {
     /// Relit un bloc. Le verrou est tenu pendant la lecture, pour la meme
     /// raison que dans [`Self::append`] : une position lue avant un elagage ne
     /// designe plus rien apres.
+    ///
+    /// Un corps **indexe mais illisible** n'est pas un corps absent : ce sont
+    /// des octets abimes au milieu du fichier. L'appelant ne voit qu'un
+    /// `None` et dira « absent » ; on le precise ici, une fois par bloc, pour
+    /// que l'operateur sache que c'est son disque, et que le bloc sera
+    /// redemande au reseau — un cout, pas une perte.
     pub fn read(&self, id: &crate::hash::Hash256) -> Option<Block> {
         let g = self.positions.lock().ok()?;
         let r = *g.get(id)?;
-        self.store.read_at(r).ok()
+        match self.store.read_at(r) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                let premiere_fois = self
+                    .illisibles_signales
+                    .lock()
+                    .map(|mut s| s.insert(*id))
+                    .unwrap_or(false);
+                if premiere_fois {
+                    let cause = match e {
+                        StoreError::FichierTronque { .. } => "le fichier s'arrete avant sa fin",
+                        StoreError::Io(_) => "erreur de lecture du disque",
+                        _ => "ses octets ne forment plus un bloc",
+                    };
+                    eprintln!(
+                        "avertissement : le corps du bloc {id} est indexe dans le fichier des \
+                         blocs (position {}, {} octets) mais ne se relit pas : {cause}. Octets \
+                         abimes sur le disque ; le bloc sera redemande au reseau",
+                        r.offset, r.len
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Reecrit le fichier en ne gardant que les blocs que `garder` retient.
@@ -787,7 +1112,7 @@ impl HeaderStore {
             }
         }
 
-        let mut entetes = Vec::with_capacity(n as usize);
+        let mut entetes = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
         let mut brut = [0u8; BlockHeader::SIZE];
         for index in 0..n {
             if f.read_exact(&mut brut).is_err() {
@@ -1034,7 +1359,8 @@ mod tests {
             // Un prefixe de longueur qui promet un enregistrement geant, suivi
             // de plus d'un bloc d'octets : ce n'est pas une queue tronquee.
             let mut f = OpenOptions::new().append(true).open(&p).unwrap();
-            f.write_all(&(MAX_BLOC_SERIALISE - 1).to_le_bytes()).unwrap();
+            f.write_all(&(MAX_BLOC_SERIALISE - 1).to_le_bytes())
+                .unwrap();
             let bourrage = vec![0u8; crate::consensus::MAX_BLOCK_SIZE + 64];
             f.write_all(&bourrage).unwrap();
         }

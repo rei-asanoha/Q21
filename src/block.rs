@@ -175,6 +175,29 @@ impl Block {
     }
 
     pub fn decode(data: &[u8]) -> Result<Block, BlockError> {
+        let (bloc, lus) = Self::decode_en_tete_de(data)?;
+        if lus != data.len() {
+            return Err(BlockError::Lecture(ReadError::OctetsRestants(
+                data.len() - lus,
+            )));
+        }
+        Ok(bloc)
+    }
+
+    /// Decode le bloc qui commence `data`, sans exiger que `data` s'arrete
+    /// avec lui, et rend le nombre d'octets qu'il occupe.
+    ///
+    /// # Pourquoi cette variante existe
+    ///
+    /// Le fichier de blocs precede chaque enregistrement de sa longueur. Quand
+    /// ce prefixe est abime — un bit retourne sur une carte fatiguee —, la
+    /// seule facon de retrouver la longueur reelle est de decoder le bloc
+    /// lui-meme : son encodage se delimite tout seul (chaque compte et chaque
+    /// sequence portent leur taille), donc il n'existe qu'une seule longueur
+    /// a laquelle le decodage aboutit. C'est ce que la reparation du fichier
+    /// de blocs emploie. Le consensus, lui, passe par [`Self::decode`], qui
+    /// exige en plus que rien ne traine derriere.
+    pub fn decode_en_tete_de(data: &[u8]) -> Result<(Block, usize), BlockError> {
         if data.len() < BlockHeader::SIZE {
             return Err(BlockError::Lecture(ReadError::FinPrematuree));
         }
@@ -205,12 +228,15 @@ impl Block {
             uncles.push(BlockHeader::decode(&tampon)?);
         }
 
-        r.expect_end()?;
-        Ok(Block {
-            header,
-            transactions,
-            uncles,
-        })
+        let lus = data.len() - r.remaining();
+        Ok((
+            Block {
+                header,
+                transactions,
+                uncles,
+            },
+            lus,
+        ))
     }
 }
 

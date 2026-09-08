@@ -736,7 +736,13 @@ impl MempoolStore {
 
         let mut v = Vec::with_capacity(n.min(10_000) as usize);
         for _ in 0..n {
-            let taille = r.varint().map_err(|_| StateError::Illisible)? as usize;
+            // `try_from` et non `as` : sur 32 bits, une longueur tronquee
+            // passerait sous la borne qui suit.
+            let taille = r
+                .varint()
+                .ok()
+                .and_then(|t| usize::try_from(t).ok())
+                .ok_or(StateError::Illisible)?;
             if taille > crate::consensus::MAX_BLOCK_SIZE {
                 return Err(StateError::Illisible);
             }
