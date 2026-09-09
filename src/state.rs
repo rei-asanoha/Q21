@@ -529,6 +529,11 @@ impl StateStore {
 
     pub fn load(&self, network: Network) -> Result<Snapshot, StateError> {
         let donnees = std::fs::read(&self.chemin)?;
+        Snapshot::decode(self.desceller(&donnees)?, network)
+    }
+
+    /// Verifie le sceau du repertoire et rend la charge scellee.
+    fn desceller<'a>(&self, donnees: &'a [u8]) -> Result<&'a [u8], StateError> {
         if donnees.len() < 32 {
             return Err(StateError::Illisible);
         }
@@ -537,7 +542,55 @@ impl StateStore {
         if !crate::kdf::egal_temps_constant(&attendu, sceau) {
             return Err(StateError::SceauInvalide);
         }
-        Snapshot::decode(charge, network)
+        Ok(charge)
+    }
+
+    /// Ce que l'instantane **sur le disque** annonce : sa hauteur et sa tete.
+    ///
+    /// # Le defaut que ceci ferme
+    ///
+    /// L'elagage decidait de ce qu'il pouvait retirer d'apres une hauteur
+    /// **passee par l'appelant** — celle de l'instantane qu'on venait de
+    /// tenter d'ecrire. Si l'ecriture avait echoue (disque plein, `rename`
+    /// refuse sous Windows par un antivirus qui tient le fichier), la hauteur
+    /// etait fictive : les corps entre l'instantane reellement sur le disque
+    /// et la fenetre conservee etaient retires, et le noeud regressait au
+    /// redemarrage. La seule hauteur qui compte est celle du fichier ; c'est
+    /// elle qu'on relit ici, avant de retirer quoi que ce soit.
+    ///
+    /// Le sceau du repertoire et la somme de controle sont verifies sur le
+    /// fichier entier — un instantane abime ne doit pas non plus servir de
+    /// caution — mais seul l'en-tete est decode : le jeu d'UTXO peut peser des
+    /// centaines de mega-octets, et l'elagage n'en a pas besoin.
+    pub fn en_tete_sur_disque(&self, network: Network) -> Result<(u64, Hash256), StateError> {
+        let donnees = std::fs::read(&self.chemin)?;
+        let charge = self.desceller(&donnees)?;
+        if charge.len() < 32 {
+            return Err(StateError::Illisible);
+        }
+        let (contenu, somme) = charge.split_at(charge.len() - 32);
+        if sha256(contenu) != somme {
+            return Err(StateError::SommeInvalide);
+        }
+        let mut r = Reader::new(contenu);
+        let mut magie = [0u8; 8];
+        for o in &mut magie {
+            *o = r.u8().map_err(|_| StateError::Illisible)?;
+        }
+        if &magie != MAGIE {
+            return Err(StateError::MagieInvalide);
+        }
+        let version = r.u32().map_err(|_| StateError::Illisible)?;
+        if version != SNAPSHOT_VERSION {
+            return Err(StateError::VersionInconnue(version));
+        }
+        let reseau = r.u8().map_err(|_| StateError::Illisible)?;
+        if reseau != code_reseau(network) {
+            return Err(StateError::MauvaisReseau);
+        }
+        let hauteur = r.u64().map_err(|_| StateError::Illisible)?;
+        let tete = Hash256(r.array32().map_err(|_| StateError::Illisible)?);
+        Ok((hauteur, tete))
     }
 
     pub fn remove(&self) -> Result<(), StateError> {
@@ -870,6 +923,35 @@ mod tests {
             assert_eq!(b.utxo.get(o), Some(e), "entree perdue : {o:?}");
         }
         s.remove().unwrap();
+    }
+
+    /// L'en-tete relu du disque dit la hauteur et la tete du fichier, verifie
+    /// son sceau et sa somme, et ne croit pas un fichier abime.
+    #[test]
+    fn l_en_tete_sur_disque_dit_la_hauteur_du_fichier_et_rien_d_autre() {
+        let p = chemin("en-tete");
+        let s = StateStore::new_scelle(&p, [9u8; 32]);
+        let a = instantane(30);
+        s.save(&a).unwrap();
+        assert_eq!(
+            s.en_tete_sur_disque(Network::Regtest).unwrap(),
+            (a.height, a.tip)
+        );
+        // Un autre sceau : refuse.
+        assert!(matches!(
+            StateStore::new_scelle(&p, [8u8; 32]).en_tete_sur_disque(Network::Regtest),
+            Err(StateError::SceauInvalide)
+        ));
+        // Un octet retourne dans le corps du fichier : refuse, meme si
+        // l'en-tete lui-meme est intact.
+        let mut octets = std::fs::read(&p).unwrap();
+        let milieu = octets.len() / 2;
+        octets[milieu] ^= 0x01;
+        std::fs::write(&p, &octets).unwrap();
+        assert!(s.en_tete_sur_disque(Network::Regtest).is_err());
+        // Absent : une erreur, pas une hauteur.
+        s.remove().unwrap();
+        assert!(s.en_tete_sur_disque(Network::Regtest).is_err());
     }
 
     #[test]

@@ -1,19 +1,23 @@
 //! Regressions du second audit de persistance : un bit retourne dans un
 //! prefixe de longueur du fichier de blocs ne coute plus ni bloc valide, ni
-//! instantane, ni revalidation.
+//! instantane, ni revalidation (P1, P4, P6) ; un noeud elague ou adopte
+//! redemarre quoi qu'il arrive a ses en-tetes, et se resynchronise (P2) ; un
+//! instantane dont l'ecriture a echoue n'autorise aucun elagage (P3).
 //!
-//! Chaque epreuve manipule `blocks.dat` comme le ferait une carte SD fatiguee
-//! ou un arret brutal, puis rejoue l'ouverture du binaire (`BlockArchive::open`)
-//! et la reprise sur instantane (`Chain::from_snapshot`).
+//! Chaque epreuve manipule `blocks.dat`, `entetes.dat` ou `state.dat` comme le
+//! ferait une carte SD fatiguee, un disque plein ou un arret brutal, puis
+//! rejoue le demarrage du binaire — `BlockArchive::open`, puis
+//! `q21_core::elagage::reprendre_la_chaine`, le chemin meme du binaire.
 
 use q21_core::address::Network;
 use q21_core::block::BlockHeader;
 use q21_core::chain::{genesis_block, Chain, GENESIS_TIME};
 use q21_core::consensus::*;
 use q21_core::hash::Hash256;
+use q21_core::net::Node;
 use q21_core::sig::SchemeId;
 use q21_core::state::StateStore;
-use q21_core::store::{BlockArchive, BlockStore};
+use q21_core::store::{BlockArchive, BlockStore, HeaderStore};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -486,5 +490,388 @@ fn une_queue_de_zeros_n_est_pas_prise_pour_un_bloc() {
     assert_eq!(entetes.len(), 6);
     assert!(souci.is_none(), "la queue de zeros a ete coupee");
     assert_eq!(std::fs::metadata(&chemin).unwrap().len(), sain);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ===========================================================================
+// P2 — un noeud elague ou adopte n'avait aucune voie de repli.
+// ===========================================================================
+
+/// Le demarrage du binaire, apres `BlockArchive::open` : le meme appel.
+fn redemarrer(d: &Path) -> Result<(Arc<BlockArchive>, Chain), String> {
+    let (archive, entetes, souci) =
+        BlockArchive::open(d.join("blocks.dat"), RESEAU).map_err(|e| e.to_string())?;
+    if let Some(s) = souci {
+        eprintln!("avertissement : {s}");
+    }
+    let archive = Arc::new(archive);
+    let magasin = HeaderStore::new(d.join("entetes.dat"));
+    let chain =
+        q21_core::elagage::reprendre_la_chaine(RESEAU, &archive, entetes, &magasin, &etat_de(d))?;
+    Ok((archive, chain))
+}
+
+/// Un dossier elague : le magasin couvre `0..=magasin`, les corps sous
+/// `premier_corps` sont retires, l'instantane est a `instantane`.
+fn dossier_elague(
+    d: &Path,
+    n: u64,
+    magasin: u64,
+    premier_corps: u64,
+    instantane: u64,
+) -> (Chain, Arc<BlockArchive>) {
+    let (c, archive) = chaine_sur_disque(d, n);
+    HeaderStore::new(d.join("entetes.dat"))
+        .append(&c.headers()[..=magasin as usize])
+        .unwrap();
+    let inst = c.snapshot_at_depth((n - instantane) as usize).unwrap();
+    assert_eq!(inst.height, instantane);
+    etat_de(d).save(&inst).unwrap();
+    archive
+        .elaguer(|h| h.height == 0 || h.height >= premier_corps)
+        .unwrap();
+    (c, archive)
+}
+
+/// Attend qu'une condition devienne vraie, sans bloquer indefiniment.
+fn attendre(mut cond: impl FnMut() -> bool, secondes: u64) -> bool {
+    let debut = std::time::Instant::now();
+    while debut.elapsed() < std::time::Duration::from_secs(secondes) {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    cond()
+}
+
+/// Le noeud repare, branche sur son archive, rattrape un pair complet.
+///
+/// Un noeud complet sert la chaine `c` ; le noeud repris `chain` journalise
+/// dans `archive`. A la sortie, le noeud repris est a la tete de `c`.
+fn se_resynchronise_depuis_un_pair(c: Chain, chain: Chain, archive: Arc<BlockArchive>) {
+    let cible = c.height();
+    let tete = c.tip_id();
+    let valeur = c.utxo.total_value();
+    let complet = Node::new(RESEAU, c);
+    let repris = Node::new(RESEAU, chain);
+    repris.set_journal(archive);
+    let addr = complet.listen("127.0.0.1:0").expect("ecoute");
+    repris.connect(addr).expect("connexion");
+    assert!(
+        attendre(|| repris.height() == cible, 60),
+        "le noeud repris est reste a la hauteur {} sur {cible}",
+        repris.height()
+    );
+    assert_eq!(repris.tip_id(), tete, "les tetes doivent coincider");
+    assert_eq!(
+        repris.with_chain(|ch| ch.utxo.total_value()),
+        valeur,
+        "les jeux d'UTXO doivent coincider"
+    );
+    complet.shutdown();
+    repris.shutdown();
+}
+
+/// Epreuve D. Avant : un bit dans le champ `time` de l'en-tete 15 de
+/// `entetes.dat` rendait le magasin illisible (`EntetesMaillonRompu`), le
+/// binaire refusait de demarrer et conseillait de repartir « dans un dossier
+/// vide » — celui qui contient le portefeuille. Attendu : le magasin est
+/// tronque a la derniere position saine, le noeud demarre a une hauteur au
+/// plus egale a la hauteur saine, et un pair complet le ramene a la tete.
+#[test]
+fn d_un_bit_dans_entetes_dat_ne_condamne_plus_un_dossier_elague() {
+    let d = rep("p2-d-entetes");
+    let (c, archive) = dossier_elague(&d, 60, 40, 41, 50);
+    drop(archive);
+    let entetes = d.join("entetes.dat");
+    let taille = std::fs::metadata(&entetes).unwrap().len();
+    // Un bit dans le champ `time` de l'en-tete 15 : le maillon 16 ne
+    // s'enchaine plus.
+    let position = 12 + 15 * BlockHeader::SIZE as u64 + 4 + 32 * 4;
+    assert!(position < taille);
+    retourner_un_bit(&entetes, position, 0x01);
+
+    let (archive, chain) = redemarrer(&d).expect("le noeud demarre");
+    eprintln!("D : hauteur au redemarrage {}", chain.height());
+    assert!(chain.height() <= 50, "au plus la hauteur saine");
+    // Le magasin a ete tronque au premier maillon rompu : 0..=15 restent,
+    // l'en-tete 15 lui-meme etant celui dont un bit a change (il s'enchaine
+    // encore sur 14 ; c'est 16 qui ne s'enchaine plus sur lui).
+    let magasin = HeaderStore::new(&entetes);
+    let relus = magasin.load(RESEAU).unwrap();
+    assert_eq!(relus.len(), 16);
+    assert_eq!(
+        std::fs::metadata(&entetes).unwrap().len(),
+        12 + 16 * BlockHeader::SIZE as u64
+    );
+    assert!(
+        archive.read(&c.active_at(0).unwrap()).is_some(),
+        "la genese se relit"
+    );
+
+    let tete = c.tip_id();
+    se_resynchronise_depuis_un_pair(c, chain, archive.clone());
+    // Ce qui a ete resynchronise se relit au redemarrage suivant.
+    drop(archive);
+    let (_, chain2) = redemarrer(&d).expect("second demarrage");
+    assert_eq!(chain2.height(), 60);
+    assert_eq!(chain2.tip_id(), tete);
+    // Et le magasin se complete depuis la chaine — l'en-tete 15 abime, que la
+    // chaine dement, est retire et reecrit : le noeud elaguera de nouveau.
+    let ajoutes = q21_core::elagage::completer_le_magasin(&chain2, &magasin, 50).unwrap();
+    assert_eq!(ajoutes, 36, "15..=50 reecrits");
+    let relus = magasin.load(RESEAU).unwrap();
+    assert_eq!(relus.len(), 51);
+    assert!(relus
+        .iter()
+        .all(|h| chain2.active_at(h.height) == Some(h.block_id())));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Epreuve H. Avant : magasin `0..=20`, instantane a 50, un bit dans le
+/// nonce de l'en-tete du bloc 35 dans `blocks.dat` — entre le magasin et
+/// l'instantane, la fenetre vitale d'un noeud elague. Le balayage ne voyait
+/// rien, `from_snapshot` rendait `InstantaneHorsChaine`, le binaire refusait
+/// de demarrer. Attendu : le noeud demarre (hauteur au plus 50), et le pair
+/// complet le ramene a 60.
+#[test]
+fn h_un_bit_dans_un_entete_sous_l_instantane_ne_condamne_plus_un_noeud_elague() {
+    let d = rep("p2-h-entete");
+    let chemin = d.join("blocks.dat");
+    let (c, archive) = dossier_elague(&d, 60, 20, 21, 50);
+    drop(archive);
+    // Le bloc 35 est le 15e enregistrement du fichier elague (genese, puis
+    // 21..). Un bit dans son nonce : l'en-tete se decode, mais n'est plus lui.
+    let enregs = prefixes(&chemin);
+    let (pos35, _) = enregs[1 + (35 - 21)];
+    retourner_un_bit(&chemin, pos35 + 4 + BlockHeader::SIZE as u64 - 1, 0x01);
+
+    let (archive, chain) = redemarrer(&d).expect("le noeud demarre");
+    eprintln!("H : hauteur au redemarrage {}", chain.height());
+    assert!(chain.height() <= 50, "au plus la hauteur saine");
+    assert!(
+        archive.read(&c.active_at(0).unwrap()).is_some(),
+        "la genese se relit"
+    );
+
+    se_resynchronise_depuis_un_pair(c, chain, archive.clone());
+    drop(archive);
+    let (_, chain2) = redemarrer(&d).expect("second demarrage");
+    assert_eq!(chain2.height(), 60);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// La fenetre AU-DESSUS de l'instantane : un bit dans la racine de Merkle de
+/// l'en-tete 55 d'un dossier elague (magasin `0..=40`, instantane a 50). Le
+/// rejeu s'arrete au dernier bloc sain, l'archive est coupee la, et le pair
+/// refournit 55..=60 — le chemin du noeud complet, reutilise tel quel.
+#[test]
+fn un_en_tete_abime_au_dessus_de_l_instantane_coute_une_coupe_et_le_reseau_refournit() {
+    let d = rep("p2-fenetre-haute");
+    let chemin = d.join("blocks.dat");
+    let (c, archive) = dossier_elague(&d, 60, 40, 41, 50);
+    drop(archive);
+    let enregs = prefixes(&chemin);
+    let (pos55, _) = enregs[1 + (55 - 41)];
+    // Octet 4 (prefixe) + 4 (version) + 32 (parent) : la racine de Merkle.
+    retourner_un_bit(&chemin, pos55 + 4 + 4 + 32, 0x01);
+
+    let (archive, chain) = redemarrer(&d).expect("le noeud demarre");
+    eprintln!("fenetre haute : hauteur au redemarrage {}", chain.height());
+    assert_eq!(chain.height(), 54, "le rejeu s'arrete au dernier bloc sain");
+    assert_eq!(chain.tip_id(), c.active_at(54).unwrap());
+
+    let tete = c.tip_id();
+    se_resynchronise_depuis_un_pair(c, chain, archive.clone());
+    drop(archive);
+    let (_, chain2) = redemarrer(&d).expect("second demarrage");
+    assert_eq!(chain2.height(), 60);
+    assert_eq!(chain2.tip_id(), tete);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Un magasin qui n'en est pas un (magie fausse) : il est mis de cote sous
+/// `entetes.dat.abime`, le noeud demarre sur ce que le fichier de blocs
+/// permet, et le reseau refournit.
+#[test]
+fn un_magasin_d_en_tetes_inutilisable_est_mis_de_cote_et_le_noeud_demarre() {
+    let d = rep("p2-magasin-magie");
+    let (c, archive) = dossier_elague(&d, 60, 40, 41, 50);
+    drop(archive);
+    retourner_un_bit(&d.join("entetes.dat"), 0, 0xff);
+
+    let (archive, chain) = redemarrer(&d).expect("le noeud demarre");
+    assert!(chain.height() <= 50);
+    assert!(
+        d.join("entetes.dat.abime").exists(),
+        "le magasin est mis de cote"
+    );
+    assert!(!d.join("entetes.dat").exists());
+    se_resynchronise_depuis_un_pair(c, chain, archive.clone());
+    drop(archive);
+    let (_, chain2) = redemarrer(&d).expect("second demarrage");
+    assert_eq!(chain2.height(), 60);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Le magasin est complete a chaque instantane, pas seulement a l'elagage :
+/// la fenetre vitale (dernier elagage, instantane] n'existe plus. Ici, un
+/// dossier elague dont le magasin s'arrete a 20 ; l'instantane a 50 vient
+/// d'etre ecrit ; le magasin est complete jusqu'a 50 sans relire le fichier,
+/// et un bit dans l'en-tete 35 de `blocks.dat` ne coute plus rien.
+#[test]
+fn le_magasin_complete_a_chaque_instantane_fait_disparaitre_la_fenetre_vitale() {
+    let d = rep("p2-completion");
+    let chemin = d.join("blocks.dat");
+    let (c, archive) = dossier_elague(&d, 60, 20, 21, 50);
+    let magasin = HeaderStore::new(d.join("entetes.dat"));
+    assert_eq!(magasin.compte(), Some(21));
+    let ajoutes = q21_core::elagage::completer_le_magasin(&c, &magasin, 50).unwrap();
+    assert_eq!(ajoutes, 30);
+    assert_eq!(magasin.compte(), Some(51));
+    assert_eq!(magasin.dernier().map(|h| h.height), Some(50));
+    // Rien a faire une seconde fois.
+    assert_eq!(
+        q21_core::elagage::completer_le_magasin(&c, &magasin, 50).unwrap(),
+        0
+    );
+    drop(archive);
+
+    let enregs = prefixes(&chemin);
+    let (pos35, _) = enregs[1 + (35 - 21)];
+    retourner_un_bit(&chemin, pos35 + 4 + BlockHeader::SIZE as u64 - 1, 0x01);
+    let (_, chain) = redemarrer(&d).expect("le noeud demarre");
+    assert_eq!(
+        chain.height(),
+        60,
+        "l'instantane tient, le rejeu va jusqu'a la tete"
+    );
+    assert_eq!(chain.tip_id(), c.tip_id());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ===========================================================================
+// P3 — elaguer sur la foi d'un instantane qui n'a pas ete ecrit.
+// ===========================================================================
+
+/// Epreuve C. Avant : instantane sur le disque a 100, ecriture de celui a
+/// 115 en echec (`state.tmp` est un dossier : le renommage echoue, comme un
+/// disque plein ou un fichier tenu par un antivirus) ; l'elagage recevait
+/// 115 de l'appelant et retirait 109 corps ; au redemarrage, 9 corps a
+/// rejouer manquaient et l'archive etait ramenee a la genese. Attendu :
+/// l'elagage relit la hauteur du disque (100), la trouve plus ancienne que
+/// la fenetre, refuse et le dit, le fichier est intact ; une fois l'ecriture
+/// reussie, il elague normalement et le redemarrage retrouve la tete.
+#[test]
+fn c_un_instantane_non_ecrit_n_autorise_aucun_elagage() {
+    use q21_core::elagage::{elaguer, Politique};
+    let d = rep("p3-c-instantane");
+    let (c, archive) = chaine_sur_disque(&d, 120);
+    let magasin = HeaderStore::new(d.join("entetes.dat"));
+    let etat = etat_de(&d);
+    let ancien = c.snapshot_at_depth(20).unwrap();
+    assert_eq!(ancien.height, 100);
+    etat.save(&ancien).unwrap();
+
+    std::fs::create_dir_all(d.join("state.tmp")).unwrap();
+    let nouveau = c.snapshot_at_depth(5).unwrap();
+    assert_eq!(nouveau.height, 115);
+    assert!(
+        etat.save(&nouveau).is_err(),
+        "l'ecriture de l'instantane echoue"
+    );
+
+    // Quinze corps conserves : plus que ce que la regle des oncles relit
+    // (`MAX_UNCLE_AGE`), moins que ce qui separe l'ancien instantane de la
+    // tete.
+    let politique = Politique {
+        corps_conserves: 15,
+        pas: 1,
+    };
+    let mut derniere = 0;
+    let avant = archive.len();
+    let r = elaguer(
+        &c,
+        &archive,
+        &magasin,
+        &etat,
+        RESEAU,
+        politique,
+        &mut derniere,
+    );
+    let message = r.as_ref().err().cloned().unwrap_or_default();
+    eprintln!("C, ecriture en echec : {message}");
+    assert!(
+        message.contains("hauteur 100") && message.contains("plus ancien que la fenetre"),
+        "l'elagage doit etre refuse en nommant la cause, obtenu {r:?}"
+    );
+    assert_eq!(archive.len(), avant, "aucun corps retire");
+    assert!(!magasin.exists(), "rien n'a ete ecrit dans le magasin");
+    assert_eq!(derniere, 0, "un refus ne compte pas comme un elagage");
+
+    // L'ecriture reussit : l'elagage reprend son cours normal.
+    std::fs::remove_dir_all(d.join("state.tmp")).unwrap();
+    etat.save(&nouveau).unwrap();
+    let bilan = elaguer(
+        &c,
+        &archive,
+        &magasin,
+        &etat,
+        RESEAU,
+        politique,
+        &mut derniere,
+    )
+    .expect("elagage")
+    .expect("il y avait a elaguer");
+    eprintln!(
+        "C, ecriture reussie : {} retires, {} conserves",
+        bilan.retires, bilan.conserves
+    );
+    assert_eq!(bilan.conserves, 1 + 16); // genese + 105..=120
+    assert_eq!(
+        magasin.load(RESEAU).unwrap().last().map(|h| h.height),
+        Some(115)
+    );
+    drop(archive);
+
+    // Redemarrage : rien ne manque, la tete est retrouvee.
+    let (_, chain) = redemarrer(&d).expect("le noeud redemarre");
+    assert_eq!(chain.height(), 120, "aucune regression");
+    assert_eq!(chain.tip_id(), c.tip_id());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Variante : `state.dat` lui-meme est devenu un dossier — plus aucun
+/// instantane lisible sur le disque. L'elagage refuse aussi.
+#[test]
+fn un_instantane_illisible_sur_le_disque_n_autorise_aucun_elagage() {
+    use q21_core::elagage::{elaguer, Politique};
+    let d = rep("p3-illisible");
+    let (c, archive) = chaine_sur_disque(&d, 120);
+    let magasin = HeaderStore::new(d.join("entetes.dat"));
+    let etat = etat_de(&d);
+    std::fs::create_dir_all(d.join("state.dat")).unwrap();
+    assert!(etat.save(&c.snapshot_at_depth(5).unwrap()).is_err());
+    let politique = Politique {
+        corps_conserves: 10,
+        pas: 1,
+    };
+    let mut derniere = 0;
+    let avant = archive.len();
+    let r = elaguer(
+        &c,
+        &archive,
+        &magasin,
+        &etat,
+        RESEAU,
+        politique,
+        &mut derniere,
+    );
+    let message = r.as_ref().err().cloned().unwrap_or_default();
+    eprintln!("state.dat illisible : {message}");
+    assert!(message.contains("illisible"), "obtenu {r:?}");
+    assert_eq!(archive.len(), avant, "aucun corps retire");
+    assert!(!magasin.exists());
     let _ = std::fs::remove_dir_all(&d);
 }

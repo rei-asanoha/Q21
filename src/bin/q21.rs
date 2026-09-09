@@ -1418,24 +1418,35 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
 /// Elague le fichier de blocs si assez de blocs se sont accumules.
 ///
 /// La politique et sa preuve sont dans [`q21_core::elagage`] ; ici, on ne
-/// fait que la brancher sur le dossier et en rendre compte a l'ecran.
+/// fait que la brancher sur le dossier et en rendre compte a l'ecran. La
+/// hauteur de l'instantane n'est pas passee : l'elagage la relit lui-meme du
+/// fichier `state.dat`, sceau verifie, et refuse si elle ne couvre pas la
+/// fenetre — c'est ce qui empeche un instantane dont l'ecriture a echoue de
+/// servir de caution a la suppression de corps.
 fn elaguer_si_utile(
     datadir: &Path,
     reseau: Network,
     node: &q21_core::net::Node,
     archive: &q21_core::store::BlockArchive,
-    hauteur_instantane: u64,
     derniere: &mut u64,
 ) {
     let entetes = q21_core::store::HeaderStore::new(chemin_entetes(datadir));
+    let clef = match q21_core::state::clef_de_repertoire(datadir) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("avertissement : pas d'elagage ({e}) — le fichier est intact");
+            return;
+        }
+    };
+    let instantane = StateStore::new_scelle(chemin_etat(datadir), clef);
     let politique = q21_core::elagage::POLITIQUE_DEFAUT;
     let resultat = node.with_chain(|c| {
         q21_core::elagage::elaguer(
             c,
             archive,
             &entetes,
+            &instantane,
             reseau,
-            hauteur_instantane,
             politique,
             derniere,
         )
@@ -1449,6 +1460,25 @@ fn elaguer_si_utile(
         ),
         Ok(_) => {}
         Err(e) => eprintln!("avertissement : pas d'elagage ({e}) — le fichier est intact"),
+    }
+}
+
+/// Complete le magasin d'en-tetes d'un noeud elague jusqu'a l'instantane qui
+/// vient d'etre ecrit. Voir [`q21_core::elagage::completer_le_magasin`] : c'est
+/// ce qui fait qu'un en-tete abime dans le fichier de blocs, entre deux
+/// elagages, ne coute plus l'instantane.
+///
+/// Seulement si le magasin existe deja : sa presence marque un dossier
+/// adopte ou elague, et un noeud complet qui n'a pas encore elague doit
+/// pouvoir revalider depuis ses corps.
+fn completer_le_magasin_si_elague(datadir: &Path, node: &q21_core::net::Node, jusqu_a: u64) {
+    let entetes = q21_core::store::HeaderStore::new(chemin_entetes(datadir));
+    if !entetes.exists() {
+        return;
+    }
+    let r = node.with_chain(|c| q21_core::elagage::completer_le_magasin(c, &entetes, jusqu_a));
+    if let Err(e) = r {
+        eprintln!("avertissement : magasin d'en-tetes non complete ({e})");
     }
 }
 
@@ -1597,7 +1627,7 @@ fn chemin_pairs(d: &Path) -> PathBuf {
 /// pas une chaine perdue.
 fn ecrire_instantane(datadir: &Path, chain: &Chain) {
     if let Some(i) = chain.snapshot() {
-        ecrire_instantane_pris(datadir, &i);
+        let _ = ecrire_instantane_pris(datadir, &i);
     }
 }
 
@@ -1606,17 +1636,23 @@ fn ecrire_instantane(datadir: &Path, chain: &Chain) {
 /// une copie du jeu d'UTXO et le rejeu des annulations — a besoin du verrou ;
 /// le reste, qui coute le plus a mesure que l'etat grossit, n'a besoin que de
 /// la copie.
-fn ecrire_instantane_pris(datadir: &Path, i: &q21_core::state::Snapshot) {
-    let clef = match q21_core::state::clef_de_repertoire(datadir) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("avertissement : instantane non ecrit ({e})");
-            return;
-        }
-    };
-    if let Err(e) = StateStore::new_scelle(chemin_etat(datadir), clef).save(i) {
+///
+/// Rend l'erreur en plus de l'afficher : l'appelant qui elague ensuite doit
+/// savoir que l'instantane **n'est pas** sur le disque. Une premiere version
+/// ne rendait rien, et la boucle d'instantane notait la hauteur comme ecrite
+/// puis elaguait sur cette foi — les corps entre l'ancien instantane et la
+/// fenetre disparaissaient, le noeud regressait au redemarrage.
+fn ecrire_instantane_pris(datadir: &Path, i: &q21_core::state::Snapshot) -> Result<(), String> {
+    let clef = q21_core::state::clef_de_repertoire(datadir).map_err(|e| e.to_string());
+    let ecrit = clef.and_then(|k| {
+        StateStore::new_scelle(chemin_etat(datadir), k)
+            .save(i)
+            .map_err(|e| e.to_string())
+    });
+    if let Err(e) = &ecrit {
         eprintln!("avertissement : instantane non ecrit : {e}");
     }
+    ecrit
 }
 
 fn charger(datadir: &Path) -> Result<Etat, String> {
@@ -1703,41 +1739,21 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
         println!("  genese ecrite : {}", genese.header.block_id());
     }
 
-    let (archive, mut seuls_entetes, souci) =
+    let (archive, seuls_entetes, souci) =
         BlockArchive::open(chemin_blocs(datadir), reseau).map_err(|e| e.to_string())?;
     if seuls_entetes.is_empty() {
-        return Err("aucun bloc. Lancez `q21 init` d'abord.".into());
+        return Err(
+            "le fichier des blocs ne contient aucun bloc lisible, pas meme la genese : \
+             c'est la seule perte qui empeche de demarrer. Mettez d'abord le portefeuille \
+             a l'abri (wallet.dat, wallet.seq, addresses.dat). Puis, soit deplacez \
+             blocks.dat, state.dat et entetes.dat hors du dossier — la genese sera reecrite \
+             et le reseau refournira la chaine —, soit resynchronisez dans un dossier vide."
+                .into(),
+        );
     }
     if let Some(s) = souci {
         eprintln!("avertissement : {s}");
     }
-
-    // --- Dossier adopte : la chaine d'en-tetes vient du magasin, pas des corps.
-    //
-    // Un noeud parti d'un instantane n'a pas les corps d'avant lui, donc leurs
-    // en-tetes ne se relisent pas du fichier de blocs. Elles viennent du magasin
-    // d'en-tetes (genese -> hauteur de l'instantane), etendu par les blocs
-    // posterieurs deja synchronises, presents, eux, dans le fichier de blocs.
-    let adopte = chemin_entetes(datadir).exists();
-    if adopte {
-        let hs = q21_core::store::HeaderStore::new(chemin_entetes(datadir));
-        let mut base = hs
-            .load(reseau)
-            .map_err(|e| format!("magasin d'en-tetes illisible : {e}"))?;
-        let h_inst = base
-            .last()
-            .map(|h| h.height)
-            .ok_or("dossier adopte sans en-tetes")?;
-        let mut posterieurs: Vec<_> = seuls_entetes
-            .iter()
-            .copied()
-            .filter(|h| h.height > h_inst)
-            .collect();
-        posterieurs.sort_by_key(|h| h.height);
-        base.extend(posterieurs);
-        seuls_entetes = base;
-    }
-
     if chrono {
         eprintln!(
             "[chrono] balayage en-tetes {:.2} s",
@@ -1746,149 +1762,19 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
     }
     let archive = std::sync::Arc::new(archive);
 
-    // 2. Reprise sur instantane, si l'on en a un et qu'il est coherent.
+    // 2. La chaine, reconstruite de ce que le disque permet : magasin
+    // d'en-tetes d'un dossier adopte ou elague, instantane et rejeu, ou
+    // revalidation depuis la genese. Le chemin est dans la bibliotheque —
+    // `q21_core::elagage::reprendre_la_chaine` — pour etre eprouvable ; sa
+    // regle est qu'une corruption locale coute du reseau, jamais le refus de
+    // demarrer, tant que la genese se relit.
+    //
     // Le sceau du repertoire : un instantane venu d'ailleurs ne sera pas adopte.
     let clef = q21_core::state::clef_de_repertoire(datadir).map_err(|e| e.to_string())?;
     let etat = StateStore::new_scelle(chemin_etat(datadir), clef);
-    let reprise = match etat.load(reseau) {
-        Ok(i) => match Chain::from_snapshot(reseau, i, &seuls_entetes) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("avertissement : instantane inutilisable ({e}) — revalidation complete");
-                None
-            }
-        },
-        Err(e) if etat.exists() => {
-            eprintln!("avertissement : {e}");
-            None
-        }
-        Err(_) => None,
-    };
-
-    let mut chain = match reprise {
-        Some(r) => {
-            let mut c = r.chain;
-            // Le fournisseur de corps est branche AVANT le rejeu : la regle du
-            // double paiement d'oncle relit les corps anterieurs a l'instantane,
-            // et valider sans eux serait valider a l'aveugle.
-            c.set_body_source(archive.clone());
-            // 3a. Seule la fenetre qui suit l'instantane est revalidee — c'est
-            // ce qui reconstruit les enregistrements d'annulation, donc la
-            // capacite a reorganiser.
-            for id in &r.a_rejouer {
-                let Some(b) = archive.read(id) else {
-                    couper_l_archive_a(&archive, c.height() + 1, "corps manquant au rejeu")?;
-                    break;
-                };
-                let now = b.header.time + MAX_FUTURE_TIME;
-                if let Err(e) = c.connect(&b, now) {
-                    couper_l_archive_a(
-                        &archive,
-                        b.header.height,
-                        &format!("bloc {} refuse au rejeu : {e:?}", b.header.height),
-                    )?;
-                    break;
-                }
-            }
-            c
-        }
-        None => {
-            // Un dossier adopte n'a pas d'histoire d'avant l'instantane : il ne
-            // PEUT pas revalider depuis la genese. Si l'instantane est devenu
-            // inexploitable, c'est une erreur franche, pas un repli silencieux.
-            if adopte {
-                return Err(
-                    "ce dossier n'a pas toute l'histoire (adopte depuis une amorce, ou \
-                     elague), et son instantane est illisible ou incoherent : rien a \
-                     rejouer. Resynchronisez depuis le reseau dans un dossier vide, ou \
-                     re-adoptez depuis une amorce saine."
-                        .into(),
-                );
-            }
-            // 3b. Sans instantane exploitable, on reconstruit tout depuis la
-            // genese. C'est le chemin de secours, celui qui doit fonctionner le
-            // jour ou tout le reste a echoue — un debranchement, une batterie a
-            // plat, un arret force.
-            //
-            // --- Ce qui n'allait pas, et qui a couté un incident
-            //
-            // Ce chemin rejouait le fichier **dans son ordre d'ecriture**, en
-            // appelant `submit` pour chaque enregistrement. Or le fichier n'est
-            // pas une ligne droite : il consigne aussi les branches laterales,
-            // sans quoi aucune reorganisation ne survivrait a un redemarrage.
-            // Rejouer cet ordre revenait donc a demander a la chaine d'accepter
-            // des dizaines de reorganisations successives — et a se heurter aux
-            // **defenses anti-reorganisation**, qui sont faites pour repousser
-            // un attaquant, pas pour relire sa propre histoire deja validee.
-            //
-            // Mesure faite sur deux noeuds minant l'un contre l'autre : au bout
-            // de deux mille blocs, le noeud refusait purement et simplement de
-            // redemarrer, avec un message qui ne pouvait mener nulle part —
-            // `FinaliteDepassee { profondeur: 18446744073709551615 }`. Un noeud
-            // incapable de relire son propre fichier est un noeud a une coupure
-            // de courant de la perte totale.
-            //
-            // --- Ce qu'on fait a la place
-            //
-            // On demande d'abord aux **en-tetes** quelle est la chaine active —
-            // c'est un calcul, pas une opinion : la tete la plus lourde, puis la
-            // remontee jusqu'a la genese. Puis on valide cette suite **dans
-            // l'ordre des hauteurs**, de la genese a la tete, avec `connect`.
-            //
-            // Il n'y a alors plus une seule reorganisation a accepter : chaque
-            // bloc prolonge le precedent, par construction. Les branches
-            // laterales restent dans le fichier et dans l'index — une
-            // reorganisation ulterieure retrouvera leurs corps.
-            let ordre = Chain::arborescence(&seuls_entetes)
-                .map_err(|e| format!("index des blocs illisible : {e:?}"))?;
-            let genese_id = ordre.active[0];
-            let corps_genese = archive
-                .read(&genese_id)
-                .ok_or("le bloc de genese est absent du fichier")?;
-            let mut c = Chain::new(reseau, corps_genese);
-            c.set_body_source(archive.clone());
-            for id in ordre.active.iter().skip(1) {
-                let Some(b) = archive.read(id) else {
-                    couper_l_archive_a(
-                        &archive,
-                        c.height() + 1,
-                        &format!("corps du bloc {id} absent du fichier"),
-                    )?;
-                    break;
-                };
-                let now = b.header.time + MAX_FUTURE_TIME;
-                if let Err(e) = c.connect(&b, now) {
-                    couper_l_archive_a(
-                        &archive,
-                        b.header.height,
-                        &format!("bloc {} refuse a la reconstruction : {e:?}", b.header.height),
-                    )?;
-                    break;
-                }
-            }
-            // Les branches laterales sont reinjectees ensuite, une fois la
-            // chaine active en place. Chacune est alors une simple branche
-            // concurrente moins lourde : aucune ne declenche de reorganisation,
-            // et leur presence dans l'index est ce qui permettra d'en adopter
-            // une plus tard si elle prend l'avantage.
-            let actifs: std::collections::HashSet<_> = ordre.active.iter().copied().collect();
-            let mut laterales = 0usize;
-            for (id, entete) in &ordre.par_id {
-                if actifs.contains(id) || !ordre.travail.contains_key(id) {
-                    continue;
-                }
-                let Some(b) = archive.read(id) else { continue };
-                let now = entete.time + MAX_FUTURE_TIME;
-                if c.submit(&b, now).is_ok() {
-                    laterales += 1;
-                }
-            }
-            if laterales > 0 {
-                println!("  {laterales} bloc(s) de branches laterales reintegres");
-            }
-            c
-        }
-    };
+    let magasin = q21_core::store::HeaderStore::new(chemin_entetes(datadir));
+    let mut chain =
+        q21_core::elagage::reprendre_la_chaine(reseau, &archive, seuls_entetes, &magasin, &etat)?;
 
     if chrono {
         eprintln!("[chrono] chaine prete {:.2} s", t0.elapsed().as_secs_f64());
@@ -2099,32 +1985,6 @@ fn decouvrir_dans_la_boucle(w: &mut Wallet, c: &Chain) -> usize {
         }
     }
     trouvees
-}
-
-/// Un corps illisible ou refuse au rejeu : on s'arrete au dernier bloc sain.
-///
-/// # Le defaut que ceci ferme
-///
-/// Une corruption d'un corps qui n'etait pas en queue du fichier — un bit
-/// retourne sur une carte SD — rendait tout demarrage impossible, avec un
-/// message qui ne disait pas quoi faire. Rien n'etait faux dans ce refus :
-/// mieux vaut ne pas demarrer qu'adopter un etat faux. Mais un noeud complet
-/// sait exactement quoi faire de ce cas : garder ce qui precede, retirer ce
-/// qui suit, et redemander le reste au reseau. C'est ce qu'on fait ici — la
-/// reecriture passe par le meme chemin que l'elagage, sur, et ce qui est
-/// retire etait de toute facon inutilisable.
-fn couper_l_archive_a(
-    archive: &std::sync::Arc<BlockArchive>,
-    hauteur: u64,
-    raison: &str,
-) -> Result<(), String> {
-    eprintln!(
-        "  fichier des blocs : {raison}.\n               Les corps a partir de la hauteur {hauteur} sont retires ; le reseau \n               fournira le reste."
-    );
-    archive
-        .elaguer(|h| h.height < hauteur)
-        .map(|_| ())
-        .map_err(|e| format!("impossible de couper le fichier des blocs : {e}"))
 }
 
 fn maintenant() -> u64 {
@@ -4388,16 +4248,22 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // Pris sous le verrou, ecrit dehors : voir `ecrire_instantane_pris`.
             let pris = node.with_chain(|c| c.snapshot());
             if let Some(i) = pris {
-                if hauteur_instantane != Some(i.height) {
-                    ecrire_instantane_pris(datadir, &i);
+                // La hauteur n'est notee — et l'elagage tente — qu'apres une
+                // ecriture **reussie**. Un echec laisse `hauteur_instantane`
+                // en l'etat : on reessaiera dans cinq minutes, et rien n'est
+                // retire du fichier de blocs sur la foi d'un instantane qui
+                // n'est pas sur le disque.
+                if hauteur_instantane != Some(i.height)
+                    && ecrire_instantane_pris(datadir, &i).is_ok()
+                {
                     hauteur_instantane = Some(i.height);
+                    completer_le_magasin_si_elague(datadir, &node, i.height);
                     if elaguer {
                         elaguer_si_utile(
                             datadir,
                             reseau,
                             &node,
                             archive.as_ref(),
-                            i.height,
                             &mut derniere_hauteur_elaguee,
                         );
                     }
@@ -4756,7 +4622,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // de demarrage, pas une donnee dont la perte couterait quoi que ce soit.
     let pris = node.with_chain(|c| c.snapshot());
     if let Some(i) = pris {
-        ecrire_instantane_pris(datadir, &i);
+        if ecrire_instantane_pris(datadir, &i).is_ok() {
+            completer_le_magasin_si_elague(datadir, &node, i.height);
+        }
     }
     println!();
     println!("Arret. Hauteur finale : {}", node.height());
