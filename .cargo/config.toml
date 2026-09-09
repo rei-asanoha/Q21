@@ -2,8 +2,15 @@
 #
 # Cet environnement n'a pas acces a index.crates.io. Les sources de `ml-dsa` et
 # de ses dependances transitives ont ete apportees par `cargo vendor` depuis une
-# machine connectee, puis verifiees par les `.cargo-checksum.json` que cargo
-# controle a chaque compilation.
+# machine connectee.
+#
+# Ce que cargo verifie a chaque compilation : que chaque fichier a la somme
+# inscrite dans son `.cargo-checksum.json`, et que le champ `package` de ce
+# fichier egale `Cargo.lock`. Ce qu'il ne verifie PAS : que `package` decoule
+# des fichiers — il ne le recalcule jamais. Une source modifiee dont on
+# regenere la carte des sommes passe donc `--locked` sans un mot. La garantie
+# reelle vient du travail `vendor` de `.github/workflows/essais.yml`, qui refait
+# `cargo vendor` depuis crates.io et exige l'identite octet pour octet.
 [source.crates-io]
 replace-with = "vendored-sources"
 

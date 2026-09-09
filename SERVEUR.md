@@ -325,6 +325,44 @@ En bas, section **Apply to** : cochez le serveur `q21-amorce`. Puis
 
 ---
 
+# Étape 8 bis — Limiter les tentatives
+
+Le pare-feu dit *qui* peut frapper à la porte ; il ne dit pas *combien de
+fois*. Un mot de passe ou une clé se devinent par insistance, et un serveur
+public reçoit des milliers de tentatives par jour. `fail2ban` lit les journaux
+et bannit, pour une heure, toute adresse qui échoue cinq fois.
+
+```bash
+sudo apt install -y fail2ban
+```
+
+```bash
+sudo tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+EOF
+```
+
+```bash
+sudo systemctl enable --now fail2ban && sudo fail2ban-client status sshd
+```
+
+**Vous devez voir** `Status for the jail: sshd` avec un nombre de bannis (zéro
+au début).
+
+> Si ce serveur héberge aussi du courrier (Postfix, Dovecot), ajoutez à
+> `jail.local` les deux sections `[postfix]` et `[dovecot]` avec
+> `enabled = true` : le mot de passe de la boîte est alors, lui aussi, protégé
+> contre la devinette — et c'est ce mot de passe qui commande, par la
+> récupération de compte, tout ce qui dépend de votre adresse.
+
+---
+
 # Étape 9 — Envoyer le programme
 
 Le fichier se télécharge **sur le Mac** (GitHub demande d'être connecté, ce que
@@ -333,26 +371,52 @@ le serveur ne peut pas faire), puis se pousse vers le serveur.
 ### Sur le Mac
 
 Sur `github.com/reiasanoha/q21` → **Actions** → **Livraison** → la dernière
-exécution verte → section **Artifacts** → **`q21-linux-x86_64.tar.gz`**.
+exécution **verte** → section **Artifacts** → téléchargez **deux** artefacts :
+**`q21-linux-x86_64.tar.gz`** et **`SHA256SUMS-signe`**.
 
-Décompressez-le (double-clic, éventuellement deux fois). Vous obtenez un dossier
-contenant un fichier `q21`.
+Décompressez chacun une fois (double-clic) : vous obtenez `q21-linux-x86_64.tar.gz`
+d'un côté, `SHA256SUMS` et `SHA256SUMS.minisig` de l'autre. **Ne décompressez
+pas le `.tar.gz` lui-même** : c'est lui que la signature couvre, et c'est lui
+qu'on envoie.
 
-Dans le Terminal, placez-vous dans ce dossier — tapez `cd ` puis glissez le
-dossier depuis le Finder — et envoyez :
-
-```bash
-scp q21 q21op@VOTRE_IP:~/
-```
-
-### Sur le serveur
+Dans le Terminal, placez-vous dans le dossier des téléchargements et envoyez
+les trois fichiers :
 
 ```bash
-ssh q21op@VOTRE_IP
-sudo mv ~/q21 /opt/q21/q21
-sudo chown q21:q21 /opt/q21/q21
-sudo chmod +x /opt/q21/q21
+scp q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig q21op@VOTRE_IP:~/
 ```
+
+### Sur le serveur — vérifier la signature avant d'installer
+
+Le condensat seul prouve que le fichier est arrivé entier ; il ne prouve pas
+qui l'a construit. Avant d'installer un programme qui garde des clés, on
+vérifie la **signature** — voir `SIGNATURE.md`. Le serveur a `minisign`
+(`sudo apt install -y minisign` la première fois). Remplacez `RW…` par la
+clé publique du README :
+
+```bash
+minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore-missing
+```
+
+**Vous devez voir** `Signature and comment signature verified`, puis une ligne
+`Trusted comment: Q21 main <empreinte> -- Rei Asanoha` (ou `Q21 v…` pour une
+version étiquetée), puis `q21-linux-x86_64.tar.gz: OK`.
+
+⛔ **Refusez d'installer** si le deuxième mot du commentaire n'est ni `main` ni
+une étiquette `v…`, si l'empreinte n'est pas celle de l'exécution que vous
+avez lancée, ou si l'exécution était rouge. Une signature valide de quelque
+chose que vous n'avez pas voulu reste quelque chose que vous n'avez pas voulu.
+
+Puis, et seulement alors :
+
+```bash
+tar -xzf ~/q21-linux-x86_64.tar.gz
+sudo install -o root -g root -m 0755 ~/q21 /opt/q21/q21
+```
+
+`install -o root` : le programme appartient à `root`, pas au compte qui le
+fait tourner. Un service qui peut réécrire son propre exécutable n'a plus
+aucune barrière entre une faille d'exécution et une persistance.
 
 **Vérifiez que le programme tourne, et qu'il est sur la bonne chaîne :**
 

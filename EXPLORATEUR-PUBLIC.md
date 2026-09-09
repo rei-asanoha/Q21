@@ -116,47 +116,59 @@ l'option `--rpc-public`. Sans cette étape, l'étape 3 échouera.
 
 1. Poussez la dernière archive dans votre dossier Q21 avec GitHub Desktop.
 2. Attendez que **Actions → Livraison** soit verte.
-3. Téléchargez l'artefact **`q21-linux-x86_64.tar.gz`** — celui avec `linux`.
+3. Téléchargez **deux** artefacts : **`q21-linux-x86_64.tar.gz`** — celui avec
+   `linux` — et **`SHA256SUMS-signe`**.
 
-Dans une **FENÊTRE PC**, décompressez (adaptez le chemin) :
+Dans une **FENÊTRE PC**, ouvrez les deux `.zip` de GitHub — et seulement eux :
+le `.tar.gz` qu'ils contiennent reste fermé, c'est lui que la signature couvre
+(adaptez le chemin) :
 
 ```powershell
 cd "C:\Users\VotreNom\Documents\Q21\Serveur\serveur linux"
 ```
 
 ```powershell
-Expand-Archive .\q21-linux-x86_64.tar.gz.zip -DestinationPath .\maj -Force
+Expand-Archive .\q21-linux-x86_64.tar.gz.zip -DestinationPath .\maj -Force; Expand-Archive .\SHA256SUMS-signe.zip -DestinationPath .\maj -Force
 ```
 
 ```powershell
-cd .\maj
+cd .\maj; dir
 ```
 
-```powershell
-tar -xzf .\q21-linux-x86_64.tar.gz
-```
+Vous devez voir **trois** fichiers : `q21-linux-x86_64.tar.gz`, `SHA256SUMS`,
+`SHA256SUMS.minisig`. Envoyez-les :
 
 ```powershell
-dir
-```
-
-Vous devez voir un fichier **`q21`**, sans extension. Envoyez-le :
-
-```powershell
-scp .\q21 ubuntu@ADRESSE-IPV4-DU-SERVEUR:~/q21-neuf
+scp .\q21-linux-x86_64.tar.gz .\SHA256SUMS .\SHA256SUMS.minisig ubuntu@ADRESSE-IPV4-DU-SERVEUR:~/
 ```
 
 ### Sur le serveur
 
-Dans la **FENÊTRE SERVEUR** :
+Dans la **FENÊTRE SERVEUR**, vérifiez la signature **avant** d'installer
+(`sudo apt install -y minisign` la première fois ; `RW…` est la clé publique
+du README) :
 
 ```bash
-sudo systemctl stop q21
+minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Attendu : `Signature and comment signature verified`, un commentaire
+`Trusted comment: Q21 main <empreinte> -- Rei Asanoha`, et
+`q21-linux-x86_64.tar.gz: OK`. ⛔ Autre branche que `main`, autre empreinte
+que celle de l'exécution que vous avez lancée, exécution rouge : **n'installez
+pas** (voir `SIGNATURE.md`).
+
+```bash
+tar -xzf ~/q21-linux-x86_64.tar.gz && sudo systemctl stop q21
 ```
 
 ```bash
-sudo mv ~/q21-neuf /opt/q21/q21 && sudo chown q21:q21 /opt/q21/q21 && sudo chmod +x /opt/q21/q21
+sudo install -o root -g root -m 0755 ~/q21 /opt/q21/q21
 ```
+
+Le programme appartient à `root`, pas au compte qui le fait tourner : un
+service qui peut réécrire son propre exécutable n'a plus de barrière entre une
+faille d'exécution et une persistance.
 
 Vérifiez que la nouvelle option existe **avant** d'aller plus loin :
 

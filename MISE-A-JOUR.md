@@ -58,7 +58,11 @@ Sur `github.com/reiasanoha/q21` :
 
 **Actions** → **Livraison** (colonne de gauche) → **Run workflow** ▾ → bouton vert **Run workflow**
 
-Dix à vingt minutes. Puis télécharge `q21-windows-x86_64.zip` en bas de la page.
+Dix à vingt minutes. Puis télécharge, en bas de la page, `q21-windows-x86_64.zip`
+**et** `SHA256SUMS-signe`, et vérifie la signature avant d'installer — la
+marche à suivre est dans `SIGNATURE.md`, section 4. Une exécution rouge, ou un
+commentaire de confiance qui ne dit pas `Q21 main <empreinte>`, c'est un
+fichier qu'on n'installe pas.
 
 ---
 

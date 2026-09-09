@@ -33,19 +33,37 @@ notez-le sur papier. Deux fichiers sortent :
 | `q21-livraison.pub` | la clé **publique** | dans le README (section ci-dessous), et par un second canal — un message, une page que vous contrôlez |
 | `q21-livraison.key` | la clé **secrète**, chiffrée par le mot de passe | dans les secrets du dépôt, puis nulle part d'autre qu'une copie hors ligne |
 
-## 2 · Confier la clé à la livraison
+## 2 · Confier la clé à la livraison — dans un environnement protégé
 
-Dans le dépôt GitHub : *Settings → Secrets and variables → Actions → New
-repository secret*, deux fois :
+Un secret **de dépôt** est lu par toute exécution lancée depuis le dépôt, sur
+n'importe quelle branche : quiconque peut pousser une branche et cliquer
+« Run workflow » — un collaborateur, un jeton fuité, un compte repris — fait
+signer ce qu'il veut, ou remplace l'étape de signature par un envoi de la clé
+ailleurs. C'est pourquoi la clé ne vit pas dans les secrets du dépôt, mais
+dans un **environnement** GitHub que le travail `signer` est seul à employer,
+et qui n'accepte que `main` et les étiquettes `v*`.
 
-| Nom | Valeur |
+Dans le dépôt GitHub : *Settings → Environments → New environment*, nom
+**`livraison`**, puis :
+
+| Réglage | Valeur |
 |---|---|
-| `MINISIGN_KEY` | le contenu intégral de `q21-livraison.key` (deux lignes) |
-| `MINISIGN_PASSWORD` | le mot de passe choisi à la création |
+| *Required reviewers* | vous-même — chaque livraison attend votre clic |
+| *Deployment branches and tags* | *Selected branches and tags* : `main`, et le motif `v*` |
+| *Environment secrets* → *Add secret* | `MINISIGN_KEY` : le contenu intégral de `q21-livraison.key` (deux lignes) |
+| *Environment secrets* → *Add secret* | `MINISIGN_PASSWORD` : le mot de passe choisi à la création |
+
+Si les deux secrets existaient déjà **au niveau du dépôt**, supprimez-les de
+là une fois recopiés dans l'environnement : tant qu'ils y restent, la
+protection n'est qu'apparente.
 
 Puis effacez `q21-livraison.key` de la machine, ou rangez-le sur un support
 hors ligne. La clé publique, elle, est faite pour être vue : collez sa
 seconde ligne dans le README.
+
+Le compte GitHub qui détient cet environnement doit avoir **deux facteurs**
+activés : c'est lui, en dernier ressort, qui commande la signature. Une
+adresse de récupération de compte est une clé de signature de plus.
 
 ## 3 · Ce que la livraison produit
 
@@ -74,7 +92,16 @@ Trusted comment: Q21 main <empreinte du commit> -- Rei Asanoha
 Ce commentaire est **couvert par la signature** : il ne peut être ni réécrit
 ni usurpé sans la clé secrète. Le nom ne confère aucune autorité — Q21 n'a pas
 de gouvernance — il atteste seulement d'une origine constante d'une livraison
-à l'autre. La
+à l'autre.
+
+**Lisez-le, et refusez tout ce qui ne lui ressemble pas.** Le deuxième mot
+doit être `main` ou une étiquette `v…` ; le troisième, l'empreinte du commit
+que vous attendiez (celle affichée en tête de l'exécution dans l'onglet
+Actions). Un commentaire qui nomme une autre branche, ou un commit que vous
+n'avez pas relu, est une signature valide de quelque chose que vous n'avez
+pas voulu : **n'installez pas**. Et n'installez jamais depuis une exécution
+rouge, même si les archives y sont — une exécution rouge est une exécution
+dont la signature a échoué. La
 seconde doit dire `OK` pour l'archive que vous avez téléchargée. **Si l'une
 des deux échoue, n'installez pas** : ce n'est pas votre livraison.
 

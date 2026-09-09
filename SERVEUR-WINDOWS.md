@@ -419,6 +419,44 @@ En bas, section **Apply to** : cochez le serveur `q21-amorce`. Puis
 
 ---
 
+# Étape 8 bis — Limiter les tentatives
+
+Le pare-feu dit *qui* peut frapper à la porte ; il ne dit pas *combien de
+fois*. Un mot de passe ou une clé se devinent par insistance, et un serveur
+public reçoit des milliers de tentatives par jour. `fail2ban` lit les journaux
+et bannit, pour une heure, toute adresse qui échoue cinq fois.
+
+```bash
+sudo apt install -y fail2ban
+```
+
+```bash
+sudo tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+EOF
+```
+
+```bash
+sudo systemctl enable --now fail2ban && sudo fail2ban-client status sshd
+```
+
+**Vous devez voir** `Status for the jail: sshd` avec un nombre de bannis (zéro
+au début).
+
+> Si ce serveur héberge aussi du courrier (Postfix, Dovecot), ajoutez à
+> `jail.local` les deux sections `[postfix]` et `[dovecot]` avec
+> `enabled = true` : le mot de passe de la boîte est alors, lui aussi, protégé
+> contre la devinette — et c'est ce mot de passe qui commande, par la
+> récupération de compte, tout ce qui dépend de votre adresse.
+
+---
+
 # Étape 9 — Envoyer le programme
 
 Le fichier se télécharge **sur le PC** (GitHub demande d'être connecté, ce que le
@@ -427,46 +465,71 @@ serveur ne peut pas faire), puis se pousse vers le serveur.
 ### Sur le PC
 
 Sur `github.com/reiasanoha/q21` → **Actions** → **Livraison** → la dernière
-exécution verte → section **Artifacts** → **`q21-linux-x86_64.tar.gz`**.
+exécution **verte** → section **Artifacts** → téléchargez **deux** artefacts :
+**`q21-linux-x86_64.tar.gz`** et **`SHA256SUMS-signe`**.
 
-⚠️ **Bien celui-là** : `linux`, pas `windows`. C'est le programme du serveur.
+⚠️ **Bien `linux`**, pas `windows` : c'est le programme du serveur.
 
-GitHub vous livre un `.zip` qui contient le `.tar.gz`. Deux emballages, donc deux
-décompressions. Dans PowerShell — remplacez le chemin par le vôtre :
+GitHub livre chaque artefact dans un `.zip`. On ouvre ces `.zip`-là, et
+**seulement eux** — le `.tar.gz` qu'ils contiennent reste fermé, c'est lui que
+la signature couvre. Dans PowerShell :
 
 ```powershell
 cd $env:USERPROFILE\Downloads
-Expand-Archive .\q21-linux-x86_64.tar.gz.zip -DestinationPath .\pour-serveur
+Expand-Archive .\q21-linux-x86_64.tar.gz.zip -DestinationPath .\pour-serveur -Force
+Expand-Archive .\SHA256SUMS-signe.zip -DestinationPath .\pour-serveur -Force
 cd .\pour-serveur
-tar -xzf .\q21-linux-x86_64.tar.gz
 dir
 ```
 
-`dir` doit lister un fichier nommé **`q21`**, sans extension, d'environ 1,6 Mo.
+`dir` doit lister **trois** fichiers : `q21-linux-x86_64.tar.gz`, `SHA256SUMS`
+et `SHA256SUMS.minisig`.
 
-> `tar` fait partie de Windows depuis Windows 10 (build 17063). Si la commande
-> n'est pas reconnue, décompressez le `.tar.gz` avec 7-Zip — deux fois, comme
-> ci-dessus.
-
-Envoyez-le :
+Envoyez-les :
 
 ```powershell
-scp .\q21 q21op@VOTRE_IP:~/
+scp .\q21-linux-x86_64.tar.gz .\SHA256SUMS .\SHA256SUMS.minisig q21op@VOTRE_IP:~/
 ```
 
-Une barre de progression s'affiche, puis `100%`.
+Trois barres de progression, trois `100%`.
 
-### Sur le serveur
+Puis connectez-vous :
 
 ```powershell
 ssh q21op@VOTRE_IP
 ```
 
+### Sur le serveur — vérifier la signature avant d'installer
+
+Le condensat seul prouve que le fichier est arrivé entier ; il ne prouve pas
+qui l'a construit. Avant d'installer un programme qui garde des clés, on
+vérifie la **signature** — voir `SIGNATURE.md`. Le serveur a `minisign`
+(`sudo apt install -y minisign` la première fois). Remplacez `RW…` par la
+clé publique du README :
+
 ```bash
-sudo mv ~/q21 /opt/q21/q21
-sudo chown q21:q21 /opt/q21/q21
-sudo chmod +x /opt/q21/q21
+minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore-missing
 ```
+
+**Vous devez voir** `Signature and comment signature verified`, puis une ligne
+`Trusted comment: Q21 main <empreinte> -- Rei Asanoha` (ou `Q21 v…` pour une
+version étiquetée), puis `q21-linux-x86_64.tar.gz: OK`.
+
+⛔ **Refusez d'installer** si le deuxième mot du commentaire n'est ni `main` ni
+une étiquette `v…`, si l'empreinte n'est pas celle de l'exécution que vous
+avez lancée, ou si l'exécution était rouge. Une signature valide de quelque
+chose que vous n'avez pas voulu reste quelque chose que vous n'avez pas voulu.
+
+Puis, et seulement alors :
+
+```bash
+tar -xzf ~/q21-linux-x86_64.tar.gz
+sudo install -o root -g root -m 0755 ~/q21 /opt/q21/q21
+```
+
+`install -o root` : le programme appartient à `root`, pas au compte qui le
+fait tourner. Un service qui peut réécrire son propre exécutable n'a plus
+aucune barrière entre une faille d'exécution et une persistance.
 
 **Vérifiez que le programme tourne, et qu'il est sur la bonne chaîne :**
 

@@ -102,3 +102,38 @@ jobs:
         with:
           command: check advisories bans licenses sources
           arguments: --all-features
+
+  # ---------------------------------------------------------------------------
+  #
+  # `vendor/` s'auto-certifie : cargo verifie que chaque fichier a la somme
+  # inscrite dans `.cargo-checksum.json`, et que le champ `package` de ce
+  # fichier egale `Cargo.lock` — il ne recalcule jamais `package` a partir des
+  # fichiers. Une crate modifiee dont on regenere la carte des sommes passe
+  # `--locked` sans un mot. Ce travail refait donc `cargo vendor` depuis
+  # crates.io dans un dossier propre et exige que le resultat soit identique,
+  # octet pour octet, a ce que le depot embarque. Toute divergence — une ligne
+  # ajoutee, un fichier de plus — arrete la fusion.
+  vendor:
+    name: Vendor identique a crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Chaine d'outils
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Revendoriser et comparer
+        shell: bash
+        run: |
+          set -eu
+          # Sans le remplacement de source : on veut crates.io, pas vendor/.
+          mv .cargo/config.toml /tmp/config.toml.depot
+          cargo vendor --locked /tmp/vendor-neuf > /dev/null
+          mv /tmp/config.toml.depot .cargo/config.toml
+          if ! diff -r --brief vendor /tmp/vendor-neuf; then
+            echo "::error::vendor/ differe de ce que crates.io fournit pour Cargo.lock : une source vendorisee a ete modifiee, ou le lock ne correspond plus."
+            exit 1
+          fi
+          echo "vendor/ est identique a crates.io, fichier pour fichier."
