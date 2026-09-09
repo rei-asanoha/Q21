@@ -1069,12 +1069,90 @@ impl HeaderStore {
         Ok(())
     }
 
+    /// Nombre d'en-tetes complets que le fichier contient, d'apres sa seule
+    /// taille — sans le relire. `None` si le magasin n'existe pas ou n'a meme
+    /// pas son prefixe.
+    ///
+    /// C'est ce que la boucle d'instantane consulte toutes les cinq minutes
+    /// pour savoir jusqu'ou completer le magasin : relire tout le fichier —
+    /// 160 octets par bloc, tout l'historique — a cette frequence userait
+    /// une carte SD pour rien. La chaine relue au demarrage par [`Self::load`]
+    /// garantit que les en-tetes comptes ici s'enchainent bien.
+    pub fn compte(&self) -> Option<u64> {
+        let taille = std::fs::metadata(&self.chemin).ok()?.len();
+        if taille < PREFIXE_ENTETES {
+            return None;
+        }
+        Some((taille - PREFIXE_ENTETES) / BlockHeader::SIZE as u64)
+    }
+
+    /// Le dernier en-tete complet du fichier, relu seul — sans parcourir le
+    /// reste. `None` si le magasin est vide, absent, ou si cet en-tete ne se
+    /// decode pas.
+    pub fn dernier(&self) -> Option<BlockHeader> {
+        let n = self.compte()?;
+        if n == 0 {
+            return None;
+        }
+        self.entete_a(n - 1)
+    }
+
+    /// L'en-tete a l'index `index` (l'index est aussi la hauteur, le magasin
+    /// partant de la genese sans trou), relu seul. `None` s'il n'existe pas
+    /// ou ne se decode pas.
+    pub fn entete_a(&self, index: u64) -> Option<BlockHeader> {
+        if index >= self.compte()? {
+            return None;
+        }
+        let mut f = File::open(&self.chemin).ok()?;
+        f.seek(SeekFrom::Start(
+            PREFIXE_ENTETES + index * BlockHeader::SIZE as u64,
+        ))
+        .ok()?;
+        let mut brut = [0u8; BlockHeader::SIZE];
+        f.read_exact(&mut brut).ok()?;
+        BlockHeader::decode(&brut).ok()
+    }
+
+    /// Ne garde que les `n` premiers en-tetes. Sert a retirer une queue que
+    /// la chaine en memoire dement — un dernier en-tete abime qui s'enchaine
+    /// encore sur son parent mais n'est plus lui-meme.
+    pub fn tronquer(&self, n: u64) -> Result<(), StoreError> {
+        let Some(actuel) = self.compte() else {
+            return Ok(());
+        };
+        if n >= actuel {
+            return Ok(());
+        }
+        let fh = OpenOptions::new().write(true).open(&self.chemin)?;
+        fh.set_len(PREFIXE_ENTETES + n * BlockHeader::SIZE as u64)?;
+        fh.sync_all()?;
+        Ok(())
+    }
+
     /// Relit toute la chaine d'en-tetes.
     ///
     /// Verifie la magie, la genese, l'enchainement (parent et hauteur), et coupe
-    /// une eventuelle queue partielle. Une rupture d'enchainement **au milieu**
-    /// du fichier n'est pas une ecriture interrompue : elle est signalee, jamais
-    /// coupee.
+    /// une eventuelle queue partielle.
+    ///
+    /// # Un en-tete illisible ou non chaine au milieu : on coupe, on ne refuse plus
+    ///
+    /// Une premiere version signalait toute rupture d'enchainement au milieu du
+    /// fichier comme une corruption et refusait le magasin entier. Sur un noeud
+    /// elague ou adopte, ce magasin est la **seule** source de la chaine
+    /// d'en-tetes d'avant l'instantane : un seul bit retourne sur la carte SD
+    /// — dans n'importe lequel des 160 octets de n'importe quel bloc de tout
+    /// l'historique — rendait le dossier indemarrable, avec pour seul conseil
+    /// de « resynchroniser dans un dossier vide ». C'est le defaut que ceci
+    /// ferme : le fichier est tronque a la derniere position saine, l'operateur
+    /// en est averti, et l'appelant repart de ce qui reste — le reseau
+    /// refournira les en-tetes manquants, puisque la preuve de travail d'un
+    /// en-tete recu du reseau est verifiee de toute facon.
+    ///
+    /// Tronquer plutot que garder le prefixe sain en memoire : le prochain
+    /// `append` doit ecrire a la suite du dernier en-tete **sain**, pas apres
+    /// les octets abimes. Si la troncature elle-meme echoue, l'ancienne erreur
+    /// [`StoreError::EntetesMaillonRompu`] est rendue : rien n'est cru.
     pub fn load(&self, reseau: crate::address::Network) -> Result<Vec<BlockHeader>, StoreError> {
         if !self.exists() {
             return Ok(Vec::new());
@@ -1112,33 +1190,95 @@ impl HeaderStore {
             }
         }
 
-        let mut entetes = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
+        // Chaque en-tete est decode, puis confronte au precedent, **au fil de
+        // la lecture** : le premier qui ne se decode pas ou ne s'enchaine pas
+        // marque la fin de ce qu'on peut croire. `None` = rien d'anormal.
+        let mut entetes: Vec<BlockHeader> = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
         let mut brut = [0u8; BlockHeader::SIZE];
+        let mut premier_douteux: Option<u64> = None;
         for index in 0..n {
             if f.read_exact(&mut brut).is_err() {
-                return Err(StoreError::FichierTronque { index });
+                premier_douteux = Some(index);
+                break;
             }
-            let h = BlockHeader::decode(&brut).map_err(|_| StoreError::BlocIllisible { index })?;
+            let Ok(h) = BlockHeader::decode(&brut) else {
+                premier_douteux = Some(index);
+                break;
+            };
+            if let Some(precedent) = entetes.last() {
+                if h.prev_block != precedent.block_id() || h.height != precedent.height + 1 {
+                    premier_douteux = Some(index);
+                    break;
+                }
+            }
             entetes.push(h);
         }
 
         // La genese, avant tout : un fichier d'en-tetes d'une autre chaine ne
         // doit pas etre adopte.
-        if let Some(premier) = entetes.first() {
-            let attendu = crate::chain::genesis_id(reseau);
-            let vu = premier.block_id();
-            if vu != attendu {
-                return Err(StoreError::GeneseEtrangere { attendu, vu });
+        //
+        // Mais une genese **abimee** n'est pas une genese etrangere. Elle est
+        // une constante du reseau ; si l'en-tete qui suit s'enchaine sur la
+        // vraie genese, le premier enregistrement n'est que quelques octets
+        // retournes : on le recopie, comme le fait le fichier de blocs.
+        let attendu = crate::chain::genesis_id(reseau);
+        let genese_lue = entetes.first().map(|h| h.block_id());
+        let genese_douteuse = match genese_lue {
+            Some(vu) => vu != attendu,
+            None => n >= 1, // le premier enregistrement ne se decode pas
+        };
+        if genese_douteuse {
+            let etrangere = || match genese_lue {
+                Some(vu) => StoreError::GeneseEtrangere { attendu, vu },
+                None => StoreError::BlocIllisible { index: 0 },
+            };
+            if n < 2 {
+                return Err(etrangere());
             }
+            // Le second en-tete, relu directement : la boucle ci-dessus s'est
+            // peut-etre arretee sur lui, puisqu'il ne s'enchaine pas sur la
+            // fausse genese.
+            let mut second = [0u8; BlockHeader::SIZE];
+            let mut g = File::open(&self.chemin)?;
+            g.seek(SeekFrom::Start(PREFIXE_ENTETES + taille_entete))?;
+            let s = g
+                .read_exact(&mut second)
+                .ok()
+                .and_then(|_| BlockHeader::decode(&second).ok());
+            let chaine_sur_la_vraie = s.is_some_and(|s| s.prev_block == attendu && s.height == 1);
+            if !chaine_sur_la_vraie {
+                return Err(etrangere());
+            }
+            let canonique = crate::chain::genesis_block(reseau).header;
+            let mut fh = OpenOptions::new().write(true).open(&self.chemin)?;
+            fh.seek(SeekFrom::Start(PREFIXE_ENTETES))?;
+            fh.write_all(&canonique.encode())?;
+            fh.sync_all()?;
+            eprintln!("  magasin d'en-tetes repare : en-tete de genese abime, recopie");
+            // On relit tout : l'enchainement doit etre reverifie depuis la
+            // vraie genese, et la troncature eventuelle se decide sur ce
+            // fichier repare.
+            return self.load(reseau);
         }
-        // Puis l'enchainement : chaque en-tete pointe sur le precedent, hauteurs
-        // contigues. Un maillon rompu est une corruption, pas une troncature.
-        for i in 1..entetes.len() {
-            if entetes[i].prev_block != entetes[i - 1].block_id()
-                || entetes[i].height != entetes[i - 1].height + 1
-            {
-                return Err(StoreError::EntetesMaillonRompu { index: i as u64 });
+
+        // Puis la coupe : tout ce qui suit le premier en-tete douteux est
+        // retire du fichier, et l'operateur le sait.
+        if let Some(index) = premier_douteux {
+            let propre = PREFIXE_ENTETES + index * taille_entete;
+            let coupe = std::fs::metadata(&self.chemin)?
+                .len()
+                .saturating_sub(propre);
+            let fh = OpenOptions::new().write(true).open(&self.chemin)?;
+            if fh.set_len(propre).is_err() {
+                return Err(StoreError::EntetesMaillonRompu { index });
             }
+            let _ = fh.sync_all();
+            eprintln!(
+                "  magasin d'en-tetes repare : l'en-tete {index} est illisible ou ne \
+                 s'enchaine pas sur le precedent ; {} en-tete(s) ({coupe} octets) \
+                 retire(s) a partir de la hauteur {index}. Le reseau les refournira",
+                n.saturating_sub(index)
+            );
         }
 
         Ok(entetes)
@@ -1573,18 +1713,55 @@ mod tests {
         s.remove().unwrap();
     }
 
+    /// Un maillon rompu au milieu ne condamne plus le magasin : on coupe a la
+    /// derniere position saine, et ce qui suit reviendra du reseau.
     #[test]
-    fn un_maillon_rompu_est_signale() {
+    fn un_maillon_rompu_est_coupe_a_la_derniere_position_saine() {
         let p = chemin_temporaire("hdr-maillon");
         let s = HeaderStore::new(&p);
         let mut chaine = chaine_entetes(5);
         // On casse l'enchainement du troisieme en-tete.
         chaine[3].prev_block = crate::hash::Hash256([0x77; 32]);
         s.append(&chaine).unwrap();
-        assert!(matches!(
-            s.load(Network::Regtest),
-            Err(StoreError::EntetesMaillonRompu { index: 3 })
-        ));
+        let relus = s.load(Network::Regtest).expect("le magasin se repare");
+        assert_eq!(relus, chaine[..3], "0..=2 sont sains, 3 et 4 sont retires");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len(),
+            PREFIXE_ENTETES + 3 * BlockHeader::SIZE as u64,
+            "le fichier est tronque, pas seulement lu court"
+        );
+        // Et l'on peut ecrire a la suite : les en-tetes sains reviennent.
+        let bonne = chaine_entetes(5);
+        s.append(&bonne[3..]).unwrap();
+        assert_eq!(s.load(Network::Regtest).unwrap(), bonne);
+        s.remove().unwrap();
+    }
+
+    /// Un en-tete de genese abime n'est pas une genese etrangere : il est
+    /// recopie depuis la constante du reseau, comme dans le fichier de blocs.
+    #[test]
+    fn une_genese_abimee_dans_le_magasin_est_recopiee() {
+        let p = chemin_temporaire("hdr-genese-abimee");
+        let s = HeaderStore::new(&p);
+        let chaine = chaine_entetes(4);
+        s.append(&chaine).unwrap();
+        // Un bit dans le nonce de la genese : son identifiant change, le
+        // second en-tete ne s'enchaine plus sur elle.
+        {
+            let mut f = OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            f.seek(SeekFrom::Start(
+                PREFIXE_ENTETES + BlockHeader::SIZE as u64 - 1,
+            ))
+            .unwrap();
+            let mut o = [0u8; 1];
+            f.read_exact(&mut o).unwrap();
+            f.seek(SeekFrom::Start(
+                PREFIXE_ENTETES + BlockHeader::SIZE as u64 - 1,
+            ))
+            .unwrap();
+            f.write_all(&[o[0] ^ 0x01]).unwrap();
+        }
+        assert_eq!(s.load(Network::Regtest).unwrap(), chaine);
         s.remove().unwrap();
     }
 
