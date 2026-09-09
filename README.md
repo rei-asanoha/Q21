@@ -535,8 +535,12 @@ rq21seed18zpjwkqmz5kvhxk2vw6fnzek3js5dzk3w7stkx66jfugyfsflemsjlt3za
 ```
 
 Un test substitue chaque caractère du code par sept autres : les 400 fautes de
-frappe sont détectées, aucune ne passe. `q21 restore <code>` reconstitue le
-portefeuille — vérifié de bout en bout.
+frappe sont détectées, aucune ne passe. `q21 restore` reconstitue le
+portefeuille — vérifié de bout en bout. Le code est demandé au terminal, sans
+écho, ou lu dans un fichier à soi seul (`--code-fichier`) : il n'est **jamais**
+accepté en argument, parce qu'un argument finit dans l'historique du terminal
+et dans `/proc/<pid>/cmdline`, lisible par tout compte de la machine — et ce
+code *est* la graine. Un `q21 restore <code>` est refusé en expliquant pourquoi.
 
 Le chiffrement n'invente aucune primitive : **Argon2id** (RFC 9106, 64 Mio,
 trois passes) dérive la clef, un flot HMAC en mode compteur chiffre, un HMAC

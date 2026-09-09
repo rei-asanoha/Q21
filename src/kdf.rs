@@ -362,6 +362,47 @@ pub fn est_ancien_format(contenu: &[u8]) -> bool {
     contenu.starts_with(MAGIE)
 }
 
+/// Le cout Argon2id annonce par l'en-tete d'un scelle du format courant.
+///
+/// `None` pour tout autre contenu — un fichier en clair, ou l'ancien format,
+/// qui n'a pas de cout Argon2. La valeur est lue **avant** d'etre
+/// authentifiee, comme dans [`desceller`] : elle ne sert qu'a decider d'un
+/// rescellement une fois la phrase verifiee, jamais a accorder quoi que ce
+/// soit.
+pub fn cout_lu(contenu: &[u8]) -> Option<Cout> {
+    if !contenu.starts_with(MAGIE2) || contenu.len() < 16 {
+        return None;
+    }
+    Some(Cout {
+        memoire_kib: u32::from_le_bytes([contenu[8], contenu[9], contenu[10], contenu[11]]),
+        passes: u32::from_le_bytes([contenu[12], contenu[13], contenu[14], contenu[15]]),
+    })
+}
+
+/// Ce scelle est-il protege par moins que le cout par defaut ?
+///
+/// # Le defaut que ceci ferme
+///
+/// Le MAC couvre l'en-tete : un tiers sans la phrase ne peut pas abaisser le
+/// cout. Mais un fichier scelle a 8 Kio et une passe — par un autre outil,
+/// une version modifiee, une option d'essai — s'ouvrait en quarante
+/// microsecondes sans un mot, et n'etait jamais rescelle : l'utilisateur
+/// croyait son fichier derriere 64 Mio d'Argon2id. Un plancher n'aurait pas
+/// suffi — refuser d'ouvrir un portefeuille legitime serait pire — mais il
+/// faut le dire, et le resceller au defaut a la premiere ouverture.
+///
+/// L'ancien format (PBKDF2) est **toujours** sous le defaut : il n'a pas de
+/// resistance a la memoire du tout, c'est pour cela qu'il est rescelle.
+pub fn est_sous_le_cout_par_defaut(contenu: &[u8]) -> bool {
+    if est_ancien_format(contenu) {
+        return true;
+    }
+    match cout_lu(contenu) {
+        Some(c) => c.memoire_kib < COUT_DEFAUT.memoire_kib || c.passes < COUT_DEFAUT.passes,
+        None => false,
+    }
+}
+
 /// Verifie puis dechiffre.
 pub fn desceller(phrase: &[u8], scelle: &[u8]) -> Result<Vec<u8>, ScelleError> {
     // --- Un fichier tronque ne doit pas se distinguer d'une mauvaise phrase.
@@ -467,6 +508,54 @@ mod tests {
 
     fn hex(o: &[u8]) -> String {
         o.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Un scelle sous le cout par defaut est reconnu comme tel ; un scelle au
+    /// defaut, ou au-dela, ne l'est pas ; l'ancien format l'est toujours.
+    #[test]
+    fn un_scelle_sous_le_cout_par_defaut_est_reconnu() {
+        let faible = sceller(
+            b"p",
+            b"x",
+            Cout {
+                memoire_kib: 8,
+                passes: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cout_lu(&faible),
+            Some(Cout {
+                memoire_kib: 8,
+                passes: 1
+            })
+        );
+        assert!(est_sous_le_cout_par_defaut(&faible));
+        // Assez de memoire, pas assez de passes : c'est encore sous le defaut.
+        let passes = sceller(
+            b"p",
+            b"x",
+            Cout {
+                memoire_kib: COUT_DEFAUT.memoire_kib,
+                passes: 1,
+            },
+        )
+        .unwrap();
+        assert!(est_sous_le_cout_par_defaut(&passes));
+        // Le cout par defaut lui-meme : rien a resceller.
+        let defaut = sceller(b"p", b"x", COUT_DEFAUT).unwrap();
+        assert_eq!(cout_lu(&defaut), Some(COUT_DEFAUT));
+        assert!(!est_sous_le_cout_par_defaut(&defaut));
+        // Un contenu en clair n'a pas de cout, et n'est pas « sous le defaut ».
+        assert_eq!(cout_lu(b"seed=00"), None);
+        assert!(!est_sous_le_cout_par_defaut(b"seed=00"));
+        // L'ancien format est toujours a resceller.
+        let mut ancien = Vec::new();
+        ancien.extend_from_slice(MAGIE);
+        ancien.extend_from_slice(&1_000u32.to_le_bytes());
+        ancien.extend_from_slice(&[7u8; 16]);
+        assert!(est_ancien_format(&ancien));
+        assert!(est_sous_le_cout_par_defaut(&ancien));
     }
 
     // -----------------------------------------------------------------------

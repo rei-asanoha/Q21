@@ -24,15 +24,23 @@ const AIDE: &str = "\
 q21 — noeud et portefeuille du protocole Q21 (phase 2)
 
 USAGE
-    q21 [--datadir <chemin>] [--phrase-fichier <chemin>] <commande> [arguments]
+    q21 [--datadir <chemin>] [--phrase-fichier <chemin>] [--code-fichier <chemin>]
+        [--accepter-autre-graine] <commande> [arguments]
+
+    --phrase-fichier <f>    phrase secrete lue dans f (un fichier a vous seul)
+    --code-fichier <f>      code de sauvegarde lu dans f, pour `restore`
+    --accepter-autre-graine ouvre un wallet.dat d'une autre graine que celle
+                            que ce dossier a connue (voir PORTEFEUILLE.md)
 
 COMMANDES
     init [regtest|testnet] [lamport|mldsa65|mldsa87]
                             Cree une chaine et un portefeuille
                             (schema par defaut : mldsa87 si compile, sinon lamport)
-    restore <code> [reseau] [schema]
+    restore [reseau] [schema]
                             Restaure un portefeuille depuis son code de
-                            sauvegarde Bech32m
+                            sauvegarde Bech32m. Le code est demande au
+                            terminal, sans echo, ou lu avec --code-fichier :
+                            il ne passe JAMAIS en argument
     info                     Etat de la chaine
     address                  Produit une adresse de reception neuve
     balance                  Solde depensable du portefeuille
@@ -173,6 +181,7 @@ fn main() {
     let mut reste: Vec<String> = Vec::new();
 
     let mut phrase_option: Option<String> = None;
+    let mut code_option: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--datadir" && i + 1 < args.len() {
@@ -181,6 +190,12 @@ fn main() {
         } else if args[i] == "--phrase-fichier" && i + 1 < args.len() {
             phrase_option = Some(args[i + 1].clone());
             i += 2;
+        } else if args[i] == "--code-fichier" && i + 1 < args.len() {
+            code_option = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--accepter-autre-graine" {
+            ACCEPTER_AUTRE_GRAINE.store(true, std::sync::atomic::Ordering::Relaxed);
+            i += 1;
         } else {
             reste.push(args[i].clone());
             i += 1;
@@ -283,9 +298,8 @@ fn main() {
         ),
         "restore" => cmd_restore(
             &datadir,
-            reste.get(1).map(|s| s.as_str()),
-            reste.get(2).map(|s| s.as_str()),
-            reste.get(3).map(|s| s.as_str()),
+            &reste[1..],
+            code_option.as_deref(),
             phrase_option.as_deref(),
         ),
         "info" => cmd_info(&datadir),
@@ -397,29 +411,7 @@ fn phrase_secrete(
     interactif: bool,
 ) -> Result<Option<String>, String> {
     if let Some(chemin) = depuis_fichier {
-        // Un fichier de phrase lisible par d'autres comptes vaut une phrase
-        // affichee : on le dit, sans refuser — refuser bloquerait un service
-        // qui demarre sans personne pour corriger, et le fichier, lui, ne
-        // devient pas plus secret parce qu'on ne l'a pas lu.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(m) = std::fs::metadata(chemin) {
-                if m.permissions().mode() & 0o077 != 0 {
-                    eprintln!(
-                        "  avertissement : {chemin} est lisible par d'autres comptes de cette \
-                         machine (droits {:o}). Restreignez-le : chmod 600 {chemin}",
-                        m.permissions().mode() & 0o777
-                    );
-                }
-            }
-        }
-        let brut = std::fs::read_to_string(chemin)
-            .map_err(|e| format!("phrase secrete illisible dans {chemin} : {e}"))?;
-        let p = brut.trim_end_matches(['\n', '\r']).to_string();
-        if p.is_empty() {
-            return Err(format!("le fichier {chemin} est vide"));
-        }
+        let p = lire_secret_dans_un_fichier(chemin, "phrase secrete")?;
         return Ok(Some(p));
     }
     if let Some(p) = phrase_d_environnement() {
@@ -435,6 +427,45 @@ fn phrase_secrete(
     }
     Ok(if p.is_empty() { None } else { Some(p) })
 }
+
+/// Lit un secret — phrase ou code de sauvegarde — dans un fichier.
+///
+/// Un fichier lisible par d'autres comptes vaut un secret affiche : on le dit,
+/// sans refuser — refuser bloquerait un service qui demarre sans personne pour
+/// corriger, et le fichier, lui, ne devient pas plus secret parce qu'on ne l'a
+/// pas lu. Seule la fin de ligne est retiree : une phrase a le droit de
+/// commencer ou de finir par une espace.
+fn lire_secret_dans_un_fichier(chemin: &str, quoi: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(chemin) {
+            if m.permissions().mode() & 0o077 != 0 {
+                eprintln!(
+                    "  avertissement : {chemin} est lisible par d'autres comptes de cette \
+                     machine (droits {:o}). Restreignez-le : chmod 600 {chemin}",
+                    m.permissions().mode() & 0o777
+                );
+            }
+        }
+    }
+    let mut brut = std::fs::read_to_string(chemin)
+        .map_err(|e| format!("{quoi} illisible dans {chemin} : {e}"))?;
+    let p = brut.trim_end_matches(['\n', '\r']).to_string();
+    // La lecture brute est effacee : seule la copie rognee survit, dans un
+    // type qui s'efface a son tour (`Secret`) chez l'appelant.
+    // Sur : on n'ecrit que des zeros, qui sont de l'UTF-8 valide.
+    q21_core::kdf::effacer(unsafe { brut.as_bytes_mut() });
+    if p.is_empty() {
+        return Err(format!("le fichier {chemin} est vide"));
+    }
+    Ok(p)
+}
+
+/// Un `wallet.dat` d'une autre graine que celle que le dossier a connue est
+/// accepte : pose par `--accepter-autre-graine`. Voir [`lire_portefeuille`].
+static ACCEPTER_AUTRE_GRAINE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Restreint le fichier a son proprietaire.
 ///
@@ -528,6 +559,194 @@ fn restreindre_acces(chemin: &Path) -> bool {
     }
 }
 
+/// Cree un fichier temporaire **deja** restreint a son proprietaire.
+///
+/// # Le defaut que ceci ferme
+///
+/// Le temporaire du portefeuille etait cree avec les droits du `umask` — 0644
+/// avec le 022 habituel — rempli, synchronise sur disque, puis seulement passe
+/// en 0600. Entre la creation et la restriction, tout compte de la machine
+/// pouvait l'ouvrir, et un descripteur ouvert survit au `chmod`. La fenetre
+/// incluait le `fsync`, long sur une carte SD, et s'ouvrait a chaque ecriture :
+/// chaque bloc mine, chaque envoi, chaque adresse demandee. Portefeuille en
+/// clair : la graine ; scelle : de quoi attaquer la phrase hors ligne.
+///
+/// Sous Unix, le mode est pose par `O_CREAT` lui-meme : le fichier n'existe
+/// jamais sous un autre. `create_new` refuse un temporaire qui serait deja la ;
+/// un reste d'ecriture interrompue est retire avant, jamais rouvert en place.
+/// Sous Windows, il n'y a pas de mode a la creation : le fichier est cree
+/// **vide**, restreint par `icacls`, et le premier octet n'est ecrit qu'apres.
+fn creer_temporaire_prive(tmp: &Path) -> Result<std::fs::File, String> {
+    let _ = std::fs::remove_file(tmp);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(tmp)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let f = std::fs::File::create(tmp).map_err(|e| e.to_string())?;
+        if !restreindre_acces(tmp) {
+            eprintln!(
+                "avertissement : les droits d'acces de {} n'ont pas pu etre restreints.",
+                tmp.display()
+            );
+        }
+        Ok(f)
+    }
+}
+
+/// Cree le dossier de donnees, prive des sa naissance.
+///
+/// Le dossier etait cree avec les droits par defaut — 0755 — et le restait.
+/// Un dossier lisible par autrui laisse voir les noms et tailles de tout ce
+/// qu'il contient, et c'est le premier maillon de toutes les fenetres que ce
+/// fichier ferme : un fichier en 0600 dans un dossier en 0700 n'est plus a
+/// portee d'un `inotify` d'un autre compte. Les dossiers parents, eux, sont
+/// crees avec les droits ordinaires : ils ne sont pas a nous.
+fn creer_dossier_prive(d: &Path) -> Result<(), String> {
+    if d.is_dir() {
+        resserrer_dossier(d);
+        return Ok(());
+    }
+    if let Some(parent) = d.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(d)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(d).map_err(|e| e.to_string())
+    }
+}
+
+/// Resserre un dossier de donnees plus large que 0700, et le dit.
+///
+/// Un dossier cree par une version anterieure, ou par un `mkdir` a la main,
+/// est ramene a son proprietaire au demarrage suivant. Un echec — un systeme
+/// de fichiers sans droits, une cle USB en FAT32 — est dit, jamais fatal :
+/// refuser d'ouvrir le portefeuille ne rendrait pas le dossier plus prive.
+/// Sous Windows, les droits sont ceux des fichiers, poses un a un par `icacls`.
+fn resserrer_dossier(d: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(d) {
+            if m.is_dir() && m.permissions().mode() & 0o077 != 0 {
+                match std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)) {
+                    Ok(()) => println!(
+                        "  droits du dossier {} ramenes a son seul proprietaire (0700)",
+                        d.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "avertissement : le dossier {} reste lisible par d'autres comptes \
+                         (droits {:o}) et n'a pas pu etre restreint : {e}",
+                        d.display(),
+                        m.permissions().mode() & 0o777
+                    ),
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = d;
+}
+
+/// L'ancre du dossier : ce qu'il a connu de son portefeuille.
+///
+/// # Le defaut que ceci ferme
+///
+/// Le seul lien entre un dossier et *son* portefeuille etait `wallet.seq`, un
+/// entier. Rien ne retenait que ce dossier etait protege par une phrase, ni a
+/// quelle graine il appartenait. Un `wallet.dat` en clair, d'une autre
+/// graine, portant le numero de serie courant, etait lu, cru, et le processus
+/// basculait en mode « pas de phrase » : le minage et le solde affiche
+/// devenaient ceux de la graine etrangere, les ecritures suivantes se
+/// faisaient en clair, et rien ne le signalait. Quiconque ecrit dans le
+/// dossier sans executer de code sous le compte — partage, sauvegarde
+/// restauree, client de synchronisation — pouvait detourner un mineur sans
+/// surveillance.
+///
+/// Le dossier retient donc deux faits, dans `wallet.ancre` : « ce dossier a
+/// vu un portefeuille scelle » — et cela ne s'oublie pas — et une empreinte
+/// **publique** de la graine, `HMAC(graine, "Q21-DOSSIER-v1")`, qui ne dit
+/// rien de la graine mais suffit a reconnaitre une autre. Un fichier non
+/// scelle dans un dossier qui a vu un scelle est refuse ; une autre graine
+/// est refusee sauf `--accepter-autre-graine`. Ce n'est pas une defense
+/// contre qui peut aussi effacer l'ancre : c'est la meme limite, deja
+/// acceptee, que l'anti-rejeu par numero de serie.
+///
+/// Un dossier anterieur, sans ancre, l'acquiert a sa premiere ecriture.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct Ancre {
+    /// Ce dossier a deja contenu un portefeuille scelle par une phrase.
+    scelle: bool,
+    /// Empreinte publique de la graine que ce dossier a connue.
+    graine: Option<[u8; 32]>,
+}
+
+fn chemin_ancre(d: &Path) -> PathBuf {
+    d.join("wallet.ancre")
+}
+
+/// L'empreinte publique d'une graine, pour l'ancre.
+fn empreinte_de_dossier(w: &Wallet) -> [u8; 32] {
+    w.empreinte_publique(b"Q21-DOSSIER-v1")
+}
+
+fn lire_ancre(d: &Path) -> Option<Ancre> {
+    let texte = std::fs::read_to_string(chemin_ancre(d)).ok()?;
+    let mut a = Ancre::default();
+    for ligne in texte.lines() {
+        match ligne.split_once('=') {
+            Some(("scelle", v)) => a.scelle = v.trim() == "1",
+            Some(("graine", v)) => {
+                a.graine = hex_en_octets(v.trim())
+                    .filter(|o| o.len() == 32)
+                    .map(|o| {
+                        let mut g = [0u8; 32];
+                        g.copy_from_slice(&o);
+                        g
+                    })
+            }
+            _ => {}
+        }
+    }
+    Some(a)
+}
+
+fn ecrire_ancre(d: &Path, a: &Ancre) {
+    let chemin = chemin_ancre(d);
+    let tmp = chemin.with_extension("ancre.tmp");
+    let graine: String = a
+        .graine
+        .map(|g| g.iter().map(|o| format!("{o:02x}")).collect())
+        .unwrap_or_default();
+    let contenu = format!("scelle={}\ngraine={graine}\n", u8::from(a.scelle));
+    let ecrit = creer_temporaire_prive(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(contenu.as_bytes())
+            .and_then(|_| f.sync_all())
+            .map_err(|e| e.to_string())
+    });
+    if ecrit.is_ok() && std::fs::rename(&tmp, &chemin).is_ok() {
+        let _ = restreindre_acces(&chemin);
+    }
+}
+
 /// Numero de serie du fichier de portefeuille, conserve a part.
 ///
 /// # Le rejeu qu'il empeche
@@ -585,8 +804,17 @@ fn serie_connue(d: &Path) -> u64 {
 
 fn enregistrer_serie(d: &Path, serie: u64) {
     let chemin = chemin_serie(d);
-    let tmp = chemin.with_extension("tmp");
-    if std::fs::write(&tmp, serie.to_string()).is_ok() && std::fs::rename(&tmp, &chemin).is_ok() {
+    // `wallet.seq.tmp`, et non `wallet.tmp` : ce dernier est le temporaire du
+    // portefeuille lui-meme. Les deux ecritures se suivent sans se chevaucher,
+    // mais un temporaire cree en 0644 sous le nom de celui qui porte la graine
+    // est exactement ce qu'un guetteur attend de voir.
+    let tmp = chemin.with_extension("seq.tmp");
+    let ecrit = creer_temporaire_prive(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(serie.to_string().as_bytes())
+            .map_err(|e| e.to_string())
+    });
+    if ecrit.is_ok() && std::fs::rename(&tmp, &chemin).is_ok() {
         // Ce fichier ne porte qu'un compteur : son echec ne merite pas un
         // avertissement, contrairement a celui qui porte la graine.
         let _ = restreindre_acces(&chemin);
@@ -636,10 +864,22 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     let serie = serie_connue(d).saturating_add(1);
     // Les indices deja employes font partie du portefeuille au meme titre que
     // la graine : les perdre coute une clef privee.
+    //
+    // Les indices seulement reserves y figurent aussi : un binaire anterieur,
+    // qui ignore la ligne `reserves=`, les tiendra pour consommes, ce qui est
+    // le sens prudent. Voir `Wallet::indices_consommes_pour_le_fichier`.
     let consommes: Vec<String> = w
-        .indices_consommes()
+        .indices_consommes_pour_le_fichier()
         .iter()
         .map(|i| i.to_string())
+        .collect();
+    // Les reservations en cours, avec la hauteur de leur reservation : c'est
+    // ce qui permet, au redemarrage, de rendre une piece qu'un arret entre la
+    // reservation et la diffusion aurait sinon figee pour toujours.
+    let reserves: Vec<String> = w
+        .indices_reserves()
+        .iter()
+        .map(|(i, h)| format!("{i}:{h}"))
         .collect();
     // --- Les etiquettes du carnet.
     //
@@ -659,8 +899,10 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
         .iter()
         .map(|i| i.to_string())
         .collect();
-    let contenu = format!(
-        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserie={}\nverifie_jusqu_a={}\nconsommes={}\netiquettes={}\ndemandees={}\n",
+    // Le texte en clair est efface a la sortie de cette fonction, qu'elle
+    // reussisse ou non : il porte la graine.
+    let contenu = Secret(format!(
+        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserie={}\nverifie_jusqu_a={}\nconsommes={}\netiquettes={}\ndemandees={}\nreserves={}\n",
         w.seed_hex(),
         w.next_index(),
         reseau,
@@ -669,21 +911,27 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
         w.verifie_jusqu_a(),
         consommes.join(","),
         etiquettes,
-        demandees.join(",")
-    );
+        demandees.join(","),
+        reserves.join(",")
+    ));
     // Le portefeuille est scelle si une phrase secrete est connue de cette
     // session. La graine ne doit jamais toucher le disque en clair quand
     // l'utilisateur a demande le contraire.
     let chemin = chemin_portefeuille(d);
-    let octets = match phrase_courante() {
+    let phrase = phrase_courante();
+    let scelle = phrase.is_some();
+    let octets = match &phrase {
         Some(phrase) => q21_core::kdf::sceller(
             phrase.as_bytes(),
             contenu.as_bytes(),
             q21_core::kdf::COUT_DEFAUT,
         )
         .map_err(|e| e.to_string())?,
-        None => contenu.into_bytes(),
+        // En clair : une copie, effacee comme l'original a la sortie.
+        None => contenu.as_bytes().to_vec(),
     };
+    // Efface a la destruction : en clair, ces octets sont la graine.
+    let octets = OctetsSecrets(octets);
     // --- L'ecriture passe par un fichier temporaire, puis un renommage.
     //
     // `std::fs::write` tronque le fichier existant **avant** d'ecrire le
@@ -694,20 +942,21 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     //
     // `wallet.seq` avait deja cette precaution ; le fichier qui porte les fonds
     // ne l'avait pas.
+    //
+    // Le temporaire porte la graine : il nait deja restreint a son
+    // proprietaire, il n'existe a aucun instant sous un autre mode. Voir
+    // `creer_temporaire_prive` pour la fenetre que cela ferme.
     let tmp = chemin.with_extension("tmp");
     {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        f.write_all(&octets).map_err(|e| e.to_string())?;
+        let mut f = creer_temporaire_prive(&tmp)?;
+        f.write_all(&octets.0).map_err(|e| e.to_string())?;
         // Jusqu'au disque, pas seulement jusqu'au cache du systeme : ce fichier
         // sert d'ecriture anticipee avant une signature a usage unique, et une
         // coupure de courant juste apres le renommage ne doit pas rendre un
         // indice que l'on vient de consommer.
         f.sync_all().map_err(|e| e.to_string())?;
     }
-    // Le temporaire porte deja la graine : on le restreint avant meme qu'il
-    // prenne son nom definitif.
-    let _ = restreindre_acces(&tmp);
     std::fs::rename(&tmp, &chemin).map_err(|e| e.to_string())?;
     // Le renommage lui-meme doit atteindre le disque : sans cela, le repertoire
     // peut encore designer l'ancien fichier apres une coupure.
@@ -732,6 +981,17 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     // La marque de serie n'est posee qu'apres l'ecriture reussie : sinon une
     // coupure entre les deux rendrait le portefeuille reel « trop ancien ».
     enregistrer_serie(d, serie);
+    // L'ancre du dossier suit : « a vu un scelle » ne redevient jamais faux,
+    // et l'empreinte est celle de la graine qu'on vient d'ecrire — un dossier
+    // anterieur, sans ancre, l'acquiert ici.
+    let precedente = lire_ancre(d).unwrap_or_default();
+    let ancre = Ancre {
+        scelle: precedente.scelle || scelle,
+        graine: Some(empreinte_de_dossier(w)),
+    };
+    if ancre != precedente {
+        ecrire_ancre(d, &ancre);
+    }
 
     // Le cache d'adresses suit le portefeuille. Son echec n'est pas fatal : on
     // y perd du temps de demarrage, jamais des fonds.
@@ -765,8 +1025,34 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
 static PHRASE: std::sync::Mutex<Option<Option<Secret>>> = std::sync::Mutex::new(None);
 
 /// Une chaine effacee a sa destruction : la phrase secrete ne doit pas
-/// survivre dans le tas quand on l'oublie ou qu'on la remplace.
+/// survivre dans le tas quand on l'oublie ou qu'on la remplace — ni le texte
+/// en clair du portefeuille, qui porte la graine.
+///
+/// # Le defaut que ceci ferme
+///
+/// `phrase_courante()` rendait un `String` ordinaire, clone a chaque
+/// ecriture du portefeuille et jamais efface ; le texte en clair du
+/// portefeuille, avant scellement et apres descellement, vivait de meme dans
+/// un `String` nu. L'effacement promis par les commentaires — « ni graine, ni
+/// phrase, ni clef derivee » — ne couvrait que la graine. Tout ce qui passe
+/// par ce type est efface quand il sort de portee.
 struct Secret(String);
+
+impl Secret {
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Clone for Secret {
+    fn clone(&self) -> Self {
+        Secret(self.0.clone())
+    }
+}
 
 impl Drop for Secret {
     fn drop(&mut self) {
@@ -775,12 +1061,24 @@ impl Drop for Secret {
     }
 }
 
-fn phrase_courante() -> Option<String> {
+/// Des octets effaces a leur destruction : le portefeuille pret a etre ecrit,
+/// qui est la graine elle-meme quand il n'y a pas de phrase.
+struct OctetsSecrets(Vec<u8>);
+
+impl Drop for OctetsSecrets {
+    fn drop(&mut self) {
+        q21_core::kdf::effacer(&mut self.0);
+    }
+}
+
+/// La phrase retenue, dans un type qui s'efface a la destruction. Chaque
+/// appel rend une copie ; la copie est effacee quand l'appelant la lache.
+fn phrase_courante() -> Option<Secret> {
     PHRASE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .and_then(|p| p.as_ref().map(|s| s.0.clone()))
+        .and_then(|p| p.as_ref().cloned())
 }
 
 fn retenir_phrase(p: Option<String>) {
@@ -890,32 +1188,77 @@ fn hex_en_octets(s: &str) -> Option<Vec<u8>> {
 fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     let brut = std::fs::read(chemin_portefeuille(d))
         .map_err(|_| "aucun portefeuille ici. Lancez `q21 init` d'abord.".to_string())?;
+    // Le dossier qui porte le portefeuille est a son proprietaire, et a lui
+    // seul. Un dossier plus large — version anterieure, `mkdir` a la main —
+    // est resserre ici, au premier passage.
+    resserrer_dossier(d);
+
+    // --- L'ancre du dossier, AVANT de croire le fichier.
+    //
+    // Un fichier non scelle dans un dossier qui a connu un scelle n'est pas
+    // le portefeuille de ce dossier : c'est une substitution, ou une
+    // manipulation qu'il faut assumer explicitement. On refuse avant meme de
+    // decider qu'il n'y a pas de phrase — sans quoi la prochaine ecriture se
+    // ferait en clair. Voir `Ancre`.
+    let ancre = lire_ancre(d).unwrap_or_default();
+    let scelle = q21_core::kdf::est_scelle(&brut);
+    if !scelle && ancre.scelle {
+        return Err(format!(
+            "ce dossier etait protege par une phrase secrete ; ce fichier ne l'est pas.\n             \
+             Le wallet.dat de {} n'est pas celui que ce dossier a connu : il a ete\n             \
+             remplace, ou restaure depuis une copie ecrite sans phrase. On refuse de\n             \
+             l'ouvrir plutot que de basculer en clair sans un mot.\n\n             \
+             Si c'est voulu — un portefeuille que vous avez vous-meme deplace ici —\n             \
+             effacez {} apres avoir verifie que ce fichier est bien le votre.",
+            d.display(),
+            chemin_ancre(d).display()
+        ));
+    }
 
     // Un portefeuille scelle se reconnait a sa magie. On ne devine jamais : soit
     // le fichier annonce qu'il est chiffre, soit il ne l'est pas.
     let ancien_format = q21_core::kdf::est_ancien_format(&brut);
-    let contenu = if q21_core::kdf::est_scelle(&brut) {
+    // Un scelle sous le cout par defaut — 8 Kio et une passe, par exemple —
+    // s'ouvre en quelques microsecondes : la phrase n'est protegee que par sa
+    // longueur. On le dit, et on rescelle au defaut une fois la phrase
+    // verifiee, par le meme chemin que l'ancien format.
+    let sous_le_cout = scelle && q21_core::kdf::est_sous_le_cout_par_defaut(&brut);
+    if sous_le_cout && !ancien_format {
+        let c = q21_core::kdf::cout_lu(&brut).unwrap_or(q21_core::kdf::COUT_DEFAUT);
+        eprintln!(
+            "avertissement : ce portefeuille est scelle avec un cout Argon2id de {} Kio \
+             et {} passe(s), sous le defaut ({} Kio, {} passes) : une phrase courte se \
+             devine vite. Il sera rescelle au cout par defaut.",
+            c.memoire_kib,
+            c.passes,
+            q21_core::kdf::COUT_DEFAUT.memoire_kib,
+            q21_core::kdf::COUT_DEFAUT.passes
+        );
+    }
+    // Le texte en clair porte la graine : il est efface a la sortie.
+    let contenu: Secret = if scelle {
         let phrase = match phrase_courante() {
             Some(p) => p,
             None => {
                 let p = phrase_secrete(None, true)?
                     .ok_or("ce portefeuille est chiffre : une phrase secrete est necessaire")?;
-                retenir_phrase(Some(p.clone()));
-                p
+                retenir_phrase(Some(p));
+                phrase_courante().ok_or("phrase secrete non retenue")?
             }
         };
         let clair =
             q21_core::kdf::desceller(phrase.as_bytes(), &brut).map_err(|e| e.to_string())?;
-        String::from_utf8(clair).map_err(|_| "portefeuille illisible apres dechiffrement")?
+        Secret(String::from_utf8(clair).map_err(|_| "portefeuille illisible apres dechiffrement")?)
     } else {
         retenir_phrase(None);
-        String::from_utf8(brut).map_err(|_| "portefeuille illisible")?
+        Secret(String::from_utf8(brut).map_err(|_| "portefeuille illisible")?)
     };
 
     let mut seed = None;
     let mut next_index = 0u32;
     let mut serie = 0u64;
     let mut consommes: Vec<u32> = Vec::new();
+    let mut reserves: Vec<(u32, u64)> = Vec::new();
     let mut etiquettes: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     let mut demandees: Vec<u32> = Vec::new();
     let mut verifie_jusqu_a = 0u64;
@@ -923,7 +1266,7 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     // Absent des portefeuilles ecrits avant l'arrivee de ML-DSA : on retombe
     // sur Lamport, qui est ce qu'ils contenaient.
     let mut scheme = SchemeId::LamportOts;
-    for ligne in contenu.lines() {
+    for ligne in contenu.as_str().lines() {
         let (clef, valeur) = match ligne.split_once('=') {
             Some(p) => p,
             None => continue,
@@ -938,6 +1281,19 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
                     .split(',')
                     .filter(|s| !s.is_empty())
                     .filter_map(|s| s.parse().ok())
+                    .collect()
+            }
+            // Absent des portefeuilles anterieurs : aucune reservation en
+            // cours, et les indices de `consommes=` restent consommes, ce qui
+            // est le sens prudent. Une entree malformee est ignoree seule.
+            "reserves" => {
+                reserves = valeur
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| {
+                        let (i, h) = s.split_once(':')?;
+                        Some((i.parse().ok()?, h.parse().ok()?))
+                    })
                     .collect()
             }
             // Absent des portefeuilles ecrits avant le carnet : leur lecture
@@ -975,6 +1331,30 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
 
     let seed = seed.ok_or("portefeuille illisible : graine absente ou malformee")?;
 
+    // --- Une autre graine que celle que ce dossier a connue.
+    //
+    // Le fichier est lisible — il est scelle par la bonne phrase, ou en clair
+    // dans un dossier qui n'a jamais vu de scelle — mais ce n'est pas *le*
+    // portefeuille de ce dossier. Sur un mineur sans surveillance, l'adopter
+    // enverrait les recompenses ailleurs jusqu'a ce que quelqu'un compare une
+    // adresse. On refuse, sauf confirmation explicite.
+    if let Some(connue) = ancre.graine {
+        let empreinte = Wallet::from_seed(seed, reseau).empreinte_publique(b"Q21-DOSSIER-v1");
+        if !q21_core::kdf::egal_temps_constant(&connue, &empreinte)
+            && !ACCEPTER_AUTRE_GRAINE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(format!(
+                "ce wallet.dat porte une autre graine que celle que le dossier {} a connue.\n             \
+                 C'est la signature d'un fichier remplace : sauvegarde d'un autre portefeuille,\n             \
+                 dossier partage, substitution. Ouvert sans le dire, il detournerait le minage\n             \
+                 et afficherait le solde d'un autre.\n\n             \
+                 Si ce remplacement est voulu, relancez avec --accepter-autre-graine : le\n             \
+                 dossier retiendra alors cette graine-ci.",
+                d.display()
+            ));
+        }
+    }
+
     // --- Rejeu d'un fichier anterieur.
     //
     // Un `wallet.dat` remis en place depuis une sauvegarde ramene `next_index`
@@ -1011,6 +1391,7 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
         }
     };
     w.marquer_consommes(&consommes);
+    w.charger_reservations(&reserves);
     w.charger_etiquettes(etiquettes);
     w.charger_demandees(&demandees);
     w.noter_verification(verifie_jusqu_a);
@@ -1020,13 +1401,14 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
             let _ = cache.save(scheme, &w.known_hashes(), &clef_cache);
         }
     }
-    // Un fichier scelle par l'ancienne derivation (PBKDF2) est rescelle tout
-    // de suite par la nouvelle (Argon2id), avec la phrase qu'on vient de
-    // verifier : le contenu ne change pas, seule la serrure est remplacee.
-    // Un echec n'empeche pas d'ouvrir — le fichier reste tel qu'il etait.
-    if ancien_format {
+    // Un fichier scelle par l'ancienne derivation (PBKDF2), ou par Argon2id
+    // sous le cout par defaut, est rescelle tout de suite au defaut, avec la
+    // phrase qu'on vient de verifier : le contenu ne change pas, seule la
+    // serrure est remplacee. Un echec n'empeche pas d'ouvrir — le fichier
+    // reste tel qu'il etait.
+    if ancien_format || sous_le_cout {
         match ecrire_portefeuille(d, &w) {
-            Ok(()) => println!("  Portefeuille rescelle avec la nouvelle protection (Argon2id)."),
+            Ok(()) => println!("  Portefeuille rescelle avec la protection par defaut (Argon2id)."),
             Err(e) => eprintln!("avertissement : portefeuille non rescelle ({e})"),
         }
     }
@@ -1636,6 +2018,15 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
         }
     }
 
+    // --- Les reservations laissees par un arret entre reservation et diffusion.
+    //
+    // Un indice reserve porte la piece que l'on depensait. Si le processus est
+    // mort avant de diffuser, la chaine ne portera jamais la signature : passe
+    // le delai, l'indice redevient libre. Voir `Wallet::reexaminer_reservations`.
+    if !sans_portefeuille && reexaminer_les_reservations(&mut wallet, &chain, &archive) {
+        let _ = ecrire_portefeuille(datadir, &wallet);
+    }
+
     Ok(Etat {
         chain,
         wallet,
@@ -1643,6 +2034,71 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
         datadir: datadir.to_path_buf(),
         sans_portefeuille,
     })
+}
+
+/// Reexamine les reservations du portefeuille a la lumiere de la chaine, et
+/// dit ce qui a change. Rend `true` si le portefeuille doit etre reecrit.
+fn reexaminer_les_reservations(
+    wallet: &mut Wallet,
+    chain: &Chain,
+    archive: &BlockArchive,
+) -> bool {
+    if wallet.indices_reserves().is_empty() {
+        return false;
+    }
+    let (confirmees, liberees) = wallet.reexaminer_reservations(chain.height(), |h| {
+        chain.active_at(h).and_then(|id| archive.read(&id))
+    });
+    if confirmees > 0 {
+        println!(
+            "  {confirmees} reservation(s) confirmee(s) par la chaine : clef(s) employee(s)."
+        );
+    }
+    if liberees > 0 {
+        println!(
+            "  {liberees} reservation(s) levee(s) : aucune signature dans la chaine apres \
+             {} blocs, la piece redevient depensable.",
+            Wallet::DELAI_RESERVATION
+        );
+    }
+    confirmees + liberees > 0
+}
+
+/// La decouverte d'adresses telle que la boucle du noeud la fait, suivie du
+/// balayage des clefs a usage unique.
+///
+/// # Le defaut que ceci ferme
+///
+/// Le balayage des depenses n'existait qu'au chargement. Sur une machine
+/// neuve, l'ordre est inverse — on restaure, *puis* la chaine arrive — et la
+/// decouverte se faisait ici, dans la boucle, sans relire un seul bloc.
+/// Jusqu'au redemarrage suivant, une clef Lamport deja revelee dans un bloc
+/// etait annoncee depensable, et le portefeuille signait une seconde fois :
+/// les deux preimages de chaque bit devenaient publiques.
+///
+/// Apres une decouverte fructueuse sur un schema a usage unique, la chaine
+/// est relue depuis la genese **avant** toute ecriture : les adresses
+/// retrouvees sont neuves pour ce fichier, et la verification anterieure ne
+/// les couvrait pas. Rend le nombre de sorties retrouvees.
+fn decouvrir_dans_la_boucle(w: &mut Wallet, c: &Chain) -> usize {
+    let trouvees = {
+        let u = &c.utxo;
+        if u.is_empty() {
+            return 0;
+        }
+        w.decouvrir(|e| u.connait(e))
+    };
+    if trouvees > 0 && w.scheme().est_a_usage_unique() {
+        w.oublier_la_verification();
+        let marquees = w.balayer_la_chaine(c.height(), |h| c.block_at(h));
+        if marquees > 0 {
+            println!(
+                "  {marquees} clef(s) a usage unique deja employee(s) retrouvee(s) dans la \
+                 chaine : elles ne resserviront pas."
+            );
+        }
+    }
+    trouvees
 }
 
 /// Un corps illisible ou refuse au rejeu : on s'arrete au dernier bloc sain.
@@ -1733,25 +2189,90 @@ fn schema_depuis_nom(nom: &str) -> Result<SchemeId, String> {
     Ok(s)
 }
 
+/// Cette chaine ressemble-t-elle a un code de sauvegarde ?
+///
+/// Le prefixe humain du code est `q21seed`, precede d'une lettre de reseau,
+/// suivi du separateur `1` de Bech32. C'est ce qu'on refuse de voir sur une
+/// ligne de commande.
+fn ressemble_a_un_code_de_sauvegarde(s: &str) -> bool {
+    s.to_ascii_lowercase().contains("q21seed1")
+}
+
 /// Restaure un portefeuille depuis son code de sauvegarde.
 ///
 /// La contrepartie du code Bech32m : un code qu'on ne peut pas rejouer ne sert
 /// a rien. La chaine, elle, se resynchronisera depuis le reseau ; seules les
 /// clefs se restaurent ici.
+///
+/// # Le defaut que ceci ferme
+///
+/// `q21 restore <code>` recevait la graine — car le code *est* la graine —
+/// en argument de processus. Elle partait dans l'historique du terminal
+/// (`~/.bash_history`, en clair, souvent sauvegarde), dans
+/// `/proc/<pid>/cmdline` lisible par tout compte de la machine pendant toute
+/// l'execution, dans `ps`, dans les journaux d'audit, et sous Windows dans
+/// l'evenement 4688. Ce n'est pas un secret d'une execution : c'est le
+/// portefeuille entier, definitivement.
+///
+/// Le code n'est donc plus accepte en argument. Il est lu au terminal sans
+/// echo, ou dans un fichier a soi seul (`--code-fichier`, avec le meme
+/// controle de droits que `--phrase-fichier`). Un argument qui ressemble a un
+/// code est refuse en expliquant pourquoi et comment faire — il est deja dans
+/// l'historique, autant que l'utilisateur le sache.
 fn cmd_restore(
     datadir: &Path,
-    code: Option<&str>,
-    reseau: Option<&str>,
-    schema: Option<&str>,
+    arguments: &[String],
+    code_fichier: Option<&str>,
     phrase_fichier: Option<&str>,
 ) -> Result<(), String> {
-    let code = code.ok_or("usage : q21 restore <code-de-sauvegarde> [reseau] [schema]")?;
+    if arguments.iter().any(|a| ressemble_a_un_code_de_sauvegarde(a)) {
+        // Le code n'est pas repete ici, meme en partie : l'erreur peut finir
+        // dans un journal, et il en est deja assez dans l'historique.
+        return Err("le code de sauvegarde ne doit pas etre donne en argument.\n\n             \
+             Un argument de commande est ecrit dans l'historique du terminal, lisible\n             \
+             par tout compte de cette machine dans /proc/<pid>/cmdline pendant toute\n             \
+             l'execution, et consigne par les journaux d'audit. Or ce code EST la\n             \
+             graine : qui le lit detient les fonds, sans limite de temps.\n\n             \
+             Ce code figure probablement deja dans l'historique de votre terminal :\n             \
+             effacez-le (`history -d`, ou le fichier d'historique), puis :\n\n                 \
+             q21 restore [reseau] [schema]\n                     \
+             (le code est demande au terminal, sans echo)\n\n                 \
+             q21 --code-fichier <fichier> restore [reseau] [schema]\n                     \
+             (un fichier a vous seul : chmod 600, efface ensuite)"
+            .to_string());
+    }
+    let reseau = arguments.first().map(|s| s.as_str());
+    let schema = arguments.get(1).map(|s| s.as_str());
     let reseau_choisi = match reseau.unwrap_or("regtest") {
         "regtest" => Network::Regtest,
         "testnet" => Network::Testnet,
         autre => return Err(format!("reseau inconnu : {autre}")),
     };
-    let graine = Wallet::seed_from_backup(code, reseau_choisi).map_err(|e| match e {
+    let code = match code_fichier {
+        Some(chemin) => Secret(lire_secret_dans_un_fichier(chemin, "code de sauvegarde")?),
+        None => {
+            if !q21_core::prompt::entree_interactive() {
+                return Err(
+                    "aucun terminal pour demander le code de sauvegarde.\n\n                   \
+                     Sans terminal, fournissez-le dans un fichier a vous seul :\n\n                       \
+                     q21 --code-fichier <fichier> restore [reseau] [schema]\n                           \
+                     (chmod 600 sur le fichier, et effacez-le ensuite)\n\n                   \
+                     Jamais en argument : il resterait dans l'historique du terminal."
+                        .to_string(),
+                );
+            }
+            let (saisi, masque) = q21_core::prompt::lire_phrase("Code de sauvegarde : ")
+                .map_err(|e| e.to_string())?;
+            if !masque {
+                eprintln!("  avertissement : l'echo du terminal n'a pas pu etre coupe.");
+            }
+            if saisi.trim().is_empty() {
+                return Err("aucun code de sauvegarde saisi".to_string());
+            }
+            Secret(saisi)
+        }
+    };
+    let graine = Wallet::seed_from_backup(code.as_str(), reseau_choisi).map_err(|e| match e {
         q21_core::wallet::WalletError::SauvegardeAutreReseau => {
             "ce code de sauvegarde appartient a un autre reseau".to_string()
         }
@@ -1833,7 +2354,7 @@ fn cmd_init_avec(
             datadir.display()
         ));
     }
-    std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
+    creer_dossier_prive(datadir)?;
 
     // Par defaut, le meilleur schema que ce binaire sache manipuler.
     let schema = match schema {
@@ -4112,39 +4633,48 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // `charger_avec` pour la raison. Tant qu'il ne voit aucun de ses fonds
         // sur une chaine qui en porte, on cherche ; des qu'il les voit, on
         // s'arrete.
+        //
+        // Les verrous sont pris dans l'ordre du RPC — portefeuille, puis
+        // chaine — jamais l'inverse : deux ordres opposes, c'est un blocage
+        // mutuel qui attend son heure.
         if !sans_portefeuille {
             let h = node.height();
             if h > derniere_decouverte + 20 {
                 derniere_decouverte = h;
-                let a_chercher = node.with_chain(|c| {
-                    if c.utxo.is_empty() {
-                        return false;
-                    }
-                    match wallet.lock() {
-                        Ok(w) => !w.voit_des_fonds(&c.utxo),
-                        Err(_) => false,
-                    }
-                });
+                let mut w = wallet.lock().map_err(|_| "portefeuille verrouille")?;
+                let a_chercher = node.with_chain(|c| !c.utxo.is_empty() && !w.voit_des_fonds(&c.utxo));
                 if a_chercher {
-                    let trouvees = node.with_chain(|c| {
-                        let u = &c.utxo;
-                        if u.is_empty() {
-                            return 0;
-                        }
-                        let mut w = match wallet.lock() {
-                            Ok(w) => w,
-                            Err(_) => return 0,
-                        };
-                        w.decouvrir(|e| u.connait(e))
-                    });
+                    // Decouverte puis balayage des clefs a usage unique,
+                    // AVANT l'ecriture : voir `decouvrir_dans_la_boucle`.
+                    let trouvees = node.with_chain(|c| decouvrir_dans_la_boucle(&mut w, c));
                     if trouvees > 0 {
-                        let w = wallet.lock().map_err(|_| "portefeuille verrouille")?;
                         println!(
                             "  restauration : {trouvees} sortie(s) retrouvee(s), {} adresse(s) rederivee(s)",
                             w.next_index()
                         );
                         let _ = ecrire_portefeuille(datadir, &w);
                     }
+                }
+                // Les reservations laissees par un arret entre reservation
+                // et diffusion : passe le delai, la piece redevient libre.
+                // Un noeud qui ne redemarre jamais doit le faire ici.
+                let change = node.with_chain(|c| {
+                    if w.indices_reserves().is_empty() {
+                        return false;
+                    }
+                    let (confirmees, liberees) =
+                        w.reexaminer_reservations(c.height(), |h| c.block_at(h));
+                    if liberees > 0 {
+                        println!(
+                            "  {liberees} reservation(s) levee(s) : aucune signature dans la \
+                             chaine apres {} blocs, la piece redevient depensable.",
+                            Wallet::DELAI_RESERVATION
+                        );
+                    }
+                    confirmees + liberees > 0
+                });
+                if change {
+                    let _ = ecrire_portefeuille(datadir, &w);
                 }
             }
         }
@@ -4740,7 +5270,7 @@ fn traiter_installation(
             } else {
                 SchemeId::LamportOts
             };
-            if std::fs::create_dir_all(datadir).is_err() {
+            if creer_dossier_prive(datadir).is_err() {
                 oublier_phrase();
                 return erreur("le dossier de donnees n'a pas pu etre cree");
             }
@@ -4767,12 +5297,20 @@ fn traiter_installation(
                     let adresse = w.demander_adresse().to_string();
                     Json::obj().set("adresse", Json::str(adresse)).build()
                 }
-                Err(_) => {
+                Err(e) => {
                     // On revient a « rien n'a ete dit », et non a « il n'y a pas
                     // de phrase » : la seconde autoriserait une ecriture en
                     // clair au prochain enregistrement.
                     oublier_phrase();
-                    erreur("Phrase secrete incorrecte. Reessayez.")
+                    // Un refus de l'ancre du dossier — fichier substitue —
+                    // n'est pas une phrase fausse : la page doit le dire tel
+                    // quel, sinon l'utilisateur retape sa phrase sans fin.
+                    if e.starts_with("ce dossier") || e.starts_with("ce wallet.dat") {
+                        eprintln!("erreur : {e}");
+                        erreur(&e)
+                    } else {
+                        erreur("Phrase secrete incorrecte. Reessayez.")
+                    }
                 }
             }
         }
@@ -5110,5 +5648,111 @@ mod tests {
         assert_eq!(nom_de_compte_windows(None, Some("DOM")), None);
         assert_eq!(nom_de_compte_windows(Some(""), Some("DOM")), None);
         assert_eq!(nom_de_compte_windows(Some("   "), None), None);
+    }
+
+    /// La decouverte de la boucle du noeud ne laisse pas resigner une clef
+    /// Lamport deja revelee dans un bloc.
+    ///
+    /// Rejoue la preuve P5 de l'audit contre le chemin du noeud : une chaine
+    /// ou l'indice 0 recoit toutes les coinbases puis en depense une ; un
+    /// portefeuille restaure de la meme graine, decouvert dans la boucle,
+    /// doit tenir l'indice 0 pour consomme et ne plus l'engager.
+    #[test]
+    fn la_decouverte_dans_la_boucle_balaie_les_clefs_a_usage_unique() {
+        use q21_core::chain::GENESIS_TIME;
+        use q21_core::sig::pubkey_hash;
+
+        let graine = [0x21u8; 32];
+        let mut origine = Wallet::from_seed(graine, Network::Regtest);
+        let a0 = origine.new_address();
+        let mut c = Chain::new(Network::Regtest, genesis_block(Network::Regtest));
+        for i in 0..(COINBASE_MATURITY + 2) {
+            let t = GENESIS_TIME + (i + 1) * TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(a0.hash, SchemeId::LamportOts, &[], t, 20_000_000)
+                .unwrap();
+            c.connect(&b, t + 1).unwrap();
+        }
+        let mut tiers = Wallet::from_seed([0x99; 32], Network::Regtest);
+        let dest = tiers.new_address();
+        let tx1 = origine
+            .create_transaction(
+                &c.utxo,
+                c.height(),
+                &dest,
+                Amount::from_units(50_000),
+                Amount::from_units(1_000),
+            )
+            .unwrap();
+        let pk0 = tx1.inputs[0].witness.pubkey.clone();
+        assert_eq!(pubkey_hash(SchemeId::LamportOts, &pk0), a0.hash);
+        let t = GENESIS_TIME + (COINBASE_MATURITY + 3) * TARGET_BLOCK_SECS;
+        let b = c
+            .mine_block(a0.hash, SchemeId::LamportOts, &[tx1], t, 20_000_000)
+            .unwrap();
+        c.connect(&b, t + 1).unwrap();
+
+        // Le chemin du noeud : decouverte dans la boucle, chaine deja la.
+        let mut restaure = Wallet::from_seed(graine, Network::Regtest);
+        assert!(decouvrir_dans_la_boucle(&mut restaure, &c) > 0);
+        assert!(
+            restaure.est_consomme(0),
+            "CONSTAT : la clef 0, revelee dans un bloc, est tenue pour libre"
+        );
+        assert_eq!(restaure.verifie_jusqu_a(), c.height());
+        assert!(!restaure
+            .spendable(&c.utxo, c.height())
+            .iter()
+            .any(|(_, _, i)| *i == 0));
+        let solde = restaure.balance(&c.utxo, c.height()).units();
+        let tx2 = restaure
+            .create_transaction(
+                &c.utxo,
+                c.height(),
+                &dest,
+                Amount::from_units(solde - 1_000),
+                Amount::from_units(1_000),
+            )
+            .unwrap();
+        assert!(
+            !tx2.inputs.iter().any(|e| e.witness.pubkey == pk0),
+            "CONSTAT : la clef 0 a resigne"
+        );
+    }
+
+    /// Un argument qui ressemble a un code de sauvegarde est reconnu, quelle
+    /// que soit sa casse et son reseau ; un nom de reseau ou de schema ne
+    /// l'est pas.
+    #[test]
+    fn un_code_de_sauvegarde_en_argument_est_reconnu() {
+        let code = Wallet::from_seed([0x5a; 32], Network::Regtest).backup_code();
+        assert!(ressemble_a_un_code_de_sauvegarde(&code));
+        assert!(ressemble_a_un_code_de_sauvegarde(&code.to_uppercase()));
+        assert!(ressemble_a_un_code_de_sauvegarde(
+            &Wallet::from_seed([0x5a; 32], Network::Testnet).backup_code()
+        ));
+        for mot in ["regtest", "testnet", "lamport", "mldsa87", "--sans-navigateur"] {
+            assert!(!ressemble_a_un_code_de_sauvegarde(mot), "{mot}");
+        }
+    }
+
+    /// L'ancre du dossier fait l'aller-retour, et un dossier sans ancre se
+    /// lit comme vierge.
+    #[test]
+    fn l_ancre_du_dossier_survit_a_l_ecriture_et_a_la_relecture() {
+        let d = std::env::temp_dir().join(format!("q21-ancre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(lire_ancre(&d), None);
+        let w = Wallet::from_seed([0x5a; 32], Network::Regtest);
+        let a = Ancre {
+            scelle: true,
+            graine: Some(empreinte_de_dossier(&w)),
+        };
+        ecrire_ancre(&d, &a);
+        assert_eq!(lire_ancre(&d), Some(a));
+        let autre = Wallet::from_seed([0x5b; 32], Network::Regtest);
+        assert_ne!(empreinte_de_dossier(&w), empreinte_de_dossier(&autre));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

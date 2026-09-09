@@ -130,6 +130,16 @@ fn message_portefeuille(e: &crate::wallet::WalletError) -> &'static str {
             "le portefeuille n'a pas pu etre enregistre avant la signature : rien \
              n'a ete signe, verifiez le disque"
         }
+        W::PiecesDisparues => {
+            "une des pieces choisies a disparu pendant l'enregistrement du \
+             portefeuille (depensee ailleurs, ou reorganisation) : rien n'a ete \
+             signe, recommencez"
+        }
+        W::VerificationEnRetard { .. } => {
+            "clefs a usage unique : la chaine n'a pas pu etre balayee jusqu'a la \
+             hauteur courante (corps de blocs manquants). Signer sans savoir \
+             quelles clefs ont deja servi pourrait en reveler une : envoi refuse"
+        }
     }
 }
 
@@ -2652,44 +2662,7 @@ impl RpcContext {
         let dest = Address::parse_on(adresse, self.network)
             .map_err(|e| erreur(ERR_PARAMS, &format!("adresse invalide : {e:?}")))?;
 
-        // Construction et acceptation sous **un seul** verrou : la chaine et le
-        // reservoir vivent sous le meme, et les prendre l'un dans l'autre
-        // figerait le noeud.
-        //
-        // Sur une reference, jamais sur une copie : recopier le jeu d'UTXO pour
-        // construire une transaction coutait des centaines de mebioctets sur
-        // une chaine reelle, et un lot en demandait autant de copies.
-        let (tx, txid) = {
-            let mut g = w
-                .lock()
-                .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
-            let resultat = self.node.with_chain_and_mempool(|c, m| {
-                let tx = g.create_transaction_multi_gardee(
-                    &c.utxo,
-                    c.height(),
-                    &[(dest, Amount::from_units(unites))],
-                    Amount::from_units(frais),
-                    &mut |w| self.enregistrer(w),
-                );
-                match tx {
-                    Ok(tx) => {
-                        let r = m.accept(&tx, &c.utxo, self.network, c.height());
-                        Ok((tx, r))
-                    }
-                    Err(e) => Err(e),
-                }
-            });
-            // Les indices sont deja sur le disque (ecriture anticipee, avant
-            // la signature). On enregistre encore pour ce qui a pu bouger
-            // depuis — l'adresse de monnaie, par exemple.
-            if let Err(e) = self.enregistrer(&g) {
-                eprintln!("ALERTE : portefeuille non enregistre apres l'envoi : {e}");
-            }
-            let (tx, accepte) =
-                resultat.map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
-            let txid = accepte.map_err(|e| erreur(ERR_PORTEFEUILLE, &message_reservoir(&e)))?;
-            (tx, txid)
-        };
+        let (tx, txid) = self.depenser(w, &[(dest, Amount::from_units(unites))], frais)?;
 
         self.node.announce_tx(txid);
 
@@ -2697,6 +2670,98 @@ impl RpcContext {
             .set("txid", Json::str(txid.to_hex()))
             .set("transaction", tx_json(&tx, self.network))
             .build())
+    }
+
+    /// Construit, enregistre, signe et place au reservoir une depense — en
+    /// trois temps, pour ne jamais sceller le portefeuille sous le verrou de
+    /// la chaine.
+    ///
+    /// # Le defaut que ceci ferme
+    ///
+    /// L'ecriture anticipee est necessaire : les indices doivent etre sur le
+    /// disque avant la signature. Mais elle se faisait **sous le verrou de la
+    /// chaine et du reservoir**, et ecrire le portefeuille, c'est le sceller —
+    /// Argon2id, 64 Mio, trois passes : un tiers de seconde sur un PC, une
+    /// seconde sur un Raspberry. Validation des blocs et service des pairs
+    /// s'arretaient a chaque envoi, le temps d'une derivation de clef qui
+    /// n'a rien a voir avec eux.
+    ///
+    /// # Les trois temps
+    ///
+    /// 1. Sous le verrou : balayer les blocs pas encore vus (usage unique),
+    ///    choisir les pieces, verifier les clefs, **reserver** les indices.
+    /// 2. Sans le verrou : ecrire le portefeuille. Un echec leve la
+    ///    reservation, et rien n'a ete signe.
+    /// 3. Sous le verrou : revérifier que les pieces sont toujours la, signer,
+    ///    accepter au reservoir. Une piece disparue entre-temps leve la
+    ///    reservation, et l'appelant recommence.
+    ///
+    /// Le verrou du portefeuille, lui, est tenu d'un bout a l'autre : il ne
+    /// protege que le portefeuille, et personne d'autre ne l'attend pendant un
+    /// envoi.
+    fn depenser(
+        &self,
+        w: &Arc<Mutex<Wallet>>,
+        destinations: &[(crate::address::Address, Amount)],
+        frais: u64,
+    ) -> Result<(crate::tx::Transaction, crate::hash::Hash256), Json> {
+        let mut g = w
+            .lock()
+            .map_err(|_| erreur(ERR_INTERNE, "portefeuille verrouille"))?;
+
+        // 1. Reservation, sous le verrou de la chaine — sans le reservoir,
+        //    dont on n'a pas encore besoin.
+        //
+        // Sur une reference, jamais sur une copie : recopier le jeu d'UTXO
+        // pour construire une transaction coutait des centaines de mebioctets
+        // sur une chaine reelle, et un lot en demandait autant de copies.
+        let prepare = self.node.with_chain(|c| {
+            // Un schema a usage unique doit savoir quelles clefs ont deja
+            // signe jusqu'a la tete : les blocs arrives depuis le dernier
+            // balayage sont relus ici. Ils sont recents, donc en memoire ;
+            // s'il en manque un, on refuse plutot que de signer a l'aveugle.
+            if g.scheme().est_a_usage_unique() && g.verifie_jusqu_a() < c.height() {
+                g.balayer_la_chaine(c.height(), |h| c.block_at(h));
+                if g.verifie_jusqu_a() < c.height() {
+                    return Err(crate::wallet::WalletError::VerificationEnRetard {
+                        verifie: g.verifie_jusqu_a(),
+                        hauteur: c.height(),
+                    });
+                }
+            }
+            g.preparer_depense(&c.utxo, c.height(), destinations, Amount::from_units(frais))
+        });
+        let prepare = prepare.map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
+
+        // 2. Ecriture anticipee, hors du verrou de la chaine : les indices
+        //    reserves atteignent le disque avant que la moindre signature
+        //    existe. Un echec ne signe rien et rend les indices.
+        if self.enregistrer(&g).is_err() {
+            g.abandonner_depense(prepare);
+            return Err(erreur(
+                ERR_PORTEFEUILLE,
+                message_portefeuille(&crate::wallet::WalletError::EnregistrementImpossible),
+            ));
+        }
+
+        // 3. Signature et acceptation, sous le verrou de la chaine et du
+        //    reservoir : les deux vivent sous le meme, et les prendre l'un
+        //    dans l'autre figerait le noeud.
+        let resultat = self.node.with_chain_and_mempool(|c, m| {
+            let tx = g.signer_depense(&c.utxo, prepare)?;
+            let r = m.accept(&tx, &c.utxo, self.network, c.height());
+            Ok((tx, r))
+        });
+        // Les indices reserves sont sur le disque ; on enregistre encore pour
+        // ce qui a bouge depuis — les indices passes de reserves a consommes,
+        // ou rendus si les pieces avaient disparu.
+        if let Err(e) = self.enregistrer(&g) {
+            eprintln!("ALERTE : portefeuille non enregistre apres l'envoi : {e}");
+        }
+        let (tx, accepte) =
+            resultat.map_err(|e| erreur(ERR_PORTEFEUILLE, message_portefeuille(&e)))?;
+        let txid = accepte.map_err(|e| erreur(ERR_PORTEFEUILLE, &message_reservoir(&e)))?;
+        Ok((tx, txid))
     }
 
     /// Paie plusieurs destinataires en **une seule** transaction.
@@ -3492,6 +3557,207 @@ mod tests {
             r.get("error").is_some(),
             "un indice inconnu doit etre refuse"
         );
+    }
+
+    /// Le portefeuille n'est jamais ecrit sous le verrou de la chaine.
+    ///
+    /// # Le defaut que cette epreuve fige
+    ///
+    /// L'ecriture anticipee — necessaire — se faisait sous le verrou de la
+    /// chaine et du reservoir, et ecrire le portefeuille, c'est le sceller :
+    /// Argon2id, un tiers de seconde sur un PC, une seconde sur un Raspberry.
+    /// Validation des blocs et service des pairs s'arretaient a chaque envoi.
+    ///
+    /// Le rappel d'enregistrement joue ici le scellement : a chaque appel, un
+    /// autre fil tente de prendre le verrou de la chaine. S'il n'y parvient
+    /// pas dans le delai, c'est que l'envoi le tenait pendant l'ecriture.
+    #[test]
+    fn le_portefeuille_n_est_pas_ecrit_sous_le_verrou_de_la_chaine() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut c = contexte_avec_fonds();
+        let node = c.node.clone();
+        let appels = Arc::new(AtomicUsize::new(0));
+        let tenus = Arc::new(AtomicUsize::new(0));
+        let (a, t) = (appels.clone(), tenus.clone());
+        c.sur_changement = Some(Arc::new(move |_w: &Wallet| {
+            a.fetch_add(1, Ordering::SeqCst);
+            let n = node.clone();
+            let sonde = std::thread::spawn(move || n.with_chain(|c| c.height()));
+            let debut = std::time::Instant::now();
+            while !sonde.is_finished() {
+                if debut.elapsed() > std::time::Duration::from_millis(1500) {
+                    t.fetch_add(1, Ordering::SeqCst);
+                    // On ne joint pas : le fil se terminera quand le verrou
+                    // sera rendu, apres cet appel.
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let _ = sonde.join();
+            Ok(())
+        }));
+        let mut dest = Wallet::from_seed([0xcc; 32], RESEAU);
+        let adresse = dest.new_address().to_string_bech32();
+        let envoi = resultat(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"adresse":"{adresse}","unites":100000}}"#),
+        );
+        assert!(envoi.get("txid").is_some());
+        assert!(
+            appels.load(Ordering::SeqCst) >= 2,
+            "l'ecriture anticipee et l'ecriture finale doivent avoir eu lieu"
+        );
+        assert_eq!(
+            tenus.load(Ordering::SeqCst),
+            0,
+            "CONSTAT : le verrou de la chaine etait tenu pendant l'ecriture du portefeuille"
+        );
+        assert_eq!(c.node.mempool_len(), 1);
+    }
+
+    /// Un envoi sur un schema a usage unique relit d'abord les blocs que le
+    /// portefeuille n'a pas encore vus, et refuse si des corps manquent.
+    ///
+    /// Restaure sur une machine neuve, un portefeuille Lamport apprend ses
+    /// adresses par la decouverte sans savoir lesquelles ont deja signe.
+    /// Signer dans cet etat peut resigner une clef revelee dans un bloc.
+    /// L'envoi rattrape donc la chaine avant de choisir ses pieces ; et si les
+    /// corps ne sont pas la pour le faire, il refuse plutot que de signer a
+    /// l'aveugle.
+    #[test]
+    fn un_envoi_a_usage_unique_rattrape_la_chaine_ou_refuse() {
+        // Une chaine ou l'indice 0 recoit toutes les coinbases puis en
+        // depense une : sa clef est revelee dans un bloc.
+        let graine = [0x21u8; 32];
+        let mut origine = Wallet::from_seed(graine, RESEAU);
+        let a0 = origine.new_address();
+        let g = genesis_block(RESEAU);
+        let mut chaine = Chain::new(RESEAU, g);
+        for i in 1..=(COINBASE_MATURITY + 2) {
+            let t = crate::chain::GENESIS_TIME + i * TARGET_BLOCK_SECS;
+            let b = chaine
+                .mine_block(a0.hash, a0.scheme, &[], t, 5_000_000)
+                .expect("minage");
+            chaine.connect(&b, t + 1).expect("connexion");
+        }
+        let mut tiers = Wallet::from_seed([0x99; 32], RESEAU);
+        let dest = tiers.new_address();
+        let tx1 = origine
+            .create_transaction(
+                &chaine.utxo,
+                chaine.height(),
+                &dest,
+                Amount::from_units(50_000),
+                Amount::from_units(1_000),
+            )
+            .unwrap();
+        let pk0 = tx1.inputs[0].witness.pubkey.clone();
+        let t = crate::chain::GENESIS_TIME + (COINBASE_MATURITY + 3) * TARGET_BLOCK_SECS;
+        let b = chaine
+            .mine_block(a0.hash, a0.scheme, &[tx1], t, 5_000_000)
+            .unwrap();
+        chaine.connect(&b, t + 1).unwrap();
+
+        // Un portefeuille restaure : decouverte seule, aucun balayage.
+        let restaurer = |chaine: &Chain| {
+            let mut r = Wallet::from_seed(graine, RESEAU);
+            assert!(r.decouvrir(|h| chaine.utxo.connait(h)) > 0);
+            assert!(!r.est_consomme(0));
+            assert_eq!(r.verifie_jusqu_a(), 0);
+            r
+        };
+        let contexte = |chaine: Chain, w: Wallet| RpcContext {
+            sur_changement: None,
+            balayages: None,
+            index: None,
+            minage: None,
+            node: Arc::new(Node::new(RESEAU, chaine)),
+            wallet: Some(Arc::new(Mutex::new(w))),
+            network: RESEAU,
+        };
+
+        // 1. Les corps manquent — une chaine repartie d'un instantane, sans
+        //    fournisseur de corps : l'envoi est refuse, rien n'est reserve.
+        let instantane = chaine.snapshot_at_depth(1).expect("instantane");
+        let entetes = chaine.headers();
+        let sans_corps = Chain::from_snapshot(RESEAU, instantane, &entetes)
+            .expect("reprise")
+            .chain;
+        assert!(sans_corps.block_at(1).is_none(), "les corps doivent manquer");
+        let restaure = restaurer(&sans_corps);
+        let c = contexte(sans_corps, restaure);
+        let r = appel(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"adresse":"{}","unites":50000}}"#, dest.to_string_bech32()),
+        );
+        let message = r
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            message.contains("balayee"),
+            "l'envoi doit etre refuse faute de balayage : {}",
+            r.encode()
+        );
+        let w = c.wallet.as_ref().unwrap().lock().unwrap();
+        assert!(w.indices_reserves().is_empty() && w.indices_consommes().is_empty());
+        drop(w);
+
+        // 2. Les corps sont la : l'envoi rattrape la chaine, et la clef 0 ne
+        //    resigne pas. Le solde demande couvre tout : sans la clef 0 il
+        //    manque une piece, et l'envoi est refuse pour fonds insuffisants
+        //    — c'est le comportement attendu, l'inverse etait le defaut.
+        let restaure = restaurer(&chaine);
+        let solde = restaure.balance(&chaine.utxo, chaine.height()).units();
+        let c = contexte(chaine, restaure);
+        let r = appel(
+            &c,
+            "sendtoaddress",
+            &format!(
+                r#"{{"adresse":"{}","unites":{}}}"#,
+                dest.to_string_bech32(),
+                solde - 1_000
+            ),
+        );
+        let w = c.wallet.as_ref().unwrap().lock().unwrap();
+        assert_eq!(w.verifie_jusqu_a(), c.node.height(), "la chaine est rattrapee");
+        assert!(w.est_consomme(0), "la clef 0, revelee dans un bloc, doit etre consommee");
+        drop(w);
+        let message = r
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            message.contains("fonds insuffisants"),
+            "sans la clef 0, le solde entier n'est plus couvert : {}",
+            r.encode()
+        );
+        let resigne = c.node.with_mempool(|m| {
+            m.transactions_ordonnees()
+                .iter()
+                .any(|t| t.inputs.iter().any(|e| e.witness.pubkey == pk0))
+        });
+        assert!(!resigne, "CONSTAT : la clef 0 a resigne");
+
+        // Et un envoi qui tient sans la clef 0 aboutit.
+        let envoi = resultat(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"adresse":"{}","unites":50000}}"#, dest.to_string_bech32()),
+        );
+        assert!(envoi.get("txid").is_some());
+        let resigne = c.node.with_mempool(|m| {
+            m.transactions_ordonnees()
+                .iter()
+                .any(|t| t.inputs.iter().any(|e| e.witness.pubkey == pk0))
+        });
+        assert!(!resigne, "CONSTAT : la clef 0 a resigne");
     }
 
     /// Un envoi se voit dans l'historique **avant** d'etre dans un bloc.

@@ -430,6 +430,43 @@ fn restreindre(chemin: &Path) {
     let _ = chemin;
 }
 
+/// Cree un fichier temporaire **deja** restreint a son proprietaire.
+///
+/// # Le defaut que ceci ferme
+///
+/// Les temporaires etaient crees avec les droits du `umask` — 0644 le plus
+/// souvent — puis remplis, synchronises, renommes ; la restriction, quand il
+/// y en avait une, venait apres. Entre la creation et le renommage, tout
+/// compte de la machine pouvait ouvrir le fichier, et un descripteur ouvert
+/// survit au `chmod`. Pour `addresses.dat`, qui liste toutes les empreintes
+/// du porteur, la restriction n'existait meme pas : le fichier restait en
+/// 0644 pour toujours, reliant publiquement des adresses que le protocole
+/// s'efforce de ne pas relier.
+///
+/// Sous Unix, le mode est pose a la creation, par `O_CREAT` : il n'y a pas
+/// de fenetre. `create_new` refuse un temporaire qui existerait deja — un
+/// reste d'ecriture interrompue est retire d'abord, jamais rouvert en place.
+/// Ailleurs, on retombe sur la creation ordinaire puis la restriction
+/// disponible.
+pub(crate) fn creer_temporaire_prive(tmp: &Path) -> std::io::Result<std::fs::File> {
+    let _ = std::fs::remove_file(tmp);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(tmp)
+    }
+    #[cfg(not(unix))]
+    {
+        let f = std::fs::File::create(tmp)?;
+        restreindre(tmp);
+        Ok(f)
+    }
+}
+
 /// Fichier d'instantane.
 pub struct StateStore {
     chemin: PathBuf,
@@ -567,14 +604,18 @@ impl AddressCache {
         let sceau = crate::kdf::hmac_sha256(clef, &donnees);
         donnees.extend_from_slice(&sceau);
 
+        // Le cache est cree deja restreint : il ne porte aucun secret, mais il
+        // designe toutes les adresses du porteur, et cela ne regarde pas les
+        // autres comptes de la machine.
         let tmp = self.chemin.with_extension("tmp");
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut f = creer_temporaire_prive(&tmp)?;
             f.write_all(&donnees)?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &self.chemin)?;
+        restreindre(&self.chemin);
         Ok(())
     }
 
@@ -691,14 +732,17 @@ impl MempoolStore {
         let mut donnees = w.finish();
         donnees.extend_from_slice(&crate::kdf::hmac_sha256(&self.clef, &donnees));
 
+        // Meme discipline que le cache d'adresses : les transactions en
+        // attente disent qui paie qui, et le fichier nait restreint.
         let tmp = self.chemin.with_extension("tmp");
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut f = creer_temporaire_prive(&tmp)?;
             f.write_all(&donnees)?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &self.chemin)?;
+        restreindre(&self.chemin);
         Ok(())
     }
 
