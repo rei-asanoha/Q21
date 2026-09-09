@@ -249,9 +249,11 @@ Un test substitue **chaque caractère** du code par sept autres : les 400 fautes
 de frappe sont détectées, aucune ne passe. Le préfixe désigne le réseau — une
 graine de test ne peut pas être prise pour une graine du réseau principal.
 
-Et un code qu'on ne peut pas rejouer ne sert à rien : `q21 restore <code>`
+Et un code qu'on ne peut pas rejouer ne sert à rien : `q21 restore`
 reconstitue le portefeuille. Vérifié de bout en bout — les adresses dérivées sont
-identiques, caractère pour caractère.
+identiques, caractère pour caractère. *(Le code se saisissait alors en argument ;
+l'audit v2 a montré qu'il finissait dans l'historique du terminal, et il est
+depuis demandé au terminal sans écho ou lu par `--code-fichier`.)*
 
 ### Ce qui a aussi été ajouté
 

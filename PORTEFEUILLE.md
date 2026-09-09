@@ -14,6 +14,96 @@ La première commande demande une phrase secrète, puis affiche un **code de
 sauvegarde** de 66 caractères. Recopiez-le sur papier avant d'aller plus loin :
 c'est le seul moyen de retrouver vos fonds si le fichier disparaît.
 
+## Restaurer depuis le code de sauvegarde
+
+```bash
+./q21 --datadir <dossier-vide> restore testnet
+```
+
+Le code est demandé au terminal, **sans écho**. Il n'est jamais accepté en
+argument : un argument de commande est écrit dans l'historique du terminal
+(`~/.bash_history`, en clair, souvent sauvegardé), lisible par tout compte de
+la machine dans `/proc/<pid>/cmdline` pendant toute l'exécution, et consigné
+par les journaux d'audit — or ce code *est* la graine, et qui le lit détient
+les fonds sans limite de temps. `q21 restore <code>` est refusé, en disant
+pourquoi et comment faire.
+
+Sans terminal — un service, un script — le code se lit dans un fichier à vous
+seul, avec le même contrôle de droits que `--phrase-fichier` :
+
+```bash
+chmod 600 code.txt
+./q21 --code-fichier code.txt --phrase-fichier phrase.txt restore testnet
+rm code.txt
+```
+
+La page d'installation (`q21 wallet` dans un dossier vide) propose la même
+restauration : le code y passe par le corps d'une requête locale, jamais par
+une adresse ni une ligne de commande.
+
+## Ce que le dossier de données retient
+
+À côté de `wallet.dat`, le dossier porte deux petits fichiers qui ne
+contiennent aucun secret :
+
+- `wallet.seq`, le **numéro de série** : un `wallet.dat` plus ancien que ce
+  que le dossier a déjà vu est refusé — c'est la signature d'une restauration
+  depuis une sauvegarde ancienne, qui ferait resigner des clefs à usage unique.
+- `wallet.ancre`, l'**ancre** : « ce dossier a vu un portefeuille scellé par
+  une phrase » — et cela ne s'oublie pas — et une empreinte publique de la
+  graine (`HMAC(graine, "Q21-DOSSIER-v1")`, qui ne dit rien de la graine mais
+  suffit à en reconnaître une autre).
+
+L'ancre ferme une substitution que l'audit v2 a démontrée : un `wallet.dat`
+**en clair**, d'une autre graine, portant le bon numéro de série, était adopté
+sans phrase et sans un mot — le processus basculait en clair, le minage et le
+solde devenaient ceux de la graine étrangère. Désormais :
+
+- un fichier non scellé dans un dossier qui a connu un scellé est refusé :
+  « ce dossier était protégé par une phrase secrète ; ce fichier ne l'est pas » ;
+- un fichier d'une autre graine que celle que le dossier a connue est refusé,
+  sauf `--accepter-autre-graine`, à réserver au cas où c'est *vous* qui avez
+  remplacé le fichier — le dossier retient alors la nouvelle graine.
+
+Ce n'est pas une défense contre qui peut aussi effacer `wallet.ancre` : c'est
+la même limite, déjà acceptée, que le numéro de série. Un dossier antérieur,
+sans ancre, l'acquiert à sa première écriture. Une restauration dans un
+dossier vide n'est pas concernée.
+
+### Clefs à usage unique : réservé n'est pas révélé
+
+Sur Lamport (réseaux d'essai), l'indice d'une pièce dépensée est écrit sur le
+disque **avant** la signature — c'est ce qui empêche de resigner après une
+coupure. Mais un indice réservé porte la pièce que l'on dépense : le compter
+comme consommé dès la réservation figeait cette pièce pour toujours si le
+processus mourait entre la réservation et la diffusion, sans qu'aucune
+signature ait existé. Le fichier distingue donc les deux : `consommes=` porte
+les clefs révélées *et* les indices réservés (un binaire antérieur les tient
+tous pour consommés, ce qui est le sens prudent), et `reserves=` dit lesquels
+ne sont que réservés, avec la hauteur de la réservation. Au démarrage, et
+régulièrement dans le nœud, une réservation est confrontée à la chaîne :
+signature trouvée dans un bloc, la clef est consommée ; rien après vingt blocs,
+l'indice redevient libre et la pièce dépensable.
+
+L'envoi lui-même se fait en trois temps : réserver sous le verrou de la chaîne,
+écrire le portefeuille **hors** de ce verrou (le scellement Argon2id prend un
+tiers de seconde, pendant lequel le nœud continue de valider et de servir ses
+pairs), puis reprendre le verrou pour vérifier que les pièces sont toujours là,
+signer, et placer au réservoir.
+
+Les signatures ML-DSA sont produites en variante « hedged » (FIPS 204) : trente-
+deux octets d'aléa du système entrent dans chaque signature, deux signatures du
+même message diffèrent, et si l'aléa manque le portefeuille **refuse de
+signer** plutôt que de retomber sur la variante déterministe. Le vérificateur
+accepte les deux ; rien ne change pour le réseau.
+
+Le dossier lui-même est créé en `0700`, et resserré au démarrage s'il est plus
+large ; `wallet.dat`, `wallet.seq`, `wallet.ancre`, `addresses.dat` et
+`mempool.dat` sont en `0600`, et le temporaire par lequel passe chaque
+écriture du portefeuille **naît** en `0600` — il n'existe à aucun instant sous
+un autre mode. Sous Windows, l'équivalent est posé par `icacls` avant le
+premier octet écrit.
+
 ---
 
 ## Trois décisions, et pourquoi

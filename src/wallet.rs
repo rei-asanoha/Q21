@@ -79,6 +79,21 @@ pub enum WalletError {
     /// de risquer, au prochain envoi, de resigner avec une clef que le disque
     /// croit encore vierge.
     EnregistrementImpossible,
+    /// Entre la reservation des pieces et la signature, une d'elles a disparu
+    /// du jeu de sorties : depensee par une autre transaction, ou emportee
+    /// par une reorganisation. Rien n'a ete signe, la reservation est levee.
+    ///
+    /// N'arrive que sur le chemin en deux temps ([`Wallet::preparer_depense`]
+    /// puis [`Wallet::signer_depense`]), ou le verrou de la chaine est rendu
+    /// entre les deux le temps d'ecrire le portefeuille.
+    PiecesDisparues,
+    /// Schema a usage unique : la chaine n'a pas ete balayee jusqu'a la
+    /// hauteur courante, et des corps manquent pour le faire. Signer sans
+    /// savoir quelles clefs ont deja servi pourrait en resigner une.
+    VerificationEnRetard {
+        verifie: u64,
+        hauteur: u64,
+    },
 }
 
 /// En deca de ce nombre d'adresses, un cache est resonde **integralement**.
@@ -107,6 +122,26 @@ pub struct Wallet {
     connues: HashMap<Hash256, u32>,
     /// Indices deja employes pour signer. Interdits de reemploi.
     consommes: Vec<u32>,
+    /// Indices **reserves** pour une depense en cours, avec la hauteur de la
+    /// chaine au moment de la reservation.
+    ///
+    /// # Reserve n'est pas revele
+    ///
+    /// L'ecriture anticipee met l'indice sur le disque avant la signature —
+    /// c'est ce qui empeche de resigner apres une coupure. Mais l'indice
+    /// reserve porte la piece que l'on depense : le compter comme consomme
+    /// des la reservation figeait cette piece pour toujours si le processus
+    /// mourait entre la reservation et la diffusion, sans qu'aucune signature
+    /// ait jamais existe. Le solde baissait, et rien ne l'expliquait.
+    ///
+    /// Une reservation est levee par la signature (l'indice passe dans
+    /// `consommes`), par l'abandon avant signature (il redevient libre), ou par
+    /// [`Wallet::reexaminer_reservations`] : si la chaine ne porte aucune
+    /// signature de cette clef [`Wallet::DELAI_RESERVATION`] blocs apres la
+    /// reservation, l'indice redevient libre. Sur le disque, un indice reserve
+    /// figure **aussi** dans `consommes=` : un lecteur ancien le tient pour
+    /// consomme, ce qui est le sens prudent.
+    reserves: std::collections::BTreeMap<u32, u64>,
     /// Hauteur jusqu'a laquelle la chaine a ete balayee a la recherche de
     /// signatures de ce portefeuille.
     ///
@@ -167,6 +202,7 @@ impl Wallet {
             next_index: 0,
             connues: HashMap::new(),
             consommes: Vec::new(),
+            reserves: std::collections::BTreeMap::new(),
             verifie_jusqu_a: 0,
             etiquettes: HashMap::new(),
             demandees: BTreeSet::new(),
@@ -197,6 +233,7 @@ impl Wallet {
             next_index: 0,
             connues: HashMap::new(),
             consommes: Vec::new(),
+            reserves: std::collections::BTreeMap::new(),
             verifie_jusqu_a: 0,
             etiquettes: HashMap::new(),
             demandees: BTreeSet::new(),
@@ -285,7 +322,20 @@ impl Wallet {
     /// La clef est **derivee** de la graine, jamais la graine elle-meme :
     /// meme un fichier de cache fuite ne dit rien des clefs privees.
     pub fn clef_cache(&self) -> [u8; 32] {
-        crate::kdf::hmac_sha256(&self.seed, b"Q21-CACHE-ADRESSES-v1")
+        self.empreinte_publique(b"Q21-CACHE-ADRESSES-v1")
+    }
+
+    /// Une empreinte publique de la graine sous une etiquette :
+    /// `HMAC(graine, etiquette)`.
+    ///
+    /// Elle ne dit rien de la graine — HMAC sous une clef secrete est une
+    /// fonction pseudo-aleatoire — mais elle suffit a reconnaitre la meme
+    /// graine d'une fois sur l'autre, ou a en distinguer une autre. C'est ce
+    /// qui ancre un dossier de donnees a *son* portefeuille : un fichier d'une
+    /// autre graine y est reconnu comme etranger. Chaque usage a son
+    /// etiquette, pour qu'une empreinte ne serve jamais a deux choses.
+    pub fn empreinte_publique(&self, etiquette: &[u8]) -> [u8; 32] {
+        crate::kdf::hmac_sha256(&self.seed, etiquette)
     }
 
     pub fn network(&self) -> Network {
@@ -344,12 +394,17 @@ impl Wallet {
 
     /// Signe `message` avec l'indice `index`.
     ///
+    /// ML-DSA signe en variante « hedged » : trente-deux octets d'alea du
+    /// systeme entrent dans chaque signature. Si l'alea manque, on **refuse de
+    /// signer** plutot que de retomber sur la variante deterministe — voir
+    /// `mldsa_wallet::sign`.
+    ///
     /// # Panique
     ///
     /// Meme invariant que [`Wallet::public_key`].
-    fn sign_at(&self, index: u32, message: &Hash256) -> Vec<u8> {
+    fn sign_at(&self, index: u32, message: &Hash256) -> Result<Vec<u8>, WalletError> {
         match self.scheme {
-            SchemeId::LamportOts => self.key(index).sign(message),
+            SchemeId::LamportOts => Ok(self.key(index).sign(message)),
             #[cfg(feature = "mldsa")]
             SchemeId::MlDsa65 => {
                 mldsa_wallet::sign::<ml_dsa::MlDsa65>(&self.graine_derivee(index), message)
@@ -655,11 +710,140 @@ impl Wallet {
     /// avec le processus. Un portefeuille Lamport redemarre repartait donc avec
     /// une ardoise vierge, et deux signatures d'une meme clef Lamport revelent
     /// la clef privee.
+    ///
+    /// Ne contient que les clefs **revelees**. Les indices seulement reserves
+    /// sont rendus par [`Wallet::indices_reserves`], et la ligne du fichier
+    /// par [`Wallet::indices_consommes_pour_le_fichier`].
     pub fn indices_consommes(&self) -> Vec<u32> {
         let mut v = self.consommes.clone();
         v.sort_unstable();
         v.dedup();
         v
+    }
+
+    /// Cet indice est-il reserve pour une depense en cours ?
+    pub fn est_reserve(&self, index: u32) -> bool {
+        self.reserves.contains_key(&index)
+    }
+
+    /// Indices reserves, avec la hauteur de leur reservation, tries.
+    pub fn indices_reserves(&self) -> Vec<(u32, u64)> {
+        self.reserves.iter().map(|(i, h)| (*i, *h)).collect()
+    }
+
+    /// Ce que la ligne `consommes=` du fichier doit porter : les clefs
+    /// revelees **et** les indices reserves.
+    ///
+    /// Un indice reserve y figure a dessein. Un binaire anterieur, qui ignore
+    /// la ligne `reserves=`, le tiendra pour consomme : c'est le sens prudent,
+    /// celui qui ne resigne jamais. Le binaire courant le retire de
+    /// `consommes` en relisant `reserves=` ([`Wallet::charger_reservations`]).
+    pub fn indices_consommes_pour_le_fichier(&self) -> Vec<u32> {
+        let mut v = self.consommes.clone();
+        v.extend(self.reserves.keys().copied());
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Reinstalle les reservations lues dans le fichier.
+    ///
+    /// Chaque indice est retire de `consommes` — ou il figure aussi, par
+    /// prudence pour les lecteurs anciens — et redevient une reservation, qui
+    /// sera confirmee ou levee par [`Wallet::reexaminer_reservations`]. Un
+    /// indice que le fichier donne comme consomme sans le donner comme reserve
+    /// reste consomme : on ne libere jamais sur un doute.
+    pub fn charger_reservations(&mut self, reservations: &[(u32, u64)]) {
+        for (i, h) in reservations {
+            if !self.reserves.contains_key(i) {
+                self.consommes.retain(|c| c != i);
+                self.reserves.insert(*i, *h);
+            }
+        }
+    }
+
+    /// Blocs apres lesquels une reservation sans signature dans la chaine est
+    /// levee.
+    ///
+    /// Vingt blocs, soit une quarantaine de minutes a la cadence cible. Une
+    /// transaction diffusee est minee bien avant ; une reservation encore la
+    /// au bout de ce delai est celle d'un processus mort entre la reservation
+    /// et la diffusion — la piece n'a pas a rester figee pour cela. Le risque
+    /// residuel est une transaction signee, annoncee, jamais minee en vingt
+    /// blocs puis minee ensuite : elle entrerait en conflit avec la depense
+    /// suivante de la meme piece, et les deux signatures seraient publiques.
+    /// C'est la limite acceptee, et elle ne concerne que les reseaux d'essai.
+    pub const DELAI_RESERVATION: u64 = 20;
+
+    /// Reexamine les reservations a la lumiere de la chaine.
+    ///
+    /// `lire_bloc` rend le bloc actif a une hauteur, s'il est disponible. Pour
+    /// chaque reservation dont le delai est ecoule, les blocs ecrits depuis la
+    /// reservation sont relus a la recherche d'une signature de cette clef :
+    /// trouvee, l'indice est consomme ; absente, il redevient libre. Une
+    /// reservation plus jeune que le delai est laissee telle quelle. Si un
+    /// bloc de la fenetre manque, on ne libere rien : liberer sur une
+    /// lecture incomplete serait liberer sur un doute.
+    ///
+    /// Rend `(confirmees, liberees)`.
+    pub fn reexaminer_reservations<L>(&mut self, hauteur: u64, lire_bloc: L) -> (usize, usize)
+    where
+        L: Fn(u64) -> Option<crate::block::Block>,
+    {
+        let echues: Vec<(u32, u64)> = self
+            .reserves
+            .iter()
+            .filter(|(_, h)| hauteur >= h.saturating_add(Self::DELAI_RESERVATION))
+            .map(|(i, h)| (*i, *h))
+            .collect();
+        if echues.is_empty() {
+            return (0, 0);
+        }
+        let depuis = echues.iter().map(|(_, h)| *h).min().unwrap_or(hauteur);
+        let mut complet = true;
+        for h in depuis..=hauteur {
+            match lire_bloc(h) {
+                Some(b) => {
+                    self.noter_depenses(&b);
+                }
+                None => complet = false,
+            }
+        }
+        let confirmees = echues
+            .iter()
+            .filter(|(i, _)| self.consommes.contains(i))
+            .count();
+        let mut liberees = 0;
+        if complet {
+            for (i, _) in &echues {
+                if self.reserves.remove(i).is_some() {
+                    liberees += 1;
+                }
+            }
+        }
+        (confirmees, liberees)
+    }
+
+    /// Montant immobilise par les reservations en cours, pour que l'interface
+    /// puisse nommer ce qui manque au solde et pourquoi.
+    pub fn montant_reserve(&self, utxo: &UtxoSet, hauteur: u64) -> Amount {
+        if !self.scheme.est_a_usage_unique() {
+            return Amount::ZERO;
+        }
+        let mut total: u64 = 0;
+        for (h, index) in &self.connues {
+            if !self.reserves.contains_key(index) {
+                continue;
+            }
+            let plus_grosse = utxo
+                .spendable_for(h, hauteur, COINBASE_MATURITY)
+                .iter()
+                .map(|(_, e)| e.output.value.units())
+                .max()
+                .unwrap_or(0);
+            total = total.saturating_add(plus_grosse);
+        }
+        Amount::from_units(total)
     }
 
     /// Hauteur jusqu'a laquelle la chaine a deja ete balayee.
@@ -762,6 +946,9 @@ impl Wallet {
                 }
                 let h = pubkey_hash(self.scheme, &entree.witness.pubkey);
                 if let Some(index) = self.connues.get(&h).copied() {
+                    // Une signature dans un bloc leve la reservation : la
+                    // clef n'est plus reservee, elle est revelee.
+                    self.reserves.remove(&index);
                     if !self.consommes.contains(&index) {
                         self.consommes.push(index);
                         nouveaux += 1;
@@ -770,6 +957,40 @@ impl Wallet {
             }
         }
         nouveaux
+    }
+
+    /// Balaie les blocs actifs depuis la derniere hauteur verifiee, et note
+    /// les clefs de ce portefeuille qui y ont signe.
+    ///
+    /// # Le defaut que ceci ferme
+    ///
+    /// Le balayage n'existait qu'au chargement. Sur une machine neuve, l'ordre
+    /// est inverse — on restaure, *puis* la chaine arrive — et la decouverte
+    /// d'adresses se faisait dans la boucle du noeud sans relire un seul bloc.
+    /// Jusqu'au redemarrage suivant, une clef Lamport deja revelee dans un
+    /// bloc etait annoncee depensable, et le portefeuille signait une seconde
+    /// fois. Le noeud appelle ceci apres toute decouverte fructueuse, et
+    /// l'envoi de fonds l'appelle avant de choisir ses pieces.
+    ///
+    /// `lire_bloc` rend le bloc actif a une hauteur, s'il est disponible. Le
+    /// balayage s'arrete au premier bloc manquant, et la hauteur verifiee
+    /// n'avance que jusque-la : on ne declare pas verifie ce qu'on n'a pas lu.
+    /// Rend le nombre de clefs nouvellement marquees.
+    pub fn balayer_la_chaine<L>(&mut self, hauteur: u64, lire_bloc: L) -> usize
+    where
+        L: Fn(u64) -> Option<crate::block::Block>,
+    {
+        let mut trouves = 0usize;
+        let mut h = self.verifie_jusqu_a.saturating_add(1);
+        while h <= hauteur {
+            match lire_bloc(h) {
+                Some(b) => trouves += self.noter_depenses(&b),
+                None => break,
+            }
+            self.verifie_jusqu_a = h;
+            h += 1;
+        }
+        trouves
     }
 
     /// Associe de force une empreinte a un indice, pour les epreuves d'audit.
@@ -798,7 +1019,8 @@ impl Wallet {
             // Une clef Lamport consommee est morte : les fonds qu'elle garde ne
             // sont plus depensables sans reveler la clef privee. ML-DSA n'a pas
             // cette contrainte, et masquer ses fonds serait un bogue.
-            if usage_unique && self.consommes.contains(index) {
+            if usage_unique && (self.consommes.contains(index) || self.reserves.contains_key(index))
+            {
                 continue;
             }
             let pieces = utxo.spendable_for(h, hauteur, COINBASE_MATURITY);
@@ -1013,7 +1235,7 @@ impl Wallet {
         // unique seulement.
         if self.scheme.est_a_usage_unique() {
             for (_, _, index) in &choisies {
-                if self.consommes.contains(index) {
+                if self.consommes.contains(index) || self.reserves.contains_key(index) {
                     return Err(WalletError::ClefDejaUtilisee(*index));
                 }
             }
@@ -1067,10 +1289,14 @@ impl Wallet {
     /// signatures Lamport d'une meme clef suffisent a en forger une troisieme.
     ///
     /// L'ordre est desormais : reserver les indices, **enregistrer**, puis
-    /// signer. `garde` recoit le portefeuille avec les indices deja marques et
-    /// doit les mettre sur le disque de facon durable ; s'il echoue, rien n'est
-    /// signe et la depense est refusee. Un indice reserve pour rien est perdu,
-    /// ce qui ne coute qu'une derivation ; une clef reutilisee coute les fonds.
+    /// signer. `garde` recoit le portefeuille avec les indices deja reserves
+    /// et doit les mettre sur le disque de facon durable ; s'il echoue, rien
+    /// n'est signe, la reservation est levee et la depense est refusee.
+    ///
+    /// C'est [`Self::preparer_depense`] puis [`Self::signer_depense`] en un
+    /// seul appel, pour qui tient le jeu de sorties d'un bout a l'autre. Le
+    /// noeud, lui, rend le verrou de la chaine entre les deux le temps
+    /// d'ecrire le portefeuille.
     pub fn create_transaction_multi_gardee(
         &mut self,
         utxo: &UtxoSet,
@@ -1079,6 +1305,38 @@ impl Wallet {
         frais: Amount,
         garde: &mut dyn FnMut(&Wallet) -> Result<(), String>,
     ) -> Result<Transaction, WalletError> {
+        let depense = self.preparer_depense(utxo, hauteur, destinations, frais)?;
+        if garde(&*self).is_err() {
+            // Rien n'a ete signe et le disque n'a rien retenu : l'indice
+            // redevient libre. Le garder reserve figerait la piece pour rien.
+            self.abandonner_depense(depense);
+            return Err(WalletError::EnregistrementImpossible);
+        }
+        self.signer_depense(utxo, depense)
+    }
+
+    /// Premier temps d'une depense : choisir les pieces, verifier les clefs,
+    /// **reserver** les indices. Rien n'est signe.
+    ///
+    /// # Pourquoi la depense est coupee en deux
+    ///
+    /// Entre la reservation et la signature, le portefeuille doit etre ecrit
+    /// sur le disque — et cette ecriture est un scellement Argon2id de
+    /// plusieurs dixiemes de seconde. Le noeud la faisait sous le verrou de
+    /// la chaine et du reservoir : validation des blocs et service des pairs
+    /// s'arretaient a chaque envoi. Couper ici permet de rendre le verrou,
+    /// d'ecrire, puis de le reprendre pour [`Self::signer_depense`], qui
+    /// revérifie que les pieces sont toujours la.
+    ///
+    /// L'adresse de monnaie est tiree ici : elle fait partie de ce que le
+    /// disque doit connaitre avant la signature.
+    pub fn preparer_depense(
+        &mut self,
+        utxo: &UtxoSet,
+        hauteur: u64,
+        destinations: &[(Address, Amount)],
+        frais: Amount,
+    ) -> Result<DepensePreparee, WalletError> {
         if destinations.is_empty() {
             return Err(WalletError::MontantNul);
         }
@@ -1147,7 +1405,7 @@ impl Wallet {
             });
         }
 
-        let mut tx = Transaction {
+        let tx = Transaction {
             version: 1,
             inputs: choisies
                 .iter()
@@ -1183,28 +1441,108 @@ impl Wallet {
             clefs.push(pubkey);
         }
 
-        // Ecriture anticipee : les indices sont marques consommes et mis sur le
-        // disque **avant** que la moindre signature existe.
+        // Reservation : les indices sont retenus, et l'appelant doit les mettre
+        // sur le disque **avant** que la moindre signature existe. Ils ne sont
+        // pas encore consommes : rien n'est revele tant que rien n'est signe.
         for (_, _, index) in &choisies {
-            if !self.consommes.contains(index) {
-                self.consommes.push(*index);
-            }
+            self.reserves.entry(*index).or_insert(hauteur);
         }
-        if garde(&*self).is_err() {
-            return Err(WalletError::EnregistrementImpossible);
+        Ok(DepensePreparee {
+            choisies,
+            clefs,
+            tx,
+        })
+    }
+
+    /// Renonce a une depense preparee : les indices reserves redeviennent
+    /// libres. A n'appeler que si **rien n'a ete signe**, ce que garantit le
+    /// type — une depense signee n'existe plus sous cette forme.
+    pub fn abandonner_depense(&mut self, depense: DepensePreparee) {
+        for (_, _, index) in &depense.choisies {
+            self.reserves.remove(index);
         }
+    }
+
+    /// Second temps : revérifier les pieces, signer, consommer.
+    ///
+    /// Le jeu de sorties a pu changer pendant que le verrou etait rendu : une
+    /// piece depensee ailleurs, une reorganisation. Chaque piece choisie doit
+    /// etre encore la, identique. Sinon rien n'est signe, la reservation est
+    /// levee, et l'appelant recommence sur l'etat courant.
+    ///
+    /// Apres la signature, les indices passent de reserves a consommes : la
+    /// clef est revelee, que la transaction soit diffusee ou non — elle existe.
+    pub fn signer_depense(
+        &mut self,
+        utxo: &UtxoSet,
+        depense: DepensePreparee,
+    ) -> Result<Transaction, WalletError> {
+        let toujours_la = depense.choisies.iter().all(|(o, sortie, _)| {
+            utxo.get(o).map(|e| e.output == *sortie).unwrap_or(false)
+        });
+        if !toujours_la {
+            self.abandonner_depense(depense);
+            return Err(WalletError::PiecesDisparues);
+        }
+        let DepensePreparee {
+            choisies,
+            clefs,
+            mut tx,
+        } = depense;
 
         // Signature : le condensat couvre la transaction depouillee, donc il ne
-        // change pas a mesure qu'on remplit les temoins.
+        // change pas a mesure qu'on remplit les temoins. Un echec de l'alea
+        // arrete tout avant la premiere signature ecrite : les temoins deja
+        // calcules ne quittent pas cette fonction.
+        let mut temoins = Vec::with_capacity(choisies.len());
         for (i, ((_, depensee, index), pubkey)) in choisies.iter().zip(clefs).enumerate() {
             let message = tx.sighash(i as u32, self.network, depensee);
-            tx.inputs[i].witness = Witness {
-                pubkey,
-                signature: self.sign_at(*index, &message),
+            let signature = match self.sign_at(*index, &message) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Les signatures deja produites en memoire sont jetees ;
+                    // pour un schema a usage unique, on les tient neanmoins
+                    // pour revelees — elles ont existe.
+                    for (_, _, index) in choisies.iter().take(temoins.len()) {
+                        self.consommer(*index);
+                    }
+                    return Err(e);
+                }
             };
+            temoins.push(Witness { pubkey, signature });
         }
-
+        for (i, ((_, _, index), temoin)) in choisies.iter().zip(temoins).enumerate() {
+            tx.inputs[i].witness = temoin;
+            self.consommer(*index);
+        }
         Ok(tx)
+    }
+
+    /// Un indice reserve devient consomme : la clef a signe.
+    fn consommer(&mut self, index: u32) {
+        self.reserves.remove(&index);
+        if !self.consommes.contains(&index) {
+            self.consommes.push(index);
+        }
+    }
+}
+
+/// Une depense preparee et non signee : pieces choisies, clefs publiques
+/// verifiees, transaction depouillee. Voir [`Wallet::preparer_depense`].
+///
+/// Le type ne se construit que par le portefeuille et se consomme par
+/// [`Wallet::signer_depense`] ou [`Wallet::abandonner_depense`] : une depense
+/// preparee ne peut ni etre signee deux fois, ni etre oubliee en silence.
+pub struct DepensePreparee {
+    choisies: Vec<(OutPoint, TxOut, u32)>,
+    clefs: Vec<Vec<u8>>,
+    tx: Transaction,
+}
+
+impl DepensePreparee {
+    /// Indices dont les pieces sont engagees dans cette depense.
+    pub fn indices(&self) -> Vec<u32> {
+        self.choisies.iter().map(|(_, _, i)| *i).collect()
     }
 }
 
@@ -1214,8 +1552,33 @@ impl Wallet {
 /// portefeuille en a besoin.
 #[cfg(feature = "mldsa")]
 mod mldsa_wallet {
+    use super::WalletError;
     use crate::hash::Hash256;
-    use ml_dsa::{signature::Keypair, MlDsaParams, Signer, SigningKey, B32};
+    use ml_dsa::signature::rand_core::{TryCryptoRng, TryRng};
+    use ml_dsa::{signature::Keypair, MlDsaParams, SigningKey, B32};
+
+    /// Le generateur du systeme, presente a `ml-dsa` sous le trait qu'il
+    /// attend. Aucun etat : chaque appel interroge [`crate::rng`], qui echoue
+    /// plutot que de degrader.
+    struct Alea;
+
+    impl TryRng for Alea {
+        type Error = crate::rng::RngError;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(u32::from_le_bytes(crate::rng::octets()?))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(u64::from_le_bytes(crate::rng::octets()?))
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            crate::rng::remplir(dst)
+        }
+    }
+
+    impl TryCryptoRng for Alea {}
 
     pub fn public_key<P: MlDsaParams>(graine: &[u8; 32]) -> Vec<u8> {
         SigningKey::<P>::from_seed(&B32::from(*graine))
@@ -1224,11 +1587,30 @@ mod mldsa_wallet {
             .to_vec()
     }
 
-    pub fn sign<P: MlDsaParams>(graine: &[u8; 32], message: &Hash256) -> Vec<u8> {
-        SigningKey::<P>::from_seed(&B32::from(*graine))
-            .sign(message.as_bytes())
-            .encode()[..]
-            .to_vec()
+    /// Signature ML-DSA en variante « hedged » (FIPS 204, algorithme 2 avec
+    /// `rnd` tire au sort).
+    ///
+    /// # Le defaut que ceci ferme
+    ///
+    /// Le portefeuille signait en variante deterministe (`rnd = 0`) : deux
+    /// signatures du meme message etaient identiques. FIPS 204 l'autorise
+    /// mais recommande la variante aleatoire, qui protege contre les attaques
+    /// par faute — une faute pendant le calcul de `z` avec un `y` rejouable
+    /// revele `s1`. Le verificateur accepte les deux variantes : rien ne
+    /// change pour le reseau.
+    ///
+    /// Si le generateur du systeme manque, on **refuse de signer** : jamais de
+    /// repli sur `rnd = 0`, qui serait exactement la variante qu'on quitte.
+    pub fn sign<P: MlDsaParams>(
+        graine: &[u8; 32],
+        message: &Hash256,
+    ) -> Result<Vec<u8>, WalletError> {
+        let clef = SigningKey::<P>::from_seed(&B32::from(*graine));
+        let signature = clef
+            .expanded_key()
+            .sign_randomized(message.as_bytes(), b"", &mut Alea)
+            .map_err(|_| WalletError::AleaIndisponible)?;
+        Ok(signature.encode()[..].to_vec())
     }
 }
 
@@ -1404,42 +1786,53 @@ mod tests {
     /// signature, et un disque qui refuse empeche la signature.
     ///
     /// La garde joue le disque. Elle verifie qu'au moment ou elle est appelee,
-    /// les indices des pieces choisies sont deja marques consommes et
-    /// qu'aucune signature n'existe encore ; puis elle refuse. Rien ne doit
-    /// avoir ete signe, et les indices doivent rester reserves — un indice
-    /// perdu ne coute qu'une derivation, une clef resignee coute les fonds.
+    /// les indices des pieces choisies sont deja reserves — et figurent dans
+    /// ce que le fichier ecrira sous `consommes=` — et qu'aucune signature
+    /// n'existe encore ; puis elle refuse. Rien ne doit avoir ete signe, et
+    /// la reservation est levee : le disque n'a rien retenu, la piece n'a pas
+    /// a rester figee pour une ecriture qui n'a pas eu lieu.
     #[test]
     fn les_indices_sont_enregistres_avant_de_signer_et_un_disque_qui_refuse_bloque() {
         let mut w = portefeuille();
         let c = chaine_avec_fonds(&mut w);
         let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
         let a = dest.new_address();
-        let avant: Vec<u32> = w.indices_consommes();
+        let avant: Vec<u32> = w.indices_consommes_pour_le_fichier();
 
         let mut vus_par_la_garde: Vec<u32> = Vec::new();
+        let mut reserves_par_la_garde: Vec<(u32, u64)> = Vec::new();
         let r = w.create_transaction_multi_gardee(
             &c.utxo,
             c.height(),
             &[(a, Amount::from_units(50_000))],
             Amount::from_units(1_000),
             &mut |portefeuille| {
-                vus_par_la_garde = portefeuille.indices_consommes();
+                vus_par_la_garde = portefeuille.indices_consommes_pour_le_fichier();
+                reserves_par_la_garde = portefeuille.indices_reserves();
+                assert!(
+                    portefeuille.indices_consommes().is_empty(),
+                    "rien n'est revele avant la signature"
+                );
                 Err("disque plein".to_string())
             },
         );
         assert_eq!(r, Err(WalletError::EnregistrementImpossible));
         assert!(
             vus_par_la_garde.len() > avant.len(),
-            "la garde doit voir les indices deja consommes"
+            "la garde doit voir les indices reserves dans la ligne du fichier"
         );
-        assert_eq!(
-            w.indices_consommes(),
-            vus_par_la_garde,
-            "les indices reserves restent reserves apres le refus"
+        assert!(
+            !reserves_par_la_garde.is_empty()
+                && reserves_par_la_garde.iter().all(|(_, h)| *h == c.height()),
+            "la reservation porte la hauteur courante"
+        );
+        assert!(
+            w.indices_reserves().is_empty() && w.indices_consommes().is_empty(),
+            "un disque qui refuse ne fige rien : rien n'a ete signe"
         );
 
         // Le meme envoi, avec un disque qui accepte : les indices vus par la
-        // garde sont exactement ceux qui signent.
+        // garde sont exactement ceux qui signent, et ils sont consommes apres.
         let mut vus: Vec<u32> = Vec::new();
         let tx = w
             .create_transaction_multi_gardee(
@@ -1448,7 +1841,7 @@ mod tests {
                 &[(a, Amount::from_units(50_000))],
                 Amount::from_units(1_000),
                 &mut |portefeuille| {
-                    vus = portefeuille.indices_consommes();
+                    vus = portefeuille.indices_consommes_pour_le_fichier();
                     Ok(())
                 },
             )
@@ -1460,7 +1853,166 @@ mod tests {
                 vus.contains(&index),
                 "l'indice {index} a signe sans avoir ete enregistre d'abord"
             );
+            assert!(w.est_consomme(index) && !w.est_reserve(index));
         }
+    }
+
+    /// La depense en deux temps : entre la reservation et la signature, une
+    /// piece qui disparait leve la reservation sans rien signer ; une piece
+    /// toujours la est signee, et l'indice passe de reserve a consomme.
+    #[test]
+    fn une_piece_disparue_entre_reservation_et_signature_ne_brule_rien() {
+        let mut w = portefeuille();
+        let c = chaine_avec_fonds(&mut w);
+        let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
+        let a = dest.new_address();
+
+        let prepare = w
+            .preparer_depense(
+                &c.utxo,
+                c.height(),
+                &[(a, Amount::from_units(50_000))],
+                Amount::from_units(1_000),
+            )
+            .expect("preparation");
+        let indices = prepare.indices();
+        assert!(!indices.is_empty());
+        assert!(indices.iter().all(|i| w.est_reserve(*i) && !w.est_consomme(*i)));
+        // Reservee, la piece n'est plus proposee a une seconde depense.
+        assert!(!w
+            .spendable(&c.utxo, c.height())
+            .iter()
+            .any(|(_, _, i)| indices.contains(i)));
+
+        // Le jeu de sorties change : la piece n'y est plus.
+        let vide = UtxoSet::new();
+        assert_eq!(
+            w.signer_depense(&vide, prepare).err(),
+            Some(WalletError::PiecesDisparues)
+        );
+        assert!(
+            indices.iter().all(|i| !w.est_reserve(*i) && !w.est_consomme(*i)),
+            "rien n'a ete signe : les indices sont rendus"
+        );
+
+        // Sur le jeu inchange, la signature aboutit et consomme.
+        let prepare = w
+            .preparer_depense(
+                &c.utxo,
+                c.height(),
+                &[(a, Amount::from_units(50_000))],
+                Amount::from_units(1_000),
+            )
+            .expect("preparation");
+        let indices = prepare.indices();
+        let tx = w.signer_depense(&c.utxo, prepare).expect("signature");
+        assert_eq!(tx.inputs.len(), indices.len());
+        assert!(indices.iter().all(|i| w.est_consomme(*i) && !w.est_reserve(*i)));
+    }
+
+    /// Une reservation relue du disque est confirmee par la chaine si la
+    /// signature y figure, et levee si elle n'y figure pas passe le delai —
+    /// jamais avant, jamais sur une lecture incomplete.
+    #[test]
+    fn une_reservation_est_confirmee_ou_levee_par_la_chaine() {
+        let mut w = portefeuille();
+        let mut c = chaine_avec_fonds(&mut w);
+        let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
+        let a = dest.new_address();
+        let h0 = c.height();
+
+        // Deux depenses preparees, une seule signee et minee.
+        let signee = w
+            .preparer_depense(&c.utxo, h0, &[(a, Amount::from_units(50_000))], Amount::from_units(1_000))
+            .unwrap();
+        let abandonnee = w
+            .preparer_depense(&c.utxo, h0, &[(a, Amount::from_units(50_000))], Amount::from_units(1_000))
+            .unwrap();
+        let i_signee = signee.indices()[0];
+        let i_abandonnee = abandonnee.indices()[0];
+        assert_ne!(i_signee, i_abandonnee);
+        let tx = w.signer_depense(&c.utxo, signee).unwrap();
+        // « Arret » : on relit un portefeuille depuis ce que le fichier porte.
+        let fichier_consommes = w.indices_consommes_pour_le_fichier();
+        let fichier_reserves = w.indices_reserves();
+        assert!(fichier_consommes.contains(&i_abandonnee));
+        assert_eq!(fichier_reserves, vec![(i_abandonnee, h0)]);
+        drop(abandonnee);
+
+        let mineur = w.new_address();
+        let t = GENESIS_TIME + (h0 + 1) * TARGET_BLOCK_SECS;
+        let b = c.mine_block(mineur.hash, mineur.scheme, &[tx], t, 20_000_000).unwrap();
+        c.connect(&b, t + 1).unwrap();
+
+        let mut r = Wallet::from_seed([0x11; 32], Network::Regtest);
+        r.rescan(w.next_index());
+        r.marquer_consommes(&fichier_consommes);
+        r.charger_reservations(&fichier_reserves);
+        assert!(r.est_consomme(i_signee));
+        assert!(r.est_reserve(i_abandonnee) && !r.est_consomme(i_abandonnee));
+
+        // Trop tot : rien ne bouge.
+        assert_eq!(r.reexaminer_reservations(c.height(), |h| c.block_at(h)), (0, 0));
+        assert!(r.est_reserve(i_abandonnee));
+
+        // Le delai passe, mais un bloc manque : rien n'est libere.
+        for _ in 0..Wallet::DELAI_RESERVATION {
+            let m = w.new_address();
+            let t = GENESIS_TIME + (c.height() + 1) * TARGET_BLOCK_SECS;
+            let b = c.mine_block(m.hash, m.scheme, &[], t, 20_000_000).unwrap();
+            c.connect(&b, t + 1).unwrap();
+        }
+        let trou = h0 + 3;
+        assert_eq!(
+            r.reexaminer_reservations(c.height(), |h| if h == trou { None } else { c.block_at(h) }),
+            (0, 0)
+        );
+        assert!(r.est_reserve(i_abandonnee), "une lecture incomplete ne libere rien");
+
+        // Lecture complete : l'indice abandonne est libre, et une reservation
+        // dont la signature est dans la chaine serait confirmee.
+        let mut r2 = Wallet::from_seed([0x11; 32], Network::Regtest);
+        r2.rescan(w.next_index());
+        r2.charger_reservations(&[(i_signee, h0), (i_abandonnee, h0)]);
+        assert_eq!(r2.reexaminer_reservations(c.height(), |h| c.block_at(h)), (1, 1));
+        assert!(r2.est_consomme(i_signee) && !r2.est_reserve(i_signee));
+        assert!(!r2.est_consomme(i_abandonnee) && !r2.est_reserve(i_abandonnee));
+    }
+
+    /// Le balayage incremental : les blocs au-dela de la hauteur verifiee
+    /// sont relus, la hauteur avance jusqu'au premier bloc manquant, et une
+    /// clef vue dans un bloc n'est plus proposee.
+    #[test]
+    fn le_balayage_incremental_s_arrete_au_premier_bloc_manquant() {
+        let mut w = portefeuille();
+        let mut c = chaine_avec_fonds(&mut w);
+        let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
+        let a = dest.new_address();
+        let tx = w
+            .create_transaction(&c.utxo, c.height(), &a, Amount::from_units(50_000), Amount::from_units(1_000))
+            .unwrap();
+        let signataire = pubkey_hash(w.scheme(), &tx.inputs[0].witness.pubkey);
+        let index = *w.connues.get(&signataire).unwrap();
+        let h_depense = c.height() + 1;
+        let mineur = w.new_address();
+        let t = GENESIS_TIME + h_depense * TARGET_BLOCK_SECS;
+        let b = c.mine_block(mineur.hash, mineur.scheme, &[tx], t, 20_000_000).unwrap();
+        c.connect(&b, t + 1).unwrap();
+
+        // Un portefeuille de la meme graine, qui ne sait rien de la depense.
+        let mut r = Wallet::from_seed([0x11; 32], Network::Regtest);
+        r.rescan(w.next_index());
+        assert!(!r.est_consomme(index));
+        // Un trou avant le bloc de la depense : le balayage s'arrete devant.
+        let trou = h_depense - 2;
+        let marquees = r.balayer_la_chaine(c.height(), |h| if h == trou { None } else { c.block_at(h) });
+        assert_eq!(marquees, 0);
+        assert_eq!(r.verifie_jusqu_a(), trou - 1);
+        // Lecture complete : la clef est marquee, la hauteur atteint la tete.
+        assert_eq!(r.balayer_la_chaine(c.height(), |h| c.block_at(h)), 1);
+        assert_eq!(r.verifie_jusqu_a(), c.height());
+        assert!(r.est_consomme(index));
+        assert!(!r.spendable(&c.utxo, c.height()).iter().any(|(_, _, i)| *i == index));
     }
 
     /// Epreuves du portefeuille ML-DSA — le chemin qui sera celui du reseau
@@ -1567,9 +2119,25 @@ mod tests {
             let m2 = crate::hash::tagged_hash("Q21/test", b"deux");
 
             for m in [m1, m2] {
-                let s = w.sign_at(0, &m);
+                let s = w.sign_at(0, &m).expect("alea disponible");
                 assert_eq!(crate::sig::verify(SchemeId::MlDsa65, &pk, &m, &s), Ok(()));
             }
+        }
+
+        /// ML-DSA signe en variante « hedged » : deux signatures du meme
+        /// message different, et chacune verifie. La variante deterministe
+        /// (`rnd = 0`) rendait deux signatures identiques, la plus exposee aux
+        /// attaques par faute.
+        #[test]
+        fn deux_signatures_ml_dsa_du_meme_message_different_et_verifient() {
+            let w = portefeuille_mldsa([0x11; 32]);
+            let pk = w.public_key(0);
+            let m = crate::hash::tagged_hash("Q21/test", b"le meme message");
+            let a = w.sign_at(0, &m).expect("alea disponible");
+            let b = w.sign_at(0, &m).expect("alea disponible");
+            assert_ne!(a, b, "deux signatures identiques : variante deterministe");
+            assert_eq!(crate::sig::verify(SchemeId::MlDsa65, &pk, &m, &a), Ok(()));
+            assert_eq!(crate::sig::verify(SchemeId::MlDsa65, &pk, &m, &b), Ok(()));
         }
 
         /// Deux schemas issus de la meme graine ne partagent aucune clef.

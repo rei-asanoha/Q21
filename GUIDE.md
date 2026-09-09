@@ -170,6 +170,12 @@ La première crée ton portefeuille. Elle demande une phrase secrète, puis affi
 un **code de sauvegarde** de 66 caractères. **Recopie-le sur papier.** C'est le
 seul moyen de retrouver tes fonds si le fichier disparaît.
 
+Le jour où tu en as besoin, sur une machine neuve : `q21 restore testnet`, et
+le code t'est demandé au clavier, sans s'afficher. Ne le tape **jamais** dans
+la commande elle-même — le terminal garde l'historique de tout ce que tu tapes,
+et ce code, c'est ton portefeuille entier. Le programme refuse d'ailleurs de le
+prendre ainsi, et t'explique pourquoi.
+
 La seconde ouvre le portefeuille dans ton navigateur.
 
 ---

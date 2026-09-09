@@ -43,8 +43,16 @@ path = "src/lib.rs"
 # que **verifier** des signatures. Il n'a besoin ni d'aleatoire ni d'un format
 # d'export de clefs, et chaque dependance en moins est une surface d'attaque en
 # moins. La signature vit dans le portefeuille, pas dans le consensus.
+#
+# `zeroize` : sans elle, chaque signature laissait dans le tas une clef ML-DSA
+# etendue (graine, s1, s2, t0, versions NTT — des dizaines de Kio) que rien
+# n'effacait ; l'audit v2 l'a montre par `cargo tree`. La crate est vendorisee.
+#
+# `rand_core` : ouvre `sign_randomized`, la variante « hedged » de FIPS 204.
+# L'alea vient de `rng.rs`, pas de `getrandom` — ce n'est qu'un trait, et la
+# crate `rand_core` (0.10, sans feature) est vendorisee elle aussi.
 [dependencies]
-ml-dsa = { version = "0.1.1", optional = true, default-features = false, features = ["alloc"] }
+ml-dsa = { version = "0.1.1", optional = true, default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 
 # Une seule fonction en est tiree : `setrlimit`, pour interdire les vidages
 # memoire d'un processus qui garde une graine. `libc` est deja dans le graphe
