@@ -21,9 +21,10 @@
 #   au commit et a l'execution qui l'ont produite. Elle se verifie avec
 #   `gh attestation verify <archive> --repo <proprietaire>/<depot>`. GitHub
 #   ne l'offre qu'aux depots publics : sur un depot prive, l'etape est sautee ;
-# - si le depot detient une clef `MINISIGN_KEY`, une signature `minisign` du
-#   fichier `SHA256SUMS`, verifiable hors ligne avec la clef publique publiee
-#   dans le README. Sans cette clef, l'etape est simplement sautee.
+# - une signature `minisign` du fichier `SHA256SUMS`, faite avec la clef
+#   `MINISIGN_KEY` de l'environnement `livraison`, verifiable hors ligne avec
+#   la clef publique publiee dans le README. Sans cette clef, la livraison
+#   echoue : une livraison non signee n'est pas une livraison.
 #
 # La chaine d'outils est celle de `rust-toolchain.toml` : deux compilations
 # du meme commit produisent le meme binaire.
@@ -192,10 +193,28 @@ jobs:
   # de version : c'est la livraison lancee a la main que l'on installe sur le
   # serveur et les machines, et c'est elle qui doit etre signee. Sans clef,
   # le travail echoue — une livraison non signee n'est pas une livraison.
+  #
+  # # D'ou la clef peut signer
+  #
+  # Un secret de depot est lu par toute execution lancee depuis le depot, sur
+  # n'importe quelle branche : qui pousse une branche et clique « Run
+  # workflow » fait signer ce qu'il veut, ou remplace ce `run:` par un envoi
+  # de la clef ailleurs. Deux verrous ferment cela :
+  #
+  # - le travail ne s'execute que sur `main` ou sur une etiquette `v*` — une
+  #   branche quelconque ne produit pas de signature ;
+  # - les deux secrets vivent dans l'**environnement** GitHub `livraison`,
+  #   dont la politique de deploiement n'admet que `main` et `v*`, et dont un
+  #   relecteur doit approuver chaque execution. Voir SIGNATURE.md, section 2.
+  #   Tant que l'environnement n'existe pas, GitHub le cree sans protection et
+  #   les secrets du depot servent encore : rien ne casse, mais rien ne
+  #   protege — d'ou la marche a suivre du SIGNATURE.md.
   signer:
     name: Signature
     needs: construire
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    environment: livraison
     steps:
       - uses: actions/download-artifact@v4
         with:
