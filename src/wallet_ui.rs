@@ -16,14 +16,17 @@
 //! epreuve, pas par la vigilance.
 //!
 //! **Presque aucun stockage navigateur.** Le seul objet conserve est le jeton
-//! de session, dans `sessionStorage` : il est cloisonne par origine — donc par
-//! port, tire au hasard a chaque lancement — et meurt avec l'onglet. Sans lui,
-//! un simple rafraichissement rendait le portefeuille inutilisable.
+//! de session, dans `localStorage`, cloisonne par origine — donc par port,
+//! tire au hasard a chaque lancement. Sans lui, un simple rafraichissement
+//! rendait le portefeuille inutilisable ; et depuis que le lien du lanceur ne
+//! sert qu'une fois, un onglet ferme par megarde ne se rouvrait plus avant la
+//! relance du programme. Ce qui est range la ne survit a rien d'utile : le
+//! jeton est tire a chaque execution et meurt avec elle. Ce qu'un navigateur
+//! garde apres l'arret du nœud est une chaine inerte, effacee au premier refus.
 //!
-//! `localStorage`, `indexedDB` et les cookies restent interdits : ils survivent
-//! a la fermeture, et rien ici ne doit survivre a la session. La graine et la
-//! phrase secrete, elles, ne quittent jamais le noeud — **cette page-ci** ne
-//! les voit a aucun moment.
+//! `indexedDB` et les cookies restent interdits, et rien d'autre que ce jeton
+//! n'est range. La graine et la phrase secrete, elles, ne quittent jamais le
+//! noeud — **cette page-ci** ne les voit a aucun moment.
 //!
 //! La precision compte depuis que `installation.rs` existe. La page
 //! d'installation, elle, recoit la phrase secrete a la saisie et affiche le code
@@ -964,7 +967,7 @@ const I18N_MOTIFS = {
     [/^environ (.+)$/, "約 $1"]
   ]
 };
-const I18N_PREFIXES = {"en": {"Impossible d'interroger le nœud : ": "Cannot reach the node: ", "Fonds insuffisants : ": "Insufficient funds: ", "Frais non estimés : ": "Fee not estimated: "}, "ja": {"Impossible d'interroger le nœud : ": "ノードに問い合わせできません: ", "Fonds insuffisants : ": "残高不足: ", "Frais non estimés : ": "手数料を見積れません: "}};
+const I18N_PREFIXES = {"en": {"Impossible d'interroger le nœud : ": "Cannot reach the node: ", "Ce lien a déjà servi, ou a expiré. Relancez le portefeuille pour en obtenir un neuf.": "This link has already been used, or has expired. Start the wallet again to get a fresh one.", "Fonds insuffisants : ": "Insufficient funds: ", "Frais non estimés : ": "Fee not estimated: "}, "ja": {"Impossible d'interroger le nœud : ": "ノードに問い合わせできません: ", "Ce lien a déjà servi, ou a expiré. Relancez le portefeuille pour en obtenir un neuf.": "このリンクはすでに使用済みか、期限切れです。ウォレットを再起動して新しいリンクを取得してください。", "Fonds insuffisants : ": "残高不足: ", "Frais non estimés : ": "手数料を見積れません: "}};
 let LANGUE = "fr";
 
 // Les dates et les nombres suivent aussi la langue : « 12/08/2025 » ne se lit
@@ -1100,21 +1103,29 @@ let adresseCourante = null;
 let envoiPrepare = null;
 let enCours = false;
 
-// Le jeton survit a un rafraichissement, et a rien d'autre.
+// Le jeton survit a un rafraichissement et a la fermeture de l'onglet, tant
+// que le programme tourne — et a rien d'autre.
 //
 // La premiere version le gardait dans une simple variable. Un F5 — le reflexe
 // de tout le monde devant une page qui semble figee — le perdait, et le
 // portefeuille devenait inutilisable jusqu'a relancer le lanceur. C'est
-// exactement ce qui est arrive au premier utilisateur.
+// exactement ce qui est arrive au premier utilisateur. La deuxieme le rangeait
+// dans `sessionStorage`, qui meurt avec l'onglet : c'etait suffisant tant que
+// le lien du lanceur pouvait etre rouvert. Il ne le peut plus — il ne sert
+// qu'une fois — et fermer l'onglet coupait alors l'utilisateur de son propre
+// portefeuille jusqu'a la relance.
 //
-// `sessionStorage` est le compromis retenu, et il merite d'etre justifie :
+// `localStorage` est ce qui reste, et il merite d'etre justifie :
 //
 // - il est **cloisonne par origine**, et l'origine contient le port, que le
 //   lanceur tire au hasard a chaque demarrage. Ce qu'on y ecrit ne vaut donc
 //   que pour cette execution-la ;
-// - il **meurt avec l'onglet**, contrairement a `localStorage` ;
 // - le jeton lui-meme est ephemere : le lanceur en tire un neuf de trente-deux
-//   octets a chaque lancement, et l'ancien n'ouvre plus rien.
+//   octets a chaque lancement, et l'ancien n'ouvre plus rien. Ce qui reste
+//   dans le navigateur apres l'arret est une chaine inerte, effacee au premier
+//   401 ;
+// - seul le profil du navigateur de l'utilisateur le contient — pas la ligne
+//   de commande, pas l'historique, pas un journal.
 //
 // Ce qu'on refuse toujours : que le jeton reste dans la **barre d'adresse**,
 // donc dans l'historique du navigateur, dans les journaux d'un mandataire et
@@ -1124,14 +1135,23 @@ let enCours = false;
 // jeton de session n'est pas une clef.
 const CLEF_SESSION = "q21-jeton";
 
+// Tout acces au rangement passe par ici, et par la seule clef ci-dessus.
+function rangement(){
+  try { return window.localStorage; } catch (e) { return null; }
+}
+
+function jetonRange(){
+  try { const r = rangement(); return r ? r.getItem(CLEF_SESSION) : null; } catch (e) { return null; }
+}
+
 function retenirJeton(v){
   jeton = v;
-  try { if (v) sessionStorage.setItem(CLEF_SESSION, v); } catch (e) { /* refus du navigateur : tant pis */ }
+  try { const r = rangement(); if (v && r) r.setItem(CLEF_SESSION, v); } catch (e) { /* refus du navigateur : tant pis */ }
 }
 
 function oublierJeton(){
   jeton = null;
-  try { sessionStorage.removeItem(CLEF_SESSION); } catch (e) { /* rien a faire */ }
+  try { const r = rangement(); if (r) r.removeItem(CLEF_SESSION); } catch (e) { /* rien a faire */ }
 }
 
 // --- Le fragment ne porte plus le jeton : il porte une amorce.
@@ -1149,6 +1169,12 @@ async function echangerAmorce(amorce){
       headers:{"Content-Type":"application/json", "Authorization":"Bearer " + amorce}});
     if (r.ok){ const d = await r.json(); retenirJeton(d.jeton); return; }
   } catch (e) { /* le noeud ne repond pas encore : le 401 qui suit ouvrira le panneau */ }
+  // Le lien a deja servi. Si cette origine a garde le jeton de la session en
+  // cours — l'onglet a ete ferme puis rouvert depuis l'historique — il
+  // reprend sans rien demander. S'il est perime, le 401 qui suit l'efface et
+  // ouvre le panneau.
+  const garde = jetonRange();
+  if (garde){ jeton = garde; return; }
   signalerErreur("Ce lien a déjà servi, ou a expiré. Relancez le portefeuille pour en obtenir un neuf.");
 }
 
@@ -1161,11 +1187,10 @@ async function echangerAmorce(amorce){
     echange = echangerAmorce(v);
     return;
   }
-  // Pas de fragment : un rafraichissement, ou une ouverture a la main.
-  try {
-    const garde = sessionStorage.getItem(CLEF_SESSION);
-    if (garde) jeton = garde;
-  } catch (e) { /* stockage refuse : le panneau de saisie prendra le relais */ }
+  // Pas de fragment : un rafraichissement, une ouverture a la main, ou un
+  // onglet rouvert tant que le programme tourne.
+  const garde = jetonRange();
+  if (garde) jeton = garde;
 })();
 
 function entetes(){
@@ -2658,46 +2683,83 @@ mod tests {
     /// et il fallait relancer le lanceur. C'est arrive au premier utilisateur,
     /// devant une page qui semblait figee — le reflexe de tout le monde.
     ///
-    /// Le jeton de session est donc admis dans `sessionStorage`, et lui seul.
-    /// Il est cloisonne par origine — donc par port, tire au hasard a chaque
-    /// lancement — et meurt avec l'onglet. Ce n'est pas une clef : la graine et
-    /// la phrase secrete ne quittent jamais le noeud.
+    /// Le jeton de session est donc admis dans le rangement du navigateur, et
+    /// lui seul. Il y est cloisonne par origine — donc par port, tire au
+    /// hasard a chaque lancement — et il meurt avec le processus qui l'a tire :
+    /// ce que le navigateur garde ensuite n'ouvre plus rien. Ce n'est pas une
+    /// clef : la graine et la phrase secrete ne quittent jamais le noeud.
     ///
-    /// `localStorage`, `indexedDB` et les cookies restent interdits : ils
-    /// survivent a la fermeture, et rien ici ne doit survivre a la session.
+    /// Depuis que le lien du lanceur ne sert qu'une fois, ce rangement doit
+    /// survivre a l'onglet, sinon le fermer coupe l'utilisateur de son
+    /// portefeuille jusqu'a la relance : c'est `localStorage`, par un seul
+    /// point d'acces, sous une seule clef. `indexedDB` et les cookies restent
+    /// interdits.
     #[test]
-    fn la_page_ne_persiste_que_le_jeton_de_session() {
-        // On cherche des **appels**, pas des mentions : les commentaires du
-        // fichier nomment `localStorage` pour expliquer pourquoi il est ecarte,
-        // et une epreuve qui interdirait jusqu'au mot interdirait d'expliquer.
-        for interdit in [
-            "localStorage.setItem",
-            "localStorage.getItem",
-            "localStorage[",
-            "indexedDB.open",
-            "document.cookie =",
-        ] {
+    fn la_page_ne_range_que_le_jeton_de_session() {
+        for interdit in ["indexedDB.open", "document.cookie =", "localStorage["] {
             assert!(
                 !PAGE.contains(interdit),
-                "le portefeuille persiste au-dela de la session : {interdit}"
+                "le portefeuille range autre chose que le jeton : {interdit}"
             );
         }
         let s = script();
-        assert!(
-            s.contains("sessionStorage.setItem(CLEF_SESSION"),
-            "le jeton doit survivre a un rafraichissement"
+        // Un seul point d'acces au rangement durable, et une seule clef.
+        assert_eq!(
+            s.matches("window.localStorage").count(),
+            1,
+            "`localStorage` ne doit etre touche que par `rangement()`"
         );
         assert!(
-            s.contains("sessionStorage.removeItem(CLEF_SESSION"),
+            !s.contains("localStorage."),
+            "aucun acces direct : tout passe par `rangement()`"
+        );
+        assert!(s.contains("function rangement(){"));
+        assert!(
+            s.contains("r.setItem(CLEF_SESSION"),
+            "le jeton doit survivre a un rafraichissement et a l'onglet"
+        );
+        assert!(
+            s.contains("r.removeItem(CLEF_SESSION"),
             "un jeton refuse doit etre oublie, pas reessaye indefiniment"
         );
+        // Le seul autre usage de `sessionStorage` est la langue choisie : elle
+        // n'est pas un secret, et elle n'a pas a survivre a l'onglet.
+        for occ in s.match_indices("sessionStorage.") {
+            let suite = &s[occ.0..(occ.0 + 60).min(s.len())];
+            assert!(
+                suite.contains("q21-langue"),
+                "seul le choix de langue passe par sessionStorage : {suite}"
+            );
+        }
         // Toute lecture ou ecriture est gardee : un navigateur peut refuser le
         // stockage, et la page doit alors fonctionner sans, pas s'arreter.
-        let occurrences = s.matches("sessionStorage").count();
+        let occurrences = s.matches("Storage.").count()
+            + s.matches(".getItem(").count()
+            + s.matches(".setItem(").count()
+            + s.matches(".removeItem(").count();
         let gardes = s.matches("try {").count();
         assert!(
             gardes >= occurrences,
             "chaque acces au stockage doit etre garde : {occurrences} acces, {gardes} gardes"
+        );
+    }
+
+    /// Un onglet ferme se rouvre tant que le programme tourne.
+    ///
+    /// Le lien du lanceur ne sert qu'une fois. Rouvert depuis l'historique,
+    /// l'echange echoue : la page doit alors reprendre le jeton range sous
+    /// cette origine, sans rien demander, et ne montrer « ce lien a deja
+    /// servi » qu'a defaut. Un jeton perime est efface par le 401 qui suit.
+    #[test]
+    fn un_onglet_rouvert_reprend_le_jeton_range() {
+        let s = script();
+        let echec = s.find("const garde = jetonRange();\n  if (garde){ jeton = garde; return; }")
+            .expect("reprise du jeton range");
+        let message = s.find("signalerErreur(\"Ce lien a déjà servi").expect("message");
+        assert!(echec < message, "la reprise passe avant le message");
+        assert!(
+            s.contains("if (r.status === 401){\n    oublierJeton();"),
+            "un 401 doit effacer le jeton range"
         );
     }
 

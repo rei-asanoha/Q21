@@ -32,8 +32,8 @@
 ///
 /// Le jeton employait deja ce fragment. Les deux cohabitent sans ambiguite :
 /// une route commence toujours par une barre oblique, un jeton jamais. Le jeton
-/// est lu une fois, range dans `sessionStorage` — cloisonne par port, efface a
-/// la fermeture de l'onglet — et le fragment rendu au routage.
+/// est lu une fois, range dans `localStorage` — cloisonne par port, et mort
+/// avec le processus qui l'a tire — et le fragment rendu au routage.
 pub const PAGE: &str = r##"<!doctype html>
 <html lang="fr">
 <head>
@@ -288,32 +288,53 @@ a.plat:hover{text-decoration:underline}
 //
 // Ce fragment sert aussi au routage. Les deux ne se confondent pas : une route
 // commence toujours par une barre oblique, un jeton jamais. Le jeton est lu une
-// fois, range pour la duree de l'onglet, et le fragment rendu au routage.
+// fois, range sous cette origine, et le fragment rendu au routage.
+//
+// Le rangement est `localStorage`, cloisonne par port : depuis que le lien du
+// lanceur ne sert qu'une fois, un onglet ferme doit pouvoir se rouvrir tant
+// que le programme tourne. Le jeton est tire a chaque execution et meurt avec
+// elle ; ce qui reste dans le navigateur ensuite n'ouvre plus rien, et le
+// premier 401 l'efface.
 // ---------------------------------------------------------------------------
 const RPC = "/rpc";
 const CLEF_SESSION = "q21-jeton-explorateur";
 let jeton = null;
 let compteur = 0;
 
+function rangement(){
+  try { return window.localStorage; } catch (e) { return null; }
+}
+
+function jetonRange(){
+  try { const r = rangement(); return r ? r.getItem(CLEF_SESSION) : null; } catch (e) { return null; }
+}
+
 function retenirJeton(v){
   jeton = v;
-  try { if (v) sessionStorage.setItem(CLEF_SESSION, v); } catch (e) {}
+  try { const r = rangement(); if (v && r) r.setItem(CLEF_SESSION, v); } catch (e) {}
+}
+
+function oublierJeton(){
+  jeton = null;
+  try { const r = rangement(); if (r) r.removeItem(CLEF_SESSION); } catch (e) {}
 }
 
 // Ce que le lanceur met dans le fragment est une amorce a usage unique, pas le
 // jeton : l'adresse passe par la ligne de commande du navigateur, lisible par
 // d'autres comptes. La page l'echange contre le jeton de session, et les
 // appels attendent que ce soit fait. Si l'echange echoue — lien deja servi —
-// le 401 qui suit ouvre le panneau de saisie, comme pour une ouverture a la
-// main.
+// la page reprend le jeton range sous cette origine s'il y en a un ; sinon le
+// 401 qui suit ouvre le panneau de saisie, comme pour une ouverture a la main.
 let echange = null;
 
 async function echangerAmorce(amorce){
   try {
     const r = await fetch("/session", {method:"POST",
       headers:{"Content-Type":"application/json", "Authorization":"Bearer " + amorce}});
-    if (r.ok){ const d = await r.json(); retenirJeton(d.jeton); }
+    if (r.ok){ const d = await r.json(); retenirJeton(d.jeton); return; }
   } catch (e) {}
+  const garde = jetonRange();
+  if (garde) jeton = garde;
 }
 
 (function lireJeton(){
@@ -325,7 +346,8 @@ async function echangerAmorce(amorce){
     echange = echangerAmorce(decodeURIComponent(f));
     return;
   }
-  try { const g = sessionStorage.getItem(CLEF_SESSION); if (g) jeton = g; } catch (e) {}
+  const garde = jetonRange();
+  if (garde) jeton = garde;
 })();
 
 function entetes(){
@@ -363,6 +385,7 @@ async function appel(methode, params){
     body: JSON.stringify({jsonrpc:"2.0", id:++compteur, method:methode, params:params||{}})
   });
   if (r.status === 401){
+    oublierJeton();
     await demanderJeton();
     return appel(methode, params);
   }
@@ -950,6 +973,32 @@ mod tests {
             attente > appel && attente - appel < 80,
             "l'attente doit ouvrir `appel`"
         );
+    }
+
+    /// Un onglet ferme se rouvre tant que le programme tourne.
+    ///
+    /// Le lien du lanceur ne sert qu'une fois. Rouvert, l'echange echoue et la
+    /// page reprend le jeton range sous cette origine — `localStorage`,
+    /// cloisonne par port, touche par un seul point d'acces. Un jeton perime
+    /// est efface par le 401 qui suit, avant que le panneau ne s'ouvre.
+    #[test]
+    fn un_onglet_rouvert_reprend_le_jeton_range() {
+        assert_eq!(PAGE.matches("window.localStorage").count(), 1);
+        assert!(!PAGE.contains("localStorage."));
+        assert!(!PAGE.contains("sessionStorage"));
+        assert!(PAGE.contains("r.setItem(CLEF_SESSION"));
+        assert!(PAGE.contains("r.removeItem(CLEF_SESSION"));
+        let echec = PAGE
+            .find("} catch (e) {}\n  const garde = jetonRange();\n  if (garde) jeton = garde;\n}")
+            .expect("reprise apres un echange echoue");
+        assert!(echec > PAGE.find("async function echangerAmorce(").expect("echange"));
+        assert!(
+            PAGE.contains("if (r.status === 401){\n    oublierJeton();\n    await demanderJeton();"),
+            "un 401 doit effacer le jeton range avant de le redemander"
+        );
+        for interdit in ["indexedDB.open", "document.cookie ="] {
+            assert!(!PAGE.contains(interdit), "{interdit}");
+        }
     }
 
     /// Le jeton se demande dans la page, pas par une fenetre du navigateur.
