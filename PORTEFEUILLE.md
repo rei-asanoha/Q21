@@ -148,15 +148,18 @@ Ce fragment n'est pas le jeton lui-même. L'adresse passe par la ligne de
 commande du lanceur de navigateur, que d'autres comptes de la machine peuvent
 lire ; ce qui s'y trouve est donc un **jeton d'amorçage à usage unique**, que
 la page échange au chargement contre le jeton de session, et que le nœud
-détruit aussitôt. Ouvert une seconde fois, le lien ne donne rien : relancez
-le programme pour en obtenir un neuf. Voir `DURCISSEMENT.md`, « Le
-portefeuille sur un poste partagé ».
+détruit aussitôt. Voir `DURCISSEMENT.md`, « Le portefeuille sur un poste
+partagé ».
 
-Ni `localStorage`, ni cookie : les deux survivent à la fermeture du navigateur, et
-un jeton qui survit à la session qu'il ouvrait est un jeton de trop. Le jeton vit
-dans une variable JavaScript, doublée de `sessionStorage` — cloisonné par port,
-effacé à la fermeture de l'onglet — pour la seule raison qu'un `F5` ne doit pas
-couper l'utilisateur de son propre portefeuille.
+**Un lien ne sert qu'une fois, mais un onglet se rouvre tant que le programme
+tourne.** Le jeton de session, une fois obtenu, est rangé dans le
+`localStorage` du navigateur, cloisonné par origine — donc par port, tiré au
+hasard à chaque lancement. Fermez l'onglet par mégarde, rouvrez la page
+depuis l'historique : elle reprend là où elle en était, sans rien demander.
+Ce rangement ne survit à rien d'utile : le jeton est tiré à chaque exécution
+et meurt avec elle ; ce que le navigateur garde après l'arrêt est une chaîne
+inerte, effacée au premier refus du nœud. Ni cookie, ni `indexedDB`, ni quoi
+que ce soit d'autre : la graine et la phrase ne passent jamais par la page.
 
 ---
 
@@ -189,7 +192,7 @@ portefeuille a tourné sur **deux machines réelles** au lieu d'une.
 | 2 | **Aucun gestionnaire de Ctrl-C** : le processus était tué sans rien écrire | `src/arret.rs` — le chemin d'arrêt testé n'était pas le chemin emprunté |
 | 3 | `q21 mine` ignorait le réservoir et minait des blocs vides | Les transactions en attente entrent dans les blocs minés |
 | 4 | Il fallait une fenêtre de commande | *Portefeuille Q21* se double-clique |
-| 5 | Rafraîchir la page cassait la session | Le jeton survit dans `sessionStorage`, cloisonné par port |
+| 5 | Rafraîchir la page, ou fermer l'onglet, cassait la session | Le jeton survit dans le navigateur, cloisonné par port, tant que le programme tourne |
 | 6 | Les lignes d'état noyaient l'adresse à ouvrir | Mode silencieux dans le portefeuille |
 | 7 | L'historique n'affichait pas la somme sortie | Colonne **Sorti**, et la page ne contredit plus le nœud |
 | 8 | `q21.exe` double-cliqué affichait l'aide et se refermait | Sans argument, `q21` ouvre le portefeuille |

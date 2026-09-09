@@ -146,7 +146,10 @@ Deux défenses, indépendantes :
   dans la ligne de commande n'ouvre plus rien, sur tous les systèmes. Un
   autre compte qui l'aurait lue avant la page ne gagne qu'une course d'une
   seconde — et s'il la gagne, la page légitime affiche « ce lien a déjà
-  servi » au lieu de fonctionner à côté d'un intrus silencieux.
+  servi » au lieu de fonctionner à côté d'un intrus silencieux. Un lien ne
+  sert qu'une fois, mais un onglet se rouvre tant que le programme tourne :
+  le jeton de session est rangé dans le navigateur, sous cette origine, et
+  meurt avec le processus qui l'a tiré.
 - **Sous Linux, le nœud refuse les autres comptes.** Il demande au noyau
   quel compte tient l'autre bout de chaque connexion locale, et refuse tout
   compte autre que le sien — ce qui ferme aussi la course ci-dessus. Cette

@@ -124,8 +124,10 @@ jamais au serveur — un jeton d'amorçage à usage unique ; la page l'efface
 aussitôt de la barre d'adresse, l'échange contre le jeton de session, et
 envoie ensuite celui-ci en `Authorization: Bearer`. Le lien ne vaut donc
 qu'une fois — c'est voulu, l'adresse passe par la ligne de commande du
-navigateur, lisible par d'autres comptes. Sans lanceur (`q21 node
---rpc-token`), la page demande le jeton dans un champ.
+navigateur, lisible par d'autres comptes. Un onglet fermé, lui, se rouvre
+tant que le programme tourne : le jeton de session est rangé dans le
+navigateur, cloisonné par port, et meurt avec le processus qui l'a tiré. Sans
+lanceur (`q21 node --rpc-token`), la page demande le jeton dans un champ.
 
 Ce même fragment sert au routage des quatre vues. Les deux ne se confondent
 pas : **une route commence toujours par une barre oblique, un jeton jamais.**
