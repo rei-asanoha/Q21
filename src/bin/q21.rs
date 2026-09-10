@@ -1372,7 +1372,7 @@ fn lire_portefeuille(d: &Path) -> Result<Wallet, String> {
     let cache = AddressCache::new(chemin_adresses(d));
     let mut w = Wallet::from_seed_scheme(seed, reseau, scheme).map_err(|_| {
         format!(
-            "ce portefeuille est en {}, que ce binaire ne sait pas manipuler.\n             Recompilez avec `cargo build --release --features mldsa`.",
+            "ce portefeuille est en {}, que ce binaire ne sait pas manipuler.\n             Ce binaire a ete construit avec `--no-default-features` : reconstruisez-le avec `cargo build --release` (ML-DSA est inclus par defaut).",
             scheme.name()
         )
     })?;
@@ -1659,6 +1659,49 @@ fn charger(datadir: &Path) -> Result<Etat, String> {
     charger_avec(datadir, None)
 }
 
+/// Ce binaire sait-il verifier tout ce que ce reseau peut porter ?
+///
+/// Un binaire construit avec `--no-default-features` n'a pas ML-DSA. Mis en
+/// face d'une chaine qui en porte, il ne dirait pas « je ne sais pas
+/// verifier » : il dirait « ce bloc est faux » — a chaque bloc, donc a chaque
+/// pair, qu'il bannirait au deuxieme ; et au rejeu de son propre dossier, il
+/// couperait l'archive comme corrompue. Un logiciel qui n'est pas equipe pour
+/// juger doit refuser de juger, pas condamner.
+///
+/// Sur le reseau de regression, on previent sans refuser : c'est un bac a
+/// sable local, et c'est la que Lamport se teste sans ML-DSA.
+fn garde_des_schemas(reseau: Network) -> Result<(), String> {
+    let disponible = SchemeId::MlDsa87.disponible() && SchemeId::MlDsa65.disponible();
+    garde_des_schemas_avec(reseau, disponible).map(|avertissement| {
+        if let Some(a) = avertissement {
+            eprintln!("avertissement : {a}");
+        }
+    })
+}
+
+/// Le jugement de [`garde_des_schemas`], separe de la compilation pour etre
+/// eprouve : `Ok(None)` demarre, `Ok(Some(_))` demarre en prevenant, `Err`
+/// refuse.
+fn garde_des_schemas_avec(reseau: Network, mldsa_disponible: bool) -> Result<Option<String>, String> {
+    if mldsa_disponible {
+        return Ok(None);
+    }
+    let explication = "ce binaire a ete construit sans ML-DSA (`--no-default-features`) : \
+         il ne sait pas verifier les signatures que ce reseau porte. Il ne pourrait ni \
+         suivre la chaine, ni rouvrir un dossier qui en contient deja.";
+    match reseau {
+        Network::Regtest => Ok(Some(format!(
+            "{explication}\n               Le reseau de regression est tolere : seules les clefs \
+             Lamport y fonctionneront."
+        ))),
+        _ => Err(format!(
+            "{explication}\n\n                   Reconstruisez-le :   cargo build --release   (ML-DSA \
+             est inclus par defaut)\n                   ou installez la livraison signee \
+             (voir SIGNATURE.md)."
+        )),
+    }
+}
+
 /// Charge l'etat du repertoire.
 ///
 /// `reseau_impose` sert au noeud sans portefeuille : c'est alors la seule
@@ -1701,6 +1744,10 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
             ));
         }
     }
+    // Avant de toucher au moindre fichier de blocs : ce binaire sait-il
+    // verifier ce que ce reseau porte ? Un rejeu qui ne sait pas verifier
+    // couperait l'archive comme corrompue.
+    garde_des_schemas(reseau)?;
 
     // 1. Balayage des en-tetes : une lecture sequentielle, aucun corps decode.
     //
@@ -2042,7 +2089,7 @@ fn schema_depuis_nom(nom: &str) -> Result<SchemeId, String> {
     };
     if !s.disponible() {
         return Err(format!(
-            "{} n'est pas compile dans ce binaire.\n  Recompilez avec `cargo build --release --features mldsa`.",
+            "{} n'est pas compile dans ce binaire.\n  Ce binaire a ete construit avec `--no-default-features` : reconstruisez-le avec `cargo build --release` (ML-DSA est inclus par defaut).",
             s.name()
         ));
     }
@@ -5413,6 +5460,35 @@ fn cmd_explorateur(datadir: &Path, args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Un binaire sans ML-DSA refuse de demarrer la ou ML-DSA circule.
+    ///
+    /// Avant cette garde, il demarrait, tenait chaque bloc pour faux,
+    /// bannissait ses pairs et coupait son archive au rejeu. Le reseau de
+    /// regression reste tolere, en prevenant : c'est la que Lamport se teste.
+    #[test]
+    fn un_binaire_sans_ml_dsa_refuse_de_demarrer_hors_regression() {
+        for reseau in [Network::Mainnet, Network::Testnet] {
+            let refus = garde_des_schemas_avec(reseau, false).expect_err("doit refuser");
+            assert!(refus.contains("cargo build --release"), "{refus}");
+            assert!(refus.contains("--no-default-features"), "{refus}");
+        }
+        let toleree = garde_des_schemas_avec(Network::Regtest, false).expect("regtest tolere");
+        assert!(toleree.expect("avec avertissement").contains("Lamport"));
+        for reseau in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            assert_eq!(garde_des_schemas_avec(reseau, true), Ok(None));
+        }
+    }
+
+    /// La garde est reellement sur le chemin de tout chargement : un dossier
+    /// de reseau principal est refuse avant qu'un fichier ne soit ouvert.
+    #[test]
+    fn la_garde_precede_le_moindre_fichier() {
+        let s = include_str!("q21.rs");
+        let garde = s.find("garde_des_schemas(reseau)?;").expect("appel de la garde");
+        let ouverture = s.find("BlockArchive::open(chemin_blocs(datadir), reseau)").expect("ouverture");
+        assert!(garde < ouverture, "la garde doit preceder l'ouverture de l'archive");
+    }
 
     /// Le carnet fait l'aller-retour sans rien perdre.
     #[test]

@@ -504,8 +504,8 @@ ssh q21op@VOTRE_IP
 Le condensat seul prouve que le fichier est arrivé entier ; il ne prouve pas
 qui l'a construit. Avant d'installer un programme qui garde des clés, on
 vérifie la **signature** — voir `SIGNATURE.md`. Le serveur a `minisign`
-(`sudo apt install -y minisign` la première fois). Remplacez `RW…` par la
-clé publique du README :
+(`sudo apt install -y minisign` la première fois). La clé `RW…` ci-dessous
+est la clé publique du projet, la même que celle du README :
 
 ```bash
 minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore-missing

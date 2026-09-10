@@ -256,6 +256,29 @@ pub fn elaguer(
 /// suit, et redemander le reste au reseau. C'est ce qu'on fait ici — la
 /// reecriture passe par le meme chemin que l'elagage, sur, et ce qui est
 /// retire etait de toute facon inutilisable.
+/// Un bloc que **ce binaire** ne sait pas verifier n'est pas un bloc faux :
+/// on ne coupe rien, on s'arrete en le disant.
+///
+/// Sans cette garde, un binaire construit sans ML-DSA qui rouvrait un dossier
+/// portant une transaction ML-DSA retirait tous les corps a partir de ce bloc
+/// — mesure : 72 342 octets ramenes a 56 625, « bloc 208 refuse a la
+/// reconstruction : SchemaNonDisponible » — et le noeud repartait tronque,
+/// sur une chaine qu'il n'aurait pas pu suivre de toute facon.
+fn refuser_de_couper_si_incapable(
+    e: &crate::validate::ValidationError,
+    hauteur: u64,
+) -> Result<(), String> {
+    if let Some(schema) = e.incapacite_locale() {
+        return Err(format!(
+            "le bloc {hauteur} porte des signatures {} que ce binaire ne sait pas verifier \
+             (construit sans ML-DSA). Rien n'est coupe : le fichier des blocs est intact.\n\n\
+             Reconstruisez-le :   cargo build --release   (ML-DSA est inclus par defaut)",
+            schema.name()
+        ));
+    }
+    Ok(())
+}
+
 pub fn couper_l_archive_a(
     archive: &BlockArchive,
     hauteur: u64,
@@ -395,6 +418,7 @@ pub fn reprendre_la_chaine(
             };
             let now = b.header.time + MAX_FUTURE_TIME;
             if let Err(e) = c.connect(&b, now) {
+                refuser_de_couper_si_incapable(&e, b.header.height)?;
                 couper_l_archive_a(
                     archive,
                     b.header.height,
@@ -478,6 +502,7 @@ pub fn reprendre_la_chaine(
         };
         let now = b.header.time + MAX_FUTURE_TIME;
         if let Err(e) = c.connect(&b, now) {
+            refuser_de_couper_si_incapable(&e, b.header.height)?;
             couper_l_archive_a(
                 archive,
                 b.header.height,

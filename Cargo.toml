@@ -36,8 +36,18 @@ path = "src/lib.rs"
 #                   module-lattice 0.2.3, pkcs8 0.11.0
 # rand_core 0.10 n'a PAS de feature `os_rng` (contrairement a 0.9).
 #
-# Le noyau n'a toujours aucune dependance obligatoire. `ml-dsa` n'est tire que
-# si la feature `mldsa` est demandee.
+# `ml-dsa` est tire par la feature `mldsa`, qui est **active par defaut**.
+#
+# Elle ne l'etait pas : le noyau se voulait sans aucune dependance, et un
+# `cargo build` nu donnait un binaire qui ne savait pas verifier ML-DSA. Or
+# c'est le seul schema admis sur le reseau principal. Un tel binaire, mis en
+# face de la vraie chaine, tenait chaque bloc pour invalide — donc bannissait
+# ses pairs honnetes, deux blocs suffisant a atteindre le seuil — et, au
+# rejeu d'un dossier existant, coupait sa propre archive comme corrompue.
+# Le defaut de compilation doit produire un noeud qui fonctionne. Le noyau
+# sans dependance reste a portee de main : `--no-default-features`. Le
+# binaire, lui, refuse alors de demarrer sur un reseau qu'il ne sait pas
+# verifier (voir `garde_des_schemas` dans le binaire) au lieu de se tromper.
 #
 # `default-features = false` : on refuse `getrandom` et `pkcs8`. Un noeud ne fait
 # que **verifier** des signatures. Il n'a besoin ni d'aleatoire ni d'un format
@@ -63,7 +73,7 @@ ml-dsa = { version = "0.1.1", optional = true, default-features = false, feature
 libc = "0.2"
 
 [features]
-default = []
+default = ["mldsa"]
 mldsa = ["dep:ml-dsa"]
 # Expose quelques crochets internes aux epreuves d'audit hors du crate. Jamais
 # active dans une compilation de production : ce sont des fabricants d'etat
