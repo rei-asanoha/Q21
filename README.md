@@ -15,8 +15,9 @@ Réseau             TCP nu, relais compact, carnet d'adresses anti-éclipse
 Consultation       JSON-RPC + explorateur servis par votre propre nœud
 ```
 
-**582 épreuves (597 avec ML-DSA). Zéro avertissement clippy sur la bibliothèque.
-Zéro dépendance obligatoire.**
+**849 épreuves. Zéro avertissement clippy, tous binaires compris.
+Une seule dépendance, ML-DSA, vendorisée — et `--no-default-features` pour un
+cœur qui n'en a aucune.**
 
 ---
 
@@ -422,17 +423,26 @@ attaquant majoritaire peut et ne peut pas faire — y compris
 ## Les signatures sont du ML-DSA
 
 ```bash
-cargo build --release --features mldsa
-q21 init regtest mldsa65
+cargo build --release          # ML-DSA est inclus par défaut
+q21 init regtest               # schéma par défaut : ML-DSA-87
+q21 init regtest mldsa65       # ou, au choix, ML-DSA-65
 ```
+
+ML-DSA est compilé par défaut depuis que l'audit v2 a montré ce que donnait
+un binaire qui ne l'avait pas : mis en face d'une chaîne qui en porte, il
+tenait chaque bloc pour faux et, au rejeu d'un dossier existant, coupait sa
+propre archive comme corrompue. Le cœur sans aucune dépendance reste
+accessible par `cargo build --no-default-features` ; le binaire refuse alors
+de démarrer hors du réseau de régression, en disant quoi reconstruire, et ne
+coupe jamais une archive qu'il ne sait pas vérifier.
 
 Le protocole reconnaît quatre schémas, dont l'identifiant est inscrit dans
 l'adresse elle-même — ajouter un schéma est une évolution, jamais une rupture :
 
 | id | schéma | clé publique | signature | réseau principal |
 |---:|--------|-------------:|----------:|:-----------------|
-| 1 | ML-DSA-65 | 1 952 o | 3 309 o | oui, par défaut |
-| 2 | ML-DSA-87 | 2 592 o | 4 627 o | oui |
+| 1 | ML-DSA-65 | 1 952 o | 3 309 o | oui |
+| 2 | ML-DSA-87 | 2 592 o | 4 627 o | oui, par défaut |
 | 3 | SPHINCS+ | — | — | déclaré, non implémenté |
 | 4 | Lamport OTS | 16 384 o | 8 192 o | **interdit** |
 

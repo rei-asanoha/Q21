@@ -311,8 +311,11 @@ chemin-là, rien n'était écrit, et la correction n'aurait servi à rien.
 ## Compiler soi-même
 
 ```bash
-cargo build --release --features mldsa
+cargo build --release
 ```
+
+ML-DSA est inclus par défaut ; `--features mldsa` reste accepté et ne change
+rien.
 
 Les sources de `ml-dsa` sont dans `vendor/`, et `.cargo/config.toml` y redirige
 crates.io : la compilation ne dépend d'aucun réseau, et deux compilations à deux

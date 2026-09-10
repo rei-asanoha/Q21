@@ -229,6 +229,24 @@ pub const AMORCE_SEAU_MAX: u64 = 8 * 1024 * 1024;
 /// pair qui la fabrique, jamais d'un relais honnete.
 pub const MISCONDUCT_BAD_TX: u32 = 20;
 
+/// Voir [`crate::validate::ValidationError::incapacite_locale`].
+pub fn incapacite_locale(e: &crate::validate::ValidationError) -> Option<crate::sig::SchemeId> {
+    e.incapacite_locale()
+}
+
+/// Le dit une fois par execution, pas a chaque bloc.
+fn signaler_l_incapacite(schema: crate::sig::SchemeId) {
+    static DEJA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !DEJA.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "avertissement : un bloc porte des signatures {} que ce binaire ne sait pas \
+             verifier (construit sans ML-DSA). Le pair n'est pas sanctionne et le bloc \
+             n'est pas adopte. Reconstruisez : cargo build --release",
+            schema.name()
+        );
+    }
+}
+
 /// Transactions inedites qu'un pair peut pousser d'emblee.
 pub const TX_SEAU_MAX: u64 = 64;
 
@@ -1149,17 +1167,20 @@ impl Node {
     fn transaction_invalide_en_soi(e: &crate::mempool::MempoolError) -> bool {
         use crate::mempool::MempoolError as M;
         use crate::validate::ValidationError as V;
-        matches!(
-            e,
+        match e {
+            // « Je ne sais pas verifier » n'est pas « tu mens » : voir
+            // `incapacite_locale`.
+            M::Validation(v) if incapacite_locale(v).is_some() => false,
             M::Validation(
                 V::Signature(_)
-                    | V::ClefNeCorrespondPasAuVerrou
-                    | V::Transaction(_)
-                    | V::ValeurNonConservee { .. }
-                    | V::SchemaInterditSurCeReseau(_)
-                    | V::SortiePoussiere { .. }
-            )
-        )
+                | V::ClefNeCorrespondPasAuVerrou
+                | V::Transaction(_)
+                | V::ValeurNonConservee { .. }
+                | V::SchemaInterditSurCeReseau(_)
+                | V::SortiePoussiere { .. },
+            ) => true,
+            _ => false,
+        }
     }
 
     fn sanctionner(&self, id: u64, points: u32) -> bool {
@@ -2060,6 +2081,14 @@ impl Node {
                 // benigne entre deux annonces.
                 true
             }
+            Err(crate::chain::ChainError::Validation(v)) if incapacite_locale(&v).is_some() => {
+                // Le bloc n'est pas faux : c'est ce binaire qui ne sait pas
+                // le lire. Le pair n'y est pour rien, on ne le sanctionne
+                // pas ; on le dit une fois a l'operateur, et on ne compte pas
+                // le bloc comme invalide — il ne l'est peut-etre pas.
+                signaler_l_incapacite(incapacite_locale(&v).expect("garde"));
+                true
+            }
             Err(_) => {
                 stats.blocs_invalides.fetch_add(1, Ordering::Relaxed);
                 if let Some(p) = g.peers.get_mut(&source) {
@@ -2162,6 +2191,38 @@ fn ecrire(flux: &Arc<Mutex<TcpStream>>, m: &Message, magie: [u8; 4]) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    /// « Je ne sais pas verifier » n'est pas une faute du pair.
+    ///
+    /// Un bloc ou une transaction dont la signature releve d'un schema connu
+    /// mais absent de cette compilation ne coute aucun point au pair. Une
+    /// signature fausse, elle, en coute toujours : la distinction ne peut
+    /// pas servir a inonder gratuitement.
+    #[test]
+    fn l_incapacite_locale_n_est_pas_une_faute_du_pair() {
+        use crate::mempool::MempoolError as M;
+        use crate::sig::{SchemeId, VerifyError};
+        use crate::validate::ValidationError as V;
+        let locale = V::Signature(VerifyError::SchemaNonDisponible(SchemeId::MlDsa87));
+        let fausse = V::Signature(VerifyError::SignatureInvalide);
+        assert_eq!(super::incapacite_locale(&locale), Some(SchemeId::MlDsa87));
+        assert_eq!(super::incapacite_locale(&fausse), None);
+        let (locale, fausse) = (M::Validation(locale), M::Validation(fausse));
+        assert!(!super::Node::transaction_invalide_en_soi(&locale));
+        assert!(super::Node::transaction_invalide_en_soi(&fausse));
+    }
+
+    /// ML-DSA est compile par defaut : `cargo build` nu donne un noeud qui
+    /// sait verifier le reseau principal. Le noyau sans dependance reste
+    /// accessible par `--no-default-features`, et il refuse alors de
+    /// demarrer la ou il ne sait pas verifier.
+    #[test]
+    fn ml_dsa_est_compile_par_defaut() {
+        let manifeste = include_str!("../Cargo.toml");
+        assert!(
+            manifeste.contains("default = [\"mldsa\"]"),
+            "la feature mldsa doit etre dans les features par defaut"
+        );
+    }
     use super::*;
     use crate::chain::genesis_block;
     use crate::consensus::TARGET_BLOCK_SECS;

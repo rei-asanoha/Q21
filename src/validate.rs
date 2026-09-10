@@ -129,6 +129,25 @@ pub enum ValidationError {
     },
 }
 
+impl ValidationError {
+    /// Le refus vient-il de **ce binaire**, qui ne sait pas verifier le
+    /// schema, et non du bloc ?
+    ///
+    /// `SchemaNonDisponible` ne vise qu'un schema **connu** du protocole,
+    /// absent de cette compilation (`--no-default-features`). Un identifiant
+    /// inconnu ne passe pas le decodage et reste une faute de l'emetteur.
+    /// Quand cette fonction repond, personne n'a menti et rien ne doit etre
+    /// sanctionne ni coupe : c'est le logiciel qui n'est pas equipe pour
+    /// juger. Le binaire refuse d'ailleurs de demarrer dans cet etat hors du
+    /// reseau de regression ; ceci est la ceinture par-dessus les bretelles.
+    pub fn incapacite_locale(&self) -> Option<SchemeId> {
+        match self {
+            ValidationError::Signature(VerifyError::SchemaNonDisponible(s)) => Some(*s),
+            _ => None,
+        }
+    }
+}
+
 impl From<BlockError> for ValidationError {
     fn from(e: BlockError) -> Self {
         ValidationError::Structure(e)

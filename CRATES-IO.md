@@ -100,8 +100,10 @@ compilation hors ligne côté développement. Sur une machine ayant accès à
 crates.io, il n'y a rien à configurer :
 
 ```bash
-cargo test  --features mldsa
-cargo build --release --features mldsa
+cargo test
+cargo build --release
 ```
+
+ML-DSA est dans les features par défaut ; `--features mldsa` reste accepté.
 
 Cargo télécharge `ml-dsa` 0.1.1 et ses dépendances lui-même.
