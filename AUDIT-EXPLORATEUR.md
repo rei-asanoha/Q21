@@ -2,7 +2,7 @@
 
 Mené avant toute mise en ligne, contre un nœud réel en mode public — chaîne de
 1 224 blocs, index d'adresses actif, port de bouclage, nom déclaré
-`explorateur.q21.dev`.
+`explorateur.example.org`.
 
 La question posée était unique et non négociable : **un visiteur peut-il faire
 autre chose que lire ?**
@@ -19,7 +19,7 @@ d'exister, et un rendait le service trivialement inutilisable.
 
 ### 1 · La page du portefeuille était servie publiquement — corrigé
 
-`https://explorateur.q21.dev/portefeuille` rendait **200** et affichait
+`https://explorateur.example.org/portefeuille` rendait **200** et affichait
 l'interface complète du portefeuille Q21.
 
 Elle ne pouvait rien déplacer : le nœud publié n'a pas de portefeuille, et
@@ -46,7 +46,7 @@ un refus, `400`.
 
 ### 3 · Un `Host` en double passait selon l'ordre — corrigé
 
-`Host: evil.example` suivi de `Host: explorateur.q21.dev` était **accepté** : la
+`Host: evil.example` suivi de `Host: explorateur.example.org` était **accepté** : la
 table conserve la dernière valeur, alors qu'un intermédiaire lit la première.
 Deux machines qui ne lisent pas la même valeur pour le même champ, c'est
 exactement ce qu'exploite la contrebande de requêtes.
@@ -102,11 +102,11 @@ un portefeuille est servi**, avec un message qui dit comment faire autrement.
 ### La reliaison DNS
 
 Sept en-têtes `Host` hostiles, sept refus — dont
-`explorateur.q21.dev.evil.example`, le genre de sous-chaîne qui trompe une
+`explorateur.example.org.evil.example`, le genre de sous-chaîne qui trompe une
 comparaison paresseuse.
 
 Cinq origines tierces, cinq refus — dont `null`,
-`https://evil.example/#explorateur.q21.dev`, et l'origine **en clair** du nom
+`https://evil.example/#explorateur.example.org`, et l'origine **en clair** du nom
 légitime.
 
 ### Les chemins
@@ -161,7 +161,7 @@ Déjà en place, et vérifiés : `Content-Security-Policy: default-src 'none'`,
 
 ### La confiance dans le mandataire
 
-`X-Forwarded-Host: explorateur.q21.dev` avec `Host: evil.example` est **refusé**.
+`X-Forwarded-Host: explorateur.example.org` avec `Host: evil.example` est **refusé**.
 Le nœud ne fait confiance à aucun en-tête réécrit — ce qui est la bonne règle
 quand le mandataire est le seul à pouvoir en poser.
 

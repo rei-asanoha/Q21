@@ -4702,7 +4702,7 @@ fn servir(
         // une raison de la servir.
         //
         // Un audit d'intrusion l'a releve avant la mise en ligne : un visiteur
-        // qui tombe sur `https://explorateur.q21.dev/portefeuille` voit une
+        // qui tombe sur `https://explorateur.example.org/portefeuille` voit une
         // interface de portefeuille Q21 authentique, servie par le domaine
         // officiel du projet. C'est le decor exact d'un hameconnage — sauf
         // qu'ici c'est nous qui le montons, et qu'il habitue les gens a saisir

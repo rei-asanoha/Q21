@@ -935,8 +935,8 @@ fn garde_navigateur(
 /// L'hote declare par l'exploitant pour un service public, port compris ou non.
 ///
 /// La comparaison est insensible a la casse — un nom de domaine l'est — et
-/// exacte sur le reste : `q21.dev.evil.example` ne doit pas passer pour
-/// `q21.dev`, et c'est le genre de sous-chaine qui trompe une comparaison
+/// exacte sur le reste : `example.org.evil.example` ne doit pas passer pour
+/// `example.org`, et c'est le genre de sous-chaine qui trompe une comparaison
 /// paresseuse.
 fn hote_declare(host: &str, declare: Option<&str>) -> bool {
     let Some(d) = declare else { return false };
@@ -1092,7 +1092,7 @@ fn lire_requete(flux: &TcpStream, echeance: std::time::Instant) -> Result<Reques
             // --- Un `Host` en double n'est jamais une maladresse.
             //
             // La table conserve la derniere valeur : `Host: evil.example` suivi
-            // de `Host: explorateur.q21.dev` passait donc la garde, alors que le
+            // de `Host: explorateur.example.org` passait donc la garde, alors que le
             // premier `Host` est celui qu'un intermediaire aura lu. Deux
             // machines qui ne lisent pas la meme valeur pour le meme champ,
             // c'est la definition de la contrebande de requetes.
@@ -1416,7 +1416,7 @@ mod tests {
     /// exige. Et le binaire refuse de combiner ce mode avec un portefeuille.
     #[test]
     fn le_mode_public_n_accepte_que_le_nom_declare() {
-        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+        let h = serve_public_web("127.0.0.1:0", "explorateur.example.org".to_string(), echo())
             .expect("demarrage");
 
         let avec = |entetes: &str| {
@@ -1432,9 +1432,9 @@ mod tests {
 
         // 1. Le nom declare passe, avec ou sans port, quelle que soit la casse.
         for hote in [
-            "explorateur.q21.dev",
-            "explorateur.q21.dev:443",
-            "Explorateur.Q21.Dev",
+            "explorateur.example.org",
+            "explorateur.example.org:443",
+            "Explorateur.Example.Org",
         ] {
             let r = avec(&format!("Host: {hote}\r\n"));
             assert!(r.starts_with("HTTP/1.1 200"), "{hote} doit passer : {r}");
@@ -1448,12 +1448,12 @@ mod tests {
         );
 
         // 3. Un autre nom est refuse. Et surtout : un nom qui **contient** le
-        //    notre ne passe pas. `explorateur.q21.dev.evil.example` est le
+        //    notre ne passe pas. `explorateur.example.org.evil.example` est le
         //    genre de chaine qui trompe une comparaison paresseuse.
         for hote in [
             "evil.example",
-            "explorateur.q21.dev.evil.example",
-            "q21.dev",
+            "explorateur.example.org.evil.example",
+            "example.org",
         ] {
             let r = avec(&format!("Host: {hote}\r\n"));
             assert!(
@@ -1464,19 +1464,19 @@ mod tests {
 
         // 4. L'origine declaree passe — la page de l'explorateur est servie par
         //    ce nom — mais une origine tierce reste refusee.
-        let r = avec("Host: explorateur.q21.dev\r\nOrigin: https://explorateur.q21.dev\r\n");
+        let r = avec("Host: explorateur.example.org\r\nOrigin: https://explorateur.example.org\r\n");
         assert!(
             r.starts_with("HTTP/1.1 200"),
             "l'origine declaree doit passer : {r}"
         );
-        let r = avec("Host: explorateur.q21.dev\r\nOrigin: https://evil.example\r\n");
+        let r = avec("Host: explorateur.example.org\r\nOrigin: https://evil.example\r\n");
         assert!(
             r.starts_with("HTTP/1.1 403"),
             "une origine tierce doit etre refusee : {r}"
         );
         // En clair, non : le service public est derriere un mandataire qui
         // termine le chiffrement.
-        let r = avec("Host: explorateur.q21.dev\r\nOrigin: http://explorateur.q21.dev\r\n");
+        let r = avec("Host: explorateur.example.org\r\nOrigin: http://explorateur.example.org\r\n");
         assert!(
             r.starts_with("HTTP/1.1 403"),
             "une origine en clair doit etre refusee : {r}"
@@ -1488,17 +1488,17 @@ mod tests {
     /// Un `Host` en double est refuse, quel que soit l'ordre.
     ///
     /// La table des en-tetes conserve la derniere valeur. `Host: evil.example`
-    /// suivi de `Host: explorateur.q21.dev` passait donc la garde, alors qu'un
+    /// suivi de `Host: explorateur.example.org` passait donc la garde, alors qu'un
     /// intermediaire aurait lu le premier. Deux machines qui ne lisent pas la
     /// meme valeur pour le meme champ, c'est la definition de la contrebande de
     /// requetes. Releve par l'audit d'intrusion avant la mise en ligne.
     #[test]
     fn un_host_en_double_est_refuse_dans_les_deux_ordres() {
-        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+        let h = serve_public_web("127.0.0.1:0", "explorateur.example.org".to_string(), echo())
             .expect("demarrage");
         for (a, b) in [
-            ("evil.example", "explorateur.q21.dev"),
-            ("explorateur.q21.dev", "evil.example"),
+            ("evil.example", "explorateur.example.org"),
+            ("explorateur.example.org", "evil.example"),
         ] {
             let r = requete(
                 h.addr,
@@ -1519,7 +1519,7 @@ mod tests {
     /// Un service publie ne repond que sous son nom : sans `Host`, il refuse.
     #[test]
     fn le_mode_public_exige_un_host() {
-        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+        let h = serve_public_web("127.0.0.1:0", "explorateur.example.org".to_string(), echo())
             .expect("demarrage");
         let r = requete(
             h.addr,
@@ -1542,7 +1542,7 @@ mod tests {
     /// mandataire est fait pour ca ; le refus est ici plutot que dans une note.
     #[test]
     fn le_mode_public_refuse_d_ecouter_hors_de_la_boucle_locale() {
-        let r = serve_public_web("0.0.0.0:0", "explorateur.q21.dev".to_string(), echo());
+        let r = serve_public_web("0.0.0.0:0", "explorateur.example.org".to_string(), echo());
         assert!(
             matches!(r, Err(HttpError::ExpositionSansJeton(_))),
             "un mode public expose directement doit etre refuse"
@@ -1575,11 +1575,11 @@ mod tests {
     /// Le mode public n'assouplit pas le `Content-Type`.
     #[test]
     fn le_mode_public_exige_toujours_du_json() {
-        let h = serve_public_web("127.0.0.1:0", "explorateur.q21.dev".to_string(), echo())
+        let h = serve_public_web("127.0.0.1:0", "explorateur.example.org".to_string(), echo())
             .expect("demarrage");
         let r = requete(
             h.addr,
-            "POST /rpc HTTP/1.1\r\nHost: explorateur.q21.dev\r\n\
+            "POST /rpc HTTP/1.1\r\nHost: explorateur.example.org\r\n\
              Content-Type: text/plain\r\nContent-Length: 2\r\n\
              Connection: close\r\n\r\n{}",
         );
