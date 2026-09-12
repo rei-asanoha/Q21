@@ -1,7 +1,13 @@
 # Publier l'explorateur de chaîne, en HTTPS
 
-Pour rendre `explorateur.q21.dev` consultable par n'importe qui, depuis n'importe
+Pour rendre `explorateur.example.org` consultable par n'importe qui, depuis n'importe
 quel navigateur, avec un certificat obtenu et renouvelé tout seul.
+
+> 📌 **`example.org` est un exemple**, réservé à cet usage par la norme et qui
+> ne mène nulle part. Partout dans ce guide, remplacez-le par votre propre
+> domaine. Le guide ne nomme aucun domaine réel : un nom inscrit dans une
+> documentation publique devient une dépendance permanente envers celui qui le
+> tient.
 
 Comptez **une heure et demie**, sans se presser. Aucun coût supplémentaire : le
 serveur et le domaine existent déjà, et le certificat est gratuit.
@@ -52,7 +58,7 @@ l'étape 1, et c'est une protection que la plupart des sites n'ont pas.
 ### Le nom devient public, définitivement
 
 Tout certificat émis est inscrit dans les **journaux publics de transparence**.
-Dès la première émission, `explorateur.q21.dev` est connu du monde entier et le
+Dès la première émission, `explorateur.example.org` est connu du monde entier et le
 restera. Ce n'est pas un défaut — c'est ce qui permet de détecter un certificat
 frauduleux — mais il faut le savoir : **il n'y a pas de sous-domaine discret**.
 
@@ -189,7 +195,7 @@ sudo systemctl start q21 && sudo systemctl status q21
 
 # Étape 1 — Le nom de domaine, et qui a le droit de le certifier
 
-Dans l'espace client OVH : **Web Cloud** → **Noms de domaine** → `q21.dev` →
+Dans l'espace client OVH : **Web Cloud** → **Noms de domaine** → `example.org` →
 onglet **Zone DNS**.
 
 ### 1.1 — L'adresse de l'explorateur
@@ -211,7 +217,7 @@ Toujours **Ajouter une entrée**, type **CAA**, **deux fois** :
 | *(laisser vide)* | `0` | `issue` | `letsencrypt.org` |
 | *(laisser vide)* | `0` | `issue` | `sectigo.com` |
 
-Sous-domaine vide = la règle vaut pour `q21.dev` **et tous ses sous-domaines**.
+Sous-domaine vide = la règle vaut pour `example.org` **et tous ses sous-domaines**.
 
 Ces deux lignes disent : *seules ces deux autorités peuvent émettre un
 certificat pour ce domaine.* Toute autre demande sera refusée par l'autorité
@@ -227,13 +233,13 @@ rabat sur la seconde en cas d'incident.
 Dans une **FENÊTRE PC** :
 
 ```powershell
-Resolve-DnsName explorateur.q21.dev -Type A
+Resolve-DnsName explorateur.example.org -Type A
 ```
 
 La colonne `IPAddress` doit afficher **`ADRESSE-IPV4-DU-SERVEUR`**.
 
 ```powershell
-Resolve-DnsName q21.dev -Type CAA
+Resolve-DnsName example.org -Type CAA
 ```
 
 Vous devez voir vos deux autorités.
@@ -287,7 +293,7 @@ Trouvez la ligne qui commence par `ExecStart=` et remplacez-la **entièrement**
 par celle-ci — c'est la seule modification du fichier :
 
 ```ini
-ExecStart=/opt/q21/q21 --datadir /opt/q21/donnees node --reseau testnet --listen 21121 --sans-amorces --index-adresses --rpc 127.0.0.1:21080 --rpc-public explorateur.q21.dev
+ExecStart=/opt/q21/q21 --datadir /opt/q21/donnees node --reseau testnet --listen 21121 --sans-amorces --index-adresses --rpc 127.0.0.1:21080 --rpc-public explorateur.example.org
 ```
 
 Trois ajouts, et rien d'autre :
@@ -297,7 +303,7 @@ Trois ajouts, et rien d'autre :
 - **`--rpc 127.0.0.1:21080`** sert la page et l'API **sur la boucle locale
   uniquement**. Personne ne peut l'atteindre directement, et le programme
   refuserait d'écouter ailleurs en mode public.
-- **`--rpc-public explorateur.q21.dev`** déclare le nom sous lequel le nœud
+- **`--rpc-public explorateur.example.org`** déclare le nom sous lequel le nœud
   accepte d'être joint à travers le portier.
 
 **Ctrl + O**, **Entrée**, **Ctrl + X**. Puis :
@@ -315,7 +321,7 @@ sudo systemctl status q21
 Vérifiez que la page se sert bien en local :
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:21080/ -H "Host: explorateur.q21.dev"
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:21080/ -H "Host: explorateur.example.org"
 ```
 
 Doit afficher **`200`**.
@@ -323,7 +329,7 @@ Doit afficher **`200`**.
 Et vérifiez que la page de portefeuille est bien absente :
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:21080/portefeuille -H "Host: explorateur.q21.dev"
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:21080/portefeuille -H "Host: explorateur.example.org"
 ```
 
 Doit afficher **`404`**. C'est voulu : un explorateur public n'a pas à montrer
@@ -387,7 +393,7 @@ l'écran soit vide — puis collez exactement ceci (**clic droit** pour coller) 
 	}
 }
 
-explorateur.q21.dev {
+explorateur.example.org {
 	log {
 		output discard
 	}
@@ -529,7 +535,7 @@ donner dans le bloc global, puis la poser dans le site :
 	}
 }
 
-explorateur.q21.dev {
+explorateur.example.org {
 	rate_limit {
 		zone visiteurs {
 			key    {client_ip}
@@ -585,7 +591,7 @@ portier, et par personne d'autre.
 
 ### 5.1 — Le plus simple
 
-Ouvrez **https://explorateur.q21.dev** dans votre navigateur.
+Ouvrez **https://explorateur.example.org** dans votre navigateur.
 
 Vous devez voir la hauteur de la chaîne, les derniers blocs, l'émission — et
 **un cadenas** dans la barre d'adresse. Essayez la recherche : une hauteur de
@@ -596,13 +602,13 @@ bloc, un identifiant de transaction, une de vos adresses.
 Dans une **FENÊTRE PC** :
 
 ```powershell
-Invoke-WebRequest https://explorateur.q21.dev -UseBasicParsing | Select-Object StatusCode
+Invoke-WebRequest https://explorateur.example.org -UseBasicParsing | Select-Object StatusCode
 ```
 
 Doit afficher **200**.
 
 ```powershell
-(Invoke-WebRequest https://explorateur.q21.dev -UseBasicParsing).Headers | Format-List
+(Invoke-WebRequest https://explorateur.example.org -UseBasicParsing).Headers | Format-List
 ```
 
 Vous devez y lire `Strict-Transport-Security`, `Content-Security-Policy`,
@@ -611,12 +617,12 @@ Vous devez y lire `Strict-Transport-Security`, `Content-Security-Policy`,
 Et la version en clair doit renvoyer vers la version chiffrée :
 
 ```powershell
-curl.exe -sI http://explorateur.q21.dev | Select-String "301|Location"
+curl.exe -sI http://explorateur.example.org | Select-String "301|Location"
 ```
 
 ### 5.3 — La poignée de main post-quantique
 
-Dans **Chrome ou Edge**, sur `https://explorateur.q21.dev` :
+Dans **Chrome ou Edge**, sur `https://explorateur.example.org` :
 
 1. **F12** pour ouvrir les outils de développement.
 2. Onglet **Security** (ou **Sécurité**).
@@ -632,7 +638,7 @@ amélioré par une mise à jour du portier.
 ### 5.4 — Le contrôle indépendant
 
 Allez sur **ssllabs.com/ssltest** et demandez l'analyse de
-`explorateur.q21.dev`. Comptez deux minutes. Une note **A** ou **A+** est
+`explorateur.example.org`. Comptez deux minutes. Une note **A** ou **A+** est
 attendue.
 
 C'est un avis extérieur, produit par des gens dont c'est le métier. Il vaut
@@ -646,20 +652,20 @@ Trois commandes dans une **FENÊTRE PC**. Ce sont des extraits de l'audit
 d'intrusion : vous les rejouez sur votre propre serveur.
 
 ```powershell
-curl.exe -s -o NUL -w "%{http_code}`n" https://explorateur.q21.dev/portefeuille
+curl.exe -s -o NUL -w "%{http_code}`n" https://explorateur.example.org/portefeuille
 ```
 
 → **404** attendu. Pas d'interface de portefeuille sur le domaine public.
 
 ```powershell
-curl.exe -s -X POST https://explorateur.q21.dev/rpc -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"arreter\"}"
+curl.exe -s -X POST https://explorateur.example.org/rpc -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"arreter\"}"
 ```
 
 → **`methodes de portefeuille desactivees`** attendu. Personne ne peut arrêter
 votre serveur à distance.
 
 ```powershell
-curl.exe -s -X POST https://explorateur.q21.dev/rpc -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getinfo\"}"
+curl.exe -s -X POST https://explorateur.example.org/rpc -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getinfo\"}"
 ```
 
 → La hauteur de la chaîne. **La lecture, et rien d'autre.**
@@ -678,7 +684,7 @@ sudo journalctl -u q21 -f        # la chaîne, en direct
 Pour voir quand le certificat expire :
 
 ```bash
-echo | openssl s_client -connect explorateur.q21.dev:443 -servername explorateur.q21.dev 2>/dev/null | openssl x509 -noout -dates
+echo | openssl s_client -connect explorateur.example.org:443 -servername explorateur.example.org 2>/dev/null | openssl x509 -noout -dates
 ```
 
 Il se renouvelle seul, environ un mois avant l'échéance. **Vous n'avez rien à

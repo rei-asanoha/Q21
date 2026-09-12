@@ -209,15 +209,22 @@ Les points d'entrée qui tiennent sont inscrits dans le binaire lui-même —
 fraîchement téléchargé trouve le réseau **sans que personne ne tape quoi que ce
 soit**.
 
-**Le réseau d'essai est ouvert depuis le 29 août 2026**, derrière un nom :
+**Aucun point d'entrée n'est compilé dans le binaire.** C'est un choix : un nom
+gravé dans le code est une dépendance permanente envers celui qui le tient, et
+un protocole censé survivre à son auteur ne doit pas naître avec l'adresse de
+son auteur dedans.
+
+Le point d'entrée se fournit donc à l'exécution, de deux façons :
 
 ```
-amorce.q21.dev
+q21 node --amorce <hôte>          # une fois, en ligne de commande
+echo <hôte> >> <datadir>/amorces.txt   # durablement
 ```
 
-Un nom, et non une adresse IP : une adresse est attachée à une machine, et un
+Un nom plutôt qu'une adresse IP : une adresse est attachée à une machine, et un
 binaire distribué ne se met pas à jour quand elle change. Un nom se repointe en
-une minute, sans rien redistribuer.
+une minute, sans rien redistribuer. Le nom du réseau à rejoindre est annoncé
+avec chaque livraison.
 
 La règle d'inscription ne bouge pas : **on n'écrit ici que ce qui répond
 vraiment**, vérifié depuis une machine extérieure, poignée de main comprise.

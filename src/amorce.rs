@@ -63,11 +63,21 @@ pub fn port_par_defaut(n: Network) -> u16 {
 ///
 /// # Etat des listes
 ///
-/// - **Testnet** : ouvert. `amorce.q21.dev` repond depuis le 29 aout 2026 ; le
-///   nom a ete verifie avant d'etre inscrit ici, poignee de main comprise.
-/// - **Mainnet** : vide, et il le reste tant que le reseau principal n'existe
-///   pas. Annoncer un nom qui ne repond pas serait pire que rien : chaque
-///   demarrage attendrait une reponse qui ne vient jamais.
+/// - **Toutes les listes sont vides**, et c'est un choix, pas un oubli.
+///
+///   Un nom inscrit ici est compile dans chaque binaire distribue : il devient
+///   le point d'entree que tout nouveau venu interroge, donc une dependance
+///   permanente envers celui qui tient ce nom. Un protocole cense survivre a
+///   son auteur ne doit pas naitre avec l'adresse de son auteur gravee dedans.
+///
+///   Le point d'entree se fournit donc a l'execution : `amorces.txt` dans le
+///   repertoire de donnees, ou `--amorce <hote>`. Les guides d'installation
+///   donnent le nom du reseau a rejoindre, et il se change sans recompiler ni
+///   rien redistribuer.
+///
+///   Le jour ou le projet possede un nom qui lui appartient en propre — a lui,
+///   pas a une personne —, c'est ici qu'il s'inscrit, apres avoir ete verifie
+///   (resolution et poignee de main depuis une machine exterieure).
 /// - **Regtest** : vide par nature — un reseau de regression est local, il
 ///   n'a personne a rejoindre.
 ///
@@ -78,7 +88,7 @@ pub fn port_par_defaut(n: Network) -> u16 {
 pub fn amorces_integrees(n: Network) -> &'static [&'static str] {
     match n {
         Network::Mainnet => &[],
-        Network::Testnet => &["amorce.q21.dev"],
+        Network::Testnet => &[],
         Network::Regtest => &[],
     }
 }
@@ -267,21 +277,24 @@ mod tests {
     /// Il a ete verifie (poignee de main et `pairs 1` depuis une machine
     /// exterieure) avant d'etre inscrit.
     ///
-    /// Elle garde desormais l'invariant qui reste vrai : on n'annonce un point
-    /// d'entree que pour un reseau qui existe.
+    /// Elle garde desormais l'invariant qui compte : **aucun nom de domaine
+    /// n'est compile dans le binaire**.
+    ///
+    /// Un point d'entree grave dans le code est une dependance permanente
+    /// envers celui qui tient ce nom, et il expose son proprietaire a chaque
+    /// utilisateur qui le resout. Le point d'entree se fournit a l'execution
+    /// (`amorces.txt`, `--amorce`). Cette epreuve tombera le jour ou le projet
+    /// inscrira un nom qui lui appartient en propre : ce sera alors un choix
+    /// assume, a faire en connaissance de cause, pas un residu.
     #[test]
-    fn on_n_annonce_que_les_reseaux_ouverts() {
-        for r in [Network::Mainnet, Network::Regtest] {
+    fn aucun_domaine_n_est_compile_dans_le_binaire() {
+        for r in [Network::Mainnet, Network::Testnet, Network::Regtest] {
             assert!(
                 amorces_integrees(r).is_empty(),
-                "des amorces sont annoncees pour {r:?}, qui n'est pas ouvert"
+                "un point d'entree est grave dans le binaire pour {r:?} : {:?}",
+                amorces_integrees(r)
             );
         }
-        let t = amorces_integrees(Network::Testnet);
-        assert!(
-            !t.is_empty(),
-            "le reseau d'essai est ouvert : il doit avoir un point d'entree"
-        );
     }
 
     /// Chaque amorce integree doit etre une cible que `resoudre` sait lire.
