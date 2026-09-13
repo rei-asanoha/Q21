@@ -114,24 +114,75 @@ jobs:
       # On ne livre pas un binaire dont les epreuves n'ont pas ete passees sur
       # cette plateforme. Un portefeuille qui perd des fonds sous Windows
       # seulement est un portefeuille qui perd des fonds.
+      # Sans argument `--test` : toutes les epreuves du depot, y compris
+      # celles ajoutees apres l'ecriture de ce fichier. L'enumeration qui
+      # figurait ici avait laisse cinq fichiers d'epreuves hors CI.
       - name: Epreuves
-        run: |
-          cargo test --locked --features mldsa,audit --lib
-          cargo test --locked --features mldsa,audit --test regression_securite
-          cargo test --locked --features mldsa,audit --test regression_reseau
-          cargo test --locked --features mldsa,audit --test regression_phase8b
-          cargo test --locked --features mldsa,audit --test audit_persistance
-          cargo test --locked --features mldsa,audit --test audit_rpc
-          cargo test --locked --features mldsa,audit --test integration
-          cargo test --locked --features mldsa,audit --test audit_arith
-          cargo test --locked --features mldsa,audit --test audit_mempool
-          cargo test --locked --features mldsa,audit --test audit_muhash
-          cargo test --locked --features mldsa,audit --test audit_synchro_rapide
-          cargo test --locked --features mldsa,audit --test fuzz_decodeurs
-          cargo test --locked --features mldsa,audit --test audit_difficulte
+        run: cargo test --locked --features mldsa,audit
 
-      - name: Compilation
-        run: cargo build --locked --release --features mldsa --target ${{ matrix.cible }}
+      # Compilation reproductible. Le remappage de chemin retire du binaire le
+      # repertoire ou il a ete construit — ici `/home/runner/work/<depot>/<depot>`,
+      # qui porte le nom du proprietaire du depot et ne doit pas finir dans un
+      # fichier publie. Surtout, il rend le binaire identique quel que soit le
+      # repertoire : une tierce personne qui recompile ce commit chez elle
+      # obtient le meme condensat SHA-256 et n'a a croire personne.
+      #
+      # `trim-paths` ferait cela dans `Cargo.toml`, mais il n'est pas stabilise
+      # dans Cargo 1.95.0 (voir le commentaire du profil `release`).
+      #
+      # La meme commande a la main : `./outils/construire-reproductible.sh`.
+      # Voir REPRODUIRE.md.
+      #
+      # Windows demande un detour : rustc y recoit des chemins a
+      # contre-oblique (`D:\a\depot\depot`), tandis que `pwd` sous git bash
+      # rend `/d/a/depot/depot`. On passe les deux formes — le drapeau accepte
+      # d'etre repete, et une forme qui ne correspond a rien ne coute rien.
+      - name: Compilation reproductible
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            RACINE=$(pwd -W)                                  # D:/a/depot/depot
+            RACINE_ANTI=$(printf '%s' "$RACINE" | tr '/' '\\')  # D:\a\depot\depot
+            DRAPEAUX="--remap-path-prefix=$RACINE_ANTI=/q21 --remap-path-prefix=$RACINE=/q21"
+          else
+            RACINE=$(pwd -P)
+            DRAPEAUX="--remap-path-prefix=$RACINE=/q21"
+          fi
+          echo "remappage : $DRAPEAUX"
+          RUSTFLAGS="$DRAPEAUX" \
+            cargo build --locked --release --features mldsa --target ${{ matrix.cible }}
+
+      # Un binaire livre ne doit plus contenir le chemin de la machine qui l'a
+      # construit. Si le remappage a echoue en silence — un `RUSTFLAGS` pose
+      # ailleurs, un chemin non canonique, une forme de separateur imprevue —
+      # on le voit ici et la livraison s'arrete, au lieu de publier un fichier
+      # que personne ne pourra reproduire.
+      #
+      # `grep -a` traite le binaire comme du texte ; c'est present sur les
+      # trois systemes, contrairement a `strings` sous Windows.
+      - name: Aucun chemin de construction dans le binaire
+        shell: bash
+        run: |
+          set -eu
+          BIN="target/${{ matrix.cible }}/release/${{ matrix.binaire }}"
+          ECHEC=0
+          for FORME in "$(pwd -P)" "$(pwd)"; do
+            [ -n "$FORME" ] || continue
+            if grep -a -c -F -- "$FORME" "$BIN" >/dev/null 2>&1; then
+              echo "::error::le chemin « $FORME » est inscrit dans $BIN ; le remappage n'a pas pris"
+              ECHEC=1
+            fi
+          done
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            FORME=$(pwd -W | tr '/' '\\')
+            if grep -a -c -F -- "$FORME" "$BIN" >/dev/null 2>&1; then
+              echo "::error::le chemin « $FORME » est inscrit dans $BIN ; le remappage n'a pas pris"
+              ECHEC=1
+            fi
+          fi
+          [ "$ECHEC" -eq 0 ] || exit 1
+          echo "aucun chemin de construction dans $BIN"
 
       - name: Assemblage
         shell: bash

@@ -3684,13 +3684,19 @@ mod tests {
         let sans_corps = Chain::from_snapshot(RESEAU, instantane, &entetes)
             .expect("reprise")
             .chain;
-        assert!(sans_corps.block_at(1).is_none(), "les corps doivent manquer");
+        assert!(
+            sans_corps.block_at(1).is_none(),
+            "les corps doivent manquer"
+        );
         let restaure = restaurer(&sans_corps);
         let c = contexte(sans_corps, restaure);
         let r = appel(
             &c,
             "sendtoaddress",
-            &format!(r#"{{"adresse":"{}","unites":50000}}"#, dest.to_string_bech32()),
+            &format!(
+                r#"{{"adresse":"{}","unites":50000}}"#,
+                dest.to_string_bech32()
+            ),
         );
         let message = r
             .get("error")
@@ -3724,8 +3730,15 @@ mod tests {
             ),
         );
         let w = c.wallet.as_ref().unwrap().lock().unwrap();
-        assert_eq!(w.verifie_jusqu_a(), c.node.height(), "la chaine est rattrapee");
-        assert!(w.est_consomme(0), "la clef 0, revelee dans un bloc, doit etre consommee");
+        assert_eq!(
+            w.verifie_jusqu_a(),
+            c.node.height(),
+            "la chaine est rattrapee"
+        );
+        assert!(
+            w.est_consomme(0),
+            "la clef 0, revelee dans un bloc, doit etre consommee"
+        );
         drop(w);
         let message = r
             .get("error")
@@ -3749,7 +3762,10 @@ mod tests {
         let envoi = resultat(
             &c,
             "sendtoaddress",
-            &format!(r#"{{"adresse":"{}","unites":50000}}"#, dest.to_string_bech32()),
+            &format!(
+                r#"{{"adresse":"{}","unites":50000}}"#,
+                dest.to_string_bech32()
+            ),
         );
         assert!(envoi.get("txid").is_some());
         let resigne = c.node.with_mempool(|m| {

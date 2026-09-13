@@ -110,7 +110,8 @@ fn un_enfant_peut_suivre_son_parent_dans_le_meme_bloc() {
     let enfant = tx_signee(&[p_out], vec![sortie(20_000, h3)]);
     let b = miner_avec(&c, &[p.clone(), enfant.clone()]);
     let t = b.header.time + 1;
-    c.connect(&b, t).expect("la chaine parent -> enfant est valide dans un seul bloc");
+    c.connect(&b, t)
+        .expect("la chaine parent -> enfant est valide dans un seul bloc");
     // La sortie de P est consommee, celle de C existe.
     assert!(c.utxo.get(&p_out.0).is_none());
     assert!(c

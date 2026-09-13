@@ -59,24 +59,17 @@ jobs:
       - name: Compilation
         run: cargo build --locked --features mldsa
 
-      - name: Epreuves de la bibliotheque
-        run: cargo test --locked --features mldsa,audit --lib
-
-      # Les epreuves qui doivent passer : chacune verrouille une correction.
-      - name: Non-regression
-        run: |
-          cargo test --locked --features mldsa,audit --test regression_securite
-          cargo test --locked --features mldsa,audit --test regression_reseau
-          cargo test --locked --features mldsa,audit --test regression_phase8b
-          cargo test --locked --features mldsa,audit --test audit_persistance
-          cargo test --locked --features mldsa,audit --test audit_rpc
-          cargo test --locked --features mldsa,audit --test integration
-          cargo test --locked --features mldsa,audit --test audit_arith
-          cargo test --locked --features mldsa,audit --test audit_mempool
-          cargo test --locked --features mldsa,audit --test audit_muhash
-          cargo test --locked --features mldsa,audit --test audit_synchro_rapide
-          cargo test --locked --features mldsa,audit --test fuzz_decodeurs
-          cargo test --locked --features mldsa,audit --test audit_difficulte
+      # Toutes les epreuves, sans enumeration.
+      #
+      # Cette etape enumerait les fichiers un par un. Le piege est mecanique :
+      # un fichier d'epreuves ajoute au depot et oublie dans cette liste
+      # n'est jamais execute en integration, et une epreuve qui ne tourne pas
+      # est une decoration. Cinq fichiers etaient dans ce cas —
+      # `regression_chainage`, les trois `*audit2*` / `*audit_v2*`, et
+      # `regression_reproductible`. Sans argument `--test`, cargo passe tout
+      # ce qui existe, aujourd'hui et demain.
+      - name: Epreuves
+        run: cargo test --locked --features mldsa,audit
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --features mldsa,audit
@@ -137,3 +130,43 @@ jobs:
             exit 1
           fi
           echo "vendor/ est identique a crates.io, fichier pour fichier."
+
+  # Compilation reproductible : deux repertoires, un condensat.
+  #
+  # # Ce que ce travail garde
+  #
+  # Le condensat SHA-256 publie avec un binaire ne prouve que le transport :
+  # il est produit sur la meme machine que le fichier, publie au meme endroit,
+  # et remplace avec lui par quiconque prend la main sur le depot. La seule
+  # preuve qu'un binaire vient bien de sources publiques est qu'une tierce
+  # personne puisse le **recompiler a l'identique** et retrouver le meme
+  # condensat. Pour cela, la compilation ne doit dependre d'aucune variable
+  # locale — et la premiere de ces variables est le repertoire de travail,
+  # que rustc inscrit dans le binaire pour les messages de panique.
+  #
+  # Ce travail compile le meme commit dans deux repertoires de longueur et de
+  # profondeur differentes, sans cache partage, et exige l'egalite des deux
+  # condensats. S'ils divergent, la reproductibilite est cassee et la fusion
+  # s'arrete — avant qu'une livraison non verifiable ne soit publiee.
+  #
+  # C'est la propriete que Bitcoin Core obtient par Guix, et la condition de
+  # tout le reste : sans elle, le depot d'attestations n'a rien a attester.
+  # Voir REPRODUIRE.md.
+  reproductible:
+    name: Compilation reproductible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Chaine d'outils
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup default 1.95.0
+          rustc --version
+      # Volontairement sans cache : un cache partage entre les deux
+      # compilations reutiliserait des artefacts portant l'ancien chemin et
+      # ferait passer la preuve pour de mauvaises raisons.
+      - name: Deux compilations, deux repertoires
+        shell: bash
+        run: ./outils/verifier-reproductible.sh

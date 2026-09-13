@@ -991,9 +991,16 @@ mod tests {
         let echec = PAGE
             .find("} catch (e) {}\n  const garde = jetonRange();\n  if (garde) jeton = garde;\n}")
             .expect("reprise apres un echange echoue");
-        assert!(echec > PAGE.find("async function echangerAmorce(").expect("echange"));
         assert!(
-            PAGE.contains("if (r.status === 401){\n    oublierJeton();\n    await demanderJeton();"),
+            echec
+                > PAGE
+                    .find("async function echangerAmorce(")
+                    .expect("echange")
+        );
+        assert!(
+            PAGE.contains(
+                "if (r.status === 401){\n    oublierJeton();\n    await demanderJeton();"
+            ),
             "un 401 doit effacer le jeton range avant de le redemander"
         );
         for interdit in ["indexedDB.open", "document.cookie ="] {

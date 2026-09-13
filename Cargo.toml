@@ -84,6 +84,15 @@ audit = []
 overflow-checks = true   # jamais de wraparound silencieux dans du code monetaire
 panic = "abort"
 
+# Compilation reproductible : voir `.cargo/config.toml`, section
+# `[build] rustflags`, et REPRODUIRE.md. Le reglage `trim-paths` du profil
+# ferait le travail en une ligne, mais il n'est pas stabilise dans Cargo
+# 1.95.0 — la chaine epinglee par `rust-toolchain.toml` le refuse :
+#
+#   feature `trim-paths` is required ... not stabilized in this version
+#
+# On emploie donc `--remap-path-prefix`, qui est stable depuis 2018.
+
 # La preuve de travail memory-hard fait 33 condensats par tentative. Non
 # optimise, un test qui mine deux cents blocs prend des minutes pour de mauvaises
 # raisons. On garde les controles de debordement : c'est du code monetaire.

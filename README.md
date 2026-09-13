@@ -391,6 +391,12 @@ AUDIT-2026.md    La chaîne face à l'état de l'art 2026 : où elle est devant,
                  où est le mur de la vitesse, et les axes classés par horizon
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 SIGNATURE.md     Signer chaque livraison, et vérifier avant d'installer
+REPRODUIRE.md    Recompiler le binaire et retrouver le condensat publié —
+                 la seule vérification qui ne demande de croire personne
+SUCCESSION.md    Ce qui arrive à Q21 sans son mainteneur : ce qui survit,
+                 comment on repart, et pourquoi il n'y a pas de clé maîtresse
+attestations/    Le dossier où plusieurs constructeurs déposent le condensat
+                 qu'ils ont obtenu — vide jusqu'à la première attestation
 DURCISSEMENT.md  La machine qui garde des Q21 : Raspberry, serveur, poste partagé
 livre-blanc/     Le livre blanc de référence, édition de septembre 2026 :
                  une page (anglais, français, japonais) et trois PDF
@@ -606,7 +612,24 @@ Trusted comment: Q21 main <empreinte du commit> -- Rei Asanoha
 C'est tout ce que ce nom garantit — une origine constante d'une livraison à la
 suivante. Il ne confère aucune autorité : Q21 n'a ni vote, ni conseil, ni clé
 d'arrêt, et aucune règle du protocole ne dépend de qui l'a écrite. Le jour où
-ce nom se tait, la chaîne continue sans lui.
+ce nom se tait, la chaîne continue sans lui — `SUCCESSION.md` dit exactement
+comment, et ce qui, en revanche, ne survivrait pas.
+
+Et cette clé n'est pas la vérification la plus forte : une clé volée signe un
+binaire piégé aussi bien qu'un binaire honnête. La vérification qui ne demande
+de croire personne est de **recompiler** et de retrouver le même condensat.
+Elle est possible parce que la compilation est reproductible, et vérifiée
+comme telle à chaque poussée :
+
+```bash
+./outils/construire-reproductible.sh    # puis comparer au condensat publié
+./outils/verifier-reproductible.sh      # deux répertoires, un seul condensat
+```
+
+Marche à suivre complète dans `REPRODUIRE.md`. Le dossier `attestations/`
+recueille ce que chaque constructeur indépendant obtient : tant qu'une seule
+personne compile, la reproductibilité est un outil disponible, pas une
+garantie acquise.
 
 ---
 

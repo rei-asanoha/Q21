@@ -22,10 +22,7 @@ fn q21() -> &'static str {
 }
 
 fn dossier(nom: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "q21-regression-v2-{nom}-{}",
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("q21-regression-v2-{nom}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
@@ -166,7 +163,8 @@ fn v2_le_temporaire_nait_restreint_et_le_dossier_est_prive() {
     use std::sync::Arc;
 
     let d = dossier("droits");
-    let phrase = std::env::temp_dir().join(format!("q21-regression-v2-phrase-{}", std::process::id()));
+    let phrase =
+        std::env::temp_dir().join(format!("q21-regression-v2-phrase-{}", std::process::id()));
     fichier_prive(&phrase, "phrase d'epreuve\n");
     let s = lancer(&d, &phrase, &["init", "regtest", "lamport"]);
     assert!(s.status.success(), "{}", String::from_utf8_lossy(&s.stderr));
@@ -180,8 +178,14 @@ fn v2_le_temporaire_nait_restreint_et_le_dossier_est_prive() {
     println!("dossier {m_dossier:o}  wallet.dat {m_wallet:o}  wallet.seq {m_seq:o}  addresses.dat {m_adr:o}");
     assert_eq!(m_wallet, 0o600);
     assert_eq!(m_seq, 0o600);
-    assert_eq!(m_adr, 0o600, "CONSTAT : addresses.dat est lisible par d'autres comptes");
-    assert_eq!(m_dossier, 0o700, "CONSTAT : le dossier est lisible par d'autres comptes");
+    assert_eq!(
+        m_adr, 0o600,
+        "CONSTAT : addresses.dat est lisible par d'autres comptes"
+    );
+    assert_eq!(
+        m_dossier, 0o700,
+        "CONSTAT : le dossier est lisible par d'autres comptes"
+    );
 
     let tmp = d.join("wallet.tmp");
     let fini = Arc::new(AtomicBool::new(false));
@@ -296,7 +300,10 @@ fn v3_un_portefeuille_substitue_est_refuse_en_nommant_la_cause() {
     );
     let mut etranger = Wallet::from_seed([0x77u8; 32], Network::Regtest);
     etranger.rescan(1);
-    assert_eq!(premiere_adresse(&s.stdout), etranger.new_address().to_string());
+    assert_eq!(
+        premiere_adresse(&s.stdout),
+        etranger.new_address().to_string()
+    );
 
     // 4. Le portefeuille legitime, remis en place, est refuse a son tour :
     //    le dossier appartient maintenant a la nouvelle graine.
@@ -404,8 +411,13 @@ fn v6_deux_signatures_ml_dsa_du_meme_message_different_et_verifient() {
     for t in [&t1, &t2] {
         let m = t.sighash(0, Network::Regtest, &depensee);
         assert!(
-            q21_core::sig::verify(SchemeId::MlDsa65, &t.inputs[0].witness.pubkey, &m, &t.inputs[0].witness.signature)
-                .is_ok(),
+            q21_core::sig::verify(
+                SchemeId::MlDsa65,
+                &t.inputs[0].witness.pubkey,
+                &m,
+                &t.inputs[0].witness.signature
+            )
+            .is_ok(),
             "chaque variante doit verifier"
         );
     }
@@ -450,7 +462,10 @@ fn v8_une_reservation_abandonnee_redevient_libre() {
     assert!(!w.est_consomme(0), "rien n'a ete signe : rien n'est revele");
     let sur_le_disque_consommes = w.indices_consommes_pour_le_fichier();
     let sur_le_disque_reserves = w.indices_reserves();
-    assert!(sur_le_disque_consommes.contains(&0), "conservateur pour un lecteur ancien");
+    assert!(
+        sur_le_disque_consommes.contains(&0),
+        "conservateur pour un lecteur ancien"
+    );
     drop(prepare);
     drop(w);
 
@@ -461,7 +476,9 @@ fn v8_une_reservation_abandonnee_redevient_libre() {
     r.charger_reservations(&sur_le_disque_reserves);
     assert!(r.est_reserve(0) && !r.est_consomme(0));
     assert!(
-        !r.spendable(&c.utxo, c.height()).iter().any(|(_, _, i)| *i == 0),
+        !r.spendable(&c.utxo, c.height())
+            .iter()
+            .any(|(_, _, i)| *i == 0),
         "reservee, la piece n'est pas proposee"
     );
 
@@ -476,7 +493,9 @@ fn v8_une_reservation_abandonnee_redevient_libre() {
     assert_eq!((confirmees, liberees), (0, 1));
     assert!(!r.est_reserve(0) && !r.est_consomme(0));
     assert!(
-        r.spendable(&c.utxo, c.height()).iter().any(|(_, _, i)| *i == 0),
+        r.spendable(&c.utxo, c.height())
+            .iter()
+            .any(|(_, _, i)| *i == 0),
         "CONSTAT : la piece reste figee apres un arret entre reservation et diffusion"
     );
 }

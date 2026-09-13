@@ -2753,9 +2753,12 @@ mod tests {
     #[test]
     fn un_onglet_rouvert_reprend_le_jeton_range() {
         let s = script();
-        let echec = s.find("const garde = jetonRange();\n  if (garde){ jeton = garde; return; }")
+        let echec = s
+            .find("const garde = jetonRange();\n  if (garde){ jeton = garde; return; }")
             .expect("reprise du jeton range");
-        let message = s.find("signalerErreur(\"Ce lien a déjà servi").expect("message");
+        let message = s
+            .find("signalerErreur(\"Ce lien a déjà servi")
+            .expect("message");
         assert!(echec < message, "la reprise passe avant le message");
         assert!(
             s.contains("if (r.status === 401){\n    oublierJeton();"),
@@ -3366,9 +3369,18 @@ mod tests {
     /// recherche parcourt tout, et un bouton deplie le reste.
     #[test]
     fn la_page_recevoir_range_les_adresses_du_minage() {
-        assert!(PAGE.contains("function aMontrer(e)"), "pas de tri demandee/minage");
-        assert!(PAGE.contains("e.demandee || e.etiquette"), "le critere n'est pas le bon");
-        assert!(PAGE.contains("bouton-minage"), "pas de bouton pour deplier le minage");
+        assert!(
+            PAGE.contains("function aMontrer(e)"),
+            "pas de tri demandee/minage"
+        );
+        assert!(
+            PAGE.contains("e.demandee || e.etiquette"),
+            "le critere n'est pas le bon"
+        );
+        assert!(
+            PAGE.contains("bouton-minage"),
+            "pas de bouton pour deplier le minage"
+        );
         assert!(
             PAGE.contains("(f || carnetTout) ? carnet : carnet.filter(aMontrer)"),
             "une recherche doit parcourir tout le carnet"

@@ -1477,9 +1477,10 @@ impl Wallet {
         utxo: &UtxoSet,
         depense: DepensePreparee,
     ) -> Result<Transaction, WalletError> {
-        let toujours_la = depense.choisies.iter().all(|(o, sortie, _)| {
-            utxo.get(o).map(|e| e.output == *sortie).unwrap_or(false)
-        });
+        let toujours_la = depense
+            .choisies
+            .iter()
+            .all(|(o, sortie, _)| utxo.get(o).map(|e| e.output == *sortie).unwrap_or(false));
         if !toujours_la {
             self.abandonner_depense(depense);
             return Err(WalletError::PiecesDisparues);
@@ -1630,7 +1631,10 @@ mod tests {
         let minage = w.new_address();
         let donnee = w.demander_adresse();
         let _ = w.new_address();
-        assert!(!w.est_demandee(0), "une adresse de minage n'est pas demandee");
+        assert!(
+            !w.est_demandee(0),
+            "une adresse de minage n'est pas demandee"
+        );
         assert!(w.est_demandee(1), "une adresse demandee l'est");
         assert!(!w.est_demandee(2));
         assert_ne!(minage.hash, donnee.hash);
@@ -1673,7 +1677,10 @@ mod tests {
         assert_eq!(n, 7, "les sept adresses distribuees apres l'ecriture");
         assert_eq!(apres.next_index(), 10);
         for h in &servies {
-            assert!(apres.connues.contains_key(h), "chaque adresse servie est reconnue");
+            assert!(
+                apres.connues.contains_key(h),
+                "chaque adresse servie est reconnue"
+            );
         }
         // Rien de plus a rattraper : une fenetre vide, et l'indice ne bouge pas.
         assert_eq!(apres.rattraper(|h| servies.contains(h)), 0);
@@ -1877,7 +1884,9 @@ mod tests {
             .expect("preparation");
         let indices = prepare.indices();
         assert!(!indices.is_empty());
-        assert!(indices.iter().all(|i| w.est_reserve(*i) && !w.est_consomme(*i)));
+        assert!(indices
+            .iter()
+            .all(|i| w.est_reserve(*i) && !w.est_consomme(*i)));
         // Reservee, la piece n'est plus proposee a une seconde depense.
         assert!(!w
             .spendable(&c.utxo, c.height())
@@ -1891,7 +1900,9 @@ mod tests {
             Some(WalletError::PiecesDisparues)
         );
         assert!(
-            indices.iter().all(|i| !w.est_reserve(*i) && !w.est_consomme(*i)),
+            indices
+                .iter()
+                .all(|i| !w.est_reserve(*i) && !w.est_consomme(*i)),
             "rien n'a ete signe : les indices sont rendus"
         );
 
@@ -1907,7 +1918,9 @@ mod tests {
         let indices = prepare.indices();
         let tx = w.signer_depense(&c.utxo, prepare).expect("signature");
         assert_eq!(tx.inputs.len(), indices.len());
-        assert!(indices.iter().all(|i| w.est_consomme(*i) && !w.est_reserve(*i)));
+        assert!(indices
+            .iter()
+            .all(|i| w.est_consomme(*i) && !w.est_reserve(*i)));
     }
 
     /// Une reservation relue du disque est confirmee par la chaine si la
@@ -1923,10 +1936,20 @@ mod tests {
 
         // Deux depenses preparees, une seule signee et minee.
         let signee = w
-            .preparer_depense(&c.utxo, h0, &[(a, Amount::from_units(50_000))], Amount::from_units(1_000))
+            .preparer_depense(
+                &c.utxo,
+                h0,
+                &[(a, Amount::from_units(50_000))],
+                Amount::from_units(1_000),
+            )
             .unwrap();
         let abandonnee = w
-            .preparer_depense(&c.utxo, h0, &[(a, Amount::from_units(50_000))], Amount::from_units(1_000))
+            .preparer_depense(
+                &c.utxo,
+                h0,
+                &[(a, Amount::from_units(50_000))],
+                Amount::from_units(1_000),
+            )
             .unwrap();
         let i_signee = signee.indices()[0];
         let i_abandonnee = abandonnee.indices()[0];
@@ -1941,7 +1964,9 @@ mod tests {
 
         let mineur = w.new_address();
         let t = GENESIS_TIME + (h0 + 1) * TARGET_BLOCK_SECS;
-        let b = c.mine_block(mineur.hash, mineur.scheme, &[tx], t, 20_000_000).unwrap();
+        let b = c
+            .mine_block(mineur.hash, mineur.scheme, &[tx], t, 20_000_000)
+            .unwrap();
         c.connect(&b, t + 1).unwrap();
 
         let mut r = Wallet::from_seed([0x11; 32], Network::Regtest);
@@ -1952,7 +1977,10 @@ mod tests {
         assert!(r.est_reserve(i_abandonnee) && !r.est_consomme(i_abandonnee));
 
         // Trop tot : rien ne bouge.
-        assert_eq!(r.reexaminer_reservations(c.height(), |h| c.block_at(h)), (0, 0));
+        assert_eq!(
+            r.reexaminer_reservations(c.height(), |h| c.block_at(h)),
+            (0, 0)
+        );
         assert!(r.est_reserve(i_abandonnee));
 
         // Le delai passe, mais un bloc manque : rien n'est libere.
@@ -1967,14 +1995,20 @@ mod tests {
             r.reexaminer_reservations(c.height(), |h| if h == trou { None } else { c.block_at(h) }),
             (0, 0)
         );
-        assert!(r.est_reserve(i_abandonnee), "une lecture incomplete ne libere rien");
+        assert!(
+            r.est_reserve(i_abandonnee),
+            "une lecture incomplete ne libere rien"
+        );
 
         // Lecture complete : l'indice abandonne est libre, et une reservation
         // dont la signature est dans la chaine serait confirmee.
         let mut r2 = Wallet::from_seed([0x11; 32], Network::Regtest);
         r2.rescan(w.next_index());
         r2.charger_reservations(&[(i_signee, h0), (i_abandonnee, h0)]);
-        assert_eq!(r2.reexaminer_reservations(c.height(), |h| c.block_at(h)), (1, 1));
+        assert_eq!(
+            r2.reexaminer_reservations(c.height(), |h| c.block_at(h)),
+            (1, 1)
+        );
         assert!(r2.est_consomme(i_signee) && !r2.est_reserve(i_signee));
         assert!(!r2.est_consomme(i_abandonnee) && !r2.est_reserve(i_abandonnee));
     }
@@ -1989,14 +2023,22 @@ mod tests {
         let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
         let a = dest.new_address();
         let tx = w
-            .create_transaction(&c.utxo, c.height(), &a, Amount::from_units(50_000), Amount::from_units(1_000))
+            .create_transaction(
+                &c.utxo,
+                c.height(),
+                &a,
+                Amount::from_units(50_000),
+                Amount::from_units(1_000),
+            )
             .unwrap();
         let signataire = pubkey_hash(w.scheme(), &tx.inputs[0].witness.pubkey);
         let index = *w.connues.get(&signataire).unwrap();
         let h_depense = c.height() + 1;
         let mineur = w.new_address();
         let t = GENESIS_TIME + h_depense * TARGET_BLOCK_SECS;
-        let b = c.mine_block(mineur.hash, mineur.scheme, &[tx], t, 20_000_000).unwrap();
+        let b = c
+            .mine_block(mineur.hash, mineur.scheme, &[tx], t, 20_000_000)
+            .unwrap();
         c.connect(&b, t + 1).unwrap();
 
         // Un portefeuille de la meme graine, qui ne sait rien de la depense.
@@ -2005,14 +2047,18 @@ mod tests {
         assert!(!r.est_consomme(index));
         // Un trou avant le bloc de la depense : le balayage s'arrete devant.
         let trou = h_depense - 2;
-        let marquees = r.balayer_la_chaine(c.height(), |h| if h == trou { None } else { c.block_at(h) });
+        let marquees =
+            r.balayer_la_chaine(c.height(), |h| if h == trou { None } else { c.block_at(h) });
         assert_eq!(marquees, 0);
         assert_eq!(r.verifie_jusqu_a(), trou - 1);
         // Lecture complete : la clef est marquee, la hauteur atteint la tete.
         assert_eq!(r.balayer_la_chaine(c.height(), |h| c.block_at(h)), 1);
         assert_eq!(r.verifie_jusqu_a(), c.height());
         assert!(r.est_consomme(index));
-        assert!(!r.spendable(&c.utxo, c.height()).iter().any(|(_, _, i)| *i == index));
+        assert!(!r
+            .spendable(&c.utxo, c.height())
+            .iter()
+            .any(|(_, _, i)| *i == index));
     }
 
     /// Epreuves du portefeuille ML-DSA — le chemin qui sera celui du reseau
