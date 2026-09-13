@@ -207,16 +207,40 @@ jobs:
             tar czf "../${{ matrix.archive }}" ./*
           fi
 
-      - name: Condensat SHA-256
+      # Deux condensats, et ils ne servent pas a la meme chose.
+      #
+      # Celui de l'**archive** sert au transport : vous avez bien recu ce qui a
+      # ete depose ici. Il n'est PAS reproductible, et ne peut pas l'etre en
+      # l'etat : une archive tar ou zip inscrit pour chaque fichier une date de
+      # modification, un proprietaire et des permissions, qui dependent de la
+      # machine et de l'instant. Deux executions donnent deux archives
+      # differentes meme quand le binaire dedans est identique.
+      #
+      # Celui du **binaire** sert a la verification par recompilation : c'est
+      # lui, et lui seul, qu'un tiers retrouve en compilant les memes sources
+      # (REPRODUIRE.md). Sans cette ligne, il n'y avait rien a comparer — le
+      # seul condensat publie etait celui de l'archive, donc incomparable par
+      # construction, et toute la reproductibilite restait inverifiable de
+      # l'exterieur.
+      - name: Condensats SHA-256 — l'archive et le binaire
         shell: bash
         run: |
           set -eu
-          if command -v sha256sum >/dev/null; then
-            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
-          else
-            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
-          fi
-          cat "${{ matrix.archive }}.sha256"
+          somme() {
+            if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
+            else shasum -a 256 "$1" | cut -d' ' -f1; fi
+          }
+          ARCHIVE="${{ matrix.archive }}"
+          # `q21-linux-x86_64.tar.gz` -> `q21-linux-x86_64` : le nom sous lequel
+          # le binaire de cette plateforme est atteste.
+          NOM="${ARCHIVE%%.*}"
+          BIN="target/${{ matrix.cible }}/release/${{ matrix.binaire }}"
+
+          printf '%s  %s\n' "$(somme "$ARCHIVE")" "$ARCHIVE" > "$ARCHIVE.sha256"
+          printf '%s  %s\n' "$(somme "$BIN")"     "$NOM"     > "$NOM.bin.sha256"
+
+          echo "--- archive (transport) ---"; cat "$ARCHIVE.sha256"
+          echo "--- binaire (a reproduire) ---"; cat "$NOM.bin.sha256"
 
       # L'attestation lie l'archive a ce commit et a cette execution, signee
       # par GitHub. Quiconque la verifie sait que le fichier a ete construit
@@ -239,6 +263,7 @@ jobs:
           path: |
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
+            *.bin.sha256
 
   # La signature a lieu a **chaque** livraison, pas seulement sur une etiquette
   # de version : c'est la livraison lancee a la main que l'on installe sur le
@@ -272,13 +297,29 @@ jobs:
           path: livraisons
           merge-multiple: true
 
+      # Un seul fichier signe, deux natures de lignes, separees et etiquetees.
+      #
+      # Les archives repondent a « ai-je bien recu ce qui a ete depose ». Les
+      # binaires repondent a « ce fichier sort-il bien de ces sources » — ce
+      # sont eux qu'un tiers reproduit, et eux seuls qu'il peut comparer. Les
+      # melanger sans le dire conduirait quelqu'un a comparer le condensat de
+      # son binaire recompile a celui d'une archive, a ne pas trouver, et a
+      # conclure a une falsification.
       - name: SHA256SUMS
         shell: bash
         run: |
           set -eu
           cd livraisons
           rm -f SHA256SUMS
-          sha256sum q21-*.tar.gz q21-*.zip > SHA256SUMS
+          {
+            echo "# Archives — integrite du telechargement. Non reproductibles :"
+            echo "# une archive inscrit dates, proprietaires et permissions."
+            sha256sum q21-*.tar.gz q21-*.zip
+            echo "#"
+            echo "# Binaires — a comparer apres recompilation (REPRODUIRE.md)."
+            echo "# Meme commit + meme plateforme + meme chaine d'outils = meme condensat."
+            cat ./*.bin.sha256
+          } > SHA256SUMS
           cat SHA256SUMS
 
       # Signature hors ligne. `minisign` tient en un fichier et n'exige aucune
