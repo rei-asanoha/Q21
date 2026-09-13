@@ -303,6 +303,27 @@ dépendance peut introduire un `build.rs` qui inscrit une date, un chemin, un
 nom de machine. La tâche `reproductible` de `essais.yml` est là pour que ce
 jour-là la fusion s'arrête au lieu de passer.
 
+**Les archives `.tar.gz` et `.zip` ne sont pas reproductibles, et ne peuvent
+pas l'être en l'état.** Une archive inscrit pour chaque fichier une date de
+modification, un propriétaire et des permissions, qui dépendent de la machine
+et de l'instant : deux livraisons donnent deux archives différentes alors même
+que le binaire qu'elles contiennent est identique. C'est pourquoi le fichier
+`SHA256SUMS` publié avec chaque livraison porte **deux sortes de lignes**,
+séparées et étiquetées :
+
+```
+# Archives — integrite du telechargement. Non reproductibles.
+4b91…  q21-linux-x86_64.tar.gz
+#
+# Binaires — a comparer apres recompilation.
+85092844…  q21-linux-x86_64
+```
+
+Ce que vous reproduisez et comparez est **la seconde sorte** : le binaire nu,
+extrait de l'archive ou recompilé par vous. Comparer votre binaire recompilé
+au condensat d'une archive ne peut pas concorder, et c'est l'erreur la plus
+facile à commettre ici.
+
 ---
 
 ## 7 · Résumé en quatre commandes
