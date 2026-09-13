@@ -714,13 +714,11 @@ fn lire_ancre(d: &Path) -> Option<Ancre> {
         match ligne.split_once('=') {
             Some(("scelle", v)) => a.scelle = v.trim() == "1",
             Some(("graine", v)) => {
-                a.graine = hex_en_octets(v.trim())
-                    .filter(|o| o.len() == 32)
-                    .map(|o| {
-                        let mut g = [0u8; 32];
-                        g.copy_from_slice(&o);
-                        g
-                    })
+                a.graine = hex_en_octets(v.trim()).filter(|o| o.len() == 32).map(|o| {
+                    let mut g = [0u8; 32];
+                    g.copy_from_slice(&o);
+                    g
+                })
             }
             _ => {}
         }
@@ -894,11 +892,7 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     // Les adresses que le porteur a demandees lui-meme, pour les distinguer
     // des centaines que le minage derive. Ce n'est qu'un ordre de
     // presentation : perdre cette ligne ne perd ni une clef ni un fond.
-    let demandees: Vec<String> = w
-        .indices_demandes()
-        .iter()
-        .map(|i| i.to_string())
-        .collect();
+    let demandees: Vec<String> = w.indices_demandes().iter().map(|i| i.to_string()).collect();
     // Le texte en clair est efface a la sortie de cette fonction, qu'elle
     // reussisse ou non : il porte la graine.
     let contenu = Secret(format!(
@@ -1682,7 +1676,10 @@ fn garde_des_schemas(reseau: Network) -> Result<(), String> {
 /// Le jugement de [`garde_des_schemas`], separe de la compilation pour etre
 /// eprouve : `Ok(None)` demarre, `Ok(Some(_))` demarre en prevenant, `Err`
 /// refuse.
-fn garde_des_schemas_avec(reseau: Network, mldsa_disponible: bool) -> Result<Option<String>, String> {
+fn garde_des_schemas_avec(
+    reseau: Network,
+    mldsa_disponible: bool,
+) -> Result<Option<String>, String> {
     if mldsa_disponible {
         return Ok(None);
     }
@@ -1971,11 +1968,7 @@ fn charger_avec(datadir: &Path, reseau_impose: Option<Network>) -> Result<Etat, 
 
 /// Reexamine les reservations du portefeuille a la lumiere de la chaine, et
 /// dit ce qui a change. Rend `true` si le portefeuille doit etre reecrit.
-fn reexaminer_les_reservations(
-    wallet: &mut Wallet,
-    chain: &Chain,
-    archive: &BlockArchive,
-) -> bool {
+fn reexaminer_les_reservations(wallet: &mut Wallet, chain: &Chain, archive: &BlockArchive) -> bool {
     if wallet.indices_reserves().is_empty() {
         return false;
     }
@@ -1983,9 +1976,7 @@ fn reexaminer_les_reservations(
         chain.active_at(h).and_then(|id| archive.read(&id))
     });
     if confirmees > 0 {
-        println!(
-            "  {confirmees} reservation(s) confirmee(s) par la chaine : clef(s) employee(s)."
-        );
+        println!("  {confirmees} reservation(s) confirmee(s) par la chaine : clef(s) employee(s).");
     }
     if liberees > 0 {
         println!(
@@ -2132,7 +2123,10 @@ fn cmd_restore(
     code_fichier: Option<&str>,
     phrase_fichier: Option<&str>,
 ) -> Result<(), String> {
-    if arguments.iter().any(|a| ressemble_a_un_code_de_sauvegarde(a)) {
+    if arguments
+        .iter()
+        .any(|a| ressemble_a_un_code_de_sauvegarde(a))
+    {
         // Le code n'est pas repete ici, meme en partie : l'erreur peut finir
         // dans un journal, et il en est deja assez dans l'historique.
         return Err("le code de sauvegarde ne doit pas etre donne en argument.\n\n             \
@@ -4517,7 +4511,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     if !sans_portefeuille {
                         if let Ok(w) = wallet.lock() {
                             if let Err(e) = ecrire_portefeuille(datadir, &w) {
-                                eprintln!("avertissement : portefeuille non ecrit apres le bloc : {e}");
+                                eprintln!(
+                                    "avertissement : portefeuille non ecrit apres le bloc : {e}"
+                                );
                             }
                         }
                     }
@@ -4555,7 +4551,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             if h > derniere_decouverte + 20 {
                 derniere_decouverte = h;
                 let mut w = wallet.lock().map_err(|_| "portefeuille verrouille")?;
-                let a_chercher = node.with_chain(|c| !c.utxo.is_empty() && !w.voit_des_fonds(&c.utxo));
+                let a_chercher =
+                    node.with_chain(|c| !c.utxo.is_empty() && !w.voit_des_fonds(&c.utxo));
                 if a_chercher {
                     // Decouverte puis balayage des clefs a usage unique,
                     // AVANT l'ecriture : voir `decouvrir_dans_la_boucle`.
@@ -5485,9 +5482,16 @@ mod tests {
     #[test]
     fn la_garde_precede_le_moindre_fichier() {
         let s = include_str!("q21.rs");
-        let garde = s.find("garde_des_schemas(reseau)?;").expect("appel de la garde");
-        let ouverture = s.find("BlockArchive::open(chemin_blocs(datadir), reseau)").expect("ouverture");
-        assert!(garde < ouverture, "la garde doit preceder l'ouverture de l'archive");
+        let garde = s
+            .find("garde_des_schemas(reseau)?;")
+            .expect("appel de la garde");
+        let ouverture = s
+            .find("BlockArchive::open(chemin_blocs(datadir), reseau)")
+            .expect("ouverture");
+        assert!(
+            garde < ouverture,
+            "la garde doit preceder l'ouverture de l'archive"
+        );
     }
 
     /// Le carnet fait l'aller-retour sans rien perdre.
@@ -5675,7 +5679,13 @@ mod tests {
         assert!(ressemble_a_un_code_de_sauvegarde(
             &Wallet::from_seed([0x5a; 32], Network::Testnet).backup_code()
         ));
-        for mot in ["regtest", "testnet", "lamport", "mldsa87", "--sans-navigateur"] {
+        for mot in [
+            "regtest",
+            "testnet",
+            "lamport",
+            "mldsa87",
+            "--sans-navigateur",
+        ] {
             assert!(!ressemble_a_un_code_de_sauvegarde(mot), "{mot}");
         }
     }

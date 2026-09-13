@@ -1779,8 +1779,7 @@ impl Node {
                     let txid = t.txid();
                     let inedite = !g.mempool.contains(&txid);
                     let lire = !inedite
-                        || g
-                            .peers
+                        || g.peers
                             .get_mut(&id)
                             .map(|p| {
                                 p.seau_tx.autoriser_avec(

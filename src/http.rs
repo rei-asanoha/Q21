@@ -1464,7 +1464,8 @@ mod tests {
 
         // 4. L'origine declaree passe — la page de l'explorateur est servie par
         //    ce nom — mais une origine tierce reste refusee.
-        let r = avec("Host: explorateur.example.org\r\nOrigin: https://explorateur.example.org\r\n");
+        let r =
+            avec("Host: explorateur.example.org\r\nOrigin: https://explorateur.example.org\r\n");
         assert!(
             r.starts_with("HTTP/1.1 200"),
             "l'origine declaree doit passer : {r}"

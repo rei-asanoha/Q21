@@ -328,12 +328,12 @@ fn rien_n_est_lu_avant_la_poignee_de_main_meme_pousse() {
 /// le message n'est pas lu, et le pair perd des points a chaque envoi.
 #[test]
 fn le_budget_de_transactions_par_pair_finit_par_couper() {
-    use q21_core::net::TX_SEAU_MAX;
-    use q21_core::tx::{Transaction, TxIn, TxOut, Witness};
     use q21_core::amount::Amount;
     use q21_core::hash::Hash256;
+    use q21_core::net::TX_SEAU_MAX;
     use q21_core::sig::SchemeId;
     use q21_core::tx::OutPoint;
+    use q21_core::tx::{Transaction, TxIn, TxOut, Witness};
 
     let a = noeud();
     let addr = a.listen("127.0.0.1:0").expect("ecoute");
