@@ -190,7 +190,10 @@ jobs:
           set -eu
           mkdir -p livraison
           cp "target/${{ matrix.cible }}/release/${{ matrix.binaire }}" livraison/
-          cp README.md AUDIT.md PORTEFEUILLE.md livraison/ 2>/dev/null || true
+          # REPRODUIRE.md voyage avec le binaire : les instructions pour
+          # verifier un fichier ne servent a rien si elles restent sur une
+          # page web que celui qui telecharge ne visitera pas.
+          cp README.md AUDIT.md PORTEFEUILLE.md REPRODUIRE.md SUCCESSION.md livraison/ 2>/dev/null || true
           # Le lanceur a double-cliquer, propre a chaque systeme. Sans lui,
           # l'utilisateur doit ouvrir une fenetre de commande et taper `wallet`,
           # ce qu'aucune application de bureau ne demande.
