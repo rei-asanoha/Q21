@@ -78,6 +78,23 @@ sinon — **et la page dit toujours laquelle des deux a servi**. Voir
 ./q21 wallet           # le portefeuille sert le meme explorateur, meme port
 ```
 
+### L'explorateur public, aujourd'hui
+
+Faire tourner un nœud reste la manière de consulter la chaîne sans faire
+confiance à personne. Pour qui veut d'abord regarder, une instance tourne en
+continu :
+
+```
+https://explorateur.q21.dev
+```
+
+Le domaine est en `.dev` — une extension dont le navigateur **impose HTTPS
+avant même de regarder le certificat** (elle est préchargée HSTS au niveau du
+TLD entier). Une connexion refusée d'emblée, ou un avertissement inhabituel,
+ne veut donc pas dire que le serveur est en panne : voir
+[EXPLORATEUR-PUBLIC.md](EXPLORATEUR-PUBLIC.md#audit-de-la-couche-https) pour
+le test à faire avant de conclure à une panne.
+
 ### Trois décisions de sécurité, prises à la liaison et pas au premier appel
 
 | Décision | Pourquoi |
@@ -634,9 +651,12 @@ garantie acquise.
 ---
 
 Une faille — dans la preuve de travail, dans le consensus, dans le
-portefeuille — se signale à l'adresse ci-dessous, de préférence avant d'être
-publiée. Il n'y a ni prime, ni contrat, ni délai imposé : seulement une réponse,
-un correctif, et une épreuve de non-régression qui portera votre trouvaille.
+portefeuille — se signale via les **Issues** du dépôt :
+[github.com/rei-asanoha/Q21/issues](https://github.com/rei-asanoha/Q21/issues),
+de préférence avant d'être publiée. C'est le seul canal de contact du projet —
+il n'y a pas d'adresse mail. Il n'y a ni prime, ni contrat, ni délai imposé :
+seulement une réponse, un correctif, et une épreuve de non-régression qui
+portera votre trouvaille.
 
 ---
 

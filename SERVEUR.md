@@ -370,7 +370,7 @@ le serveur ne peut pas faire), puis se pousse vers le serveur.
 
 ### Sur le Mac
 
-Sur `github.com/reiasanoha/q21` → **Actions** → **Livraison** → la dernière
+Sur `github.com/rei-asanoha/Q21` → **Actions** → **Livraison** → la dernière
 exécution **verte** → section **Artifacts** → téléchargez **deux** artefacts :
 **`q21-linux-x86_64.tar.gz`** et **`SHA256SUMS-signe`**.
 
