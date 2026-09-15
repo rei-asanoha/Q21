@@ -192,6 +192,20 @@ ssh -L 21080:127.0.0.1:21080 q21@votre-serveur
 - **Il ne décide de rien.** Il donne un premier contact ; ce que vous croyez
   vient de la preuve de travail et de la genèse que vous avez écrite vous-même.
 
+## Le point d'entrée du réseau d'essai, aujourd'hui
+
+```
+amorce.q21.dev:21121
+92.222.86.135:21121
+```
+
+Le nom **et** l'adresse sont publiés côte à côte, volontairement. Un nom de
+domaine peut un jour expirer et être racheté par quelqu'un d'autre ; une
+adresse reste joignable tant que la machine qui la tient existe. Publier les
+deux donne un choix à qui rejoint, et la défaillance de l'un n'isole personne
+du réseau — voir plus bas pourquoi ni l'un ni l'autre n'est compilé dans le
+binaire.
+
 ## Publier le point d'entrée
 
 Une fois le nœud en marche, annoncez son nom. Ceux qui rejoignent l'écrivent
@@ -200,8 +214,8 @@ une par ligne, les lignes vides et celles commençant par `#` sont ignorées :
 
 ```
 # les amorces du réseau d'essai Q21
-amorce1.exemple.fr
-amorce2.exemple.fr:21121
+amorce.q21.dev:21121
+92.222.86.135:21121
 ```
 
 Les points d'entrée qui tiennent sont inscrits dans le binaire lui-même —
