@@ -193,7 +193,7 @@ jobs:
           # REPRODUIRE.md voyage avec le binaire : les instructions pour
           # verifier un fichier ne servent a rien si elles restent sur une
           # page web que celui qui telecharge ne visitera pas.
-          cp README.md AUDIT.md PORTEFEUILLE.md REPRODUIRE.md SUCCESSION.md livraison/ 2>/dev/null || true
+          cp README.md REJOINDRE.md AUDIT.md PORTEFEUILLE.md REPRODUIRE.md SUCCESSION.md livraison/ 2>/dev/null || true
           # Le lanceur a double-cliquer, propre a chaque systeme. Sans lui,
           # l'utilisateur doit ouvrir une fenetre de commande et taper `wallet`,
           # ce qu'aucune application de bureau ne demande.
@@ -392,6 +392,13 @@ jobs:
             - Windows : `Portefeuille Q21.bat`
             - macOS : `Portefeuille Q21.command`
             - Linux : `./q21 wallet` dans un terminal
+
+            **Avant le premier lancement**, dites au programme ou frapper :
+            creez un dossier `q21-data` a cote de lui, et dedans un fichier
+            `amorces.txt` contenant la ligne `amorce.q21.dev`. Le programme
+            ne contient l'adresse d'aucun serveur, par choix. `REJOINDRE.md`,
+            joint a l'archive, detaille ce geste et tout le reste en dix
+            minutes, y compris comment devenir soi-meme un point d'entree.
 
             Le navigateur s'ouvre et vous guide : creer un portefeuille, ou
             restaurer le votre a partir de son code de sauvegarde. Il n'y a

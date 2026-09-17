@@ -386,6 +386,8 @@ src/
   arret.rs       Arrêt propre sur Ctrl-C, fermeture de fenêtre, SIGTERM
   bin/q21.rs     Nœud, portefeuille, explorateur et bancs en ligne de commande
 
+REJOINDRE.md     Rejoindre Q21 en dix minutes, sans jamais avoir ouvert un
+                 terminal — participer, puis être un point d'entrée
 PHASE6.md        Le verdict anti-ASIC : la mesure, ce qu'elle a détruit,
                  et la correction à deux niveaux
 PHASE7.md        Ce qui permet à une chaîne de durer : les cinq murs du
