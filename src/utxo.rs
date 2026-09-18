@@ -237,11 +237,44 @@ impl UtxoSet {
     }
 
     /// Defait un bloc : supprime ce qu'il a cree, restaure ce qu'il a consomme.
+    ///
+    /// # Le dedoublonnage que cette methode doit faire
+    ///
+    /// Un bloc peut depenser une sortie qu'il a lui-meme creee plus tot — une
+    /// transaction depense la monnaie rendue d'une transaction precedente du
+    /// meme bloc, chainage parent-avant-enfant que `validate` autorise. Cette
+    /// sortie figure alors dans **les deux** listes : `creees` (par la
+    /// transaction qui l'a fabriquee) et `consommees` (par celle qui l'a
+    /// depensee). Or, avant le bloc, elle n'existait pas : elle est nee et morte
+    /// a l'interieur. Apres annulation, elle ne doit donc PAS exister.
+    ///
+    /// La version naive retirait les `creees` puis reinserait les `consommees`
+    /// sans dedoublonner : la sortie intra-bloc, retiree comme creee, etait
+    /// reinseree comme consommee, et survivait — un UTXO fantome, depensable, ne
+    /// prolongeant aucune transaction de la chaine active. La red-team de la
+    /// phase 8b l'a demontre : valeur totale passee de 10 000 a 19 000 sur une
+    /// seule annulation, monnaie creee a partir de rien, et l'empreinte d'etat
+    /// corrompue restait coherente avec elle-meme (l'engagement incremental
+    /// egalait le recalcul), donc indetectable par le controle interne et
+    /// divergente pour tout noeud fraichement synchronise. Une reorganisation
+    /// est un evenement normal en preuve de travail, et depenser sa monnaie
+    /// rendue dans le meme bloc l'est tout autant : le defaut se declenchait sur
+    /// l'activite ordinaire, pas seulement sous attaque.
+    ///
+    /// On restaure donc une sortie consommee **seulement si le bloc ne l'a pas
+    /// aussi creee**. Une sortie presente dans les deux listes est nette :
+    /// retiree, jamais restauree.
     pub fn undo(&mut self, record: &UndoRecord) {
+        let creees: std::collections::HashSet<&OutPoint> = record.creees.iter().collect();
         for o in &record.creees {
             self.remove(o);
         }
         for (o, e) in &record.consommees {
+            if creees.contains(o) {
+                // Sortie nee et depensee dans ce bloc : avant lui, elle
+                // n'existait pas. Ne pas la ressusciter.
+                continue;
+            }
             self.insert(*o, *e);
         }
     }
