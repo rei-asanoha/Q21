@@ -408,6 +408,8 @@ PROJECTION.md    La vie de la chaîne, calculée par le code de consensus :
                  émission sur cent ans, capacité, et le mur des 4,74 tx/s
 AUDIT-2026.md    La chaîne face à l'état de l'art 2026 : où elle est devant,
                  où est le mur de la vitesse, et les axes classés par horizon
+RED-TEAM-2026.md La campagne adverse : une faille critique trouvée, prouvée et
+                 corrigée, sept durcissements, classés par criticité
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 SIGNATURE.md     Signer chaque livraison, et vérifier avant d'installer
 REPRODUIRE.md    Recompiler le binaire et retrouver le condensat publié —
