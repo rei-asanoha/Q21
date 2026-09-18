@@ -462,6 +462,16 @@ fn lire_secret_dans_un_fichier(chemin: &str, quoi: &str) -> Result<String, Strin
     Ok(p)
 }
 
+/// Longueur minimale d'une phrase secrete NON VIDE, a la creation.
+///
+/// Une phrase d'un a quelques caracteres est scellee avec toute la robustesse
+/// d'Argon2id — et se devine quand meme par une liste courte, quel que soit le
+/// cout par essai. Elle donne donc un faux sentiment de securite, pire qu'une
+/// absence de phrase assumee. Le vide reste un choix explicite (aucune
+/// protection, avertissement bruyant) ; une phrase *reelle* doit atteindre ce
+/// plancher. Red-team 8b.
+const LONGUEUR_MIN_PHRASE: usize = 8;
+
 /// Un `wallet.dat` d'une autre graine que celle que le dossier a connue est
 /// accepte : pose par `--accepter-autre-graine`. Voir [`lire_portefeuille`].
 static ACCEPTER_AUTRE_GRAINE: std::sync::atomic::AtomicBool =
@@ -2300,6 +2310,20 @@ fn cmd_init_avec(
             "Phrase secrete du portefeuille (vide = aucune protection) : ",
         )
         .map_err(|e| format!("phrase secrete : {e}"))?;
+        // Une phrase non vide mais sous le plancher est refusee : mieux vaut
+        // arreter et laisser l'utilisateur en choisir une vraie, ou choisir le
+        // vide en connaissance de cause, que sceller une graine derriere un
+        // secret devinable. Voir LONGUEUR_MIN_PHRASE.
+        if let Some(ref p) = saisie {
+            let n = p.chars().count();
+            if n < LONGUEUR_MIN_PHRASE {
+                return Err(format!(
+                    "phrase secrete trop courte ({n} caractere(s)) : il en faut au moins \
+                     {LONGUEUR_MIN_PHRASE}, ou aucune (laissez vide) pour un portefeuille sans \
+                     protection, choisi en connaissance de cause. Relancez `init`."
+                ));
+            }
+        }
         retenir_phrase(saisie);
     }
     if phrase_courante().is_none() {

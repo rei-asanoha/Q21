@@ -693,7 +693,21 @@ mod tests {
         for r in [Network::Mainnet, Network::Testnet, Network::Regtest] {
             assert!(SchemeId::MlDsa65.allowed_on(r));
             assert!(SchemeId::MlDsa87.allowed_on(r));
-            assert!(SchemeId::SphincsPlus.allowed_on(r));
+        }
+    }
+
+    /// SPHINCS+ n'a aucune implementation de verification : l'autoriser a la
+    /// creation d'une sortie brulait des fonds indepensables (red-team 8b).
+    /// Il doit etre refuse partout, a la creation comme a la depense, tant qu'il
+    /// n'est pas implemente.
+    #[test]
+    fn sphincs_plus_non_implemente_est_refuse_partout() {
+        for r in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            assert!(
+                !SchemeId::SphincsPlus.allowed_on(r),
+                "un schema non verifiable ne doit pas pouvoir verrouiller une sortie"
+            );
+            assert!(!SchemeId::SphincsPlus.disponible());
         }
     }
 

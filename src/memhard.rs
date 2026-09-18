@@ -225,10 +225,21 @@ impl PowCache {
         for _ in 0..POW_CACHE_ROUNDS {
             for i in 0..c as usize {
                 let prec = if i == 0 { c as usize - 1 } else { i - 1 };
-                let j = {
+                let mut j = {
                     let d = &data[i * POW_ELEMENT_SIZE..i * POW_ELEMENT_SIZE + 4];
                     (u32::from_le_bytes([d[0], d[1], d[2], d[3]]) % c) as usize
                 };
+                // Si l'element tire est le precedent lui-meme, le XOR ci-dessous
+                // s'annulerait et l'element deviendrait une constante — H(0) pour
+                // ce tag — au lieu de dependre du cache. Perte d'entropie dans la
+                // structure meme que les verificateurs detiennent (red-team 8b).
+                // On decale alors d'un cran : les deux termes melanges restent
+                // deux elements distincts, donc le XOR n'est jamais nul. Seules
+                // les cases degenerees (environ une sur `c`) changent ; toutes les
+                // autres gardent exactement leur valeur.
+                if j == prec && c > 1 {
+                    j = (prec + 1) % c as usize;
+                }
                 for k in 0..POW_ELEMENT_SIZE {
                     xor[k] = data[prec * POW_ELEMENT_SIZE + k] ^ data[j * POW_ELEMENT_SIZE + k];
                 }

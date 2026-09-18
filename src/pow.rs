@@ -54,7 +54,31 @@ pub enum PowError {
     CibleNegative,
     CibleNulle,
     CibleTropGrande,
+    /// Cible plus facile que le plancher de difficulte ([`INITIAL_BITS`]).
+    ///
+    /// Un en-tete peut annoncer une cible aussi grande qu'il veut ; sans borne,
+    /// il suffirait d'annoncer une cible proche de 2^256 pour qu'un condensat
+    /// quelconque passe avec un travail derisoire — « des en-tetes valides a
+    /// l'infini sans miner ». La borne vivait jusqu'ici uniquement dans
+    /// `chain.rs` (l'egalite `header.bits == next_bits(parent)`, qui plafonne a
+    /// `INITIAL_BITS`). La fonction de travail elle-meme acceptait n'importe
+    /// quelle cible. Un futur appelant de `check` — un validateur d'en-tetes
+    /// avant les corps, par exemple — qui oublierait la borne la reintroduirait.
+    /// On la met donc dans le calcul qu'elle protege, pas dans ses appelants.
+    /// Trouve par la red-team de phase 8b.
+    CibleTropFacile,
     TravailInsuffisant,
+}
+
+/// La cible la plus grande — la difficulte la plus faible — qu'un en-tete valide
+/// puisse porter, derivee du plancher [`crate::consensus::INITIAL_BITS`].
+///
+/// Fonction, et non constante, parce que `target_from_compact` n'est pas `const`.
+/// Le decodage de `INITIAL_BITS` ne peut pas echouer : c'est une cible compacte
+/// bien formee, verifiee par une epreuve.
+pub fn cible_plancher() -> U256 {
+    target_from_compact(crate::consensus::INITIAL_BITS)
+        .expect("INITIAL_BITS est une cible compacte valide")
 }
 
 /// Decode une cible compacte vers sa valeur 256 bits.
@@ -124,6 +148,12 @@ pub trait PowEngine {
 
     fn check(&self, header: &BlockHeader) -> Result<(), PowError> {
         let cible = target_from_compact(header.bits)?;
+        // Plancher de difficulte, applique DANS la fonction de travail : une
+        // cible plus facile que le plancher est refusee ici, et pas seulement
+        // par l'egalite de bits que pose `chain.rs`. Voir `CibleTropFacile`.
+        if cible > cible_plancher() {
+            return Err(PowError::CibleTropFacile);
+        }
         let valeur = U256::from_be_bytes(self.hash(header).as_bytes());
         if valeur > cible {
             return Err(PowError::TravailInsuffisant);
@@ -534,11 +564,36 @@ mod tests {
     #[test]
     fn le_minage_trouve_un_nonce_pour_une_cible_facile() {
         let moteur = Sha256Pow;
-        // Cible tres permissive : quelques essais suffisent.
-        let mut h = entete(0x2100_ffff);
+        // La cible la plus facile ADMISE : le plancher lui-meme. Une sur ~256
+        // tentatives passe, donc quelques centaines d'essais suffisent — et,
+        // contrairement a l'ancienne `0x2100_ffff`, cette cible est dans les
+        // bornes du consensus (voir `cible_plancher` et `CibleTropFacile`).
+        let mut h = entete(crate::consensus::INITIAL_BITS);
         let essais = mine(&moteur, &mut h, 100_000).expect("aucun nonce trouve");
         assert!(moteur.check(&h).is_ok(), "le bloc mine ne valide pas");
         assert!(essais < 100_000);
+    }
+
+    /// ATTAQUE (red-team 8b) : un en-tete qui annonce une cible plus facile que
+    /// le plancher passait `check` avec un nonce nul et un travail derisoire,
+    /// tant qu'aucun appelant ne verifiait la borne au dehors. `check` doit
+    /// desormais le refuser lui-meme.
+    #[test]
+    fn une_cible_plus_facile_que_le_plancher_est_refusee_par_check() {
+        let moteur = Sha256Pow;
+        // 0x2100_7fff : exposant 0x21, cible ~2^255, tres au-dessus du plancher
+        // ~2^248. Le decodage reussit (pas de debordement), donc seule la borne
+        // l'arrete. Nonce nul : aucun travail.
+        let h = entete(0x2100_7fff);
+        assert!(
+            target_from_compact(h.bits).is_ok(),
+            "la cible se decode : ce n'est pas un debordement qui l'arrete"
+        );
+        assert_eq!(
+            moteur.check(&h),
+            Err(PowError::CibleTropFacile),
+            "une cible sous le plancher doit etre refusee DANS la fonction de travail"
+        );
     }
 
     #[test]

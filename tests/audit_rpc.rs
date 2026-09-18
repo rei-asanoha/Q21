@@ -1359,20 +1359,15 @@ fn faille_au_dela_de_64_entetes_le_reste_devient_le_corps() {
     h2.shutdown();
 }
 
-/// `Transfer-Encoding: chunked` n'est pas implemente et n'est pas refuse : le
-/// corps est simplement ignore (aucun `Content-Length`, donc taille zero).
+/// `Transfer-Encoding: chunked` n'est pas implemente, et desormais **refuse**
+/// franchement par un 400 — au lieu d'etre ignore en silence (red-team 8b).
 ///
-/// Ce point n'a pas ete corrige, et ce test le fixe tel quel. Ce qu'il verifie,
-/// c'est ce qui compte vraiment ici : l'absence de **contrebande**. Une seule
-/// requete est traitee par connexion, et les octets du corps chunked ne sont
-/// jamais relus comme une seconde requete — ni quand `Content-Length` et
-/// `Transfer-Encoding` se contredisent, ce qui est le motif classique de
-/// desynchronisation entre un mandataire et son amont.
-///
-/// Un client conforme, lui, voit toujours sa requete disparaitre derriere une
-/// erreur d'analyse ; un 400 « chunked non supporte » vaudrait mieux.
+/// On verifie le refus ET l'absence de contrebande : le corps chunked n'est
+/// jamais execute, une seule reponse sort par connexion, et une requete cachee
+/// dans les morceaux — y compris quand `Content-Length` et `Transfer-Encoding`
+/// se contredisent, motif classique de desynchronisation — n'est jamais servie.
 #[test]
-fn faille_chunked_est_ignore_en_silence() {
+fn chunked_est_refuse_par_400() {
     let h = serveur(false, None);
 
     let r = brut(
@@ -1382,17 +1377,16 @@ fn faille_chunked_est_ignore_en_silence() {
           2a\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getinfo\"}\r\n0\r\n\r\n",
     );
     assert!(
-        corps_de(&r).contains("-32700"),
-        "chunked devrait etre refuse par 400, pas ignore : {r}"
+        r.starts_with("HTTP/1.1 400"),
+        "chunked doit etre refuse par un 400 franc : {r}"
     );
     assert!(
-        !corps_de(&r).contains("\"hauteur\""),
+        !r.contains("\"hauteur\""),
         "le corps chunked ne doit pas etre execute : {r}"
     );
 
-    // `Content-Length` et `Transfer-Encoding` contradictoires : c'est le motif
-    // de la contrebande de requetes. Une seule reponse doit sortir, et la
-    // seconde requete cachee ne doit jamais etre servie.
+    // `Content-Length` et `Transfer-Encoding` contradictoires : le motif meme de
+    // la contrebande. Refus, une seule reponse, requete cachee jamais servie.
     let cache = r#"{"jsonrpc":"2.0","id":9,"method":"getsupply"}"#;
     let r = brut(
         h.addr,
@@ -1403,6 +1397,10 @@ fn faille_chunked_est_ignore_en_silence() {
             cache.len()
         )
         .as_bytes(),
+    );
+    assert!(
+        r.starts_with("HTTP/1.1 400"),
+        "Content-Length et Transfer-Encoding contradictoires doivent etre refuses : {r}"
     );
     assert_eq!(
         r.matches("HTTP/1.1 ").count(),
@@ -1416,69 +1414,44 @@ fn faille_chunked_est_ignore_en_silence() {
     h.shutdown();
 }
 
-/// `Content-Length` duplique : la derniere valeur gagne (`BTreeMap::insert`),
-/// et le corps reel plus grand que declare est tronque, l'excedent jete.
+/// `Content-Length` duplique : desormais **refuse** par un 400 franc, comme
+/// l'exige le RFC 9112 — au lieu de retenir la derniere valeur et de jeter
+/// l'excedent en silence (red-team 8b). Deux `Content-Length` contradictoires
+/// etaient l'autre moitie classique de la contrebande : un mandataire pouvait
+/// retenir la premiere valeur et lire un autre message que le noeud.
 ///
-/// Ce point n'a pas ete corrige non plus, et ce test le fixe tel quel : deux
-/// `Content-Length` contradictoires devraient valoir un 400 franc, comme
-/// l'exige le RFC 9112. Tant que ce n'est pas le cas, un mandataire qui
-/// retiendrait la **premiere** valeur lirait un autre message que le noeud.
-///
-/// Ce que le serveur garantit malgre tout, et que ce test verrouille : l'excedent
-/// n'est jamais relu comme une requete supplementaire. Une connexion, une
-/// reponse — la contrebande de requetes reste impossible.
+/// On verifie le refus dans les deux ordres, et l'absence de contrebande : une
+/// connexion, une reponse, aucune requete cachee servie.
 #[test]
-fn faille_content_length_duplique_et_corps_tronque() {
+fn content_length_duplique_est_refuse_par_400() {
     let h = serveur(false, None);
     let json = r#"{"jsonrpc":"2.0","id":1,"method":"getinfo"}"#;
     let cache = r#"{"jsonrpc":"2.0","id":9,"method":"getsupply"}"#;
     let corps = format!("{json}{cache}");
 
-    // Deux valeurs contradictoires ; le corps reel est plus long que les deux.
-    // C'est la **derniere** en-tete qui est retenue.
-    let r = brut(
-        h.addr,
-        format!(
-            "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-             Content-Length: 9999\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{corps}",
-            json.len()
-        )
-        .as_bytes(),
-    );
-    assert!(
-        corps_de(&r).contains("\"hauteur\""),
-        "la derniere valeur de Content-Length l'emporte et l'excedent est jete \
-         sans erreur : {r}"
-    );
-    assert_eq!(
-        r.matches("HTTP/1.1 ").count(),
-        1,
-        "l'excedent ne doit jamais devenir une seconde requete : {r}"
-    );
-    assert!(
-        !r.contains("\"plafond\""),
-        "la requete dissimulee dans l'excedent a ete servie : {r}"
-    );
-
-    // Ordre inverse : si c'etait la premiere qui gagnait, la requete serait
-    // identique. Elle ne l'est pas — preuve que seule la derniere compte.
-    let r2 = brut(
-        h.addr,
-        format!(
-            "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nContent-Length: 9999\r\nConnection: close\r\n\r\n{corps}",
-            json.len()
-        )
-        .as_bytes(),
-    );
-    assert!(
-        r2.starts_with("HTTP/1.1 400"),
-        "avec 9999 en dernier, le serveur attend un corps qui n'arrive pas : {r2}"
-    );
-    assert!(
-        !corps_de(&r2).contains("\"hauteur\""),
-        "l'appel a tout de meme ete execute : {r2}"
-    );
+    for (a, b) in [(9999, json.len()), (json.len(), 9999)] {
+        let r = brut(
+            h.addr,
+            format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {a}\r\nContent-Length: {b}\r\nConnection: close\r\n\r\n{corps}"
+            )
+            .as_bytes(),
+        );
+        assert!(
+            r.starts_with("HTTP/1.1 400"),
+            "deux Content-Length doivent valoir un 400 franc (ordre {a}/{b}) : {r}"
+        );
+        assert_eq!(
+            r.matches("HTTP/1.1 ").count(),
+            1,
+            "une seule reponse par connexion (ordre {a}/{b}) : {r}"
+        );
+        assert!(
+            !r.contains("\"hauteur\"") && !r.contains("\"plafond\""),
+            "aucun appel ne doit etre execute (ordre {a}/{b}) : {r}"
+        );
+    }
     h.shutdown();
 }
 

@@ -105,8 +105,18 @@ pub fn adresse_client(pair: Option<IpAddr>, headers: &BTreeMap<String, String>) 
     let Some(transmis) = headers.get("x-forwarded-for") else {
         return Some(pair);
     };
-    let premier = transmis.split(',').next().unwrap_or("").trim();
-    match premier.parse::<IpAddr>() {
+    // On prend la DERNIERE valeur, pas la premiere.
+    //
+    // Un mandataire ajoute a la fin de `X-Forwarded-For` l'adresse d'ou LUI a
+    // recu la connexion — le vrai client. La premiere valeur, elle, est ce que
+    // le client a bien voulu ecrire : un mandataire qui *ajoute* (au lieu de
+    // *remplacer*, reglage par defaut frequent) la laisse intacte, et la croire
+    // rendait le budget forgeable a chaque requete — une IP differente par appel
+    // suffisait a contourner le quota par client (red-team 8b). La derniere
+    // entree est celle du saut de confiance immediat, la seule qu'on n'ait pas
+    // laisse l'attaquant choisir.
+    let dernier = transmis.split(',').next_back().unwrap_or("").trim();
+    match dernier.parse::<IpAddr>() {
         Ok(ip) => Some(ip),
         Err(_) => Some(pair),
     }
@@ -1102,6 +1112,23 @@ fn lire_requete(flux: &TcpStream, echeance: std::time::Instant) -> Result<Reques
             if clef == "host" && headers.contains_key("host") {
                 return Err("en-tete Host en double");
             }
+            // --- Meme raison pour `Content-Length` en double.
+            //
+            // La table gardait la derniere valeur ; deux `Content-Length`
+            // discordants sont l'autre moitie classique de la contrebande de
+            // requetes (CL.CL). On refuse au lieu de choisir. Red-team 8b.
+            if clef == "content-length" && headers.contains_key("content-length") {
+                return Err("en-tete Content-Length en double");
+            }
+            // --- `Transfer-Encoding` n'est pas gere, donc pas tolere.
+            //
+            // Le corps est determine uniquement par `Content-Length`. Accepter
+            // en silence un `Transfer-Encoding: chunked` qu'on n'interprete pas,
+            // c'est ouvrir la desynchronisation TE.CL avec un mandataire qui, lui,
+            // l'interprete. On refuse toute requete qui en porte un.
+            if clef == "transfer-encoding" {
+                return Err("Transfer-Encoding non supporte");
+            }
             headers.insert(clef, v.trim().to_string());
         }
         expire(echeance)?;
@@ -1110,10 +1137,14 @@ fn lire_requete(flux: &TcpStream, echeance: std::time::Instant) -> Result<Reques
         return Err("trop d'en-tetes");
     }
 
-    let taille: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // Un `Content-Length` present mais illisible (valeur multiple « 5, 6 »,
+    // caracteres parasites) est ambigu : on refuse plutot que de retomber en
+    // silence sur zero, ce qui laisserait des octets non lus etre relus comme
+    // une seconde requete par un mandataire. Red-team 8b.
+    let taille: usize = match headers.get("content-length") {
+        None => 0,
+        Some(v) => v.trim().parse().map_err(|_| "Content-Length illisible")?,
+    };
     if taille > MAX_BODY {
         return Err("corps de requete trop grand");
     }
@@ -1918,9 +1949,16 @@ mod tests {
         assert_eq!(adresse_client(Some(lointain), &h), Some(lointain));
         assert_eq!(adresse_client(None, &h), None);
 
-        // Depuis la boucle locale, l'en-tete est celui du mandataire : on lit
-        // la premiere adresse, meme si une chaine suit.
-        h.insert("x-forwarded-for".into(), "198.51.100.7, 10.0.0.1".into());
+        // Depuis la boucle locale, l'en-tete vient du mandataire. On lit la
+        // DERNIERE adresse : celle que le mandataire a ajoutee au bout, le vrai
+        // client. Ici un attaquant a prefixe une adresse forgee (1.2.3.4) en
+        // pariant sur un mandataire qui AJOUTE au lieu de remplacer ; on prend la
+        // derniere, sa forgerie ne choisit donc pas son identite. Red-team 8b.
+        h.insert("x-forwarded-for".into(), "1.2.3.4, 198.51.100.7".into());
+        assert_eq!(adresse_client(Some(bouclage), &h), Some(visiteur));
+
+        // Une seule valeur : premier et dernier coincident.
+        h.insert("x-forwarded-for".into(), "198.51.100.7".into());
         assert_eq!(adresse_client(Some(bouclage), &h), Some(visiteur));
 
         // Depuis ailleurs, le meme en-tete est une forgerie : ignore.
