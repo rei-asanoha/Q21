@@ -1901,8 +1901,26 @@ impl Chain {
                     }
                 }
                 for ab in &corps_ancienne {
-                    self.connect(ab, now)
-                        .expect("la chaine d'origine doit se revalider");
+                    if self.connect(ab, now).is_err() {
+                        // La chaine d'origine ne se revalide pas — ce qui ne
+                        // devrait jamais arriver, ces blocs etant actifs et
+                        // valides il y a un instant. L'ancienne version plantait
+                        // ici (`expect`) : un `panic` sur une routine de
+                        // consensus, donc l'arret du noeud. La red-team 8b l'a
+                        // signale ; on n'a pas su le declencher (le chemin est
+                        // deterministe), mais un plantage n'est pas la bonne
+                        // reponse. On redescend plutot au point de fourche — un
+                        // ancetre PROUVE valide, donc un etat toujours coherent,
+                        // seulement plus court — et on rend la main. Le noeud
+                        // repartira de la en se resynchronisant aupres de ses
+                        // pairs, sans jamais servir un etat incoherent.
+                        while self.active.len() > fourche + 1 {
+                            if !self.disconnect() {
+                                break;
+                            }
+                        }
+                        return Err(ChainError::Validation(e));
+                    }
                 }
                 return Err(ChainError::Validation(e));
             }

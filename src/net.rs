@@ -214,6 +214,25 @@ pub const PING_APRES: Duration = Duration::from_secs(45);
 /// qui repond a autre chose reste vivant.
 pub const SILENCE_MAX: Duration = Duration::from_secs(100);
 
+/// Delai maximal pour terminer la poignee de main.
+///
+/// Une connexion entrante qui ne s'est pas presentee — `Version` **puis**
+/// `VerAck` — dans ce delai est fermee.
+///
+/// # Le defaut que ce delai ferme
+///
+/// Le seul controle de vie etait le silence depuis la derniere trame, et
+/// **toute** trame rafraichit ce repere, y compris un `Ping` recu avant la
+/// poignee de main (auquel on repond un `Pong` sans exiger la presentation).
+/// Un attaquant pouvait donc ouvrir des connexions entrantes, envoyer un `Ping`
+/// toutes les quarante secondes, et ne jamais se presenter : la connexion
+/// restait « vivante » pour toujours, `handshaked` faux. Quelques groupes /16
+/// suffisaient a occuper les vingt-quatre places entrantes et a fermer la porte
+/// aux nouveaux venus honnetes — un deni de service sur l'accessibilite d'un
+/// portier, trouve par la red-team de phase 8b. Une echeance de poignee de main
+/// retire ces connexions inabouties, quelle que soit leur activite de surface.
+pub const DELAI_POIGNEE_MAIN: Duration = Duration::from_secs(30);
+
 /// Debit soutenu accorde a un pair pour le service d'amorce, en octets par
 /// seconde.
 pub const AMORCE_DEBIT_PAR_SEC: u64 = 2 * 1024 * 1024;
@@ -438,6 +457,11 @@ struct Peer {
     derniere_reception: Instant,
     /// Instant du dernier `Ping` envoye et resté sans reponse.
     ping_en_attente: Option<Instant>,
+    /// Instant d'ouverture de la connexion, fige a la creation. Sert l'echeance
+    /// de poignee de main : voir [`DELAI_POIGNEE_MAIN`]. A la difference de
+    /// `derniere_reception`, aucune trame ne le repousse — une connexion qui ne
+    /// se presente pas ne peut donc pas prolonger sa place en s'agitant.
+    instant_connexion: Instant,
     /// Nombre d'en-tetes recus qui ne se rattachent a rien de connu.
     ///
     /// Compte les signes que ce pair est sur une autre chaine. Sans ce compteur,
@@ -946,6 +970,13 @@ impl Node {
                 let silence = maintenant.duration_since(p.derniere_reception);
                 if silence >= SILENCE_MAX {
                     morts.push(*id);
+                } else if !p.handshaked
+                    && maintenant.duration_since(p.instant_connexion) >= DELAI_POIGNEE_MAIN
+                {
+                    // Poignee de main jamais terminee dans le delai : la place
+                    // entrante ne doit pas rester squattee par une connexion qui
+                    // ne fait que s'agiter. Voir DELAI_POIGNEE_MAIN.
+                    morts.push(*id);
                 } else if silence >= PING_APRES && p.ping_en_attente.is_none() {
                     p.ping_en_attente = Some(maintenant);
                     a_pinger.push((*id, p.sortie.clone()));
@@ -1083,6 +1114,7 @@ impl Node {
                     orphelins_consecutifs: 0,
                     derniere_reception: Instant::now(),
                     ping_en_attente: None,
+                    instant_connexion: Instant::now(),
                 },
             );
         }
@@ -1770,29 +1802,42 @@ impl Node {
 
                 Message::Tx(t) => {
                     self.stats.tx_recues.fetch_add(1, Ordering::Relaxed);
-                    // --- Defense : le budget de transactions du pair.
+                    // --- Defense : le budget de transactions du pair, debite
+                    // AVANT tout calcul couteux.
                     //
-                    // Une transaction deja connue n'est pas comptee : la
-                    // relayer plusieurs fois est le comportement normal du
-                    // reseau. Ce qui est compte, c'est ce qui force une
-                    // verification — donc tout ce qui est inedit.
-                    let txid = t.txid();
-                    let inedite = !g.mempool.contains(&txid);
-                    let lire = !inedite
-                        || g.peers
-                            .get_mut(&id)
-                            .map(|p| {
-                                p.seau_tx.autoriser_avec(
-                                    1,
-                                    Instant::now(),
-                                    TX_SEAU_MAX,
-                                    TX_DEBIT_PAR_SEC,
-                                )
-                            })
-                            .unwrap_or(false);
-                    if !lire {
-                        // Au-dela du budget, on ne lit pas : c'est le pair
-                        // qui attend, pas le noeud. Insister coute des points.
+                    // # Le defaut que ce debit anticipe ferme
+                    //
+                    // La version precedente ne comptait que les transactions
+                    // *inedites* : `lire = !inedite || seau`. Mais pour savoir si
+                    // une transaction est inedite, il faut d'abord son identifiant
+                    // — `t.txid()`, une empreinte de toute la transaction, jusqu'a
+                    // plusieurs mebioctets. En rejouant en boucle une meme grosse
+                    // transaction *deja connue*, un pair forcait donc ce calcul a
+                    // chaque message, sous le verrou global, sans jamais toucher
+                    // le seau : le budget gardait le cout de *valider* une
+                    // transaction, jamais celui de *decider* qu'on la connait
+                    // deja. Deni de service par epuisement du processeur, trouve
+                    // par la red-team de phase 8b.
+                    //
+                    // On debite donc un jeton pour *chaque* message `Tx`, avant
+                    // l'empreinte. Un pair honnete ne rejoue pas une transaction
+                    // qu'il a deja envoyee : son budget n'en est pas affecte. Un
+                    // pair qui inonde est refuse sans qu'on ait rien hache.
+                    let autorise = g
+                        .peers
+                        .get_mut(&id)
+                        .map(|p| {
+                            p.seau_tx.autoriser_avec(
+                                1,
+                                Instant::now(),
+                                TX_SEAU_MAX,
+                                TX_DEBIT_PAR_SEC,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if !autorise {
+                        // Au-dela du budget, on ne lit pas — et surtout on ne
+                        // hache pas. Insister coute des points.
                         if let Some(p) = g.peers.get_mut(&id) {
                             p.ban_score += MISCONDUCT_MALFORMED;
                             if p.ban_score >= BAN_THRESHOLD {
@@ -1800,50 +1845,54 @@ impl Node {
                                 couper = true;
                             }
                         }
-                    }
-                    let hauteur = g.chain.height();
-                    // Sur une reference, jamais sur une copie : dupliquer le jeu
-                    // d'UTXO a chaque transaction recue coutait des centaines de
-                    // mebioctets par message sur une chaine reelle, sous le
-                    // verrou global — un pair bavard suffisait a figer le noeud.
-                    // Le reemprunt `&mut *g` separe les champs de la garde.
-                    let partage = &mut *g;
-                    let resultat = if lire {
-                        partage
-                            .mempool
-                            .accept(&t, &partage.chain.utxo, magie_reseau, hauteur)
                     } else {
-                        // Non lue : rien a relayer, rien a sanctionner de plus.
-                        Err(crate::mempool::MempoolError::DejaPresent)
-                    };
-                    match resultat {
-                        Ok(txid) => {
-                            let autres: Vec<u64> =
-                                g.peers.keys().copied().filter(|p| *p != id).collect();
-                            for p in autres {
-                                envois.push(Envoi {
-                                    peer: p,
-                                    message: Message::Inv(vec![InvItem {
-                                        kind: InvKind::Tx,
-                                        hash: txid,
-                                    }]),
-                                });
+                        let txid = t.txid();
+                        let inedite = !g.mempool.contains(&txid);
+                        let hauteur = g.chain.height();
+                        // Sur une reference, jamais sur une copie : dupliquer le
+                        // jeu d'UTXO a chaque transaction recue coutait des
+                        // centaines de mebioctets par message sur une chaine
+                        // reelle, sous le verrou global — un pair bavard suffisait
+                        // a figer le noeud. Le reemprunt `&mut *g` separe les
+                        // champs de la garde.
+                        let partage = &mut *g;
+                        let resultat = if inedite {
+                            partage
+                                .mempool
+                                .accept(&t, &partage.chain.utxo, magie_reseau, hauteur)
+                        } else {
+                            // Deja connue : rien a revalider, rien a relayer.
+                            Err(crate::mempool::MempoolError::DejaPresent)
+                        };
+                        match resultat {
+                            Ok(txid) => {
+                                let autres: Vec<u64> =
+                                    g.peers.keys().copied().filter(|p| *p != id).collect();
+                                for p in autres {
+                                    envois.push(Envoi {
+                                        peer: p,
+                                        message: Message::Inv(vec![InvItem {
+                                            kind: InvKind::Tx,
+                                            hash: txid,
+                                        }]),
+                                    });
+                                }
                             }
-                        }
-                        Err(e) => {
-                            // Une transaction refusee n'est pas forcement une
-                            // agression : elle peut etre deja connue, ou
-                            // depasser une sortie qu'un bloc vient de
-                            // consommer. Mais une signature fausse, une clef
-                            // qui ne correspond pas au verrou, une forme
-                            // incorrecte ou une valeur non conservee ne
-                            // viennent que d'un pair qui l'a fabriquee.
-                            if Self::transaction_invalide_en_soi(&e) {
-                                if let Some(p) = g.peers.get_mut(&id) {
-                                    p.ban_score += MISCONDUCT_BAD_TX;
-                                    if p.ban_score >= BAN_THRESHOLD {
-                                        self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
-                                        couper = true;
+                            Err(e) => {
+                                // Une transaction refusee n'est pas forcement une
+                                // agression : elle peut etre deja connue, ou
+                                // depasser une sortie qu'un bloc vient de
+                                // consommer. Mais une signature fausse, une clef
+                                // qui ne correspond pas au verrou, une forme
+                                // incorrecte ou une valeur non conservee ne
+                                // viennent que d'un pair qui l'a fabriquee.
+                                if Self::transaction_invalide_en_soi(&e) {
+                                    if let Some(p) = g.peers.get_mut(&id) {
+                                        p.ban_score += MISCONDUCT_BAD_TX;
+                                        if p.ban_score >= BAN_THRESHOLD {
+                                            self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                                            couper = true;
+                                        }
                                     }
                                 }
                             }
@@ -1851,9 +1900,20 @@ impl Node {
                     }
                 }
 
+                Message::GetAddr if !handshaked => {
+                    // Servir le carnet avant la poignee de main offrait a un
+                    // scanner anonyme la totalite des adresses connues, et une
+                    // amplification d'environ 600x (24 octets demandes, jusqu'a
+                    // 16 Ko rendus) construite sous le verrou global — ce que le
+                    // reste du code refuse deja (« rien n'est lu avant la poignee
+                    // de main »). On aligne GetAddr sur GetHeaders. Red-team 8b.
+                }
+
                 Message::GetAddr => {
-                    // Le carnet d'abord — il est reparti sur les groupes — puis
-                    // les pairs en cours, qui sont par construction joignables.
+                    // Meme apres la poignee de main, la reponse est bornee par le
+                    // seau : sa taille reelle est debitee, de sorte qu'une rafale
+                    // de `getaddr` ne se transforme pas en amplification de bande
+                    // passante sous le verrou.
                     let mut v = g.carnet.a_annoncer(crate::wire::MAX_ADDR);
                     if v.len() < crate::wire::MAX_ADDR {
                         for p in g.peers.values() {
@@ -1873,10 +1933,21 @@ impl Node {
                         }
                     }
                     if !v.is_empty() {
-                        envois.push(Envoi {
-                            peer: id,
-                            message: Message::Addr(v),
-                        });
+                        // ~20 octets par adresse ; on debite la taille servie du
+                        // seau d'amorce du pair. Au-dela du budget, on ne repond
+                        // pas : le pair attend, le noeud ne s'epuise pas.
+                        let cout = (v.len() as u64).saturating_mul(20);
+                        let autorise = g
+                            .peers
+                            .get_mut(&id)
+                            .map(|p| p.seau_amorce.autoriser(cout, Instant::now()))
+                            .unwrap_or(false);
+                        if autorise {
+                            envois.push(Envoi {
+                                peer: id,
+                                message: Message::Addr(v),
+                            });
+                        }
                     }
                 }
 
@@ -2780,6 +2851,7 @@ mod tests {
                 orphelins_consecutifs: 0,
                 derniere_reception: Instant::now(),
                 ping_en_attente: None,
+                instant_connexion: Instant::now(),
             },
         );
     }

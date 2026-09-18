@@ -145,7 +145,17 @@ impl SchemeId {
     pub const fn allowed_on(self, network: crate::address::Network) -> bool {
         match self {
             SchemeId::LamportOts => !matches!(network, crate::address::Network::Mainnet),
-            _ => true,
+            SchemeId::MlDsa65 | SchemeId::MlDsa87 => true,
+            // SPHINCS+ est reserve dans l'enumeration mais n'a aucune
+            // implementation de verification ([`Self::disponible`] est faux
+            // partout, sans meme dependre d'une option de compilation). Tant
+            // qu'il n'est pas implemente, le protocole ne l'autorise nulle part :
+            // permettre d'en verrouiller une sortie laissait bruler des fonds que
+            // PERSONNE ne pourrait jamais depenser — la verification rendrait
+            // toujours `SchemaNonDisponible`. Combustion silencieuse trouvee par
+            // la red-team de phase 8b. Le jour ou un dos-arriere existe, ce bras
+            // s'ouvre — pas avant.
+            SchemeId::SphincsPlus => false,
         }
     }
 

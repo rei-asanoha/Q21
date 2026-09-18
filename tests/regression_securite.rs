@@ -128,9 +128,14 @@ fn tout_oncle_est_refuse_l_authentique_comme_le_forge() {
     // Un oncle forge : cible choisie par l'attaquant, aucun travail.
     let parent = c.tip_id();
     let forge = faux_oncle(parent, hauteur - 1, 0);
-    assert!(
-        Q21Pow::new(RESEAU).check(&forge).is_ok(),
-        "le montage de l'attaque doit rester valide contre sa propre cible"
+    // Depuis la red-team 8b, le plancher de difficulte est applique DANS la
+    // fonction de travail : la cible facile choisie par l'attaquant
+    // (0x2100_ffff, plus facile que INITIAL_BITS) est desormais refusee par
+    // `check` lui-meme, en plus de l'etre par la regle des oncles ci-dessous.
+    assert_eq!(
+        Q21Pow::new(RESEAU).check(&forge),
+        Err(pow::PowError::CibleTropFacile),
+        "le plancher doit refuser la cible facile de l'attaquant"
     );
     let b = c
         .mine_block_with_uncles(
