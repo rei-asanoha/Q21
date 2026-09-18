@@ -777,7 +777,18 @@ impl Chain {
         let mut hauteur = instantane.height;
         // On retient le chemin au passage : c'est exactement la chaine dont il
         // faut ensuite verifier le travail, et la reparcourir serait du gachis.
-        let mut chemin: Vec<BlockHeader> = Vec::with_capacity(instantane.height as usize + 1);
+        //
+        // La capacite se borne au nombre d'en-tetes reellement fournis, JAMAIS a
+        // `instantane.height` : cette hauteur vient d'un instantane qu'un pair
+        // decode et controle (elle n'est validee qu'a l'interieur de la boucle
+        // ci-dessous). Une hauteur adverse de `u64::MAX` faisait deborder
+        // `as usize + 1`, ou tentait une allocation de plusieurs teraoctets, et
+        // faisait AVORTER le processus (overflow-checks, panic=abort) : un
+        // plantage a distance, fiable, de tout noeud en synchronisation rapide
+        // depuis ce pair. Trouve par la red-team de phase 8b (2e campagne). La
+        // boucle ne peut de toute facon pas depasser le nombre d'en-tetes
+        // presents, chaque pas exigeant une entree dans `par_id`.
+        let mut chemin: Vec<BlockHeader> = Vec::with_capacity(headers.len());
         loop {
             let Some(h) = par_id.get(&courant) else {
                 return Err(AdoptionError::EntetesInauthentiques);
@@ -925,7 +936,14 @@ impl Chain {
             }
             poignees
                 .into_iter()
-                .map(|p| p.join().unwrap_or(Ok(())))
+                // Un fil de verification qui PANIQUE est un echec, jamais un
+                // succes : le traiter comme `Ok(())` laissait un segment dont la
+                // preuve de travail a fait paniquer le verificateur passer pour
+                // valide — une adoption a l'ouverture. Red-team 8b (2e campagne).
+                .map(|p| {
+                    p.join()
+                        .unwrap_or(Err(AdoptionError::EntetesInauthentiques))
+                })
                 .collect()
         });
         // Les segments sont ranges par hauteur croissante : prendre la premiere

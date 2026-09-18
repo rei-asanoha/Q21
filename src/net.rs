@@ -266,21 +266,41 @@ fn signaler_l_incapacite(schema: crate::sig::SchemeId) {
     }
 }
 
-/// Transactions inedites qu'un pair peut pousser d'emblee.
-pub const TX_SEAU_MAX: u64 = 64;
+/// Budget de verification qu'un pair peut consommer d'emblee, en signatures.
+///
+/// Le seau est desormais denomme en **verifications de signature**, pas en
+/// transactions : c'est la verification qui coute, et une transaction en porte
+/// autant que d'entrees. Le plafond couvre la plus grosse transaction valide
+/// possible — bornee par le poids, de l'ordre de quelques centaines d'entrees —
+/// de sorte qu'aucune transaction honnete ne soit jamais refusee faute de
+/// budget : elle draine le seau, puis il se remplit. Voir le debit ci-dessous.
+pub const TX_SEAU_MAX: u64 = 512;
 
-/// Debit soutenu de transactions inedites accorde a un pair, par seconde.
+/// En deca de ce nombre d'entrees, une transaction refusee faute de budget est
+/// traitee comme un flot de messages (sanctionnable) ; au-dela, comme une seule
+/// grosse demande possiblement honnete (differee sans sanction). Voir le bras
+/// `Message::Tx`.
+pub const SEUIL_FLOT_ENTREES: u64 = 16;
+
+/// Debit soutenu de verifications de signature accorde a un pair, par seconde.
 ///
-/// # Le defaut que ceci ferme
+/// # Le defaut que ceci ferme, et sa vraie taille
 ///
-/// Une transaction poussee coute au recepteur, dans le pire cas, une
-/// verification de signature post-quantique **sous le verrou global** — de
-/// l'ordre de seize millisecondes pour ML-DSA-87. Sans budget, une seule
-/// connexion poussant une soixantaine de transactions par seconde a signature
-/// fausse suffisait a tenir le verrou en permanence : plus un bloc valide,
-/// plus un pair servi. Huit par seconde, c'est deux ordres de grandeur
-/// au-dessus de ce qu'un usage reel produit, et un ordre de grandeur en
-/// dessous de ce qui gene.
+/// Une transaction poussee coute au recepteur une verification de signature
+/// post-quantique **par entree**, sous le verrou global. La note precedente
+/// annoncait « seize millisecondes » par verification ML-DSA-87 ; la mesure
+/// reelle (banc `sig`, machine du bac a sable) est de l'ordre de **0,33 ms** —
+/// la note etait cinquante fois trop pessimiste. Le danger n'en disparait pas :
+/// rien ne bornait le nombre d'entrees d'une transaction (seul le poids la
+/// borne, ~271 entrees pour ML-DSA-87), et le budget se comptait en
+/// transactions, pas en verifications. Une transaction a nombreuses entrees,
+/// ou un flot de telles transactions, tenait donc le verrou bien au-dela de ce
+/// qu'un jeton par transaction laissait croire — red-team 8b, seconde campagne.
+///
+/// Desormais le seau se debite a proportion des entrees. A ce debit, le travail
+/// de verification qu'un pair peut imposer est borne a ~0,33 ms par unite, soit
+/// une fraction negligeable d'un cœur, tandis qu'une transaction ordinaire (une
+/// ou deux entrees) reste servie sans entrave.
 pub const TX_DEBIT_PAR_SEC: u64 = 8;
 
 /// Seau a jetons bornant ce qu'un pair peut se faire servir d'amorce.
@@ -1802,33 +1822,41 @@ impl Node {
 
                 Message::Tx(t) => {
                     self.stats.tx_recues.fetch_add(1, Ordering::Relaxed);
-                    // --- Defense : le budget de transactions du pair, debite
-                    // AVANT tout calcul couteux.
+                    // --- Defense : le budget du pair, debite AVANT tout calcul
+                    // couteux, et A PROPORTION du travail de verification.
                     //
-                    // # Le defaut que ce debit anticipe ferme
+                    // # Les deux defauts que ce debit ferme
                     //
-                    // La version precedente ne comptait que les transactions
-                    // *inedites* : `lire = !inedite || seau`. Mais pour savoir si
-                    // une transaction est inedite, il faut d'abord son identifiant
-                    // — `t.txid()`, une empreinte de toute la transaction, jusqu'a
-                    // plusieurs mebioctets. En rejouant en boucle une meme grosse
-                    // transaction *deja connue*, un pair forcait donc ce calcul a
-                    // chaque message, sous le verrou global, sans jamais toucher
-                    // le seau : le budget gardait le cout de *valider* une
-                    // transaction, jamais celui de *decider* qu'on la connait
-                    // deja. Deni de service par epuisement du processeur, trouve
-                    // par la red-team de phase 8b.
+                    // 1. Rejeu (red-team 8b, 1re campagne). Pour savoir si une
+                    //    transaction est inedite, il faut d'abord son identifiant
+                    //    `t.txid()`, une empreinte de toute la transaction. En
+                    //    rejouant une grosse transaction deja connue, un pair
+                    //    forcait ce calcul a chaque message. On debite donc AVANT
+                    //    l'empreinte.
+                    // 2. Verification (red-team 8b, 2e campagne). Une transaction
+                    //    coute une signature post-quantique PAR ENTREE, sous le
+                    //    verrou global. Rien ne borne le nombre d'entrees (seul le
+                    //    poids le fait, ~271), et l'ancien budget comptait une
+                    //    unite PAR TRANSACTION : une transaction a nombreuses
+                    //    entrees, ou un flot de telles, tenait le verrou bien
+                    //    au-dela. On debite donc a proportion des entrees.
                     //
-                    // On debite donc un jeton pour *chaque* message `Tx`, avant
-                    // l'empreinte. Un pair honnete ne rejoue pas une transaction
-                    // qu'il a deja envoyee : son budget n'en est pas affecte. Un
-                    // pair qui inonde est refuse sans qu'on ait rien hache.
+                    // Le cout est plafonne au seau : la plus grosse transaction
+                    // valide draine le budget mais n'est jamais refusee. Au-dela
+                    // du budget, on DIFFERE sans bannir — une consolidation a
+                    // nombreuses entrees peut etre parfaitement honnete, et
+                    // l'ancien bannissement sur depassement pouvait exclure un
+                    // relais legitime (un pair ne decroit jamais son score). Le
+                    // pair renverra quand son seau se remplit. Une transaction
+                    // reellement invalide, elle, est toujours sanctionnee plus
+                    // bas (`transaction_invalide_en_soi`).
+                    let cout = (t.inputs.len() as u64).clamp(1, TX_SEAU_MAX);
                     let autorise = g
                         .peers
                         .get_mut(&id)
                         .map(|p| {
                             p.seau_tx.autoriser_avec(
-                                1,
+                                cout,
                                 Instant::now(),
                                 TX_SEAU_MAX,
                                 TX_DEBIT_PAR_SEC,
@@ -1836,13 +1864,24 @@ impl Node {
                         })
                         .unwrap_or(false);
                     if !autorise {
-                        // Au-dela du budget, on ne lit pas — et surtout on ne
-                        // hache pas. Insister coute des points.
-                        if let Some(p) = g.peers.get_mut(&id) {
-                            p.ban_score += MISCONDUCT_MALFORMED;
-                            if p.ban_score >= BAN_THRESHOLD {
-                                self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
-                                couper = true;
+                        // Depassement de budget, deux cas distincts :
+                        // - petite transaction : le pair envoie trop de MESSAGES,
+                        //   c'est un flot. On sanctionne, comme toujours.
+                        // - grosse transaction (nombreuses entrees) : un seul
+                        //   message a demande beaucoup de travail d'un coup. Elle
+                        //   peut etre honnete (consolidation). On DIFFERE sans
+                        //   bannir — le pair renverra quand son seau se remplit —
+                        //   car un score de ban ne decroit jamais et un relais
+                        //   legitime finirait par etre exclu.
+                        // Dans les deux cas : ni empreinte, ni verification. Le
+                        // travail est borne parce qu'on s'arrete ici.
+                        if cout <= SEUIL_FLOT_ENTREES {
+                            if let Some(p) = g.peers.get_mut(&id) {
+                                p.ban_score += MISCONDUCT_MALFORMED;
+                                if p.ban_score >= BAN_THRESHOLD {
+                                    self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                                    couper = true;
+                                }
                             }
                         }
                     } else {
