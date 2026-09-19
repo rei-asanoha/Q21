@@ -74,8 +74,8 @@ pub struct Request {
     /// L'adresse du client, telle que le serveur peut la connaitre.
     ///
     /// Celle de la connexion TCP — sauf derriere le mandataire local, ou c'est
-    /// la premiere adresse de `X-Forwarded-For`. Voir [`adresse_client`]. Elle
-    /// sert a ce que le budget d'un client ne soit pas celui de tous.
+    /// la **derniere** adresse de `X-Forwarded-For`. Voir [`adresse_client`].
+    /// Elle sert a ce que le budget d'un client ne soit pas celui de tous.
     pub client: Option<IpAddr>,
 }
 
@@ -86,14 +86,29 @@ pub struct Request {
 /// En mode public, le noeud n'ecoute que sur la boucle locale et c'est le
 /// mandataire qui lui parle : toutes les connexions viennent de `127.0.0.1`,
 /// et sans l'en-tete `X-Forwarded-For` que le mandataire pose, tous les
-/// visiteurs seraient un seul et meme client. On lit donc la **premiere**
-/// adresse de cet en-tete — celle du client, le mandataire ayant efface ce
-/// qu'il aurait pu recevoir avant de poser la sienne.
+/// visiteurs seraient un seul et meme client. On lit donc la **derniere**
+/// adresse de cet en-tete — celle que le mandataire a ajoutee lui-meme, la
+/// seule que le client n'a pas pu choisir.
 ///
 /// Un `X-Forwarded-For` qui arrive d'ailleurs que de la boucle locale n'est
 /// pas celui du mandataire : c'est un client qui l'ecrit lui-meme. Le croire
 /// laisserait ce client choisir son identite, donc son budget, et en changer a
 /// chaque requete. On garde alors l'adresse de la connexion, et rien d'autre.
+///
+/// # Un seul saut de confiance
+///
+/// Ce choix suppose **un** mandataire entre le visiteur et le noeud : celui
+/// que l'operateur installe devant l'explorateur (`--public` derriere Caddy ou
+/// nginx). Si l'on empile un second intermediaire de confiance — un CDN devant
+/// ce mandataire —, la derniere adresse est celle du CDN, et tous les
+/// visiteurs se partagent alors le budget d'un seul client : le comptage se
+/// degrade, il ne devient pas forgeable. Pour retrouver un comptage par
+/// visiteur dans ce montage, c'est au mandataire local de reecrire l'en-tete
+/// avec l'adresse que le CDN lui transmet (`CF-Connecting-IP`, `True-Client-IP`
+/// ou l'equivalent), et non a ce noeud de deviner combien de sauts sont de
+/// confiance : chaque saut cru sur parole est un saut que le visiteur peut
+/// imiter. La confiance se configure a l'endroit ou elle existe, pas un cran
+/// plus loin.
 ///
 /// Une valeur illisible ne fait pas echouer la requete : on retombe sur
 /// l'adresse de la connexion, et le client est traite avec le mandataire.

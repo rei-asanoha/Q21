@@ -513,6 +513,24 @@ pub const MAX_UNCLE_AGE: u64 = 7;
 /// d'evaluation.
 pub const BODY_WINDOW: usize = MAX_REORG_DEPTH as usize + 288;
 
+/// Corps de blocs conserves en memoire, en octets — la seconde borne.
+///
+/// [`BODY_WINDOW`] compte des blocs ; un bloc pese entre quelques centaines
+/// d'octets et [`MAX_BLOCK_SIZE`]. Mille corps de 4 Mio font 4 Gio : un mineur
+/// qui produit de gros blocs faisait enfler cette reserve bien au-dela de ce
+/// qu'un Raspberry ou un petit VPS tolere (red-team de phase 8b, 2e campagne,
+/// point 6d). On borne donc aussi en octets : des que la reserve depasse ce
+/// budget, les corps les plus anciens quittent la memoire, meme s'ils sont
+/// dans la fenetre en blocs — le disque les garde, et [`Chain::block_by_id`]
+/// les y relit. Avec des blocs ordinaires, c'est la fenetre en blocs qui mord
+/// la premiere ; avec des blocs pleins, c'est celle-ci, a 256 blocs.
+///
+/// Un gigaoctet : la moitie de la table de preuve de travail d'un mineur, et
+/// de quoi garder en memoire huit heures de blocs pleins.
+///
+/// [`Chain::block_by_id`]: crate::chain::Chain::block_by_id
+pub const BODY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Part de la subvention versee au mineur d'un oncle, en pourcentage.
 ///
 /// Levier C du livre blanc : payer le travail orphelin d'un mineur mal connecte

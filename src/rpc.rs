@@ -714,7 +714,7 @@ impl RpcContext {
             ("getsupply", "Masse monetaire emise et plafond"),
             (
                 "getempreinteutxo",
-                "Empreinte MuHash du jeu d'UTXO a la tete (engagement sur l'etat)",
+                "Empreinte de l'etat a la tete (MuHash du jeu d'UTXO et total emis lies)",
             ),
             ("listmethods", "Cette liste"),
             ("getbalance", "[portefeuille] Solde depensable"),
@@ -904,19 +904,22 @@ impl RpcContext {
             .build()
     }
 
-    /// Engagement sur l'etat de la monnaie : l'empreinte MuHash du jeu d'UTXO a
-    /// la tete, avec le nombre de sorties et le total en circulation.
+    /// Engagement sur l'etat de la monnaie a la tete : l'**empreinte d'etat**
+    /// (celle que l'on recopie pour adopter un instantane — MuHash et total
+    /// emis lies, voir [`q21_core::state::empreinte_etat`]), le MuHash seul,
+    /// le nombre de sorties et le total en circulation.
     ///
-    /// Le calcul parcourt tout le jeu d'UTXO — c'est un appel qu'on fait a la
-    /// demande, quand on veut comparer deux noeuds ou verifier un instantane, pas
-    /// une valeur qu'on rafraichit en boucle. `getinfo` reste donc leger.
+    /// C'est un appel qu'on fait a la demande, quand on veut comparer deux
+    /// noeuds ou verifier un instantane, pas une valeur qu'on rafraichit en
+    /// boucle. `getinfo` reste donc leger.
     fn getempreinteutxo(&self) -> Json {
-        let (hauteur, tete, entrees, emis, empreinte) = self.node.with_chain(|c| {
+        let (hauteur, tete, entrees, emis, empreinte, muhash) = self.node.with_chain(|c| {
             (
                 c.height(),
                 c.tip_id().to_hex(),
                 c.utxo_count(),
                 c.total_issued(),
+                c.empreinte_etat().to_hex(),
                 c.utxo_commitment().to_hex(),
             )
         });
@@ -926,6 +929,7 @@ impl RpcContext {
             .set("entrees", Json::u64(entrees as u64))
             .set("total", montant(emis))
             .set("empreinte", Json::str(empreinte))
+            .set("muhash", Json::str(muhash))
             .build()
     }
 
@@ -2989,9 +2993,20 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("champ empreinte");
         assert_eq!(empreinte.len(), 64, "un condensat de 256 bits en hexa");
-        // Elle doit egaler ce que la chaine calcule directement.
-        let attendue = c.node.with_chain(|ch| ch.utxo_commitment().to_hex());
+        // Elle doit egaler ce que la chaine calcule directement : l'empreinte
+        // d'etat, qui lie le MuHash au total emis, et le MuHash seul a cote.
+        let (attendue, muhash) = c
+            .node
+            .with_chain(|ch| (ch.empreinte_etat().to_hex(), ch.utxo_commitment().to_hex()));
         assert_eq!(empreinte, attendue);
+        assert_eq!(
+            r.get("muhash").and_then(|v| v.as_str()),
+            Some(muhash.as_str())
+        );
+        assert_ne!(
+            empreinte, muhash,
+            "l'empreinte d'etat n'est pas le MuHash nu"
+        );
     }
 
     #[test]

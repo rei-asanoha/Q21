@@ -683,6 +683,10 @@ pub struct Stats {
     pub compacts_reconstruits: AtomicU64,
     /// Annonces compactes refusees par le seau, sans reconstruction.
     pub compacts_refuses: AtomicU64,
+    /// Annonces compactes dont l'en-tete a ete refuse **avant** toute
+    /// reconstruction : hauteur, difficulte, horodatage ou travail faux. Rien
+    /// n'a ete fouille ni alloue pour elles ; voir [`Chain::verifier_entete`].
+    pub compacts_entete_refuse: AtomicU64,
     pub pairs_bannis: AtomicU64,
     /// Blocs dont on ignorait le parent au moment de leur arrivee.
     ///
@@ -1646,6 +1650,48 @@ impl Node {
                                 if p.ban_score >= BAN_THRESHOLD {
                                     self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
                                     couper = true;
+                                }
+                            }
+                        } else if let Err(e) = g.chain.verifier_entete(&c.header, maintenant()) {
+                            // --- Defense : l'en-tete avant le corps (BIP 152).
+                            //
+                            // Le seau borne le NOMBRE d'annonces ; il ne dit
+                            // rien de leur valeur. Une annonce dont l'en-tete
+                            // ne porte pas le travail qu'impose sa position
+                            // faisait tout de meme fouiller le reservoir et
+                            // allouer la reconstruction, sous le verrou.
+                            // Desormais : hauteur, finalite, difficulte,
+                            // horodatage et travail sont verifies sur les
+                            // 160 octets de l'en-tete, et rien d'autre n'est
+                            // touche si l'un d'eux echoue. Ce sont les memes
+                            // controles que la soumission du bloc entier
+                            // appliquerait ; on ne fait que les avancer.
+                            //
+                            // Un en-tete faux ne vient que de celui qui l'a
+                            // fabrique : meme sanction qu'un bloc invalide,
+                            // et on ne redemande rien — son corps ne vaut
+                            // pas mieux.
+                            //
+                            // Exception : ce que ce binaire ne sait pas
+                            // lire n'est pas une faute du pair.
+                            self.stats
+                                .compacts_entete_refuse
+                                .fetch_add(1, Ordering::Relaxed);
+                            match e {
+                                crate::chain::ChainError::Validation(v)
+                                    if incapacite_locale(&v).is_some() =>
+                                {
+                                    signaler_l_incapacite(incapacite_locale(&v).expect("garde"));
+                                }
+                                _ => {
+                                    self.stats.blocs_invalides.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(p) = g.peers.get_mut(&id) {
+                                        p.ban_score += MISCONDUCT_BAD_BLOCK;
+                                        if p.ban_score >= BAN_THRESHOLD {
+                                            self.stats.pairs_bannis.fetch_add(1, Ordering::Relaxed);
+                                            couper = true;
+                                        }
+                                    }
                                 }
                             }
                         } else {

@@ -484,11 +484,17 @@ fn i_fenetre_d_annulation_courte_apres_reprise() {
     );
 }
 
-/// La règle anti-double-paiement d'oncle relit les corps des 9 derniers blocs.
-/// Sans fournisseur de corps, un nœud repris refuse tout : `HistoriqueIncomplet`.
-/// C'est un refus, pas un faux verdict — on le verrouille.
+/// La règle anti-double-paiement d'oncle relit les corps des 9 derniers blocs
+/// — quand des oncles sont possibles. Tant que `MAX_UNCLES` vaut zéro, aucun
+/// oncle n'a pu être réclamé : il n'y a rien à relire, et un nœud repris sans
+/// fournisseur de corps rend le **même verdict** qu'un nœud complet sur le bloc
+/// qui prolonge sa tête. Le jour où le protocole rouvre les oncles, la lecture
+/// des corps reprend d'elle-même, et sans fournisseur le verdict redevient un
+/// refus (`HistoriqueIncomplet`) — un refus, jamais une acceptation aveugle.
 #[test]
-fn j_sans_fournisseur_de_corps_un_noeud_repris_refuse_tout() {
+fn j_sans_fournisseur_de_corps_un_noeud_repris_rend_le_meme_verdict() {
+    use q21_core::consensus::MAX_UNCLES;
+
     let d = rep("sans-source");
     let (complet, _a) = chaine_sur_disque(&d, 20);
     let s = complet.snapshot().unwrap();
@@ -496,16 +502,28 @@ fn j_sans_fournisseur_de_corps_un_noeud_repris_refuse_tout() {
     let r = Chain::from_snapshot(RESEAU, s, &entetes).expect("reprise");
     let mut sans_source = r.chain; // aucun set_body_source
 
-    let t = horodatage(21);
-    let complet = complet;
-    let b = complet
+    // Le bloc qui prolonge la tête du nœud repris, miné par un nœud complet
+    // ramené à cette même hauteur.
+    let mut temoin = complet;
+    while temoin.height() > sans_source.height() {
+        assert!(temoin.disconnect(), "le temoin doit pouvoir redescendre");
+    }
+    let t = horodatage(sans_source.height() + 1);
+    let b = temoin
         .mine_block(Hash256([3u8; 32]), SchemeId::LamportOts, &[], t, ESSAIS)
         .unwrap();
-    // Le nœud repris n'a pas rejoué : il est à la hauteur de l'instantané.
-    // On lui soumet le bloc qui prolonge SA tête.
-    let v = sans_source.connect(&b, t + 1);
-    eprintln!("verdict sans fournisseur : {v:?}");
-    assert!(v.is_err(), "refus attendu, pas d'acceptation aveugle");
+    let attendu = temoin.connect(&b, t + 1).map(|_| ());
+    let v = sans_source.connect(&b, t + 1).map(|_| ());
+    eprintln!("verdict complet : {attendu:?} ; sans fournisseur : {v:?}");
+    if MAX_UNCLES == 0 {
+        assert!(attendu.is_ok(), "le temoin doit accepter son propre bloc");
+        assert_eq!(
+            v, attendu,
+            "sans oncle possible, l'absence de corps ne change pas le verdict"
+        );
+    } else {
+        assert!(v.is_err(), "refus attendu, pas d'acceptation aveugle");
+    }
 }
 
 // ===========================================================================

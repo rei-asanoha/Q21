@@ -437,6 +437,17 @@ borne de lui-même », plus bas). Ne mettez pas de `header_up X-Forwarded-For`
 dans ce bloc : vous remplaceriez cette adresse par une valeur fixe, et tous
 les visiteurs redeviendraient un seul client.
 
+Le nœud ne croit que **le dernier saut** : la dernière adresse de l'en-tête,
+celle que Caddy y ajoute lui-même. Si vous placez un second intermédiaire
+devant Caddy (un CDN, par exemple), cette dernière adresse devient celle du
+CDN, et tous les visiteurs se partagent alors un seul budget — le comptage se
+dégrade, il ne devient pas forgeable. Dans ce montage, c'est à Caddy de
+réécrire l'en-tête avec l'adresse que le CDN lui transmet (`header_up
+X-Forwarded-For {header.CF-Connecting-IP}` chez Cloudflare, l'équivalent
+ailleurs), et de n'accepter que les connexions venant des adresses du CDN. Le
+nœud, lui, ne devinera jamais combien de sauts sont de confiance : chaque saut
+cru sur parole est un saut qu'un visiteur peut imiter.
+
 ### 4.2 bis — Limiter les connexions par adresse
 
 Le Caddyfile ci-dessus ne limite ni le nombre de connexions ni le débit d'une

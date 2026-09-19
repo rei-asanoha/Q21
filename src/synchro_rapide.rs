@@ -298,15 +298,24 @@ impl Amorce {
     /// d'UTXO.
     ///
     /// L'instantane portable range (magie, version, reseau, hauteur, tete, emis,
-    /// empreinte, …). On lit l'empreinte a son decalage, ce qui permet a un pair
-    /// d'annoncer l'empreinte de son amorce sans la deserialiser entierement.
+    /// MuHash, …). On lit le total emis et le MuHash a leur decalage et on en
+    /// derive l'empreinte d'etat ([`crate::state::empreinte_etat`]), ce qui
+    /// permet a un pair d'annoncer l'empreinte de son amorce sans la
+    /// deserialiser entierement. C'est la meme valeur que
+    /// [`crate::state::Snapshot::empreinte`] sur l'instantane decode.
     pub fn empreinte_annoncee(&self) -> Option<Hash256> {
-        // magie(8) + version(4) + reseau(1) + hauteur(8) + tete(32) + emis(8)
-        const DECALAGE: usize = 8 + 4 + 1 + 8 + 32 + 8;
-        let fin = DECALAGE + 32;
-        self.instantane
-            .get(DECALAGE..fin)
-            .map(|s| Hash256(s.try_into().unwrap()))
+        // magie(8) + version(4) + reseau(1) + hauteur(8) + tete(32)
+        const DECALAGE_EMIS: usize = 8 + 4 + 1 + 8 + 32;
+        const DECALAGE_MUHASH: usize = DECALAGE_EMIS + 8;
+        let emis = self
+            .instantane
+            .get(DECALAGE_EMIS..DECALAGE_EMIS + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))?;
+        let muhash = self
+            .instantane
+            .get(DECALAGE_MUHASH..DECALAGE_MUHASH + 32)
+            .map(|s| Hash256(s.try_into().unwrap()))?;
+        Some(crate::state::empreinte_etat(muhash, emis))
     }
 
     /// La hauteur de l'instantane, lue a sa position.
@@ -656,11 +665,24 @@ mod tests {
             utxo,
             muhash,
         };
+        let empreinte = s.empreinte();
         let a = Amorce {
             instantane: s.to_portable_bytes(),
             entetes: vec![entete(0)],
             corps: Vec::new(),
         };
-        assert_eq!(a.empreinte_annoncee(), Some(muhash));
+        assert_eq!(a.empreinte_annoncee(), Some(empreinte));
+        // L'empreinte annoncee lie le total emis : un instantane au meme jeu
+        // mais a un autre total en porte une autre.
+        let mut autre = Snapshot::from_portable_bytes(&a.instantane, Network::Regtest).unwrap();
+        autre.emis -= 1;
+        let b = Amorce {
+            instantane: autre.to_portable_bytes(),
+            entetes: vec![entete(0)],
+            corps: Vec::new(),
+        };
+        assert_eq!(b.empreinte_annoncee(), Some(autre.empreinte()));
+        assert_ne!(b.empreinte_annoncee(), Some(empreinte));
+        assert_eq!(autre.muhash, muhash, "le MuHash, lui, n'a pas bouge");
     }
 }

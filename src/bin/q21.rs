@@ -2874,7 +2874,10 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
                  --tete {} --empreinte {}\n\n\
                  Comparez d'abord la tete et l'empreinte a celles qu'affiche une\n\
                  source de confiance (votre explorateur).\n",
-                s.tip, s.muhash, s.tip, s.muhash
+                s.tip,
+                s.empreinte(),
+                s.tip,
+                s.empreinte()
             );
             std::fs::write(d.join("amorce.txt"), &notice)
                 .map_err(|err| format!("ecriture de la notice : {err}"))?;
@@ -2966,6 +2969,23 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
             Chain::adopter_instantane(reseau, snap.clone(), &entetes, tete, empreinte)
                 .map_err(|e| format!("adoption refusee : {e}"))?;
 
+            // Les corps aussi, exactement comme sur la voie reseau : un dossier
+            // d'amorce fourni par un tiers pouvait porter les vrais en-tetes,
+            // le vrai instantane — et des corps arbitraires, copies tels quels.
+            // Le noeud les servait, et s'y heurtait a la premiere
+            // reorganisation pres de la tete. On ne copie que ce qui
+            // correspond, bloc par bloc, a l'en-tete de meme hauteur.
+            let (corps, souci) = BlockStore::new(d.join("corps.dat"))
+                .load_all()
+                .map_err(|e| format!("corps illisibles : {e}"))?;
+            if let Some(s) = souci {
+                return Err(format!(
+                    "adoption refusee : le fichier des corps est incomplet ou abime ({s})"
+                ));
+            }
+            q21_core::synchro_rapide::verifier_les_corps(reseau, &entetes, &corps)
+                .map_err(|e| format!("adoption refusee : {e}"))?;
+
             // Poser le dossier adopte.
             std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
             std::fs::copy(d.join("corps.dat"), chemin_blocs(datadir))
@@ -2997,7 +3017,7 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
                 snap.height
             );
             println!("  Tete       {}", snap.tip);
-            println!("  Empreinte  {}", snap.muhash);
+            println!("  Empreinte  {}", snap.empreinte());
             println!();
             println!("Lancez le noeud : il rejoint le reseau et rattrape la tete a partir de la.");
             println!(
@@ -3027,14 +3047,14 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
             println!("  Hauteur    {}", s.height);
             println!("  Tete       {}", s.tip);
             println!("  Sorties    {}", s.utxo.len());
-            println!("  Empreinte  {}", s.muhash);
+            println!("  Empreinte  {}", s.empreinte());
             println!();
             println!("Pour l'adopter sur une autre machine, la personne compare cette");
             println!("empreinte a celle qu'affiche une source de confiance (l'explorateur),");
             println!("puis la controle :");
             println!(
                 "  q21 instantane verifier <fichier> --empreinte {}",
-                s.muhash
+                s.empreinte()
             );
             Ok(())
         }
@@ -3090,13 +3110,13 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
             println!("  Tete       {}", s.tip);
             println!("  Sorties    {}", s.utxo.len());
             println!("  Total      {} Q21", Amount::from_units(s.emis));
-            println!("  Empreinte  {}", s.muhash);
+            println!("  Empreinte  {}", s.empreinte());
             println!();
 
             match attendue {
                 Some(att) => {
                     let att = att.trim().to_lowercase();
-                    if att == s.muhash.to_hex() {
+                    if att == s.empreinte().to_hex() {
                         println!("  ✓ L'empreinte correspond a la valeur de confiance fournie.");
                         println!("    Cet instantane represente bien l'etat attendu : il peut");
                         println!("    etre adopte.");
@@ -3105,7 +3125,7 @@ fn cmd_instantane(datadir: &Path, args: &[String]) -> Result<(), String> {
                         Err(format!(
                             "L'empreinte NE correspond PAS a la valeur fournie — a ne pas adopter.\n  \
                              attendu : {att}\n  obtenu  : {}",
-                            s.muhash.to_hex()
+                            s.empreinte().to_hex()
                         ))
                     }
                 }
@@ -3532,7 +3552,7 @@ fn stager_amorce_adoptee(
             revalide: false,
         },
     )?;
-    Ok((snap.height, snap.muhash))
+    Ok((snap.height, snap.empreinte()))
 }
 
 /// Revalide un dossier adopte : rejoue toute l'histoire depuis la genese et
@@ -3628,7 +3648,7 @@ fn cmd_revalider(datadir: &Path, args: &[String]) -> Result<(), String> {
     // Le verdict : l'etat recalculé doit reproduire, au bit pres, celui qu'on
     // avait adopte sur parole.
     let tete = c.tip_id();
-    let empreinte = c.utxo_commitment();
+    let empreinte = c.empreinte_etat();
     if tete != fiche.tete || empreinte != fiche.empreinte {
         return Err(format!(
             "REVALIDATION EN ECHEC — l'etat adopte ne se reproduit pas.\n\

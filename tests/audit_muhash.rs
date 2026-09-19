@@ -158,7 +158,7 @@ fn adopter_avec_les_bonnes_valeurs_atteint_le_meme_etat() {
     let (complet, archive, blocs) = chaine_minee(&rep("adopt-ok"), 20);
     let s = complet.snapshot().expect("instantane");
     let tete = s.tip;
-    let empreinte = s.muhash;
+    let empreinte = s.empreinte();
 
     let reprise = Chain::adopter_instantane(RESEAU, s, &complet.headers(), tete, empreinte)
         .unwrap_or_else(|e| panic!("adoption refusee : {e:?}"));
@@ -197,7 +197,7 @@ fn adopter_avec_une_mauvaise_empreinte_est_refuse() {
 fn adopter_avec_une_mauvaise_tete_est_refuse() {
     let (complet, _ar, _) = chaine_minee(&rep("adopt-tete"), 12);
     let s = complet.snapshot().expect("instantane");
-    let empreinte = s.muhash;
+    let empreinte = s.empreinte();
     let fausse = Hash256([0x77; 32]);
     assert!(matches!(
         Chain::adopter_instantane(RESEAU, s, &complet.headers(), fausse, empreinte),
@@ -212,7 +212,7 @@ fn adopter_sans_entetes_authentifiants_est_refuse() {
     let (complet, _ar, _) = chaine_minee(&rep("adopt-hdr"), 12);
     let s = complet.snapshot().expect("instantane");
     let tete = s.tip;
-    let empreinte = s.muhash;
+    let empreinte = s.empreinte();
     assert!(matches!(
         Chain::adopter_instantane(RESEAU, s, &[], tete, empreinte),
         Err(AdoptionError::EntetesInauthentiques)

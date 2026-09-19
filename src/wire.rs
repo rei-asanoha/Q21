@@ -24,6 +24,7 @@
 
 use crate::block::{Block, BlockHeader};
 use crate::compact::{CompactBlock, CompactError};
+use crate::consensus::MAX_BLOCK_SIZE;
 use crate::hash::Hash256;
 use crate::ser::{ReadError, Reader, Writer};
 use crate::sha256::sha256;
@@ -47,8 +48,18 @@ pub const MIN_PROTOCOL_VERSION: u32 = 2;
 /// Taille maximale d'une charge utile, en octets.
 ///
 /// Doit rester au-dessus de la taille maximale d'un bloc, sinon un bloc licite
-/// serait injustement refuse.
-pub const MAX_PAYLOAD: usize = 8 * 1024 * 1024;
+/// serait injustement refuse. Mais pas trop au-dessus : tout ce qui passe
+/// cette borne est **decode entierement** avant qu'une regle plus fine ne le
+/// rejette — un bloc de 8 Mio se decodait en entier pour etre refuse ensuite
+/// comme trop gros (red-team de phase 8b, 2e campagne, point 6a).
+///
+/// Le plus gros message licite est un bloc entier ([`MAX_BLOCK_SIZE`]), ou un
+/// bloc compact qui en prefigurerait toutes les transactions : le bloc, plus
+/// six octets par transaction. La marge d'un quart couvre ce cas et les
+/// prefixes de longueur. Tout le reste est bien plus petit : une tranche
+/// d'amorce fait 1 Mio, un inventaire complet moins de 2 Mio, deux mille
+/// en-tetes moins de 400 Kio.
+pub const MAX_PAYLOAD: usize = MAX_BLOCK_SIZE + MAX_BLOCK_SIZE / 4;
 
 /// Bornes de securite a la lecture. Chacune evite une allocation dictee par un
 /// inconnu.
@@ -791,6 +802,15 @@ mod tests {
             Err(WireError::SommeIncorrecte)
         );
     }
+
+    /// La borne de charge encadre le plus gros message licite, sans le double
+    /// de marge qui faisait decoder 8 Mio pour refuser ensuite. Verifie a la
+    /// compilation : un bloc entier passe, et un bloc compact qui
+    /// prefigurerait toutes ses transactions aussi (six octets d'identifiant
+    /// court par transaction) ; mais on ne decode jamais plus d'un bloc et
+    /// quart pour rien.
+    const _: () = assert!(MAX_PAYLOAD >= MAX_BLOCK_SIZE + 6 * MAX_BLOCK_TXN);
+    const _: () = assert!(MAX_PAYLOAD <= MAX_BLOCK_SIZE + MAX_BLOCK_SIZE / 4);
 
     /// Le controle qui empeche un inconnu de faire allouer des gigaoctets.
     #[test]

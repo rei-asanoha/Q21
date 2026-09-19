@@ -832,10 +832,37 @@ impl BlockArchive {
     /// `None` et dira « absent » ; on le precise ici, une fois par bloc, pour
     /// que l'operateur sache que c'est son disque, et que le bloc sera
     /// redemande au reseau — un cout, pas une perte.
+    ///
+    /// # Ce qui est verifie, au-dela du decodage
+    ///
+    /// Des octets qui se decodent ne sont pas pour autant **le** bloc demande.
+    /// L'index n'a lu que l'en-tete de chaque enregistrement ; le corps qui le
+    /// suit n'a jamais ete confronte a lui. Un fichier de blocs dont un corps
+    /// ne correspond pas a son en-tete — racine de Merkle fausse, liste
+    /// d'oncles inventee — se relisait donc sans broncher, et la chaine s'en
+    /// servait comme d'une verite : les oncles reclames, un corps servi a un
+    /// pair, une reorganisation. Un dossier d'instantane fourni par un tiers
+    /// pouvait ainsi figer un noeud sur une fausse branche jusqu'a ce qu'on
+    /// l'efface (red-team de phase 8b, 2e campagne, point 5).
+    ///
+    /// On exige donc que le bloc relu porte l'identifiant demande, et que sa
+    /// forme soit juste ([`Block::check_shape`] : racines recalculees). Ce qui
+    /// echoue est traite comme illisible — donc absent, donc redemande au
+    /// reseau, qui livrera le vrai. Le cout est un recalcul de racine par
+    /// lecture disque, et les lectures disque sont rares : la fenetre de corps
+    /// en memoire sert tout ce qui est recent.
     pub fn read(&self, id: &crate::hash::Hash256) -> Option<Block> {
         let g = self.positions.lock().ok()?;
         let r = *g.get(id)?;
-        match self.store.read_at(r) {
+        let lu = self.store.read_at(r).and_then(|b| {
+            if b.header.block_id() != *id {
+                return Err(StoreError::BlocIllisible { index: r.offset });
+            }
+            b.check_shape()
+                .map_err(|_| StoreError::BlocIllisible { index: r.offset })?;
+            Ok(b)
+        });
+        match lu {
             Ok(b) => Some(b),
             Err(e) => {
                 let premiere_fois = self
@@ -847,7 +874,7 @@ impl BlockArchive {
                     let cause = match e {
                         StoreError::FichierTronque { .. } => "le fichier s'arrete avant sa fin",
                         StoreError::Io(_) => "erreur de lecture du disque",
-                        _ => "ses octets ne forment plus un bloc",
+                        _ => "ses octets ne forment pas le bloc que son en-tete annonce",
                     };
                     eprintln!(
                         "avertissement : le corps du bloc {id} est indexe dans le fichier des \

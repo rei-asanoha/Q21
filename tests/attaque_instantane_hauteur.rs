@@ -21,19 +21,19 @@ use q21_core::utxo::UtxoSet;
 #[test]
 fn une_hauteur_d_instantane_demesuree_est_refusee_sans_planter() {
     let tete = Hash256([0x11; 32]);
-    let empreinte = Hash256([0x22; 32]);
 
     // Un instantane dont la hauteur est maximale — ce qu'un pair adverse pose.
-    // On aligne `tip`/`muhash` sur les valeurs de confiance pour franchir les
-    // deux premiers controles et atteindre la ligne autrefois vulnerable.
+    // On aligne `tip` et l'empreinte sur les valeurs de confiance pour franchir
+    // les deux premiers controles et atteindre la ligne autrefois vulnerable.
     let instantane = Snapshot {
         network: Network::Testnet,
         height: u64::MAX,
         tip: tete,
         emis: 0,
         utxo: UtxoSet::new(),
-        muhash: empreinte,
+        muhash: Hash256([0x22; 32]),
     };
+    let empreinte = instantane.empreinte();
 
     // Aucun en-tete fourni : la boucle d'authentification echoue de toute facon,
     // mais la capacite du vecteur est calculee AVANT elle. Sans la correction,

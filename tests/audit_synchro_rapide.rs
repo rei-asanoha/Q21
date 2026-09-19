@@ -180,7 +180,7 @@ fn une_chaine_d_entetes_fabriquee_n_est_pas_adoptee() {
     // eux : c'est exactement ce qu'un explorateur usurpe afficherait.
     let mut instantane = instantane_honnete;
     instantane.tip = tete_fabriquee;
-    let empreinte = instantane.muhash;
+    let empreinte = instantane.empreinte();
 
     let r = Chain::adopter_instantane(RESEAU, instantane, &entetes, tete_fabriquee, empreinte);
 

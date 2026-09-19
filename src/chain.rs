@@ -512,6 +512,9 @@ pub struct Chain {
     blocks: HashMap<Hash256, Block>,
     /// Ordre d'insertion des corps, pour elaguer les plus anciens.
     ordre_corps: VecDeque<Hash256>,
+    /// Poids des corps en memoire, en octets encodes : voir
+    /// [`BODY_BUDGET_BYTES`].
+    octets_corps: usize,
     /// Ou lire les corps elagues. Absent en memoire pure (tests, outils).
     source: Option<std::sync::Arc<dyn BodySource>>,
     /// Identifiants de la chaine active, de la genese a la tete.
@@ -560,6 +563,7 @@ impl Chain {
                 emis,
             },
         );
+        let octets_corps = genesis.encode().len();
         let mut blocks = HashMap::new();
         blocks.insert(id, genesis);
         let mut ordre_corps = VecDeque::new();
@@ -570,6 +574,7 @@ impl Chain {
             index,
             blocks,
             ordre_corps,
+            octets_corps,
             source: None,
             active: vec![id],
             utxo,
@@ -759,8 +764,9 @@ impl Chain {
         tete_de_confiance: Hash256,
         empreinte_de_confiance: Hash256,
     ) -> Result<Reprise, AdoptionError> {
-        // 1. L'etat.
-        if instantane.muhash != empreinte_de_confiance {
+        // 1. L'etat — jeu d'UTXO et total emis ensemble, voir
+        //    [`crate::state::empreinte_etat`].
+        if instantane.empreinte() != empreinte_de_confiance {
             return Err(AdoptionError::EmpreinteInattendue);
         }
         // 2. La position revendiquee.
@@ -855,7 +861,7 @@ impl Chain {
             if entete.block_id() != a.tete {
                 return Err(AdoptionError::AncrageContredit { hauteur: a.hauteur });
             }
-            if a.hauteur == instantane.height && instantane.muhash != a.empreinte {
+            if a.hauteur == instantane.height && instantane.empreinte() != a.empreinte {
                 return Err(AdoptionError::AncrageContredit { hauteur: a.hauteur });
             }
         }
@@ -1040,6 +1046,7 @@ impl Chain {
                 index,
                 blocks: HashMap::new(),
                 ordre_corps: VecDeque::new(),
+                octets_corps: 0,
                 source: None,
                 active: active[..=pos].to_vec(),
                 utxo: snapshot.utxo,
@@ -1101,20 +1108,51 @@ impl Chain {
 
     /// Enregistre un corps et elague les plus anciens.
     ///
+    /// Deux bornes, la premiere atteinte l'emporte : [`BODY_WINDOW`] en
+    /// blocs, [`BODY_BUDGET_BYTES`] en octets. Les corps partent du plus
+    /// ancien au plus recent ; le corps qu'on vient de poser est donc le
+    /// dernier a partir, ce qui garantit qu'une branche laterale en cours
+    /// d'evaluation garde son corps le temps de la reorganisation.
+    ///
     /// La genese n'est jamais elaguee : elle est le seul bloc dont l'absence
     /// rendrait la chaine inintelligible, et elle ne coute qu'un bloc.
     fn retenir_corps(&mut self, id: Hash256, block: Block) {
-        if self.blocks.insert(id, block).is_none() {
-            self.ordre_corps.push_back(id);
+        let poids = block.encode().len();
+        match self.blocks.insert(id, block) {
+            None => {
+                self.ordre_corps.push_back(id);
+                self.octets_corps += poids;
+            }
+            Some(ancien) => {
+                // Meme identifiant, meme encodage : le poids ne bouge pas. On
+                // le recalcule tout de meme plutot que de le supposer.
+                self.octets_corps = self
+                    .octets_corps
+                    .saturating_sub(ancien.encode().len())
+                    .saturating_add(poids);
+            }
         }
+        self.elaguer_corps(BODY_WINDOW, BODY_BUDGET_BYTES);
+    }
+
+    /// Fait sortir les corps les plus anciens tant que l'une des deux bornes
+    /// est depassee. Separe de [`Self::retenir_corps`] pour que les epreuves
+    /// puissent poser des bornes petites sans fabriquer un gigaoctet de blocs.
+    fn elaguer_corps(&mut self, fenetre: usize, budget: usize) {
         let genese = self.active.first().copied();
-        while self.ordre_corps.len() > BODY_WINDOW {
+        // `len() > 1` : la genese, protegee, ne doit pas faire tourner la
+        // boucle a vide si elle etait seule a depasser le budget.
+        while self.ordre_corps.len() > 1
+            && (self.ordre_corps.len() > fenetre || self.octets_corps > budget)
+        {
             if let Some(vieux) = self.ordre_corps.pop_front() {
                 if Some(vieux) == genese {
                     self.ordre_corps.push_back(vieux);
                     continue;
                 }
-                self.blocks.remove(&vieux);
+                if let Some(b) = self.blocks.remove(&vieux) {
+                    self.octets_corps = self.octets_corps.saturating_sub(b.encode().len());
+                }
             }
         }
     }
@@ -1122,6 +1160,11 @@ impl Chain {
     /// Corps conserves en memoire vive.
     pub fn bodies_in_memory(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Poids des corps conserves en memoire vive, en octets encodes.
+    pub fn body_bytes_in_memory(&self) -> usize {
+        self.octets_corps
     }
 
     /// Execute `f` avec la table de l'epoque demandee, en la construisant
@@ -1236,11 +1279,22 @@ impl Chain {
 
     /// Empreinte MuHash du jeu d'UTXO a la tete de la chaine.
     ///
-    /// C'est l'engagement sur l'etat de la monnaie a cette hauteur : deux noeuds
+    /// C'est l'engagement sur le jeu de la monnaie a cette hauteur : deux noeuds
     /// synchronises la calculent a l'identique. Elle est ce qui rend un instantane
     /// verifiable au lieu d'etre cru sur parole.
     pub fn utxo_commitment(&self) -> Hash256 {
         self.utxo.commitment()
+    }
+
+    /// Empreinte de l'etat a la tete : le MuHash **et** le total emis, liees.
+    ///
+    /// C'est la valeur qu'un explorateur affiche et qu'une personne recopie
+    /// pour adopter un instantane pris a cette hauteur : elle est egale, par
+    /// construction, a [`Snapshot::empreinte`] d'un instantane pris ici. Voir
+    /// [`crate::state::empreinte_etat`] pour ce qu'elle engage de plus que le
+    /// MuHash seul.
+    pub fn empreinte_etat(&self) -> Hash256 {
+        crate::state::empreinte_etat(self.utxo.commitment(), self.emis)
     }
 
     /// Nombre de sorties non depensees a la tete.
@@ -1355,6 +1409,14 @@ impl Chain {
     /// Valider a l'aveugle une regle anti-double-paiement serait pire que ne pas
     /// la valider du tout : on croirait etre protege.
     fn claimed_uncles(&self) -> Result<HashSet<Hash256>, ValidationError> {
+        // Sans oncle possible, aucun oncle n'a pu etre reclame : la regle du
+        // double paiement n'a rien a verifier, et relire — donc cloner — neuf
+        // corps complets a chaque raccordement n'apportait qu'un cout. La
+        // lecture ci-dessous reprend d'elle-meme si le protocole en autorise
+        // un jour.
+        if MAX_UNCLES == 0 {
+            return Ok(HashSet::new());
+        }
         let n = self.active.len();
         let debut = n.saturating_sub(MAX_UNCLE_AGE as usize + 2);
         let mut s = HashSet::new();
@@ -1610,11 +1672,17 @@ impl Chain {
         let mut branche = Vec::new();
         let mut courant = tete;
         for _ in 0..=MAX_REORG_DEPTH + 1 {
-            if let Some(pos) = self.active.iter().position(|x| *x == courant) {
-                branche.reverse();
-                return Some((pos, branche));
-            }
             let idx = self.index.get(&courant)?;
+            // `active[h]` est le bloc actif de hauteur `h` : savoir si `courant`
+            // en fait partie est une lecture indexee, pas un balayage. La
+            // version precedente parcourait toute la chaine active a chaque
+            // pas — quadratique en la profondeur, lineaire en l'age de la
+            // chaine, pour un resultat identique.
+            let hauteur = idx.header.height as usize;
+            if self.active.get(hauteur) == Some(&courant) {
+                branche.reverse();
+                return Some((hauteur, branche));
+            }
             branche.push(courant);
             if idx.header.height == 0 {
                 return None;
@@ -1666,44 +1734,44 @@ impl Chain {
         commun.checked_add(majore).unwrap_or(total)
     }
 
-    /// Soumet un bloc au noeud : rattachement, branche laterale ou reorganisation.
+    /// Rattachement d'un en-tete : parent connu, hauteur qui suit la sienne.
+    /// Rend la hauteur du parent.
     ///
-    /// C'est le point d'entree qu'utilisera la couche reseau de la phase 4.
-    pub fn submit(&mut self, block: &Block, now: u64) -> Result<Accept, ChainError> {
-        let id = block.header.block_id();
-        if self.index.contains_key(&id) {
-            return Ok(Accept::DejaVu);
-        }
-        if !self.index.contains_key(&block.header.prev_block) {
-            return Err(ChainError::ParentInconnu(block.header.prev_block));
-        }
-
-        // --- Defense : la hauteur annoncee doit suivre celle du parent.
-        //
-        // Elle est verifiee AVANT tout calcul, parce que la preuve de travail
-        // derive son epoque de `header.height` : un en-tete annoncant une
-        // hauteur arbitraire faisait construire le cache — puis la table — de
-        // l'epoque correspondante. Mesure de l'audit : ~10 s de cache et
-        // ~5 min de table sur le reseau principal, pour un message de 160
-        // octets. Repete, le noeud ne fait plus que cela.
-        let parent_height = self.index[&block.header.prev_block].header.height;
-        if block.header.height != parent_height + 1 {
+    /// --- Defense : la hauteur annoncee doit suivre celle du parent.
+    ///
+    /// Elle est verifiee AVANT tout calcul, parce que la preuve de travail
+    /// derive son epoque de `header.height` : un en-tete annoncant une
+    /// hauteur arbitraire faisait construire le cache — puis la table — de
+    /// l'epoque correspondante. Mesure de l'audit : ~10 s de cache et
+    /// ~5 min de table sur le reseau principal, pour un message de 160
+    /// octets. Repete, le noeud ne fait plus que cela.
+    fn controle_rattachement(&self, header: &BlockHeader) -> Result<u64, ChainError> {
+        let Some(parent) = self.index.get(&header.prev_block) else {
+            return Err(ChainError::ParentInconnu(header.prev_block));
+        };
+        let parent_height = parent.header.height;
+        if header.height != parent_height + 1 {
             return Err(ChainError::Validation(ValidationError::HauteurIncorrecte {
                 attendu: parent_height + 1,
-                recu: block.header.height,
+                recu: header.height,
             }));
         }
+        Ok(parent_height)
+    }
 
-        // Cas simple : le bloc prolonge la tete.
-        if block.header.prev_block == self.tip_id() {
-            self.connect(block, now)?;
-            return Ok(Accept::Prolonge);
-        }
-
-        // Branche laterale. Quatre controles avant toute insertion dans l'index,
-        // ranges du moins cher au plus cher : ce qui coute le plus a verifier
-        // doit etre ce qu'on verifie en dernier.
-        //
+    /// Ce que la position d'un en-tete dans l'index lui impose : finalite,
+    /// difficulte, horodatage. Aucun corps n'est necessaire, et rien ici ne
+    /// coute plus qu'une remontee de l'index sur quelques dizaines d'en-tetes.
+    ///
+    /// Partage entre la soumission d'un bloc entier et le controle d'un
+    /// en-tete seul ([`Self::verifier_entete`]) : une seule regle, deux
+    /// appelants, impossible a faire diverger.
+    fn controle_contexte(
+        &self,
+        header: &BlockHeader,
+        parent_height: u64,
+        now: u64,
+    ) -> Result<(), ChainError> {
         // 1. La branche est-elle seulement adoptable un jour ?
         //
         //    La finalite glissante refuse deja toute reorganisation dont le
@@ -1736,12 +1804,12 @@ impl Chain {
         //    valides sans miner une seule fois, et remplissait l'index et les
         //    corps d'un noeud jusqu'a l'epuisement. Demontre par l'audit de la
         //    phase 8 : 500 branches indexees sans le moindre calcul.
-        let attendu = self.next_bits_after(block.header.prev_block);
-        if block.header.bits != attendu {
+        let attendu = self.next_bits_after(header.prev_block);
+        if header.bits != attendu {
             return Err(ChainError::Validation(
                 ValidationError::DifficulteIncorrecte {
                     attendu,
-                    recu: block.header.bits,
+                    recu: header.bits,
                 },
             ));
         }
@@ -1757,25 +1825,92 @@ impl Chain {
         //    bon compte des corps de 4 Mio que le noeud conservait et servait.
         //    Refuser ici n'ecarte aucun bloc valide : la connexion l'aurait
         //    refuse de toute facon, pour la meme raison.
-        let temps = self.recent_times_after(block.header.prev_block);
+        let temps = self.recent_times_after(header.prev_block);
         let mediane = validate::median_time(&temps);
-        if !temps.is_empty() && block.header.time <= mediane {
+        if !temps.is_empty() && header.time <= mediane {
             return Err(ChainError::Validation(
                 ValidationError::HorodatageTropAncien {
                     median: mediane,
-                    recu: block.header.time,
+                    recu: header.time,
                 },
             ));
         }
         let limite = now + MAX_FUTURE_TIME;
-        if block.header.time > limite {
+        if header.time > limite {
             return Err(ChainError::Validation(
                 ValidationError::HorodatageDansLeFutur {
                     limite,
-                    recu: block.header.time,
+                    recu: header.time,
                 },
             ));
         }
+        Ok(())
+    }
+
+    /// Controle un en-tete **seul**, sans son corps : rattachement, hauteur,
+    /// finalite, difficulte, horodatage, et enfin le travail.
+    ///
+    /// # Pourquoi ce controle existe
+    ///
+    /// Un bloc compact n'apporte que l'en-tete et des identifiants courts : le
+    /// corps, c'est le noeud qui le reconstruit en fouillant son reservoir. La
+    /// reconstruction se faisait **avant** qu'on ait regarde si l'en-tete
+    /// portait un travail reel. Un pair pouvait donc faire fouiller le
+    /// reservoir — sous le verrou global — pour des en-tetes qu'il fabriquait
+    /// sans miner (red-team de phase 8b, 2e campagne, point 4). Le budget
+    /// d'annonces par pair bornait deja la depense ; ce controle la ramene a
+    /// ce qu'elle doit etre : rien du tout pour un en-tete faux.
+    ///
+    /// C'est ce que BIP 152 prescrit : un bloc compact est traite comme un
+    /// en-tete d'abord, et un en-tete se verifie avant tout le reste.
+    ///
+    /// # Ce que cela garantit
+    ///
+    /// Ces controles sont un **sous-ensemble strict** de ceux que
+    /// [`Self::submit`] applique au bloc entier : ce sont les memes fonctions,
+    /// appelees dans le meme ordre. Un en-tete que ce controle refuse aurait
+    /// ete refuse avec son corps ; un en-tete qu'il accepte n'a rien franchi que
+    /// la soumission ne reverifie. Le travail est verifie par le chemin leger
+    /// (cache seul, jamais la table) : quelques dizaines de microsecondes.
+    ///
+    /// Un en-tete deja indexe est accepte tel quel — le corps sera reconnu
+    /// comme deja vu par la soumission.
+    pub fn verifier_entete(&self, header: &BlockHeader, now: u64) -> Result<(), ChainError> {
+        if self.index.contains_key(&header.block_id()) {
+            return Ok(());
+        }
+        let parent_height = self.controle_rattachement(header)?;
+        self.controle_contexte(header, parent_height, now)?;
+        self.pow
+            .check(header)
+            .map_err(|e| ChainError::Validation(ValidationError::PreuveDeTravail(e)))
+    }
+
+    /// Soumet un bloc au noeud : rattachement, branche laterale ou reorganisation.
+    ///
+    /// C'est le point d'entree qu'utilisera la couche reseau de la phase 4.
+    pub fn submit(&mut self, block: &Block, now: u64) -> Result<Accept, ChainError> {
+        let id = block.header.block_id();
+        if self.index.contains_key(&id) {
+            return Ok(Accept::DejaVu);
+        }
+        let parent_height = self.controle_rattachement(&block.header)?;
+
+        // Cas simple : le bloc prolonge la tete.
+        if block.header.prev_block == self.tip_id() {
+            self.connect(block, now)?;
+            return Ok(Accept::Prolonge);
+        }
+
+        // Branche laterale. Quatre controles avant toute insertion dans l'index,
+        // ranges du moins cher au plus cher : ce qui coute le plus a verifier
+        // doit etre ce qu'on verifie en dernier.
+        //
+        // 1, 2 et 2 bis : finalite, difficulte et horodatage de l'en-tete, tels
+        //    que les impose sa position dans l'index. Voir
+        //    [`Self::controle_contexte`], qui les partage avec le controle
+        //    d'en-tete seul.
+        self.controle_contexte(&block.header, parent_height, now)?;
 
         // 3. La forme et la taille — les controles qui ne demandent aucun
         //    contexte, et que Bitcoin nomme `CheckBlock`.
@@ -2384,6 +2519,56 @@ mod tests {
         // Sur une chaine courte, rien n'est encore elague : la borne est la
         // propriete, pas l'elagage lui-meme.
         assert_eq!(c.bodies_in_memory(), 31);
+    }
+
+    /// La memoire ne doit pas croitre avec la taille des blocs non plus : la
+    /// borne en octets fait sortir les corps anciens avant la borne en blocs,
+    /// du plus ancien au plus recent, sans jamais toucher a la genese.
+    #[test]
+    fn le_budget_en_octets_elague_les_corps_avant_la_fenetre_en_blocs() {
+        let mut c = chaine();
+        mine(&mut c, 30);
+        let total = c.body_bytes_in_memory();
+        let recompte: usize = c.blocks.values().map(|b| b.encode().len()).sum();
+        assert_eq!(
+            total, recompte,
+            "le poids tenu au fil de l'eau doit etre exact"
+        );
+        assert_eq!(c.bodies_in_memory(), 31);
+
+        // Un budget qui ne tient que les dix derniers corps environ.
+        let genese = c.active[0];
+        let poids_genese = c.blocks[&genese].encode().len();
+        let dix_derniers: usize = (21..=30)
+            .map(|h| c.blocks[&c.active[h]].encode().len())
+            .sum();
+        let budget = poids_genese + dix_derniers;
+        c.elaguer_corps(BODY_WINDOW, budget);
+
+        assert!(
+            c.body_bytes_in_memory() <= budget,
+            "{} octets en memoire pour un budget de {budget}",
+            c.body_bytes_in_memory()
+        );
+        let recompte: usize = c.blocks.values().map(|b| b.encode().len()).sum();
+        assert_eq!(c.body_bytes_in_memory(), recompte);
+        assert!(c.blocks.contains_key(&genese), "la genese ne part jamais");
+        for h in 21..=30 {
+            assert!(
+                c.blocks.contains_key(&c.active[h]),
+                "le corps recent {h} doit rester"
+            );
+        }
+        for h in 1..=20 {
+            assert!(
+                !c.blocks.contains_key(&c.active[h]),
+                "le corps ancien {h} doit etre sorti"
+            );
+        }
+        // La chaine reste entiere : les corps sortis se relisent aupres du
+        // fournisseur, ou sont dits absents — jamais inventes.
+        assert_eq!(c.height(), 30);
+        assert!(c.block_by_id(&c.active[5]).is_none());
     }
 
     #[test]

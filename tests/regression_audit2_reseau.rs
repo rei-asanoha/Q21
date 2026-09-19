@@ -213,14 +213,30 @@ fn les_corps_en_vol_sont_plafonnes_par_pair() {
 ///
 /// Desormais la reserve est de `CMPCT_SEAU_MAX` annonces non sollicitees ; au-
 /// dela, rien n'est reconstruit et le pair perd des points jusqu'a la coupure.
+///
+/// L'en-tete annonce est **vrai** — mine, a la bonne difficulte, a l'heure —
+/// parce que depuis la 2e campagne de la phase 8b un en-tete faux est refuse
+/// avant meme le seau (voir `attaque_bloc_compact_sans_travail`) : c'est bien
+/// le seau qu'on mesure ici, pas le controle d'en-tete. Seule la clef SipHash
+/// change d'une annonce a l'autre ; les identifiants courts, eux, ne
+/// correspondent a rien, donc chaque annonce entame une reconstruction sans
+/// jamais l'achever.
 #[test]
 fn les_annonces_compactes_sont_mesurees_et_l_insistance_coupe() {
+    use q21_core::chain::GENESIS_TIME;
     use q21_core::compact::CompactBlock;
+    use q21_core::consensus::TARGET_BLOCK_SECS;
+    use q21_core::sig::SchemeId;
 
     let a = noeud();
     let addr = a.listen("127.0.0.1:0").expect("ecoute");
     let magie = magic_for(RESEAU);
-    let tete = a.tip_id();
+
+    let t = GENESIS_TIME + TARGET_BLOCK_SECS;
+    let vrai = a
+        .with_chain(|c| c.mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, 50_000_000))
+        .expect("minage");
+    let entete: BlockHeader = vrai.header;
 
     let mut s = TcpStream::connect(addr).expect("connexion");
     presenter(&mut s, magie, 0xc0ff_ee02);
@@ -228,17 +244,6 @@ fn les_annonces_compactes_sont_mesurees_et_l_insistance_coupe() {
     const ANNONCES: u64 = 200;
     let mut envoyees = 0u64;
     for k in 0..ANNONCES {
-        let entete = BlockHeader {
-            version: 1,
-            prev_block: tete, // parent connu : la tete, valeur publique
-            merkle_root: Hash256([1u8; 32]),
-            uncles_root: Hash256::ZERO,
-            miner: Hash256([2u8; 32]),
-            time: 1_800_000_000 + k,
-            bits: 0x2000_ffff,
-            height: 1,
-            nonce: k,
-        };
         let c = CompactBlock {
             header: entete,
             nonce: k, // clef SipHash differente a chaque annonce

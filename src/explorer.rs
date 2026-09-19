@@ -552,7 +552,7 @@ async function accueil(){
             supply.sous_le_plafond ? "sous le plafond ✓" : "PLAFOND FRANCHI") +
       tuile("Part émise", pct.toFixed(6) + " %") +
       tuile("Sorties non dépensées", info.utxo_total) +
-      tuile("Empreinte de l'état (MuHash)", court(emp.empreinte, 20), ech(emp.empreinte));
+      tuile("Empreinte de l'état", court(emp.empreinte, 20), ech(emp.empreinte));
 
     lignes("pow", [
       ["Époque", pow.epoque],

@@ -134,13 +134,49 @@ pub struct Snapshot {
     pub emis: u64,
     pub utxo: UtxoSet,
     /// Empreinte MuHash du jeu d'UTXO ci-dessus, calculee a l'ecriture et
-    /// verifiee au chargement. C'est l'engagement sur l'etat : deux noeuds a la
+    /// verifiee au chargement. C'est l'engagement sur le jeu : deux noeuds a la
     /// meme hauteur portent la meme, et un fichier dont le jeu ne la reproduit
     /// pas est rejete.
+    ///
+    /// Ce n'est pas la valeur que l'on recopie pour adopter un instantane :
+    /// celle-la est [`Snapshot::empreinte`], qui engage aussi le total emis.
     pub muhash: Hash256,
 }
 
+/// Etiquette de l'empreinte d'etat, distincte de celles du MuHash.
+const TAG_EMPREINTE_ETAT: &str = "Q21/etat/empreinte";
+
+/// L'empreinte d'un etat : ce que l'on recopie, compare et donne a
+/// `--empreinte`.
+///
+/// # Pourquoi elle engage plus que le jeu d'UTXO
+///
+/// Le MuHash n'engage que les sorties non depensees. Le **total emis**, lui,
+/// n'en decoule pas : ce qui a ete depense puis detruit en frais n'y figure
+/// plus, et un mineur peut reclamer moins que sa subvention. Un instantane dont
+/// on reecrit le total emis — dans la plage que les invariants tolerent —
+/// portait donc la meme empreinte MuHash, et se faisait adopter avec la bonne
+/// valeur de confiance : l'affichage de la masse monetaire etait faux, et la
+/// borne anti-inflation du plafond se calculait sur un total faux (red-team de
+/// phase 8b, 2e campagne, point 6c).
+///
+/// L'empreinte d'etat lie les deux : MuHash et total emis, sous une etiquette
+/// propre. Le MuHash reste ce qu'il est — l'engagement incrementiel sur le jeu,
+/// tenu au fil de l'eau — et le format de l'instantane ne change pas : seule
+/// la valeur que l'on compare a une source de confiance en derive desormais.
+pub fn empreinte_etat(muhash: Hash256, emis: u64) -> Hash256 {
+    crate::hash::tagged_hash_parts(
+        TAG_EMPREINTE_ETAT,
+        &[muhash.as_bytes(), &emis.to_le_bytes()],
+    )
+}
+
 impl Snapshot {
+    /// L'empreinte de cet etat : voir [`empreinte_etat`].
+    pub fn empreinte(&self) -> Hash256 {
+        empreinte_etat(self.muhash, self.emis)
+    }
+
     /// Invariants que tout instantane honnete satisfait, verifies **sans faire
     /// confiance a personne**.
     ///
@@ -357,9 +393,9 @@ impl Snapshot {
     /// l'empreinte inscrite — est verifiee a la relecture, comme pour un
     /// instantane local. Ce qu'il ne porte pas, c'est la **confiance** : rien
     /// dans le fichier ne prouve que cette empreinte est celle de la vraie
-    /// chaine. C'est a celui qui l'adopte de comparer [`Snapshot::muhash`] a une
-    /// valeur qu'il tient d'une source sure — l'empreinte qu'affiche son propre
-    /// explorateur, par exemple.
+    /// chaine. C'est a celui qui l'adopte de comparer [`Snapshot::empreinte`]
+    /// a une valeur qu'il tient d'une source sure — l'empreinte qu'affiche son
+    /// propre explorateur, par exemple.
     pub fn to_portable_bytes(&self) -> Vec<u8> {
         self.encode()
     }
