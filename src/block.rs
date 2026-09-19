@@ -18,7 +18,7 @@ use crate::merkle::merkle_root;
 use crate::ser::{ReadError, Reader, Writer};
 use crate::tx::{Transaction, TxError};
 
-/// En-tete de bloc : 92 octets, taille fixe.
+/// En-tete de bloc : 160 octets, taille fixe (voir [`BlockHeader::SIZE`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlockHeader {
     pub version: u32,
