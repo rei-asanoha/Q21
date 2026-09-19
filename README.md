@@ -413,6 +413,9 @@ RED-TEAM-2026.md La campagne adverse : une faille critique trouvée, prouvée et
 RED-TEAM-2026-2.md La seconde campagne, sous un angle neuf : un plantage à
                  distance et une surcharge corrigés, une « faille critique »
                  ramenée à sa vraie mesure, six points tous fermés avec épreuve
+RED-TEAM-2026-3.md La troisième campagne, visant la monnaie elle-même : aucune
+                 création, duplication ni scission n'a résisté — parce
+                 qu'aucune n'a été trouvée ; trois attaques de bout en bout
 LIVRE-BLANC.md   Ce que Q21 corrige, comment, et ce qui reste supposé
 SIGNATURE.md     Signer chaque livraison, et vérifier avant d'installer
 REPRODUIRE.md    Recompiler le binaire et retrouver le condensat publié —
