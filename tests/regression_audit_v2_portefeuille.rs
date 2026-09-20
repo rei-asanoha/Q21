@@ -101,6 +101,12 @@ fn v1_le_code_de_sauvegarde_ne_passe_plus_par_la_ligne_de_commande() {
     let fichier_code = d.join("code.txt");
     fichier_prive(&fichier_code, &format!("{code}\n"));
     let cible = d.join("par-fichier");
+    // Le `mut` sert au bloc Linux plus bas, qui appelle `enfant.try_wait()`
+    // en boucle pour lire `/proc/<pid>/cmdline` tant que le processus vit.
+    // Hors Linux ce bloc n'existe pas, `enfant` n'est plus que consomme par
+    // `wait_with_output`, et le `mut` devient inutile — la ou l'avertissement
+    // est attendu, on le tait ; sur Linux il reste vif.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut enfant = Command::new(q21())
         .arg("--datadir")
         .arg(&cible)
