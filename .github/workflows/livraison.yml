@@ -97,6 +97,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Une etiquette qui ne correspond pas a la version du programme publie un
+      # binaire qui se presente sous un autre nom que sa livraison : `q21
+      # version` repondrait 0.1.0 dans une archive nommee v0.1.1, et le
+      # commentaire de confiance de la signature dirait encore autre chose.
+      # C'est exactement la confusion que la commande `version` sert a
+      # dissiper. Le controle est place avant tout le reste : echouer en dix
+      # secondes vaut mieux qu'echouer apres quinze minutes de compilation.
+      - name: L'etiquette et la version du programme concordent
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -eu
+          ETIQUETTE="${GITHUB_REF_NAME#v}"
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$ETIQUETTE" != "$VERSION" ]; then
+            echo "::error::etiquette v$ETIQUETTE, mais Cargo.toml annonce $VERSION : le binaire livre ne dirait pas la version sous laquelle il est publie. Mettez les deux d'accord dans le meme commit, puis re-etiquetez."
+            exit 1
+          fi
+          echo "etiquette v$ETIQUETTE = version $VERSION"
+
       # `rustup` directement, sans action tierce sur une branche mouvante :
       # voir essais.yml.
       - name: Chaine Rust
