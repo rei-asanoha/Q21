@@ -112,11 +112,22 @@ n'économise rien : il paie autrement, et plus cher.
 télécharger, pas de configuration à écrire, pas de « pool » où s'inscrire. Le
 portefeuille Q21 mine.
 
-*(Aujourd'hui, cela se déclenche encore par une option au lancement. Un bouton
-« Miner » dans la page du portefeuille est en cours de construction — c'est
-précisément ce document qui explique pourquoi il est important.)*
+*(L'onglet **Miner** de la page du portefeuille l'allume et l'éteint sans rien
+relancer, et affiche le débit, les blocs trouvés et la mémoire réellement
+occupée. L'option `--mine` au lancement reste disponible pour une machine sans
+écran.)*
 
 ### La machine
+
+> **Les chiffres de cette section sont ceux de la chaîne principale**, la seule
+> pour laquelle la taille de la table est un enjeu : elle est dimensionnée pour
+> qu'une machine spécialisée n'ait aucun avantage sur un ordinateur ordinaire.
+>
+> Sur le **réseau d'essai** — le seul ouvert aujourd'hui — la table part de
+> 32 Mio et plafonne à 128 Mio. N'importe quelle machine y mine, y compris un
+> Raspberry Pi ancien. Un réseau d'essai sert à éprouver le protocole, pas à
+> défendre une monnaie ; lui imposer les exigences de la chaîne principale
+> n'écarterait que des participants.
 
 | Ce qu'il faut | Détail |
 |---|---|

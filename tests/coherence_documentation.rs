@@ -112,3 +112,54 @@ fn aucun_document_ne_cite_une_genese_perimee() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Les tailles de memoire annoncees aux participants
+// ---------------------------------------------------------------------------
+//
+// REJOINDRE.md reclamait 8 Go de memoire vive pour miner, et annoncait une table
+// de 2 Go : les chiffres de la chaine principale, dans le guide qui conduit au
+// reseau d'essai. Celui-ci demande soixante-quatre fois moins. Un guide qui
+// surestime ses exigences n'ecarte que des participants — et un reseau d'essai
+// sans participants ne mesure rien.
+//
+// Ces tailles se calculent a partir des constantes de consensus. On les y
+// rattache, comme la genese.
+
+fn mio(elements: u32) -> u64 {
+    (elements as u64) * (q21_core::consensus::POW_ELEMENT_SIZE as u64) / (1024 * 1024)
+}
+
+#[test]
+fn rejoindre_md_annonce_les_tailles_memoire_du_reseau_d_essai() {
+    use q21_core::memhard::{cache_size, table_size, TableParams};
+
+    let p = TableParams::for_network(Network::Testnet);
+    let table_depart = mio(table_size(p, 0));
+    let table_plafond = mio(p.nmax);
+    let cache_depart = mio(cache_size(p, 0)).max(1);
+
+    let texte = lire("REJOINDRE.md");
+
+    for (valeur, quoi) in [
+        (table_depart, "la table du mineur a l'epoque 0"),
+        (table_plafond, "le plafond de la table"),
+        (cache_depart, "le cache d'un noeud qui verifie"),
+    ] {
+        let attendu = format!("{valeur} Mio");
+        assert!(
+            texte.contains(&attendu),
+            "REJOINDRE.md n'annonce plus `{attendu}` pour {quoi}.\n\
+             Les constantes de consensus ont change : mettre le guide a jour dans\n\
+             le meme commit, sans quoi il decrit un reseau qui n'existe pas."
+        );
+    }
+
+    // Le piege d'origine : les chiffres de la chaine principale presentes comme
+    // ceux du reseau que le guide fait rejoindre.
+    assert!(
+        !texte.contains("Il faut **8 Go de mémoire vive**"),
+        "REJOINDRE.md reclame a nouveau la memoire de la chaine principale pour \
+         miner sur le reseau d'essai."
+    );
+}

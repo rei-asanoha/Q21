@@ -141,8 +141,18 @@ fichier `amorces.txt` n'est pas au bon endroit, ou porte un autre nom.
 ### 6. Miner, si vous le voulez
 
 Miner, c'est prêter la mémoire de votre machine au réseau, et être payé pour
-chaque bloc trouvé. Il faut **8 Go de mémoire vive** ; la carte graphique ne
-sert à rien, c'est expliqué dans `MINAGE.md`.
+chaque bloc trouvé. La carte graphique ne sert à rien : c'est la mémoire qui
+travaille, et `MINAGE.md` explique pourquoi.
+
+**Sur le réseau d'essai — le seul qui existe aujourd'hui — n'importe quelle
+machine ordinaire suffit.** La table du mineur y part de **32 Mio** et plafonne
+à **128 Mio** : un vieux portable, un Raspberry Pi 4, conviennent. Les chiffres
+que vous lirez ailleurs dans le projet — 2 Gio de table, 8 Go de mémoire vive —
+sont ceux de la **chaîne principale**, dimensionnés pour qu'une machine
+spécialisée n'ait aucun avantage sur la vôtre. Le réseau d'essai sert à
+éprouver le protocole, pas à défendre une monnaie : il n'a aucune raison de
+demander autant, et exiger une grosse machine pour y participer écarterait
+précisément les gens dont il a besoin.
 
 Ajoutez `--mine` au lancement :
 
@@ -151,10 +161,13 @@ Ajoutez `--mine` au lancement :
 - **Mac** : même chose dans `Portefeuille Q21.command`, avec TextEdit.
 - **Linux et Raspberry Pi** : `./q21 wallet --mine`.
 
-Au premier lancement en minage, le programme construit une table de 2 Go en
-mémoire — comptez quelques minutes, une seule fois par période de 71 jours.
+Au premier lancement en minage, le programme construit sa table en mémoire —
+quelques secondes sur le réseau d'essai, une seule fois par période de 71 jours.
 Ensuite, il mine tant que la fenêtre est ouverte, avec tous les cœurs ; `--fils
 2` en limite le nombre si vous voulez garder la machine confortable.
+
+L'onglet **Miner** du portefeuille affiche la mémoire réellement occupée. C'est
+cette valeur qui fait foi, pas ce guide : elle est calculée par votre machine.
 
 ---
 
@@ -176,9 +189,13 @@ généralement ouvert d'office ou en un clic.
 Une **adresse connue** : il faut le dire au projet, pour que les nouveaux venus
 sachent où frapper.
 
-Pour miner en même temps, 8 Go de mémoire. Pour être portier sans miner, un
-Raspberry Pi 5 à 4 Go suffit largement : un nœud qui ne mine pas n'a besoin
-que de 64 Mo pour vérifier.
+Sur le réseau d'essai, la mémoire n'est pas un obstacle : un nœud qui se
+contente de vérifier tient dans **1 Mio** de table, et un nœud qui mine dans
+**32 Mio**. Un Raspberry Pi, même ancien, fait l'affaire dans les deux cas. Ces
+chiffres grandissent de 5 % toutes les 71 jours et plafonnent à 128 Mio.
+
+Sur la chaîne principale, le jour où elle existera, ce sera 64 Mio pour
+vérifier et 2 Gio pour miner — voir `MINAGE.md`.
 
 ### 1. Écouter
 
