@@ -242,6 +242,17 @@ pub struct RpcContext {
     /// Absent en local : celui qui interroge son propre noeud peut le faire
     /// attendre. Present en mode public : voir [`SeauBalayages`].
     pub balayages: Option<Arc<Mutex<SeauBalayages>>>,
+    /// Combien de points d'entree ce noeud a recus au lancement.
+    ///
+    /// Zero veut dire qu'il ne cherchera personne : ni `--amorce`, ni
+    /// `amorces.txt` dans son dossier, ni liste integree. La fenetre de
+    /// commande le dit deja, mais c'est precisement la fenetre que le guide
+    /// apprend a ignorer. Sans ce compte, une page ne peut pas distinguer
+    /// « je n'ai l'adresse de personne » — ou il manque un fichier de deux
+    /// lignes — de « j'ai frappe et personne n'a ouvert » — ou c'est le
+    /// serveur ou le reseau qu'il faut regarder. Les deux se voient pareil,
+    /// et l'un des deux fait abandonner.
+    pub amorces_configurees: usize,
 }
 
 /// Balayages de chaine qu'un service public accorde : un budget **par
@@ -428,6 +439,7 @@ impl RpcContext {
             minage: None,
             sur_changement: None,
             balayages: None,
+            amorces_configurees: 0,
         }
     }
 
@@ -862,6 +874,10 @@ impl RpcContext {
             // version, mais il est attache au fichier des condensats, pas au
             // programme.
             .set("version", Json::str(env!("CARGO_PKG_VERSION")))
+            .set(
+                "amorces_configurees",
+                Json::u64(self.amorces_configurees as u64),
+            )
             .set("reseau", Json::str(format!("{:?}", self.network)))
             .set("hauteur", Json::u64(hauteur))
             .set("tete", Json::str(tete))
@@ -2916,6 +2932,7 @@ mod tests {
         RpcContext {
             sur_changement: None,
             balayages: None,
+            amorces_configurees: 0,
             index: None,
             // Les epreuves du RPC voient un minage possible : c'est ce qui
             // permet de verifier que l'interrupteur repond, et que sans
@@ -2955,6 +2972,7 @@ mod tests {
         RpcContext {
             sur_changement: None,
             balayages: None,
+            amorces_configurees: 0,
             index: None,
             minage: Some(Arc::new(crate::minage::Minage::new(false))),
             node: Arc::new(Node::new(RESEAU, c)),
@@ -3701,6 +3719,7 @@ mod tests {
         let contexte = |chaine: Chain, w: Wallet| RpcContext {
             sur_changement: None,
             balayages: None,
+            amorces_configurees: 0,
             index: None,
             minage: None,
             node: Arc::new(Node::new(RESEAU, chaine)),
@@ -3986,6 +4005,7 @@ mod tests {
         let c = RpcContext {
             sur_changement: None,
             balayages: None,
+            amorces_configurees: 0,
             index: None,
             minage: None,
             node,

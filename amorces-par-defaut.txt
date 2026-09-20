@@ -1,0 +1,23 @@
+# Points d'entree du reseau d'essai Q21.
+#
+# Ce fichier est livre avec le programme, deja rempli, pour que le premier
+# lancement trouve le reseau sans rien avoir a taper.
+#
+# Il n'est PAS grave dans le programme. Le binaire, lui, ne contient l'adresse
+# d'aucun serveur : c'est un choix, parce qu'une adresse gravee dans un
+# logiciel distribue deviendrait une dependance permanente envers celui qui la
+# tient. Ce fichier-ci est a cote, en clair, et il vous appartient — modifiez-le,
+# ajoutez des lignes, videz-le. Le protocole ne depend d'aucune de ces adresses :
+# elles ne servent qu'a frapper a une premiere porte, et ce que vous croirez
+# ensuite viendra de la preuve de travail et de la genese que votre machine
+# calcule elle-meme.
+#
+# Une adresse par ligne, `hote` ou `hote:port`. Les lignes vides et celles
+# commencant par # sont ignorees. La liste a jour des points d'entree, et la
+# marche a suivre pour en tenir un, sont dans RESEAU.md.
+#
+# Le nom et l'adresse numerique sont donnes cote a cote, volontairement : un nom
+# de domaine peut expirer, une adresse reste joignable tant que la machine
+# existe. La defaillance de l'un n'isole personne.
+amorce.q21.dev:21121
+92.222.86.135:21121

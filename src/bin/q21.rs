@@ -4207,6 +4207,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             balayages: rpc_public.as_ref().map(|_| {
                 std::sync::Arc::new(std::sync::Mutex::new(q21_core::rpc::SeauBalayages::new()))
             }),
+            // Ce que la page a besoin de savoir pour distinguer « je n'ai
+            // l'adresse de personne » de « personne ne m'a ouvert ».
+            amorces_configurees: cibles.len(),
         };
         // La coquille de l'explorateur est servie sans jeton : elle ne porte
         // aucune donnee, et c'est elle qui demande le jeton a l'utilisateur.

@@ -56,6 +56,7 @@ fn serveur(avec_portefeuille: bool, token: Option<&str>) -> ServerHandle {
     let ctx = RpcContext {
         sur_changement: None,
         balayages: None,
+        amorces_configurees: 0,
         node,
         wallet: if avec_portefeuille {
             Some(Arc::new(Mutex::new(Wallet::from_seed([7u8; 32], RESEAU))))
@@ -136,6 +137,7 @@ fn serveur_et_noeud() -> (ServerHandle, Arc<Node>) {
         minage: None,
         sur_changement: None,
         balayages: None,
+        amorces_configurees: 0,
     };
     let h = http::serve("127.0.0.1:0", None, move |req| routeur(&ctx, req))
         .expect("demarrage du serveur");

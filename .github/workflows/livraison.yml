@@ -223,6 +223,18 @@ jobs:
             cp "Portefeuille Q21.command" livraison/
             chmod +x "livraison/Portefeuille Q21.command"
           fi
+          # Le point d'entree, livre deja ecrit.
+          #
+          # Le binaire reste sans adresse — c'est la regle, et elle ne bouge
+          # pas : une adresse gravee dans un programme distribue deviendrait
+          # une dependance permanente envers celui qui la tient. Mais le
+          # fichier qui la porte, lui, voyage rempli. Sans cela, toute archive
+          # fraichement decompressee est aveugle, et le nouveau venu lit
+          # « aucun ordinateur joignable » sans savoir que rien n'est casse :
+          # il conclut que le reseau est mort et n'y revient pas. Le fichier
+          # est en clair, commente, et lui appartient des qu'il l'a.
+          mkdir -p livraison/q21-data
+          cp amorces-par-defaut.txt livraison/q21-data/amorces.txt
           cd livraison
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a "../${{ matrix.archive }}" ./*

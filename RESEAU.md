@@ -218,15 +218,21 @@ amorce.q21.dev:21121
 92.222.86.135:21121
 ```
 
-Les points d'entrée qui tiennent sont inscrits dans le binaire lui-même —
-`amorces_integrees` dans `src/amorce.rs`. C'est ce qui fait qu'un portefeuille
-fraîchement téléchargé trouve le réseau **sans que personne ne tape quoi que ce
-soit**.
+Un portefeuille fraîchement téléchargé trouve le réseau **sans que personne ne
+tape quoi que ce soit** : l'archive livrée porte déjà ce fichier, rempli et
+commenté, dans son sous-dossier `q21-data`. La source en est
+`amorces-par-defaut.txt`, à la racine du dépôt, et une épreuve interdit d'y
+inscrire une adresse que ce document ne publie pas — on publie d'abord, on livre
+ensuite.
 
-**Aucun point d'entrée n'est compilé dans le binaire.** C'est un choix : un nom
-gravé dans le code est une dépendance permanente envers celui qui le tient, et
-un protocole censé survivre à son auteur ne doit pas naître avec l'adresse de
-son auteur dedans.
+**Aucun point d'entrée n'est pour autant compilé dans le binaire**, et
+`amorces_integrees` dans `src/amorce.rs` reste vide. La distinction porte tout :
+une adresse gravée dans un programme ne se change qu'en redistribuant le
+programme, donc par celui qui le signe ; une adresse dans un fichier texte
+appartient à celui qui l'a reçue, dès la seconde où il l'a. Il l'édite, la
+remplace, ou vide le fichier. C'est un confort de premier démarrage, pas une
+dépendance — et un protocole censé survivre à son auteur ne doit pas naître avec
+l'adresse de son auteur dedans.
 
 Le point d'entrée se fournit donc à l'exécution, de deux façons :
 

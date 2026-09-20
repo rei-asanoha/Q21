@@ -59,45 +59,53 @@ plus loin : le fichier n'est pas celui qui a été publié.
 est bien signé par le projet. C'est un cran de confiance supplémentaire, et il
 vaut la peine d'être franchi une fois.
 
-### 3. Décompresser, et dire au programme où frapper
+### 3. Décompresser — et savoir où le programme va frapper
 
 Décompressez l'archive où vous voulez — sur le Bureau, dans Documents. Vous
 obtenez un dossier contenant le programme (`q21.exe` sur Windows, `q21`
-ailleurs), un lanceur à double-cliquer, et quelques documents.
+ailleurs), un lanceur à double-cliquer, quelques documents, et un sous-dossier
+`q21-data`.
 
-Il manque une chose, et c'est voulu : **le programme ne contient l'adresse
-d'aucun serveur.** Une adresse gravée dans un logiciel distribué deviendrait
-une dépendance permanente envers celui qui la tient, et un protocole censé
-survivre à son auteur ne doit pas naître avec l'adresse de son auteur dedans.
-L'adresse se donne donc à côté, dans un petit fichier que vous pouvez modifier
-à tout moment.
+**Vous n'avez rien à faire ici.** Cette étape se lit, elle ne s'exécute pas :
+le point d'entrée est déjà en place, et vous pouvez passer à l'étape 4. Elle
+existe parce qu'un jour vous voudrez peut-être en changer, et qu'il vaut mieux
+savoir comment avant d'en avoir besoin.
 
-Dans le dossier que vous venez de décompresser :
+Voici ce qui s'y joue. **Le programme ne contient l'adresse d'aucun serveur**,
+et c'est voulu : une adresse gravée dans un logiciel distribué deviendrait une
+dépendance permanente envers celui qui la tient, et un protocole censé survivre
+à son auteur ne doit pas naître avec l'adresse de son auteur dedans. L'adresse
+se donne donc **à côté**, dans un fichier ordinaire que vous pouvez lire et
+modifier : `q21-data/amorces.txt`. Ouvrez-le, il s'explique lui-même.
 
-1. Créez un sous-dossier nommé exactement `q21-data`.
-2. À l'intérieur, créez un fichier texte nommé exactement `amorces.txt`.
-3. Écrivez dedans une seule ligne :
+La différence n'est pas un détail de forme. Une adresse dans le binaire ne se
+change qu'en redistribuant le binaire — donc par celui qui le signe. Une
+adresse dans un fichier texte vous appartient à la seconde où vous l'avez :
+ajoutez des lignes, remplacez-les toutes, videz le fichier. Le protocole ne
+dépend d'aucune de ces adresses ; elles ne servent qu'à frapper à une première
+porte. Ce que votre machine croira ensuite viendra de la preuve de travail et
+de la genèse qu'elle calcule elle-même.
+
+Une adresse par ligne, `hôte` ou `hôte:port`. Les lignes vides et celles
+commençant par `#` sont ignorées. Le jour où d'autres portiers existent, on
+ajoute leurs adresses ici ; `RESEAU.md` tient la liste à jour.
+
+**Si le fichier manque** — vous l'avez supprimé, ou l'archive a été recopiée à
+moitié — le portefeuille vous le dira en clair au lancement, et vous rappellera
+quoi écrire dedans. Pour le recréer à la main, une ligne suffit, depuis le
+dossier du programme :
 
 ```
-amorce.q21.dev
+Windows      mkdir q21-data ; Set-Content q21-data\amorces.txt "amorce.q21.dev:21121"
+Mac, Linux   mkdir -p q21-data && echo amorce.q21.dev:21121 > q21-data/amorces.txt
 ```
 
-Sur Windows, le Bloc-notes ajoute parfois `.txt` une seconde fois sans le
-dire, ce qui donne `amorces.txt.txt` et un fichier que le programme ne voit
-pas. Au moment d'enregistrer, choisissez « Type : Tous les fichiers » et tapez
-le nom complet. Sur Mac, TextEdit doit être en « Format → Convertir au format
-Texte » avant d'enregistrer, sinon il produit un document enrichi.
-
-Si vous préférez une seule ligne de commande, dans la fenêtre ouverte à
-l'étape 2, une fois placé dans le dossier du programme :
-
-```
-Windows      mkdir q21-data ; Set-Content q21-data\amorces.txt "amorce.q21.dev"
-Mac, Linux   mkdir -p q21-data && echo amorce.q21.dev > q21-data/amorces.txt
-```
-
-Le jour où d'autres portiers existent, on ajoute leurs adresses dans ce
-fichier, une par ligne. `RESEAU.md` tient la liste à jour.
+Sur Windows, le Bloc-notes ajoute parfois `.txt` une seconde fois sans le dire,
+ce qui donne `amorces.txt.txt` et un fichier que le programme ne voit pas. Au
+moment d'enregistrer, choisissez « Type : Tous les fichiers » et tapez le nom
+complet. Sur Mac, TextEdit doit être en « Format → Convertir au format Texte »
+avant d'enregistrer, sinon il produit un document enrichi. La ligne de commande
+ci-dessus évite les deux pièges.
 
 ### 4. Lancer
 
@@ -264,12 +272,18 @@ arrivent frappent chez les autres.
 
 ## Si quelque chose ne va pas
 
-**« aucune amorce : ce nœud ne cherchera personne »** — le fichier
-`amorces.txt` n'est pas dans `q21-data`, ou s'appelle autrement. Étape 3.
+**« Aucune adresse de départ : ce nœud ne cherche personne »**, dans la page —
+ou **« aucune amorce : ce nœud ne cherchera personne »**, dans la fenêtre
+noire. Les deux disent la même chose : le fichier `amorces.txt` n'est pas dans
+`q21-data`, ou s'appelle autrement. Il est livré avec le programme ; s'il a
+disparu, l'étape 3 donne la ligne qui le recrée.
 
-**`pairs 0` qui ne bouge pas** — même cause, presque toujours. Sinon, votre
-réseau bloque les connexions sortantes vers le port `21121` ; c'est rare chez
-soi, fréquent dans une entreprise.
+**`pairs 0` qui ne bouge pas, sans ce message** — le nœud a donc une adresse et
+frappe pour de bon, mais personne n'ouvre. Ce n'est plus la même panne : soit le
+point d'entrée est momentanément arrêté, soit votre réseau bloque les connexions
+sortantes vers le port `21121` — rare chez soi, fréquent en entreprise. Pour
+trancher depuis votre machine : `Test-NetConnection amorce.q21.dev -Port 21121`
+sous Windows, `nc -vz amorce.q21.dev 21121` sur Mac ou Linux.
 
 **Windows demande « Terminer le programme de commandes (O/N) ? »** — vous
 avez fait Ctrl-C dans la fenêtre noire. Le portefeuille s'est déjà arrêté

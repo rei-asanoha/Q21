@@ -163,3 +163,69 @@ fn rejoindre_md_annonce_les_tailles_memoire_du_reseau_d_essai() {
          miner sur le reseau d'essai."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Le point d'entree livre avec le programme
+// ---------------------------------------------------------------------------
+//
+// Le binaire ne contient l'adresse d'aucun serveur, et cela ne change pas : une
+// adresse gravee dans un logiciel distribue serait une dependance permanente
+// envers celui qui la tient. Mais le fichier qui la porte voyage desormais
+// rempli dans l'archive. Sans cela, toute archive fraichement decompressee est
+// aveugle, et son porteur lit « aucun ordinateur joignable » sans savoir que
+// rien n'est casse.
+//
+// Deux derives deviennent alors possibles, et ces epreuves les ferment : livrer
+// une adresse que le projet n'a pas publiee — donc que personne n'a verifiee —
+// et cesser de livrer le fichier sans s'en apercevoir.
+
+/// Les adresses livrees sont celles que le projet publie.
+///
+/// `RESEAU.md` pose la regle : « on n'ecrit ici que ce qui repond vraiment,
+/// verifie depuis une machine exterieure ». Une adresse livree a des milliers
+/// de machines doit au moins avoir passe cette porte-la.
+#[test]
+fn les_amorces_livrees_sont_celles_que_reseau_md_publie() {
+    let fichier = lire("amorces-par-defaut.txt");
+    let reseau_md = lire("RESEAU.md");
+
+    let adresses: Vec<&str> = fichier
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    assert!(
+        !adresses.is_empty(),
+        "amorces-par-defaut.txt ne contient aucune adresse : l'archive repartirait \
+         aveugle, et le premier lancement n'aboutirait nulle part."
+    );
+
+    for a in &adresses {
+        assert!(
+            reseau_md.contains(a),
+            "amorces-par-defaut.txt livre `{a}`, que RESEAU.md ne publie pas.\n\
+             Publier d'abord, livrer ensuite : on n'envoie pas a des inconnus une \
+             adresse que le projet n'a pas verifiee."
+        );
+    }
+}
+
+/// La chaine de livraison depose bien ce fichier dans l'archive.
+///
+/// Le fichier peut etre parfait dans le depot et n'arriver nulle part. C'est
+/// l'etape d'assemblage qui le fait voyager, et rien d'autre ne la garde.
+#[test]
+fn la_livraison_depose_le_fichier_d_amorces_dans_l_archive() {
+    let workflow = lire(".github/workflows/livraison.yml");
+    assert!(
+        workflow.contains("cp amorces-par-defaut.txt livraison/q21-data/amorces.txt"),
+        "la chaine de livraison ne depose plus amorces.txt dans l'archive : \
+         toute archive repartirait aveugle."
+    );
+    assert!(
+        workflow.contains("mkdir -p livraison/q21-data"),
+        "le dossier q21-data n'est plus cree dans l'archive : le fichier d'amorces \
+         n'atterrirait pas la ou le noeud le cherche."
+    );
+}
