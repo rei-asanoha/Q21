@@ -509,8 +509,10 @@ conteste.
 
 ### Verifie sur un lancement reel
 
-Testnet, deux noeuds, ML-DSA-87 de bout en bout : genese `02140e8a…` identique
-des deux cotes, 205 blocs mines, transaction de 7 361 octets, synchronisation
+Testnet, deux noeuds, ML-DSA-87 de bout en bout : genese identique des deux
+cotes — `02140e8a…` a cette date, empreinte du consensus d'alors, changee
+depuis ; ce qui etait mesure la, c'est l'accord des deux machines, pas la
+valeur — 205 blocs mines, transaction de 7 361 octets, synchronisation
 par TCP, reception de 0,005 Q21, aller-retour vers l'expediteur. Le banc de
 mesure des signatures est conserve : `cargo run --release --features mldsa
 --example bench_sig`.

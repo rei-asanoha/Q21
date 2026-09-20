@@ -495,7 +495,7 @@ sudo journalctl -u q21 -f
 Vous devez voir la genèse écrite, puis l'écoute :
 
 ```
-  genese ecrite : 02140e8ad7f3d57d3ebb...
+  genese ecrite : 30853c2fe725d24817ae...
   sans portefeuille : aucune methode de portefeuille servie
   ecoute sur 0.0.0.0:21121
 ```
@@ -551,7 +551,7 @@ C'est le moment de vérité. **Depuis le Mac**, dans le dossier où se trouve vo
 Vous devez voir :
 
 ```
-  genese ecrite : 02140e8a...
+  genese ecrite : 30853c2f...
   connexion vers amorce.VOTREDOMAINE.fr (5.75.xxx.xxx:21121)
 ```
 

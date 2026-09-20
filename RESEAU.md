@@ -15,7 +15,7 @@ q21 genese testnet
 
 ```
   testnet
-    identifiant   02140e8ad7f3d57d3ebb3936d380e37f0192a27b99dd894ca409a75db498a921
+    identifiant   30853c2fe725d24817ae35bd8a8a81bbd1f38f6c33a957e5470fc5bc231d5fe0
     port P2P      21121
 ```
 
