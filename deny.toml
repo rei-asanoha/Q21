@@ -12,10 +12,19 @@ all-features = true
 [advisories]
 # Une faille publiee (base RustSec) sur une dependance fait echouer la
 # verification. Les avis « non maintenu » et « non fiable » sont signales.
+#
+# `unmaintained` et `unsound` ne prennent plus un niveau (« deny », « warn »)
+# mais une **portee** : quelles caisses examiner. `all` = toutes, y compris
+# les dependances transitives ; `workspace` = les notres seulement ; `none` =
+# aucune. Un avis trouve dans la portee est toujours une erreur. L'ancienne
+# forme `unsound = "deny"` a cesse d'etre lue par cargo-deny en septembre
+# 2026, et la chaine d'integration s'est arretee sur ce fichier sans qu'une
+# ligne de code ait change : c'est le prix d'une action tierce suivie par une
+# etiquette mouvante (`@v2`), voir SIGNATURE.md, section 5.
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
-unsound = "deny"
+unsound = "all"
 
 [licenses]
 version = 2

@@ -831,6 +831,12 @@ impl Node {
             .unwrap_or(0)
     }
 
+    /// Nombre de connexions ouvertes, **poignee de main faite ou non**.
+    ///
+    /// Un pair compte ici des qu'il est enregistre, avant `Version` et
+    /// `VerAck`. Les envois qui exigent la presentation — `announce_block`,
+    /// `announce_tx` — ne le verront qu'une fois `handshaked`. Attendre
+    /// `peer_count() == 1` ne garantit donc pas qu'une annonce sera recue.
     pub fn peer_count(&self) -> usize {
         self.partage.lock().unwrap().peers.len()
     }
@@ -2992,12 +2998,38 @@ mod tests {
         a.shutdown();
     }
 
+    /// Nombre de pairs dont la poignee de main est **achevee** — les seuls a
+    /// qui `announce_block` parle.
+    ///
+    /// `peer_count` compte aussi les connexions encore en train de se
+    /// presenter. Une epreuve qui attend `peer_count() == 1` puis annonce un
+    /// bloc court donc une course : mesure sur 150 essais, dans 135 cas le pair
+    /// etait compte avant d'etre presente. L'annonce partait alors vers
+    /// personne, en silence, et l'epreuve n'a tenu jusqu'ici que parce que
+    /// miner le bloc prenait plus longtemps que finir la poignee de main. Sur
+    /// une machine chargee — un runner d'integration continue qui fait tourner
+    /// six cents epreuves de front — ce n'est plus vrai, et la livraison
+    /// echoue sans qu'aucune ligne de code n'ait change.
+    fn pairs_presentes(n: &Node) -> usize {
+        n.partage
+            .lock()
+            .unwrap()
+            .peers
+            .values()
+            .filter(|p| p.handshaked)
+            .count()
+    }
+
     #[test]
     fn un_bloc_mine_apres_connexion_se_propage() {
         let (a, b) = paire();
         let addr = a.listen("127.0.0.1:0").expect("ecoute");
         b.connect(addr).expect("connexion");
-        assert!(attendre(|| a.peer_count() == 1 && b.peer_count() == 1, 5));
+        // La poignee de main, pas seulement la connexion : voir `pairs_presentes`.
+        assert!(
+            attendre(|| pairs_presentes(&a) == 1 && pairs_presentes(&b) == 1, 5),
+            "poignee de main non achevee"
+        );
 
         miner(&a, 1);
         let bloc = a.with_chain(|c| c.block_by_id(&c.tip_id())).unwrap();
