@@ -1988,6 +1988,8 @@ async function infos(){
       appel("getempreinteutxo")
     ]);
     document.getElementById("tuiles-infos").innerHTML =
+      tuile("Version du programme", "q21 " + info.version,
+            "celle que vous exécutez — à comparer à la version annoncée par la livraison") +
       tuile("Schéma de signature", w.schema, "identifiant " + w.schema_id + " dans le protocole") +
       tuile("Réseau", w.reseau) +
       tuile("Adresses connues", adresses.length, w.adresses_derivees + " dérivée(s) depuis la graine") +
@@ -3653,6 +3655,26 @@ mod tests {
         assert!(
             script().contains(r#"const VUES = ["solde","miner","recevoir","reseau","envoyer","historique","infos"];"#),
             "la liste des vues du script ne correspond pas au balisage"
+        );
+    }
+
+    /// La version affichee vient du nœud, pas de la page.
+    ///
+    /// Une version ecrite en dur dans le balisage serait juste le jour de sa
+    /// redaction et fausse a la livraison suivante — et c'est precisement quand
+    /// elle est fausse qu'on la consulte. Elle doit venir de `getinfo`, seule
+    /// source qui ait le droit de dire ce que le programme est.
+    #[test]
+    fn la_version_affichee_vient_du_noeud() {
+        let s = script();
+        assert!(
+            s.contains(r#"tuile("Version du programme", "q21 " + info.version"#),
+            "la version n'est plus lue dans la reponse du nœud"
+        );
+        assert!(
+            !PAGE.contains(&format!("q21 {}", env!("CARGO_PKG_VERSION"))),
+            "la version est ecrite en dur dans la page : elle mentira a la \
+             prochaine livraison"
         );
     }
 

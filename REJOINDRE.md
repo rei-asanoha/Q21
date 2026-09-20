@@ -138,6 +138,10 @@ une heure selon l'âge de la chaîne.
 Si `pairs` reste à `0`, relisez l'étape 3 : dans presque tous les cas, le
 fichier `amorces.txt` n'est pas au bon endroit, ou porte un autre nom.
 
+L'onglet **Infos** de la page affiche la version du programme que vous faites
+tourner, et `q21 version` répond la même chose depuis une fenêtre de commandes.
+C'est la première chose à donner si vous demandez de l'aide quelque part.
+
 ### 6. Miner, si vous le voulez
 
 Miner, c'est prêter la mémoire de votre machine au réseau, et être payé pour

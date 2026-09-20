@@ -854,6 +854,14 @@ impl RpcContext {
         let s = &self.node.stats;
 
         Json::obj()
+            // La version du programme qui repond. Meme raison que les deux
+            // constantes plus bas : une page qui l'ecrirait en dur mentirait a
+            // la premiere livraison suivante. Et sans elle, celui qui tient un
+            // binaire six mois plus tard n'a aucun moyen de savoir ce qu'il
+            // execute — le commentaire de confiance de la signature porte la
+            // version, mais il est attache au fichier des condensats, pas au
+            // programme.
+            .set("version", Json::str(env!("CARGO_PKG_VERSION")))
             .set("reseau", Json::str(format!("{:?}", self.network)))
             .set("hauteur", Json::u64(hauteur))
             .set("tete", Json::str(tete))
@@ -2980,6 +2988,14 @@ mod tests {
             r.get("portefeuille_actif"),
             Some(&Json::Bool(false)),
             "le portefeuille doit etre annonce inactif"
+        );
+        // La version du programme. Un binaire qui ne sait pas dire ce qu'il est
+        // ne se depanne pas a distance, et son porteur ne peut pas le comparer
+        // a la version annoncee par la livraison.
+        assert_eq!(
+            r.get("version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "getinfo doit annoncer la version du programme"
         );
     }
 

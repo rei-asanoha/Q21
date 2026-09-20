@@ -120,6 +120,11 @@ des deux échoue, n'installez pas** : ce n'est pas votre livraison.
 Sous Windows, `minisign` se télécharge depuis la page des versions de son
 auteur ; la vérification est la même dans PowerShell.
 
+Une fois installé, `q21 version` dit ce que le programme est. Le commentaire de
+confiance porte la version, mais il est attaché au fichier des condensats, pas
+au binaire : six mois plus tard, devant un `q21` trouvé dans un dossier, c'est
+cette commande qui répond. Elle ne demande ni dossier de données, ni réseau.
+
 ## 5 · Les actions de la chaîne de construction
 
 Les workflows appellent des actions tierces (`actions/checkout`,

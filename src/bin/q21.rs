@@ -141,6 +141,7 @@ COMMANDES
                             A verifier avant de rejoindre : deux noeuds qui n'ont
                             pas la meme genese ne sont pas sur la meme chaine.
     securite                 Ce qui est protege, et ce qui ne l'est pas
+    version                  Version de ce programme. Aussi --version et -V
     help                     Cette aide
 
 EXEMPLE
@@ -247,7 +248,16 @@ fn main() {
     let commande_lue = reste.first().map(|s| s.as_str()).unwrap_or("help");
     let sans_repertoire = matches!(
         commande_lue,
-        "emission" | "securite" | "genese" | "genesis" | "help" | "--help" | "-h"
+        "emission"
+            | "securite"
+            | "genese"
+            | "genesis"
+            | "version"
+            | "--version"
+            | "-V"
+            | "help"
+            | "--help"
+            | "-h"
     );
     let _verrou = if sans_repertoire {
         None
@@ -322,6 +332,10 @@ fn main() {
         "genese" | "genesis" => cmd_genese(reste.get(1).map(|s| s.as_str())),
         "revalider" => cmd_revalider(&datadir, &reste[1..]),
         "securite" => cmd_securite(),
+        "version" | "--version" | "-V" => {
+            println!("q21 {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             print!("{AIDE}");
             Ok(())
