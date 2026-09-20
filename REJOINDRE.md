@@ -123,12 +123,26 @@ fenêtre noire.
 vos fonds si ce disque disparaît — et il suffit : sur une machine neuve, ce
 code seul redonne l'intégralité du portefeuille.
 
-Deux avertissements sont normaux au premier lancement. Windows affiche un écran
-SmartScreen : cliquez « Informations complémentaires », puis « Exécuter quand
-même ». Mac refuse d'ouvrir « un développeur non identifié » : faites un clic
-droit sur le lanceur, « Ouvrir », puis confirmez. Ces messages disent qu'aucun
-certificat commercial n'a été acheté ; c'est le cas, et c'est la vérification
-de l'étape 2 qui le remplace.
+Deux avertissements sont normaux au premier lancement, et ils disent tous deux
+la même chose : aucun certificat commercial n'a été acheté pour ce programme.
+C'est le cas, et c'est la vérification de l'étape 2 qui le remplace.
+
+**Windows** affiche un écran SmartScreen : cliquez « Informations
+complémentaires », puis « Exécuter quand même ».
+
+**Mac** refuse d'ouvrir le lanceur — « d'un développeur non identifié » — ou
+propose de le mettre à la corbeille. Ne le faites pas. Ouvrez **Réglages
+Système → Confidentialité et sécurité**, descendez tout en bas : une ligne y
+signale que `Portefeuille Q21.command` a été bloqué, avec un bouton
+**« Ouvrir quand même »**. Cliquez-le, confirmez, et c'est fini : le lanceur
+lève lui-même la marque de quarantaine sur le reste du dossier, et vous n'aurez
+plus jamais cette question, ni pour lui, ni pour `q21`. Sur un Mac plus ancien
+que macOS 15, un clic droit sur le lanceur puis « Ouvrir » suffit.
+
+Si vous préférez ne rien passer par les Réglages, le Terminal fait la même chose
+en une ligne, depuis le dossier décompressé : `xattr -dr com.apple.quarantine .`
+Un programme signé et notarié par Apple éviterait ce détour ; cela demanderait
+une identité vérifiée par Apple, et ce projet a choisi de n'en avoir aucune.
 
 ### 5. Savoir que vous êtes dedans
 

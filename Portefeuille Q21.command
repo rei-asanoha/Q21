@@ -19,9 +19,29 @@
 #  Tout cela se passe maintenant dans des ecrans, a l'ouverture du navigateur —
 #  voir src/installation.rs.
 #
-#  Sur macOS, l'extension `.command` rend ce fichier double-cliquable dans le
-#  Finder. Si macOS refuse de l'ouvrir : clic droit, puis « Ouvrir ».
+#  Ce qu'il fait en plus, sur macOS : lever la quarantaine
+#
+#  Tout fichier telecharge par un navigateur recoit de macOS une marque de
+#  quarantaine, et un programme non notarie qui la porte est refuse au
+#  lancement avec « est endommage et ne peut pas etre ouvert » — un message
+#  qui accuse le fichier alors que rien n'est abime. Notarier demanderait un
+#  compte Apple Developer, donc une identite verifiee par Apple, ce que ce
+#  projet ne fait pas. On leve donc la marque ici, une fois, sur tout le
+#  dossier : c'est exactement le geste que RESEAU.md demandait de faire a la
+#  main dans le Terminal, et il n'y a aucune raison de le laisser a
+#  l'utilisateur. `xattr` echoue en silence quand il n'y a rien a lever —
+#  Linux, ou une archive ouverte depuis le Terminal — et le lanceur continue.
+#
+#  Ce lanceur-ci porte la meme marque, et macOS le bloque une fois : « d'un
+#  developpeur non identifie ». C'est le seul geste qui reste a l'utilisateur,
+#  et il est documente dans REJOINDRE.md. Une fois autorise, tout le reste
+#  passe par ici.
 # ---------------------------------------------------------------------------
 cd "$(dirname "$0")" || exit 1
+
+# Lever la quarantaine sur tout le dossier, sans bruit si rien n'est a lever.
+xattr -dr com.apple.quarantine . 2>/dev/null || true
+# L'archive conserve le droit d'execution ; on le remet par surete.
+chmod +x ./q21 2>/dev/null || true
 
 ./q21 wallet

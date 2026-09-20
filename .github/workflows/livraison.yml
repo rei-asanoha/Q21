@@ -488,16 +488,20 @@ jobs:
 
             ### Ces fichiers ne sont pas signes
 
-            macOS dira « impossible d'ouvrir, le developpeur ne peut pas etre
-            verifie ». Clic droit sur le fichier, puis « Ouvrir », puis
-            « Ouvrir » a nouveau dans la fenetre qui s'affiche.
+            macOS bloque le lanceur — « d'un developpeur non identifie » — ou
+            propose de le mettre a la corbeille. Ne le faites pas : Reglages
+            Systeme, Confidentialite et securite, tout en bas, « Ouvrir quand
+            meme ». Une seule fois : le lanceur leve ensuite lui-meme la
+            quarantaine sur le reste du dossier. Avant macOS 15, un clic droit
+            sur le lanceur puis « Ouvrir » suffit.
 
             Windows affichera un avertissement SmartScreen. « Informations
             complementaires », puis « Executer quand meme ».
 
-            Signer ces fichiers pour macOS et Windows demande un compte Apple
-            Developer payant et un certificat Authenticode. Tant que ce n'est
-            pas fait, trois verifications restent possibles, de la plus simple
+            Signer ces fichiers pour macOS demande une identite verifiee par
+            Apple, et pour Windows un certificat Authenticode — ce projet a
+            choisi de n'avoir ni l'une ni l'autre. Trois verifications restent
+            possibles, de la plus simple
             a la plus forte :
 
             1. le condensat SHA-256 joint (`.sha256`, et `SHA256SUMS` pour

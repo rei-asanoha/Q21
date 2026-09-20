@@ -229,3 +229,35 @@ fn la_livraison_depose_le_fichier_d_amorces_dans_l_archive() {
          n'atterrirait pas la ou le noeud le cherche."
     );
 }
+
+/// Le lanceur macOS leve la quarantaine avant de demarrer.
+///
+/// Sans cette ligne, tout telechargement par navigateur aboutit a « est
+/// endommage et ne peut pas etre ouvert » sur `q21` — un message qui accuse
+/// le fichier et envoie le nouveau venu vers la corbeille. Le geste qu'elle
+/// fait est celui que RESEAU.md demandait a la main ; le laisser a
+/// l'utilisateur n'avait aucune raison d'etre.
+#[test]
+fn le_lanceur_macos_leve_la_quarantaine() {
+    let lanceur = lire("Portefeuille Q21.command");
+    assert!(
+        lanceur.contains("xattr -dr com.apple.quarantine ."),
+        "le lanceur macOS ne leve plus la quarantaine : q21 sera « endommage » \
+         a chaque premier lancement."
+    );
+    assert!(
+        lanceur.contains("2>/dev/null || true"),
+        "la levee de quarantaine doit rester silencieuse la ou il n'y a rien a \
+         lever, sinon le lanceur s'arrete sur Linux ou apres une archive ouverte \
+         depuis le Terminal."
+    );
+    // Et le geste utile vient AVANT le lancement, pas apres.
+    let (i_xattr, i_wallet) = (
+        lanceur.find("xattr -dr").expect("xattr present"),
+        lanceur.find("./q21 wallet").expect("lancement present"),
+    );
+    assert!(
+        i_xattr < i_wallet,
+        "la quarantaine doit etre levee avant de lancer q21, pas apres"
+    );
+}

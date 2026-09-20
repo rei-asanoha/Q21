@@ -28,12 +28,20 @@ personne : il demande de comparer deux nombres.
 
 ## 1 bis · Sur macOS : lever la quarantaine, une fois
 
-Les fichiers livrés ne sont pas signés — cela demande un compte Apple Developer
-payant. macOS met donc en quarantaine tout ce qui vient d'un navigateur, et
-propose de le **mettre à la corbeille**. Ce n'est pas une panne, et le refuser
-est le bon réflexe de sa part.
+Les fichiers livrés ne sont pas notariés — cela demande une identité vérifiée
+par Apple, et ce projet a choisi de n'en avoir aucune. macOS met donc en
+quarantaine tout ce qui vient d'un navigateur, et propose de le **mettre à la
+corbeille**. Ce n'est pas une panne, et le refuser est le bon réflexe de sa
+part.
 
-Deux choses à savoir, dans cet ordre :
+**Si vous voulez le portefeuille**, vous n'avez rien à taper : le lanceur
+`Portefeuille Q21.command` lève lui-même la quarantaine sur tout le dossier
+avant de démarrer. macOS bloquera le lanceur une fois — « d'un développeur non
+identifié » — et **Réglages Système → Confidentialité et sécurité → Ouvrir
+quand même** règle la question pour de bon. `REJOINDRE.md` détaille ce geste.
+
+**Si vous voulez un nœud sans portefeuille**, ou simplement vérifier la genèse,
+deux choses à savoir, dans cet ordre :
 
 **`q21` ne se double-clique pas.** C'est un programme en ligne de commande. Le
 double-cliquer dans le Finder est précisément ce qui déclenche ce dialogue.
