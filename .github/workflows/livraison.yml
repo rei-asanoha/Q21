@@ -295,6 +295,12 @@ jobs:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     environment: livraison
     steps:
+      # Le depot d'abord, les artefacts ensuite : `checkout` nettoie le
+      # repertoire de travail, et l'inverse effacerait les archives a signer.
+      # On ne vient chercher qu'une chose ici : la clef publique publiee, pour
+      # la contre-verification qui suit la signature.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: livraisons
@@ -348,6 +354,29 @@ jobs:
             -m livraisons/SHA256SUMS -t "Q21 ${GITHUB_REF_NAME} ${GITHUB_SHA} -- Rei Asanoha"
           rm -f minisign.key
           cat livraisons/SHA256SUMS.minisig
+
+      # Contre-verification : la signature qu'on vient de produire doit se
+      # verifier avec la clef publique **publiee dans le depot**, celle que les
+      # gens recopient depuis le README.
+      #
+      # Sans ce controle, deux pannes silencieuses passent : une clef tournee
+      # dans les secrets sans que le depot suive, et un secret subtilement faux.
+      # Dans les deux cas la livraison part signee — d'une clef que personne ne
+      # peut verifier — et on ne l'apprend que par la plainte d'un utilisateur.
+      # Mieux vaut une livraison rouge qu'une livraison qu'on croit signee.
+      - name: Contre-verification de la signature
+        shell: bash
+        run: |
+          set -eu
+          if [ ! -f q21-livraison.pub ]; then
+            echo "::error::q21-livraison.pub absent du depot : la signature ne peut pas etre contre-verifiee. Voir SIGNATURE.md."
+            exit 1
+          fi
+          if ! minisign -Vm livraisons/SHA256SUMS -p q21-livraison.pub; then
+            echo "::error::la signature ne se verifie PAS avec la clef publique du depot. La clef des secrets et celle du README ont diverge : livraison interrompue. Voir SIGNATURE.md."
+            exit 1
+          fi
+          echo "Signature verifiee avec la clef publique du depot."
 
       - name: Depot des condensats signes
         uses: actions/upload-artifact@v4

@@ -625,8 +625,20 @@ publique qui vérifie ces signatures est celle-ci — à comparer avec la copie
 publiée par un second canal avant de s'y fier :
 
 ```
-<clé publique minisign, ligne RW…, à coller ici après la création de la clé>
+RWQEzj2lfpk5/AdkPvUkzD3PjGIA6nkQt5tT2qSl9UcIbWaw0CE1m49T
 ```
+
+Elle est aussi dans le fichier `q21-livraison.pub`, à la racine du dépôt, sous
+la forme que `minisign` lit directement :
+
+```bash
+minisign -Vm SHA256SUMS -p q21-livraison.pub
+```
+
+Ce fichier n'est pas qu'une commodité : la chaîne de livraison **contre-vérifie
+sa propre signature** avec lui avant de publier quoi que ce soit. Une clé qui
+tournerait dans les secrets sans que ce fichier suive ferait échouer la
+livraison, plutôt que d'expédier une signature que personne ne peut vérifier.
 
 Le commentaire de confiance de chaque signature porte le nom qui signe le
 projet, et ce commentaire est **couvert par la signature** : il ne se réécrit

@@ -30,7 +30,7 @@ notez-le sur papier. Deux fichiers sortent :
 
 | Fichier | Ce que c'est | Où il va |
 |---|---|---|
-| `q21-livraison.pub` | la clé **publique** | dans le README (section ci-dessous), et par un second canal — un message, une page que vous contrôlez |
+| `q21-livraison.pub` | la clé **publique** | dans le README, dans le fichier `q21-livraison.pub` à la racine du dépôt, et par un second canal — un message, une page que vous contrôlez |
 | `q21-livraison.key` | la clé **secrète**, chiffrée par le mot de passe | dans les secrets du dépôt, puis nulle part d'autre qu'une copie hors ligne |
 
 ## 2 · Confier la clé à la livraison — dans un environnement protégé
@@ -70,6 +70,18 @@ adresse de récupération de compte est une clé de signature de plus.
 À chaque livraison, le travail **Signature** rassemble les condensats de
 toutes les archives dans `SHA256SUMS` et le signe : `SHA256SUMS.minisig`. Les
 deux sont déposés ensemble, dans l'artefact `SHA256SUMS-signe`.
+
+Puis il **contre-vérifie sa propre signature** avec `q21-livraison.pub`, le
+fichier de clé publique versionné dans le dépôt — celui que les gens recopient
+depuis le README. Ce contrôle ferme deux pannes silencieuses : une clé changée
+dans les secrets sans que le dépôt suive, et un secret subtilement faux. Dans
+les deux cas la livraison partirait signée d'une clé que personne ne peut
+vérifier, et on ne l'apprendrait que par la plainte d'un utilisateur. La
+livraison échoue désormais à la place.
+
+Si vous tournez un jour de clé, les deux vont donc ensemble : le secret dans
+l'environnement GitHub, **et** `q21-livraison.pub` plus le README dans le même
+commit. La chaîne de livraison refusera toute autre combinaison.
 
 ## 4 · Vérifier avant d'installer
 
