@@ -511,6 +511,22 @@ where
 }
 
 /// Ce que le noyau sait du compte qui tient l'autre bout d'une connexion.
+///
+/// `Compte` et `Absent` ne sont construits que par la lecture de
+/// `/proc/net/tcp`, qui n'existe que sous Linux ; ailleurs,
+/// `proprietaire_de_la_connexion` rend toujours `Inconnu`. Ces deux variantes
+/// sont donc du code mort hors Linux — non par oubli, mais parce que la seule
+/// machine capable de les produire est absente. `verdict` les lit sur toutes
+/// les plateformes ; c'est leur construction, pas leur usage, qui est
+/// specifique a Linux. On tait l'avertissement la ou il est attendu, plutot
+/// que partout.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "construits seulement par la lecture de /proc, propre a Linux"
+    )
+)]
 #[derive(Debug, PartialEq, Eq)]
 enum Proprietaire {
     /// Le compte designe par la table des sockets.

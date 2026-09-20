@@ -125,11 +125,56 @@ jobs:
           mv .cargo/config.toml /tmp/config.toml.depot
           cargo vendor --locked /tmp/vendor-neuf > /dev/null
           mv /tmp/config.toml.depot .cargo/config.toml
-          if ! diff -r --brief vendor /tmp/vendor-neuf; then
-            echo "::error::vendor/ differe de ce que crates.io fournit pour Cargo.lock : une source vendorisee a ete modifiee, ou le lock ne correspond plus."
+
+          # On compare les SOURCES, pas la comptabilite interne de cargo.
+          #
+          # `.cargo-checksum.json` est un fichier que cargo ecrit pour son
+          # propre usage ; son format a change entre la version de cargo qui a
+          # cree `vendor/` et une autre, si bien que deux vendorisations d'un
+          # meme crate, aux sources rigoureusement identiques, produisent des
+          # `.cargo-checksum.json` differents. Les exclure supprime ce faux
+          # positif sans rien relacher : la propriete qu'on veut est « les
+          # sources vendorisees sont celles de crates.io », et une source
+          # falsifiee ne correspondrait pas a la vendorisation fraiche, quel
+          # que soit le contenu de son fichier de sommes.
+          if ! diff -r --brief --exclude=.cargo-checksum.json vendor /tmp/vendor-neuf; then
+            echo "::error::une source vendorisee differe de ce que crates.io fournit pour Cargo.lock : source modifiee, ou lock qui ne correspond plus."
             exit 1
           fi
-          echo "vendor/ est identique a crates.io, fichier pour fichier."
+          echo "vendor/ : sources identiques a crates.io, fichier pour fichier."
+
+      # Et l'inverse : chaque fichier vendorise correspond-il a la somme que
+      # son propre `.cargo-checksum.json` annonce ? C'est ce que cargo verifie
+      # a la compilation ; on le refait ici a decouvert, pour qu'une source
+      # modifiee dont on aurait aussi reecrit la carte des sommes — donc
+      # coherente avec elle-meme — soit tout de meme prise par l'etape
+      # precedente, qui la compare a crates.io.
+      - name: Chaque source vendorisee correspond a sa somme enregistree
+        shell: bash
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, glob, hashlib, os, sys
+          mauvais = 0
+          total = 0
+          for carte in glob.glob("vendor/*/.cargo-checksum.json"):
+              d = os.path.dirname(carte)
+              sommes = json.load(open(carte))["files"]
+              for rel, attendue in sommes.items():
+                  total += 1
+                  chemin = os.path.join(d, rel)
+                  try:
+                      obtenue = hashlib.sha256(open(chemin, "rb").read()).hexdigest()
+                  except FileNotFoundError:
+                      print(f"::error::{chemin} : annonce dans les sommes, absent du vendor")
+                      mauvais += 1
+                      continue
+                  if obtenue != attendue:
+                      print(f"::error::{chemin} : contenu different de la somme enregistree")
+                      mauvais += 1
+          print(f"{total} fichiers vendorises verifies, {mauvais} incoherent(s).")
+          sys.exit(1 if mauvais else 0)
+          PY
 
   # Compilation reproductible : deux repertoires, un condensat.
   #
@@ -155,6 +200,14 @@ jobs:
   reproductible:
     name: Compilation reproductible
     runs-on: ubuntu-latest
+    # Le `-D warnings` global n'a pas sa place ici, et il empeche meme ce
+    # travail. `verifier-reproductible.sh` pose ses propres drapeaux — le
+    # remappage de chemin qui rend le binaire independant du repertoire — et
+    # refuse de tourner si RUSTFLAGS est deja defini, car il l'ecraserait sans
+    # le dire. Le vider pour ce travail leve le conflit ; la reproductibilite
+    # se moque des avertissements, elle ne regarde que les octets du binaire.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - name: Chaine d'outils
