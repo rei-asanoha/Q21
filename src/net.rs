@@ -841,6 +841,23 @@ impl Node {
         self.partage.lock().unwrap().peers.len()
     }
 
+    /// Nombre de pairs dont la poignee de main est **achevee**.
+    ///
+    /// C'est le seul compte qui dise « on se parle vraiment ». Une connexion
+    /// TCP acceptee puis refermee par le pair — parce qu'il est plein, ou que
+    /// nos genesses different — compte dans `peer_count` le temps d'un souffle
+    /// et jamais ici. Un diagnostic qui ne regarderait que `peer_count`
+    /// annoncerait donc une liaison la ou il n'y en a pas.
+    pub fn peer_count_presentes(&self) -> usize {
+        self.partage
+            .lock()
+            .unwrap()
+            .peers
+            .values()
+            .filter(|p| p.handshaked)
+            .count()
+    }
+
     /// Nombre de connexions **sortantes** — celles que nous avons initiees
     /// depuis le carnet. C'est ce compte, et non le total, que la boucle de
     /// maintien doit ramener a la cible : sinon un flot de connexions entrantes

@@ -286,6 +286,23 @@ arrivent frappent chez les autres.
 
 ## Si quelque chose ne va pas
 
+**Commencez par là**, quelle que soit la panne. Dans une fenêtre de commandes,
+depuis le dossier du programme — et **sans fermer le portefeuille**, c'est
+même tout l'intérêt :
+
+```
+Windows      .\q21.exe diagnostic
+Mac, Linux   ./q21 diagnostic
+```
+
+Elle refait tout le chemin dans l'ordre — le fichier d'amorces, la résolution
+du nom, l'ouverture du port, la poignée de main — et nomme l'étape qui casse.
+Une panne de réseau ressemble toujours à la même chose vue de la page
+d'accueil ; cette commande, elle, distingue un fichier manquant d'un pare-feu,
+et un pare-feu d'un point d'entrée arrêté. Si vous demandez de l'aide quelque
+part, c'est sa sortie complète qu'il faut joindre.
+
+
 **« Aucune adresse de départ : ce nœud ne cherche personne »**, dans la page —
 ou **« aucune amorce : ce nœud ne cherchera personne »**, dans la fenêtre
 noire. Les deux disent la même chose : le fichier `amorces.txt` n'est pas dans

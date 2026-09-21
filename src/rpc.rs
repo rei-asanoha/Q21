@@ -118,6 +118,9 @@ fn message_portefeuille(e: &crate::wallet::WalletError) -> &'static str {
         W::AleaIndisponible => "generateur d'alea du systeme inaccessible",
         W::SauvegardeInvalide => "code de sauvegarde illisible",
         W::SauvegardeAutreReseau => "code de sauvegarde d'un autre reseau",
+        W::SauvegardeEstUneAdresse => {
+            "ceci est une adresse de reception, pas un code de sauvegarde"
+        }
         W::VerrouIncoherent { .. } => {
             "incoherence entre la clef derivee et la sortie a depenser : rien \
              n'a ete signe"

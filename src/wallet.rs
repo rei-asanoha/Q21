@@ -49,6 +49,14 @@ pub enum WalletError {
     SauvegardeInvalide,
     /// Code de sauvegarde d'un autre reseau.
     SauvegardeAutreReseau,
+    /// Ce qu'on a recu est une adresse de reception, pas un code de sauvegarde.
+    ///
+    /// Les deux s'ecrivent pareil — Bech32m, meme alphabet — et ne different que
+    /// par le prefixe. Un portefeuille perdu, une adresse sous les yeux, et la
+    /// confusion est faite. La rejeter comme « somme de controle fausse »
+    /// envoyait la personne verifier une recopie parfaite : c'est l'objet qui
+    /// est faux, pas la copie, et c'est cela qu'il faut dire.
+    SauvegardeEstUneAdresse,
     /// La clef derivee a cet indice ne correspond pas au verrou de la sortie
     /// que le portefeuille croyait pouvoir depenser.
     ///
@@ -104,6 +112,14 @@ pub enum WalletError {
 const SEUIL_VERIFICATION_COMPLETE: usize = 1024;
 
 /// Prefixe humain du code de sauvegarde, par reseau.
+/// Le prefixe d'un code de sauvegarde, pour le nommer dans un message.
+///
+/// Rendu public pour que l'interface puisse dire a quoi ressemble ce qu'elle
+/// attend, sans recopier la table ici et la — une table recopiee derive.
+pub fn hrp_graine_public(n: Network) -> &'static str {
+    hrp_graine(n)
+}
+
 fn hrp_graine(n: Network) -> &'static str {
     match n {
         Network::Mainnet => "q21seed",
@@ -289,8 +305,17 @@ impl Wallet {
 
     /// Retrouve une graine depuis son code de sauvegarde.
     pub fn seed_from_backup(code: &str, network: Network) -> Result<[u8; 32], WalletError> {
+        let code = code.trim();
+        // Une adresse de reception collee ici est reconnue a son prefixe,
+        // avant meme de decoder : c'est le cas de confusion le plus probable,
+        // et il merite sa propre reponse plutot que le verdict generique.
+        if let Some((prefixe, _)) = code.rsplit_once('1') {
+            if Network::from_hrp(&prefixe.to_ascii_lowercase()).is_some() {
+                return Err(WalletError::SauvegardeEstUneAdresse);
+            }
+        }
         let (hrp, donnees) =
-            crate::bech32::decode(code.trim()).map_err(|_| WalletError::SauvegardeInvalide)?;
+            crate::bech32::decode(code).map_err(|_| WalletError::SauvegardeInvalide)?;
         if hrp != hrp_graine(network) {
             return Err(WalletError::SauvegardeAutreReseau);
         }
@@ -2501,6 +2526,45 @@ mod tests {
         assert_eq!(
             Wallet::seed_from_backup(&code, Network::Mainnet),
             Err(WalletError::SauvegardeAutreReseau)
+        );
+    }
+
+    /// Une adresse collee a la place du code est reconnue pour ce qu'elle est.
+    ///
+    /// Le cas reel : un portefeuille perdu, une adresse de reception sous les
+    /// yeux, et la certitude que « c'est pareil ». Le verdict generique —
+    /// « somme de controle fausse, verifiez la recopie » — faisait chercher une
+    /// faute de frappe dans une copie parfaite. Le programme doit nommer
+    /// l'objet recu, sur les trois reseaux, quelle que soit la casse.
+    #[test]
+    fn une_adresse_collee_a_la_place_du_code_est_nommee() {
+        for reseau in [Network::Regtest, Network::Testnet, Network::Mainnet] {
+            let mut w = Wallet::from_seed([7u8; 32], reseau);
+            let adresse = w.new_address().to_string();
+            assert!(adresse.starts_with(reseau.hrp()), "adresse : {adresse}");
+            assert_eq!(
+                Wallet::seed_from_backup(&adresse, reseau),
+                Err(WalletError::SauvegardeEstUneAdresse),
+                "une adresse {reseau:?} n'est pas nommee comme telle"
+            );
+            // Quelle que soit la casse et les espaces autour : on lit ce
+            // qu'une personne colle, pas ce qu'un programme produit.
+            let brouillonne = format!("  {}  ", adresse.to_ascii_uppercase());
+            assert_eq!(
+                Wallet::seed_from_backup(&brouillonne, reseau),
+                Err(WalletError::SauvegardeEstUneAdresse)
+            );
+        }
+        // Et le vrai code passe toujours, exactement comme avant.
+        let w = portefeuille();
+        assert_eq!(
+            Wallet::seed_from_backup(&w.backup_code(), w.network()),
+            Ok([0x11; 32])
+        );
+        // Une chaine quelconque reste « illisible », pas « une adresse ».
+        assert_eq!(
+            Wallet::seed_from_backup("n'importe quoi", Network::Testnet),
+            Err(WalletError::SauvegardeInvalide)
         );
     }
 

@@ -142,6 +142,9 @@ COMMANDES
                             pas la meme genese ne sont pas sur la meme chaine.
     securite                 Ce qui est protege, et ce qui ne l'est pas
     version                  Version de ce programme. Aussi --version et -V
+    diagnostic [--reseau n]  Pourquoi ce noeud ne se connecte pas : amorces, nom,
+                            port, poignee de main. A lancer pendant que le
+                            portefeuille tourne
     help                     Cette aide
 
 EXEMPLE
@@ -253,6 +256,7 @@ fn main() {
             | "genese"
             | "genesis"
             | "version"
+            | "diagnostic"
             | "--version"
             | "-V"
             | "help"
@@ -332,6 +336,7 @@ fn main() {
         "genese" | "genesis" => cmd_genese(reste.get(1).map(|s| s.as_str())),
         "revalider" => cmd_revalider(&datadir, &reste[1..]),
         "securite" => cmd_securite(),
+        "diagnostic" => cmd_diagnostic(&datadir, &reste[1..]),
         "version" | "--version" | "-V" => {
             println!("q21 {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -2201,10 +2206,221 @@ fn cmd_restore(
         q21_core::wallet::WalletError::SauvegardeAutreReseau => {
             "ce code de sauvegarde appartient a un autre reseau".to_string()
         }
+        q21_core::wallet::WalletError::SauvegardeEstUneAdresse => message_adresse_au_lieu_du_code(reseau_choisi),
         _ => "code de sauvegarde illisible : la somme de controle ne correspond pas.\n                Verifiez la recopie — l'alphabet Bech32 ne contient ni 1, ni b, ni i, ni o."
             .to_string(),
     })?;
     cmd_init_avec(datadir, reseau, schema, phrase_fichier, Some(graine))
+}
+
+/// `q21 diagnostic` — pourquoi ce noeud ne se connecte pas.
+///
+/// # Ce qu'il repare
+///
+/// Un portefeuille qui n'arrive pas a joindre le reseau affiche « en attente
+/// d'un ordinateur ». C'est vrai et c'est inutile : la cause peut etre un nom
+/// qui ne se resout pas, un port ferme par un pare-feu, un point d'entree
+/// arrete, un point d'entree plein, ou deux chaines differentes. Cinq pannes,
+/// un seul message — et personne, pas meme celui qui a ecrit le programme, ne
+/// peut trancher sans outil.
+///
+/// Cette commande fait les quatre essais dans l'ordre, sur chaque adresse
+/// d'amorcage, et nomme celui qui echoue :
+///
+/// 1. le fichier d'amorces est-il la, et que contient-il ;
+/// 2. le nom se resout-il en adresses ;
+/// 3. le port accepte-t-il une connexion TCP ;
+/// 4. la poignee de main Q21 aboutit-elle — meme reseau, meme genese.
+///
+/// Elle ne prend pas le verrou du dossier de donnees : on diagnostique
+/// pendant que le portefeuille tourne, c'est tout l'interet.
+fn cmd_diagnostic(datadir: &Path, args: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let reseau = match args.iter().position(|a| a == "--reseau") {
+        Some(i) => reseau_depuis_nom(args.get(i + 1).map(|s| s.as_str()).unwrap_or(""))?,
+        None => Network::Testnet,
+    };
+
+    println!("Diagnostic Q21");
+    println!();
+    println!("  reseau          {}", nom_de_reseau(reseau));
+    let genese = q21_core::chain::genesis_block(reseau);
+    println!("  genese calculee {}", genese.header.block_id());
+    println!("  dossier         {}", datadir.display());
+    println!();
+
+    // --- 1. Les adresses d'amorcage, et d'ou elles viennent.
+    let fichier = datadir.join("amorces.txt");
+    let du_fichier = q21_core::amorce::amorces_du_dossier(datadir);
+    let integrees: Vec<String> = q21_core::amorce::amorces_integrees(reseau)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    if fichier.exists() {
+        println!("  {} : {} adresse(s)", fichier.display(), du_fichier.len());
+    } else {
+        println!("  {} : ABSENT", fichier.display());
+    }
+    if !integrees.is_empty() {
+        println!("  integrees au binaire : {}", integrees.len());
+    }
+
+    let mut cibles = du_fichier;
+    cibles.extend(integrees);
+    cibles.dedup();
+
+    if cibles.is_empty() {
+        println!();
+        println!("  VERDICT : aucune adresse d'amorcage. Ce noeud ne cherchera personne.");
+        println!();
+        println!("  Creez {} et ecrivez-y une ligne :", fichier.display());
+        println!("      amorce.q21.dev:21121");
+        return Ok(());
+    }
+
+    // --- Un noeud jetable, en memoire, avec la genese de ce reseau. C'est lui
+    //     qui fera les vraies poignees de main : on n'eprouve pas un protocole
+    //     en le reimplementant a cote, on l'eprouve avec son propre code.
+    let chaine = q21_core::chain::Chain::new(reseau, genese);
+    let noeud = std::sync::Arc::new(q21_core::net::Node::new(reseau, chaine));
+
+    let mut une_marche = false;
+    for cible in &cibles {
+        println!();
+        println!("  --- {cible}");
+
+        // --- 2. Resolution.
+        let adresses = match q21_core::amorce::resoudre(cible, reseau) {
+            Ok(a) if !a.is_empty() => a,
+            Ok(_) => {
+                println!("      nom          AUCUNE ADRESSE — le nom ne rend rien");
+                continue;
+            }
+            Err(e) => {
+                println!("      nom          IRRESOLU : {e}");
+                println!("      -> verifiez l'orthographe, et votre acces a internet");
+                continue;
+            }
+        };
+        println!(
+            "      nom          resolu : {}",
+            adresses
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        for sa in &adresses {
+            // --- 3. Le port repond-il ?
+            let t0 = Instant::now();
+            match TcpStream::connect_timeout(sa, Duration::from_secs(5)) {
+                Ok(f) => {
+                    println!("      port {sa}  OUVERT en {} ms", t0.elapsed().as_millis());
+                    drop(f);
+                }
+                Err(e) => {
+                    println!("      port {sa}  FERME : {e}");
+                    println!("      -> point d'entree arrete, ou pare-feu entre vous et lui");
+                    continue;
+                }
+            }
+
+            // --- 4. La poignee de main Q21.
+            if noeud.est_connecte_a(*sa) {
+                continue;
+            }
+            if noeud.connect(*sa).is_err() {
+                println!("      poignee      REFUSEE a l'ouverture");
+                continue;
+            }
+            let avant = noeud.peer_count_presentes();
+            let mut faite = false;
+            let debut = Instant::now();
+            while debut.elapsed() < Duration::from_secs(8) {
+                if noeud.peer_count_presentes() > avant {
+                    faite = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if faite {
+                println!(
+                    "      poignee      FAITE — le pair annonce la hauteur {}",
+                    noeud.hauteur_annoncee_max()
+                );
+                // La poignee de main ne transporte pas la genese : deux noeuds
+                // de chaines differentes se la donnent, puis se separent a
+                // l'echange d'en-tetes. On regarde donc si la liaison TIENT,
+                // au lieu d'annoncer une identite de chaine qu'on n'a pas
+                // verifiee. Ce que cette commande sait, elle le dit ; ce
+                // qu'elle ne sait pas, elle ne l'invente pas.
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_secs(6) {
+                    if noeud.peer_count_presentes() <= avant {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                if noeud.peer_count_presentes() > avant {
+                    println!("      liaison      MAINTENUE — le pair nous garde");
+                    une_marche = true;
+                } else {
+                    println!("      liaison      ROMPUE aussitot apres la poignee");
+                    println!("      -> chaines differentes, le plus souvent : comparez");
+                    println!(
+                        "         `q21 genese {}` avec la valeur publiee par l'exploitant",
+                        nom_de_reseau(reseau)
+                    );
+                }
+            } else {
+                println!("      poignee      ECHOUEE — le port repond mais le pair nous ecarte");
+                println!("      -> point d'entree plein, ou reseau different");
+            }
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    println!();
+    if une_marche {
+        println!("  VERDICT : au moins un point d'entree repond et garde la liaison.");
+        println!();
+        println!("  Le chemin est donc ouvert. Si le portefeuille reste « en attente » :");
+        println!("  fermez-le entierement — une seule instance a la fois par dossier —");
+        println!(
+            "  puis relancez-le. Et comparez `q21 genese {}` a la valeur",
+            nom_de_reseau(reseau)
+        );
+        println!("  publiee par l'exploitant : c'est le seul controle que rien n'automatise.");
+    } else {
+        println!("  VERDICT : aucun point d'entree joignable.");
+        println!("  Le reseau ne peut pas etre rejoint tant que cela dure. Ce n'est pas");
+        println!("  votre machine : les essais ci-dessus disent a quelle etape cela casse.");
+    }
+    Ok(())
+}
+
+/// Le message pour qui a colle une adresse la ou un code etait attendu.
+///
+/// Il nomme les deux objets, dit pourquoi l'un ne peut pas faire le travail de
+/// l'autre, et donne le prefixe a chercher. Une adresse ne restaure rien, et
+/// c'est une propriete du systeme, pas une limite : si elle le pouvait,
+/// quiconque a votre adresse aurait vos fonds.
+fn message_adresse_au_lieu_du_code(reseau: Network) -> String {
+    format!(
+        "ceci est une adresse de reception ({}…), pas un code de sauvegarde.\n\n                \
+         Une adresse sert a recevoir ; elle ne peut restaurer aucun portefeuille — sinon\n                \
+         quiconque la connait aurait vos fonds. Le code de sauvegarde est celui affiche une\n                \
+         seule fois a la creation, a recopier sur papier : il commence par {}1…\n                \
+         Si vous ne l'avez pas note, le portefeuille existe encore la ou il a ete cree :\n                \
+         ouvrez-le depuis ce dossier-la, l'onglet Infos affiche son code de sauvegarde.",
+        reseau.hrp(),
+        q21_core::wallet::hrp_graine_public(reseau)
+    )
 }
 
 fn cmd_init(
@@ -5214,6 +5430,9 @@ fn traiter_installation(
                         Ok(g) => Some(g),
                         Err(q21_core::wallet::WalletError::SauvegardeAutreReseau) => {
                             return erreur("ce code de sauvegarde appartient a un autre reseau")
+                        }
+                        Err(q21_core::wallet::WalletError::SauvegardeEstUneAdresse) => {
+                            return erreur(&message_adresse_au_lieu_du_code(reseau))
                         }
                         Err(_) => {
                             return erreur(
