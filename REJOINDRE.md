@@ -76,7 +76,15 @@ et c'est voulu : une adresse gravée dans un logiciel distribué deviendrait une
 dépendance permanente envers celui qui la tient, et un protocole censé survivre
 à son auteur ne doit pas naître avec l'adresse de son auteur dedans. L'adresse
 se donne donc **à côté**, dans un fichier ordinaire que vous pouvez lire et
-modifier : `q21-data/amorces.txt`. Ouvrez-le, il s'explique lui-même.
+modifier. Il y en a deux, et c'est voulu : `amorces.txt` posé à côté du
+programme — celui que la livraison dépose —, et `q21-data/amorces.txt`, le
+vôtre, qui l'emporte si vous le créez. Ouvrez-les, ils s'expliquent eux-mêmes.
+
+Pourquoi deux ? Parce qu'un fichier rangé dans un sous-dossier peut se perdre
+à l'empaquetage d'une archive, selon l'outil et la plateforme — c'est arrivé,
+et les utilisateurs Windows d'une version se sont retrouvés sans point
+d'entrée pendant que Mac et Linux fonctionnaient. Un fichier posé à plat
+traverse tous les outils. La perte de l'un ne rend donc plus personne aveugle.
 
 La différence n'est pas un détail de forme. Une adresse dans le binaire ne se
 change qu'en redistribuant le binaire — donc par celui qui le signe. Une

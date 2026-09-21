@@ -99,16 +99,47 @@ pub fn amorces_integrees(n: Network) -> &'static [&'static str] {
 /// depose `amorces.txt`, chacun y ajoute ce qu'il veut. Les lignes vides et
 /// celles commencant par `#` sont ignorees.
 pub fn amorces_du_dossier(datadir: &Path) -> Vec<String> {
-    let chemin = datadir.join("amorces.txt");
-    let Ok(contenu) = std::fs::read_to_string(&chemin) else {
+    lire_fichier_amorces(&datadir.join("amorces.txt"))
+}
+
+/// Lit un fichier d'amorces, s'il existe. Absent ou illisible : liste vide.
+///
+/// Le decoupage lui-meme est confie a [`lire_amorces`], qui est eprouvee a
+/// part : un format que l'exploitant tape a la main merite d'etre verifie
+/// sans passer par un fichier.
+fn lire_fichier_amorces(chemin: &Path) -> Vec<String> {
+    match std::fs::read_to_string(chemin) {
+        Ok(contenu) => lire_amorces(&contenu),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Amorces lues **a cote du programme**, et non dans le dossier de donnees.
+///
+/// # Ce que cela repare
+///
+/// Le fichier livre vivait dans `q21-data/`, un sous-dossier. Assembler une
+/// archive et l'empaqueter sont deux gestes : `tar` descendait dans ce
+/// sous-dossier, `7z` non. Les archives Mac et Linux portaient donc le
+/// fichier, l'archive Windows partait aveugle, et rien ne le signalait — le
+/// defaut n'a ete vu que chez un utilisateur, plusieurs versions plus tard.
+///
+/// Un fichier **plat, a cote du binaire** traverse tous les outils
+/// d'archivage sans condition. C'est la meme idee qu'avant — l'adresse est a
+/// cote du programme, jamais dedans, et elle reste lisible et modifiable par
+/// celui qui la recoit — mais elle ne depend plus d'une structure de dossiers
+/// qui peut se perdre en route.
+///
+/// Le dossier de donnees garde la priorite : ce que l'utilisateur ecrit chez
+/// lui l'emporte sur ce que la livraison a depose.
+pub fn amorces_a_cote_du_programme() -> Vec<String> {
+    let Ok(exe) = std::env::current_exe() else {
         return Vec::new();
     };
-    contenu
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.to_string())
-        .collect()
+    let Some(dossier) = exe.parent() else {
+        return Vec::new();
+    };
+    lire_fichier_amorces(&dossier.join("amorces.txt"))
 }
 
 /// Resout `hote:port`, ou `hote` seul avec le port par defaut du reseau.

@@ -228,7 +228,10 @@ amorce.q21.dev:21121
 
 Un portefeuille fraîchement téléchargé trouve le réseau **sans que personne ne
 tape quoi que ce soit** : l'archive livrée porte déjà ce fichier, rempli et
-commenté, dans son sous-dossier `q21-data`. La source en est
+commenté, en deux exemplaires — `amorces.txt` à plat à côté du binaire, et
+`q21-data/amorces.txt` que l'utilisateur édite et qui l'emporte. Le doublon est
+délibéré : un sous-dossier peut se perdre à l'empaquetage selon l'outil, un
+fichier plat non. La source en est
 `amorces-par-defaut.txt`, à la racine du dépôt, et une épreuve interdit d'y
 inscrire une adresse que ce document ne publie pas — on publie d'abord, on livre
 ensuite.

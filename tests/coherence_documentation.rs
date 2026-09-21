@@ -241,6 +241,41 @@ fn la_livraison_verifie_le_contenu_de_l_archive_produite() {
     );
 }
 
+/// Le fichier d'amorces voyage en deux exemplaires, dont un a plat.
+///
+/// Un sous-dossier se perd a l'empaquetage selon l'outil : `tar` y descend,
+/// `7z` pas toujours. Les archives Mac et Linux portaient `q21-data/`,
+/// l'archive Windows partait sans — et son porteur lisait « aucune amorce ».
+/// Un fichier pose a plat a cote du binaire traverse tous les outils ; le
+/// noeud le lit quand le dossier de donnees n'a rien. La perte de l'un ne
+/// rend plus personne aveugle.
+#[test]
+fn le_fichier_d_amorces_voyage_aussi_a_plat() {
+    let workflow = lire(".github/workflows/livraison.yml");
+    assert!(
+        workflow.contains("cp amorces-par-defaut.txt livraison/amorces.txt"),
+        "l'exemplaire a plat n'est plus livre : une archive qui perdrait \
+         q21-data repartirait aveugle."
+    );
+    let amorce_rs = lire("src/amorce.rs");
+    assert!(
+        amorce_rs.contains("pub fn amorces_a_cote_du_programme"),
+        "le noeud ne cherche plus d'amorces a cote du binaire"
+    );
+    let bin = lire("src/bin/q21.rs");
+    let (i_dossier, i_cote) = (
+        bin.find("amorces_du_dossier(datadir)")
+            .expect("source datadir"),
+        bin.find("amorces_a_cote_du_programme()")
+            .expect("source a plat"),
+    );
+    assert!(
+        i_dossier < i_cote,
+        "le fichier livre passerait avant celui de l'utilisateur : ce qu'il \
+         ecrit chez lui doit l'emporter"
+    );
+}
+
 /// La chaine de livraison depose bien ce fichier dans l'archive.
 ///
 /// Le fichier peut etre parfait dans le depot et n'arriver nulle part. C'est

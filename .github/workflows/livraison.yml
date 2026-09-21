@@ -233,6 +233,17 @@ jobs:
           # « aucun ordinateur joignable » sans savoir que rien n'est casse :
           # il conclut que le reseau est mort et n'y revient pas. Le fichier
           # est en clair, commente, et lui appartient des qu'il l'a.
+          # Deux exemplaires, volontairement.
+          #
+          # A plat a cote du binaire : un fichier simple traverse tar, 7z et
+          # zip sans condition. C'est celui sur lequel on compte.
+          #
+          # Dans q21-data : c'est le fichier que les guides decrivent, celui
+          # que l'utilisateur edite, et il l'emporte sur l'autre. Il vit dans
+          # un sous-dossier — et c'est precisement ce qu'un outil
+          # d'empaquetage peut perdre. Les deux ensemble font que la perte de
+          # l'un ne rend personne aveugle.
+          cp amorces-par-defaut.txt livraison/amorces.txt
           mkdir -p livraison/q21-data
           cp amorces-par-defaut.txt livraison/q21-data/amorces.txt
           cd livraison

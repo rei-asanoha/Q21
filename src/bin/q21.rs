@@ -2269,8 +2269,20 @@ fn cmd_diagnostic(datadir: &Path, args: &[String]) -> Result<(), String> {
         println!("  integrees au binaire : {}", integrees.len());
     }
 
+    let a_cote = q21_core::amorce::amorces_a_cote_du_programme();
+    match std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.join("amorces.txt")))
+    {
+        Some(c) if c.exists() => println!("  {} : {} adresse(s)", c.display(), a_cote.len()),
+        Some(c) => println!("  {} : ABSENT", c.display()),
+        None => {}
+    }
+
     let mut cibles = du_fichier;
+    cibles.extend(a_cote);
     cibles.extend(integrees);
+    cibles.sort();
     cibles.dedup();
 
     if cibles.is_empty() {
@@ -4270,16 +4282,21 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut cibles: Vec<String> = vers.clone();
     if !sans_amorces {
         cibles.extend(q21_core::amorce::amorces_du_dossier(datadir));
+        // Le fichier livre avec le programme, a plat a cote du binaire. Il
+        // vient apres le dossier de donnees : ce que l'utilisateur ecrit chez
+        // lui l'emporte toujours sur ce que la livraison a depose.
+        cibles.extend(q21_core::amorce::amorces_a_cote_du_programme());
         cibles.extend(
             q21_core::amorce::amorces_integrees(reseau)
                 .iter()
                 .map(|s| s.to_string()),
         );
     }
+    cibles.sort();
     cibles.dedup();
     if cibles.is_empty() && ecoute.is_none() {
         println!(
-            "  aucune amorce : ce noeud ne cherchera personne. Donnez-lui\n               --amorce <hote> ou un fichier amorces.txt dans {}",
+            "  aucune amorce : ce noeud ne cherchera personne. Donnez-lui\n               --amorce <hote>, ou un fichier amorces.txt dans {}\n               (le programme en cherche aussi un a cote de lui)",
             datadir.display()
         );
     }
