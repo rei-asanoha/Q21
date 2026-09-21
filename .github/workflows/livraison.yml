@@ -236,11 +236,50 @@ jobs:
           mkdir -p livraison/q21-data
           cp amorces-par-defaut.txt livraison/q21-data/amorces.txt
           cd livraison
+          # `-r` explicite sur 7z : le comportement de `./*` face a un
+          # sous-dossier depend de la version et du shell qui developpe le
+          # motif. `q21-data/` est precisement un sous-dossier, et une archive
+          # Windows qui l'aurait perdu repartait aveugle — sans que rien ne le
+          # signale, puisque les archives tar, elles, le portaient.
           if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "../${{ matrix.archive }}" ./*
+            7z a -r "../${{ matrix.archive }}" ./*
           else
             tar czf "../${{ matrix.archive }}" ./*
           fi
+
+      # --- L'archive contient-elle vraiment ce qu'on croit y avoir mis ?
+      #
+      # Assembler et empaqueter sont deux gestes, et le second peut perdre ce
+      # que le premier a pose : un outil d'archivage differe d'une plateforme a
+      # l'autre, et un sous-dossier absent ne fait echouer personne. C'est
+      # arrive : le fichier d'amorces etait bien copie dans `livraison/`, et
+      # l'archive Windows partait sans lui. Le defaut ne s'est vu que chez un
+      # utilisateur, plusieurs versions plus tard.
+      #
+      # On ouvre donc l'archive **produite** et on verifie sa liste. Ce qui
+      # manque arrete la livraison, au lieu d'etre decouvert par celui qui
+      # telecharge.
+      - name: L'archive porte bien tout ce qu'il faut
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            LISTE=$(7z l -ba -slt "${{ matrix.archive }}" | sed -n 's/^Path = //p')
+          else
+            LISTE=$(tar tzf "${{ matrix.archive }}")
+          fi
+          echo "--- contenu de ${{ matrix.archive }} ---"
+          printf '%s\n' "$LISTE"
+          echo "---"
+          MANQUE=0
+          for ATTENDU in "${{ matrix.binaire }}" "q21-data" "amorces.txt" "REJOINDRE.md" "README.md"; do
+            if ! printf '%s\n' "$LISTE" | grep -q -- "$ATTENDU"; then
+              echo "::error::$ATTENDU est absent de ${{ matrix.archive }}"
+              MANQUE=1
+            fi
+          done
+          [ "$MANQUE" -eq 0 ] || exit 1
+          echo "archive complete."
 
       # Deux condensats, et ils ne servent pas a la meme chose.
       #

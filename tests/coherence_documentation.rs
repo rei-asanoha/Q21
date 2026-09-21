@@ -211,6 +211,36 @@ fn les_amorces_livrees_sont_celles_que_reseau_md_publie() {
     }
 }
 
+/// L'archive **produite** est ouverte et verifiee avant de partir.
+///
+/// Deposer un fichier dans le dossier d'assemblage ne garantit pas qu'il
+/// finisse dans l'archive : l'outil d'empaquetage differe d'une plateforme a
+/// l'autre, et un sous-dossier perdu ne fait echouer personne. C'est arrive —
+/// `q21-data/` present sur les archives tar, absent de l'archive Windows — et
+/// le defaut n'a ete vu que par un utilisateur, plusieurs versions plus tard.
+/// Assembler et empaqueter sont deux gestes : le second doit etre verifie.
+#[test]
+fn la_livraison_verifie_le_contenu_de_l_archive_produite() {
+    let workflow = lire(".github/workflows/livraison.yml");
+    assert!(
+        workflow.contains("L'archive porte bien tout ce qu'il faut"),
+        "l'etape qui ouvre l'archive produite et controle sa liste a disparu : \
+         une archive incomplete repartirait sans que rien ne le signale."
+    );
+    for attendu in ["q21-data", "amorces.txt", "REJOINDRE.md"] {
+        assert!(
+            workflow.contains(&format!("\"{attendu}\"")),
+            "`{attendu}` n'est plus exige dans le controle de l'archive"
+        );
+    }
+    // 7z doit recurser explicitement : c'est ce qui manquait.
+    assert!(
+        workflow.contains("7z a -r "),
+        "l'archive Windows n'est plus construite en mode recursif : le \
+         sous-dossier q21-data peut disparaitre a nouveau."
+    );
+}
+
 /// La chaine de livraison depose bien ce fichier dans l'archive.
 ///
 /// Le fichier peut etre parfait dans le depot et n'arriver nulle part. C'est
