@@ -126,14 +126,115 @@ mod imp {
     use super::RngError;
     use std::io::Read;
 
+    /// Ce qu'un appel systeme d'entropie peut nous dire d'autre qu'un succes.
+    ///
+    /// Utilise uniquement par les chemins `getrandom`/`getentropy` ; sur un
+    /// autre Unix, seul `/dev/urandom` sert et ce type n'existe pas.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    enum Echec {
+        /// L'appel n'existe pas sur ce noyau/cette version : on peut retomber
+        /// sur `/dev/urandom` sans rien perdre.
+        Indisponible,
+        /// L'appel existe mais a franchement echoue : on s'arrete, on n'invente
+        /// pas d'alea.
+        Fatale(String),
+    }
+
     pub fn remplir(sortie: &mut [u8]) -> Result<(), RngError> {
-        // `/dev/urandom` et non `/dev/random` : depuis Linux 4.8 les deux
-        // partagent le meme generateur, et `/dev/random` peut bloquer
-        // indefiniment sans rien apporter.
+        // Le point de cette correction : `/dev/urandom` NE BLOQUE JAMAIS. Au
+        // tout premier demarrage d'une machine — machine virtuelle clonee d'un
+        // instantane, conteneur, image embarquee — le reservoir d'entropie du
+        // noyau peut ne pas etre encore initialise, et `/dev/urandom` rend alors
+        // des octets previsibles sans le signaler. Les controles de
+        // vraisemblance de `verifier` n'attrapent pas un tel etat : la sortie
+        // « a l'air » aleatoire.
+        //
+        // `getrandom(2)` (Linux) et `getentropy(3)` (macOS/BSD) partagent le
+        // MEME generateur que `/dev/urandom`, mais BLOQUENT jusqu'a ce que le
+        // reservoir soit initialise, une seule fois, puis ne bloquent plus.
+        // C'est exactement la garantie qui manquait. On ne retombe sur le
+        // fichier que si l'appel n'existe pas (noyau anterieur a 3.17).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        match getrandom_bloquant(sortie) {
+            Ok(()) => return Ok(()),
+            Err(Echec::Indisponible) => {}
+            Err(Echec::Fatale(d)) => return Err(RngError::Indisponible(d)),
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        match getentropy_bloquant(sortie) {
+            Ok(()) => return Ok(()),
+            Err(Echec::Indisponible) => {}
+            Err(Echec::Fatale(d)) => return Err(RngError::Indisponible(d)),
+        }
+
+        depuis_urandom(sortie)
+    }
+
+    /// Repli historique. `/dev/urandom` et non `/dev/random` : depuis Linux 4.8
+    /// les deux partagent le meme generateur, et `/dev/random` peut bloquer
+    /// indefiniment sans rien apporter.
+    fn depuis_urandom(sortie: &mut [u8]) -> Result<(), RngError> {
         let mut f = std::fs::File::open("/dev/urandom")
             .map_err(|e| RngError::Indisponible(format!("/dev/urandom : {e}")))?;
         f.read_exact(sortie)
             .map_err(|e| RngError::Indisponible(format!("/dev/urandom : {e}")))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn getrandom_bloquant(sortie: &mut [u8]) -> Result<(), Echec> {
+        let mut rempli = 0usize;
+        while rempli < sortie.len() {
+            // Drapeau 0 : source `/dev/urandom`, comportement bloquant jusqu'a
+            // initialisation du reservoir. SAFETY : le pointeur et la longueur
+            // designent la partie non encore remplie de `sortie`, valide et
+            // exclusive ; l'appel n'ecrit que dans ce tampon.
+            let n = unsafe {
+                libc::getrandom(
+                    sortie[rempli..].as_mut_ptr() as *mut libc::c_void,
+                    sortie.len() - rempli,
+                    0,
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                match e.raw_os_error() {
+                    // Interrompu par un signal avant tout octet : on reessaie.
+                    Some(libc::EINTR) => continue,
+                    // Noyau anterieur a 3.17 : l'appel n'existe pas.
+                    Some(libc::ENOSYS) => return Err(Echec::Indisponible),
+                    _ => return Err(Echec::Fatale(format!("getrandom : {e}"))),
+                }
+            }
+            rempli += n as usize;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn getentropy_bloquant(sortie: &mut [u8]) -> Result<(), Echec> {
+        // `getentropy` accepte au plus 256 octets par appel : on decoupe. Une
+        // graine de 32 octets tient de toute facon en un seul.
+        for morceau in sortie.chunks_mut(256) {
+            // SAFETY : `morceau` est une tranche valide et exclusive de longueur
+            // <= 256 ; l'appel n'ecrit que dans ce tampon.
+            let r = unsafe {
+                libc::getentropy(morceau.as_mut_ptr() as *mut libc::c_void, morceau.len())
+            };
+            if r != 0 {
+                let e = std::io::Error::last_os_error();
+                match e.raw_os_error() {
+                    Some(libc::ENOSYS) => return Err(Echec::Indisponible),
+                    _ => return Err(Echec::Fatale(format!("getentropy : {e}"))),
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -261,7 +261,11 @@ impl Amorce {
         // Chaque en-tete occupe une taille fixe connue : on ne reserve jamais
         // plus d'emplacements que le reste du flux ne peut en contenir.
         let n = borne(&mut r, MAX_ENTETES, BlockHeader::SIZE)?;
-        let mut entetes = Vec::with_capacity(n);
+        // Meme garde que pour les corps plus bas : on ne pre-alloue jamais plus
+        // que quelques milliers d'emplacements d'un coup, meme si le flux en
+        // annonce des millions. La boucle agrandit au besoin ; un pair ne peut
+        // pas nous faire reserver des centaines de mega-octets sur une annonce.
+        let mut entetes = Vec::with_capacity(n.min(4096));
         for _ in 0..n {
             let mut buf = [0u8; BlockHeader::SIZE];
             for o in buf.iter_mut() {

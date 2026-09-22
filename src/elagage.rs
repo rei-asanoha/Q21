@@ -224,8 +224,6 @@ pub fn elaguer(
              rejouer, on n'elague pas"
         ));
     }
-    *derniere = tete;
-
     // Garde-fou 2 : le magasin d'en-tetes, de la genese a l'instantane. Relu
     // en entier ici — c'est rare — pour qu'un en-tete abime soit coupe et
     // reecrit depuis la chaine, qui les a tous en memoire, plutot que
@@ -238,10 +236,16 @@ pub fn elaguer(
 
     // Les corps : la genese, et tout ce qui est a moins de `corps_conserves`
     // de la tete. Ce qui est plus ancien est resume dans l'instantane.
-    archive
+    let elagage = archive
         .elaguer(|h| h.height == 0 || h.height >= garde)
-        .map(Some)
-        .map_err(|e| format!("reecriture du fichier de blocs : {e}"))
+        .map_err(|e| format!("reecriture du fichier de blocs : {e}"))?;
+
+    // La hauteur « derniere elaguee » n'est avancee qu'ICI, apres le succes de
+    // l'elagage. Placee plus haut, un echec de `load`, `raccorder_le_magasin`,
+    // `completer_depuis` ou `elaguer` l'aurait fait avancer sans qu'aucun corps
+    // n'ait ete retire, retardant le prochain elagage d'un pas entier.
+    *derniere = tete;
+    Ok(Some(elagage))
 }
 
 /// Un corps illisible ou refuse au rejeu : on s'arrete au dernier bloc sain.

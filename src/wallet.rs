@@ -407,11 +407,17 @@ impl Wallet {
             SchemeId::LamportOts => self.key(index).public_key(),
             #[cfg(feature = "mldsa")]
             SchemeId::MlDsa65 => {
-                mldsa_wallet::public_key::<ml_dsa::MlDsa65>(&self.graine_derivee(index))
+                let mut g = self.graine_derivee(index);
+                let pk = mldsa_wallet::public_key::<ml_dsa::MlDsa65>(&g);
+                crate::kdf::effacer(&mut g);
+                pk
             }
             #[cfg(feature = "mldsa")]
             SchemeId::MlDsa87 => {
-                mldsa_wallet::public_key::<ml_dsa::MlDsa87>(&self.graine_derivee(index))
+                let mut g = self.graine_derivee(index);
+                let pk = mldsa_wallet::public_key::<ml_dsa::MlDsa87>(&g);
+                crate::kdf::effacer(&mut g);
+                pk
             }
             autre => panic!("portefeuille sur un schema indisponible : {}", autre.name()),
         }
@@ -432,11 +438,17 @@ impl Wallet {
             SchemeId::LamportOts => Ok(self.key(index).sign(message)),
             #[cfg(feature = "mldsa")]
             SchemeId::MlDsa65 => {
-                mldsa_wallet::sign::<ml_dsa::MlDsa65>(&self.graine_derivee(index), message)
+                let mut g = self.graine_derivee(index);
+                let sig = mldsa_wallet::sign::<ml_dsa::MlDsa65>(&g, message);
+                crate::kdf::effacer(&mut g);
+                sig
             }
             #[cfg(feature = "mldsa")]
             SchemeId::MlDsa87 => {
-                mldsa_wallet::sign::<ml_dsa::MlDsa87>(&self.graine_derivee(index), message)
+                let mut g = self.graine_derivee(index);
+                let sig = mldsa_wallet::sign::<ml_dsa::MlDsa87>(&g, message);
+                crate::kdf::effacer(&mut g);
+                sig
             }
             autre => panic!("portefeuille sur un schema indisponible : {}", autre.name()),
         }

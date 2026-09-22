@@ -942,6 +942,22 @@ fn ecrire_portefeuille(d: &Path, w: &Wallet) -> Result<(), String> {
     // l'utilisateur a demande le contraire.
     let chemin = chemin_portefeuille(d);
     let phrase = phrase_courante();
+    // Sur le reseau principal, la graine ne touche JAMAIS le disque en clair.
+    // Ailleurs (test, regression), le choix reste a l'utilisateur, averti. Un
+    // cliche de machine virtuelle, une sauvegarde cloud ou un disque revendu
+    // exposerait une graine ecrite en clair — inacceptable pour de la valeur
+    // reelle. Ce point d'ecriture est le seul par ou la graine atteint le
+    // disque : la garde y couvre l'init, la restauration et le minage.
+    if w.network() == Network::Mainnet && phrase.is_none() {
+        return Err(
+            "portefeuille du reseau principal sans phrase secrete : refuse.\n  \
+             Sur le reseau principal, la graine doit etre chiffree par une phrase secrete,\n  \
+             jamais ecrite en clair. Fournissez une phrase et relancez :\n  \
+             q21 --phrase-fichier <chemin> ...   (un fichier a vous seul, chmod 600)\n  \
+             ou   read -rs Q21_PASSPHRASE && export Q21_PASSPHRASE   puis la commande."
+                .into(),
+        );
+    }
     let scelle = phrase.is_some();
     let octets = match &phrase {
         Some(phrase) => q21_core::kdf::sceller(
@@ -4561,7 +4577,12 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // La hauteur du dernier instantane ecrit : un noeud au repos n'a aucune
     // raison de reecrire cent mega-octets identiques toutes les cinq minutes,
     // et une carte SD de Raspberry a un nombre d'ecritures compte.
-    let mut hauteur_instantane: Option<u64> = None;
+    // Cle de deduplication : hauteur ET tete. Deduire sur la seule hauteur
+    // laissait, apres une reorganisation qui remplace le bloc a cette hauteur,
+    // un instantane sur disque desormais hors chaine, jamais reecrit — rejete
+    // au redemarrage suivant (rejeu complet). En comparant aussi la tete, une
+    // reorganisation a hauteur egale declenche bien une nouvelle ecriture.
+    let mut cle_instantane: Option<(u64, q21_core::hash::Hash256)> = None;
     // Hauteur de la tete au dernier elagage : on ne reecrit pas le fichier
     // toutes les cinq minutes pour quelques blocs.
     let mut derniere_hauteur_elaguee: u64 = 0;
@@ -4583,15 +4604,15 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // Pris sous le verrou, ecrit dehors : voir `ecrire_instantane_pris`.
             let pris = node.with_chain(|c| c.snapshot());
             if let Some(i) = pris {
-                // La hauteur n'est notee — et l'elagage tente — qu'apres une
-                // ecriture **reussie**. Un echec laisse `hauteur_instantane`
+                // La cle n'est notee — et l'elagage tente — qu'apres une
+                // ecriture **reussie**. Un echec laisse `cle_instantane`
                 // en l'etat : on reessaiera dans cinq minutes, et rien n'est
                 // retire du fichier de blocs sur la foi d'un instantane qui
                 // n'est pas sur le disque.
-                if hauteur_instantane != Some(i.height)
+                if cle_instantane != Some((i.height, i.tip))
                     && ecrire_instantane_pris(datadir, &i).is_ok()
                 {
-                    hauteur_instantane = Some(i.height);
+                    cle_instantane = Some((i.height, i.tip));
                     completer_le_magasin_si_elague(datadir, &node, i.height);
                     if elaguer {
                         elaguer_si_utile(
@@ -4776,7 +4797,24 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             };
             minage.compter(essais);
             if let Some(b) = bloc {
-                let ok = node.with_chain(|c| c.connect(&b, maintenant()).is_ok());
+                // Meme discipline que pour un bloc recu (`Node::integrer`) :
+                // connexion, ecriture au journal et nettoyage du mempool sous
+                // UN SEUL maintien du verrou. Auparavant, la connexion prenait
+                // le verrou, le relachait, puis on le reprenait pour le
+                // mempool : une reorganisation poussee par un pair pouvait
+                // s'intercaler et faire nettoyer le mempool sur un bloc devenu
+                // lateral. L'annonce reseau, elle, reste hors verrou.
+                let ok = node.with_chain_and_mempool(|c, m| {
+                    if c.connect(&b, maintenant()).is_ok() {
+                        // L'ecriture passe par le journal, comme pour tout bloc
+                        // accepte : une seule voie vers le disque.
+                        q21_core::chain::Journal::consigner(archive.as_ref(), &b);
+                        m.on_block_connected(&b);
+                        true
+                    } else {
+                        false
+                    }
+                });
                 if ok {
                     // Ce que ce bloc rapporte : la premiere sortie de la
                     // coinbase, que le consensus oblige a payer le mineur —
@@ -4811,11 +4849,6 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                             }
                         }
                     }
-                    node.with_mempool(|m| m.on_block_connected(&b));
-                    // L'ecriture passe par le journal, comme pour tout bloc
-                    // accepte : une seule voie vers le disque, donc un seul
-                    // endroit ou l'oublier.
-                    q21_core::chain::Journal::consigner(archive.as_ref(), &b);
                     node.announce_block(&b);
                 }
             }
@@ -5792,6 +5825,54 @@ mod tests {
     }
 
     /// Le carnet fait l'aller-retour sans rien perdre.
+    /// Sur le reseau principal, la graine ne touche jamais le disque en clair.
+    ///
+    /// Campagne de securite de septembre 2026 : un cliche de VM, une sauvegarde
+    /// cloud ou un disque revendu exposerait une graine ecrite sans phrase. La
+    /// garde est au seul point d'ecriture, donc elle couvre init, restauration
+    /// et minage. Ailleurs (test, regression), le clair reste permis, averti.
+    #[test]
+    fn un_portefeuille_mainnet_sans_phrase_est_refuse() {
+        use q21_core::wallet::Wallet;
+
+        // Aucune phrase retenue pour cette session.
+        retenir_phrase(None);
+
+        let base = std::env::temp_dir().join(format!(
+            "q21_test_mainnet_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Reseau principal, sans phrase : refuse.
+        let d_main = base.join("main");
+        std::fs::create_dir_all(&d_main).unwrap();
+        let w_main = Wallet::from_seed([0x5a; 32], Network::Mainnet);
+        let refus = ecrire_portefeuille(&d_main, &w_main)
+            .expect_err("un portefeuille mainnet sans phrase doit etre refuse");
+        assert!(
+            refus.contains("reseau principal sans phrase"),
+            "message inattendu : {refus}"
+        );
+        assert!(
+            !chemin_portefeuille(&d_main).exists(),
+            "aucun fichier de portefeuille ne doit avoir ete ecrit en clair"
+        );
+
+        // Reseau de test, sans phrase : autorise (choix averti).
+        let d_test = base.join("test");
+        std::fs::create_dir_all(&d_test).unwrap();
+        let w_test = Wallet::from_seed([0x5a; 32], Network::Testnet);
+        ecrire_portefeuille(&d_test, &w_test)
+            .expect("un portefeuille de test sans phrase reste permis");
+        assert!(chemin_portefeuille(&d_test).exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn les_etiquettes_survivent_a_l_ecriture_et_a_la_relecture() {
         let mut e = HashMap::new();
