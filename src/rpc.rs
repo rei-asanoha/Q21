@@ -216,6 +216,9 @@ pub const ERR_PORTEFEUILLE: i64 = -3;
 /// un echec doit **empecher** la signature, pas seulement etre affiche.
 pub type SurChangement = Arc<dyn Fn(&Wallet) -> Result<(), String> + Send + Sync>;
 
+/// Rappel qui persiste le reglage « joignable ». Voir [`RpcContext`].
+pub type DefinirJoignable = Arc<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
+
 pub struct RpcContext {
     pub node: Arc<Node>,
     /// Absent si les methodes de portefeuille sont desactivees.
@@ -256,6 +259,19 @@ pub struct RpcContext {
     /// serveur ou le reseau qu'il faut regarder. Les deux se voient pareil,
     /// et l'un des deux fait abandonner.
     pub amorces_configurees: usize,
+    /// Le reglage « ce noeud est-il joignable de l'exterieur » lu au lancement.
+    ///
+    /// Sert a peindre l'interrupteur de l'interface. Le changer prend effet au
+    /// prochain lancement : l'ecoute et l'ouverture de box se decident au
+    /// demarrage, pas en cours de route.
+    pub joignable: bool,
+    /// Etat de l'ouverture du port dans la box, en clair, quand ce noeud tente
+    /// de s'ouvrir. Absent (ou vide) : pas de tentative — nœud client, ou
+    /// portier a adresse directe. Rempli par le fil dedie.
+    pub etat_box: Option<Arc<Mutex<String>>>,
+    /// Persiste un changement du reglage « joignable ». Fourni par l'appelant,
+    /// qui seul sait ou vit le fichier. Absent en memoire pure (epreuves).
+    pub definir_joignable: Option<DefinirJoignable>,
 }
 
 /// Balayages de chaine qu'un service public accorde : un budget **par
@@ -443,6 +459,9 @@ impl RpcContext {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
+            joignable: true,
+            etat_box: None,
+            definir_joignable: None,
         }
     }
 
@@ -775,6 +794,10 @@ impl RpcContext {
                 "setminage",
                 "[portefeuille] Allume ou eteint le minage sans relancer le programme",
             ),
+            (
+                "setjoignable",
+                "[portefeuille] Rend ce noeud joignable ou non (prend effet au prochain lancement)",
+            ),
             ("getsyncstatus", "Etat de la synchronisation avec le reseau"),
             (
                 "arreter",
@@ -838,6 +861,7 @@ impl RpcContext {
             "getminage" => Ok(self.getminage()),
             "getreseau" => Ok(self.getreseau()),
             "setminage" => self.setminage(params),
+            "setjoignable" => self.setjoignable(params),
             "arreter" => self.arreter(),
             "rechercher" => self.rechercher(params),
             "getadresse" => self.getadresse(params, client),
@@ -892,6 +916,19 @@ impl RpcContext {
             .set("pairs", Json::u64(self.node.peer_count() as u64))
             .set("mempool", Json::u64(self.node.mempool_len() as u64))
             .set("portefeuille_actif", Json::Bool(self.wallet.is_some()))
+            // --- Joignabilite : le reglage, et l'etat reel de l'ouverture.
+            //
+            // On ne pretend jamais « joignable » — on ne peut pas le prouver
+            // d'ici. On rend le reglage voulu, et le texte exact de ce que la
+            // box a repondu.
+            .set("joignable", Json::Bool(self.joignable))
+            .set(
+                "ouverture_box",
+                match &self.etat_box {
+                    Some(e) => Json::str(e.lock().map(|s| s.clone()).unwrap_or_default()),
+                    None => Json::str(String::new()),
+                },
+            )
             // --- Deux constantes du protocole, rendues avec l'etat.
             //
             // Une interface qui veut annoncer *quand* une recompense sera
@@ -2548,6 +2585,31 @@ impl RpcContext {
         Ok(self.getminage())
     }
 
+    /// Change le reglage « ce noeud est-il joignable de l'exterieur ».
+    ///
+    /// Le changement est ecrit sur disque et prend effet **au prochain
+    /// lancement** : l'ecoute et l'ouverture de box se decident au demarrage.
+    /// On le dit dans la reponse, pour que l'interface ne laisse pas croire a un
+    /// effet immediat.
+    fn setjoignable(&self, params: &Json) -> Result<Json, Json> {
+        // Reserve au portefeuille : un nœud public ne se laisse pas reconfigurer
+        // par le premier venu.
+        self.portefeuille()?;
+        let vers = match params.get("actif") {
+            Some(Json::Bool(b)) => *b,
+            _ => return Err(erreur(-32602, "parametre `actif` booleen attendu")),
+        };
+        let definir = self
+            .definir_joignable
+            .as_ref()
+            .ok_or_else(|| erreur(ERR_INTERNE, "ce noeud ne sait pas ou ecrire ce reglage"))?;
+        definir(vers).map_err(|e| erreur(ERR_INTERNE, &format!("reglage non enregistre : {e}")))?;
+        Ok(Json::obj()
+            .set("joignable", Json::Bool(vers))
+            .set("prend_effet", Json::str("au prochain lancement"))
+            .build())
+    }
+
     fn getbalance(&self) -> Result<Json, Json> {
         let w = self.portefeuille()?;
         // --- Ne pas recopier l'ensemble des UTXO a chaque appel.
@@ -2936,6 +2998,9 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
+            joignable: true,
+            etat_box: None,
+            definir_joignable: None,
             index: None,
             // Les epreuves du RPC voient un minage possible : c'est ce qui
             // permet de verifier que l'interrupteur repond, et que sans
@@ -2976,6 +3041,9 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
+            joignable: true,
+            etat_box: None,
+            definir_joignable: None,
             index: None,
             minage: Some(Arc::new(crate::minage::Minage::new(false))),
             node: Arc::new(Node::new(RESEAU, c)),
@@ -3723,6 +3791,9 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
+            joignable: true,
+            etat_box: None,
+            definir_joignable: None,
             index: None,
             minage: None,
             node: Arc::new(Node::new(RESEAU, chaine)),
@@ -4009,6 +4080,9 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
+            joignable: true,
+            etat_box: None,
+            definir_joignable: None,
             index: None,
             minage: None,
             node,

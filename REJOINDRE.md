@@ -9,9 +9,13 @@ le monde.
 
 **Participer** — avoir un portefeuille, et miner si l'on veut. Votre machine
 télécharge la chaîne, la vérifie elle-même bloc par bloc, et ne fait confiance
-à personne. C'est déjà un nœud complet. Derrière une box internet, il *sort*
-vers le réseau mais n'accepte pas de connexions entrantes, et c'est très bien
-ainsi. Partie 1.
+à personne. C'est déjà un nœud complet. Depuis la version 0.2, le portefeuille
+va plus loin sans rien vous demander : il accepte aussi les connexions des
+autres et demande à votre box d'ouvrir son accès, pour que le réseau ne dépende
+pas d'une seule machine. La plupart des box le font toutes seules ; celles qui
+refusent ne changent rien pour vous, votre portefeuille reste un client qui sort
+vers le réseau. Ce réglage se voit et se change dans l'onglet Réseau du
+portefeuille. Partie 1.
 
 **Être un point d'entrée** — ce que ce guide appelle un *portier*. Un nouveau
 venu ne connaît personne ; il lui faut une première adresse où frapper. Un

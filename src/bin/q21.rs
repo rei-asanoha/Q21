@@ -1660,6 +1660,133 @@ fn chemin_pairs(d: &Path) -> PathBuf {
     d.join("peers.dat")
 }
 
+fn chemin_reglages(d: &Path) -> PathBuf {
+    d.join("reglages.txt")
+}
+
+/// Dort `secondes`, mais se reveille chaque seconde pour voir si l'arret a ete
+/// demande. Rend vrai si l'arret est demande. On ne bloque jamais longtemps sur
+/// un `sleep` : un Ctrl-C doit couper court.
+fn dormir_surveille(secondes: u64) -> bool {
+    for _ in 0..secondes {
+        if q21_core::arret::demande() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    q21_core::arret::demande()
+}
+
+/// Le fil qui garde le port ouvert dans la box.
+///
+/// Il ouvre, annonce l'adresse externe aux pairs, dort la moitie du bail, puis
+/// renouvelle — un cycle qui survit a une box qui redemarre, sans jamais
+/// s'eterniser si le programme meurt. A l'arret, il retire l'ouverture.
+///
+/// Un echec n'arrete jamais le noeud : il reste un client qui sort vers le
+/// reseau, exactement comme avant cette version. On reessaie plus tard.
+fn boucle_ouverture_box(
+    port: u16,
+    node: std::sync::Arc<q21_core::net::Node>,
+    etat: std::sync::Arc<std::sync::Mutex<String>>,
+    ouverture: std::sync::Arc<std::sync::Mutex<Option<q21_core::nat::Ouverture>>>,
+) {
+    while !q21_core::arret::demande() {
+        match q21_core::nat::ouvrir(port) {
+            Ok(o) => {
+                let texte = format!(
+                    "reussie par {} — adresse externe {}:{}",
+                    o.methode, o.adresse_externe, o.port_externe
+                );
+                if let Ok(mut e) = etat.lock() {
+                    *e = texte.clone();
+                }
+                println!("  ouverture de la box : {texte}");
+                // On annonce notre adresse externe : elle entre dans les
+                // carnets des pairs, puis se propage. Adresse deja verifiee
+                // publique par `nat::ouvrir`.
+                node.annoncer_adresse(q21_core::wire::NetAddr {
+                    ip: o.adresse_externe.octets(),
+                    port: o.port_externe,
+                    last_seen: maintenant(),
+                });
+                let bail = if o.bail_secondes == 0 {
+                    q21_core::nat::BAIL_SECONDES
+                } else {
+                    o.bail_secondes
+                };
+                if let Ok(mut g) = ouverture.lock() {
+                    *g = Some(o);
+                }
+                // Renouvellement a mi-vie, jamais moins d'une minute.
+                if dormir_surveille((bail as u64 / 2).max(60)) {
+                    break;
+                }
+            }
+            Err(e) => {
+                let texte = format!("impossible ({e})");
+                if let Ok(mut g) = etat.lock() {
+                    *g = texte.clone();
+                }
+                println!(
+                    "  ouverture de la box impossible : {e}\n  \
+                     Ce noeud reste un client : il sort vers le reseau, mais n'est pas \
+                     joignable de l'exterieur. Rien n'est casse."
+                );
+                // On reessaie dans cinq minutes : une box peut revenir, ou
+                // l'utilisateur activer NAT-PMP entre-temps.
+                if dormir_surveille(300) {
+                    break;
+                }
+            }
+        }
+    }
+    // Arret : on retire l'ouverture. Sans garantie, et sans importance — un
+    // bail non renouvele expire seul.
+    if let Ok(mut g) = ouverture.lock() {
+        if let Some(o) = g.take() {
+            q21_core::nat::fermer(&o, port);
+        }
+    }
+}
+
+/// Lit le reglage « ce noeud est-il joignable de l'exterieur ». Absent =
+/// **oui** : par defaut, un portefeuille contribue au reseau en s'ouvrant. Un
+/// fichier illisible retombe aussi sur oui — le defaut ne doit pas dependre de
+/// l'etat du disque.
+///
+/// Format `clef=valeur`, comme `adoption.txt` : lisible, non secret, une ligne.
+/// Une clef inconnue est ignoree, pour qu'une version future puisse en ajouter
+/// sans qu'une ancienne s'y perde.
+fn lire_joignable(d: &Path) -> bool {
+    let texte = match std::fs::read_to_string(chemin_reglages(d)) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+    for ligne in texte.lines() {
+        if let Some(v) = ligne.trim().strip_prefix("joignable=") {
+            return v.trim() != "non";
+        }
+    }
+    true
+}
+
+/// Ecrit le reglage « joignable ». Ecriture atomique (fichier temporaire puis
+/// renommage), sur le modele de `wallet.ancre` : une coupure laisse l'ancien
+/// fichier entier, jamais un fichier a moitie ecrit.
+fn ecrire_joignable(d: &Path, joignable: bool) -> Result<(), String> {
+    let chemin = chemin_reglages(d);
+    let tmp = chemin.with_extension("tmp");
+    let texte = format!("joignable={}\n", if joignable { "oui" } else { "non" });
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(texte.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, &chemin).map_err(|e| e.to_string())
+}
+
 /// Ecrit un instantane de l'etat monetaire, si la chaine est assez longue.
 ///
 /// L'echec n'est jamais fatal : un instantane absent coute un demarrage lent,
@@ -4014,6 +4141,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut elaguer = false;
     let mut reseau_impose: Option<Network> = None;
     let mut sans_amorces = false;
+    let mut ouvrir_box = false;
     let mut adopter_empreinte: Option<String> = None;
     let mut adopter_tete: Option<String> = None;
 
@@ -4041,6 +4169,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // passeraient leur temps a se rappeler l'un l'autre.
             "--sans-amorces" => {
                 sans_amorces = true;
+                i += 1;
+            }
+            "--ouvrir-box" => {
+                ouvrir_box = true;
                 i += 1;
             }
             "--rpc" if i + 1 < args.len() => {
@@ -4283,11 +4415,47 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         avertir_si_non_revalide(datadir);
     }
 
+    // Etat de l'ouverture de box, partage avec le fil dedie et lu par le RPC
+    // pour l'afficher honnetement dans l'interface.
+    let etat_box: std::sync::Arc<std::sync::Mutex<String>> =
+        std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let ouverture_box: std::sync::Arc<std::sync::Mutex<Option<q21_core::nat::Ouverture>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
     if let Some(a) = &ecoute {
-        let local = node
-            .listen(&q21_core::amorce::adresse_d_ecoute(a, reseau))
-            .map_err(|e| format!("ecoute impossible : {e}"))?;
-        println!("  ecoute sur {local}");
+        match node.listen(&q21_core::amorce::adresse_d_ecoute(a, reseau)) {
+            Ok(local) => {
+                println!("  ecoute sur {local}");
+                // Couche 2 : demander a la box d'ouvrir ce port, dans un fil
+                // dedie qui renouvelle le bail et annonce notre adresse.
+                // Reserve au portefeuille (`--ouvrir-box`) : le portier public,
+                // lui, a une adresse directe et n'en a pas besoin.
+                if ouvrir_box {
+                    let port = local.port();
+                    let node_box = node.clone();
+                    let etat = etat_box.clone();
+                    let ouv = ouverture_box.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("box".to_string())
+                        .spawn(move || boucle_ouverture_box(port, node_box, etat, ouv));
+                }
+            }
+            // Un echec de liaison ne doit pas empecher le PORTEFEUILLE de
+            // demarrer : l'ecoute y est un bonus, pas une condition. On retombe
+            // en mode client, qui marche exactement comme avant cette version.
+            // Mais quand l'utilisateur a demande `--listen` explicitement (un
+            // portier), l'echec reste fatal : c'est precisement ce qu'il voulait.
+            Err(e) if ouvrir_box => {
+                println!(
+                    "  ecoute impossible ({e}) : ce portefeuille demarre en mode client. \
+                     Il sort vers le reseau, mais n'est pas joignable. Rien n'est casse."
+                );
+                if let Ok(mut g) = etat_box.lock() {
+                    *g = format!("ecoute impossible ({e})");
+                }
+            }
+            Err(e) => return Err(format!("ecoute impossible : {e}")),
+        }
     }
     // --- Ce vers quoi on tente de sortir.
     //
@@ -4459,6 +4627,12 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // Ce que la page a besoin de savoir pour distinguer « je n'ai
             // l'adresse de personne » de « personne ne m'a ouvert ».
             amorces_configurees: cibles.len(),
+            joignable: lire_joignable(datadir),
+            etat_box: Some(etat_box.clone()),
+            definir_joignable: Some({
+                let d = datadir.to_path_buf();
+                std::sync::Arc::new(move |v: bool| ecrire_joignable(&d, v))
+            }),
         };
         // La coquille de l'explorateur est servie sans jeton : elle ne porte
         // aucune donnee, et c'est elle qui demande le jeton a l'utilisateur.
@@ -5275,6 +5449,17 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         // information utile, l'adresse a ouvrir.
         "--silencieux".to_string(),
     ];
+    // Couches 1 et 2 : par defaut, le portefeuille CONTRIBUE au reseau. Il
+    // ecoute les connexions entrantes et demande a la box d'ouvrir son port,
+    // pour que le reseau ne repose plus sur un point d'entree unique. Le
+    // reglage se change dans l'interface (onglet Reseau) et vit dans
+    // `reglages.txt`. On n'ajoute rien si l'utilisateur a deja pose `--listen`
+    // a la main : son choix l'emporte.
+    if lire_joignable(datadir) && !reste.iter().any(|a| a == "--listen") {
+        arguments.push("--listen".to_string());
+        arguments.push(String::new()); // port P2P par defaut du reseau
+        arguments.push("--ouvrir-box".to_string());
+    }
     arguments.extend(reste);
     cmd_node(datadir, &arguments)
 }

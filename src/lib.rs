@@ -66,6 +66,7 @@ pub mod mempool;
 pub mod merkle;
 pub mod minage;
 pub mod muhash;
+pub mod nat;
 pub mod net;
 pub mod pow;
 pub mod prompt;

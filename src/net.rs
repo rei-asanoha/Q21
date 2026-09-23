@@ -2025,6 +2025,14 @@ impl Node {
                     let mut v = g.carnet.a_annoncer(crate::wire::MAX_ADDR);
                     if v.len() < crate::wire::MAX_ADDR {
                         for p in g.peers.values() {
+                            // SEULS les pairs SORTANTS : leur `addr` porte le
+                            // vrai port d'ecoute, donc une adresse joignable.
+                            // Un pair entrant est connu par son port source
+                            // ephemere, inutilisable : le diffuser polluait les
+                            // carnets de tout le reseau d'adresses mortes.
+                            if !p.sortant {
+                                continue;
+                            }
                             if let SocketAddr::V4(a) = p.addr {
                                 let n = crate::wire::NetAddr {
                                     ip: a.ip().octets(),
@@ -2294,6 +2302,29 @@ impl Node {
         } = *g;
         if let Some(p) = peers.get_mut(&source) {
             p.poursuivre_synchro(source, chain, envois, Instant::now(), true);
+        }
+    }
+
+    /// Annonce notre propre adresse externe aux pairs, pour entrer dans leurs
+    /// carnets et, de proche en proche, dans ceux de tout le reseau.
+    ///
+    /// On envoie un simple `Addr` : un message que meme les anciens pairs
+    /// comprennent deja. Aucun changement de protocole, donc aucune rupture
+    /// entre versions. L'adresse annoncee a ete verifiee publique par
+    /// l'appelant ; le carnet du pair applique de toute facon ses propres
+    /// regles de routabilite avant de la garder.
+    pub fn annoncer_adresse(&self, n: crate::wire::NetAddr) {
+        let cibles: Vec<Arc<Mutex<TcpStream>>> = {
+            let g = self.partage.lock().unwrap_or_else(|e| e.into_inner());
+            g.peers
+                .values()
+                .filter(|p| p.handshaked)
+                .map(|p| p.sortie.clone())
+                .collect()
+        };
+        let m = Message::Addr(vec![n]);
+        for s in cibles {
+            let _ = ecrire(&s, &m, self.magie);
         }
     }
 
