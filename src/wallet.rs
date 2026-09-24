@@ -305,7 +305,22 @@ impl Wallet {
 
     /// Retrouve une graine depuis son code de sauvegarde.
     pub fn seed_from_backup(code: &str, network: Network) -> Result<[u8; 32], WalletError> {
-        let code = code.trim();
+        // L'alphabet Bech32m d'un code de sauvegarde ne contient aucun blanc.
+        // Un copier-coller peut pourtant en glisser un au milieu — un retour a
+        // la ligne, une tabulation, une espace insecable, un caractere de
+        // largeur nulle. On les retire tous avant de decoder, pour qu'un code
+        // correct soit toujours accepte, quelle que soit sa mise en forme.
+        let nettoye: String = code
+            .chars()
+            .filter(|c| {
+                !c.is_whitespace()
+                    && !matches!(
+                        *c,
+                        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+                    )
+            })
+            .collect();
+        let code = nettoye.as_str();
         // Une adresse de reception collee ici est reconnue a son prefixe,
         // avant meme de decoder : c'est le cas de confusion le plus probable,
         // et il merite sa propre reponse plutot que le verdict generique.
@@ -2578,6 +2593,42 @@ mod tests {
             Wallet::seed_from_backup("n'importe quoi", Network::Testnet),
             Err(WalletError::SauvegardeInvalide)
         );
+    }
+
+    /// Un copier-coller maladroit ne doit pas faire echouer une restauration.
+    ///
+    /// Le cas reel : le code, colle depuis un carnet ou un gestionnaire de mots
+    /// de passe, arrive coupe par un retour a la ligne au milieu, ou entoure
+    /// d'espaces. Il reste le meme code ; l'alphabet Bech32m n'ayant aucun
+    /// blanc, tout blanc est du bruit de mise en forme. La restauration doit
+    /// donc reconstituer la meme graine, quelle que soit la maniere dont le
+    /// code a ete colle.
+    #[test]
+    fn un_code_truffe_de_blancs_restaure_la_meme_graine() {
+        let w = portefeuille();
+        let code = w.backup_code();
+        let attendu = Wallet::seed_from_backup(&code, Network::Regtest).unwrap();
+
+        // Coupe en son milieu par un retour a la ligne.
+        let milieu = code.len() / 2;
+        let coupe = format!("{}\n{}", &code[..milieu], &code[milieu..]);
+        // Un panache de tous les blancs qu'un collage peut introduire :
+        // espaces, tabulation, retours a la ligne, espace insecable, largeur
+        // nulle, autour et au milieu.
+        let bruite = format!(
+            "  {}\t{}\u{00A0}{}\u{200B}\r\n{}  ",
+            &code[..8],
+            &code[8..milieu],
+            &code[milieu..code.len() - 4],
+            &code[code.len() - 4..]
+        );
+        for essai in [coupe, bruite] {
+            assert_eq!(
+                Wallet::seed_from_backup(&essai, Network::Regtest).unwrap(),
+                attendu,
+                "un code colle avec des blancs doit restaurer la meme graine : {essai:?}"
+            );
+        }
     }
 
     /// La graine tiree du systeme doit etre differente a chaque fois.

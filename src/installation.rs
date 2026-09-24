@@ -412,9 +412,18 @@ function ecranRestaurer(){
   + '<button class="s" id="retour">Retour</button>'
   + '<button class="p" id="suite" disabled>Continuer</button></div>';
   var c = $("c");
-  c.oninput = function(){ $("suite").disabled = c.value.trim().length < 20; };
+  // Un copier-coller peut glisser un retour a la ligne ou une espace au milieu
+  // du code — l'alphabet du code n'en contient aucun. On les retire a la saisie
+  // pour que le champ ne montre, et ne transmette, qu'un seul code continu,
+  // quelle que soit la mise en forme d'origine (voir capture du defaut corrige).
+  function nettoyerCode(v){ return v.replace(/[\s\u200B\u200C\u200D\uFEFF\u00AD]/g, ''); }
+  c.oninput = function(){
+    var propre = nettoyerCode(c.value);
+    if (propre !== c.value) c.value = propre;
+    $("suite").disabled = c.value.length < 20;
+  };
   $("retour").onclick = ecranChoix;
-  $("suite").onclick = function(){ CODE = c.value.trim(); ecranPhrase(true); };
+  $("suite").onclick = function(){ CODE = nettoyerCode(c.value); ecranPhrase(true); };
   c.focus();
 }
 
