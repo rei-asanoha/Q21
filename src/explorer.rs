@@ -136,13 +136,29 @@ a.plat:hover{text-decoration:underline}
 .badge{display:inline-block;padding:.05rem .4rem;border-radius:3px;font-size:.72rem;
   background:var(--accent-fond);color:var(--accent)}
 .badge.gris{background:var(--bord);color:var(--doux)}
+
+/* Choix de la langue : le meme que dans le portefeuille. */
+.entete-haut{display:flex;align-items:center;justify-content:space-between;gap:.8rem;flex-wrap:wrap}
+.langues{display:flex;gap:.25rem;align-items:center}
+.langues button{background:transparent;border:1px solid transparent;border-radius:.4rem;
+  padding:.15rem .35rem;font-size:1.05rem;line-height:1;cursor:pointer;opacity:.55}
+.langues button:hover{opacity:.9;background:var(--accent-fond)}
+.langues button[aria-pressed="true"]{opacity:1;border-color:var(--bord-fort)}
+.langues button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 </style>
 </head>
 <body>
 <div class="enveloppe">
 
 <header>
-  <h1><a href="#/">Q21</a> <span class="etat" id="reseau">…</span></h1>
+  <div class="entete-haut">
+    <h1><a href="#/">Q21</a> <span class="etat" id="reseau">…</span></h1>
+    <div class="langues" id="langues" role="group" aria-label="Langue / Language">
+      <button type="button" data-langue="fr" aria-pressed="true" title="Français">&#127467;&#127479;</button>
+      <button type="button" data-langue="en" aria-pressed="false" title="English">&#127468;&#127463;</button>
+      <button type="button" data-langue="ja" aria-pressed="false" title="&#26085;&#26412;&#35486;">&#127471;&#127477;</button>
+    </div>
+  </div>
   <div class="sous">
     Explorateur servi par <strong>votre nœud</strong>, en local. Aucune ressource
     externe n'est chargée&nbsp;: ce que vous lisez, votre machine l'a validé.
@@ -278,6 +294,179 @@ a.plat:hover{text-decoration:underline}
 
 </div>
 <script>
+// ---------------------------------------------------------------------------
+// Langue
+//
+// Meme moteur que le portefeuille, et meme cle de rangement `q21-langue` : la
+// langue choisie dans le portefeuille suit dans l'explorateur, qui s'ouvre dans
+// le meme onglet, et inversement. `sessionStorage` ne sert qu'a cela, jamais au
+// jeton, qui reste dans `localStorage` sous l'origine.
+//
+// La page ecrit toujours ses textes en francais ; le moteur les traduit a
+// l'affichage. C'est ce qui permet de changer de langue a tout moment, dans les
+// deux sens, sans recharger. Les textes venus du noeud (notes, erreurs) passent
+// par la meme table : l'explorateur ne demande rien au noeud selon la langue.
+// ---------------------------------------------------------------------------
+const I18N = {"en": {"Q21 — explorateur local": "Q21 — local explorer", "Explorateur servi par": "Explorer served by", "votre nœud": "your node", ", en local. Aucune ressource externe n'est chargée : ce que vous lisez, votre machine l'a validé.": ", locally. No external resource is loaded: what you read, your machine has validated.", "hauteur, bloc, transaction, adresse ou montant (ex. 1.5)": "height, block, transaction, address or amount (e.g. 1.5)", "Chercher": "Search", "Un seul champ : le nœud reconnaît ce que vous collez.": "One field: the node recognises whatever you paste.", "Recherche…": "Searching…", "Jeton d'accès requis": "Access token required", "Le nœud exige un jeton. Il est normalement transmis par le lanceur dans le fragment de l'adresse ; si vous avez ouvert cette page à la main, saisissez ici le jeton passé à": "The node requires a token. The launcher normally passes it in the address fragment; if you opened this page by hand, enter here the token given to", "jeton d'accès": "access token", "Déverrouiller": "Unlock", "Nœud injoignable": "Node unreachable", "Portefeuille": "Wallet", "— servi par le même nœud, sur le même port.": "— served by the same node, on the same port.", "API JSON-RPC sur": "JSON-RPC API at", "énumère les méthodes disponibles. Code de recherche, non audité : ne protège aucune valeur réelle.": "lists the available methods. Research code, not audited: it protects no real value.", "Chargement…": "Loading…", "Chaîne": "Chain", "Monnaie": "Currency", "Preuve de travail": "Proof of work", "Réseau": "Network", "Derniers blocs": "Latest blocks", "Réservoir de transactions": "Transaction pool", "Ce que le protocole ne protège pas": "What the protocol does not protect", "Accueil": "Home", "→ bloc": "→ block", "→ transaction": "→ transaction", "→ adresse": "→ address", "→ montant": "→ amount", "Bloc": "Block", "Transactions": "Transactions", "Transaction": "Transaction", "Adresse": "Address", "Mouvements": "Movements", "Recherche par montant": "Search by amount", "Sorties trouvées": "Outputs found", "Oncles": "Uncles", "Hauteur": "Height", "Identifiant": "Identifier", "Identifiants": "Identifiers", "Taille": "Size", "Subvention": "Subsidy", "Horodatage": "Timestamp", "Genre": "Kind", "Entrées": "Inputs", "Sorties": "Outputs", "Valeur sortante": "Output value", "Poids": "Weight", "Reçu": "Received", "Envoyé": "Sent", "Conf.": "Conf.", "Montant": "Amount", "Confirmations": "Confirmations", "Parent": "Parent", "Racine de Merkle": "Merkle root", "Mineur": "Miner", "Nonce": "Nonce", "Difficulté": "Difficulty", "Tête": "Tip", "Travail cumulé": "Cumulative work", "tentatives espérées": "expected attempts", "Pairs": "Peers", "Blocs connus": "Known blocks", "branches latérales comprises": "side branches included", "Émis": "Issued", "Dans les UTXO": "In the UTXO set", "Plafond": "Cap", "sous le plafond ✓": "under the cap ✓", "PLAFOND FRANCHI": "CAP EXCEEDED", "Part émise": "Share issued", "Sorties non dépensées": "Unspent outputs", "Empreinte de l'état": "State fingerprint", "Époque": "Epoch", "Éléments de table": "Table elements", "Mémoire du mineur": "Miner memory", "Mémoire du nœud": "Node memory", "Accès par tentative": "Accesses per attempt", "Croissance": "Growth", "Blocs reçus": "Blocks received", "Blocs acceptés": "Blocks accepted", "Annonces compactes": "Compact announcements", "Reconstruits sans aller-retour": "Rebuilt without a round trip", "Transactions reçues": "Transactions received", "Pairs bannis": "Banned peers", "Octets": "Bytes", "Protection à 100 % contre une attaque à 51 % : impossible": "100 % protection against a 51 % attack: impossible", "Protection à 100 % contre une attaque à 51 % : oui": "100 % protection against a 51 % attack: yes", "Un attaquant majoritaire peut :": "A majority attacker can:", "Il ne peut pas, même avec 99 % de la puissance :": "Even with 99 % of the power, it cannot:", "Finalité glissante :": "Sliding finality:", "Le consensus definit la chaine valide comme celle qui porte le plus de travail. Un majoritaire en produit plus que tous les autres, par definition. Refuser sa chaine supposerait de savoir que c'est lui : une identite, donc une autorite, donc la fin du caractere sans permission. C'est un theoreme, pas une lacune d'implementation.": "Consensus defines the valid chain as the one carrying the most work. A majority produces more of it than everyone else, by definition. Refusing its chain would require knowing that it is them: an identity, hence an authority, hence the end of permissionlessness. This is a theorem, not an implementation gap.", "reorganiser les blocs recents, donc annuler ses propres paiements": "reorganise recent blocks, and so undo its own payments", "refuser d'inclure certaines transactions": "refuse to include certain transactions", "voler une piece dont il n'a pas la clef": "steal a coin it holds no key for", "fabriquer une unite au-dela de la subvention": "create a single unit beyond the subsidy", "relever le plafond de 21 000 001": "raise the cap of 21 000 001", "changer une regle : ses blocs sont simplement rejetes": "change a rule: its blocks are simply rejected", "minage": "mining", "transfert": "transfer", "Frais": "Fees", "une coinbase les perçoit, elle n'en paie pas": "a coinbase collects them, it pays none", "payés au mineur": "paid to the miner", "non résolu sans index": "unresolved without an index", "État": "Status", "confirmée": "confirmed", "en attente": "pending", "dans le réservoir": "in the pool", "Création monétaire — cette transaction ne consomme rien": "Money creation — this transaction consumes nothing", "Transaction de minage": "Mining transaction", "Elle crée la subvention du bloc et récolte les frais des autres transactions. Elle ne consomme aucune sortie antérieure, et ce qu'elle produit n'est dépensable qu'après le délai de maturité — de sorte qu'un bloc annulé par une réorganisation n'ait pas déjà servi à payer quelqu'un.": "It creates the block subsidy and collects the fees of the other transactions. It consumes no earlier output, and what it produces can only be spent after the maturity delay — so that a block undone by a reorganisation has not already been used to pay someone.", "Frais non résolus": "Fees unresolved", "Une entrée au moins échappe à l'index de ce nœud — index absent, ou pièce trop ancienne pour lui. Les frais ne se calculent pas sur une somme partielle : la page préfère se taire plutôt qu'afficher un chiffre qu'elle n'a pas vérifié.": "At least one input escapes this node's index — no index, or a coin too old for it. Fees are not computed on a partial sum: the page would rather stay silent than show a figure it has not verified.", "Empreinte de clef": "Key fingerprint", "Solde": "Balance", "tous affichés": "all shown", "Reçu (affiché)": "Received (shown)", "Envoyé (affiché)": "Sent (shown)", "Historique complet": "Full history", "Historique borné": "Bounded history", "Historique complet : l'index d'adresses couvre toute la chaine.": "Full history: the address index covers the whole chain.", "Historique borne : ce noeud tourne sans index d'adresses. Les envois ne sont pas resolus, et la recherche s'arrete au plancher indique. Relancez-le avec --index-adresses pour une reponse complete.": "Bounded history: this node runs without an address index. Sends are not resolved, and the search stops at the floor shown. Restart it with --index-adresses for a complete answer.", "Le solde, lui, ne dépend d'aucun index : il vient de l'ensemble des sorties non dépensées que ce nœud a validé lui-même. Il est exact même quand l'historique ne l'est pas.": "The balance, however, depends on no index: it comes from the set of unspent outputs this node validated itself. It is exact even when the history is not.", "envoi": "sending", "réception": "receiving", "Aucun mouvement dans la portée de la recherche.": "No movement within the search range.", "Montant cherché": "Amount searched", "les 100 plus récentes": "the 100 most recent", "Fenêtre": "Window", "Recherche bornée": "Bounded search", "Aucune sortie de ce montant dans la fenêtre parcourue.": "No output of this amount in the window searched.", "recherche vide": "empty search", "recherche trop longue": "search too long", "hauteur illisible": "unreadable height", "montant illisible : au plus 8 decimales": "unreadable amount: at most 8 decimals", "ni bloc, ni transaction connue de ce noeud": "neither a block nor a transaction known to this node", "ni une hauteur, ni un identifiant de 64 caracteres hexadecimaux, ni une adresse valide": "neither a height, nor a 64-character hexadecimal identifier, nor a valid address", "index indisponible": "index unavailable", "transaction introuvable": "transaction not found", "bloc introuvable": "block not found", "trop de recherches en cours sur ce service public : reessayez dans une minute": "too many searches in progress on this public service: try again in a minute"}, "ja": {"Q21 — explorateur local": "Q21 — ローカル・エクスプローラー", "Explorateur servi par": "このエクスプローラーを提供しているのは", "votre nœud": "あなたのノード", ", en local. Aucune ressource externe n'est chargée : ce que vous lisez, votre machine l'a validé.": "です(ローカル動作)。外部リソースは一切読み込みません。表示内容はすべてあなたのマシンが検証したものです。", "hauteur, bloc, transaction, adresse ou montant (ex. 1.5)": "高さ、ブロック、トランザクション、アドレス、または金額(例:1.5)", "Chercher": "検索", "Un seul champ : le nœud reconnaît ce que vous collez.": "入力欄はひとつだけ。貼り付けた内容をノードが判別します。", "Recherche…": "検索中…", "Jeton d'accès requis": "アクセストークンが必要です", "Le nœud exige un jeton. Il est normalement transmis par le lanceur dans le fragment de l'adresse ; si vous avez ouvert cette page à la main, saisissez ici le jeton passé à": "ノードはトークンを要求しています。通常はランチャーがアドレスのフラグメントで渡します。このページを手動で開いた場合は、次のオプションに渡したトークンをここに入力してください:", "jeton d'accès": "アクセストークン", "Déverrouiller": "ロック解除", "Nœud injoignable": "ノードに接続できません", "Portefeuille": "ウォレット", "— servi par le même nœud, sur le même port.": "— 同じノード、同じポートで提供されています。", "API JSON-RPC sur": "JSON-RPC API:", "énumère les méthodes disponibles. Code de recherche, non audité : ne protège aucune valeur réelle.": "で利用できるメソッドを一覧できます。研究用のコードで未監査のため、実際の価値は一切保護しません。", "Chargement…": "読み込み中…", "Chaîne": "チェーン", "Monnaie": "通貨", "Preuve de travail": "プルーフ・オブ・ワーク", "Réseau": "ネットワーク", "Derniers blocs": "最新のブロック", "Réservoir de transactions": "トランザクションプール", "Ce que le protocole ne protège pas": "プロトコルが守らないもの", "Accueil": "ホーム", "→ bloc": "→ ブロック", "→ transaction": "→ トランザクション", "→ adresse": "→ アドレス", "→ montant": "→ 金額", "Bloc": "ブロック", "Transactions": "トランザクション", "Transaction": "トランザクション", "Adresse": "アドレス", "Mouvements": "入出金", "Recherche par montant": "金額で検索", "Sorties trouvées": "見つかった出力", "Oncles": "アンクル", "Hauteur": "高さ", "Identifiant": "識別子", "Identifiants": "識別子", "Taille": "サイズ", "Subvention": "補助金", "Horodatage": "タイムスタンプ", "Genre": "種類", "Entrées": "入力", "Sorties": "出力", "Valeur sortante": "出力額", "Poids": "重み", "Reçu": "受取", "Envoyé": "送金", "Conf.": "承認", "Montant": "金額", "Confirmations": "承認数", "Parent": "親ブロック", "Racine de Merkle": "マークル・ルート", "Mineur": "マイナー", "Nonce": "ナンス", "Difficulté": "難易度", "Tête": "先端", "Travail cumulé": "累積ワーク", "tentatives espérées": "期待試行回数", "Pairs": "ピア", "Blocs connus": "既知のブロック", "branches latérales comprises": "側枝を含む", "Émis": "発行済み", "Dans les UTXO": "UTXO内", "Plafond": "上限", "sous le plafond ✓": "上限以内 ✓", "PLAFOND FRANCHI": "上限超過", "Part émise": "発行割合", "Sorties non dépensées": "未使用出力", "Empreinte de l'état": "状態フィンガープリント", "Époque": "エポック", "Éléments de table": "テーブル要素数", "Mémoire du mineur": "マイナーのメモリ", "Mémoire du nœud": "ノードのメモリ", "Accès par tentative": "試行あたりのアクセス数", "Croissance": "増加", "Blocs reçus": "受信ブロック", "Blocs acceptés": "受理したブロック", "Annonces compactes": "コンパクト通知", "Reconstruits sans aller-retour": "往復なしで再構成", "Transactions reçues": "受信トランザクション", "Pairs bannis": "禁止されたピア", "Octets": "バイト", "Protection à 100 % contre une attaque à 51 % : impossible": "51 % 攻撃に対する 100 % の防御:不可能", "Protection à 100 % contre une attaque à 51 % : oui": "51 % 攻撃に対する 100 % の防御:可能", "Un attaquant majoritaire peut :": "過半数を握る攻撃者にできること:", "Il ne peut pas, même avec 99 % de la puissance :": "計算力の 99 % を握っていても、できないこと:", "Finalité glissante :": "スライディング・ファイナリティ:", "Le consensus definit la chaine valide comme celle qui porte le plus de travail. Un majoritaire en produit plus que tous les autres, par definition. Refuser sa chaine supposerait de savoir que c'est lui : une identite, donc une autorite, donc la fin du caractere sans permission. C'est un theoreme, pas une lacune d'implementation.": "コンセンサスは、最も多くのワークを持つチェーンを正当なチェーンと定めます。過半数を握る者は、定義上、他の全員より多くのワークを生み出します。そのチェーンを拒むには、それが誰かを知る必要があります。それは身元、つまり権威を意味し、許可不要という性質の終わりです。これは実装の欠陥ではなく、定理です。", "reorganiser les blocs recents, donc annuler ses propres paiements": "最近のブロックを再編成し、自分自身の支払いを取り消すこと", "refuser d'inclure certaines transactions": "特定のトランザクションの取り込みを拒むこと", "voler une piece dont il n'a pas la clef": "鍵を持たないコインを盗むこと", "fabriquer une unite au-dela de la subvention": "補助金を超えて 1 単位でも作り出すこと", "relever le plafond de 21 000 001": "21 000 001 の上限を引き上げること", "changer une regle : ses blocs sont simplement rejetes": "ルールを変えること:そのブロックは単に拒否されます", "minage": "マイニング", "transfert": "送金", "Frais": "手数料", "une coinbase les perçoit, elle n'en paie pas": "コインベースは手数料を受け取り、支払いはしません", "payés au mineur": "マイナーに支払い済み", "non résolu sans index": "インデックスなしでは未解決", "État": "状態", "confirmée": "承認済み", "en attente": "保留中", "dans le réservoir": "プール内", "Création monétaire — cette transaction ne consomme rien": "通貨の発行 — このトランザクションは何も消費しません", "Transaction de minage": "マイニング・トランザクション", "Elle crée la subvention du bloc et récolte les frais des autres transactions. Elle ne consomme aucune sortie antérieure, et ce qu'elle produit n'est dépensable qu'après le délai de maturité — de sorte qu'un bloc annulé par une réorganisation n'ait pas déjà servi à payer quelqu'un.": "ブロックの補助金を生み出し、他のトランザクションの手数料を集めます。以前の出力は何も消費せず、生み出したものは成熟期間を過ぎるまで使えません。これにより、再編成で取り消されたブロックが、すでに誰かへの支払いに使われていたという事態を防ぎます。", "Frais non résolus": "手数料は未解決", "Une entrée au moins échappe à l'index de ce nœud — index absent, ou pièce trop ancienne pour lui. Les frais ne se calculent pas sur une somme partielle : la page préfère se taire plutôt qu'afficher un chiffre qu'elle n'a pas vérifié.": "少なくとも 1 つの入力がこのノードのインデックスの対象外です(インデックスがないか、古すぎるコインです)。手数料は部分的な合計からは計算しません。検証していない数字を表示するより、何も表示しないことを選びます。", "Empreinte de clef": "鍵フィンガープリント", "Solde": "残高", "tous affichés": "すべて表示", "Reçu (affiché)": "受取(表示分)", "Envoyé (affiché)": "送金(表示分)", "Historique complet": "完全な履歴", "Historique borné": "範囲を限定した履歴", "Historique complet : l'index d'adresses couvre toute la chaine.": "完全な履歴:アドレス・インデックスがチェーン全体をカバーしています。", "Historique borne : ce noeud tourne sans index d'adresses. Les envois ne sont pas resolus, et la recherche s'arrete au plancher indique. Relancez-le avec --index-adresses pour une reponse complete.": "範囲を限定した履歴:このノードはアドレス・インデックスなしで動作しています。送金は解決されず、検索は表示された下限で止まります。完全な結果を得るには --index-adresses を付けて再起動してください。", "Le solde, lui, ne dépend d'aucun index : il vient de l'ensemble des sorties non dépensées que ce nœud a validé lui-même. Il est exact même quand l'historique ne l'est pas.": "一方、残高はインデックスに依存しません。このノード自身が検証した未使用出力の集合から得られるため、履歴が不完全なときでも正確です。", "envoi": "送金", "réception": "受取", "Aucun mouvement dans la portée de la recherche.": "検索範囲内に入出金はありません。", "Montant cherché": "検索した金額", "les 100 plus récentes": "最新の 100 件", "Fenêtre": "検索範囲", "Recherche bornée": "範囲を限定した検索", "Aucune sortie de ce montant dans la fenêtre parcourue.": "検索した範囲に、この金額の出力はありません。", "recherche vide": "検索語が空です", "recherche trop longue": "検索語が長すぎます", "hauteur illisible": "高さを読み取れません", "montant illisible : au plus 8 decimales": "金額を読み取れません:小数点以下は最大 8 桁です", "ni bloc, ni transaction connue de ce noeud": "このノードが知るブロックでもトランザクションでもありません", "ni une hauteur, ni un identifiant de 64 caracteres hexadecimaux, ni une adresse valide": "高さでも、64 文字の 16 進識別子でも、有効なアドレスでもありません", "index indisponible": "インデックスを利用できません", "transaction introuvable": "トランザクションが見つかりません", "bloc introuvable": "ブロックが見つかりません", "trop de recherches en cours sur ce service public : reessayez dans une minute": "この公開サービスでは検索が集中しています。1 分後にもう一度お試しください"}};
+const I18N_MOTIFS = {
+  "en": [
+    [/^Bloc (\d+)$/, "Block $1"],
+    [/^(\d+) confirmation\(s\)$/, "$1 confirmation(s)"],
+    [/^(\d+) sortie\(s\) non dépensée\(s\)$/, "$1 unspent output(s)"],
+    [/^(\d+) affiché\(s\)$/, "$1 shown"],
+    [/^(\d+) % de témoin$/, "$1 % witness data"],
+    [/^Entrées \((\d+)\)$/, "Inputs ($1)"],
+    [/^Sorties \((\d+)\)$/, "Outputs ($1)"],
+    [/^(\d+) \(plafonné\)$/, "$1 (capped)"],
+    [/^blocs (\d+) → (\d+)$/, "blocks $1 → $2"],
+    [/^(\d+) blocs au plus$/, "at most $1 blocks"],
+    [/^\+([\d\s.,]+) % \/ ([\d\s.,]+) blocs$/, "+$1 % / $2 blocks"],
+    [/^([\d.]+) Mio — la vérification n'en a pas besoin$/, "$1 MiB — verification does not need it"],
+    [/^([\d.]+) Kio — la vérification n'en a pas besoin$/, "$1 KiB — verification does not need it"],
+    [/^(\d+) o — la vérification n'en a pas besoin$/, "$1 B — verification does not need it"],
+    [/^([\d.]+) Mio$/, "$1 MiB"],
+    [/^([\d.]+) Kio$/, "$1 KiB"],
+    [/^(\d+) o$/, "$1 B"],
+    [/^(\d+) blocs \((\d+) h\)\. Elle ne supprime pas l'attaque, elle en change la nature\. Une partition reseau prolongee produit deux chaines qui ne se reconcilieront pas seules\. On echange une reecriture silencieuse contre une scission visible\.$/, "$1 blocks ($2 h). It does not remove the attack, it changes its nature. A prolonged network partition produces two chains that will not reconcile on their own. A silent rewrite is traded for a visible split."],
+    [/^Recherche remontée jusqu'au bloc (\d+) sur (\d+)\. Le solde affiché reste exact : il vient de l'ensemble des sorties non dépensées, pas de cette liste\.$/, "Search went back to block $1 of $2. The balance shown stays exact: it comes from the set of unspent outputs, not from this list."],
+    [/^Sans index par montant, la recherche remonte une fenêtre de (\d+) blocs — ici de (\d+) à (\d+)\. Une somme courante peut apparaître des milliers de fois : la liste est plafonnée aux 100 plus récentes\. Rapide, bornée, et la page dit jusqu'où elle est allée\.$/, "Without an amount index, the search goes back over a window of $1 blocks — here from $2 to $3. A common sum can appear thousands of times: the list is capped at the 100 most recent. Fast, bounded, and the page says how far it went."],
+    [/^aucun bloc a la hauteur (\d+) : la chaine s'arrete plus bas$/, "no block at height $1: the chain stops lower"],
+    [/^cette adresse appartient au reseau (\w+), ce noeud suit (\w+)$/, "this address belongs to the $1 network, this node follows $2"],
+    [/^transaction introuvable dans les (\d+) derniers blocs\. Ce noeud n'a pas d'index par identifiant : au-dela, la recherche n'est pas rendue\.$/, "transaction not found in the last $1 blocks. This node has no index by identifier: beyond that, the search is not carried out."],
+    [/^Impossible d'interroger le nœud : (.*)\. Si un jeton d'accès est configuré, l'explorateur le demandera\.$/, "Could not query the node: $1. If an access token is configured, the explorer will ask for it."]
+  ],
+  "ja": [
+    [/^Bloc (\d+)$/, "ブロック $1"],
+    [/^(\d+) confirmation\(s\)$/, "$1 回承認"],
+    [/^(\d+) sortie\(s\) non dépensée\(s\)$/, "未使用出力 $1 件"],
+    [/^(\d+) affiché\(s\)$/, "$1 件を表示"],
+    [/^(\d+) % de témoin$/, "証人データ $1 %"],
+    [/^Entrées \((\d+)\)$/, "入力($1)"],
+    [/^Sorties \((\d+)\)$/, "出力($1)"],
+    [/^(\d+) \(plafonné\)$/, "$1(上限あり)"],
+    [/^blocs (\d+) → (\d+)$/, "ブロック $1 → $2"],
+    [/^(\d+) blocs au plus$/, "最大 $1 ブロック"],
+    [/^\+([\d\s.,]+) % \/ ([\d\s.,]+) blocs$/, "+$1 % / $2 ブロック"],
+    [/^([\d.]+) Mio — la vérification n'en a pas besoin$/, "$1 MiB — 検証には不要です"],
+    [/^([\d.]+) Kio — la vérification n'en a pas besoin$/, "$1 KiB — 検証には不要です"],
+    [/^(\d+) o — la vérification n'en a pas besoin$/, "$1 B — 検証には不要です"],
+    [/^([\d.]+) Mio$/, "$1 MiB"],
+    [/^([\d.]+) Kio$/, "$1 KiB"],
+    [/^(\d+) o$/, "$1 B"],
+    [/^(\d+) blocs \((\d+) h\)\. Elle ne supprime pas l'attaque, elle en change la nature\. Une partition reseau prolongee produit deux chaines qui ne se reconcilieront pas seules\. On echange une reecriture silencieuse contre une scission visible\.$/, "$1 ブロック($2 時間)。攻撃をなくすのではなく、その性質を変えます。ネットワークの分断が長く続くと、自然には和解しない 2 本のチェーンが生まれます。気づかれない書き換えを、目に見える分裂と引き換えにするのです。"],
+    [/^Recherche remontée jusqu'au bloc (\d+) sur (\d+)\. Le solde affiché reste exact : il vient de l'ensemble des sorties non dépensées, pas de cette liste\.$/, "検索はブロック $1(全 $2)まで遡りました。表示された残高は正確なままです。この一覧ではなく、未使用出力の集合から得られています。"],
+    [/^Sans index par montant, la recherche remonte une fenêtre de (\d+) blocs — ici de (\d+) à (\d+)\. Une somme courante peut apparaître des milliers de fois : la liste est plafonnée aux 100 plus récentes\. Rapide, bornée, et la page dit jusqu'où elle est allée\.$/, "金額のインデックスがないため、検索は $1 ブロックの範囲を遡ります(今回は $2 から $3 まで)。よくある金額は何千回も現れることがあるため、一覧は最新の 100 件に制限されます。速く、範囲が限られ、どこまで調べたかをページが示します。"],
+    [/^aucun bloc a la hauteur (\d+) : la chaine s'arrete plus bas$/, "高さ $1 のブロックはありません:チェーンはそれより手前で終わっています"],
+    [/^cette adresse appartient au reseau (\w+), ce noeud suit (\w+)$/, "このアドレスは $1 ネットワークのもので、このノードは $2 を追っています"],
+    [/^transaction introuvable dans les (\d+) derniers blocs\. Ce noeud n'a pas d'index par identifiant : au-dela, la recherche n'est pas rendue\.$/, "直近 $1 ブロック内にトランザクションが見つかりません。このノードには識別子のインデックスがないため、それ以上は検索しません。"],
+    [/^Impossible d'interroger le nœud : (.*)\. Si un jeton d'accès est configuré, l'explorateur le demandera\.$/, "ノードに問い合わせできません:$1。アクセストークンが設定されている場合は、エクスプローラーが入力を求めます。"]
+  ]
+};
+const I18N_PREFIXES = {"en": {"adresse illisible : ": "unreadable address: "}, "ja": {"adresse illisible : ": "アドレスを読み取れません:"}};
+let LANGUE = "fr";
+
+function q21Locale(){
+  return LANGUE === "en" ? "en-US" : (LANGUE === "ja" ? "ja-JP" : "fr-FR");
+}
+
+function q21Norm(s){ return s.replace(/ /g, " ").replace(/\s+/g, " ").trim(); }
+
+function q21Trad(src){
+  const d = I18N[LANGUE];
+  if (!d) return null;
+  const n = q21Norm(src);
+  let v = d[n];
+  if (v === undefined){
+    const pr = I18N_PREFIXES[LANGUE] || {};
+    for (const k in pr){ if (n.startsWith(k)){ v = pr[k] + n.slice(k.length); break; } }
+  }
+  if (v === undefined){
+    for (const [motif, modele] of (I18N_MOTIFS[LANGUE] || [])){
+      if (motif.test(n)){ v = n.replace(motif, modele); break; }
+    }
+  }
+  if (v === undefined) return null;
+  const av = src.match(/^\s*/)[0], ap = src.match(/\s*$/)[0];
+  return av + v + ap;
+}
+
+function q21TraduireTexte(n){
+  // Meme distinction que dans le portefeuille : une valeur que nous avons posee
+  // nous-memes n'est pas une nouvelle source. Sans cela, un rafraichissement
+  // ferait traduire une traduction.
+  if (n.__q21pose === undefined || n.nodeValue !== n.__q21pose) n.__q21fr = n.nodeValue;
+  let v = n.__q21fr;
+  if (LANGUE !== "fr"){ const t = q21Trad(n.__q21fr); if (t !== null) v = t; }
+  if (n.nodeValue !== v) n.nodeValue = v;
+  n.__q21pose = v;
+}
+
+const Q21_ATTRS = ["placeholder", "title", "aria-label"];
+
+function q21Traduire(n){
+  if (!n) return;
+  if (n.nodeType === 3){ q21TraduireTexte(n); return; }
+  if (n.nodeType !== 1) return;
+  const t = n.tagName;
+  if (t === "SCRIPT" || t === "STYLE") return;
+  if (n.id !== "langues"){
+    for (const a of Q21_ATTRS){
+      if (!n.hasAttribute(a)) continue;
+      const cle = "__q21a_" + a;
+      if (n[cle] === undefined) n[cle] = n.getAttribute(a);
+      let v = n[cle];
+      if (LANGUE !== "fr"){ const x = q21Trad(n[cle]); if (x !== null) v = x; }
+      if (n.getAttribute(a) !== v) n.setAttribute(a, v);
+    }
+  }
+  if (n.id === "langues") return;
+  for (const e of n.childNodes) q21Traduire(e);
+}
+
+let q21Titre = null;
+
+function q21AppliquerLangue(code){
+  LANGUE = (code === "en" || code === "ja") ? code : "fr";
+  document.documentElement.lang = LANGUE;
+  try { sessionStorage.setItem("q21-langue", LANGUE); } catch (e) {}
+  if (q21Titre === null) q21Titre = document.title;
+  const titre = LANGUE === "fr" ? null : q21Trad(q21Titre);
+  document.title = titre === null ? q21Titre : titre;
+  q21Traduire(document.body);
+  const g = document.getElementById("langues");
+  if (g) for (const b of g.querySelectorAll("button"))
+    b.setAttribute("aria-pressed", b.dataset.langue === LANGUE ? "true" : "false");
+}
+
+(function q21InitLangue(){
+  let choix = null;
+  try { choix = sessionStorage.getItem("q21-langue"); } catch (e) {}
+  if (!choix){
+    const n = (navigator.language || "fr").slice(0, 2).toLowerCase();
+    choix = (n === "en" || n === "ja") ? n : "fr";
+  }
+  const demarrer = function(){
+    const g = document.getElementById("langues");
+    if (g) g.addEventListener("click", function(ev){
+      const b = ev.target.closest("button[data-langue]");
+      if (b) q21AppliquerLangue(b.dataset.langue);
+    });
+    q21AppliquerLangue(choix);
+    // Ce que le script ecrit ensuite — chaque vue, chaque rafraichissement de
+    // l'accueil — doit etre traduit aussi.
+    new MutationObserver(function(ms){
+      if (LANGUE === "fr") return;
+      for (const m of ms){
+        if (m.type === "characterData") q21Traduire(m.target);
+        else for (const n of m.addedNodes) q21Traduire(n);
+      }
+    }).observe(document.body, {childList:true, subtree:true, characterData:true});
+  };
+  if (document.readyState === "loading")
+    document.addEventListener("DOMContentLoaded", demarrer);
+  else demarrer();
+})();
+
 // ---------------------------------------------------------------------------
 // Le jeton, et le fragment qu'il partage avec le routage
 //
@@ -475,6 +664,12 @@ async function routeur(){
   const f = location.hash.slice(1);
   if (f && !f.startsWith("/")) return; // un jeton, pas une route
   const bouts = f.replace(/^\//, "").split("/").filter(x => x.length);
+  // L'etiquette du reseau n'etait remplie que par l'accueil : arrive par un
+  // lien direct vers un bloc ou une transaction, on lisait « … » en haut de la
+  // page. On la remplit une fois, sans faire attendre la vue.
+  const etiquette = document.getElementById("reseau");
+  if (etiquette.textContent === "…")
+    appel("getinfo").then(i => { etiquette.textContent = i.reseau; }).catch(() => {});
   try{
     if (!bouts.length){ montrer("accueil"); await accueil(); return; }
     switch (bouts[0]){
@@ -638,9 +833,9 @@ async function voirBloc(cle){
 
   lignes("bloc-entete", [
     ["Identifiant", brut(`<span class="mono">${ech(e.id)}</span>`)],
-    ["Parent", brut(e.hauteur > 0 ? lien("bloc/"+e.prev_block, e.prev_block) : "—")],
-    ["Racine de Merkle", brut(`<span class="mono">${ech(e.merkle_root)}</span>`)],
-    ["Mineur", brut(`<span class="mono">${ech(e.miner)}</span>`)],
+    ["Parent", brut(e.hauteur > 0 ? lien("bloc/"+e.parent, e.parent) : "—")],
+    ["Racine de Merkle", brut(`<span class="mono">${ech(e.merkle)}</span>`)],
+    ["Mineur", brut(`<span class="mono">${ech(e.mineur)}</span>`)],
     ["Horodatage", date(e.horodatage) + " UTC"],
     ["Difficulté", e.bits],
     ["Nonce", e.nonce]
@@ -661,7 +856,7 @@ async function voirBloc(cle){
 
   document.getElementById("bloc-oncles").innerHTML = b.oncles.length
     ? `<h2>Oncles</h2><div class="defile"><table><thead><tr><th>Hauteur</th><th>Identifiant</th><th>Mineur</th></tr></thead><tbody>` +
-      b.oncles.map(o=>`<tr><td>${ech(o.hauteur)}</td><td><span class="coupe">${ech(o.id)}</span></td><td><span class="coupe">${court(o.miner,20)}</span></td></tr>`).join("") +
+      b.oncles.map(o=>`<tr><td>${ech(o.hauteur)}</td><td><span class="coupe">${ech(o.id)}</span></td><td><span class="coupe">${court(o.mineur,20)}</span></td></tr>`).join("") +
       `</tbody></table></div>`
     : "";
 }
@@ -892,6 +1087,80 @@ mod tests {
         );
     }
 
+    /// L'explorateur se traduit comme le portefeuille, et garde la langue.
+    ///
+    /// Regression v0.2.0 : la langue choisie dans le portefeuille se perdait en
+    /// ouvrant l'explorateur, qui n'avait aucun moyen de traduction.
+    #[test]
+    fn l_explorateur_se_traduit_et_garde_la_langue() {
+        let s = script();
+        for piece in [
+            "const I18N =",
+            "const I18N_MOTIFS =",
+            "const I18N_PREFIXES =",
+            "function q21Trad(",
+            "function q21AppliquerLangue(",
+            "new MutationObserver(",
+            r#"sessionStorage.getItem("q21-langue")"#,
+            r#"sessionStorage.setItem("q21-langue", LANGUE)"#,
+        ] {
+            assert!(
+                s.contains(piece),
+                "moteur de traduction incomplet : {piece}"
+            );
+        }
+        assert!(
+            PAGE.contains(r#"id="langues""#),
+            "selecteur de langue absent"
+        );
+        for code in ["fr", "en", "ja"] {
+            assert!(
+                PAGE.contains(&format!(r#"data-langue="{code}""#)),
+                "langue {code} absente du selecteur"
+            );
+        }
+        // Les libelles principaux ont bien leur traduction dans les deux langues.
+        let debut = s.find("const I18N =").expect("dictionnaire");
+        let fin = debut + s[debut..].find('\n').expect("fin du dictionnaire");
+        let dico = &s[debut..fin];
+        for cle in [
+            "\"Derniers blocs\"",
+            "\"Preuve de travail\"",
+            "\"Ce que le protocole ne protège pas\"",
+            "\"Racine de Merkle\"",
+            "\"Historique complet\"",
+        ] {
+            assert_eq!(
+                dico.matches(cle).count(),
+                2,
+                "{cle} doit etre traduit en anglais et en japonais"
+            );
+        }
+    }
+
+    /// La page lit l'en-tete de bloc sous les noms que le noeud lui donne.
+    ///
+    /// Regression : la page lisait `prev_block`, `merkle_root` et `miner`, alors
+    /// que le noeud rend `parent`, `merkle` et `mineur`. Les lignes Parent,
+    /// Racine de Merkle et Mineur affichaient « undefined ».
+    #[test]
+    fn l_en_tete_de_bloc_se_lit_sous_les_noms_du_noeud() {
+        let s = script();
+        for ancien in ["e.prev_block", "e.merkle_root", "e.miner", "o.miner"] {
+            assert!(
+                !s.contains(ancien),
+                "champ inexistant cote noeud : {ancien}"
+            );
+        }
+        for nouveau in ["e.parent", "e.merkle)", "e.mineur)", "o.mineur,"] {
+            assert!(s.contains(nouveau), "champ attendu : {nouveau}");
+        }
+        let rpc = include_str!("rpc.rs");
+        for champ in [r#".set("parent""#, r#".set("merkle""#, r#".set("mineur""#] {
+            assert!(rpc.contains(champ), "le noeud ne rend plus {champ}");
+        }
+    }
+
     #[test]
     fn la_page_prevoit_les_deux_themes() {
         assert!(PAGE.contains("prefers-color-scheme: dark"));
@@ -985,7 +1254,25 @@ mod tests {
     fn un_onglet_rouvert_reprend_le_jeton_range() {
         assert_eq!(PAGE.matches("window.localStorage").count(), 1);
         assert!(!PAGE.contains("localStorage."));
-        assert!(!PAGE.contains("sessionStorage"));
+        // `sessionStorage` ne porte que la langue choisie, comme dans le
+        // portefeuille : jamais le jeton. Chaque usage vise `q21-langue` et se
+        // tient dans un `try`, car un navigateur peut refuser le stockage.
+        for (i, _) in PAGE.match_indices("sessionStorage.") {
+            let suite = &PAGE[i..(i + 60).min(PAGE.len())];
+            assert!(
+                suite.contains("q21-langue"),
+                "seul le choix de langue passe par sessionStorage : {suite}"
+            );
+            // Le `try` se lit sur la meme ligne, avant l'acces. On borne a la
+            // ligne plutot qu'a un nombre d'octets : un decoupage au milieu d'un
+            // caractere accentue ferait paniquer l'epreuve elle-meme.
+            let ligne = PAGE[..i].rfind('\n').map(|d| d + 1).unwrap_or(0);
+            let avant = &PAGE[ligne..i];
+            assert!(
+                avant.contains("try {"),
+                "acces au stockage non garde : {avant}"
+            );
+        }
         assert!(PAGE.contains("r.setItem(CLEF_SESSION"));
         assert!(PAGE.contains("r.removeItem(CLEF_SESSION"));
         let echec = PAGE

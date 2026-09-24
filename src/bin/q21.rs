@@ -4627,7 +4627,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // Ce que la page a besoin de savoir pour distinguer « je n'ai
             // l'adresse de personne » de « personne ne m'a ouvert ».
             amorces_configurees: cibles.len(),
-            joignable: lire_joignable(datadir),
+            joignable: std::sync::atomic::AtomicBool::new(lire_joignable(datadir)),
+            // Ce qui gouverne CETTE session : l'ecoute a-t-elle ete demandee au
+            // lancement ? Le portefeuille la demande quand le reglage valait oui
+            // au demarrage ; un utilisateur peut aussi la demander a la main.
+            joignable_session: ecoute.is_some(),
             etat_box: Some(etat_box.clone()),
             definir_joignable: Some({
                 let d = datadir.to_path_buf();

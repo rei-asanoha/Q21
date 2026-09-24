@@ -2363,12 +2363,14 @@ document.getElementById("bascule-joignable").addEventListener("click", async () 
   const vers = b.getAttribute("aria-pressed") !== "true";
   try{
     const rep = await appel("setjoignable", {actif: vers});
-    // Le reglage est ecrit, mais l'ecoute se decide au lancement : on peint le
-    // nouvel etat voulu et on dit clairement qu'il faut relancer.
-    peindreJoignable({joignable: !!rep.joignable, ouverture_box: ""});
-    document.getElementById("joignable-etat").textContent = vers
-      ? "Votre nœud sera joignable au prochain lancement du portefeuille."
-      : "Votre nœud sera un simple client au prochain lancement du portefeuille.";
+    // Le reglage est ecrit et devient le choix voulu cote nœud : les
+    // rafraichissements suivants le repeindront a l'identique. L'ecoute, elle,
+    // se decide au lancement ; `peindreJoignable` le dit quand il le faut.
+    peindreJoignable({
+      joignable: !!rep.joignable,
+      joignable_session: rep.joignable_session,
+      ouverture_box: ""
+    });
   }catch(e){
     signalerErreur("Le réglage n'a pas pu être changé : " + e.message);
   }finally{
@@ -2429,9 +2431,19 @@ function peindreJoignable(info){
   document.getElementById("joignable-sous").textContent = actif
     ? "Il accepte les connexions des autres, pour que le réseau ne dépende pas d'une seule machine."
     : "Il sort vers le réseau, mais n'accepte pas de connexions entrantes.";
+  // Le choix voulu et la session en cours peuvent differer : l'ecoute se
+  // decide au lancement. On le dit, plutot que de montrer un etat de box qui
+  // ne correspond plus au choix affiche.
+  const etat = document.getElementById("joignable-etat");
+  const session = info.joignable_session === undefined ? actif : !!info.joignable_session;
+  if (actif !== session){
+    etat.textContent = actif
+      ? "Votre nœud sera joignable au prochain lancement du portefeuille."
+      : "Votre nœud sera un simple client au prochain lancement du portefeuille.";
+    return;
+  }
   // Etat reel de l'ouverture de box, honnete : ce que la box a repondu, jamais
   // un « joignable » qu'on ne peut pas prouver d'ici.
-  const etat = document.getElementById("joignable-etat");
   const ob = (info.ouverture_box || "").trim();
   etat.textContent = actif && ob ? "Ouverture du port dans la box : " + ob : "";
 }

@@ -259,12 +259,19 @@ pub struct RpcContext {
     /// serveur ou le reseau qu'il faut regarder. Les deux se voient pareil,
     /// et l'un des deux fait abandonner.
     pub amorces_configurees: usize,
-    /// Le reglage « ce noeud est-il joignable de l'exterieur » lu au lancement.
+    /// Le reglage « ce noeud est-il joignable de l'exterieur », tel que
+    /// l'utilisateur l'a **voulu** en dernier.
     ///
-    /// Sert a peindre l'interrupteur de l'interface. Le changer prend effet au
-    /// prochain lancement : l'ecoute et l'ouverture de box se decident au
-    /// demarrage, pas en cours de route.
-    pub joignable: bool,
+    /// Il change des que `setjoignable` l'a ecrit sur le disque, et c'est lui
+    /// qui peint l'interrupteur. La v0.2.0 ne gardait que la valeur lue au
+    /// lancement : l'onglet Reseau, rafraichi toutes les quatre secondes,
+    /// repeignait l'ancienne valeur et l'interrupteur se remettait tout seul.
+    pub joignable: std::sync::atomic::AtomicBool,
+    /// Le meme reglage tel qu'il etait au lancement : c'est lui qui gouverne
+    /// cette session, car l'ecoute et l'ouverture de box se decident au
+    /// demarrage. Quand les deux different, l'interface dit que le changement
+    /// prend effet au prochain lancement.
+    pub joignable_session: bool,
     /// Etat de l'ouverture du port dans la box, en clair, quand ce noeud tente
     /// de s'ouvrir. Absent (ou vide) : pas de tentative — nœud client, ou
     /// portier a adresse directe. Rempli par le fil dedie.
@@ -459,7 +466,8 @@ impl RpcContext {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
-            joignable: true,
+            joignable: std::sync::atomic::AtomicBool::new(true),
+            joignable_session: true,
             etat_box: None,
             definir_joignable: None,
         }
@@ -921,7 +929,11 @@ impl RpcContext {
             // On ne pretend jamais « joignable » — on ne peut pas le prouver
             // d'ici. On rend le reglage voulu, et le texte exact de ce que la
             // box a repondu.
-            .set("joignable", Json::Bool(self.joignable))
+            .set(
+                "joignable",
+                Json::Bool(self.joignable.load(std::sync::atomic::Ordering::SeqCst)),
+            )
+            .set("joignable_session", Json::Bool(self.joignable_session))
             .set(
                 "ouverture_box",
                 match &self.etat_box {
@@ -2604,8 +2616,14 @@ impl RpcContext {
             .as_ref()
             .ok_or_else(|| erreur(ERR_INTERNE, "ce noeud ne sait pas ou ecrire ce reglage"))?;
         definir(vers).map_err(|e| erreur(ERR_INTERNE, &format!("reglage non enregistre : {e}")))?;
+        // Le choix est sur le disque : il devient le choix voulu, que tout
+        // `getinfo` suivant rendra. Sans cela, le rafraichissement de la page
+        // repeignait la valeur du lancement et annulait le clic.
+        self.joignable
+            .store(vers, std::sync::atomic::Ordering::SeqCst);
         Ok(Json::obj()
             .set("joignable", Json::Bool(vers))
+            .set("joignable_session", Json::Bool(self.joignable_session))
             .set("prend_effet", Json::str("au prochain lancement"))
             .build())
     }
@@ -2998,7 +3016,8 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
-            joignable: true,
+            joignable: std::sync::atomic::AtomicBool::new(true),
+            joignable_session: true,
             etat_box: None,
             definir_joignable: None,
             index: None,
@@ -3041,7 +3060,8 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
-            joignable: true,
+            joignable: std::sync::atomic::AtomicBool::new(true),
+            joignable_session: true,
             etat_box: None,
             definir_joignable: None,
             index: None,
@@ -3065,6 +3085,50 @@ mod tests {
             r.encode()
         );
         r.get("result").cloned().expect("champ result")
+    }
+
+    #[test]
+    fn le_choix_joignable_survit_au_rafraichissement() {
+        // Regression v0.2.0 : l'interrupteur « joignable » se remettait tout
+        // seul, parce que `getinfo` rendait la valeur lue au lancement et que
+        // l'onglet Reseau le relit toutes les quatre secondes.
+        let ecrit = Arc::new(Mutex::new(None::<bool>));
+        let temoin = ecrit.clone();
+        let mut c = contexte(true);
+        c.joignable = std::sync::atomic::AtomicBool::new(true);
+        c.joignable_session = true;
+        c.definir_joignable = Some(Arc::new(move |v: bool| {
+            *temoin.lock().unwrap() = Some(v);
+            Ok(())
+        }));
+
+        let r = resultat(&c, "setjoignable", r#"{"actif":false}"#);
+        assert_eq!(r.get("joignable"), Some(&Json::Bool(false)));
+        assert_eq!(
+            *ecrit.lock().unwrap(),
+            Some(false),
+            "le choix doit etre ecrit"
+        );
+
+        // Le rafraichissement suivant doit rendre le choix, pas le lancement.
+        for _ in 0..3 {
+            let info = resultat(&c, "getinfo", "{}");
+            assert_eq!(
+                info.get("joignable"),
+                Some(&Json::Bool(false)),
+                "getinfo a repeint la valeur du lancement"
+            );
+            assert_eq!(
+                info.get("joignable_session"),
+                Some(&Json::Bool(true)),
+                "la session en cours reste celle du lancement"
+            );
+        }
+
+        // Et le retour en arriere est tout aussi stable.
+        resultat(&c, "setjoignable", r#"{"actif":true}"#);
+        let info = resultat(&c, "getinfo", "{}");
+        assert_eq!(info.get("joignable"), Some(&Json::Bool(true)));
     }
 
     #[test]
@@ -3791,7 +3855,8 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
-            joignable: true,
+            joignable: std::sync::atomic::AtomicBool::new(true),
+            joignable_session: true,
             etat_box: None,
             definir_joignable: None,
             index: None,
@@ -4080,7 +4145,8 @@ mod tests {
             sur_changement: None,
             balayages: None,
             amorces_configurees: 0,
-            joignable: true,
+            joignable: std::sync::atomic::AtomicBool::new(true),
+            joignable_session: true,
             etat_box: None,
             definir_joignable: None,
             index: None,
