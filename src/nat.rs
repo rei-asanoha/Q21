@@ -25,10 +25,18 @@
 //!
 //! La box est un appareil du reseau local, et un reseau local peut heberger un
 //! appareil hostile qui se fait passer pour elle. Ce module borne donc chaque
-//! lecture, fixe chaque delai, n'accepte une description que depuis une adresse
-//! privee, et ne tient une adresse externe pour bonne que si elle est publique.
-//! Une adresse privee ou de CGNAT rendue par la box signifie une seconde box
-//! devant elle : le port est ouvert pour rien, et on ne l'annonce pas.
+//! lecture, fixe chaque delai, et ne tient une adresse externe pour bonne que
+//! si elle est publique. Une adresse privee ou de CGNAT rendue par la box
+//! signifie une seconde box devant elle : le port est ouvert pour rien, et on
+//! ne l'annonce pas.
+//!
+//! Surtout, il ne parle qu'a **la** box, jamais a un tiers qu'une reponse lui
+//! designerait : la reponse SSDP doit designer l'appareil qui l'a emise ; la
+//! description doit venir de la passerelle par defaut quand le systeme la
+//! connait ; et l'URL de controle lue dans la description doit designer ce
+//! meme appareil. Un appareil qui gagnerait la course des reponses ne peut
+//! donc ni nous faire emettre une requete vers une machine de son choix, ni
+//! — quand la passerelle est connue — nous dicter une adresse externe.
 //!
 //! # Ce que ce module ne garantit pas
 //!
@@ -227,15 +235,28 @@ pub fn ip_locale() -> Option<Ipv4Addr> {
 
 /// Les adresses ou la box est probablement, dans l'ordre d'essai.
 ///
-/// Sous Linux, la route par defaut du noyau donne la reponse exacte. Ailleurs,
-/// et en repli, on tente les conventions des box grand public : le `.1` et le
-/// `.254` du reseau local. NAT-PMP ne repond qu'a la bonne adresse, une
-/// mauvaise ne coute qu'un delai court.
+/// Sous Linux, la route par defaut du noyau donne la reponse exacte, et on
+/// s'y tient. Ailleurs, on tente les conventions des box grand public : le
+/// `.1` et le `.254` du reseau local. NAT-PMP ne repond qu'a la bonne
+/// adresse, une mauvaise ne coute qu'un delai court.
 pub fn passerelles_candidates(ip_locale: Option<Ipv4Addr>) -> Vec<Ipv4Addr> {
-    let mut v: Vec<Ipv4Addr> = Vec::new();
-    if let Some(gw) = passerelle_systeme() {
-        v.push(gw);
+    candidates_depuis(passerelle_systeme(), ip_locale)
+}
+
+/// Le choix des candidates, la passerelle du systeme etant donnee.
+///
+/// # Le defaut que ceci ferme
+///
+/// Quand la passerelle etait connue, on lui ajoutait quand meme les
+/// conventions `.1` et `.254`. Si la vraie box ne repond pas a NAT-PMP, on
+/// passait donc a ces adresses devinees — ou un appareil hostile du reseau
+/// local peut s'installer et se faire passer pour la box. La passerelle par
+/// defaut *est* la box : quand on la connait, on ne parle qu'a elle.
+fn candidates_depuis(passerelle: Option<Ipv4Addr>, ip_locale: Option<Ipv4Addr>) -> Vec<Ipv4Addr> {
+    if let Some(gw) = passerelle {
+        return vec![gw];
     }
+    let mut v: Vec<Ipv4Addr> = Vec::new();
     if let Some(ip) = ip_locale {
         let o = ip.octets();
         for dernier in [1u8, 254] {
@@ -425,9 +446,26 @@ fn upnp_ouvrir(port: u16) -> Result<Ouverture, String> {
     if adresse_publique(ip_desc) {
         return Err("la description UPnP vient d'une adresse publique : refuse".into());
     }
+    // La box *est* la passerelle par defaut. Quand le systeme la connait, la
+    // description doit venir d'elle : un autre appareil du reseau local, meme
+    // prive, meme premier a repondre, n'est pas la box.
+    if let Some(gw) = passerelle_systeme() {
+        if ip_desc != gw {
+            return Err(format!(
+                "la description UPnP vient de {ip_desc}, qui n'est pas la passerelle {gw} : refuse"
+            ));
+        }
+    }
     let corps = http_get(&location)?;
     let (controle, service) = upnp_extraire_controle(&corps, &location)
         .ok_or("service WANIPConnection introuvable dans la description")?;
+    // L'URL de controle sort du XML, donc de l'appareil lui-meme : elle doit
+    // designer ce meme appareil. Une description qui nous envoie parler a un
+    // tiers — boucle locale, autre machine, hote public — n'est pas une box,
+    // et l'on ne fait pas sortir de requete vers ce tiers.
+    if !url_designe(&controle, ip_desc) {
+        return Err("l'URL de controle UPnP ne designe pas la box : refuse".into());
+    }
 
     // Certaines box n'acceptent que des baux permanents (erreur 725) : on
     // retombe alors sur zero.
@@ -486,19 +524,55 @@ fn ssdp_decouvrir() -> Option<String> {
     }
     let mut buf = [0u8; 2048];
     // Plusieurs appareils peuvent repondre : on prend la premiere reponse qui
-    // porte un LOCATION, sans attendre les autres au-dela du delai.
+    // porte un LOCATION designant son propre emetteur, sans attendre les
+    // autres au-dela du delai.
     for _ in 0..8 {
         match s.recv_from(&mut buf) {
-            Ok((n, _)) => {
+            Ok((n, source)) => {
                 let texte = String::from_utf8_lossy(&buf[..n]);
                 if let Some(loc) = ssdp_extraire_location(&texte) {
-                    return Some(loc);
+                    // Une reponse dont le LOCATION renvoie ailleurs que chez
+                    // son emetteur est une redirection, pas une box : on
+                    // l'ignore et on attend la suivante.
+                    if location_vient_de(&loc, &source) {
+                        return Some(loc);
+                    }
                 }
             }
             Err(_) => break,
         }
     }
     None
+}
+
+/// Le `LOCATION` d'une reponse SSDP designe-t-il l'appareil qui l'a emise,
+/// lui-meme sur le reseau local ?
+///
+/// # Le defaut que ceci ferme
+///
+/// L'expediteur de la reponse n'etait pas regarde : n'importe quel appareil
+/// du reseau local pouvait repondre le premier et nous envoyer chercher la
+/// description chez un tiers. Lier la description a son emetteur retire ce
+/// levier : pour se faire passer pour la box, il faut au moins etre
+/// l'appareil que l'on designe.
+fn location_vient_de(location: &str, source: &std::net::SocketAddr) -> bool {
+    let src = match source {
+        std::net::SocketAddr::V4(a) => *a.ip(),
+        std::net::SocketAddr::V6(_) => return false,
+    };
+    let ip = match decouper_url(location).and_then(|(h, _, _)| h.parse::<Ipv4Addr>().ok()) {
+        Some(ip) => ip,
+        None => return false,
+    };
+    ip == src && !adresse_publique(ip)
+}
+
+/// L'URL designe-t-elle exactement cette adresse ?
+fn url_designe(url: &str, ip: Ipv4Addr) -> bool {
+    decouper_url(url)
+        .and_then(|(h, _, _)| h.parse::<Ipv4Addr>().ok())
+        .map(|h| h == ip)
+        .unwrap_or(false)
 }
 
 /// L'en-tete `LOCATION` d'une reponse SSDP, insensible a la casse du nom.
@@ -738,10 +812,74 @@ mod tests {
     }
 
     #[test]
-    fn les_candidates_couvrent_1_et_254_du_reseau_local() {
-        let c = passerelles_candidates(Some(Ipv4Addr::new(192, 168, 1, 50)));
+    fn sans_passerelle_connue_les_candidates_couvrent_1_et_254() {
+        let c = candidates_depuis(None, Some(Ipv4Addr::new(192, 168, 1, 50)));
         assert!(c.contains(&Ipv4Addr::new(192, 168, 1, 1)));
         assert!(c.contains(&Ipv4Addr::new(192, 168, 1, 254)));
+    }
+
+    /// Quand la passerelle est connue, on ne devine plus d'autres adresses :
+    /// un appareil hostile installe en `.254` ne serait jamais interroge.
+    #[test]
+    fn avec_passerelle_connue_on_ne_parle_qu_a_elle() {
+        let gw = Ipv4Addr::new(192, 168, 1, 1);
+        let c = candidates_depuis(Some(gw), Some(Ipv4Addr::new(192, 168, 1, 50)));
+        assert_eq!(c, vec![gw]);
+    }
+
+    /// Une reponse SSDP n'est retenue que si son LOCATION designe l'appareil
+    /// qui l'a emise, sur le reseau local.
+    #[test]
+    fn le_location_ssdp_doit_designer_son_emetteur() {
+        let box_ = std::net::SocketAddr::from(([192, 168, 1, 1], 1900));
+        assert!(location_vient_de("http://192.168.1.1:5000/desc.xml", &box_));
+        // Redirection vers un tiers du reseau local : refusee.
+        assert!(!location_vient_de(
+            "http://192.168.1.77:5000/desc.xml",
+            &box_
+        ));
+        // Redirection vers la boucle locale ou un hote public : refusee.
+        assert!(!location_vient_de("http://127.0.0.1:21080/desc.xml", &box_));
+        assert!(!location_vient_de("http://203.0.113.9/desc.xml", &box_));
+        // Un emetteur qui se designe lui-meme mais avec une adresse publique
+        // n'est pas une box du reseau local.
+        let public = std::net::SocketAddr::from(([203, 0, 113, 9], 1900));
+        assert!(!location_vient_de("http://203.0.113.9/desc.xml", &public));
+    }
+
+    /// L'URL de controle lue dans la description doit designer la box, et
+    /// rien d'autre.
+    ///
+    /// # Le defaut que cette epreuve fige
+    ///
+    /// Un audit a montre qu'une description hostile pouvait pointer son
+    /// `controlURL` vers la boucle locale ou un hote public : le noeud y
+    /// envoyait alors ses requetes SOAP, et annoncait l'adresse externe que
+    /// ce tiers lui rendait. Le controle d'adresse ne portait que sur l'URL
+    /// de description, jamais sur celle de controle.
+    #[test]
+    fn l_url_de_controle_doit_designer_la_box() {
+        let box_ = Ipv4Addr::new(192, 168, 1, 1);
+        for cible in [
+            "http://127.0.0.1:21080/ctl", // vers un service local
+            "http://203.0.113.9:80/ctl",  // vers un hote public
+            "http://192.168.1.77:80/ctl", // vers un voisin du reseau local
+        ] {
+            let xml = format!(
+                "<root><device><serviceList><service>\
+                 <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
+                 <controlURL>{cible}</controlURL></service></serviceList></device></root>"
+            );
+            let (url, _) =
+                upnp_extraire_controle(&xml, "http://192.168.1.1:5000/desc.xml").unwrap();
+            assert!(!url_designe(&url, box_), "{cible} devrait etre refusee");
+        }
+        // La vraie box, en URL relative resolue contre l'origine : acceptee.
+        let xml = "<root><device><serviceList><service>\
+            <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>\
+            <controlURL>/ctl/IPConn</controlURL></service></serviceList></device></root>";
+        let (url, _) = upnp_extraire_controle(xml, "http://192.168.1.1:5000/desc.xml").unwrap();
+        assert!(url_designe(&url, box_));
     }
 
     #[test]
