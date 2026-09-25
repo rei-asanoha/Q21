@@ -443,11 +443,33 @@ fn chaine_mempool(n: u32, m: &mut Mempool, base: u32) -> Hash256 {
 ///
 /// On ne le prouve pas par une horloge absolue — une machine d'integration lente
 /// rendrait tout plafond fixe soit laxiste soit instable — mais par un RAPPORT,
-/// insensible a la vitesse de la machine. Retirer une chaine huit fois plus
-/// longue doit couter de l'ordre de huit fois plus (lineaire), pas soixante-
-/// quatre fois plus (quadratique). Le retour au balayage `Vec::contains`
-/// depasserait franchement le plafond du rapport ; le comportement lineaire
-/// tient tres au large, sur n'importe quel runner.
+/// insensible a la vitesse de la machine. Retirer une chaine quatre fois plus
+/// longue doit couter de l'ordre de quatre fois plus (lineaire), pas seize fois
+/// plus (quadratique). Le retour au balayage `Vec::contains` depasserait
+/// franchement le plafond du rapport.
+///
+/// # Le piege que ceci ferme
+///
+/// Un rapport n'est insensible a la machine que si les deux mesures vivent dans
+/// le meme regime memoire. Chaque maillon porte une signature ML-DSA-87, soit
+/// pres de 7 Kio : une chaine de 2 400 maillons pese une quinzaine de Mio et
+/// deborde le cache de dernier niveau d'un vieux processeur d'integration, la ou
+/// 600 maillons y tiennent. Sur un tel runner, le grand retrait basculait en
+/// acces memoire lents et coutait vingt-quatre fois le petit — plus qu'un
+/// quadratique — alors que l'algorithme, lineaire, passait partout ailleurs.
+/// Le test mesurait la hierarchie memoire, pas la complexite. Les deux tailles
+/// restent donc sous cette falaise (600 est prouve rapide sur le runner le plus
+/// lent) : le rapport ne peut plus echouer a tort.
+///
+/// # Ce que ce chronometre ne prouve pas
+///
+/// Le cout du balayage `Vec::contains` — des comparaisons de 32 octets, en
+/// cache — reste petit devant le cout lineaire de chaque retrait (une
+/// transaction de pres de 7 Kio a liberer) tant que la chaine tient en cache.
+/// A ces tailles, un retour au balayage ne ferait grimper le rapport qu'a
+/// quatre ou cinq : sous le plafond. Ce chronometre est donc un garde-fou
+/// contre une degradation grossiere, pas une preuve de linearite. La preuve,
+/// deterministe, est `t06b` : la propriete se lit a sa source.
 #[test]
 fn t06_le_retrait_en_paquet_est_lineaire() {
     println!("--- t06 : cout de remove() sur une chaine ---");
@@ -459,7 +481,7 @@ fn t06_le_retrait_en_paquet_est_lineaire() {
     // defaut.
     let mesure = |n: u32, prendre_min: bool| -> std::time::Duration {
         let mut best: Option<std::time::Duration> = None;
-        for _ in 0..3 {
+        for _ in 0..5 {
             let mut m = Mempool::new();
             let racine = chaine_mempool(n, &mut m, 1_000_000 + n * 10);
             assert_eq!(m.len(), n as usize);
@@ -478,10 +500,13 @@ fn t06_le_retrait_en_paquet_est_lineaire() {
         d
     };
 
-    const PETIT: u32 = 600;
-    const GRAND: u32 = 2_400; // quatre fois plus long
-    let t_petit = mesure(PETIT, false); // le plus lent des trois
-    let t_grand = mesure(GRAND, true); // le plus rapide des trois
+    // Les deux tailles tiennent dans le cache de dernier niveau de n'importe quel
+    // runner (voir le piege ci-dessus) : le rapport ne mesure alors que
+    // l'algorithme.
+    const PETIT: u32 = 150;
+    const GRAND: u32 = 600; // quatre fois plus long
+    let t_petit = mesure(PETIT, false); // le plus lent des cinq
+    let t_grand = mesure(GRAND, true); // le plus rapide des cinq
 
     // Rapport attendu : ~4 (lineaire). Un plafond de 12 laisse une marge franche
     // pour le bruit et le cout fixe des petites tailles, tout en restant tres en
@@ -498,6 +523,33 @@ fn t06_le_retrait_en_paquet_est_lineaire() {
         "  rapport {GRAND}/{PETIT} = {facteur:.1}x (lineaire ~4x) ; le plafond de \
          64 Mio limite la chaine a ~{} maillons",
         MEMPOOL_MAX_BYTES / 5_400
+    );
+}
+
+/// Le retrait teste l'appartenance dans un ensemble, jamais par balayage.
+///
+/// C'est la propriete que `t06` voudrait prouver et ne peut pas : un
+/// chronometre confond l'algorithme avec la hierarchie memoire des qu'une
+/// chaine deborde le cache, et ne voit pas le balayage tant qu'elle y tient
+/// (voir `t06`). La linearite du retrait tient a une seule decision — la
+/// descendance se parcourt avec un ensemble — et cette decision se lit a sa
+/// source. On la fige la, de facon deterministe, sur n'importe quelle machine.
+#[test]
+fn t06b_le_retrait_teste_l_appartenance_dans_un_ensemble() {
+    let source = include_str!("../src/mempool.rs");
+    let debut = source
+        .find("pub fn remove(")
+        .expect("Mempool::remove introuvable dans la source");
+    let corps = &source[debut..];
+    let fin = corps.find("fn retirer_un(").unwrap_or(corps.len());
+    let corps = &corps[..fin];
+    assert!(
+        corps.contains("HashSet<Hash256>"),
+        "la descendance ne se parcourt plus avec un ensemble"
+    );
+    assert!(
+        !corps.contains("a_retirer.contains(") && !corps.contains(".contains(&c)"),
+        "le retrait est revenu au balayage Vec::contains : quadratique"
     );
 }
 
