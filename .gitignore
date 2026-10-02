@@ -1,0 +1,23 @@
+# Build products
+/target/
+**/*.rs.bk
+
+# Node and wallet data — never in a repository.
+#
+# `wallet.dat` holds the seed. Even encrypted, it has no business in a public
+# history: encryption gets broken over time, and a repository never forgets.
+*.dat
+*.seq
+*.key
+/wallet/
+/alice/
+/bob/
+/regtest/
+/testnet/
+
+# Working archives
+*.tar.gz
+*.zip
+
+# Local node data
+/q21-data/

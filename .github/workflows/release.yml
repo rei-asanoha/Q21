@@ -1,0 +1,568 @@
+# Release: builds the wallet for macOS, Windows and Linux.
+#
+# Triggered by a version tag (`v0.2.0`, for example) or on demand. Each
+# platform builds on its own machine: nothing is cross-compiled, so nothing
+# is assumed.
+#
+# # What these files are not
+#
+# They are **neither signed nor notarized**. macOS will display "cannot be
+# opened, the developer cannot be verified", and Windows will display a
+# SmartScreen warning. This is the normal behavior for software without a
+# publisher certificate, and getting around it requires a paid Apple
+# Developer account and an Authenticode certificate. Until that is done, the
+# steps to follow are documented in the file attached to each release.
+#
+# Software that holds private keys should not be installed without
+# verification. Three things make it possible:
+#
+# - the SHA-256 hash of each file, published with it;
+# - a **provenance attestation** signed by GitHub, which ties each archive
+#   to the commit and the run that produced it. It is verified with
+#   `gh attestation verify <archive> --repo <owner>/<repo>`. GitHub only
+#   offers it to public repositories: on a private repository, the step is
+#   skipped;
+# - a `minisign` signature of the `SHA256SUMS` file, made with the
+#   `MINISIGN_KEY` key of the `release` environment, verifiable offline with
+#   the public key published in the README. Without that key, the release
+#   fails: an unsigned release is not a release.
+#
+# The toolchain is the one in `rust-toolchain.toml`: two builds of the same
+# commit produce the same binary.
+
+name: Release
+
+# Three ways to trigger it:
+#
+# - `workflow_dispatch`: a "Run workflow" button in the Actions tab.
+#   It is the simplest, and the one to use the first time.
+# - a pushed version tag (`v0.1.0`);
+# - a release published from the website.
+#
+# The last two also publish a downloadable release page; the first one only
+# drops the files on the run's page.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary: q21
+            archive: q21-macos-arm64.tar.gz
+          - name: macOS (Intel)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            binary: q21
+            archive: q21-macos-x86_64.tar.gz
+          - name: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: q21.exe
+            archive: q21-windows-x86_64.zip
+          - name: Linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: q21
+            archive: q21-linux-x86_64.tar.gz
+          # 64-bit ARM Linux: Raspberry Pi 5, Ampere machines, Hetzner CAX
+          # servers. Built on an ARM machine and not cross-compiled, like the
+          # other four, so the tests run on the architecture they check.
+          # These machines have been available since August 2025 for public
+          # repositories, January 2026 for the others.
+          - name: Linux (ARM 64)
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: q21
+            archive: q21-linux-arm64.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag that does not match the program version publishes a binary
+      # that presents itself under a different name than its release: `q21
+      # version` would answer 0.1.0 in an archive named v0.1.1, and the
+      # signature's trusted comment would say something else again. That is
+      # exactly the confusion the `version` command exists to clear up. The
+      # check comes before everything else: failing in ten seconds is better
+      # than failing after fifteen minutes of compiling.
+      - name: The tag and the program version agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag v$TAG, but Cargo.toml says $VERSION: the released binary would not report the version it is published under. Make them agree in the same commit, then tag again."
+            exit 1
+          fi
+          echo "tag v$TAG = version $VERSION"
+
+      # `rustup` directly, without a third-party action on a moving branch:
+      # see ci.yml.
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup default 1.95.0
+          rustup target add ${{ matrix.target }} --toolchain 1.95.0
+          rustc --version
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # We do not release a binary whose tests have not passed on this
+      # platform. A wallet that loses funds on Windows only is a wallet that
+      # loses funds.
+      # Without a `--test` argument: every test in the repository, including
+      # those added after this file was written. The list that used to be
+      # here had left five test files out of CI.
+      - name: Tests
+        run: cargo test --locked --features mldsa,audit
+
+      # Reproducible build. The path remapping removes from the binary the
+      # directory it was built in (here `/home/runner/work/<repo>/<repo>`),
+      # which carries the name of the repository owner and must not end up
+      # in a published file. Above all, it makes the binary identical
+      # whatever the directory: a third party who rebuilds this commit at
+      # home gets the same SHA-256 hash and has no one to trust.
+      #
+      # `trim-paths` would do this in `Cargo.toml`, but it is not stabilized
+      # in Cargo 1.95.0 (see the comment on the `release` profile).
+      #
+      # The same command by hand: `./tools/build-reproducible.sh`.
+      # See REPRODUCING.md.
+      #
+      # Windows needs a detour: rustc receives backslash paths there
+      # (`D:\a\repo\repo`), while `pwd` under git bash returns
+      # `/d/a/repo/repo`. We pass both forms: the flag can be repeated, and a
+      # form that matches nothing costs nothing.
+      - name: Reproducible build
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ROOT=$(pwd -W)                                    # D:/a/repo/repo
+            ROOT_BACKSLASH=$(printf '%s' "$ROOT" | tr '/' '\\')  # D:\a\repo\repo
+            FLAGS="--remap-path-prefix=$ROOT_BACKSLASH=/q21 --remap-path-prefix=$ROOT=/q21"
+          else
+            ROOT=$(pwd -P)
+            FLAGS="--remap-path-prefix=$ROOT=/q21"
+          fi
+          echo "remapping: $FLAGS"
+          RUSTFLAGS="$FLAGS" \
+            cargo build --locked --release --features mldsa --target ${{ matrix.target }}
+
+      # A released binary must no longer contain the path of the machine that
+      # built it. If the remapping failed silently (a `RUSTFLAGS` set
+      # elsewhere, a non-canonical path, an unexpected separator form), we
+      # see it here and the release stops, instead of publishing a file that
+      # no one will be able to reproduce.
+      #
+      # `grep -a` treats the binary as text; it is available on all three
+      # systems, unlike `strings` on Windows.
+      - name: No build path in the binary
+        shell: bash
+        run: |
+          set -eu
+          BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          FAILED=0
+          for PATH_FORM in "$(pwd -P)" "$(pwd)"; do
+            [ -n "$PATH_FORM" ] || continue
+            if grep -a -c -F -- "$PATH_FORM" "$BIN" >/dev/null 2>&1; then
+              echo "::error::the path \"$PATH_FORM\" is written in $BIN; the remapping did not take"
+              FAILED=1
+            fi
+          done
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            PATH_FORM=$(pwd -W | tr '/' '\\')
+            if grep -a -c -F -- "$PATH_FORM" "$BIN" >/dev/null 2>&1; then
+              echo "::error::the path \"$PATH_FORM\" is written in $BIN; the remapping did not take"
+              FAILED=1
+            fi
+          fi
+          [ "$FAILED" -eq 0 ] || exit 1
+          echo "no build path in $BIN"
+
+      - name: Assemble
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/
+          # REPRODUCING.md travels with the binary: the instructions for
+          # verifying a file are useless if they stay on a web page that the
+          # person downloading it will not visit.
+          cp README.md JOIN.md WHITEPAPER.md AUDIT.md WALLET.md REPRODUCING.md SUCCESSION.md dist/ 2>/dev/null || true
+          # The double-click launcher, specific to each system. Without it,
+          # the user has to open a command window and type `wallet`, which no
+          # desktop application asks for.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "Q21 Wallet.bat" dist/
+          else
+            cp "Q21 Wallet.command" dist/
+            chmod +x "dist/Q21 Wallet.command"
+          fi
+          # The entry point, shipped already filled in.
+          #
+          # The binary stays without an address; that is the rule, and it
+          # does not change: an address hard-coded into a distributed program
+          # would become a permanent dependency on whoever holds it. But the
+          # file that carries it travels filled in. Without it, every freshly
+          # unpacked archive is blind, and the newcomer reads "no reachable
+          # computer" without knowing that nothing is broken: they conclude
+          # the network is dead and do not come back. The file is plain text,
+          # commented, and belongs to them as soon as they have it.
+          # Two copies, on purpose.
+          #
+          # Flat next to the binary: a plain file goes through tar, 7z and
+          # zip unconditionally. This is the one we rely on.
+          #
+          # In q21-data: this is the file the guides describe, the one the
+          # user edits, and it takes precedence over the other. It lives in a
+          # subfolder, and that is precisely what a packaging tool can lose.
+          # Together, the two make sure that losing one leaves no one blind.
+          cp default-bootstrap.txt dist/bootstrap.txt
+          mkdir -p dist/q21-data
+          cp default-bootstrap.txt dist/q21-data/bootstrap.txt
+          cd dist
+          # Explicit `-r` on 7z: how `./*` behaves with a subfolder depends on
+          # the version and on the shell that expands the pattern. `q21-data/`
+          # is precisely a subfolder, and a Windows archive that had lost it
+          # started out blind again, with nothing to signal it, since the tar
+          # archives did carry it.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -r "../${{ matrix.archive }}" ./*
+          else
+            tar czf "../${{ matrix.archive }}" ./*
+          fi
+
+      # --- Does the archive really contain what we think we put in it?
+      #
+      # Assembling and packing are two steps, and the second can lose what
+      # the first put in place: an archiving tool differs from one platform
+      # to another, and a missing subfolder makes nothing fail. It happened:
+      # the bootstrap file was indeed copied into `dist/`, and the Windows
+      # archive shipped without it. The defect only showed up on a user's
+      # machine, several versions later.
+      #
+      # So we open the archive that was **produced** and check its listing.
+      # Anything missing stops the release, instead of being discovered by
+      # the person who downloads it.
+      - name: The archive carries everything it should
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            LISTING=$(7z l -ba -slt "${{ matrix.archive }}" | sed -n 's/^Path = //p')
+          else
+            LISTING=$(tar tzf "${{ matrix.archive }}")
+          fi
+          echo "--- contents of ${{ matrix.archive }} ---"
+          printf '%s\n' "$LISTING"
+          echo "---"
+          MISSING=0
+          for EXPECTED in "${{ matrix.binary }}" "q21-data" "bootstrap.txt" "JOIN.md" "README.md"; do
+            if ! printf '%s\n' "$LISTING" | grep -q -- "$EXPECTED"; then
+              echo "::error::$EXPECTED is missing from ${{ matrix.archive }}"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+          echo "archive complete."
+
+      # Two hashes, and they do not serve the same purpose.
+      #
+      # The one for the **archive** is for transport: you did receive what
+      # was uploaded here. It is NOT reproducible, and cannot be as things
+      # stand: a tar or zip archive records, for each file, a modification
+      # date, an owner and permissions, which depend on the machine and the
+      # moment. Two runs give two different archives even when the binary
+      # inside is identical.
+      #
+      # The one for the **binary** is for verification by rebuilding: it is
+      # this one, and only this one, that a third party gets again by
+      # compiling the same sources (REPRODUCING.md). Without this line, there
+      # was nothing to compare: the only published hash was the archive's,
+      # incomparable by construction, and all of the reproducibility remained
+      # unverifiable from the outside.
+      - name: SHA-256 hashes — the archive and the binary
+        shell: bash
+        run: |
+          set -eu
+          checksum() {
+            if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
+            else shasum -a 256 "$1" | cut -d' ' -f1; fi
+          }
+          ARCHIVE="${{ matrix.archive }}"
+          # `q21-linux-x86_64.tar.gz` -> `q21-linux-x86_64`: the name under
+          # which this platform's binary is attested.
+          NAME="${ARCHIVE%%.*}"
+          BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+          printf '%s  %s\n' "$(checksum "$ARCHIVE")" "$ARCHIVE" > "$ARCHIVE.sha256"
+          printf '%s  %s\n' "$(checksum "$BIN")"     "$NAME"    > "$NAME.bin.sha256"
+
+          echo "--- archive (transport) ---"; cat "$ARCHIVE.sha256"
+          echo "--- binary (to reproduce) ---"; cat "$NAME.bin.sha256"
+
+      # The attestation ties the archive to this commit and this run, signed
+      # by GitHub. Anyone who verifies it knows that the file was built here,
+      # from these sources, and not uploaded by hand.
+      #
+      # GitHub does not offer it to private repositories of a personal
+      # account: it therefore only runs if the repository is public, and
+      # never blocks the release; the hash and the signature are there in
+      # every case.
+      - name: Build provenance attestation
+        if: ${{ !github.event.repository.private }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ matrix.archive }}
+
+      - name: Upload the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+            *.bin.sha256
+
+  # Signing happens on **every** release, not only on a version tag: the
+  # release started by hand is the one installed on the server and the
+  # machines, and it is the one that must be signed. Without a key, the job
+  # fails: an unsigned release is not a release.
+  #
+  # # Where the key can sign from
+  #
+  # A repository secret is readable by any run started from the repository,
+  # on any branch: whoever pushes a branch and clicks "Run workflow" gets
+  # whatever they want signed, or replaces this `run:` with something that
+  # sends the key elsewhere. Two locks close this:
+  #
+  # - the job only runs on `main` or on a `v*` tag; an arbitrary branch does
+  #   not produce a signature;
+  # - both secrets live in the GitHub **environment** `release`, whose
+  #   deployment policy only admits `main` and `v*`, and for which a reviewer
+  #   must approve every run. See SIGNING.md, section 2.
+  #   As long as the environment does not exist, GitHub creates it without
+  #   protection and the repository secrets still work: nothing breaks, but
+  #   nothing protects either; hence the procedure in SIGNING.md.
+  sign:
+    name: Signing
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    environment: release
+    steps:
+      # The repository first, the artifacts second: `checkout` cleans the
+      # working directory, and the reverse order would erase the archives to
+      # sign. We only come for one thing here: the published public key, for
+      # the cross-check that follows the signature.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # A single signed file, two kinds of lines, separated and labeled.
+      #
+      # The archives answer "did I receive what was uploaded". The binaries
+      # answer "does this file really come from these sources": they are what
+      # a third party reproduces, and the only thing they can compare. Mixing
+      # them without saying so would lead someone to compare the hash of
+      # their rebuilt binary with that of an archive, find no match, and
+      # conclude there was tampering.
+      - name: SHA256SUMS
+        shell: bash
+        run: |
+          set -eu
+          cd artifacts
+          rm -f SHA256SUMS
+          {
+            echo "# Archives — download integrity. Not reproducible:"
+            echo "# an archive records dates, owners and permissions."
+            sha256sum q21-*.tar.gz q21-*.zip
+            echo "#"
+            echo "# Binaries — to compare after rebuilding (REPRODUCING.md)."
+            echo "# Same commit + same platform + same toolchain = same hash."
+            cat ./*.bin.sha256
+          } > SHA256SUMS
+          cat SHA256SUMS
+
+      # Offline signature. `minisign` fits in one file and requires no
+      # infrastructure; the public key is published in the README and its
+      # fingerprint through a second channel. The hash alone only proves the
+      # integrity of the transport: produced on the same machine as the
+      # archives, it says nothing about who built them. The signature does.
+      - name: Minisign signature
+        shell: bash
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "${MINISIGN_KEY:-}" ]; then
+            echo "::error::no MINISIGN_KEY secret: an unsigned release is not a release. See SIGNING.md."
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          printf '%s\n' "$MINISIGN_KEY" > minisign.key
+          chmod 600 minisign.key
+          printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s minisign.key \
+            -m artifacts/SHA256SUMS -t "Q21 ${GITHUB_REF_NAME} ${GITHUB_SHA} -- Rei Asanoha"
+          rm -f minisign.key
+          cat artifacts/SHA256SUMS.minisig
+
+      # Cross-check: the signature just produced must verify with the public
+      # key **published in the repository**, the one people copy from the
+      # README.
+      #
+      # Without this check, two silent failures get through: a key rotated
+      # in the secrets without the repository following, and a subtly wrong
+      # secret. In both cases the release goes out signed, with a key no one
+      # can verify, and we only find out through a user's complaint.
+      # A red release is better than a release we believe is signed.
+      - name: Cross-check the signature
+        shell: bash
+        run: |
+          set -eu
+          if [ ! -f q21-release.pub ]; then
+            echo "::error::q21-release.pub is missing from the repository: the signature cannot be cross-checked. See SIGNING.md."
+            exit 1
+          fi
+          if ! minisign -Vm artifacts/SHA256SUMS -p q21-release.pub; then
+            echo "::error::the signature does NOT verify with the repository public key. The key in the secrets and the one in the README have diverged: release stopped. See SIGNING.md."
+            exit 1
+          fi
+          echo "Signature verified with the repository public key."
+
+      - name: Upload the signed hashes
+        uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS-signed
+          path: |
+            artifacts/SHA256SUMS
+            artifacts/SHA256SUMS.minisig
+
+  publish:
+    name: Publish
+    needs: sign
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # The signed hashes come from the "Signing" job.
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body: |
+            ## Q21 wallet — public testnet
+
+            | Your computer | Archive to download |
+            |---|---|
+            | Windows | `q21-windows-x86_64.zip` |
+            | Mac with Apple Silicon (M1 and later) | `q21-macos-arm64.tar.gz` |
+            | Mac with Intel | `q21-macos-x86_64.tar.gz` |
+            | Regular Linux PC | `q21-linux-x86_64.tar.gz` |
+            | Raspberry Pi 5, Linux ARM | `q21-linux-arm64.tar.gz` |
+
+            Download the archive for your system, unzip it, then
+            **double-click the launcher**:
+
+            - Windows: `Q21 Wallet.bat`
+            - macOS: `Q21 Wallet.command`
+            - Linux: `./q21 wallet` in a terminal
+
+            The archive already contains `bootstrap.txt`, a plain-text file
+            naming the testnet entry point: there is nothing to type. The
+            program itself contains no server address, by design; the file is
+            yours to edit. `JOIN.md`, included in the archive, covers every
+            step in ten minutes, including how to become an entry point
+            yourself.
+
+            Your browser opens and guides you: create a wallet, or restore
+            yours from its backup code. The interface is available in English,
+            French and Japanese.
+
+            **Write the backup code down on paper.** It is the only way to
+            recover your funds if this disk is lost — and it is enough: on a
+            new machine, that code alone restores the whole wallet, addresses
+            included.
+
+            ### Once inside
+
+            | Tab | What it does |
+            |---|---|
+            | Balance | what is available, what is still maturing |
+            | Mine | turn mining on, see the machine's real hash rate |
+            | Receive | create addresses, copy them |
+            | Network | the network's computing power, measured |
+            | Send | pay someone, with a confirmation screen |
+            | Activity | transaction history |
+
+            The badge in the top-right corner reads **Connected**,
+            **Syncing** or **Offline**. Until it is green, the displayed
+            balance may be incomplete — and the page says so.
+
+            ### These files are not code-signed
+
+            macOS blocks the launcher ("unidentified developer") or offers to
+            move it to the Trash. Don't: open System Settings, Privacy &
+            Security, scroll to the bottom, "Open Anyway". Once is enough: the
+            launcher then removes the quarantine from the rest of the folder
+            itself. Before macOS 15, right-click the launcher and choose
+            "Open".
+
+            Windows shows a SmartScreen warning: "More info", then
+            "Run anyway".
+
+            Code-signing for macOS requires an identity verified by Apple, and
+            for Windows an Authenticode certificate — this project chose to
+            have neither. Three checks remain, from simplest to strongest:
+
+            1. the attached SHA-256 hash (`.sha256`, and `SHA256SUMS` for all
+               archives): you received what was built here;
+            2. the build provenance attestation: `gh attestation verify
+               <archive> --repo <owner>/<repo>` proves the archive came from
+               this run, from this commit;
+            3. the `SHA256SUMS.minisig` signature attached to every release:
+               `minisign -Vm SHA256SUMS -P <public key from the README>`. It
+               is the only one of the three that proves **who** built the
+               archive.
+
+            ### Warning
+
+            Research code. The proof of work has had no external
+            cryptanalysis, and the audit was carried out by its own authors.
+            Do not trust this software with anything of real value.

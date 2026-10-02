@@ -1,0 +1,10 @@
+# Pinned toolchain.
+#
+# Two builds of the same commit, months apart and on two machines, must
+# produce the same binary. Without this pin, "stable" names a different
+# version every six weeks, and the release is no longer reproducible. The
+# version is the one the tests were run with; raising it is a decision, not
+# an accident.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]

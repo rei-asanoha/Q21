@@ -1,0 +1,105 @@
+[package]
+name = "q21-core"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Consensus core of the Q21 protocol — types, emission, hashing, post-quantum addresses"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "q21_core"
+path = "src/lib.rs"
+
+# No mandatory dependency.
+#
+# Consensus code must depend only on what can be audited. Everything here —
+# SHA-256, Bech32m, Merkle, emission — is implemented and tested against
+# official vectors.
+#
+# ML-DSA is the exception and is NOT implemented here: writing your own
+# lattice-based signature scheme is professional malpractice. The `sig` module
+# defines the interface; the real implementation plugs in through the `mldsa`
+# feature once the crates are available:
+#
+#   cargo add ml-dsa            # RustCrypto
+#   cargo build --features mldsa
+# To plug in the real cryptography, on a machine with access to crates.io,
+# uncomment the block below, then:
+#
+#   cargo build  --features mldsa
+#   cargo test   --features mldsa
+#
+# [dependencies]
+# Versions confirmed by actual resolution (cargo tree, 2026-08):
+#   ml-dsa 0.1.1 -> signature 3.0.0, rand_core 0.10.1, crypto-common 0.2.2,
+#                   hybrid-array 0.4.14, digest 0.11.3, shake 0.1.0,
+#                   module-lattice 0.2.3, pkcs8 0.11.0
+# rand_core 0.10 has NO `os_rng` feature (unlike 0.9).
+#
+# `ml-dsa` is pulled in by the `mldsa` feature, which is **on by default**.
+#
+# It was not: the core was meant to have no dependency at all, and a bare
+# `cargo build` gave a binary that could not verify ML-DSA. Yet it is the only
+# scheme allowed on mainnet. Such a binary, facing the real chain, held every
+# block invalid — so it banned its honest peers, two blocks being enough to
+# reach the threshold — and, when replaying an existing directory, cut its own
+# archive as corrupted. The default build must produce a node that works. The
+# dependency-free core stays within reach: `--no-default-features`. The
+# binary then refuses to start on a network it cannot verify (see the
+# signature scheme guard in `src/bin/q21.rs`) instead of getting it wrong.
+#
+# `default-features = false`: we refuse `getrandom` and `pkcs8`. A node only
+# **verifies** signatures. It needs neither randomness nor a key export
+# format, and every dependency less is attack surface less. Signing lives in
+# the wallet, not in consensus.
+#
+# `zeroize`: without it, every signature left in the heap an expanded ML-DSA
+# key (seed, s1, s2, t0, NTT forms — tens of KiB) that nothing erased; the v2
+# audit showed it with `cargo tree`. The crate is vendored.
+#
+# `rand_core`: enables `sign_randomized`, the "hedged" variant of FIPS 204.
+# The randomness comes from `rng.rs`, not from `getrandom` — it is only a
+# trait, and the `rand_core` crate (0.10, no feature) is vendored as well.
+[dependencies]
+ml-dsa = { version = "0.1.1", optional = true, default-features = false, features = ["alloc", "zeroize", "rand_core"] }
+
+# A single function is used from it: `setrlimit`, to forbid core dumps of a
+# process that holds a seed. `libc` is already in the dependency graph
+# (through `getrandom`), vendored like the rest; declaring it here adds
+# nothing to compile. Declaring it by hand with `extern "C"` would mean
+# reproducing the layout of `rlimit`, which differs from one system to
+# another.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = ["mldsa"]
+mldsa = ["dep:ml-dsa"]
+# Exposes a few internal hooks to the audit tests outside the crate. Never
+# enabled in a production build: they manufacture inconsistent state, useful
+# to prove that a barrier holds, dangerous anywhere else.
+audit = []
+
+[profile.release]
+overflow-checks = true   # never silent wraparound in monetary code
+panic = "abort"
+
+# Reproducible build: see `.cargo/config.toml`, `[build] rustflags` section,
+# and REPRODUCING.md. The profile setting `trim-paths` would do the job in one
+# line, but it is not stabilized in Cargo 1.95.0 — the toolchain pinned by
+# `rust-toolchain.toml` refuses it:
+#
+#   feature `trim-paths` is required ... not stabilized in this version
+#
+# So we use `--remap-path-prefix`, which has been stable since 2018.
+
+# The memory-hard proof of work computes 33 hashes per attempt. Unoptimized, a
+# test that mines two hundred blocks takes minutes for bad reasons. Overflow
+# checks stay on: this is monetary code.
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[profile.dev]
+opt-level = 1
+overflow-checks = true

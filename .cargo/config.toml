@@ -1,0 +1,18 @@
+# Vendored sources.
+#
+# The build does not reach index.crates.io. The sources of `ml-dsa` and of its
+# transitive dependencies were brought in by `cargo vendor` from a connected
+# machine.
+#
+# What cargo checks on every build: that each file has the checksum recorded
+# in its `.cargo-checksum.json`, and that the `package` field of that file
+# equals `Cargo.lock`. What it does NOT check: that `package` follows from the
+# files — it never recomputes it. A modified source whose checksum map was
+# regenerated therefore passes `--locked` without a word. The real guarantee
+# comes from the `vendor` job of `.github/workflows/ci.yml`, which redoes
+# `cargo vendor` from crates.io and requires byte-for-byte identity.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

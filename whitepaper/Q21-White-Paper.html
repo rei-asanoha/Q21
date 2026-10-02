@@ -1,0 +1,570 @@
+<title>Q21 White Paper</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --ground:#EEF1F2; --paper:#FFFFFF; --ink:#161B1E; --muted:#5A6A6D; --rule:#D3DBDC;
+  --accent:#1E6C68; --accent-ink:#154F4C; --accent-soft:#DCEAE8; --warn:#A6432B; --warn-soft:#F6E5DF;
+  --code:#F1F4F4; --shadow:0 1px 2px rgba(22,27,30,.06), 0 8px 24px rgba(22,27,30,.06);
+  --display:"Newsreader","Liberation Serif","Times New Roman",Georgia,serif;
+  --body:"IBM Plex Sans","Liberation Sans","Helvetica Neue",Arial,sans-serif;
+  --mono:"IBM Plex Mono","DejaVu Sans Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0D1315; --paper:#141C1E; --ink:#E3E9E8; --muted:#94A4A4; --rule:#263436;
+    --accent:#63C1BA; --accent-ink:#8FD6D0; --accent-soft:#163130; --warn:#E28A70; --warn-soft:#3A221B;
+    --code:#1B2527; --shadow:none;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0D1315; --paper:#141C1E; --ink:#E3E9E8; --muted:#94A4A4; --rule:#263436;
+  --accent:#63C1BA; --accent-ink:#8FD6D0; --accent-soft:#163130; --warn:#E28A70; --warn-soft:#3A221B;
+  --code:#1B2527; --shadow:none;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
+a{color:var(--accent-ink);text-decoration-thickness:1px;text-underline-offset:2px}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---- shell ---- */
+.shell{display:grid;grid-template-columns:272px minmax(0,1fr);min-height:100vh}
+.side{position:sticky;top:0;height:100vh;overflow:auto;padding:28px 22px 32px 26px;border-right:1px solid var(--rule);background:var(--ground)}
+.brand{font-family:var(--display);font-size:30px;font-weight:500;letter-spacing:-.01em;line-height:1}
+.brand small{display:block;font-family:var(--body);font-size:11px;font-weight:500;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-top:8px}
+.status{font-size:12.5px;line-height:1.45;color:var(--muted);border-left:2px solid var(--warn);padding-left:10px;margin:22px 0 20px}
+nav ol{list-style:none;margin:0;padding:0;font-size:13.5px}
+nav li{margin:0}
+nav a{display:block;padding:5px 8px;color:var(--ink);text-decoration:none;border-radius:3px;line-height:1.3}
+nav a .n{display:inline-block;width:1.6em;color:var(--muted);font-variant-numeric:tabular-nums}
+nav a:hover{background:var(--paper)}
+nav a.current{background:var(--accent-soft);color:var(--accent-ink)}
+.side .print{margin-top:22px;font-size:12px;color:var(--muted);line-height:1.45}
+
+main{padding:40px 5vw 96px}
+article{max-width:74ch;margin:0 auto;background:var(--paper);padding:56px 64px 72px;box-shadow:var(--shadow);border-radius:4px}
+
+/* ---- typography ---- */
+.cover{border-bottom:1px solid var(--rule);padding-bottom:28px;margin-bottom:36px}
+.cover .kicker{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:500;margin:0 0 18px}
+.cover h1{font-family:var(--display);font-weight:500;font-size:54px;line-height:1.02;letter-spacing:-.015em;margin:0 0 14px;text-wrap:balance}
+.cover .sub{font-family:var(--display);font-style:italic;font-size:23px;line-height:1.3;color:var(--ink);margin:0 0 22px;text-wrap:balance}
+.cover .meta{display:grid;grid-template-columns:repeat(3,auto);gap:6px 28px;font-size:13px;color:var(--muted)}
+.cover .meta b{display:block;color:var(--ink);font-weight:500;font-variant-numeric:tabular-nums}
+.notice{background:var(--warn-soft);border-left:3px solid var(--warn);padding:12px 16px;margin:24px 0;font-size:14.5px;line-height:1.5}
+.notice b{color:var(--warn)}
+h2{font-family:var(--display);font-weight:500;font-size:31px;line-height:1.12;letter-spacing:-.01em;margin:52px 0 14px;text-wrap:balance}
+h2 .n{color:var(--accent);margin-right:.35em;font-variant-numeric:tabular-nums}
+h3{font-family:var(--body);font-weight:600;font-size:16.5px;margin:30px 0 8px;letter-spacing:-.005em}
+p{margin:0 0 14px}
+p.lead{font-family:var(--display);font-size:20px;line-height:1.42;margin-bottom:20px}
+ul,ol{margin:0 0 14px;padding-left:1.3em}
+li{margin:0 0 6px}
+strong{font-weight:600}
+code,kbd{font-family:var(--mono);font-size:.88em;background:var(--code);padding:1px 5px;border-radius:3px}
+pre{font-family:var(--mono);font-size:13px;line-height:1.5;background:var(--code);padding:14px 16px;border-radius:4px;overflow-x:auto;margin:0 0 16px}
+.formula{font-family:var(--mono);font-size:13.5px;background:var(--code);padding:12px 16px;border-radius:4px;margin:12px 0 16px;overflow-x:auto;white-space:nowrap}
+blockquote{margin:18px 0;padding:2px 0 2px 18px;border-left:2px solid var(--accent);font-family:var(--display);font-size:19px;line-height:1.4;font-style:italic}
+.wrap{overflow-x:auto;margin:12px 0 18px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;line-height:1.4;font-variant-numeric:tabular-nums}
+caption{text-align:left;font-size:12.5px;color:var(--muted);padding:0 0 6px;caption-side:top}
+th,td{text-align:left;vertical-align:top;padding:7px 10px 7px 0;border-bottom:1px solid var(--rule)}
+th{font-weight:600;font-size:12.5px;letter-spacing:.02em;color:var(--muted);border-bottom:1.5px solid var(--ink)}
+td.num,th.num{text-align:right;padding-right:14px}
+tr.hi td{color:var(--accent-ink);font-weight:600}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px 28px}
+.figure{margin:18px 0 22px;padding:16px 18px 12px;border:1px solid var(--rule);border-radius:4px;background:var(--paper)}
+.figure .cap{font-size:12.5px;color:var(--muted);margin-top:8px;line-height:1.45}
+canvas{display:block;width:100%;height:auto}
+.readout{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px;font-size:12.5px;color:var(--muted)}
+.readout b{display:block;font-size:15px;color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+input[type=range]{width:100%;accent-color:var(--accent);margin:10px 0 4px}
+.calc{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0 4px}
+.calc label{font-size:13px;color:var(--muted)}
+.calc input[type=number]{font:500 15px var(--mono);padding:6px 10px;border:1px solid var(--rule);border-radius:3px;background:var(--paper);color:var(--ink);width:12em}
+.pill{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:2px;background:var(--accent-soft);color:var(--accent-ink);vertical-align:middle}
+.pill.w{background:var(--warn-soft);color:var(--warn)}
+.close{font-family:var(--display);font-size:22px;line-height:1.35;margin:44px 0 0;padding-top:24px;border-top:1px solid var(--rule);text-wrap:balance}
+.appendix h2{font-size:24px}
+.sign{font-family:var(--display);font-size:15.5px;letter-spacing:.01em;margin:30px 0 0}
+.sign a{display:block;font-family:var(--body,inherit);font-size:12.5px;color:var(--muted);text-decoration:none;border-bottom:1px solid var(--rule);margin-top:5px;width:fit-content}
+.sign span{display:block;font-size:11px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase;margin-top:7px}
+.foot{margin-top:40px;font-size:12.5px;color:var(--muted);line-height:1.5}
+
+@media (max-width: 900px){
+  .shell{grid-template-columns:1fr}
+  .side{position:static;height:auto;border-right:0;border-bottom:1px solid var(--rule);padding:18px 20px}
+  nav{display:none}
+  .side .print{display:none}
+  main{padding:18px 12px 60px}
+  article{padding:30px 22px 44px}
+  .cover h1{font-size:38px}
+  .cover .meta{grid-template-columns:1fr 1fr}
+  .two{grid-template-columns:1fr}
+  .readout{grid-template-columns:1fr 1fr}
+}
+
+/* ---- print: A4, paginated for the 21-page ceiling ---- */
+@page{size:A4;margin:15mm 16mm 17mm 16mm}
+@media print{
+  body{background:#fff;color:#111;font-size:9.6pt;line-height:1.42}
+  :root{--paper:#fff;--ink:#111;--muted:#555;--rule:#c9c9c9;--accent:#1E6C68;--accent-ink:#154F4C;--accent-soft:#e6efee;--warn:#A6432B;--warn-soft:#f4e7e2;--code:#f2f2f2}
+  .side,.print-hide{display:none !important}
+  .shell{display:block}
+  main{padding:0}
+  article{max-width:none;box-shadow:none;border-radius:0;padding:0;background:#fff}
+  .cover{margin-bottom:22px;padding-bottom:16px}
+  .cover .kicker{margin-bottom:10px}
+  .cover h1{font-size:34pt}
+  .cover .sub{font-size:15pt;margin-bottom:14px}
+  .cover .meta{font-size:9pt}
+  h2{font-size:18pt;margin:20pt 0 7pt;break-after:avoid}
+  h3{font-size:10.6pt;margin:12pt 0 4pt;break-after:avoid}
+  p{margin:0 0 7pt;orphans:3;widows:3}
+  p.lead{font-size:12.5pt;margin-bottom:9pt}
+  blockquote{font-size:11.5pt;margin:9pt 0}
+  table{font-size:8.6pt}
+  th,td{padding:3pt 6pt 3pt 0}
+  .wrap{margin:6pt 0 9pt;overflow:visible}
+  table,tr,.figure,.notice,pre{break-inside:avoid}
+  .figure{margin:9pt 0 11pt;padding:8pt 10pt 6pt}
+  .figure canvas{max-height:78mm}
+  .notice{margin:10pt 0;padding:7pt 10pt;font-size:9pt}
+  .formula{font-size:8.6pt;padding:6pt 10pt;margin:6pt 0 9pt}
+  pre{font-size:8.3pt;padding:7pt 10pt}
+  .close{font-size:13pt;margin-top:20pt;padding-top:12pt}
+  .sign{font-size:11pt;margin-top:16pt}
+  .sign span{font-size:7.6pt;margin-top:4pt}
+  .sign a{font-size:8.6pt;margin-top:3pt;border:0}
+  .foot{margin-top:18pt;font-size:8.3pt}
+  .readout{font-size:8.5pt}.readout b{font-size:10pt}
+  input[type=range],.calc{display:none}
+  a{color:inherit;text-decoration:none}
+  .page-break{break-before:page}
+}
+</style>
+
+<div class="shell">
+<aside class="side">
+  <div class="brand">Q21<small>White paper</small></div>
+  <p class="status">Test network · research code · no Q21 has any value.</p>
+  <nav aria-label="Contents"><ol id="toc"></ol></nav>
+  <p class="print">Printing this page (A4) gives the paginated edition, 21 pages at most.</p>
+</aside>
+<main>
+<article>
+<header class="cover">
+  <p class="kicker">White paper · Edition of September 2026 · Protocol version 3</p>
+  <h1>Q21</h1>
+  <p class="sub">A post-quantum, memory-hard proof-of-work currency, minable on the machine you already own.</p>
+  <div class="meta">
+    <div>Absolute cap<b>21,000,001 Q21</b></div>
+    <div>Signatures<b>ML-DSA-87 (FIPS 204)</b></div>
+    <div>Block interval<b>120 s</b></div>
+    <div>Proof of work<b>Two-level memory-hard, 2 → 4 GiB</b></div>
+    <div>Verification memory<b>64 → 128 MiB</b></div>
+    <div>Governance<b>None</b></div>
+  </div>
+</header>
+
+<p class="lead">Q21 is a peer-to-peer electronic currency written from scratch. It keeps the foundations that made Bitcoin work — proof of work, unspent outputs, the heaviest chain, every node validating everything — and corrects three decisions that were right in 2008 and have since become dead ends: signatures that a quantum computer will break, a proof of work that only a silicon foundry can win, and a supply ceiling treated as scripture rather than as a parameter. This document describes the protocol as it runs today on the public test network: every number in it is a constant of the consensus code, and every measurement is labeled as measured or as assumed.</p>
+
+<div class="notice"><b>Status.</b> Q21 is research code running on a test network. It has not been audited by an independent third party, and its proof of work has not received external cryptanalysis. No Q21 has any value, and none will until this paragraph disappears from this document.</div>
+
+<h2 id="s1"><span class="n">1</span>What Q21 is, and for whom</h2>
+
+<h3>1.1 Three debts of 2008</h3>
+<p>Bitcoin solved a problem nobody had solved: agreeing, without an authority, on who owns what. That part holds, and Q21 does not touch it. Three other things are not design flaws but debts of their era — choices that were correct when made and cannot be repaid inside Bitcoin without breaking it.</p>
+<div class="wrap"><table>
+<tr><th>What no longer holds</th><th>Why it cannot be repaired in place</th><th>What Q21 does instead</th></tr>
+<tr><td>ECDSA signatures fall to Shor's algorithm on a sufficiently large quantum computer.</td><td>The address format never anticipated that another signature scheme could exist; changing it means moving every coin.</td><td>The signature scheme is encoded in the address. Today: ML-DSA-87, NIST security level 5.</td></tr>
+<tr><td>Mining moved to dedicated circuits and to the few regions with cheap electricity.</td><td>SHA-256 is exactly what an application-specific chip does best — a factor of about 10⁸ over a processor.</td><td>A proof of work bounded by memory bandwidth, with a table that grows so that fixed hardware ages by itself.</td></tr>
+<tr><td>The 21,000,000 ceiling arrived by trial and became a totem.</td><td>Once sacred, a parameter can no longer be discussed.</td><td>21,000,001. The extra unit says the number is a parameter, not a revelation.</td></tr>
+</table></div>
+
+<h3>1.2 What Q21 keeps</h3>
+<p>A project that claims to reinvent everything reinvents nothing. Q21 keeps <strong>proof of work</strong> as the mechanism of agreement — not proof of stake, which makes the right to decide depend on what one already owns. It keeps the <strong>UTXO model</strong>: coins, not accounts. It keeps the rule that <strong>the most-worked chain wins</strong>. And it keeps the principle that <strong>every node validates everything itself</strong>: a light client asks a server what the chain contains, which means trusting someone in a system built to trust no one.</p>
+
+<h3>1.3 Who it is for</h3>
+<p>Q21 is for people who own an ordinary computer — a laptop with 8 GB of memory, a desktop, a Raspberry Pi — and want to take part in a currency as a peer, not as a customer: to verify it, to mine it without buying special hardware, and to hold it without a custodian. It is for anyone who wants a store of value whose signatures will still be valid after the first cryptographically relevant quantum computer exists. And it is for reviewers and cryptanalysts: the test network is an open invitation to break the design before anything of value depends on it.</p>
+<p>Q21 is <strong>not</strong>, today, a payment network for the general public. Post-quantum signatures are large: a simple transaction weighs about 7,361 bytes, thirty times a Bitcoin transaction, and a full 4 MiB block carries about 569 of them — 4.74 transactions per second. That is the throughput of a settlement layer, where sums worth waiting for are moved, not of a wallet used to buy coffee. Section 6 quantifies this; Section 12 names the three ways out and refuses to choose one prematurely.</p>
+
+<h2 id="s2"><span class="n">2</span>The philosophy, written as rules</h2>
+<p>Q21's founding sentence is carved into its genesis block: <em>one vote per machine, not per silicon foundry</em>. A philosophy that lives only in a preamble is a slogan. Each principle below is paired with the rule of the protocol that embodies it, so that the reader can verify the claim in the code rather than take it on faith.</p>
+<div class="wrap"><table>
+<tr><th style="width:30%">Principle</th><th>How the protocol embodies it</th></tr>
+<tr><td><strong>Minable by everyone, without a farm.</strong></td><td>The proof of work is limited by memory bandwidth, a resource sold on the same market to everyone. A miner needs 2 GiB today and never more than 4 GiB; a machine with 8 GB of RAM suffices for the whole life of the chain (§5).</td></tr>
+<tr><td><strong>Verifiable by anyone, forever.</strong></td><td>Verifying a block requires only the 64 MiB cache (128 MiB at the ceiling). The cost of mining rises with time; the cost of checking almost does not. A Raspberry Pi validates the chain today and will still do so in year ten (§9).</td></tr>
+<tr><td><strong>No owner.</strong></td><td>There is no premine. The single unit above 21,000,000 is minted once in the genesis block to an address whose key nobody has — the all-zero hash, spendable only by a preimage attack on SHA-256. It belongs to no one, least of all the person who launched the chain (§3).</td></tr>
+<tr><td><strong>No governance.</strong></td><td>There is no foundation, no admin key, no checkpoint authority, no signaling mechanism and no upgrade switch. The rules are the code that each node chooses to run. Whoever wants a different rule publishes different code; the network adopts it or does not (§12).</td></tr>
+<tr><td><strong>Totally autonomous.</strong></td><td>Emission, difficulty, the growth of the mining table, the end of the subsidy at block 26,273,578: everything is a pure function of block height and of what the chain has already recorded. Nothing requires a human decision after launch.</td></tr>
+<tr><td><strong>Trust no server.</strong></td><td>Bootstrap nodes decide who you talk to first, not what you believe. A snapshot received from a peer is only accepted against a digest the user supplies. The block explorer is served by your own node, from what your machine has validated, and loads no external resource (§8, §9).</td></tr>
+<tr><td><strong>Belonging to the people, not to a vendor.</strong></td><td>The whole node — consensus, networking, wallet, explorer — is one program with zero mandatory dependencies, compiled by anyone from the public sources, with published checksums. There is nothing to license, nothing to subscribe to, and no service that can be switched off.</td></tr>
+</table></div>
+
+<h2 id="s3"><span class="n">3</span>Money: 21,000,001 and the emission</h2>
+
+<h3>3.1 Units and the cap</h3>
+<p>One Q21 is divisible into 10⁸ units. The absolute supply is <strong>21,000,001 Q21</strong>: one unit minted once in the genesis block, outside the emission schedule, plus <strong>21,000,000 Q21 created exclusively by mining</strong>. The genesis unit has no technical function. It says one thing: a ceiling must be finite, known in advance and verifiable by anyone — it does not have to be sacred. Two invariants are checked at every block: the sum of unspent outputs never exceeds what has been issued, and what has been issued never exceeds the theoretical schedule at that height.</p>
+
+<h3>3.2 The four rules of emission</h3>
+<p>Bitcoin halves its reward at a stroke every four years; every halving is a cliff — a dated economic shock that invites speculation. Q21 decays continuously and is defined by four rules, all in <code>emission.rs</code>, all in integer arithmetic so that the result is reproducible bit for bit on every platform.</p>
+<div class="formula">base(e) = ⌊base(e−1) × 99,715,550 / 100,000,000⌋,  base(0) = 13.82743055 Q21,  e = ⌊height / 4,320⌋</div>
+<ol>
+<li><strong>Continuous decay.</strong> The base reward is multiplied by 0.9971555 every 4,320 blocks (about six days). The cumulative effect is familiar: <strong>the reward halves every 4.01 years</strong> — Bitcoin's rhythm, spread out instead of concentrated on one instant. The factor is stored as an integer fraction, never as a floating-point number.</li>
+<li><strong>A slow start.</strong> Over the first 20,000 blocks (about 28 days) the reward rises linearly from zero. Without this ramp, the handful of miners present in the first week would capture a disproportionate share of the total supply. Block 0 issues nothing by mining; the first full reward, 13.67077204 Q21, is paid at block 20,000.</li>
+<li><strong>A tail floor.</strong> The reward paid per epoch is max(decay, 0.01 Q21). A geometric decay truncated to the integer never reaches its ceiling — on the raw trajectory, 137,899 Q21 would never have been created. The floor bites only the tail: the decay passes below 0.01 Q21 around year 42, when 99.3% of the cap is already out.</li>
+<li><strong>An exact cap.</strong> Cumulative emission is clipped at the cap, and the subsidy of a block is <em>defined</em> as the difference between consecutive cumulative totals. The last issuing block — the 26,273 578th, at 99.91 years — receives the exact remainder of 0.00747908 Q21; after it the subsidy is zero for ever. A test asserts that at that height the total supply is 21,000,001.00000000, not one unit less.</li>
+</ol>
+
+<div class="figure emission">
+  <canvas data-year="4" aria-label="Emission curve: subsidy per block and circulating supply over one hundred years"></canvas>
+  <input type="range" min="0" max="100" value="4" aria-label="Year">
+  <div class="readout"></div>
+  <p class="cap">Figure 1 — Subsidy per block and circulating supply, computed in this page by the same integer formula as the validator (year 0 is shown at the end of the ramp). The dotted line marks the year the 0.01 Q21 floor takes over. Move the slider to read any year.</p>
+</div>
+
+<div class="wrap"><table>
+<caption>Table 1 — The schedule, year by year (from the consensus functions; one year = 365.25 days = 262,980 blocks)</caption>
+<tr><th class="num">Year</th><th class="num">Per block (Q21)</th><th class="num">In circulation (Q21)</th><th class="num">Of the cap</th></tr>
+<tr><td class="num">1</td><td class="num">11.6551</td><td class="num">3,205,422</td><td class="num">15.26%</td></tr>
+<tr><td class="num">2</td><td class="num">9.7961</td><td class="num">6,016,430</td><td class="num">28.65%</td></tr>
+<tr><td class="num">4</td><td class="num">6.9203</td><td class="num">10,367,132</td><td class="num">49.37%</td></tr>
+<tr><td class="num">8</td><td class="num">3.4536</td><td class="num">15,617,136</td><td class="num">74.37%</td></tr>
+<tr><td class="num">15</td><td class="num">1.0263</td><td class="num">19,304,086</td><td class="num">91.92%</td></tr>
+<tr><td class="num">30</td><td class="num">0.0762</td><td class="num">20,746,536</td><td class="num">98.79%</td></tr>
+<tr><td class="num">50</td><td class="num">0.0100</td><td class="num">20,868,755</td><td class="num">99.38%</td></tr>
+<tr class="hi"><td class="num">100</td><td class="num">0</td><td class="num">21,000,001</td><td class="num">100.00%</td></tr>
+</table></div>
+<div class="wrap"><table>
+<caption>Table 2 — Thresholds</caption>
+<tr><th>Milestone</th><th class="num">Block</th><th class="num">Time after genesis</th></tr>
+<tr><td>Half of the cap issued</td><td class="num">1,071,360</td><td class="num">4.1 years</td></tr>
+<tr><td>Three quarters</td><td class="num">2,147,040</td><td class="num">8.2 years</td></tr>
+<tr><td>90%</td><td class="num">3,598,560</td><td class="num">13.7 years</td></tr>
+<tr><td>99%</td><td class="num">8,605,440</td><td class="num">32.7 years</td></tr>
+<tr><td>Decay falls below the 0.01 Q21 floor</td><td class="num">10,968,480</td><td class="num">41.7 years</td></tr>
+<tr class="hi"><td>Cap reached, exactly</td><td class="num">26,273,578</td><td class="num">99.91 years</td></tr>
+</table></div>
+<div class="calc print-hide"><label>Subsidy at height</label><input type="number" min="0" max="30000000" step="1" value="20000" aria-label="Block height"><span class="out"></span></div>
+<p>A newly mined output can be spent only after <strong>200 confirmations</strong> (coinbase maturity), so that a reorganization cannot unwind a reward already passed on.</p>
+
+<h2 id="s4"><span class="n">4</span>Signatures: leaving the prison</h2>
+<p>ECDSA rests on the hardness of the discrete logarithm. Shor's algorithm solves it in polynomial time on a sufficiently large quantum computer. Nobody knows when such a machine will exist; everybody knows that a chain designed to last cannot bet against it. Bitcoin cannot simply "change scheme": its addresses do not say which scheme they belong to, so adding a post-quantum signature requires a chain break and a migration of every coin.</p>
+<p><strong>Q21 encodes the scheme identifier in the address itself.</strong> Adding a scheme is a compatible evolution, never a break. Addresses are Bech32m strings with the prefix <code>q21</code> on the main network, <code>tq21</code> on the test network and <code>rq21</code> in regression mode; the encoder is checked against the published BIP-350 vectors.</p>
+<p>The scheme in use is <strong>ML-DSA-87</strong> — FIPS 204, NIST security level 5, comparable to AES-256, the highest parameter set the standard defines. Its price is real and is paid deliberately.</p>
+<div class="wrap"><table>
+<caption>Table 3 — Sizes</caption>
+<tr><th></th><th class="num">ECDSA (secp256k1)</th><th class="num">ML-DSA-87</th></tr>
+<tr><td>Public key</td><td class="num">33 B</td><td class="num">2,592 B</td></tr>
+<tr><td>Signature</td><td class="num">71 B</td><td class="num">4,627 B</td></tr>
+<tr><td>Resists Shor's algorithm</td><td class="num">no</td><td class="num">yes</td></tr>
+</table></div>
+<p><strong>What a signature commits to.</strong> The signed digest (tag <code>Q21/sighash/2</code>) covers the transaction, the index of the input being signed, the network prefix and the output being spent — its amount and its script. A signature made for the test network is therefore worthless on the main network, and a wallet cannot be tricked into signing for an amount it did not see. The Merkle tree that binds transactions into a block hashes both the transaction identifier and the witness identifier, so that the signatures themselves are committed to by the proof of work.</p>
+<p><strong>What Q21 does not write itself.</strong> The core does not implement ML-DSA. Writing a lattice signature by hand is professional malpractice: side channels, rejection sampling and constant-time arithmetic are exactly where a home-made implementation looks correct, passes every functional test, and leaks the private key. Q21 defines the interface and links a reviewed implementation, vendored in the repository at a pinned version. The seed is 32 bytes, as FIPS 204 prescribes for all three levels; security is chosen through the parameter level, not through the seed length. A Lamport one-time signature exists for test and regression networks only. The reminder stays useful: in 2022, Rainbow, a NIST finalist, fell in a weekend on a laptop, and SIKE fell in an hour on one core, after five years of public review. This is why the scheme is replaceable by construction.</p>
+
+<h2 id="s5"><span class="n">5</span>Proof of work: one vote per machine</h2>
+
+<h3>5.1 The finding that shaped the design</h3>
+<p>A proof of work whose computation is pure is exactly what a dedicated circuit does best. Q21 uses SHA-256 as a hash function — for identifiers, the Merkle tree, addresses — but the proof of work is something else: a walk through a large table in memory, so that the scarce resource is no longer silicon but <strong>memory bandwidth</strong>, which a chip designer buys on the same market as everyone else.</p>
+<p>The first version was wrong, and measurement showed it. Each table element was derived independently, so a miner could recompute elements instead of storing them; on the real 2 GiB table, mining with <em>no memory at all</em> cost only 2.86 times more than mining with the whole table. A circuit whose hash is three times faster than a processor had every reason to carry no memory. The property had been "verified" on a 32 MiB table that fitted in cache and displayed a reassuring 6.46×. <strong>Only the measurement at the true size told the truth</strong>, and that lesson is applied everywhere in this document.</p>
+
+<h3>5.2 The construction: two levels</h3>
+<p>The structure follows Ethash. A <strong>cache</strong> of table/32 — 64 MiB today — is generated as a chain: element <em>i</em> depends on <em>i−1</em>, then the whole is mixed three times, so no fragment can be rebuilt without rebuilding everything before it. The <strong>table</strong> — 2 GiB today — derives each element through 256 dependent random accesses into the cache. Each attempt reads 32 table elements of 32 bytes. Mining without the table no longer saves memory: it multiplies the number of accesses by 256, and therefore the bandwidth.</p>
+<div class="wrap"><table>
+<caption>Table 4 — Relative cost of one attempt as a function of the memory held (measured on the real 2 GiB table)</caption>
+<tr><th>Fraction of the table held</th><th class="num">Memory</th><th class="num">First version</th><th class="num">Current version</th></tr>
+<tr><td>Whole table</td><td class="num">2,048 MiB</td><td class="num">1.00×</td><td class="num">1.00×</td></tr>
+<tr><td>One eighth</td><td class="num">256 MiB</td><td class="num">2.85×</td><td class="num">39.7×</td></tr>
+<tr class="hi"><td>None</td><td class="num">0 MiB</td><td class="num">2.86×</td><td class="num">47.8×</td></tr>
+</table></div>
+<p>The mixing between accesses is full-width: the next index is derived from a 64-bit finaliser over the whole state, and each absorbed element passes through four Feistel rounds. A processor that computes a 32-bit state faster than it reads memory gains nothing, because the state is not 32-bit; the mixing costs about 20 ns against about 100 ns for a random DRAM access, so the walk stays bound by memory.</p>
+
+<h3>5.3 The table grows, so hardware ages</h3>
+<p>The table grows by <strong>5% per epoch</strong> of 51,200 blocks (about 71 days), from 2 GiB (2²⁶ elements) to a ceiling of 4 GiB (2²⁷ elements) reached around the third year. A circuit designed around a fixed quantity of memory becomes mediocre as soon as the table outgrows it: dedicated hardware expires on its own, without the defensive hard forks Monero had to inflict on itself four times in 2018–2019. The ceiling was brought down from 8 to 4 GiB because above that the table weighed on the individual — a Raspberry Pi 5 or an 8 GB laptop — more than on dedicated silicon, which buys memory at will.</p>
+<div class="wrap"><table>
+<caption>Table 5 — What a machine must hold</caption>
+<tr><th class="num">Year</th><th class="num">Epoch</th><th class="num">Table (miner)</th><th class="num">Cache (every node)</th></tr>
+<tr><td class="num">0</td><td class="num">0</td><td class="num">2.00 GiB</td><td class="num">64 MiB</td></tr>
+<tr><td class="num">1</td><td class="num">5</td><td class="num">2.55 GiB</td><td class="num">82 MiB</td></tr>
+<tr><td class="num">2</td><td class="num">10</td><td class="num">3.26 GiB</td><td class="num">104 MiB</td></tr>
+<tr class="hi"><td class="num">3 and beyond</td><td class="num">15</td><td class="num">4.00 GiB</td><td class="num">128 MiB</td></tr>
+</table></div>
+<p>This asymmetry is deliberate. A node that verifies holds only the cache, and verifying a block costs about 660 µs instead of 45 µs — the exact price of the correction, the same trade Ethereum made. A miner rebuilds its table once per epoch: about 24 minutes on two cores, every 71 days. A chain whose verification becomes expensive is a chain nobody verifies any more.</p>
+
+<h3>5.4 Difficulty and time</h3>
+<p>The target adjusts at every block by a linearly weighted moving average over the last <strong>90</strong> blocks, aiming at 120 seconds, with the target never changing by more than a factor of 4 between two blocks. Solve times are clamped asymmetrically: a block may count at most 4 targets early and 6 targets late. A symmetric bound let a miner inject time with a forward-dated block that the honest next block only partly removed, leaving a net difficulty drop and about 33% extra blocks for half the power; with the asymmetric bound the honest block removes more than the attacker injected, so the manipulation <em>raises</em> difficulty and a rational miner gains nothing. A block's timestamp must exceed the median of the previous 11 and may not be more than 600 seconds ahead of the receiving node's clock. The difficulty of a block depends only on its own ancestors, never on the branch a node happens to hold, so two nodes never disagree about the target.</p>
+
+<h2 id="s6"><span class="n">6</span>Transactions, blocks and fees</h2>
+<p>A transaction spends outputs and creates outputs; each output carries an amount and a scheme-versioned key hash. Validation checks scripts and amounts before signatures, so that a malformed transaction is rejected before the expensive part. Blocks are produced every <strong>120 seconds</strong>, five times less variance in confirmation time than Bitcoin, and are bounded by size and by weight.</p>
+<div class="wrap"><table>
+<caption>Table 6 — Block and transaction rules</caption>
+<tr><th>Rule</th><th class="num">Value</th><th>Why</th></tr>
+<tr><td>Maximum block size</td><td class="num">4 MiB</td><td>1 MiB would hold about 300 transactions, because of signature size.</td></tr>
+<tr><td>Target block weight</td><td class="num">2,000,000</td><td>Signatures (witness) count for a quarter of their bytes; the part that changes the UTXO set is charged in full.</td></tr>
+<tr><td>Weight per output</td><td class="num">400</td><td>Every output must be stored by every node for ever; flooding outputs is charged.</td></tr>
+<tr><td>Minimum output</td><td class="num">10,000 units (0.0001 Q21)</td><td>A consensus dust floor; the genesis unit is exempt. Change below the floor goes to fees.</td></tr>
+<tr><td>Minimum fee rate (relay)</td><td class="num">10 units per 1,000 weight</td><td>Saturating the mempool must cost something; a fee below it is not relayed.</td></tr>
+<tr><td>Coinbase maturity</td><td class="num">200 blocks</td><td>A reward cannot be spent before a deep reorganization could still remove it.</td></tr>
+<tr><td>Merkle leaf</td><td class="num">H(txid ‖ wtxid)</td><td>The proof of work commits to the signatures, not only to the transaction skeleton.</td></tr>
+</table></div>
+<p><strong>Capacity, stated plainly.</strong> With 4 MiB blocks, a full block holds about 569 simple transactions: 4.74 per second, 409,680 per day. Fifteen million holders could each make one transaction every 36 days. Widening the block is brutal: one transaction per person per week for fifteen million people would need 21 MiB blocks and 5.2 TiB of chain per year, which no domestic machine would follow — centralization by storage, exactly what Bitcoin refused by keeping blocks small. The fee market is rudimentary and has not been observed under load; that is a parameter the real network will settle, not the reasoning.</p>
+
+<h2 id="s7"><span class="n">7</span>Consensus, forks and finality</h2>
+<p>The valid chain with the most cumulative work wins. Two mechanisms bound what a reorganization can do.</p>
+<p><strong>A maximum depth.</strong> No reorganization deeper than <strong>720 blocks</strong> (24 hours) is accepted. Beyond that horizon a node considers its history settled: an attacker who mines a competing branch in secret for two days cannot replace a day of the world's transactions.</p>
+<p><strong>A rising price for depth.</strong> From a depth of 6 blocks, a competing branch must bring <strong>1% more work per block of depth</strong>, capped at <strong>25%</strong>. The surcharge applies to the work produced <em>since the fork point</em>, on both sides — the only quantity that is disputed, since the common past is contested by no one. The first version applied it to the work since genesis: three months after launch, no reorganization of depth 7 could succeed even with 100% of the power, and a twelve-minute network partition produced two permanent chains. The cap was added after a simulation of an ordinary partition — two countries, two providers — mining at equal power on both sides: without it, the two halves became definitive within two hours. With 25%, any majority above 56% of the power reunifies the network within the 720-block window, and a deep reorganization by an attacker still costs a quarter more.</p>
+<p><strong>Uncles were tried and retired.</strong> Paying a second-place block 25% of the subsidy — deducted from the miner that included it, so that the cap would not move — meant nobody included one at their own expense; the mechanism only offered an attack surface. A block that carries an uncle is now refused. Compact relay addresses the cause of orphans instead (§8), and at two minutes per block they are rare.</p>
+
+<h2 id="s8"><span class="n">8</span>The network</h2>
+<p>The peer-to-peer layer is raw TCP over the standard library, one thread per peer, with no networking library: on code that receives bytes from strangers, every dependency is an attack surface nobody has reviewed. The rule that prevents deadlock fits in one sentence: the shared state lock is never held during a network write, so a slow peer cannot freeze the node. A node keeps up to <strong>32 peers</strong>; the test network listens on port 21121 and identifies itself with its own magic bytes, so that a main-network node and a test-network node cannot even shake hands.</p>
+<div class="wrap"><table>
+<caption>Table 7 — Network mechanisms</caption>
+<tr><th style="width:28%">Mechanism</th><th>What it does</th></tr>
+<tr><td>Compact relay</td><td>A peer already holds most of a block's transactions in its mempool, so a new block is announced in a few kilobytes and only the missing transactions are requested. Measured on three real nodes: 200 blocks out of 219 announcements relayed without a single round trip. This lowers propagation latency, hence orphans, hence the super-linear advantage of large miners.</td></tr>
+<tr><td>Address book against eclipse</td><td>Known addresses are stored in buckets by /16 network group, with a salt unique to each node, so that an adversary holding a single address range cannot occupy all of a node's slots. Bootstrap nodes decide who you speak to first, not what you believe.</td></tr>
+<tr><td>Liveness</td><td>After 45 s of silence a ping is sent; after 100 s without any frame the slot is freed and the bootstraps retried; a loop iteration lasting more than a minute means the machine slept, and all connections are dropped immediately. Measured: a laptop asleep for 75 s recovers 59 blocks within twenty seconds of waking. On a public network the same defect was an eclipse path — opening connections and staying silent occupied every slot.</td></tr>
+<tr><td>Misbehavior score</td><td>An unreadable frame costs 10 points, an invalid block 50; at 100 the peer is cut. Message parsing has zero memory amplification: a frame cannot make the receiver allocate more than it sent.</td></tr>
+<tr><td>Version gate</td><td>Protocol version 3 is both the current and the minimum; a peer announcing an older version is cut at the handshake, so an abandoned rule set cannot linger on the network.</td></tr>
+<tr><td>Fast sync</td><td>A newcomer may receive, in slices, a snapshot of the UTXO set at height H, the headers from genesis to H and a bounded window of bodies around H. The snapshot carries a MuHash digest — a product in the multiplicative group modulo a 3,072-bit prime, maintained incrementally at every insert and remove — and is accepted only if it matches a digest the user supplies from a source they trust. A peer that sends a snapshot is a convenience, never an authority. Bodies received this way are verified before being written.</td></tr>
+</table></div>
+
+<h2 id="s9"><span class="n">9</span>Running a node</h2>
+<p>The node is one binary that also contains the wallet and the block explorer. It restarts in seconds from a snapshot of the monetary state — the UTXO set, the tip, the total issued — and replays only the blocks after it; a chain whose nodes cannot be restarted quickly is a chain nobody dares to update. A node that finds a foreign genesis on disk archives that data instead of destroying it.</p>
+<div class="wrap"><table>
+<caption>Table 8 — What a node holds</caption>
+<tr><th></th><th class="num">Verifying node</th><th class="num">Miner</th><th class="num">Explorer / archive</th></tr>
+<tr><td>Proof-of-work memory</td><td class="num">64 → 128 MiB</td><td class="num">2 → 4 GiB</td><td class="num">64 → 128 MiB</td></tr>
+<tr><td>Block bodies on disk</td><td class="num">genesis + last 6,008 (pruned)</td><td class="num">genesis + last 6,008 (pruned)</td><td class="num">all</td></tr>
+<tr><td>Disk at full blocks</td><td class="num">a few GiB, constant</td><td class="num">a few GiB, constant</td><td class="num">up to 1.00 TiB per year</td></tr>
+<tr><td>Address index</td><td class="num">no</td><td class="num">no</td><td class="num">yes</td></tr>
+</table></div>
+<p><strong>Pruning.</strong> A node that validates for itself needs only what it might still undo — the 1,008-block body window that covers the 720-block reorganization limit — and what its wallet history displays, 5,000 blocks. With pruning enabled it keeps the genesis and the last 6,008 bodies (about eight days), rewrites the file every 2,016 blocks, and summarizes everything older in the snapshot. Three conditions are enforced before a single body is removed: the snapshot has just been written, the header store covers genesis to the snapshot, and every body after the snapshot remains. A pruned node verifies everything it receives; it simply does not keep what it will never read again, so an SD card lasts years. A pruned node refuses to serve as an explorer, because the address index would point to bodies it no longer has.</p>
+<p><strong>The explorer.</strong> To consult a chain, almost everyone opens a third party's website and thereby trusts a server in a system built to trust no one. Q21's explorer is served by your node on the loopback interface, shows only what your machine validated, loads no font, stylesheet or script from outside — a test asserts the absence of any external URL — and states in plain words what the protocol does <em>not</em> protect. An explorer that shows only what reassures lies by omission.</p>
+
+<h2 id="s10"><span class="n">10</span>The wallet</h2>
+<p>The wallet embeds a full node: it does not ask anyone what its balance is, it computes it. Its interface is a page served locally, with the session token carried in the address fragment so that it never reaches a log. Five locks protect it against the web: origin, <code>Referer</code> and <code>Sec-Fetch-Site</code> checks against a hostile page spending funds unnoticed; a required JSON content type against form-based CSRF, which needs no JavaScript; a <code>Host</code> check against DNS rebinding; a token on every RPC method against other programs on the machine; loopback-only listening against the rest of the network. These five locks were tried by 42 real attacks over TCP, each of which was a working exploit before its lock existed.</p>
+<div class="wrap"><table>
+<caption>Table 9 — What protects the keys</caption>
+<tr><th style="width:30%">Defense</th><th>What it prevents</th></tr>
+<tr><td>Argon2id sealing of <code>wallet.dat</code> — 64 MiB of memory, 3 passes</td><td>A stolen file costs the attacker 64 MiB of memory per password attempt; a graphics card gains almost nothing. Implemented from the standard's reference, checked against the RFC 9106 vectors and an independent implementation; files sealed by the previous key derivation are opened and resealed on first use.</td></tr>
+<tr><td>A backup code (seed, Bech32m)</td><td>Loss of the machine. The code restores the wallet in any version; the passphrase is confirmed at creation.</td></tr>
+<tr><td>Write-ahead of one-time key indices</td><td>Signing with a key index that was already used because a crash struck between signing and saving: the wallet records the index, syncs to disk, and only then signs.</td></tr>
+<tr><td>Passphrase from the environment read once and erased; core dumps disabled; secrets zeroized on drop</td><td>The passphrase or the keys lingering in a process listing, a crash file or freed memory.</td></tr>
+<tr><td>Client-side dust and fee checks</td><td>Building a transaction the consensus would refuse.</td></tr>
+</table></div>
+<p>What the wallet still does not do is said as clearly: history is bounded to 5,000 blocks without an address index, and the page says which mode served it; there is no QR code, because the content-security policy forbids external images; the delivered binaries are not code-signed for macOS or Windows, and their SHA-256 checksums are published instead.</p>
+
+<h2 id="s11"><span class="n">11</span>Threat model, and what is not proven</h2>
+<p>A security claim is worth what its threat model admits. The table lists the adversaries the design addresses and, for each, the mechanism and its status.</p>
+<div class="wrap"><table>
+<caption>Table 10 — Threats and defenses</caption>
+<tr><th style="width:24%">Threat</th><th>Defense</th><th style="width:14%">Status</th></tr>
+<tr><td>Quantum computer breaks signatures</td><td>ML-DSA-87; scheme identifier in the address, so a stronger scheme can be added without a break</td><td><span class="pill">standard</span></td></tr>
+<tr><td>Mining captured by dedicated hardware</td><td>Memory-bound proof of work, 47.8× cost without memory, table growing to 4 GiB</td><td><span class="pill w">assumed</span></td></tr>
+<tr><td>Majority attacker rewrites history</td><td>720-block horizon; rising surcharge on fork work; 200-block coinbase maturity</td><td><span class="pill">measured by simulation</span></td></tr>
+<tr><td>Timestamp manipulation lowers difficulty</td><td>Median of 11; 600 s future bound; asymmetric 4/6 clamp — no strategy lowers difficulty</td><td><span class="pill">tested</span></td></tr>
+<tr><td>Eclipse of a node</td><td>/16 buckets with per-node salt; liveness pings; sleep detection</td><td><span class="pill">tested</span></td></tr>
+<tr><td>Memory exhaustion by a peer</td><td>Zero-amplification parsing; bounded message size; misbehavior score</td><td><span class="pill">measured</span></td></tr>
+<tr><td>Mempool and UTXO flooding</td><td>Minimum fee rate; weight per output; dust floor</td><td><span class="pill">tested</span></td></tr>
+<tr><td>Tampered snapshot</td><td>MuHash digest compared with a user-supplied value; bodies verified before write</td><td><span class="pill">tested</span></td></tr>
+<tr><td>Wallet file theft</td><td>Argon2id 64 MiB; zeroization; no core dumps</td><td><span class="pill">verified against vectors</span></td></tr>
+<tr><td>Hostile web page against the wallet</td><td>Five locks, 42 real attacks in the test suite</td><td><span class="pill">tested</span></td></tr>
+<tr><td>Supply-chain compromise</td><td>Zero mandatory dependencies; ML-DSA vendored at a pinned version; pinned toolchain; dependency policy enforced in CI; SHA-256 sums published with every build</td><td><span class="pill">in place</span></td></tr>
+<tr><td>Consensus divergence between platforms</td><td>Integer arithmetic only; a Windows PC and a MacBook agreed bit for bit on 438 blocks, each recomputing every signature and proof of work of the other</td><td><span class="pill">measured</span></td></tr>
+</table></div>
+<p>The test suite counts more than 770 automated checks, including 42 network-level attacks on the wallet, cross-platform agreement, restart from a pruned archive, and the exact equality of the total supply at the last issuing block.</p>
+
+<h3>What is assumed, not proven</h3>
+<ul>
+<li><strong>The proof of work has received no external cryptanalysis.</strong> The measurements above were made by its author, on one machine, against a reference implementation — not against an implementation optimized by someone whose job is to beat it. Until that review exists, the anti-ASIC property is a supported hypothesis, not an achievement.</li>
+<li><strong>Behavior under a truly hostile network.</strong> The test network exists to observe difficulty with several miners, real reorganizations, and the cost of saturating the mempool when someone actually tries.</li>
+<li><strong>Centralization by pools.</strong> At fifteen million miners, a lone participant would find a block every 57 years and would join a pool. The design prevents a chip foundry from taking the network; it does not prevent three or four pools from directing most of the power — which is what happened to Bitcoin, without ASICs to explain it. This is identified, not solved, and must be addressed before a main network.</li>
+<li><strong>The fee market.</strong> After the subsidy ends, security rests on fees alone. Nobody knows whether fees suffice to pay for the security of a chain in the long run. Bitcoin has the same question and postpones it; Q21 notes it here rather than pretending it does not exist.</li>
+</ul>
+
+<h2 id="s12"><span class="n">12</span>From the test network to the main network</h2>
+<p>The main network has not been launched, and this document says what must exist before it is.</p>
+<div class="wrap"><table>
+<caption>Table 11 — Prerequisites for a main network</caption>
+<tr><th style="width:34%">Prerequisite</th><th>Where it stands</th></tr>
+<tr><td>A UTXO commitment in the block header</td><td>The MuHash accumulator exists and is maintained incrementally; it authenticates snapshots against a user-supplied digest. Committing it in the header would make every snapshot verifiable against the proof of work itself. It is consensus code and will not be rushed the day before a launch.</td></tr>
+<tr><td>External cryptanalysis of the proof of work</td><td>Open. The test network is the invitation.</td></tr>
+<tr><td>An independent human audit of the code</td><td>Open. An adversarial internal audit has been made and its findings corrected; it does not replace an external one.</td></tr>
+<tr><td>Several independent bootstrap nodes</td><td>One public entry point today. A second, held by someone else, comes before anything of value.</td></tr>
+<tr><td>Provisional parameters confirmed by measurement</td><td>Block interval, block size and the fee market are marked provisional in the code and will be settled by the orphan rate and the usage observed on the test network — by measurement, not by argument.</td></tr>
+</table></div>
+<h3>How change happens without governance</h3>
+<p>There is no vote, no council and no signaling. A change to the rules is a change to the code; anyone may publish one. A node runs the code its operator chose, and a rule set that the network does not adopt simply does not propagate — a peer on an abandoned protocol version is refused at the handshake. This is slower and rougher than a foundation with a roadmap. It is also the only arrangement in which the currency belongs to the people who run it and to nobody else.</p>
+<h3>How to take part</h3>
+<p>Run a node and verify the chain. Mine on the machine you already own — a laptop with 8 GB, a Raspberry Pi with pruning enabled. Read the sources; every mechanism in this document has a test that exercises it. Try to break the proof of work: the property on which the whole project rests is the one that most deserves an adversary. And keep no Q21 as if it had value: on this network it has none, and the network may be reset at any time.</p>
+
+<section class="appendix">
+<h2 id="appendix"><span class="n">A</span>Parameters at a glance</h2>
+<div class="wrap"><table>
+<tr><th>Parameter</th><th class="num">Value</th><th>Parameter</th><th class="num">Value</th></tr>
+<tr><td>Units per Q21</td><td class="num">10⁸</td><td>Absolute supply</td><td class="num">21,000,001 Q21</td></tr>
+<tr><td>Genesis unit (unspendable)</td><td class="num">1 Q21</td><td>Mined supply</td><td class="num">21,000,000 Q21</td></tr>
+<tr><td>Target block interval</td><td class="num">120 s</td><td>Blocks per year</td><td class="num">262,800</td></tr>
+<tr><td>Initial base reward</td><td class="num">13.82743055 Q21</td><td>Decay factor / epoch</td><td class="num">0.9971555 / 4,320 blocks</td></tr>
+<tr><td>Slow-start ramp</td><td class="num">20,000 blocks</td><td>Tail floor</td><td class="num">0.01 Q21</td></tr>
+<tr><td>Last issuing block</td><td class="num">26,273,578</td><td>Coinbase maturity</td><td class="num">200 blocks</td></tr>
+<tr><td>Signature scheme</td><td class="num">ML-DSA-87</td><td>Address encoding</td><td class="num">Bech32m, q21 / tq21 / rq21</td></tr>
+<tr><td>PoW table, start → ceiling</td><td class="num">2 GiB → 4 GiB</td><td>PoW cache</td><td class="num">table / 32</td></tr>
+<tr><td>PoW epoch / growth</td><td class="num">51,200 blocks / +5%</td><td>Accesses per attempt / per element</td><td class="num">32 / 256</td></tr>
+<tr><td>Difficulty window (LWMA)</td><td class="num">90 blocks</td><td>Max target change per block</td><td class="num">4×</td></tr>
+<tr><td>Solve-time clamp (early / late)</td><td class="num">4 T / 6 T</td><td>Median time span / future bound</td><td class="num">11 blocks / 600 s</td></tr>
+<tr><td>Maximum block size</td><td class="num">4 MiB</td><td>Target block weight</td><td class="num">2,000,000</td></tr>
+<tr><td>Witness discount</td><td class="num">4</td><td>Weight per output</td><td class="num">400</td></tr>
+<tr><td>Minimum output</td><td class="num">10,000 units</td><td>Minimum relay fee rate</td><td class="num">10 / 1,000 weight</td></tr>
+<tr><td>Maximum reorganization</td><td class="num">720 blocks</td><td>Reorg surcharge</td><td class="num">from depth 6, +1%/block, cap 25%</td></tr>
+<tr><td>Body window</td><td class="num">1,008 blocks</td><td>Pruned bodies kept</td><td class="num">genesis + 6,008</td></tr>
+<tr><td>Peers</td><td class="num">32</td><td>Protocol version (min)</td><td class="num">3 (3)</td></tr>
+<tr><td>Wallet sealing</td><td class="num">Argon2id, 64 MiB, 3 passes</td><td>Test-network port</td><td class="num">21121</td></tr>
+</table></div>
+</section>
+
+<p class="close">Q21 takes Bitcoin's foundations, protects them against the quantum computer, and puts mining back within reach of an ordinary machine — saying everywhere what is measured and what is not.</p>
+<p class="sign">Rei Asanoha<span>September 2026</span></p>
+<p class="foot">Q21 is free software, published under the MIT or Apache-2.0 license at the recipient's choice. This document describes protocol version 3 as deployed on the public test network in September 2026. Where this document and the consensus code disagree, the code is the protocol. Every release carries a minisign signature whose trusted comment bears this name, and the public key that verifies it is published with the sources. The name signs the work; it decides nothing. Q21 has no governance, and no part of the protocol depends on it. A flaw in the proof of work — or anywhere else in this document — is reported to that address.</p>
+</article>
+
+</main>
+</div>
+
+<script>
+(function(){
+  // ---------- labels ----------
+  var LABELS = {year:"Year",perblock:"Subsidy per block",supply:"In circulation",ofcap:"Of the cap",
+                legendA:"Subsidy per block (Q21)",legendB:"Circulating supply (% of cap)"};
+  function t(k){ return LABELS[k] || k; }
+
+  function buildToc(){
+    var toc = document.getElementById("toc"); toc.innerHTML = "";
+    var art = document.querySelector("article");
+    if(!art) return;
+    var hs = art.querySelectorAll("h2[id]");
+    for(var i=0;i<hs.length;i++){
+      var h = hs[i], li = document.createElement("li"), a = document.createElement("a");
+      a.href = "#"+h.id;
+      var n = h.querySelector(".n");
+      a.innerHTML = (n? '<span class="n">'+n.textContent.trim()+'</span>':'') + h.textContent.replace(n?n.textContent:"","").trim();
+      li.appendChild(a); toc.appendChild(li);
+    }
+  }
+
+  // ---------- emission, ported from the consensus code (integer arithmetic, BigInt) ----------
+  var INIT = 1382743055n, NUM = 99715550n, DEN = 100000000n, EPOCH = 4320n, SLOW = 20000n, TAIL = 1000000n,
+      UNIT = 100000000n, CAP = 21000000n*UNIT, PREMINT = UNIT, BPY = 262980n; // 365.25 days of 720 blocks
+  function cumulative(height){ // total mined through `height` inclusive, in units
+    height = BigInt(height);
+    var total = 0n, epoch = 0n, base = INIT;
+    for(;;){
+      var start = epoch*EPOCH;
+      if(start > height || total >= CAP) break;
+      var end = height < start+EPOCH-1n ? height : start+EPOCH-1n;
+      var paid = base > TAIL ? base : TAIL;
+      if(start < SLOW){
+        for(var h=start; h<=end; h++){ total += (h >= SLOW) ? paid : (paid*h)/SLOW; }
+      } else { total += paid*(end-start+1n); }
+      base = (base*NUM)/DEN; epoch += 1n;
+    }
+    return total > CAP ? CAP : total;
+  }
+  function subsidy(height){ height = BigInt(height); if(height===0n) return 0n; return cumulative(height)-cumulative(height-1n); }
+  function q21(units, dec){ dec = dec===undefined? 8: dec; var s = (Number(units)/1e8); return s.toLocaleString("en-US",{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
+  function intl(n){ return Number(n).toLocaleString("en-US"); }
+
+  // yearly series, computed once
+  var YEARS = 100, series = [];
+  for(var y=0; y<=YEARS; y++){
+    var h = BigInt(y)*BPY; if(y===0) h = SLOW; // year 0 shown at the end of the ramp
+    series.push({year:y, height:h, sub:subsidy(h), cum:cumulative(h)+PREMINT});
+  }
+
+  function drawChart(canvas){
+    if(!canvas) return;
+    var dpr = window.devicePixelRatio||1, W = canvas.clientWidth||680, H = Math.round(W*0.44);
+    canvas.width = W*dpr; canvas.height = H*dpr; canvas.style.height = H+"px";
+    var c = canvas.getContext("2d"); c.scale(dpr,dpr);
+    var cs = getComputedStyle(document.documentElement);
+    var ink = cs.getPropertyValue("--ink").trim(), muted = cs.getPropertyValue("--muted").trim(), rule = cs.getPropertyValue("--rule").trim(),
+        accent = cs.getPropertyValue("--accent").trim(), warn = cs.getPropertyValue("--warn").trim();
+    var padL = 46, padR = 46, padT = 18, padB = 34, w = W-padL-padR, hh = H-padT-padB;
+    var maxSub = 14; // Q21 per block, axis
+    function x(year){ return padL + (year/YEARS)*w; }
+    function yA(v){ return padT + hh - (v/maxSub)*hh; }
+    function yB(p){ return padT + hh - (p/100)*hh; }
+    c.clearRect(0,0,W,H);
+    c.font = "11px "+cs.getPropertyValue("--body");
+    c.strokeStyle = rule; c.lineWidth = 1;
+    for(var g=0; g<=4; g++){ var yy = padT + hh*g/4; c.beginPath(); c.moveTo(padL,yy); c.lineTo(W-padR,yy); c.stroke();
+      c.fillStyle = muted; c.textAlign="right"; c.fillText((maxSub - maxSub*g/4).toFixed(1), padL-6, yy+4);
+      c.textAlign="left"; c.fillText((100 - 25*g)+"%", W-padR+6, yy+4); }
+    c.textAlign="center";
+    for(var yr=0; yr<=YEARS; yr+=10){ c.fillStyle = muted; c.fillText(String(yr), x(yr), H-padB+16); }
+    c.fillStyle = muted; c.fillText(t("year"), padL + w/2, H-6);
+    // supply area
+    c.beginPath(); c.moveTo(x(0), yB(0));
+    series.forEach(function(s){ c.lineTo(x(s.year), yB(Number(s.cum)/Number(CAP+PREMINT)*100)); });
+    c.lineTo(x(YEARS), yB(0)); c.closePath();
+    c.fillStyle = accent; c.globalAlpha = 0.12; c.fill(); c.globalAlpha = 1;
+    c.beginPath(); series.forEach(function(s,i){ var px=x(s.year), py=yB(Number(s.cum)/Number(CAP+PREMINT)*100); i?c.lineTo(px,py):c.moveTo(px,py); });
+    c.strokeStyle = accent; c.lineWidth = 2; c.stroke();
+    // subsidy line
+    c.beginPath(); series.forEach(function(s,i){ var px=x(s.year), py=yA(Number(s.sub)/1e8); i?c.lineTo(px,py):c.moveTo(px,py); });
+    c.strokeStyle = ink; c.lineWidth = 1.6; c.stroke();
+    // tail floor marker at ~41.7 years, cap at 99.9
+    c.setLineDash([3,3]); c.strokeStyle = warn; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(x(41.7), padT); c.lineTo(x(41.7), padT+hh); c.stroke(); c.setLineDash([]);
+    c.fillStyle = warn; c.textAlign="left"; c.fillText("0.01", x(41.7)+4, padT+10);
+    // legend
+    c.textAlign="left"; c.fillStyle = ink; c.fillRect(padL, padT-12, 14, 2); c.fillText(t("legendA"), padL+20, padT-8);
+    c.fillStyle = accent; c.fillRect(padL+250, padT-12, 14, 2); c.fillStyle = ink; c.fillText(t("legendB"), padL+270, padT-8);
+    // marker
+    var m = Number(canvas.getAttribute("data-year")||"4");
+    var s = series[m]; c.strokeStyle = ink; c.setLineDash([2,3]); c.beginPath(); c.moveTo(x(m),padT); c.lineTo(x(m),padT+hh); c.stroke(); c.setLineDash([]);
+    c.fillStyle = ink; c.beginPath(); c.arc(x(m), yA(Number(s.sub)/1e8), 4, 0, 6.283); c.fill();
+    c.fillStyle = accent; c.beginPath(); c.arc(x(m), yB(Number(s.cum)/Number(CAP+PREMINT)*100), 4, 0, 6.283); c.fill();
+  }
+  function updateReadout(fig){
+    var canvas = fig.querySelector("canvas"), m = Number(canvas.getAttribute("data-year")||"4"), s = series[m];
+    var r = fig.querySelector(".readout"); if(!r) return;
+    r.innerHTML = '<div>'+t("year")+'<b>'+m+'</b></div><div>'+t("perblock")+'<b>'+q21(s.sub,4)+' Q21</b></div>'+
+                  '<div>'+t("supply")+'<b>'+q21(s.cum,0)+' Q21</b></div><div>'+t("ofcap")+'<b>'+(Number(s.cum)/Number(CAP+PREMINT)*100).toFixed(2)+'%</b></div>';
+  }
+  function drawAll(){
+    var figs = document.querySelectorAll(".emission");
+    for(var i=0;i<figs.length;i++){ drawChart(figs[i].querySelector("canvas")); updateReadout(figs[i]); }
+    var calcs = document.querySelectorAll(".calc");
+    for(var j=0;j<calcs.length;j++) runCalc(calcs[j]);
+  }
+  document.addEventListener("input", function(ev){
+    var r = ev.target;
+    if(r.matches && r.matches(".emission input[type=range]")){
+      var fig = r.closest(".emission"); fig.querySelector("canvas").setAttribute("data-year", r.value);
+      drawChart(fig.querySelector("canvas")); updateReadout(fig);
+    }
+    if(r.matches && r.matches(".calc input[type=number]")) runCalc(r.closest(".calc"));
+  });
+  function runCalc(box){
+    var inp = box.querySelector("input[type=number]"), out = box.querySelector(".out"); if(!inp||!out) return;
+    var h = Math.max(0, Math.min(30000000, Math.floor(Number(inp.value)||0)));
+    var sub = subsidy(h), cum = cumulative(h)+PREMINT, days = h*120/86400;
+    out.innerHTML = '<b>'+q21(sub,8)+'</b> Q21 · '+q21(cum,8)+' Q21 ('+(Number(cum)/Number(CAP+PREMINT)*100).toFixed(4)+'%) · '+(days/365.25).toFixed(2)+' years';
+  }
+  var resizeT; window.addEventListener("resize", function(){ clearTimeout(resizeT); resizeT = setTimeout(drawAll, 120); });
+  window.addEventListener("beforeprint", drawAll);
+
+  // current section highlight
+  var obs = ("IntersectionObserver" in window) ? new IntersectionObserver(function(entries){
+    entries.forEach(function(e){ if(e.isIntersecting){ var id = e.target.id; var as = document.querySelectorAll("#toc a"); for(var i=0;i<as.length;i++) as[i].classList.toggle("current", as[i].getAttribute("href")==="#"+id); } });
+  }, {rootMargin:"-10% 0px -80% 0px"}) : null;
+  if(obs){ var hs = document.querySelectorAll("article h2[id]"); for(var i=0;i<hs.length;i++) obs.observe(hs[i]); }
+
+  document.documentElement.lang = "en";
+  buildToc();
+  drawAll();
+})();
+</script>

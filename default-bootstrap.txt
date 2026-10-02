@@ -1,0 +1,22 @@
+# Entry points of the Q21 testnet.
+#
+# This file ships with the program, already filled in, so that the first
+# launch finds the network without anything to type.
+#
+# It is NOT hard-coded into the program. The binary itself contains no server
+# address: this is a choice, because an address hard-coded into distributed
+# software would become a permanent dependency on whoever holds it. This file
+# sits next to it, in plain text, and it belongs to you: edit it, add lines,
+# empty it. The protocol depends on none of these addresses: they only serve
+# to knock on a first door, and what you trust afterwards will come from the
+# proof of work and the genesis that your machine computes itself.
+#
+# One address per line, `host` or `host:port`. Empty lines and lines
+# starting with # are ignored. The up-to-date list of entry points, and the
+# steps to run one yourself, are in NETWORK.md.
+#
+# The name and the numeric address are given side by side, on purpose: a
+# domain name can expire, an address stays reachable as long as the machine
+# exists. The failure of one isolates no one.
+bootstrap.q21.dev:21121
+92.222.86.135:21121

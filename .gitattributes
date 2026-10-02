@@ -1,0 +1,36 @@
+# Line endings — why this file exists
+#
+# Windows ends its lines with two characters where the rest of the world uses
+# only one. By default Git converts them when checking files out on a Windows
+# machine, which is convenient for text and disastrous here.
+#
+# The sources vendored in `vendor/` come with a SHA-256 hash per file, which
+# cargo checks before any build. A line-ending conversion changes the file,
+# hence its hash, hence cargo refuses:
+#
+#     error: the listed checksum of `vendor\ml-dsa\src\lib.rs` has changed
+#
+# The Windows build thus failed in forty seconds, while the other three
+# succeeded. It is a defect that can only show up on a single platform, and
+# only once the project has gone through a repository.
+
+# Everywhere: Unix line endings, whatever the system.
+* text=auto eol=lf
+
+# Vendored sources: no conversion, ever. Their hash depends on it.
+vendor/** -text
+
+# Windows command files want Windows line endings.
+# A `.bat` with LF often works, and fails in confusing ways as soon as it
+# contains a label or an `if (...)` block.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# And the macOS launcher wants the opposite, or the shell reads one character
+# too many on every line.
+*.command text eol=lf
+
+# Binary files, for the record.
+*.png binary
+*.gz binary
+*.zip binary

@@ -1,0 +1,43 @@
+# Dependency policy, enforced by `cargo deny check` in continuous
+# integration.
+#
+# The project has a single direct dependency (`ml-dsa`) and its sources are
+# vendored. This file locks down what that means: no published vulnerability
+# without our knowing, no unexpected license, no source outside crates.io, no
+# duplicate dependency.
+
+[graph]
+all-features = true
+
+[advisories]
+# A published vulnerability (RustSec database) on a dependency fails the
+# check. "Unmaintained" and "unsound" advisories are reported.
+#
+# `unmaintained` and `unsound` no longer take a level ("deny", "warn") but a
+# **scope**: which crates to examine. `all` = every one, transitive
+# dependencies included; `workspace` = ours only; `none` = none. An advisory
+# found within the scope is always an error. The old form `unsound = "deny"`
+# stopped being read by cargo-deny in September 2026, and the integration
+# pipeline stopped on this file without a line of code having changed: that is
+# the price of a third-party action followed through a moving tag (`@v2`), see
+# SIGNING.md, section 5.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of the same package is twice the surface to audit.
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,225 @@
+# Tests: on every push and every pull request.
+#
+# The goal is not to decorate the repository with a green badge: it is to
+# prevent a security fix from being reverted without anyone noticing.
+# The `tests/audit_*.rs` files are former exploits turned into regression
+# tests; if they fail, a vulnerability has come back.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The monetary code tolerates no silent overflow, including during the
+  # tests.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  tests:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version comes from `rust-toolchain.toml`: the same as the release.
+      # Installed by `rustup` directly, and not by a third-party action
+      # tracked on a moving branch: the program that compiles the wallet
+      # must not depend on anything that someone could rewrite between two
+      # runs.
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt --no-self-update
+          rustup default 1.95.0
+          rustc --version
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # The `ml-dsa` sources are in `vendor/`, and `.cargo/config.toml`
+      # redirects crates.io there. The build therefore depends on no network,
+      # and two builds two months apart use exactly the same signature code.
+      - name: Check that the vendored sources are present
+        shell: bash
+        run: |
+          test -d vendor/ml-dsa || { echo "vendor/ml-dsa is missing"; exit 1; }
+          test -f .cargo/config.toml || { echo ".cargo/config.toml is missing"; exit 1; }
+
+      - name: Build
+        run: cargo build --locked --features mldsa
+
+      # All the tests, without listing them.
+      #
+      # This step used to list the files one by one. The trap is mechanical:
+      # a test file added to the repository and forgotten in that list is
+      # never run in CI, and a test that does not run is a decoration. Five
+      # files were in that situation: `regression_chaining`, the three
+      # `*audit2*` / `*audit_v2*`, and `regression_reproducible`. Without a
+      # `--test` argument, cargo runs everything that exists, today and
+      # tomorrow.
+      - name: Tests
+        run: cargo test --locked --features mldsa,audit
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features mldsa,audit
+
+      - name: Format
+        run: cargo fmt --check
+        if: matrix.os == 'ubuntu-latest'
+
+  # ---------------------------------------------------------------------------
+  # Dependencies
+  # ---------------------------------------------------------------------------
+  #
+  # A single direct dependency, vendored; but a vulnerability published in
+  # one of its transitive dependencies must show up the same day, not at the
+  # next audit. `cargo deny` checks `Cargo.lock` against the RustSec database,
+  # and applies the policy in `deny.toml`: licenses, duplicates, sources.
+  dependencies:
+    name: Dependencies (RustSec, licenses, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          arguments: --all-features
+
+  # ---------------------------------------------------------------------------
+  #
+  # `vendor/` certifies itself: cargo checks that each file has the checksum
+  # recorded in `.cargo-checksum.json`, and that the `package` field of that
+  # file equals `Cargo.lock`; it never recomputes `package` from the files.
+  # A modified crate whose checksum map is regenerated passes `--locked`
+  # without a word. This job therefore redoes `cargo vendor` from crates.io
+  # into a clean directory and requires the result to be identical, byte for
+  # byte, to what the repository ships. Any divergence (an added line, one
+  # extra file) blocks the merge.
+  vendor:
+    name: Vendor identical to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - name: Re-vendor and compare
+        shell: bash
+        run: |
+          set -eu
+          # Without the source replacement: we want crates.io, not vendor/.
+          mv .cargo/config.toml /tmp/config.toml.repo
+          cargo vendor --locked /tmp/vendor-fresh > /dev/null
+          mv /tmp/config.toml.repo .cargo/config.toml
+
+          # We compare the SOURCES, not cargo's internal bookkeeping.
+          #
+          # `.cargo-checksum.json` is a file that cargo writes for its own
+          # use; its format changed between the cargo version that created
+          # `vendor/` and another one, so two vendorings of the same crate,
+          # with strictly identical sources, produce different
+          # `.cargo-checksum.json` files. Excluding them removes this false
+          # positive without relaxing anything: the property we want is "the
+          # vendored sources are those of crates.io", and a tampered source
+          # would not match the fresh vendoring, whatever the content of its
+          # checksum file.
+          if ! diff -r --brief --exclude=.cargo-checksum.json vendor /tmp/vendor-fresh; then
+            echo "::error::a vendored source differs from what crates.io serves for Cargo.lock: modified source, or a lock file that no longer matches."
+            exit 1
+          fi
+          echo "vendor/: sources identical to crates.io, file for file."
+
+      # And the reverse: does each vendored file match the checksum that its
+      # own `.cargo-checksum.json` announces? That is what cargo checks at
+      # build time; we redo it here in the open, so that a modified source
+      # whose checksum map was also rewritten (and is therefore consistent
+      # with itself) is still caught by the previous step, which compares it
+      # with crates.io.
+      - name: Every vendored source matches its recorded checksum
+        shell: bash
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, glob, hashlib, os, sys
+          bad = 0
+          total = 0
+          for checksum_map in glob.glob("vendor/*/.cargo-checksum.json"):
+              d = os.path.dirname(checksum_map)
+              checksums = json.load(open(checksum_map))["files"]
+              for rel, expected in checksums.items():
+                  total += 1
+                  path = os.path.join(d, rel)
+                  try:
+                      actual = hashlib.sha256(open(path, "rb").read()).hexdigest()
+                  except FileNotFoundError:
+                      print(f"::error::{path}: listed in the checksums, missing from vendor")
+                      bad += 1
+                      continue
+                  if actual != expected:
+                      print(f"::error::{path}: content differs from the recorded checksum")
+                      bad += 1
+          print(f"{total} vendored files checked, {bad} inconsistent.")
+          sys.exit(1 if bad else 0)
+          PY
+
+  # Reproducible build: two directories, one hash.
+  #
+  # # What this job guards
+  #
+  # The SHA-256 hash published with a binary only proves the transport: it is
+  # produced on the same machine as the file, published in the same place,
+  # and replaced along with it by anyone who takes over the repository. The
+  # only proof that a binary really comes from public sources is that a third
+  # party can **rebuild it identically** and get the same hash. For that, the
+  # build must not depend on any local variable, and the first of these
+  # variables is the working directory, which rustc embeds in the binary for
+  # panic messages.
+  #
+  # This job builds the same commit in two directories of different length
+  # and depth, with no shared cache, and requires the two hashes to be equal.
+  # If they diverge, reproducibility is broken and the merge stops, before
+  # an unverifiable release is published.
+  #
+  # This is the property that Bitcoin Core obtains through Guix, and the
+  # condition for everything else: without it, the attestations repository
+  # has nothing to attest. See REPRODUCING.md.
+  reproducible:
+    name: Reproducible build
+    runs-on: ubuntu-latest
+    # The global `-D warnings` has no place here, and it even prevents this
+    # job from running. `verify-reproducible.sh` sets its own flags (the path
+    # remapping that makes the binary independent of the directory) and
+    # refuses to run if RUSTFLAGS is already set, because it would overwrite
+    # it silently. Emptying it for this job resolves the conflict;
+    # reproducibility does not care about warnings, it only looks at the
+    # bytes of the binary.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup default 1.95.0
+          rustc --version
+      # Deliberately without a cache: a cache shared between the two builds
+      # would reuse artifacts carrying the old path and would make the proof
+      # pass for the wrong reasons.
+      - name: Two builds, two directories
+        shell: bash
+        run: ./tools/verify-reproducible.sh
