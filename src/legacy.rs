@@ -46,9 +46,9 @@
 //!
 //! `reglages.txt` said `joignable=non` when the user chose not to accept
 //! incoming connections — typically to keep a home IP address out of other
-//! nodes' address books. An absent setting means *reachable*. Losing this
-//! line during an upgrade would silently open the router port and publish
-//! the address. So:
+//! nodes' address books. In 0.3.x and 0.4.0 an absent setting meant
+//! *reachable*; since 0.4.1 it means *not reachable*, but the translated
+//! line still matters to versions that would read it the old way. So:
 //!
 //! - it is translated before anything reads the settings;
 //! - any value other than `oui` becomes `reachable=no` (the more private

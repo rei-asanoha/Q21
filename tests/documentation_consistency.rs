@@ -317,3 +317,65 @@ fn macos_launcher_removes_the_quarantine() {
         "the quarantine must be removed before launching q21, not after"
     );
 }
+
+/// The monitoring unit keeps its state between runs.
+///
+/// `RuntimeDirectory=` alone makes systemd delete the directory each time the
+/// one-shot script exits: every run then takes its first measurement again,
+/// and a stuck node is never noticed. This was the published configuration up
+/// to 0.4.0, and it looked healthy: the timer ran, the script succeeded.
+#[test]
+fn monitoring_unit_preserves_its_state() {
+    let docs: Vec<String> = std::fs::read_dir(root())
+        .expect("repository root")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".md"))
+        .collect();
+    // Unit lines only: a line of its own, not a command that edits it.
+    const UNIT: &str = "\nRuntimeDirectory=q21-monitor\n";
+    const PRESERVED: &str = "\nRuntimeDirectory=q21-monitor\nRuntimeDirectoryPreserve=yes\n";
+    assert!(
+        docs.iter().any(|d| read(d).contains(UNIT)),
+        "no document shows the monitoring unit any more"
+    );
+    for doc in &docs {
+        let text = read(doc);
+        let units = text.matches(UNIT).count();
+        assert_eq!(
+            text.matches(PRESERVED).count(),
+            units,
+            "{doc}: a monitoring unit without RuntimeDirectoryPreserve=yes forgets \
+             its measurement after every run"
+        );
+    }
+}
+
+/// A release page lists what a user downloads and what proves it, nothing
+/// else: the archives, `SHA256SUMS` and its signature. The per-file `.sha256`
+/// that the build jobs produce are already inside `SHA256SUMS`, which is the
+/// signed one; publishing them separately invited checking an unsigned file.
+#[test]
+fn the_release_publishes_archives_and_signed_sums_only() {
+    let workflow = read(".github/workflows/release.yml");
+    let publish = &workflow[workflow
+        .find("- name: Publish the release")
+        .expect("publish step")..];
+    let files =
+        &publish[publish.find("files:").expect("files list")..publish.find("body:").expect("body")];
+    for wanted in [
+        "artifacts/q21-*.tar.gz",
+        "artifacts/q21-*.zip",
+        "artifacts/SHA256SUMS",
+        "artifacts/SHA256SUMS.minisig",
+    ] {
+        assert!(
+            files.contains(wanted),
+            "the release no longer publishes {wanted}"
+        );
+    }
+    assert!(
+        !files.contains("artifacts/*\n") && !files.contains(".sha256"),
+        "the release publishes the unsigned per-file hashes again"
+    );
+}

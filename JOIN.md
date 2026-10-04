@@ -9,13 +9,14 @@ everyone needs.
 
 **Taking part** — having a wallet, and mining if you want to. Your computer
 downloads the chain, checks it itself block by block, and trusts no one. That
-already makes it a full node. Since version 0.2, the wallet goes a step further
-without asking you anything: it also accepts connections from others and asks
-your home router to open access to it, so that the network does not depend on
-a single machine. Most routers do this on their own; if yours refuses, nothing
-changes for you, and your wallet simply remains a client that connects out to
-the network. You can see and change this setting in the wallet's Network tab.
-See Part 1.
+already makes it a full node. Your wallet is a **client**: it connects out to
+the network and accepts no incoming connection. You can turn on the Network
+tab's setting so that it also accepts connections from others and asks your
+home router to open access to it, which helps the network depend less on a
+single machine. It is off by default since version 0.4.1, because a reachable
+wallet announces your public IP address to every node of the network, and an
+address once announced cannot be called back. Turn it on only if you accept
+that. See Part 1.
 
 **Being an entry point** — a *bootstrap node*. A newcomer knows no one; they
 need a first address to knock on. An entry point is a node that can be reached

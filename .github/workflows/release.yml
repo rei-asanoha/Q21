@@ -485,7 +485,13 @@ jobs:
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          # The archives, and the signed hashes that prove them. The per-file
+          # .sha256 of the build jobs are inside SHA256SUMS already.
+          files: |
+            artifacts/q21-*.tar.gz
+            artifacts/q21-*.zip
+            artifacts/SHA256SUMS
+            artifacts/SHA256SUMS.minisig
           body: |
             ## Q21 wallet — public testnet
 

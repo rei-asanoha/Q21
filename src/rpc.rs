@@ -916,8 +916,9 @@ impl RpcContext {
             //     opening.
             //
             // We never claim "reachable" - we cannot prove it from here. We
-            // return the wanted setting, and the exact text of what the
-            // router answered.
+            // return the wanted setting, and what the router answered as a
+            // short code: `open NAT-PMP`, `open UPnP`, `failed`, or empty when
+            // nothing was asked. Never the public address.
             .set(
                 "reachable",
                 Json::Bool(self.reachable.load(std::sync::atomic::Ordering::SeqCst)),

@@ -635,6 +635,7 @@ Description=Q21 node monitoring
 Type=oneshot
 EnvironmentFile=/etc/q21/monitor.env
 RuntimeDirectory=q21-monitor
+RuntimeDirectoryPreserve=yes
 PrivateTmp=true
 NoNewPrivileges=true
 ProtectHome=true
@@ -658,6 +659,22 @@ sudo systemctl daemon-reload && sudo systemctl enable --now q21-monitor.timer
 log (`journalctl -t q21-monitor`). With a topic, you also receive the message.
 The state file lives in `/run/q21-monitor/`, which systemd creates for this
 service alone: no one else can put anything there.
+
+`RuntimeDirectoryPreserve=yes` is what keeps that file from one run to the
+next. Without it, systemd deletes the directory as soon as the script exits:
+every run then believes it is the first, records the height, and never sees
+a height that stopped moving. The monitoring runs and protects nothing. The
+directory is still emptied at reboot, which only restarts the measurement.
+
+**Check it works**, twenty minutes after enabling the timer:
+
+```bash
+sudo cat /run/q21-monitor/state
+```
+
+Two numbers, the height and the time it was recorded. Run it again ten
+minutes later: the height must have grown. If the file does not exist, the
+`RuntimeDirectoryPreserve=yes` line is missing from the unit.
 
 ---
 

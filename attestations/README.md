@@ -59,7 +59,7 @@ attestations/
 ├── builder-keys/
 │   ├── rei-asanoha.pub
 │   └── someone-else.pub
-└── v0.4.0/
+└── v0.4.1/
     ├── rei-asanoha/
     │   ├── SHA256SUMS
     │   └── SHA256SUMS.minisig
@@ -130,7 +130,7 @@ In a working folder, a file named `SHA256SUMS`:
 
 ```bash
 minisign -S -s <pseudonym>.key -m SHA256SUMS \
-  -t "Q21 v0.4.0 <commit hash> reproduced by <pseudonym>"
+  -t "Q21 v0.4.1 <commit hash> reproduced by <pseudonym>"
 ```
 
 **What you should see**: the password prompt, then nothing — silence means
@@ -150,7 +150,7 @@ minisign -Vm SHA256SUMS -p <pseudonym>.pub
 
 ```
 Signature and comment signature verified
-Trusted comment: Q21 v0.4.0 <commit> reproduced by <pseudonym>
+Trusted comment: Q21 v0.4.1 <commit> reproduced by <pseudonym>
 ```
 
 **If you see** `Signature verification failed`: the `SHA256SUMS` file has
@@ -162,12 +162,12 @@ Three files, at the three locations described in section 2:
 
 ```
 attestations/builder-keys/<pseudonym>.pub
-attestations/v0.4.0/<pseudonym>/SHA256SUMS
-attestations/v0.4.0/<pseudonym>/SHA256SUMS.minisig
+attestations/v0.4.1/<pseudonym>/SHA256SUMS
+attestations/v0.4.1/<pseudonym>/SHA256SUMS.minisig
 ```
 
 Then a pull request titled, for example,
-"attestation v0.4.0 — <pseudonym>".
+"attestation v0.4.1 — <pseudonym>".
 
 **Never modify** a folder bearing someone else's pseudonym. A pull request
 that touches a third party's attestation must be refused on principle, even
@@ -181,7 +181,7 @@ You need no rights on the repository for this, and it is the most useful
 thing a third party can do.
 
 ```bash
-cd attestations/v0.4.0
+cd attestations/v0.4.1
 for D in */; do
   P="../builder-keys/${D%/}.pub"
   printf '%-24s ' "${D%/}"

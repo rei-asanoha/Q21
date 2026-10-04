@@ -139,13 +139,52 @@ fn read_bootstrap_file(path: &Path) -> Vec<String> {
 /// The data directory keeps priority: what users write in their own directory
 /// wins over what the release dropped in.
 pub fn bootstrap_next_to_program() -> Vec<String> {
-    let Ok(exe) = std::env::current_exe() else {
-        return Vec::new();
-    };
-    let Some(dir) = exe.parent() else {
-        return Vec::new();
-    };
-    read_bootstrap_file(&dir.join(FILE_NAME))
+    program_dir()
+        .map(|d| bootstrap_in_program_dir(&d))
+        .unwrap_or_default()
+}
+
+/// The folder of the running program.
+fn program_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+/// Bootstrap addresses of a program folder: its `bootstrap.txt`, or, only when
+/// that file does not exist, the bootstrap file 0.3.x shipped there.
+///
+/// # The defect this fixes
+///
+/// The 0.3.x archives put their bootstrap file next to the program, under its
+/// 0.3.x name, and servers installed it there. The 0.4.0 data directory
+/// migration renames the file of the data directory, not this one, which may
+/// sit in a folder the node cannot even write to. A node upgraded that way
+/// started with no address at all, alone, and only said so in its log.
+///
+/// The old file is read, never renamed: the program folder belongs to the
+/// operator. An existing `bootstrap.txt`, even empty, wins: emptying it is a
+/// choice.
+pub fn bootstrap_in_program_dir(dir: &Path) -> Vec<String> {
+    let current = dir.join(FILE_NAME);
+    if current.exists() {
+        return read_bootstrap_file(&current);
+    }
+    read_bootstrap_file(&dir.join(crate::legacy::LEGACY_BOOTSTRAP_FILE))
+}
+
+/// The 0.3.x bootstrap file a program folder still relies on, if any: present,
+/// and not superseded by a `bootstrap.txt`. The binary names it at startup so
+/// that the operator renames it.
+pub fn legacy_file_in_program_dir(dir: &Path) -> Option<std::path::PathBuf> {
+    let legacy = dir.join(crate::legacy::LEGACY_BOOTSTRAP_FILE);
+    (!dir.join(FILE_NAME).exists() && legacy.exists()).then_some(legacy)
+}
+
+/// [`legacy_file_in_program_dir`] for the running program.
+pub fn legacy_bootstrap_next_to_program() -> Option<std::path::PathBuf> {
+    program_dir().and_then(|d| legacy_file_in_program_dir(&d))
 }
 
 /// Resolves `host:port`, or `host` alone with the network's default port.
@@ -212,6 +251,60 @@ pub fn read_bootstrap(contents: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    fn program_folder(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("q21-bootstrap-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A 0.3.x server install, upgraded by replacing the binary only, keeps
+    /// finding the network through its old file, and is told to rename it.
+    #[test]
+    fn the_legacy_file_next_to_the_program_is_still_read() {
+        let d = program_folder("legacy");
+        std::fs::write(
+            d.join(crate::legacy::LEGACY_BOOTSTRAP_FILE),
+            "# old\n192.0.2.7:21121\n",
+        )
+        .unwrap();
+        assert_eq!(super::bootstrap_in_program_dir(&d), vec!["192.0.2.7:21121"]);
+        assert_eq!(
+            super::legacy_file_in_program_dir(&d),
+            Some(d.join(crate::legacy::LEGACY_BOOTSTRAP_FILE))
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The new file wins, even empty: emptying it is a choice, and the old
+    /// one is then not mentioned any more.
+    #[test]
+    fn the_new_file_wins_over_the_legacy_one_even_empty() {
+        let d = program_folder("both");
+        std::fs::write(
+            d.join(crate::legacy::LEGACY_BOOTSTRAP_FILE),
+            "192.0.2.7:21121\n",
+        )
+        .unwrap();
+        std::fs::write(d.join(super::FILE_NAME), "198.51.100.9:21121\n").unwrap();
+        assert_eq!(
+            super::bootstrap_in_program_dir(&d),
+            vec!["198.51.100.9:21121"]
+        );
+        std::fs::write(d.join(super::FILE_NAME), "# nothing\n").unwrap();
+        assert!(super::bootstrap_in_program_dir(&d).is_empty());
+        assert_eq!(super::legacy_file_in_program_dir(&d), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_program_folder_without_any_file_gives_nothing() {
+        let d = program_folder("none");
+        assert!(super::bootstrap_in_program_dir(&d).is_empty());
+        assert_eq!(super::legacy_file_in_program_dir(&d), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::*;
 
     /// Three networks, three ports. Mixing them up must fail with "connection

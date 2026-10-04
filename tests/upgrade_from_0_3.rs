@@ -63,9 +63,11 @@ fn write_legacy_dir(d: &Path, reachable: &str) {
 fn a_not_reachable_wallet_stays_not_reachable_after_upgrade() {
     let d = fresh_dir("closed");
     write_legacy_dir(&d, "non");
-    // Before the upgrade, the new reader sees no setting: the default would
-    // be "reachable". This is exactly what must not happen.
-    assert!(q21_core::settings::reachable(&d));
+    // Before the upgrade, the new reader sees no setting. Since 0.4.1 that
+    // already means "not reachable", but the migration must still write the
+    // choice down: a 0.4.0 binary started on this folder later reads an
+    // absent setting as "reachable".
+    assert!(!d.join("settings.txt").exists());
 
     let stderr = start_binary(&d);
 

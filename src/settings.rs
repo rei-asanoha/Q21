@@ -5,7 +5,8 @@
 //! getting lost in it.
 //!
 //! The only key today is `reachable`: does this node accept incoming
-//! connections and ask the router to open its port? Up to 0.3.x the file
+//! connections and ask the router to open its port? It is **off** unless the
+//! user turns it on. Up to 0.3.x the file
 //! had another name and other keys; [`crate::legacy::migrate_data_dir`]
 //! translates it before anything reads it.
 
@@ -19,17 +20,22 @@ pub const REACHABLE_KEY: &str = "reachable";
 
 /// Reads the "is this node reachable from outside" setting.
 ///
-/// Absent file or absent key = **yes**: by default, a wallet contributes to
-/// the network by accepting connections. An unreadable file also falls back
-/// to yes, so the default does not depend on the state of the disk.
+/// Only an explicit `reachable=yes` makes a wallet reachable. An absent file,
+/// an absent key, an unreadable file, any other value or a typo: the node
+/// stays a client.
 ///
-/// A key that is present is read strictly: only `yes` means reachable. Any
-/// other value, including a typo, keeps the node closed. The user who wrote
-/// something there did not ask to be exposed.
+/// # Why off by default
+///
+/// A reachable wallet asks the home router to open a port and announces its
+/// public address to its peers, which pass it on: the owner's home IP address
+/// ends up in the address book of every node of the network, and an address
+/// once gossiped cannot be called back. Up to 0.4.0 this was the default.
+/// Turning it on must be a choice made knowing that, never a side effect of
+/// installing a wallet.
 pub fn reachable(datadir: &Path) -> bool {
     let text = match std::fs::read_to_string(datadir.join(FILE_NAME)) {
         Ok(t) => t,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     reachable_from_text(&text)
 }
@@ -43,7 +49,7 @@ pub fn reachable_from_text(text: &str) -> bool {
             }
         }
     }
-    true
+    false
 }
 
 /// Writes the reachability setting. Atomic write (temporary file then
@@ -91,10 +97,21 @@ mod tests {
         d
     }
 
+    /// Security regression: a new wallet, with no setting at all, must not
+    /// open the router port nor announce its owner's address.
     #[test]
-    fn absent_file_means_reachable() {
+    fn absent_file_means_not_reachable() {
         let d = dir("absent");
-        assert!(reachable(&d));
+        assert!(!reachable(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unreadable_file_means_not_reachable() {
+        let d = dir("unreadable");
+        // A directory where the file should be: present but unreadable.
+        std::fs::create_dir_all(d.join(FILE_NAME)).unwrap();
+        assert!(!reachable(&d));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -105,7 +122,10 @@ mod tests {
         // A 0.3.x-style value ("non") is not `yes`.
         assert!(!reachable_from_text("reachable=non\n"));
         assert!(!reachable_from_text("reachable=\n"));
-        assert!(reachable_from_text("other=1\n"));
+        assert!(!reachable_from_text("reachable=YES\n"));
+        // Another key only: the setting is absent, so off.
+        assert!(!reachable_from_text("other=1\n"));
+        assert!(!reachable_from_text(""));
     }
 
     #[test]

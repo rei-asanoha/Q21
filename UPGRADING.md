@@ -65,6 +65,83 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.0 to 0.4.1
+
+0.4.1 is a drop-in replacement: same protocol (3), same chain, same data
+directory. A 0.4.0 node and a 0.4.1 node talk to each other, and nothing is
+converted. Replace the program, restart, and read the four changes below.
+
+## Your wallet is a client unless you say otherwise
+
+Up to 0.4.0, a wallet was **reachable by default**: it listened for incoming
+connections, asked your router to open a port, and announced your public IP
+address to its peers, which passed it on to every node of the network. An
+address once announced cannot be called back.
+
+Since 0.4.1, a wallet is reachable **only** if `settings.txt` says
+`reachable=yes`, which is what the Network tab writes when you turn the
+setting on. Concretely:
+
+| Before the update | After |
+|---|---|
+| you never touched the setting | **client** (it was reachable) |
+| you turned it off (`reachable=no`) | client |
+| you turned it on (`reachable=yes`) | reachable, as you chose |
+
+If you want your wallet to stay reachable, turn the setting on again in the
+Network tab and restart the wallet. The tab no longer shows your public
+address: only whether your router opened the port.
+
+## Servers: the monitoring now keeps its measurement
+
+The monitoring unit published up to 0.4.0 let systemd delete its state file
+after every run, so every run took its first measurement again and a stuck
+node was never noticed. If you installed it, add one line to the unit:
+
+```bash
+sudo sed -i 's/^RuntimeDirectory=q21-monitor$/RuntimeDirectory=q21-monitor\nRuntimeDirectoryPreserve=yes/' /etc/systemd/system/q21-monitor.service
+sudo systemctl daemon-reload && sudo systemctl start q21-monitor.service
+sudo cat /run/q21-monitor/state
+```
+
+The last command prints the height and the time it was recorded. Ten minutes
+later, the height must have grown. `tools/monitor.sh` itself did not change,
+only its comments: an installed copy can stay.
+
+## A 0.3.x bootstrap file next to the program is read again
+
+The 0.4.0 migration renamed the bootstrap file of the data directory, not the
+one that 0.3.x archives put **next to the program**. A server upgraded by
+replacing its binary only, with that old file still beside it, started with no
+address to contact. 0.4.1 reads it again when no `bootstrap.txt` stands next
+to the program, and says so at startup:
+
+```
+  bootstrap: reading the 0.3.x file /opt/q21/amorces.txt. Rename it to bootstrap.txt next to the program.
+```
+
+Rename it, or replace it with the `bootstrap.txt` of the archive, which names
+the current entry points.
+
+## The release page lists only what you need
+
+The archives, `SHA256SUMS` and `SHA256SUMS.minisig`. The separate `.sha256`
+files are gone: their content is in `SHA256SUMS`, which is the signed one.
+
+## Updating a server
+
+The service and its options do not change. Download, check the signature as
+in [SIGNING.md](SIGNING.md), then:
+
+```bash
+sudo systemctl stop q21
+sudo install -o root -g root -m 0755 q21 /opt/q21/q21
+sudo systemctl start q21
+sudo /opt/q21/q21 version
+```
+
+---
+
 # Upgrading from 0.3.x to 0.4.0
 
 Version 0.4.0 moves the program to English: file names, options, commands

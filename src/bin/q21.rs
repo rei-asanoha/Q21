@@ -1755,14 +1755,17 @@ fn port_mapping_loop(
     while !q21_core::shutdown::requested() {
         match q21_core::nat::open_port(port) {
             Ok(o) => {
-                let text = format!(
-                    "succeeded via {} — external address {}:{}",
+                // The interface gets a short code, not the sentence: it
+                // translates the code, and it never shows the public address
+                // (a screenshot of the Network tab must not reveal it). The
+                // full text stays in this window, for diagnosis.
+                if let Ok(mut e) = state.lock() {
+                    *e = format!("open {}", o.method);
+                }
+                println!(
+                    "  router port mapping: succeeded via {} — external address {}:{}",
                     o.method, o.external_address, o.external_port
                 );
-                if let Ok(mut e) = state.lock() {
-                    *e = text.clone();
-                }
-                println!("  router port mapping: {text}");
                 // We announce our external address: it enters the peers'
                 // address books, then spreads. The address was already
                 // verified to be public by `nat::open_port`.
@@ -1785,9 +1788,8 @@ fn port_mapping_loop(
                 }
             }
             Err(e) => {
-                let text = format!("impossible ({e})");
                 if let Ok(mut g) = state.lock() {
-                    *g = text.clone();
+                    *g = "failed".to_string();
                 }
                 println!(
                     "  router port mapping impossible: {e}\n  \
@@ -2441,7 +2443,15 @@ fn cmd_diagnostic(datadir: &Path, args: &[String]) -> Result<(), String> {
         Some(c) if c.exists() => {
             println!("  {}: {} address(es)", c.display(), next_to_program.len())
         }
-        Some(c) => println!("  {}: MISSING", c.display()),
+        Some(c) => match q21_core::bootstrap::legacy_bootstrap_next_to_program() {
+            Some(old) => println!(
+                "  {}: MISSING, the 0.3.x file {} is read instead: {} address(es)",
+                c.display(),
+                old.display(),
+                next_to_program.len()
+            ),
+            None => println!("  {}: MISSING", c.display()),
+        },
         None => {}
     }
 
@@ -4589,6 +4599,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // comes after the data directory: what the user writes at home always
         // wins over what the release dropped there.
         targets.extend(q21_core::bootstrap::bootstrap_next_to_program());
+        if let Some(old) = q21_core::bootstrap::legacy_bootstrap_next_to_program() {
+            println!(
+                "  bootstrap: reading the 0.3.x file {}. Rename it to {} next to the program.",
+                old.display(),
+                q21_core::bootstrap::FILE_NAME
+            );
+        }
         targets.extend(
             q21_core::bootstrap::builtin_bootstrap(network)
                 .iter()
@@ -5564,9 +5581,15 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     println!("  To stop, either:");
     println!("    - the \"Close the wallet\" button, Info tab;");
     println!("    - close this window;");
-    println!("    - Ctrl-C here. Windows then asks \"Terminate batch job");
-    println!("      (Y/N)?\": answer Y. This is not an error,");
-    println!("      everything is already saved when this question appears.");
+    // The batch-file question exists only on Windows: elsewhere, mentioning
+    // it made users look for a question that never comes.
+    if cfg!(windows) {
+        println!("    - Ctrl-C here. Windows then asks \"Terminate batch job");
+        println!("      (Y/N)?\": answer Y. This is not an error,");
+        println!("      everything is already saved when this question appears.");
+    } else {
+        println!("    - Ctrl-C here. Everything is saved before the program exits.");
+    }
     println!();
 
     // 5. The node, with the wallet methods and the token.
@@ -5580,12 +5603,12 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         // information, the address to open.
         "--quiet".to_string(),
     ];
-    // Layers 1 and 2: by default, the wallet CONTRIBUTES to the network. It
-    // listens for incoming connections and asks the router to open its port,
-    // so that the network no longer relies on a single entry point. The
-    // setting is changed in the interface (Network tab) and lives in
-    // `settings.txt`. Nothing is added if the user already set `--listen` by
-    // hand: their choice wins.
+    // Layers 1 and 2: only when the user turned it on (Network tab, stored in
+    // `settings.txt`), the wallet listens for incoming connections and asks
+    // the router to open its port. It is off by default: a reachable wallet
+    // announces its owner's public address to the whole network, see
+    // `q21_core::settings::reachable`. Nothing is added if the user already
+    // set `--listen` by hand: their choice wins.
     if read_reachable(datadir) && !rest.iter().any(|a| a == "--listen") {
         arguments.push("--listen".to_string());
         arguments.push(String::new()); // default P2P port of the network

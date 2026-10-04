@@ -15,7 +15,9 @@
 #   Q21_SERVICE    systemd service name        (default: q21)
 #   Q21_STATE      file to record the height in (default: the runtime
 #                  directory that systemd provides with
-#                  RuntimeDirectory=q21-monitor, otherwise /run/q21-monitor)
+#                  RuntimeDirectory=q21-monitor, otherwise /run/q21-monitor;
+#                  the unit needs RuntimeDirectoryPreserve=yes, or systemd
+#                  deletes the file after every run, see SERVER.md)
 #   Q21_THRESHOLD  minutes without a block before acting (default: 30)
 #   Q21_NTFY       ntfy topic, for example q21-my-server-a7f3 (default: none;
 #                  to be provided through an EnvironmentFile with mode 0600,
