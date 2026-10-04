@@ -293,8 +293,9 @@ useless.
 
 ## What the wallet still does not do
 
-- **The history is bounded.** Without a per-address index, it goes back 5,000
-  blocks. The response says so, and the screen shows it.
+- **The history is complete only with the address index.** The wallet
+  builds it by default since 0.4.2. Started with `--no-index` (or `--prune`),
+  it goes back 5,000 blocks. The response says so, and the screen shows it.
 - **The wallet and mining only coexist with `--mine`.** Without this option,
   a transaction waits for someone to mine, and mining requires stopping the
   wallet. `q21 wallet --mine` does both at once.

@@ -65,6 +65,56 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.1 to 0.4.2
+
+0.4.2 is a drop-in replacement: same protocol (3), same chain, same data
+directory. It fixes the search of the explorer opened from the wallet, and the
+Activity tab of a wallet that mines.
+
+## What was wrong
+
+| Symptom in 0.4.1 | Cause | 0.4.2 |
+|---|---|---|
+| Opened from the wallet, the explorer asks for an "access token" and every search stays on "Searching…" | The wallet's link handed the explorer a token it could not use | The explorer uses the wallet's session, which is served by the same node |
+| A transaction older than about three days is "not found" | The wallet's node had no address index: 2,000 blocks at most | The wallet builds the index |
+| An address page never shows what the address sent | Same cause | Same fix |
+| An address copied by hand, `0,5`, `0.5 Q21` or `1 000,5` are refused | The search required the exact form the node prints | Spaces, line breaks, a decimal comma and the unit are accepted |
+| An identifier copied from a list (`f470f6d8d1652b74…`) is refused | Lists show 16 characters | 8 characters or more are completed, if only one identifier matches |
+| A payment just sent is not on the recipient's address page | The mempool was ignored | Pending movements are shown, marked "pending" |
+| "Sent" shows nothing in the Activity of a wallet that mines | The page filtered the last 100 rows, all mining rewards | The node filters before the limit, over the whole history |
+| Activity stops at the 100 most recent rows | No way to ask for more | **Show older movements**, a hundred at a time, up to 2,000 |
+| A synchronization stalls on blocks that carry transactions: one block per connection, and the peer is penalized | A requested block arriving before its parent was dropped | It waits for its parent, then connects |
+| A wallet restored from its backup code can miss addresses whose coins were all spent | Discovery only counted addresses still holding a coin | With the index, an address counts as used if it ever appeared in the chain |
+
+## The address index, now built by the wallet
+
+On the first start of 0.4.2, the wallet reads the whole chain once to build
+the index. This takes a few seconds and writes an `index.dat` file in the data
+folder. Then each new block updates it.
+
+Nothing to do. To keep the old behavior, start the wallet with `--no-index`.
+A wallet started with `--prune` never builds it.
+
+## Restoring from the backup code
+
+A wallet restored on a new machine finds its addresses again while the chain
+arrives. Since 0.4.2 it also recognizes the addresses it emptied, through the
+address index: the balance and the whole history come back, sends included.
+
+## The Receive tab
+
+The address to give is now shown at the top of the Receive tab, whole, with a
+**Copy the address** button and a link to see it in the explorer. Every
+address of the wallet stays valid: the new display changes no address.
+
+## Updating a server
+
+The public explorer already runs with `--address-index`: only the search
+tolerance and the pending movements change there. The steps are the same as
+for 0.4.1, below.
+
+---
+
 # Upgrading from 0.4.0 to 0.4.1
 
 0.4.1 is a drop-in replacement: same protocol (3), same chain, same data
@@ -327,9 +377,8 @@ blockchain links an address to its transactions. You have to go through all of
 them.
 
 `q21 explorer` therefore builds an **index** at startup, and the search is
-then complete. Your wallet does not do it by default — that would make you pay
-in disk space and in writes for a convenience it does not need. Add
-`--address-index` if you want it there too.
+then complete. Since 0.4.2 your wallet does too (see the 0.4.1 to 0.4.2
+section); `--no-index` turns it off.
 
 In both cases **the page always says which of the two paths was used**:
 

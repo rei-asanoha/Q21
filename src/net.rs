@@ -753,7 +753,24 @@ struct Shared {
     /// does not move. Rebuilding it is expensive (state snapshot +
     /// commitment): we only do it on request, and only once per tip.
     snapshot_cache: Option<SnapshotCache>,
+    /// Compact blocks we requested whose parent was still on its way.
+    ///
+    /// A synchronization requests up to sixteen bodies at once. When one of
+    /// them carries a transaction this node has never seen - always the case
+    /// for a block of the past - its reconstruction costs a round trip, and
+    /// the next bodies arrive before their parent is connected. They used to
+    /// be dropped without a word: the sync then stood still until the body
+    /// deadline, and the honest peer was penalized for "withholding" them.
+    /// Observed in 0.4.1: one block per connection, past the first block
+    /// holding a large transaction. They now wait here and are resumed as
+    /// soon as their parent is connected. Bounded, and only for bodies this
+    /// node asked for.
+    parked: Vec<(u64, Box<CompactBlock>)>,
 }
+
+/// How many requested compact blocks may wait for their parent. Two batches
+/// of bodies in flight: no honest situation needs more.
+const MAX_PARKED: usize = 2 * MAX_BODIES_IN_FLIGHT;
 
 /// The served snapshot, frozen for a given tip.
 struct SnapshotCache {
@@ -827,6 +844,10 @@ pub struct Stats {
     /// scan and allocation, under the lock. This is the expense the bucket
     /// bounds; see [`CMPCT_RATE_PER_SEC`].
     pub compacts_reconstructed: AtomicU64,
+    /// Requested compact blocks that arrived before their parent, and waited.
+    pub compacts_parked: AtomicU64,
+    /// Of those, the ones resumed once their parent was connected.
+    pub compacts_resumed: AtomicU64,
     /// Compact announcements rejected by the bucket, without reconstruction.
     pub compacts_rejected: AtomicU64,
     /// Compact announcements whose header was rejected **before** any
@@ -878,6 +899,7 @@ impl Node {
                 nonce,
                 journal: None,
                 snapshot_cache: None,
+                parked: Vec::new(),
             })),
             magic: magic_for(network),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -1923,6 +1945,19 @@ impl Node {
                                 p.continue_sync(id, chain, &mut outgoing, Instant::now(), true);
                             }
                         }
+                    } else if handshaked
+                        && !g.chain.has_block(&c.header.prev_block)
+                        && g.peers
+                            .get(&id)
+                            .is_some_and(|p| p.requested_bodies.contains_key(&bid))
+                    {
+                        // Requested, but its parent is still on its way: it
+                        // waits for it. See `Shared::parked`.
+                        if g.parked.len() >= MAX_PARKED {
+                            g.parked.remove(0);
+                        }
+                        g.parked.push((id, c));
+                        self.stats.compacts_parked.fetch_add(1, Ordering::Relaxed);
                     } else if !handshaked || !g.chain.has_block(&c.header.prev_block) {
                         // --- Defense: work imposed by a stranger.
                         //
@@ -1971,136 +2006,9 @@ impl Node {
                                     drop_peer = true;
                                 }
                             }
-                        } else if let Err(e) = g.chain.check_header(&c.header, unix_now()) {
-                            // --- Defense: the header before the body (BIP 152).
-                            //
-                            // The bucket bounds the NUMBER of announcements; it
-                            // says nothing about their value. An announcement
-                            // whose header did not carry the work its position
-                            // requires still made us search the mempool and
-                            // allocate the reconstruction, under the lock.
-                            // Now: height, finality, difficulty, timestamp and
-                            // work are checked on the 160 bytes of the header,
-                            // and nothing else is touched if one of them fails.
-                            // These are the same checks that submitting the full
-                            // block would apply; we only move them earlier.
-                            //
-                            // A false header can only come from whoever
-                            // fabricated it: same penalty as an invalid block,
-                            // and we request nothing again — its body is worth
-                            // no more.
-                            //
-                            // Exception: what this binary cannot read is not
-                            // the peer's fault.
-                            self.stats
-                                .compacts_header_rejected
-                                .fetch_add(1, Ordering::Relaxed);
-                            match e {
-                                crate::chain::ChainError::Validation(v)
-                                    if locally_unverifiable_scheme(&v).is_some() =>
-                                {
-                                    report_unverifiable_scheme(
-                                        locally_unverifiable_scheme(&v).expect("guarded"),
-                                    );
-                                }
-                                _ => {
-                                    self.stats.invalid_blocks.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(p) = g.peers.get_mut(&id) {
-                                        p.ban_score =
-                                            p.ban_score.saturating_add(MISCONDUCT_BAD_BLOCK);
-                                        if p.ban_score >= BAN_THRESHOLD {
-                                            self.stats.peers_banned.fetch_add(1, Ordering::Relaxed);
-                                            drop_peer = true;
-                                        }
-                                    }
-                                }
-                            }
                         } else {
-                            self.stats
-                                .compacts_reconstructed
-                                .fetch_add(1, Ordering::Relaxed);
-                            let available = Self::useful_mempool_txs(&g.mempool, &c);
-                            match Reconstruction::from_compact(&c, &available) {
-                                Ok(r) if r.is_complete() => {
-                                    self.stats
-                                        .compacts_without_round_trip
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    match r.finish() {
-                                        Ok(b) => {
-                                            drop_peer = !Self::integrate(
-                                                &mut g,
-                                                &b,
-                                                &self.stats,
-                                                &mut outgoing,
-                                                id,
-                                            );
-                                        }
-                                        Err(_) => {
-                                            // Plausible but wrong reconstruction:
-                                            // we request the full block again.
-                                            outgoing.push(Outgoing {
-                                                peer: id,
-                                                message: Message::GetData(vec![InvItem {
-                                                    kind: InvKind::Block,
-                                                    hash: bid,
-                                                }]),
-                                            });
-                                        }
-                                    }
-                                }
-                                Ok(r) => {
-                                    let indices = r.missing().to_vec();
-                                    if let Some(p) = g.peers.get_mut(&id) {
-                                        // Beyond the bound, the oldest gives way:
-                                        // we never keep more than what the peer
-                                        // can honestly have in flight.
-                                        if p.pending.len() >= MAX_PENDING_RECONSTRUCTIONS {
-                                            let oldest = p
-                                                .pending
-                                                .iter()
-                                                .min_by_key(|(_, (cb, _))| cb.header.height)
-                                                .map(|(k, _)| *k);
-                                            if let Some(k) = oldest {
-                                                p.pending.remove(&k);
-                                            }
-                                        }
-                                        p.pending.insert(bid, (*c.clone(), indices.clone()));
-                                    }
-                                    outgoing.push(Outgoing {
-                                        peer: id,
-                                        message: Message::GetBlockTxn {
-                                            block: bid,
-                                            indices,
-                                        },
-                                    });
-                                }
-                                Err(_) => {
-                                    // Rejected before even looking for the
-                                    // transactions: missing coinbase, index
-                                    // outside the block, absurd count. An
-                                    // announcement made this way can only come
-                                    // from the peer that fabricated it — unlike
-                                    // a wrong Merkle root, which can arise from a
-                                    // collision of short identifiers. We request
-                                    // the full block again, and the peer loses
-                                    // points.
-                                    if let Some(p) = g.peers.get_mut(&id) {
-                                        p.ban_score =
-                                            p.ban_score.saturating_add(MISCONDUCT_CMPCT_REJECTED);
-                                        if p.ban_score >= BAN_THRESHOLD {
-                                            self.stats.peers_banned.fetch_add(1, Ordering::Relaxed);
-                                            drop_peer = true;
-                                        }
-                                    }
-                                    outgoing.push(Outgoing {
-                                        peer: id,
-                                        message: Message::GetData(vec![InvItem {
-                                            kind: InvKind::Block,
-                                            hash: bid,
-                                        }]),
-                                    });
-                                }
-                            }
+                            drop_peer =
+                                !Self::accept_compact(&mut g, &self.stats, c, id, &mut outgoing);
                         }
                     }
                 }
@@ -2524,6 +2432,142 @@ impl Node {
         m
     }
 
+    /// Checks and reconstructs a compact block whose parent is known.
+    ///
+    /// Shared by an announcement that arrives in order and by one parked while
+    /// its parent was still on its way (see [`Shared::parked`]). Returns false
+    /// when the peer must be dropped.
+    fn accept_compact(
+        g: &mut Shared,
+        stats: &Stats,
+        c: Box<CompactBlock>,
+        id: u64,
+        outgoing: &mut Vec<Outgoing>,
+    ) -> bool {
+        let bid = c.header.block_id();
+        let mut drop_peer = false;
+        if let Err(e) = g.chain.check_header(&c.header, unix_now()) {
+            // --- Defense: the header before the body (BIP 152).
+            //
+            // The bucket bounds the NUMBER of announcements; it
+            // says nothing about their value. An announcement
+            // whose header did not carry the work its position
+            // requires still made us search the mempool and
+            // allocate the reconstruction, under the lock.
+            // Now: height, finality, difficulty, timestamp and
+            // work are checked on the 160 bytes of the header,
+            // and nothing else is touched if one of them fails.
+            // These are the same checks that submitting the full
+            // block would apply; we only move them earlier.
+            //
+            // A false header can only come from whoever
+            // fabricated it: same penalty as an invalid block,
+            // and we request nothing again — its body is worth
+            // no more.
+            //
+            // Exception: what this binary cannot read is not
+            // the peer's fault.
+            stats
+                .compacts_header_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            match e {
+                crate::chain::ChainError::Validation(v)
+                    if locally_unverifiable_scheme(&v).is_some() =>
+                {
+                    report_unverifiable_scheme(locally_unverifiable_scheme(&v).expect("guarded"));
+                }
+                _ => {
+                    stats.invalid_blocks.fetch_add(1, Ordering::Relaxed);
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        p.ban_score = p.ban_score.saturating_add(MISCONDUCT_BAD_BLOCK);
+                        if p.ban_score >= BAN_THRESHOLD {
+                            stats.peers_banned.fetch_add(1, Ordering::Relaxed);
+                            drop_peer = true;
+                        }
+                    }
+                }
+            }
+        } else {
+            stats.compacts_reconstructed.fetch_add(1, Ordering::Relaxed);
+            let available = Self::useful_mempool_txs(&g.mempool, &c);
+            match Reconstruction::from_compact(&c, &available) {
+                Ok(r) if r.is_complete() => {
+                    stats
+                        .compacts_without_round_trip
+                        .fetch_add(1, Ordering::Relaxed);
+                    match r.finish() {
+                        Ok(b) => {
+                            drop_peer = !Self::integrate(g, &b, stats, outgoing, id);
+                        }
+                        Err(_) => {
+                            // Plausible but wrong reconstruction:
+                            // we request the full block again.
+                            outgoing.push(Outgoing {
+                                peer: id,
+                                message: Message::GetData(vec![InvItem {
+                                    kind: InvKind::Block,
+                                    hash: bid,
+                                }]),
+                            });
+                        }
+                    }
+                }
+                Ok(r) => {
+                    let indices = r.missing().to_vec();
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        // Beyond the bound, the oldest gives way:
+                        // we never keep more than what the peer
+                        // can honestly have in flight.
+                        if p.pending.len() >= MAX_PENDING_RECONSTRUCTIONS {
+                            let oldest = p
+                                .pending
+                                .iter()
+                                .min_by_key(|(_, (cb, _))| cb.header.height)
+                                .map(|(k, _)| *k);
+                            if let Some(k) = oldest {
+                                p.pending.remove(&k);
+                            }
+                        }
+                        p.pending.insert(bid, (*c.clone(), indices.clone()));
+                    }
+                    outgoing.push(Outgoing {
+                        peer: id,
+                        message: Message::GetBlockTxn {
+                            block: bid,
+                            indices,
+                        },
+                    });
+                }
+                Err(_) => {
+                    // Rejected before even looking for the
+                    // transactions: missing coinbase, index
+                    // outside the block, absurd count. An
+                    // announcement made this way can only come
+                    // from the peer that fabricated it — unlike
+                    // a wrong Merkle root, which can arise from a
+                    // collision of short identifiers. We request
+                    // the full block again, and the peer loses
+                    // points.
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        p.ban_score = p.ban_score.saturating_add(MISCONDUCT_CMPCT_REJECTED);
+                        if p.ban_score >= BAN_THRESHOLD {
+                            stats.peers_banned.fetch_add(1, Ordering::Relaxed);
+                            drop_peer = true;
+                        }
+                    }
+                    outgoing.push(Outgoing {
+                        peer: id,
+                        message: Message::GetData(vec![InvItem {
+                            kind: InvKind::Block,
+                            hash: bid,
+                        }]),
+                    });
+                }
+            }
+        }
+        !drop_peer
+    }
+
     fn integrate(
         g: &mut Shared,
         b: &Block,
@@ -2571,7 +2615,7 @@ impl Node {
                     });
                 }
                 Self::body_arrived(g, source, outgoing);
-                true
+                Self::resume_parked(g, stats, bid, source, outgoing)
             }
             Ok(Accept::SideBranch) => {
                 // A side branch is valid work: if it wins later, its bodies
@@ -2581,7 +2625,7 @@ impl Node {
                     j.record(b);
                 }
                 Self::body_arrived(g, source, outgoing);
-                true
+                Self::resume_parked(g, stats, bid, source, outgoing)
             }
             Ok(_) => {
                 Self::body_arrived(g, source, outgoing);
@@ -2619,6 +2663,38 @@ impl Node {
                 true
             }
         }
+    }
+
+    /// The compact blocks that were waiting for `parent`, now connected, go
+    /// through the normal path. A reconstruction that completes connects its
+    /// block and resumes, in turn, the one waiting for it: a whole batch
+    /// unrolls without a round trip of its own.
+    fn resume_parked(
+        g: &mut Shared,
+        stats: &Stats,
+        parent: Hash256,
+        source: u64,
+        outgoing: &mut Vec<Outgoing>,
+    ) -> bool {
+        let (ready, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut g.parked)
+            .into_iter()
+            .partition(|(_, c)| c.header.prev_block == parent);
+        g.parked = keep;
+        let mut keep_source = true;
+        for (id, c) in ready {
+            if g.chain.has_block(&c.header.block_id()) || !g.peers.contains_key(&id) {
+                continue;
+            }
+            stats.compacts_resumed.fetch_add(1, Ordering::Relaxed);
+            if !Self::accept_compact(g, stats, c, id, outgoing) {
+                if id == source {
+                    keep_source = false;
+                } else if let Some(p) = g.peers.get_mut(&id) {
+                    p.ban_score = p.ban_score.max(BAN_THRESHOLD);
+                }
+            }
+        }
+        keep_source
     }
 
     /// A body has arrived from a peer: its in-flight slot is freed, and the
@@ -3764,6 +3840,55 @@ mod tests_hardening {
         assert_eq!(b.stats.work_outside_lock.load(Ordering::Relaxed), 0);
         assert_eq!(memo(&b).computed.load(Ordering::Relaxed), 0);
         assert!(memo(&b).is_empty());
+    }
+
+    /// Bodies requested together, the second arriving before the first is
+    /// connected - what a round trip for a missing transaction causes during
+    /// every synchronization. The second waits and follows its parent; in
+    /// 0.4.1 it was dropped, and the sync stood still until the deadline.
+    #[test]
+    fn a_requested_compact_waits_for_its_parent() {
+        let (a, b) = node_pair();
+        let _e = established_peer(&b, 7);
+        crate::net::tests_util::mine_locally(&a, 2);
+        let (b1, b2) = a.with_chain(|c| (c.block_at(1).unwrap(), c.block_at(2).unwrap()));
+        {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.requested_bodies
+                .insert(b1.header.block_id(), Instant::now());
+            p.requested_bodies
+                .insert(b2.header.block_id(), Instant::now());
+        }
+        let _ = b.handle(
+            7,
+            Message::CmpctBlock(Box::new(CompactBlock::from_block(&b2, 1))),
+        );
+        assert_eq!(b.height(), 0);
+        assert_eq!(b.stats.compacts_parked.load(Ordering::Relaxed), 1);
+        assert!(b.handle(7, Message::Block(Box::new(b1))));
+        assert_eq!(b.height(), 2, "the waiting block must follow its parent");
+        assert_eq!(b.stats.compacts_resumed.load(Ordering::Relaxed), 1);
+        let g = b.shared.lock().unwrap();
+        assert!(g.parked.is_empty());
+        assert_eq!(g.peers[&7].ban_score, 0, "an honest peer is not punished");
+    }
+
+    /// An announcement nobody asked for, whose parent is unknown, does not
+    /// wait: only requested bodies may take a place, and the places are
+    /// bounded.
+    #[test]
+    fn an_unrequested_orphan_compact_does_not_wait() {
+        let (a, b) = node_pair();
+        let _e = established_peer(&b, 7);
+        crate::net::tests_util::mine_locally(&a, 2);
+        let b2 = a.with_chain(|c| c.block_at(2).unwrap());
+        let _ = b.handle(
+            7,
+            Message::CmpctBlock(Box::new(CompactBlock::from_block(&b2, 1))),
+        );
+        assert_eq!(b.stats.compacts_parked.load(Ordering::Relaxed), 0);
+        assert!(b.shared.lock().unwrap().parked.is_empty());
     }
 
     /// Header requests go through a bucket: beyond it, nothing is served.

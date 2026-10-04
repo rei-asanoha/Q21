@@ -2034,7 +2034,7 @@ fn latent_flaw_unescaped_insertion_points_in_the_explorer() {
         "q21(",
     ];
     // Raw insertions allowed, and the reason for each.
-    const RAW_ALLOWED: [&str; 13] = [
+    const RAW_ALLOWED: [&str; 15] = [
         // Condition of a ternary: never inserted, only tested.
         "n",
         // Numeric fields from the node (`Json::u64`), so never strings.
@@ -2051,6 +2051,10 @@ fn latent_flaw_unescaped_insertion_points_in_the_explorer() {
         // afterward is a literal chosen in the page itself.
         "t.coinbase",
         "m.coinbase",
+        // Mempool rows: the condition picks the "pending" badge, a literal of
+        // the page, or the block link, which escapes.
+        "m.pending",
+        "s.pending",
         // Boolean of `badge(text, gray)`: condition of a ternary whose two
         // branches are literals of the page. The text goes through esc()
         // right after.

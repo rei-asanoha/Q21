@@ -78,6 +78,9 @@ COMMANDS
                              --port <n>           listening port (default: free)
                              --no-browser         does not open the browser,
                                                   prints the address
+                             --no-index           without the address index
+                                                  (explorer and history then
+                                                  bounded to recent blocks)
     node [options]           Starts a network node
                              --network <name>     testnet or regtest. Allows
                                                   starting WITHOUT a wallet:
@@ -2202,14 +2205,51 @@ fn reexamine_reservations(wallet: &mut Wallet, chain: &Chain, archive: &BlockArc
 /// from genesis **before** any write: the recovered addresses are new for
 /// this file, and the earlier verification did not cover them. Returns the
 /// number of recovered outputs.
-fn discover_in_loop(w: &mut Wallet, c: &Chain) -> usize {
+///
+/// With the address index, an address counts as used when it ever appeared
+/// in the chain, not only while it still holds a coin. See [`address_used`].
+fn discover_in_loop(w: &mut Wallet, c: &Chain, history: Option<&q21_core::index::Index>) -> usize {
     let found = {
         let u = &c.utxo;
         if u.is_empty() {
             return 0;
         }
-        w.discover(|e| u.knows(e))
+        w.discover(|e| address_used(e, c, history))
     };
+    rescan_one_time_keys(w, c, found);
+    found
+}
+
+/// Has this address been used? It holds a coin today, or - when the address
+/// index is there - it appears anywhere in the chain.
+///
+/// # The defect this closes
+///
+/// Discovery used to ask the first question only. A restore that received a
+/// long chain at once, from a wallet that had emptied its first two hundred
+/// addresses, found nothing in the first window and stopped: balance and
+/// history incomplete, with nothing on screen to say so. The gap rule of
+/// deterministic wallets is about **used** addresses, and a spent address
+/// was used.
+fn address_used(h: &Hash256, c: &Chain, history: Option<&q21_core::index::Index>) -> bool {
+    c.utxo.knows(h) || history.is_some_and(|i| !i.positions(h).is_empty())
+}
+
+/// Addresses handed out beyond the recorded index, found again through their
+/// history. Same rule as at load time (`Wallet::catch_up`), with the index's
+/// answer, which the load-time pass does not have yet.
+fn catch_up_in_loop(w: &mut Wallet, c: &Chain, history: &q21_core::index::Index) -> usize {
+    if c.utxo.is_empty() {
+        return 0;
+    }
+    let found = w.catch_up(|e| address_used(e, c, Some(history)));
+    rescan_one_time_keys(w, c, found);
+    found
+}
+
+/// After recovering addresses on a one-time scheme, the chain is reread
+/// before any write: see `discover_in_loop`.
+fn rescan_one_time_keys(w: &mut Wallet, c: &Chain, found: usize) {
     if found > 0 && w.scheme().is_one_time() {
         w.forget_verification();
         let marked = w.scan_chain(c.height(), |h| c.block_at(h));
@@ -2220,7 +2260,6 @@ fn discover_in_loop(w: &mut Wallet, c: &Chain) -> usize {
             );
         }
     }
-    found
 }
 
 fn unix_now() -> u64 {
@@ -4333,9 +4372,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 i += 2;
             }
             // The address index is paid for in disk space and in writes at
-            // every block. A node that validates the chain and keeps a wallet
-            // has no need for it: it only searches its own addresses, and it
-            // knows which ones. See `q21_core::index`.
+            // every block. A bare node has no need for it; the wallet turns it
+            // on (see `cmd_wallet`), because its explorer and its history
+            // depend on it. See `q21_core::index`.
             "--address-index" => {
                 address_index = true;
                 i += 1;
@@ -4681,6 +4720,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut mining_payee: Option<(q21_core::hash::Hash256, SchemeId)> = None;
     // Height at which the last discovery attempt took place.
     let mut last_discovery: u64 = 0;
+    // In the past: the first pass runs as soon as the loop starts.
+    let mut last_history_height: u64 = u64::MAX;
+    let mut last_history_catch_up = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap_or_else(std::time::Instant::now);
     if mine {
         println!("  mining enabled on {effective_threads} thread(s)");
     }
@@ -5205,19 +5249,24 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             if h > last_discovery + 20 {
                 last_discovery = h;
                 let mut w = wallet.lock().map_err(|_| "wallet locked")?;
+                // Wallet, then index, then chain: the order `listtransactions`
+                // takes them in. `follow_index` takes index then chain.
+                let history = index.as_ref().and_then(|i| i.lock().ok());
                 let to_search = node.with_chain(|c| !c.utxo.is_empty() && !w.sees_funds(&c.utxo));
                 if to_search {
                     // Discovery then one-time key scan, BEFORE the write: see
                     // `discover_in_loop`.
-                    let found = node.with_chain(|c| discover_in_loop(&mut w, c));
+                    let found =
+                        node.with_chain(|c| discover_in_loop(&mut w, c, history.as_deref()));
                     if found > 0 {
                         println!(
-                            "  restore: {found} output(s) found, {} address(es) derived again",
+                            "  restore: {found} used address(es) found, {} address(es) derived again",
                             w.next_index()
                         );
                         let _ = write_wallet(datadir, &w);
                     }
                 }
+                drop(history);
                 // Reservations left by a shutdown between reservation and
                 // broadcast: once the delay has passed, the coin becomes free
                 // again. A node that never restarts must do it here.
@@ -5250,6 +5299,40 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         if let Some(index) = &index {
             if let Ok(mut i) = index.lock() {
                 follow_index(&mut i, &node);
+            }
+        }
+
+        // --- Addresses used beyond the recorded index, spent ones included.
+        //
+        // Once the index has followed the chain: a restore finds again the
+        // addresses it emptied, which the UTXO set alone cannot show. At most
+        // once a minute, and only when the chain has moved: each pass derives
+        // two hundred keys, and a synchronization crosses thousands of blocks
+        // a minute. The last pass after a synchronization still comes, at
+        // most a minute later. Wallet, then index, then chain: the order of
+        // `listtransactions`.
+        if !wallet_less {
+            if let Some(index) = &index {
+                let h = node.height();
+                if h != last_history_height
+                    && last_history_catch_up.elapsed() >= std::time::Duration::from_secs(60)
+                {
+                    last_history_catch_up = std::time::Instant::now();
+                    last_history_height = h;
+                    let mut w = wallet.lock().map_err(|_| "wallet locked")?;
+                    if let Ok(i) = index.lock() {
+                        let before = w.next_index();
+                        let found = node.with_chain(|c| catch_up_in_loop(&mut w, c, &i));
+                        if found > 0 {
+                            println!(
+                                "  catch-up: {found} used address(es) found through the index, \
+                                 {} address(es) recognized",
+                                w.next_index().saturating_sub(before)
+                            );
+                            let _ = write_wallet(datadir, &w);
+                        }
+                    }
+                }
             }
         }
 
@@ -5417,6 +5500,7 @@ fn serve(
 fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut port: u16 = 0;
     let mut no_browser = false;
+    let mut index = true;
     let mut rest: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -5430,6 +5514,10 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
             "--no-browser" => {
                 no_browser = true;
+                i += 1;
+            }
+            "--no-index" => {
+                index = false;
                 i += 1;
             }
             other => {
@@ -5614,8 +5702,26 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         arguments.push(String::new()); // default P2P port of the network
         arguments.push("--upnp".to_string());
     }
+    // The address index, on by default since 0.4.2. Without it, the explorer
+    // opened from the wallet lost every transaction older than two thousand
+    // blocks (under three days), never showed what an address had sent, and
+    // the Activity tab reread five thousand blocks every ten seconds to show
+    // a week. The index answers all three from a table, for a few megabytes.
+    // A pruned node cannot keep one: `--prune` wins, and `--no-index` opts out.
+    if wallet_wants_index(index, &rest) {
+        arguments.push("--address-index".to_string());
+    }
     arguments.extend(rest);
     cmd_node(datadir, &arguments)
+}
+
+/// Does the wallet start its node with the address index? Yes, unless the
+/// user said `--no-index`, prunes, or already asked for it by hand.
+fn wallet_wants_index(index: bool, rest: &[String]) -> bool {
+    index
+        && !rest
+            .iter()
+            .any(|a| a == "--prune" || a == "--address-index")
 }
 
 // ===========================================================================
@@ -6124,6 +6230,21 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn the_wallet_starts_its_node_with_the_index() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(wallet_wants_index(true, &v(&[])));
+        assert!(!wallet_wants_index(false, &v(&[])), "--no-index");
+        assert!(
+            !wallet_wants_index(true, &v(&["--prune"])),
+            "a pruned node cannot index"
+        );
+        assert!(
+            !wallet_wants_index(true, &v(&["--address-index"])),
+            "never twice"
+        );
+    }
+
     /// A binary without ML-DSA refuses to start where ML-DSA circulates.
     ///
     /// Before this guard, it started, held every block to be invalid, banned
@@ -6311,6 +6432,61 @@ mod tests {
     /// 0 receives all the coinbases and then spends one; a wallet restored
     /// from the same seed, discovered in the loop, must hold index 0 as
     /// consumed and no longer commit it.
+    /// A restore must find addresses that were used and then emptied. The
+    /// chain whose UTXO set is read here holds only the coin of address 204;
+    /// the index, built from the full history, knows that 0 to 203 were
+    /// paid too. Without the index, the first window of two hundred finds
+    /// nothing and discovery stops at zero.
+    #[test]
+    fn discovery_counts_spent_addresses_through_the_index() {
+        use q21_core::chain::GENESIS_TIME;
+        let seed = [0x42u8; 32];
+        let mut origin = Wallet::from_seed(seed, Network::Regtest);
+        let n = Wallet::DISCOVERY_GAP + 5;
+        let addresses: Vec<_> = (0..n).map(|_| origin.new_address()).collect();
+
+        let mut history_chain = Chain::new(Network::Regtest, genesis_block(Network::Regtest));
+        for (i, a) in addresses.iter().enumerate() {
+            let t = GENESIS_TIME + (i as u64 + 1) * TARGET_BLOCK_SECS;
+            let b = history_chain
+                .mine_block(a.hash, a.scheme, &[], t, 20_000_000)
+                .unwrap();
+            history_chain.connect(&b, t + 1).unwrap();
+        }
+        let d = std::env::temp_dir().join(format!("q21-discovery-index-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut index = q21_core::index::Index::open(&d.join("index.dat"));
+        for h in 0..=history_chain.height() {
+            index
+                .index_block(&history_chain.block_at(h).unwrap())
+                .unwrap();
+        }
+
+        let mut today = Chain::new(Network::Regtest, genesis_block(Network::Regtest));
+        let last = addresses.last().unwrap();
+        let t = GENESIS_TIME + TARGET_BLOCK_SECS;
+        let b = today
+            .mine_block(last.hash, last.scheme, &[], t, 20_000_000)
+            .unwrap();
+        today.connect(&b, t + 1).unwrap();
+
+        let mut without = Wallet::from_seed(seed, Network::Regtest);
+        assert_eq!(
+            discover_in_loop(&mut without, &today, None),
+            0,
+            "the 0.4.1 behavior"
+        );
+
+        let mut with = Wallet::from_seed(seed, Network::Regtest);
+        assert_eq!(
+            discover_in_loop(&mut with, &today, Some(&index)),
+            n as usize
+        );
+        assert_eq!(with.next_index(), n);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn discovery_in_the_loop_scans_one_time_keys() {
         use q21_core::chain::GENESIS_TIME;
@@ -6348,7 +6524,7 @@ mod tests {
 
         // The node path: discovery in the loop, chain already there.
         let mut restored = Wallet::from_seed(seed, Network::Regtest);
-        assert!(discover_in_loop(&mut restored, &c) > 0);
+        assert!(discover_in_loop(&mut restored, &c, None) > 0);
         assert!(
             restored.is_consumed(0),
             "FINDING: key 0, revealed in a block, is held as free"

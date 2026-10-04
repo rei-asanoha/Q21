@@ -24,6 +24,13 @@
 //! those who explore. Bitcoin Core decided the same way, with `txindex`, and
 //! for the same reason. Here it is `--address-index`.
 //!
+//! The wallet is the exception, since 0.4.2. In practice its owner does
+//! explore - the wallet links to the explorer of its own node - and its
+//! history needs the same answer. Without the index, the explorer opened from
+//! the wallet lost every transaction older than two thousand blocks, and the
+//! Activity tab reread five thousand blocks every ten seconds to show one
+//! week. `q21 wallet --no-index` keeps the old behavior.
+//!
 //! # How
 //!
 //! An append-only log, one record per block. Each record carries its own
@@ -205,6 +212,20 @@ impl Index {
     /// Where this transaction is.
     pub fn position(&self, txid: &Hash256) -> Option<Position> {
         self.by_txid.get(txid).copied()
+    }
+
+    /// Indexed transactions accepted by `keep`, at most `max` of them.
+    ///
+    /// Used by the search to complete an identifier pasted truncated. It walks
+    /// the whole table: a memory read, bounded by `max` matches, and the
+    /// caller only reaches it for an incomplete identifier.
+    pub fn find_txids(&self, mut keep: impl FnMut(&Hash256) -> bool, max: usize) -> Vec<Hash256> {
+        self.by_txid
+            .keys()
+            .filter(|t| keep(t))
+            .take(max)
+            .copied()
+            .collect()
     }
 
     /// Number of addresses known to the index.
@@ -506,6 +527,17 @@ mod tests {
     /// This is the hard half: the input only designates the output it
     /// consumes. Without the owner table, a spend would be invisible from the
     /// address that makes it - the screen would only show what it received.
+    #[test]
+    fn find_txids_filters_and_bounds() {
+        let d = temp_dir("find-txids");
+        let mut index = Index::open(&d.join("index.dat"));
+        index.index_block(&block(0, 1, vec![coinbase(7)])).unwrap();
+        index.index_block(&block(1, 2, vec![coinbase(8)])).unwrap();
+        assert_eq!(index.find_txids(|_| true, 10).len(), 2);
+        assert_eq!(index.find_txids(|_| true, 1).len(), 1);
+        assert!(index.find_txids(|_| false, 10).is_empty());
+    }
+
     #[test]
     fn a_spend_records_the_spending_address() {
         let d = temp_dir("spend");

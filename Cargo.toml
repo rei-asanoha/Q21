@@ -1,6 +1,6 @@
 [package]
 name = "q21-core"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.75"
 description = "Consensus core of the Q21 protocol — types, emission, hashing, post-quantum addresses"

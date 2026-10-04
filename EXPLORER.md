@@ -54,11 +54,17 @@ blocks. The answer is not wrong — it is incomplete, **and it says so**:
 > shown stays exact: it comes from the set of unspent outputs, not from this
 > list.
 
-`q21 explorer` enables the index by default; `q21 node` and `q21 wallet` only
-enable it if asked, with `--address-index`. An index is paid for twice, in disk
-space and in writes at every block, and a node that validates the chain has no
-need for it: it only searches its own addresses, and it knows which ones.
+`q21 explorer` and, since 0.4.2, `q21 wallet` enable the index by default
+(`--no-index` turns it off); `q21 node` only enables it if asked, with
+`--address-index`. An index is paid for twice, in disk space and in writes at
+every block, and a bare node that validates the chain has no need for it.
 Bitcoin Core made the same decision with `txindex`, for the same reason.
+
+The wallet is the exception because its owner does explore: the wallet links
+to the explorer of its own node, and its Activity tab needs the same answer.
+Without the index, the explorer opened from a 0.4.1 wallet lost every
+transaction older than 2,000 blocks — under three days — and never showed
+what an address had sent.
 
 ### What the index makes possible, and what it costs
 

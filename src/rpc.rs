@@ -574,6 +574,65 @@ fn tx_json(t: &Transaction, network: Network) -> Json {
         .build()
 }
 
+/// Shortest identifier prefix the search completes. See `search`.
+const MIN_ID_PREFIX: usize = 8;
+
+/// What the search reads: the text without any space, line break or
+/// invisible character, and without a trailing ellipsis.
+fn compact_search(raw: &str) -> String {
+    let t: String = raw
+        .chars()
+        .filter(|c| {
+            !c.is_whitespace() && !matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}')
+        })
+        .collect();
+    t.trim_end_matches('…').trim_end_matches("...").to_string()
+}
+
+/// If `q` reads as an amount, its text in the form `amount_to_units` takes.
+///
+/// An amount carries a separator - `1.5` or, as written in French, `1,5` - or
+/// the unit after it: `2 Q21`. With both a comma and a point, the comma
+/// separates thousands (`1,000.5`). Anything else is not an amount, and the
+/// search goes on.
+fn amount_candidate(q: &str) -> Option<String> {
+    let lower = q.to_ascii_lowercase();
+    let (number, with_unit) = match lower.strip_suffix("q21") {
+        Some(n) => (n.to_string(), true),
+        None => (lower.clone(), false),
+    };
+    if number.is_empty()
+        || !number
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '\'')
+        || !number.chars().any(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let number = number.replace('\'', "");
+    let normalized = if number.contains('.') {
+        number.replace(',', "")
+    } else {
+        number.replace(',', ".")
+    };
+    if normalized.contains('.') || with_unit {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+/// Does the hexadecimal writing of `h` start with `prefix` (lowercase)?
+fn hex_starts_with(h: &Hash256, prefix: &str) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    prefix.len() <= 64
+        && prefix.bytes().enumerate().all(|(i, c)| {
+            let byte = h.0[i / 2];
+            let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+            HEX[nibble as usize] == c
+        })
+}
+
 /// Reads an amount in Q21 (e.g. `1.5`, `0.005`) and returns it in units,
 /// without ever going through a float. Returns `None` on input that is not an
 /// amount: more than eight decimals, a foreign character, or nothing at all.
@@ -860,7 +919,7 @@ impl RpcContext {
             "setmining" => self.setmining(params),
             "setreachable" => self.setreachable(params),
             "stop" => self.stop(),
-            "search" => self.search(params),
+            "search" => self.search(params, client),
             "getaddress" => self.getaddress(params, client),
             "getamount" => self.getamount(params, client),
             other => Err(rpc_error(
@@ -1437,7 +1496,7 @@ impl RpcContext {
     /// An explorer has only one input field. It is up to it to recognize a
     /// height, a block id, a transaction id or an address - not up to the user
     /// to pick from a menu what they already hold in the clipboard.
-    fn search(&self, params: &Json) -> Result<Json, Json> {
+    fn search(&self, params: &Json, client: Option<std::net::IpAddr>) -> Result<Json, Json> {
         let raw = params
             .get("q")
             .and_then(|v| v.as_str())
@@ -1451,6 +1510,16 @@ impl RpcContext {
         if raw.len() > 200 {
             return Err(rpc_error(ERR_PARAMS, "search too long"));
         }
+        // What people paste is rarely what the node prints. The wallet shows
+        // an address in groups of eight: selected by hand, it arrives with
+        // spaces or line breaks. An identifier copied from a list ends with
+        // "…". Neither an address, nor an identifier, nor an amount ever
+        // contains a space: removing them all loses nothing, and the 0.4.1
+        // audit showed that refusing them made the search look broken.
+        let q = compact_search(&raw);
+        if q.is_empty() {
+            return Err(rpc_error(ERR_PARAMS, "empty search"));
+        }
 
         let found = |kind: &str, value: String| {
             Ok(Json::obj()
@@ -1460,25 +1529,28 @@ impl RpcContext {
         };
 
         // A string of digits: a height.
-        if raw.chars().all(|c| c.is_ascii_digit()) {
-            let h: u64 = raw
+        if q.chars().all(|c| c.is_ascii_digit()) {
+            let h: u64 = q
                 .parse()
                 .map_err(|_| rpc_error(ERR_PARAMS, "unreadable height"))?;
             let exists = self.node.with_chain(|c| h <= c.height());
             if !exists {
                 return Err(rpc_error(
                     ERR_NOT_FOUND,
-                    &format!("no block at height {h}: the chain stops lower"),
+                    &format!(
+                        "no block at height {h}: the chain stops lower. \
+                         For an amount, write {h}.0"
+                    ),
                 ));
             }
             return found("block", h.to_string());
         }
 
-        // A number with a decimal point: an amount. A height is an integer -
-        // the point is enough to remove the ambiguity, with no menu to choose
-        // from.
-        if raw.contains('.') {
-            let units = amount_to_units(&raw)
+        // An amount: a decimal point or a decimal comma, or the unit written
+        // after it. A height is an integer - the separator is enough to remove
+        // the ambiguity, with no menu to choose from.
+        if let Some(text) = amount_candidate(&q) {
+            let units = amount_to_units(&text)
                 .ok_or_else(|| rpc_error(ERR_PARAMS, "unreadable amount: at most 8 decimals"))?;
             // Canonical form in Q21: readable in the URL, and parseable again
             // as is by `getamount`.
@@ -1487,7 +1559,7 @@ impl RpcContext {
 
         // An address: it carries its own checksum, so a typo is detected
         // instead of leading somewhere else.
-        if let Ok(a) = crate::address::Address::parse(&raw) {
+        if let Ok(a) = crate::address::Address::parse(&q) {
             if a.network != self.network {
                 return Err(rpc_error(
                     ERR_PARAMS,
@@ -1497,12 +1569,31 @@ impl RpcContext {
                     ),
                 ));
             }
-            return found("address", raw);
+            // Lowercase, as the node writes it: the same address must give the
+            // same page, whatever case it was pasted in.
+            return found("address", a.to_string_bech32());
+        }
+        let lower = q.to_ascii_lowercase();
+        if [
+            crate::consensus::HRP_MAINNET,
+            crate::consensus::HRP_TESTNET,
+            crate::consensus::HRP_REGTEST,
+        ]
+        .iter()
+        .any(|hrp| lower.starts_with(&format!("{hrp}1")))
+        {
+            // Said instead of the generic refusal: the checksum is there
+            // precisely to catch this, and the reader must know it did.
+            return Err(rpc_error(
+                ERR_PARAMS,
+                "this looks like an address, but it does not check out: a character \
+                 is wrong, missing or extra. Copy it again with the copy button",
+            ));
         }
 
         // Sixty-four hexadecimal characters: a block or a transaction. Blocks
         // are checked first, since their table is immediate.
-        if let Some(h) = Hash256::from_hex(&raw) {
+        if let Some(h) = Hash256::from_hex(&lower) {
             if self.node.with_chain(|c| c.block_by_id(&h).is_some()) {
                 return found("block-id", h.to_hex());
             }
@@ -1524,11 +1615,95 @@ impl RpcContext {
             ));
         }
 
+        // The beginning of an identifier: lists show sixteen characters and an
+        // ellipsis, and that is what gets copied. Eight characters at least -
+        // below that, too many identifiers would share them.
+        if (MIN_ID_PREFIX..64).contains(&lower.len())
+            && lower.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return match self.complete_identifier(&lower, client)? {
+                Some((kind, id)) => found(kind, id.to_hex()),
+                None => Err(rpc_error(
+                    ERR_NOT_FOUND,
+                    &format!(
+                        "incomplete identifier: {} characters out of 64, and no block or \
+                         recent transaction starts with them. Copy the full identifier",
+                        lower.len()
+                    ),
+                )),
+            };
+        }
+
         Err(rpc_error(
             ERR_PARAMS,
-            "neither a height, nor a 64-character hexadecimal identifier, \
-             nor a valid address",
+            "not recognized: type a height, an amount (1.5 or 1,5), an address, \
+             or a block or transaction identifier",
         ))
+    }
+
+    /// The only block or transaction whose identifier starts with `prefix`.
+    ///
+    /// Looks in the mempool, the active chain's block identifiers, and the
+    /// transactions of the index - or, without one, those of the last
+    /// [`MAX_SCANNED_BLOCKS`] blocks. Two different matches are an error: the
+    /// page must never open the wrong transaction on a guess.
+    fn complete_identifier(
+        &self,
+        prefix: &str,
+        client: Option<std::net::IpAddr>,
+    ) -> Result<Option<(&'static str, Hash256)>, Json> {
+        let mut hits: Vec<(&'static str, Hash256)> = Vec::new();
+        let starts = |h: &Hash256| hex_starts_with(h, prefix);
+        for t in self.node.with_mempool(|m| m.txids()) {
+            if starts(&t) {
+                hits.push(("transaction", t));
+            }
+        }
+        self.allow_scan(client)?;
+        self.node.with_chain(|c| {
+            for h in 0..=c.height() {
+                if let Some(id) = c.active_at(h) {
+                    if starts(&id) {
+                        hits.push(("block-id", id));
+                    }
+                }
+            }
+        });
+        match &self.index {
+            Some(index) => {
+                let i = index
+                    .lock()
+                    .map_err(|_| rpc_error(ERR_REQUEST, "index unavailable"))?;
+                for t in i.find_txids(starts, 3) {
+                    hits.push(("transaction", t));
+                }
+            }
+            None => self.node.with_chain(|c| {
+                let floor = c.height().saturating_sub(MAX_SCANNED_BLOCKS);
+                for h in floor..=c.height() {
+                    if let Some(b) = c.block_at(h) {
+                        for t in &b.transactions {
+                            let id = t.txid();
+                            if starts(&id) {
+                                hits.push(("transaction", id));
+                            }
+                        }
+                    }
+                }
+            }),
+        }
+        hits.sort_by_key(|(_, h)| h.0);
+        hits.dedup_by_key(|(_, h)| h.0);
+        match hits.len() {
+            0 => Ok(None),
+            1 => Ok(Some(hits[0])),
+            n => Err(rpc_error(
+                ERR_PARAMS,
+                &format!(
+                    "ambiguous: {n} identifiers start with these characters. Paste more of them"
+                ),
+            )),
+        }
     }
 
     /// Movements and balance of any address at all.
@@ -1601,13 +1776,63 @@ impl RpcContext {
         };
         positions.sort_unstable();
         positions.dedup();
-        let total_movements = positions.len();
+
+        // --- What waits in the mempool. Someone who has just paid this address
+        // looks it up at once; until 0.4.2 it showed nothing for the two
+        // minutes a block takes, and the payment looked lost. Mempool lock
+        // first, chain lock second: the order `listtransactions` uses.
+        let pending_txs: Vec<Transaction> = self.node.with_mempool(|m| {
+            m.txids()
+                .iter()
+                .filter_map(|id| m.get(id).cloned())
+                .collect()
+        });
+        let now = now_utc();
+        let pending: Vec<Json> = self.node.with_chain(|c| {
+            pending_txs
+                .iter()
+                .filter_map(|tx| {
+                    let received: u64 = tx
+                        .outputs
+                        .iter()
+                        .filter(|o| o.pubkey_hash == key_hash)
+                        .map(|o| o.value.units())
+                        .sum();
+                    // A coin spent by a mempool transaction is still in the
+                    // UTXO set: only a block removes it.
+                    let sent: u64 = tx
+                        .inputs
+                        .iter()
+                        .filter_map(|i| c.utxo.get(&i.prev_out))
+                        .filter(|e| e.output.pubkey_hash == key_hash)
+                        .map(|e| e.output.value.units())
+                        .sum();
+                    if received == 0 && sent == 0 {
+                        return None;
+                    }
+                    Some(
+                        Json::obj()
+                            .set("txid", Json::str(tx.txid().to_hex()))
+                            .set("height", Json::Null)
+                            .set("timestamp", Json::u64(now))
+                            .set("confirmations", Json::u64(0))
+                            .set("pending", Json::Bool(true))
+                            .set("coinbase", Json::Bool(false))
+                            .set("received", amount_json(Amount::from_units(received)))
+                            .set("sent", amount_json(Amount::from_units(sent)))
+                            .set("amount_out_known", Json::Bool(true))
+                            .build(),
+                    )
+                })
+                .collect()
+        });
+        let total_movements = positions.len() + pending.len();
         // Most recent first: that is what you want to see first.
         positions.reverse();
         positions.truncate(maximum);
 
-        // --- The detail of each movement.
-        let mut movements = Vec::with_capacity(positions.len());
+        // --- The detail of each movement, the pending ones first.
+        let mut movements = pending;
         let mut all_out_resolved = true;
         for (h, rank) in positions {
             let Some(block) = self.node.with_chain(|c| c.block_at(h)) else {
@@ -1715,10 +1940,43 @@ impl RpcContext {
             .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'units' or 'amount' expected"))?;
 
         self.allow_scan(client)?;
+        // The mempool first: an amount just sent is the one looked for.
+        let pending: Vec<Json> = self.node.with_mempool(|m| {
+            let mut v = Vec::new();
+            for id in m.txids() {
+                let Some(tx) = m.get(&id) else { continue };
+                for (i, o) in tx.outputs.iter().enumerate() {
+                    if o.value.units() == units {
+                        v.push(
+                            Json::obj()
+                                .set("txid", Json::str(id.to_hex()))
+                                .set("height", Json::Null)
+                                .set("pending", Json::Bool(true))
+                                .set("index", Json::u64(i as u64))
+                                .set(
+                                    "address",
+                                    Json::str(
+                                        crate::address::Address {
+                                            network: self.network,
+                                            scheme: o.scheme,
+                                            hash: o.pubkey_hash,
+                                        }
+                                        .to_string_bech32(),
+                                    ),
+                                )
+                                .set("value", amount_json(o.value))
+                                .build(),
+                        );
+                    }
+                }
+            }
+            v.truncate(MAX_RESULTS);
+            v
+        });
         let (results, height, since, capped) = self.node.with_chain(|c| {
             let height = c.height();
             let since = height.saturating_sub(MAX_SCANNED_BLOCKS);
-            let mut out: Vec<Json> = Vec::new();
+            let mut out: Vec<Json> = pending;
             let mut capped = false;
             let mut h = height as i64;
             'blocks: while h >= since as i64 {
@@ -1914,12 +2172,53 @@ impl RpcContext {
             .get("limit")
             .and_then(|v| v.as_u64())
             .unwrap_or(50)
-            .clamp(1, 500);
+            // A page asks for more with "Show more"; two thousand rows are
+            // read once, on demand, not at every refresh of a closed tab.
+            .clamp(1, 2000);
+        // Filtered here, before the limit. The page used to filter the rows
+        // it had received: with a hundred mining rewards in a row, "Sent"
+        // showed nothing at all, and a transfer looked as if it had never left.
+        let kind_filter: Option<String> = match params.get("kind").and_then(|v| v.as_str()) {
+            None | Some("all") => None,
+            Some(k @ ("send" | "receive" | "mining")) => Some(k.to_string()),
+            Some(_) => {
+                return Err(rpc_error(
+                    ERR_PARAMS,
+                    "parameter 'kind': send, receive, mining or all",
+                ))
+            }
+        };
 
         let g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
         let scheme = g.scheme();
+
+        // --- With the address index, the whole history and nothing else.
+        //
+        // The heights where one of our key hashes appears, read from a table:
+        // no window, and no block read for nothing. The index lock is released
+        // before the chain lock is taken.
+        let indexed: Option<(u64, Vec<u64>)> = match &self.index {
+            Some(index) => {
+                let i = index
+                    .lock()
+                    .map_err(|_| rpc_error(ERR_REQUEST, "index unavailable"))?;
+                if i.is_empty() {
+                    None
+                } else {
+                    let mut ours: Vec<u64> = g
+                        .known_hashes()
+                        .iter()
+                        .flat_map(|h| i.positions(h).iter().map(|p| p.height))
+                        .collect();
+                    ours.sort_unstable_by(|a, b| b.cmp(a));
+                    ours.dedup();
+                    Some((i.height(), ours))
+                }
+            }
+            None => None,
+        };
 
         // --- What is waiting in the mempool counts as a movement.
         //
@@ -1947,55 +2246,22 @@ impl RpcContext {
 
         let (movements, since, height, all_resolved, missing_bodies) = self.node.with_chain(|c| {
             let height = c.height();
-            let since = height.saturating_sub(HISTORY_WINDOW);
-
-            // --- Find what went OUT, not only what came in.
+            // --- Which blocks to read, most recent first.
             //
-            // An input does not carry its amount: it designates an earlier
-            // output. Without resolution, the history showed "send" without
-            // ever saying how much - precisely the figure that matters to
-            // whoever sent.
-            //
-            // So, as the scan goes, we build a table of the outputs we come
-            // across. It only covers the window: a spend whose originating
-            // coin is older stays unresolved, and that is said in the response
-            // rather than counted as zero.
-            let mut seen_outputs: std::collections::HashMap<(Hash256, u32), u64> =
-                std::collections::HashMap::new();
-            let mut blocks: Vec<Block> = Vec::new();
-            // --- An unreadable block must not silently erase a payment.
-            //
-            // This scan used to skip without a word the heights whose body
-            // could not be read. Consequence observed on a real network: after
-            // a hard shutdown and a resync, a received transfer had purely and
-            // simply **vanished from the history**, while the balance still
-            // counted it. A wallet that loses a row without saying so is worse
-            // than a broken wallet: people believe it.
-            //
-            // So we count these heights, and the response announces them.
-            let mut missing_bodies: Vec<u64> = Vec::new();
-            let mut h = height;
-            loop {
-                if h < since {
-                    break;
+            // With the index: only those where one of our key hashes appears,
+            // over the whole chain, plus the few the index may not have
+            // followed yet. Without it: every block of the window.
+            let (since, heights): (u64, Vec<u64>) = match &indexed {
+                Some((indexed_up_to, ours)) => {
+                    let mut v: Vec<u64> = ((indexed_up_to + 1)..=height).rev().collect();
+                    v.extend(ours.iter().copied().filter(|h| *h <= height));
+                    (0, v)
                 }
-                match c.block_at(h) {
-                    Some(b) => {
-                        for tx in &b.transactions {
-                            let id = tx.txid();
-                            for (i, o) in tx.outputs.iter().enumerate() {
-                                seen_outputs.insert((id, i as u32), o.value.units());
-                            }
-                        }
-                        blocks.push(b);
-                    }
-                    None => missing_bodies.push(h),
+                None => {
+                    let since = height.saturating_sub(HISTORY_WINDOW);
+                    (since, (since..=height).rev().collect())
                 }
-                if h == 0 {
-                    break;
-                }
-                h -= 1;
-            }
+            };
 
             let mut v: Vec<Json> = Vec::new();
             let mut all_resolved = true;
@@ -2003,6 +2269,9 @@ impl RpcContext {
             // The mempool first: it is the most recent, and it is what
             // someone who has just pressed "Send" looks for.
             for tx in &pending_txs {
+                if v.len() as u64 >= limit {
+                    break;
+                }
                 let received: u64 = tx
                     .outputs
                     .iter()
@@ -2031,6 +2300,10 @@ impl RpcContext {
                 if received == 0 && !is_send {
                     continue;
                 }
+                let kind = if is_send { "send" } else { "receive" };
+                if kind_filter.as_deref().is_some_and(|k| k != kind) {
+                    continue;
+                }
                 if is_send && !committed_complete {
                     all_resolved = false;
                 }
@@ -2044,7 +2317,7 @@ impl RpcContext {
                     .set("timestamp", Json::u64(now_utc()))
                     .set("confirmations", Json::u64(0))
                     .set("pending", Json::Bool(true))
-                    .set("kind", Json::str(if is_send { "send" } else { "receive" }))
+                    .set("kind", Json::str(kind))
                     .set("received", amount_json(Amount::from_units(received)))
                     // A mempool transaction is never a coinbase: maturity does
                     // not concern it.
@@ -2056,84 +2329,141 @@ impl RpcContext {
                         .set("amount_out_known", Json::Bool(committed_complete));
                 }
                 v.push(row.build());
-                if v.len() as u64 >= limit {
-                    break;
-                }
             }
 
-            for b in &blocks {
-                if v.len() as u64 >= limit {
+            // --- The blocks, read lazily.
+            //
+            // A send does not carry its amount: each input designates an
+            // earlier output, and what this wallet committed is the sum of
+            // those. They are always **older** than the spend, so reading
+            // backward finds them on the way. The rows are drafted first, and
+            // the reading goes on only while a row still waits for one of its
+            // coins - never the whole window when the first blocks suffice.
+            // An unreadable block must not silently erase a payment either: its
+            // height is counted, and the response announces it.
+            struct Draft {
+                txid: Hash256,
+                height: u64,
+                time: u64,
+                kind: &'static str,
+                received: u64,
+                coinbase: bool,
+                inputs: Vec<(Hash256, u32)>,
+            }
+            let mut drafts: Vec<Draft> = Vec::new();
+            let mut wanted: std::collections::HashSet<(Hash256, u32)> =
+                std::collections::HashSet::new();
+            let mut seen_outputs: std::collections::HashMap<(Hash256, u32), u64> =
+                std::collections::HashMap::new();
+            let mut missing_bodies: Vec<u64> = Vec::new();
+            let room = limit.saturating_sub(v.len() as u64) as usize;
+            let mut last: Option<u64> = None;
+            for h in heights {
+                // The index may list a height twice (two of our hashes).
+                if last == Some(h) {
+                    continue;
+                }
+                last = Some(h);
+                if drafts.len() >= room && wanted.is_empty() {
                     break;
                 }
+                let Some(b) = c.block_at(h) else {
+                    missing_bodies.push(h);
+                    continue;
+                };
                 for tx in &b.transactions {
+                    if drafts.len() >= room {
+                        break;
+                    }
                     let received: u64 = tx
                         .outputs
                         .iter()
                         .filter(|o| g.owns(&o.pubkey_hash))
                         .map(|o| o.value.units())
                         .sum();
-
-                    // What this wallet committed: the sum of the earlier
-                    // outputs that its own keys unlocked.
-                    let mut committed: u64 = 0;
-                    let mut committed_complete = true;
-                    let mut is_send = false;
+                    let mut inputs: Vec<(Hash256, u32)> = Vec::new();
                     for e in &tx.inputs {
                         if e.witness.pubkey.is_empty() {
                             continue; // coinbase
                         }
-                        if !g.owns(&crate::sig::pubkey_hash(scheme, &e.witness.pubkey)) {
-                            continue;
-                        }
-                        is_send = true;
-                        match seen_outputs.get(&(e.prev_out.txid, e.prev_out.index)) {
-                            Some(m) => committed += m,
-                            None => committed_complete = false,
+                        if g.owns(&crate::sig::pubkey_hash(scheme, &e.witness.pubkey)) {
+                            inputs.push((e.prev_out.txid, e.prev_out.index));
                         }
                     }
-                    if received == 0 && !is_send {
+                    if received == 0 && inputs.is_empty() {
                         continue;
                     }
-                    if is_send && !committed_complete {
-                        all_resolved = false;
-                    }
-
                     let coinbase =
                         tx.inputs.len() == 1 && tx.inputs[0].prev_out.txid == Hash256::ZERO;
-                    // Gone out for good: what was committed, minus what came
-                    // back as change.
-                    let net_out = committed.saturating_sub(received);
-                    let mut row = Json::obj()
-                        .set("txid", Json::str(tx.txid().to_hex()))
-                        .set("height", Json::u64(b.header.height))
-                        .set("timestamp", Json::u64(b.header.time))
-                        .set("confirmations", Json::u64(height - b.header.height + 1))
-                        .set(
-                            "kind",
-                            Json::str(if coinbase {
-                                "mining"
-                            } else if is_send {
-                                "send"
-                            } else {
-                                "receive"
-                            }),
-                        )
-                        .set("received", amount_json(Amount::from_units(received)))
-                        .set(
-                            "mature",
-                            Json::Bool(!coinbase || height >= b.header.height + COINBASE_MATURITY),
-                        );
-                    if is_send {
-                        row = row
-                            .set("committed", amount_json(Amount::from_units(committed)))
-                            .set("net_out", amount_json(Amount::from_units(net_out)))
-                            .set("amount_out_known", Json::Bool(committed_complete));
+                    let kind = if coinbase {
+                        "mining"
+                    } else if !inputs.is_empty() {
+                        "send"
+                    } else {
+                        "receive"
+                    };
+                    if kind_filter.as_deref().is_some_and(|k| k != kind) {
+                        continue;
                     }
-                    v.push(row.build());
-                    if v.len() as u64 >= limit {
-                        break;
+                    wanted.extend(inputs.iter().copied());
+                    drafts.push(Draft {
+                        txid: tx.txid(),
+                        height: b.header.height,
+                        time: b.header.time,
+                        kind,
+                        received,
+                        coinbase,
+                        inputs,
+                    });
+                }
+                // The coins a row waits for, found in this block - including a
+                // coin created and spent within the same block.
+                if !wanted.is_empty() {
+                    for tx in &b.transactions {
+                        let id = tx.txid();
+                        for (i, o) in tx.outputs.iter().enumerate() {
+                            if wanted.remove(&(id, i as u32)) {
+                                seen_outputs.insert((id, i as u32), o.value.units());
+                            }
+                        }
                     }
                 }
+            }
+
+            for d in drafts {
+                let is_send = !d.inputs.is_empty();
+                let mut committed: u64 = 0;
+                let mut committed_complete = true;
+                for k in &d.inputs {
+                    match seen_outputs.get(k) {
+                        Some(m) => committed += m,
+                        None => committed_complete = false,
+                    }
+                }
+                if is_send && !committed_complete {
+                    all_resolved = false;
+                }
+                // Gone out for good: what was committed, minus what came back
+                // as change.
+                let net_out = committed.saturating_sub(d.received);
+                let mut row = Json::obj()
+                    .set("txid", Json::str(d.txid.to_hex()))
+                    .set("height", Json::u64(d.height))
+                    .set("timestamp", Json::u64(d.time))
+                    .set("confirmations", Json::u64(height - d.height + 1))
+                    .set("kind", Json::str(d.kind))
+                    .set("received", amount_json(Amount::from_units(d.received)))
+                    .set(
+                        "mature",
+                        Json::Bool(!d.coinbase || height >= d.height + COINBASE_MATURITY),
+                    );
+                if is_send {
+                    row = row
+                        .set("committed", amount_json(Amount::from_units(committed)))
+                        .set("net_out", amount_json(Amount::from_units(net_out)))
+                        .set("amount_out_known", Json::Bool(committed_complete));
+                }
+                v.push(row.build());
             }
             (v, since, height, all_resolved, missing_bodies)
         });
@@ -3942,6 +4272,124 @@ mod tests {
         assert!(!resigned, "FINDING: key 0 signed again");
     }
 
+    /// A funded wallet that sends, then mines `after` more blocks: the send
+    /// sinks under the mining rewards, as on the 0.4.1 testnet.
+    fn context_send_then_mine(after: u64, with_index: bool) -> (RpcContext, String) {
+        let mut c = context_with_funds();
+        let mut dest = Wallet::from_seed([0xcd; 32], NETWORK);
+        let address = dest.new_address().to_string_bech32();
+        let sent = call_ok(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{address}","units":100000}}"#),
+        );
+        let txid = sent
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let w = c.wallet.clone().unwrap();
+        c.node.with_chain_and_mempool(|ch, m| {
+            for i in 0..=after {
+                let pool: Vec<crate::tx::Transaction> = if i == 0 {
+                    m.txids()
+                        .iter()
+                        .filter_map(|id| m.get(id).cloned())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let a = w.lock().unwrap().new_address();
+                let t =
+                    crate::chain::GENESIS_TIME + (COINBASE_MATURITY + 4 + i) * TARGET_BLOCK_SECS;
+                let b = ch
+                    .mine_block(a.hash, a.scheme, &pool, t, 5_000_000)
+                    .expect("mining");
+                ch.connect(&b, t + 1).expect("connect");
+                m.on_block_connected(&b);
+            }
+        });
+        if with_index {
+            let d = std::env::temp_dir().join(format!(
+                "q21-rpc-index-{}-{}",
+                std::process::id(),
+                after
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            let mut index = crate::index::Index::open(&d.join("index.dat"));
+            c.node.with_chain(|ch| {
+                for h in 0..=ch.height() {
+                    index.index_block(&ch.block_at(h).unwrap()).unwrap();
+                }
+            });
+            c.index = Some(Arc::new(Mutex::new(index)));
+        }
+        (c, txid)
+    }
+
+    fn rows(r: &Json) -> Vec<Json> {
+        r.get("movements")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The defect of 0.4.1: with a hundred mining rewards after it, a send
+    /// fell out of the hundred rows the page asked for, and the "Sent" filter,
+    /// applied by the page to those rows, showed nothing. The filter now runs
+    /// in the node, before the limit.
+    #[test]
+    fn a_send_is_not_hidden_behind_mining_rewards() {
+        let (c, txid) = context_send_then_mine(120, false);
+        let all = call_ok(&c, "listtransactions", r#"{"limit":100}"#);
+        assert!(
+            rows(&all)
+                .iter()
+                .all(|m| m.get("kind").and_then(|v| v.as_str()) == Some("mining")),
+            "the precondition: a hundred rewards bury the send"
+        );
+        let sends = call_ok(&c, "listtransactions", r#"{"limit":100,"kind":"send"}"#);
+        let sends = rows(&sends);
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            sends[0].get("txid").and_then(|v| v.as_str()),
+            Some(txid.as_str())
+        );
+        assert_eq!(
+            sends[0].get("amount_out_known"),
+            Some(&Json::Bool(true)),
+            "the coins it spent were found on the way back"
+        );
+        let r = call(&c, "listtransactions", r#"{"kind":"gift"}"#);
+        assert!(r.get("error").is_some(), "an unknown kind is refused");
+    }
+
+    /// With the address index, the history covers the whole chain, says so,
+    /// and gives the same rows as the scan.
+    #[test]
+    fn with_the_index_the_history_is_complete() {
+        let (scan, _) = context_send_then_mine(30, false);
+        let (indexed, txid) = context_send_then_mine(30, true);
+        let a = call_ok(&scan, "listtransactions", r#"{"limit":500}"#);
+        let b = call_ok(&indexed, "listtransactions", r#"{"limit":500}"#);
+        assert_eq!(b.get("complete_history"), Some(&Json::Bool(true)));
+        assert_eq!(
+            b.get("scanned_from_height").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            rows(&a),
+            rows(&b),
+            "the index changes the cost, not the answer"
+        );
+        let sends = call_ok(&indexed, "listtransactions", r#"{"kind":"send"}"#);
+        assert_eq!(
+            rows(&sends)[0].get("txid").and_then(|v| v.as_str()),
+            Some(txid.as_str())
+        );
+    }
+
     /// A send shows in the history **before** it is in a block.
     ///
     /// That is the defect this test pins down. The history only read blocks:
@@ -4339,6 +4787,143 @@ mod tests {
             let r = call(&c, "search", &format!(r#"{{"q":"{q}"}}"#));
             assert!(r.get("error").is_some(), "wrongly accepted: {q}");
         }
+    }
+
+    fn kind_and_value(r: &Json) -> (String, String) {
+        (
+            r.get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            r.get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    /// What people paste, not what the node prints: an address selected by
+    /// hand in its groups of eight, in capitals, over two lines. All found in
+    /// 0.4.1's audit as "nothing works".
+    #[test]
+    fn search_accepts_an_address_as_people_paste_it() {
+        let c = context(true);
+        let a = {
+            let mut w = c.wallet.as_ref().unwrap().lock().unwrap();
+            w.new_address()
+        }
+        .to_string_bech32();
+        let grouped: Vec<String> = a
+            .as_bytes()
+            .chunks(8)
+            .map(|g| String::from_utf8(g.to_vec()).unwrap())
+            .collect();
+        for pasted in [
+            grouped.join(" "),
+            grouped.join("\\n"),
+            format!("  {}  ", a.to_uppercase()),
+            grouped.join("\\u00a0"),
+        ] {
+            let r = call_ok(&c, "search", &format!(r#"{{"q":"{pasted}"}}"#));
+            assert_eq!(
+                kind_and_value(&r),
+                ("address".into(), a.clone()),
+                "{pasted}"
+            );
+        }
+        // One character changed: the checksum says so, in words.
+        let last = a.chars().last().unwrap();
+        let wrong = format!(
+            "{}{}",
+            &a[..a.len() - 1],
+            if last == 'q' { 'p' } else { 'q' }
+        );
+        let r = call(&c, "search", &format!(r#"{{"q":"{wrong}"}}"#));
+        let m = r
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(m.contains("does not check out"), "{m}");
+    }
+
+    /// Amounts as written in French, with the unit, with separators.
+    #[test]
+    fn search_accepts_amounts_as_people_write_them() {
+        let c = context(false);
+        for (q, expected) in [
+            ("1,5", "1.50000000"),
+            ("1.5 Q21", "1.50000000"),
+            ("2 q21", "2.00000000"),
+            ("1 000,5", "1000.50000000"),
+            ("1,000.5", "1000.50000000"),
+            ("0,12345678", "0.12345678"),
+        ] {
+            let r = call_ok(&c, "search", &format!(r#"{{"q":"{q}"}}"#));
+            assert_eq!(
+                kind_and_value(&r),
+                ("amount".into(), expected.into()),
+                "{q}"
+            );
+        }
+        // A bare integer stays a height, and the refusal says how to write an
+        // amount.
+        let r = call(&c, "search", r#"{"q":"999999"}"#);
+        let m = r
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(m.contains("For an amount, write 999999.0"), "{m}");
+    }
+
+    /// The beginning of an identifier, as lists show it, leads to it.
+    #[test]
+    fn search_completes_a_truncated_identifier() {
+        let c = context(false);
+        let id = c
+            .node
+            .with_chain(|ch| ch.block_at(0).unwrap().header.block_id())
+            .to_hex();
+        for q in [format!("{}…", &id[..16]), id[..8].to_uppercase()] {
+            let r = call_ok(&c, "search", &format!(r#"{{"q":"{q}"}}"#));
+            assert_eq!(kind_and_value(&r), ("block-id".into(), id.clone()), "{q}");
+        }
+        // Too short to mean anything: refused, not guessed.
+        let r = call(&c, "search", &format!(r#"{{"q":"{}"}}"#, &id[..7]));
+        assert!(r.get("error").is_some());
+        // Nothing starts with it: said, with the count.
+        let other = if id.starts_with('f') {
+            "eeeeeeeeee"
+        } else {
+            "ffffffffff"
+        };
+        let r = call(&c, "search", &format!(r#"{{"q":"{other}"}}"#));
+        let m = r
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            m.starts_with("incomplete identifier: 10 characters out of 64"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn search_helpers() {
+        assert_eq!(compact_search(" ab cd\n\u{a0}ef\u{200b}… "), "abcdef");
+        assert_eq!(compact_search("abcdef..."), "abcdef");
+        assert_eq!(amount_candidate("12"), None, "an integer is a height");
+        assert_eq!(amount_candidate("12q21").as_deref(), Some("12"));
+        assert_eq!(amount_candidate("0,5").as_deref(), Some("0.5"));
+        assert_eq!(amount_candidate("1'000.25").as_deref(), Some("1000.25"));
+        assert_eq!(amount_candidate("q21"), None);
+        assert_eq!(amount_candidate("abc.5"), None);
+        let h = Hash256::from_hex(&format!("ab{}", "0".repeat(62))).unwrap();
+        assert!(hex_starts_with(&h, "ab00"));
+        assert!(!hex_starts_with(&h, "ab01"));
+        assert!(!hex_starts_with(&h, &"0".repeat(65)));
     }
 
     /// Any address at all has a balance and a history, without belonging to
