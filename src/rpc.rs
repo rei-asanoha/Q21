@@ -574,6 +574,31 @@ fn tx_json(t: &Transaction, network: Network) -> Json {
         .build()
 }
 
+/// The notes `listtransactions` attaches to a history. They are constants
+/// because the wallet page translates them by their exact English text: a
+/// sentence changed here without its translation would silently show in
+/// English again. `wallet_ui` checks that each one is in its tables.
+pub const NOTE_INCOMPLETE: &str =
+    "INCOMPLETE history: the body of some blocks of the active chain \
+     could not be read, and what they contained does not appear here. \
+     This is not a loss of funds - the balance itself stays correct. \
+     Restart the node: it will request these blocks from the network \
+     again.";
+/// Complete, read through the address index.
+pub const NOTE_FULL_INDEX: &str = "Full history: the address index covers the whole chain.";
+/// Complete, read by scanning a chain shorter than the window.
+pub const NOTE_FULL_SCAN: &str = "Full history: the search went all the way back to genesis.";
+/// Bounded by the window, without an index.
+pub const NOTE_PARTIAL: &str = "Partial history. This node has no index by address: \
+     the search stops at the height shown.";
+/// All of them, for the checks.
+pub const HISTORY_NOTES: [&str; 4] = [
+    NOTE_INCOMPLETE,
+    NOTE_FULL_INDEX,
+    NOTE_FULL_SCAN,
+    NOTE_PARTIAL,
+];
+
 /// Shortest identifier prefix the search completes. See `search`.
 const MIN_ID_PREFIX: usize = 8;
 
@@ -2219,6 +2244,7 @@ impl RpcContext {
             }
             None => None,
         };
+        let via_index = indexed.is_some();
 
         // --- What is waiting in the mempool counts as a movement.
         //
@@ -2490,16 +2516,13 @@ impl RpcContext {
             .set(
                 "note",
                 Json::str(if !missing_bodies.is_empty() {
-                    "INCOMPLETE history: the body of some blocks of the active chain \
-                     could not be read, and what they contained does not appear here. \
-                     This is not a loss of funds - the balance itself stays correct. \
-                     Restart the node: it will request these blocks from the network \
-                     again."
+                    NOTE_INCOMPLETE
+                } else if complete && via_index {
+                    NOTE_FULL_INDEX
                 } else if complete {
-                    "Full history: the search went all the way back to genesis."
+                    NOTE_FULL_SCAN
                 } else {
-                    "Partial history. This node has no index by address: \
-                     the search stops at the height shown."
+                    NOTE_PARTIAL
                 }),
             )
             .build())
@@ -4363,6 +4386,21 @@ mod tests {
         );
         let r = call(&c, "listtransactions", r#"{"kind":"gift"}"#);
         assert!(r.get("error").is_some(), "an unknown kind is refused");
+    }
+
+    /// The note says how the history was read: through the index, or by a
+    /// scan that reached genesis.
+    #[test]
+    fn the_history_note_says_how_it_was_read() {
+        let (scan, _) = context_send_then_mine(3, false);
+        let (indexed, _) = context_send_then_mine(3, true);
+        let a = call_ok(&scan, "listtransactions", "{}");
+        let b = call_ok(&indexed, "listtransactions", "{}");
+        assert_eq!(a.get("note").and_then(|v| v.as_str()), Some(NOTE_FULL_SCAN));
+        assert_eq!(
+            b.get("note").and_then(|v| v.as_str()),
+            Some(NOTE_FULL_INDEX)
+        );
     }
 
     /// With the address index, the history covers the whole chain, says so,

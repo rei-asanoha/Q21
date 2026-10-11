@@ -22,6 +22,10 @@
 #   Q21_NTFY       ntfy topic, for example q21-my-server-a7f3 (default: none;
 #                  to be provided through an EnvironmentFile with mode 0600,
 #                  not in the unit)
+#   Q21_PUBLIC_URL public explorer address, for example
+#                  https://explorer.example.org/ (default: none, no check)
+#   Q21_PROXY      service of the reverse proxy in front of it
+#                  (default: caddy)
 #
 # The state file does not live in a shared directory: in /var/tmp, any
 # account on the machine could pre-create it, as a symbolic link to a file
@@ -34,6 +38,8 @@ SERVICE="${Q21_SERVICE:-q21}"
 STATE="${Q21_STATE:-${RUNTIME_DIRECTORY:-/run/q21-monitor}/state}"
 THRESHOLD="${Q21_THRESHOLD:-30}"
 NTFY="${Q21_NTFY:-}"
+PUBLIC_URL="${Q21_PUBLIC_URL:-}"
+PROXY="${Q21_PROXY:-caddy}"
 
 if [ -L "$STATE" ]; then
   logger -t q21-monitor "state file $STATE: symbolic link refused"
@@ -53,6 +59,37 @@ notify() {
     curl -s -m 10 -H "Title: Q21" -d "$1" "https://ntfy.sh/$NTFY" >/dev/null 2>&1
   fi
 }
+
+# The public explorer, seen from outside: the height can move forward while
+# nobody can read it. In October 2026 the reverse proxy crashed and the public
+# explorer stayed down for more than a day, while this script, which only
+# watched the node, saw nothing wrong.
+#
+# The answer decides who is at fault:
+# - no connection at all (code 000): the proxy is down. Restart it.
+# - 502, 503 or 504: the proxy answers, the node behind it does not. The node
+#   check below handles it; restarting the proxy would change nothing.
+# - anything else outside 2xx and 3xx: notify, touch nothing.
+if [ -n "$PUBLIC_URL" ]; then
+  code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$PUBLIC_URL" 2>/dev/null)
+  case "$code" in
+    2??|3??) ;;
+    000|"")
+      if systemctl is-active --quiet "$PROXY"; then
+        notify "public explorer $PUBLIC_URL unreachable while $PROXY runs: restarting $PROXY"
+      else
+        notify "$PROXY stopped, public explorer $PUBLIC_URL unreachable: restarting $PROXY"
+      fi
+      systemctl restart "$PROXY"
+      ;;
+    502|503|504)
+      logger -t q21-monitor "public explorer answers $code: the node behind $PROXY is checked below"
+      ;;
+    *)
+      notify "public explorer $PUBLIC_URL answers HTTP $code: $PROXY left as is"
+      ;;
+  esac
+fi
 
 # The RPC does not answer. Three cases, and only one justifies a restart.
 #

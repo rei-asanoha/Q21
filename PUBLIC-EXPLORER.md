@@ -375,6 +375,25 @@ caddy version
 **2.10 or newer**: the hybrid handshake will be available. Older: everything
 will work, without that refinement.
 
+Then make Caddy restart on its own if it ever crashes. The package's service
+does not: after a crash, it stays stopped, and the explorer with it. That is
+what happened in October 2026 with Caddy 2.11.6 (a crash in the reverse proxy,
+fixed in 2.11.7): more than a day without an explorer, and nothing to say so.
+
+```bash
+sudo mkdir -p /etc/systemd/system/caddy.service.d
+sudo tee /etc/systemd/system/caddy.service.d/restart.conf > /dev/null <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5s
+EOF
+sudo systemctl daemon-reload
+systemctl show caddy -p Restart -p RestartUSec
+```
+
+→ `Restart=on-failure` and `RestartUSec=5s`. The file sits next to the package's
+service without modifying it, and survives Caddy updates.
+
 ### 4.2 — Configure it
 
 ```bash
@@ -691,6 +710,18 @@ sudo journalctl -u caddy -f      # the web, live
 sudo journalctl -u q21 -f        # the chain, live
 ```
 
+Keep Caddy up to date, and only Caddy — the rest of the system follows its
+own rhythm:
+
+```bash
+apt list --upgradable 2>/dev/null | grep caddy
+sudo apt-get install --only-upgrade -y -o Dpkg::Options::="--force-confold" caddy
+```
+
+`--force-confold` keeps your Caddyfile as it is. And give the monitoring the
+explorer's address (`Q21_PUBLIC_URL`, see [SERVER.md](SERVER.md)): it then
+watches the page from outside, not only the node.
+
 To see when the certificate expires:
 
 ```bash
@@ -736,7 +767,7 @@ the most common outage on the web.
 | `502 Bad Gateway` | The node is not listening on 21080. `sudo systemctl status q21` |
 | `403` on every page | The `--rpc-public` name and the Caddyfile name differ. They must be identical, character for character |
 | The q21 service refuses to start | A wallet is in the data directory. The refusal is intentional |
-| `Connection refused` from the outside | Ports 80 and 443 are not open. `sudo ufw status` |
+| `Connection refused` from the outside | Caddy is stopped (`systemctl is-active caddy` says `failed`: `sudo journalctl -u caddy -n 30`, then `sudo systemctl restart caddy`), or ports 80 and 443 are not open (`sudo ufw status`) |
 | `caddy validate` rejects the file | A brace or a tab is missing. The message gives the line |
 | The SSL Labs grade is low | Note what it complains about and tell me: it is a signal, not a fate |
 

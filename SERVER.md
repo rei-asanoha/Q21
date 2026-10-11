@@ -625,6 +625,7 @@ sudo cp tools/monitor.sh /opt/q21/monitor.sh && sudo chmod +x /opt/q21/monitor.s
 sudo mkdir -p /etc/q21 && sudo tee /etc/q21/monitor.env > /dev/null <<'EOF'
 Q21_RPC=127.0.0.1:21080
 Q21_NTFY=
+Q21_PUBLIC_URL=
 EOF
 sudo chmod 600 /etc/q21/monitor.env
 sudo tee /etc/systemd/system/q21-monitor.service > /dev/null <<'EOF'
@@ -657,6 +658,21 @@ sudo systemctl daemon-reload && sudo systemctl enable --now q21-monitor.timer
 
 `Q21_NTFY=` empty: the script only restarts the service, and writes it to the
 log (`journalctl -t q21-monitor`). With a topic, you also receive the message.
+
+`Q21_PUBLIC_URL=` empty: the public explorer is not checked. On a server that
+publishes one (see [PUBLIC-EXPLORER.md](PUBLIC-EXPLORER.md)), give its
+address, for example `Q21_PUBLIC_URL=https://explorer.example.org/`. The
+script then also checks the page **from outside**, through the reverse proxy:
+
+- no connection at all: the proxy is down, it is restarted (`Q21_PROXY`,
+  default `caddy`);
+- `502`, `503` or `504`: the proxy answers but the node behind it does not;
+  the node check handles it;
+- any other error: a notification, nothing is restarted.
+
+Without it, a proxy that crashes leaves the explorer unreachable while the
+height keeps moving, and nothing warns you. That happened in October 2026:
+more than a day without an explorer.
 The state file lives in `/run/q21-monitor/`, which systemd creates for this
 service alone: no one else can put anything there.
 

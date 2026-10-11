@@ -3874,6 +3874,80 @@ mod tests_hardening {
         assert_eq!(g.peers[&7].ban_score, 0, "an honest peer is not punished");
     }
 
+    /// A whole batch arriving in reverse order unrolls as soon as its first
+    /// block arrives: each connected block resumes the one waiting for it.
+    /// The resumption is a recursion (`resume_parked`, `accept_compact`,
+    /// `integrate`, `resume_parked`), bounded by `MAX_PARKED`; this test pins
+    /// that it reaches the end of a long chain.
+    #[test]
+    fn a_reversed_batch_unrolls_from_its_first_block() {
+        let (a, b) = node_pair();
+        let _e = established_peer(&b, 7);
+        let n = 12;
+        crate::net::tests_util::mine_locally(&a, n);
+        let blocks: Vec<Block> =
+            a.with_chain(|c| (1..=n as u64).map(|h| c.block_at(h).unwrap()).collect());
+        {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            for blk in &blocks {
+                p.requested_bodies
+                    .insert(blk.header.block_id(), Instant::now());
+            }
+        }
+        for blk in blocks[1..].iter().rev() {
+            let _ = b.handle(
+                7,
+                Message::CmpctBlock(Box::new(CompactBlock::from_block(blk, 1))),
+            );
+        }
+        assert_eq!(b.height(), 0);
+        assert_eq!(
+            b.stats.compacts_parked.load(Ordering::Relaxed),
+            (n - 1) as u64
+        );
+        assert!(b.handle(7, Message::Block(Box::new(blocks[0].clone()))));
+        assert_eq!(
+            b.height(),
+            n as u64,
+            "the whole batch must follow its first block"
+        );
+        assert_eq!(
+            b.stats.compacts_resumed.load(Ordering::Relaxed),
+            (n - 1) as u64
+        );
+        assert!(b.shared.lock().unwrap().parked.is_empty());
+    }
+
+    /// The places are bounded: beyond `MAX_PARKED`, the oldest gives way.
+    #[test]
+    fn parked_compacts_are_bounded() {
+        let (a, b) = node_pair();
+        let _e = established_peer(&b, 7);
+        let n = MAX_PARKED + 5;
+        crate::net::tests_util::mine_locally(&a, n + 1);
+        let blocks: Vec<Block> = a.with_chain(|c| {
+            (2..=(n as u64 + 1))
+                .map(|h| c.block_at(h).unwrap())
+                .collect()
+        });
+        {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            for blk in &blocks {
+                p.requested_bodies
+                    .insert(blk.header.block_id(), Instant::now());
+            }
+        }
+        for blk in &blocks {
+            let _ = b.handle(
+                7,
+                Message::CmpctBlock(Box::new(CompactBlock::from_block(blk, 1))),
+            );
+        }
+        assert_eq!(b.shared.lock().unwrap().parked.len(), MAX_PARKED);
+    }
+
     /// An announcement nobody asked for, whose parent is unknown, does not
     /// wait: only requested bodies may take a place, and the places are
     /// bounded.

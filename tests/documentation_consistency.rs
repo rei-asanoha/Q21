@@ -351,6 +351,40 @@ fn monitoring_unit_preserves_its_state() {
     }
 }
 
+/// The public explorer survives a crash of its reverse proxy, and someone is
+/// told when it does not.
+///
+/// In October 2026 Caddy crashed and stayed stopped for more than a day: the
+/// package's service does not restart, and the monitoring only watched the
+/// node's height, which kept moving. Three things close it, and each must stay
+/// written where an operator copies it from.
+#[test]
+fn the_public_explorer_is_watched_and_restarted() {
+    let explorer = read("PUBLIC-EXPLORER.md");
+    assert!(
+        explorer.contains("/etc/systemd/system/caddy.service.d/restart.conf")
+            && explorer.contains("\nRestart=on-failure\n"),
+        "PUBLIC-EXPLORER.md no longer makes Caddy restart after a crash"
+    );
+    let script = read("tools/monitor.sh");
+    assert!(script.contains("PUBLIC_URL=\"${Q21_PUBLIC_URL:-}\""));
+    assert!(
+        script.contains("000|\"\")") && script.contains("systemctl restart \"$PROXY\""),
+        "monitor.sh no longer restarts the proxy when the explorer is unreachable"
+    );
+    // A 502 is the node, not the proxy: restarting the proxy would hide it.
+    let bad_gateway = &script[script.find("502|503|504)").expect("502 case")..];
+    let end = bad_gateway.find(";;").expect("end of the 502 case");
+    assert!(
+        !bad_gateway[..end].contains("restart"),
+        "a 502 must not restart the proxy"
+    );
+    assert!(
+        read("SERVER.md").contains("\nQ21_PUBLIC_URL=\n"),
+        "the monitoring environment file no longer shows Q21_PUBLIC_URL"
+    );
+}
+
 /// A release page lists what a user downloads and what proves it, nothing
 /// else: the archives, `SHA256SUMS` and its signature. The per-file `.sha256`
 /// that the build jobs produce are already inside `SHA256SUMS`, which is the

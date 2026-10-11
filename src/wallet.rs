@@ -451,9 +451,14 @@ impl Wallet {
     /// **refuse to sign** rather than fall back to the deterministic variant
     /// — see `mldsa_wallet::sign`.
     ///
-    /// # Panics
+    /// # An unavailable scheme is an error, not a panic
     ///
-    /// Same invariant as [`Wallet::public_key`].
+    /// The scheme is checked when the wallet is built, so this arm should
+    /// never be reached. It used to panic, like [`Wallet::public_key`]; but
+    /// this is the signing path, the one a spend goes through, and a future
+    /// change that made it reachable would have crashed the node in the middle
+    /// of a payment. Since 0.4.3 it refuses instead: `sign_spend` then
+    /// releases the reservation, and nothing is signed.
     fn sign_at(&self, index: u32, message: &Hash256) -> Result<Vec<u8>, WalletError> {
         match self.scheme {
             SchemeId::LamportOts => Ok(self.key(index).sign(message)),
@@ -471,7 +476,7 @@ impl Wallet {
                 crate::kdf::wipe(&mut g);
                 sig
             }
-            other => panic!("wallet on an unavailable scheme: {}", other.name()),
+            other => Err(WalletError::UnsupportedScheme(other)),
         }
     }
 
@@ -1709,6 +1714,19 @@ mod tests {
     /// A file behind the chain — abrupt stop during mining — is caught up:
     /// the addresses handed out beyond `next_index` are recognized, and the
     /// next index starts again after the last one used.
+    /// Signing on a scheme this binary cannot use refuses, it does not
+    /// panic: the signing path is the one a payment goes through.
+    #[test]
+    fn signing_on_an_unavailable_scheme_is_an_error() {
+        let mut w = Wallet::from_seed([0x31; 32], Network::Regtest);
+        w.scheme = SchemeId::SphincsPlus;
+        let r = w.sign_at(0, &Hash256([7u8; 32]));
+        assert!(matches!(
+            r,
+            Err(WalletError::UnsupportedScheme(SchemeId::SphincsPlus))
+        ));
+    }
+
     #[test]
     fn catch_up_finds_addresses_handed_out_after_the_last_write() {
         // The wallet "from before the cut" handed out indices 0 to 9.

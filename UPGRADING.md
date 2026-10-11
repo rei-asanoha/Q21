@@ -65,6 +65,33 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.2 to 0.4.3
+
+0.4.3 is a drop-in replacement: same protocol (3), same chain, same data
+directory. It comes out of an adversarial review of 0.4.2, which found no way
+to break the chain, and closes the operational weak points it did find.
+
+## What changes
+
+| | 0.4.2 | 0.4.3 |
+|---|---|---|
+| Public explorer whose reverse proxy crashed | Nobody is told, the explorer stays down | `tools/monitor.sh` checks the page from outside (`Q21_PUBLIC_URL`), restarts the proxy and notifies |
+| Caddy after a crash | Stays stopped | PUBLIC-EXPLORER.md makes it restart on its own (`Restart=on-failure`) and shows how to keep it up to date |
+| Signing on a scheme the program cannot use | The node panics | The spend is refused, nothing is signed |
+| Activity notes ("Full history…") | In English for every reader | Translated, and the note says whether the index was used |
+
+## Updating a server that publishes the explorer
+
+The node and its service do not change: replace the program as for 0.4.2.
+
+Then, once, make Caddy restart after a crash, and give the monitoring the
+explorer's address. The steps are in PUBLIC-EXPLORER.md (section 4.1) and
+SERVER.md ("Getting notified without watching"): a `restart.conf` file next
+to Caddy's service, a `Q21_PUBLIC_URL=` line in `/etc/q21/monitor.env`, and
+the new `monitor.sh` copied to `/opt/q21/monitor.sh`.
+
+---
+
 # Upgrading from 0.4.1 to 0.4.2
 
 0.4.2 is a drop-in replacement: same protocol (3), same chain, same data
