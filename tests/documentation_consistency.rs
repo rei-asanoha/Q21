@@ -385,6 +385,26 @@ fn the_public_explorer_is_watched_and_restarted() {
     );
 }
 
+/// A refusal is a configuration error, never a stuck node: the monitoring
+/// must not restart a node that answered "no". Both refusals the RPC can
+/// give are handled before the restart.
+#[test]
+fn the_monitoring_does_not_restart_a_node_that_refuses_it() {
+    let script = read("tools/monitor.sh");
+    let restart = script
+        .find("systemctl restart \"$SERVICE\"")
+        .expect("restart of the service");
+    for refusal in ["'access token'", "'another account'"] {
+        let at = script
+            .find(refusal)
+            .unwrap_or_else(|| panic!("monitor.sh does not recognize {refusal}"));
+        assert!(
+            at < restart,
+            "monitor.sh checks {refusal} only after restarting the node"
+        );
+    }
+}
+
 /// A release page lists what a user downloads and what proves it, nothing
 /// else: the archives, `SHA256SUMS` and its signature. The per-file `.sha256`
 /// that the build jobs produce are already inside `SHA256SUMS`, which is the

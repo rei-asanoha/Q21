@@ -79,6 +79,8 @@ to break the chain, and closes the operational weak points it did find.
 | Caddy after a crash | Stays stopped | PUBLIC-EXPLORER.md makes it restart on its own (`Restart=on-failure`) and shows how to keep it up to date |
 | Signing on a scheme the program cannot use | The node panics | The spend is refused, nothing is signed |
 | Activity notes ("Full history…") | In English for every reader | Translated, and the note says whether the index was used |
+| Monitoring of a node without a public explorer | Refused by the node (the RPC admitted only the node's own account), then restarted it every ten minutes | The administrator is admitted; `monitor.sh` never restarts a node that refuses it |
+| Entry points shipped in `bootstrap.txt` | One machine (France) | Two machines, on two continents (France and Singapore) |
 
 ## Updating a server that publishes the explorer
 
@@ -89,6 +91,12 @@ explorer's address. The steps are in PUBLIC-EXPLORER.md (section 4.1) and
 SERVER.md ("Getting notified without watching"): a `restart.conf` file next
 to Caddy's service, a `Q21_PUBLIC_URL=` line in `/etc/q21/monitor.env`, and
 the new `monitor.sh` copied to `/opt/q21/monitor.sh`.
+
+## Updating a wallet
+
+Unpack the new archive over the old one, as for 0.4.2. It also replaces
+`q21-data/bootstrap.txt` with the new list of entry points: if you had added
+your own lines to that file, copy them aside before, and add them back after.
 
 ---
 

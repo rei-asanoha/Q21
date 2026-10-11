@@ -543,7 +543,8 @@ enum Owner {
 ///
 /// Three answers, and three distinct verdicts:
 ///
-/// - the kernel names an account: we admit it if it is ours, and only ours;
+/// - the kernel names an account: we admit it if it is ours, or the
+///   administrator's (see [`ROOT_UID`]), and no other;
 /// - the socket table can be read but **does not contain** this connection:
 ///   we refuse. The first version admitted this case, for fear of shutting the
 ///   door by mistake. But a loopback connection that the kernel table does not
@@ -567,10 +568,31 @@ fn local_account_allowed(stream: &TcpStream) -> Result<(), &'static str> {
     verdict(connection_owner(local, remote))
 }
 
+/// The administrator's account, admitted alongside our own.
+///
+/// The guard keeps out the *other* accounts of the machine, those that have
+/// no power over ours. The administrator is not one of them: `root` can
+/// already read our data directory, our launch token and our memory, stop us
+/// and restart us. Refusing it protected nothing, and it broke the one
+/// legitimate client that runs as root: the monitoring (`tools/monitor.sh`,
+/// started by a systemd timer). On a node without `--rpc-public` it was
+/// refused, read "no height", and restarted a healthy node every ten
+/// minutes. Found while setting up the second testnet entry point, before
+/// the monitoring was installed there.
+const ROOT_UID: u32 = 0;
+
 /// The guard's verdict, separate from the read so it can be tested alone.
 fn verdict(p: Owner) -> Result<(), &'static str> {
+    verdict_as(p, current_uid())
+}
+
+/// The verdict for a node running under account `us`. Separate so that the
+/// test does not depend on the account that runs it: under root, "our
+/// account" and "the administrator" are the same, and dropping the
+/// administrator from the rule went unnoticed.
+fn verdict_as(p: Owner, us: u32) -> Result<(), &'static str> {
     match p {
-        Owner::Account(uid) if uid == current_uid() => Ok(()),
+        Owner::Account(uid) if uid == us || uid == ROOT_UID => Ok(()),
         Owner::Account(_) => Err("connection from another account on this machine: refused"),
         Owner::Absent => Err("local connection the kernel attributes to no account: refused"),
         Owner::Unknown => Ok(()),
@@ -742,6 +764,20 @@ mod local_account {
         assert!(verdict(Owner::Account(current_uid())).is_ok());
         // With no table at all, we cannot know: it is the only open case.
         assert!(verdict(Owner::Unknown).is_ok());
+    }
+
+    /// The administrator is admitted, any other account is not. The
+    /// monitoring runs as root: refused, it took a healthy node for a stuck
+    /// one and restarted it every ten minutes.
+    #[test]
+    fn the_administrator_is_admitted_and_no_other_account() {
+        // A node under its own service account, as on a server.
+        let service = 109;
+        assert!(verdict_as(Owner::Account(service), service).is_ok());
+        assert!(verdict_as(Owner::Account(ROOT_UID), service).is_ok());
+        assert!(verdict_as(Owner::Account(1001), service).is_err());
+        assert!(verdict_as(Owner::Absent, service).is_err());
+        assert!(verdict_as(Owner::Unknown, service).is_ok());
     }
 }
 

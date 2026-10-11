@@ -201,12 +201,23 @@ ssh -L 21080:127.0.0.1:21080 q21@your-server
 - **It decides nothing.** It provides a first contact; what you believe comes
   from the proof of work and from the genesis you wrote yourself.
 
-## The testnet entry point, today
+## The testnet entry points, today
 
 ```
 bootstrap.q21.dev:21121
 92.222.86.135:21121
+bootstrap2.q21.dev:21121
+15.235.197.229:21121
 ```
+
+Two machines, on two continents (France and Singapore), with two different
+names. Two names rather than two addresses behind one: from a name, a node
+keeps the first address that answers and stops there, so two machines behind
+one name would give each newcomer a single link. With two names, it links to
+both, and losing one leaves it connected. The second entry point connects to
+the first on its
+own (`--connect`, see SERVER.md), so whichever one a newcomer reaches, they
+see the same chain.
 
 The name **and** the address are published side by side, on purpose. A domain
 name may one day expire and be bought by someone else; an address stays
@@ -224,6 +235,8 @@ empty lines and lines starting with `#` are ignored:
 # the Q21 testnet bootstrap addresses
 bootstrap.q21.dev:21121
 92.222.86.135:21121
+bootstrap2.q21.dev:21121
+15.235.197.229:21121
 ```
 
 A freshly downloaded wallet finds the network **without anyone typing

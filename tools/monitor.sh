@@ -101,13 +101,18 @@ fi
 #
 # - The service was (re)started less than an hour ago: it is starting up,
 #   let it be. A restart here would be the loop.
-# - The RPC answers but refuses (401, token required): that is a
+# - The RPC answers but refuses (401, token required; or 403, another
+#   account, from a node older than 0.4.3 that did not admit root): that is a
 #   configuration error in the monitoring, not in the node. We notify, we do
 #   not restart; restarting would change nothing.
 # - The service is dead, or has been silent for more than an hour: restart.
 if [ -z "$height" ]; then
   if printf '%s' "$response" | grep -qi 'access token'; then
     notify "the RPC $RPC requires a token: monitoring misconfigured, service $SERVICE left as is"
+    exit 0
+  fi
+  if printf '%s' "$response" | grep -qi 'another account'; then
+    notify "the RPC $RPC refuses this account: update the node to 0.4.3 or later, service $SERVICE left as is"
     exit 0
   fi
   if systemctl is-active --quiet "$SERVICE"; then

@@ -501,6 +501,14 @@ You should see the genesis written, then the listening port:
 
 > `--no-bootstrap` because this node **is** the bootstrap. Without it, two
 > entry points of the same network would spend their time calling each other.
+>
+> **A second entry point** is the exception: it replaces `--no-bootstrap`
+> with `--connect <address of the first>:21121`, so that the two are always
+> linked and a newcomer sees the same chain whichever one they reach. Give it
+> the first one's **address**, not its name: if both machines one day answer
+> to the same name, the second would end up calling itself. One link is
+> enough: the first one keeps `--no-bootstrap`, and if it restarts, the
+> second calls it again on its own.
 
 ---
 

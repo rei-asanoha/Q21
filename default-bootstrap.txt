@@ -20,3 +20,5 @@
 # exists. The failure of one isolates no one.
 bootstrap.q21.dev:21121
 92.222.86.135:21121
+bootstrap2.q21.dev:21121
+15.235.197.229:21121
