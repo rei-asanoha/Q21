@@ -100,6 +100,12 @@ fn mempool_message(e: &crate::mempool::MempoolError) -> String {
     }
 }
 
+/// The funds exist, but every coin that could pay is already spent by a
+/// transaction waiting for a block. Saying "insufficient funds" here sent the
+/// user looking for money they had.
+pub const PENDING_FUNDS: &str = "the available coins are already used by sends waiting for \
+     a block: wait for the next block (about two minutes), then send again";
+
 fn wallet_message(e: &crate::wallet::WalletError) -> &'static str {
     use crate::wallet::WalletError as W;
     match e {
@@ -2583,9 +2589,13 @@ impl RpcContext {
             let needed = units
                 .checked_add(fee)
                 .ok_or_else(|| rpc_error(ERR_PARAMS, "amount plus fee overflows"))?;
+            // The same coins as the real send will take: not those that a
+            // pending transaction already spends.
             let (chosen, total) = self
                 .node
-                .with_chain(|c| g.select_coins(&c.utxo, c.height(), needed))
+                .with_chain_and_mempool(|c, m| {
+                    g.select_coins_avoiding(&c.utxo, c.height(), needed, &|o| m.spends(o))
+                })
                 .map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
 
             let n = chosen.len() as u64;
@@ -3150,7 +3160,11 @@ impl RpcContext {
         // On a reference, never on a copy: copying the UTXO set to build a
         // transaction cost hundreds of mebibytes on a real chain, and a batch
         // asked for as many copies.
-        let prepare = self.node.with_chain(|c| {
+        // The coins already spent by a pending transaction are left out: they
+        // stay in the confirmed set until the next block, and choosing them
+        // again built a double spend that the mempool refused. A wallet could
+        // then send only one payment per block.
+        let prepare = self.node.with_chain_and_mempool(|c, m| {
             // A one-time scheme must know which keys have already signed up to
             // the tip: the blocks that arrived since the last scan are reread
             // here. They are recent, so in memory; if one is missing, we refuse
@@ -3158,15 +3172,29 @@ impl RpcContext {
             if g.scheme().is_one_time() && g.verified_up_to() < c.height() {
                 g.scan_chain(c.height(), |h| c.block_at(h));
                 if g.verified_up_to() < c.height() {
-                    return Err(crate::wallet::WalletError::VerificationBehind {
+                    return Err(Some(crate::wallet::WalletError::VerificationBehind {
                         verified: g.verified_up_to(),
                         height: c.height(),
-                    });
+                    }));
                 }
             }
-            g.prepare_spend(&c.utxo, c.height(), destinations, Amount::from_units(fee))
+            let fee = Amount::from_units(fee);
+            let r =
+                g.prepare_spend_avoiding(&c.utxo, c.height(), destinations, fee, &|o| m.spends(o));
+            // Short only because of the pending sends? Then the funds exist:
+            // they are waiting for a block, and the user must hear that, not
+            // "insufficient funds".
+            if let Err(crate::wallet::WalletError::InsufficientFunds { requested, .. }) = &r {
+                if g.select_coins(&c.utxo, c.height(), *requested).is_ok() {
+                    return Err(None);
+                }
+            }
+            r.map_err(Some)
         });
-        let prepare = prepare.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
+        let prepare = prepare.map_err(|e| match e {
+            Some(e) => rpc_error(ERR_WALLET, wallet_message(&e)),
+            None => rpc_error(ERR_WALLET, PENDING_FUNDS),
+        })?;
 
         // 2. Write-ahead, outside the chain lock: the reserved indices reach
         //    the disk before the slightest signature exists. A failure signs
@@ -3784,6 +3812,88 @@ mod tests {
             units.contains(&100_000) && units.contains(&200_000),
             "both requested amounts must appear among the outputs: {units:?}"
         );
+    }
+
+    /// A context whose wallet uses `scheme` and holds `coins` mature coins.
+    fn context_with_coins(scheme: crate::sig::SchemeId, coins: u64) -> RpcContext {
+        let c = context_with_funds();
+        let mut w = Wallet::from_seed_scheme([0x6b; 32], NETWORK, scheme).expect("scheme");
+        let node = c.node.clone();
+        node.with_chain(|ch| {
+            let start = ch.height();
+            for i in 1..=(COINBASE_MATURITY + coins) {
+                let a = w.new_address();
+                let t = crate::chain::GENESIS_TIME + (start + i) * TARGET_BLOCK_SECS;
+                let b = ch
+                    .mine_block(a.hash, a.scheme, &[], t, 5_000_000)
+                    .expect("mining");
+                ch.connect(&b, t + 1).expect("connect");
+            }
+        });
+        RpcContext {
+            wallet: Some(Arc::new(Mutex::new(w))),
+            ..c
+        }
+    }
+
+    /// Several sends in a row, before any block: each takes coins that the
+    /// previous ones did not. Before 0.4.4, an ML-DSA wallet with many coins
+    /// sent one payment, and the next ones were refused as double spends.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn several_sends_before_a_block_use_different_coins() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 6);
+        let mut other = Wallet::from_seed([0x12; 32], NETWORK);
+        let to = other.new_address().to_string_bech32();
+        let mut inputs = std::collections::HashSet::new();
+        for k in 0..4 {
+            let r = call_ok(
+                &c,
+                "sendtoaddress",
+                &format!(r#"{{"address":"{to}","units":{}}}"#, 100_000 + k),
+            );
+            let tx_inputs = r
+                .get("transaction")
+                .and_then(|t| t.get("inputs"))
+                .and_then(|v| v.as_array())
+                .expect("inputs");
+            for i in tx_inputs {
+                let key = format!(
+                    "{}:{}",
+                    i.get("txid").and_then(|v| v.as_str()).unwrap_or(""),
+                    i.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                );
+                assert!(inputs.insert(key), "send {k} reused a coin already pending");
+            }
+        }
+        assert_eq!(c.node.with_mempool(|m| m.len()), 4);
+    }
+
+    /// When every coin is pending, the refusal says so, rather than
+    /// "insufficient funds" for money the wallet does have.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn spending_pending_coins_says_to_wait_for_a_block() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 1);
+        let mut other = Wallet::from_seed([0x13; 32], NETWORK);
+        let to = other.new_address().to_string_bech32();
+        let mut refused = None;
+        for _ in 0..8 {
+            let r = call(
+                &c,
+                "sendtoaddress",
+                &format!(r#"{{"address":"{to}","units":100000}}"#),
+            );
+            if let Some(m) = r
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+            {
+                refused = Some(m.to_string());
+                break;
+            }
+        }
+        assert_eq!(refused.as_deref(), Some(PENDING_FUNDS));
     }
 
     /// A send without a recipient is cleanly refused, not built empty.

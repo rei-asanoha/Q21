@@ -219,6 +219,15 @@ impl Mempool {
         self.bytes
     }
 
+    /// Is this output already spent by a transaction waiting here?
+    ///
+    /// The wallet asks before choosing its coins: a coin spent by a pending
+    /// transaction is still in the confirmed set until the next block, and
+    /// choosing it again only builds a double spend that this pool refuses.
+    pub fn spends(&self, o: &OutPoint) -> bool {
+        self.committed.contains_key(o)
+    }
+
     pub fn contains(&self, txid: &Hash256) -> bool {
         self.entries.contains_key(txid)
     }

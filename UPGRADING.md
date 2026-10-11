@@ -65,6 +65,25 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.3 to 0.4.4
+
+0.4.4 is a drop-in replacement: same protocol (3), same chain, same data
+directory. It changes only the wallet.
+
+## What changes
+
+| | 0.4.3 | 0.4.4 |
+|---|---|---|
+| Several payments before the next block | The second one was refused ("a transaction already pending spends the same funds"), even with many coins: one payment per block, about one every two minutes | Each payment takes coins that the pending ones do not spend: as many payments as the wallet has coins |
+| Every coin already used by pending payments | "insufficient funds", for money the wallet does have | Says the coins are waiting for a block, and to send again after it |
+
+## Who needs it
+
+The wallets. A node without a wallet (a server, a node on a small board)
+behaves exactly as with 0.4.3: updating it is optional.
+
+---
+
 # Upgrading from 0.4.2 to 0.4.3
 
 0.4.3 is a drop-in replacement: same protocol (3), same chain, same data

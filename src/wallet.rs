@@ -1253,7 +1253,30 @@ impl Wallet {
         height: u64,
         needed: u64,
     ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
-        let available = self.spendable(utxo, height);
+        self.select_coins_avoiding(utxo, height, needed, &|_| false)
+    }
+
+    /// [`Self::select_coins`], leaving out the coins `avoid` designates: those
+    /// that a transaction still waiting for a block already spends.
+    ///
+    /// # The defect this closes
+    ///
+    /// A coin stays in the confirmed set until the block that spends it.
+    /// The selection took it again for the next send, which the mempool then
+    /// refused as a double spend: a wallet holding forty-five coins could send
+    /// **one** payment per block, about one every two minutes. Lamport hid the
+    /// defect (its keys are reserved after a single use); ML-DSA, the default
+    /// scheme, showed it on the second send.
+    #[allow(clippy::type_complexity)]
+    pub fn select_coins_avoiding(
+        &self,
+        utxo: &UtxoSet,
+        height: u64,
+        needed: u64,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+    ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
+        let mut available = self.spendable(utxo, height);
+        available.retain(|e| !avoid(&e.0));
 
         // A one-time scheme (Lamport) can sign only once per key, never
         // twice: signing two different messages with the same key reveals
@@ -1393,6 +1416,19 @@ impl Wallet {
         destinations: &[(Address, Amount)],
         fee: Amount,
     ) -> Result<PreparedSpend, WalletError> {
+        self.prepare_spend_avoiding(utxo, height, destinations, fee, &|_| false)
+    }
+
+    /// [`Self::prepare_spend`], without the coins that `avoid` designates
+    /// (see [`Self::select_coins_avoiding`]).
+    pub fn prepare_spend_avoiding(
+        &mut self,
+        utxo: &UtxoSet,
+        height: u64,
+        destinations: &[(Address, Amount)],
+        fee: Amount,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+    ) -> Result<PreparedSpend, WalletError> {
         if destinations.is_empty() {
             return Err(WalletError::ZeroAmount);
         }
@@ -1435,7 +1471,7 @@ impl Wallet {
             .checked_add(fee.units())
             .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
             .ok_or(WalletError::AmountOutOfRange)?;
-        let (chosen, total) = self.select_coins(utxo, height, needed)?;
+        let (chosen, total) = self.select_coins_avoiding(utxo, height, needed, avoid)?;
 
         let mut outputs: Vec<TxOut> = destinations
             .iter()
