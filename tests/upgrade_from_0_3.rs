@@ -331,7 +331,7 @@ fn a_wallet_left_by_0_3_opens_and_is_converted() {
     );
     assert!(s.status.success(), "{out}\n{err}");
     assert!(
-        out.contains("Wallet converted to the 0.4 file format"),
+        out.contains("Wallet converted to the current file format"),
         "{out}\n{err}"
     );
     assert!(!err.contains("address cache ignored"), "{err}");

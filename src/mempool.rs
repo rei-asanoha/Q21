@@ -35,7 +35,7 @@ use crate::address::Network;
 use crate::amount::Amount;
 use crate::consensus::{COINBASE_MATURITY, MAX_BLOCK_SIZE, TARGET_BLOCK_WEIGHT, WITNESS_DISCOUNT};
 use crate::hash::Hash256;
-use crate::tx::{OutPoint, Transaction};
+use crate::tx::{OutPoint, Transaction, TxOut};
 use crate::utxo::{UtxoEntry, UtxoSet, UtxoView};
 use crate::validate::{self, ValidationError};
 use std::collections::{HashMap, HashSet};
@@ -226,6 +226,75 @@ impl Mempool {
     /// choosing it again only builds a double spend that this pool refuses.
     pub fn spends(&self, o: &OutPoint) -> bool {
         self.committed.contains_key(o)
+    }
+
+    /// Outputs created by pending transactions and not yet spent by another
+    /// one, for which `mine` answers yes; sorted, so that two runs choose
+    /// the same coins.
+    ///
+    /// The wallet spends its own change with them before the next block.
+    /// Without this, a wallet whose confirmed coins were all committed had to
+    /// wait two minutes for a block before it could pay again, although its
+    /// change was right there.
+    pub fn unspent_created(&self, mine: &dyn Fn(&TxOut) -> bool) -> Vec<(OutPoint, TxOut)> {
+        let mut v: Vec<(OutPoint, TxOut)> = self
+            .created
+            .iter()
+            .filter(|(o, e)| !self.committed.contains_key(o) && mine(&e.output))
+            .map(|(o, e)| (*o, e.output))
+            .collect();
+        v.sort_by_key(|(o, _)| *o);
+        v
+    }
+
+    /// Does every output that the pending transaction `txid` spends satisfy
+    /// `mine`? Answers whether a pending transaction is one of the wallet's
+    /// own sends, whose change it can trust before the block: a payment
+    /// received from someone else can still be replaced by its sender, and
+    /// whatever spends it would vanish with it.
+    pub fn spends_only(
+        &self,
+        txid: &Hash256,
+        confirmed: &UtxoSet,
+        mine: &dyn Fn(&TxOut) -> bool,
+    ) -> bool {
+        let Some(e) = self.entries.get(txid) else {
+            return false;
+        };
+        e.tx.inputs.iter().all(|i| {
+            self.created
+                .get(&i.prev_out)
+                .or_else(|| confirmed.get(&i.prev_out))
+                .is_some_and(|u| mine(&u.output))
+        })
+    }
+
+    /// Number of pending ancestors of `txid`, counted up to `limit` (the
+    /// walk stops there: a deep chain costs no more than the limit).
+    pub fn ancestors_up_to(&self, txid: &Hash256, limit: usize) -> usize {
+        let mut seen: HashSet<Hash256> = HashSet::new();
+        let mut todo: Vec<Hash256> = vec![*txid];
+        while let Some(id) = todo.pop() {
+            for p in self.parents.get(&id).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if self.entries.contains_key(p) && seen.insert(*p) {
+                    if seen.len() >= limit {
+                        return limit;
+                    }
+                    todo.push(*p);
+                }
+            }
+        }
+        seen.len()
+    }
+
+    /// The confirmed outputs as this pool sees them: plus those its
+    /// transactions create, minus those they already spend.
+    pub fn view<'a>(&'a self, confirmed: &'a UtxoSet) -> MempoolView<'a> {
+        MempoolView {
+            confirmed,
+            overlay: &self.created,
+            spent: &self.committed,
+        }
     }
 
     pub fn contains(&self, txid: &Hash256) -> bool {
@@ -544,6 +613,47 @@ impl Mempool {
     /// Deterministic order at equal rate: without this, two miners starting
     /// from the same mempool would build different blocks for no reason.
     pub fn select_for_block(&self, max_weight: u64) -> Vec<Transaction> {
+        self.block_order(max_weight)
+            .into_iter()
+            .map(|e| e.tx.clone())
+            .collect()
+    }
+
+    /// Identifiers to announce to a peer: the start of the block order
+    /// (parents before children, best rate first), up to `max_inputs` inputs
+    /// in all.
+    ///
+    /// # Why it exists (0.4.5)
+    ///
+    /// A transaction was announced once, when it arrived. A peer connected
+    /// later, or one that had refused a child because its parent had not
+    /// reached it yet, never heard of it again: the load test of 11 October
+    /// 2026 saw five transactions wait on the two seeds while the miners
+    /// never had them. The node now announces its pool to each new peer, and
+    /// again every ten minutes; a peer that already holds a transaction does
+    /// not ask for it, so this costs a few identifiers when all is well.
+    ///
+    /// The bound in inputs, not in transactions, matches what the receiving
+    /// peer counts: its budget is debited per input verified
+    /// ([`crate::net::TX_BUCKET_MAX`]). Staying well under it means the
+    /// answer to the announcement is never taken for a flood.
+    ///
+    /// A start of a topological order keeps every parent of what it keeps.
+    pub fn announcement(&self, max_inputs: u64) -> Vec<Hash256> {
+        let mut out = Vec::new();
+        let mut inputs = 0u64;
+        for e in self.block_order(u64::MAX) {
+            inputs += e.tx.inputs.len() as u64;
+            if inputs > max_inputs {
+                break;
+            }
+            out.push(e.tx.txid());
+        }
+        out
+    }
+
+    /// The order of [`Self::select_for_block`], without copying anything.
+    fn block_order(&self, max_weight: u64) -> Vec<&MempoolEntry> {
         // The identifiers are computed **once**, not on each comparison of the
         // sort.
         //
@@ -565,33 +675,48 @@ impl Mempool {
                 .then(ida.cmp(idb))
         });
 
-        let mut chosen: Vec<Transaction> = Vec::new();
+        let mut chosen: Vec<&MempoolEntry> = Vec::new();
         let mut selected: HashSet<Hash256> = HashSet::new();
         let mut weight = 0u64;
+        // Children met before one of their parents, by the parent they wait
+        // for.
+        let mut waiting: HashMap<Hash256, Vec<usize>> = HashMap::new();
 
-        for (e, id, _) in v {
-            if weight + e.weight > max_weight {
-                continue;
-            }
-            // --- Topological order: a child never goes before its parent.
-            //
-            // Without this check, the miner would produce a block where a
-            // transaction spends an output that does not exist yet — invalid,
-            // and it would only notice after having spent its electricity.
-            let parents_ready = self
-                .parents
-                .get(&id)
-                .map(|ps| {
+        for start in 0..v.len() {
+            let mut stack = vec![start];
+            while let Some(i) = stack.pop() {
+                let (e, id, _) = v[i];
+                if selected.contains(&id) || weight + e.weight > max_weight {
+                    continue;
+                }
+                // --- Topological order: a child never goes before its parent.
+                //
+                // Without this check, the miner would produce a block where a
+                // transaction spends an output that does not exist yet —
+                // invalid, and it would only notice after having spent its
+                // electricity.
+                //
+                // A child met first is no longer dropped from the block: it
+                // waits for its parent and goes in right after it. Dropping it
+                // cost a block per link once a wallet spent its own change: a
+                // parent with more inputs pays a lower rate than its child, so
+                // the child always came first, and a chain of ten payments
+                // took ten blocks.
+                let missing = self.parents.get(&id).and_then(|ps| {
                     ps.iter()
-                        .all(|p| selected.contains(p) || !self.entries.contains_key(p))
-                })
-                .unwrap_or(true);
-            if !parents_ready {
-                continue;
+                        .find(|p| !selected.contains(*p) && self.entries.contains_key(*p))
+                });
+                if let Some(p) = missing {
+                    waiting.entry(*p).or_default().push(i);
+                    continue;
+                }
+                weight += e.weight;
+                selected.insert(id);
+                chosen.push(e);
+                if let Some(children) = waiting.remove(&id) {
+                    stack.extend(children.into_iter().rev());
+                }
             }
-            weight += e.weight;
-            selected.insert(id);
-            chosen.push(e.tx.clone());
         }
         chosen
     }
@@ -1091,6 +1216,64 @@ mod tests_chains {
                 }
             }
         }
+    }
+
+    /// A send from `w` that may spend the change of its pending sends.
+    fn spend_with_pending(
+        w: &mut Wallet,
+        c: &crate::chain::Chain,
+        m: &Mempool,
+        fee: u64,
+    ) -> Transaction {
+        let mut dest = Wallet::from_seed([0x26; 32], NETWORK);
+        let a = dest.new_address();
+        let pending = m.unspent_created(&|o| w.owns_output(o));
+        let p = w
+            .prepare_spend_avoiding(
+                &c.utxo,
+                c.height(),
+                &[(a, Amount::from_units(10_000))],
+                Amount::from_units(fee),
+                &|o| m.spends(o),
+                &pending,
+            )
+            .expect("prepare");
+        w.sign_spend(&m.view(&c.utxo), p).expect("sign")
+    }
+
+    /// One mature coin, three sends: each spends the change of the one
+    /// before. The announcement keeps the parents before the children, and
+    /// a bound in inputs keeps a start of the chain, never a child alone.
+    #[test]
+    fn the_announcement_keeps_parents_first_and_stays_bounded() {
+        let mut w = Wallet::from_seed([0x27; 32], NETWORK);
+        let c = funded_chain(&mut w, crate::consensus::COINBASE_MATURITY + 1);
+        let mut m = Mempool::new();
+        let mut ids = Vec::new();
+        for k in 0..3u64 {
+            // The child pays more than its parent: the best rate first must
+            // not put it ahead.
+            let tx = spend_with_pending(&mut w, &c, &m, 300 + 100 * k);
+            if let Some(parent) = ids.last() {
+                assert_eq!(
+                    tx.inputs[0].prev_out.txid, *parent,
+                    "send {k} spends the change"
+                );
+            }
+            ids.push(
+                m.accept(&tx, &c.utxo, NETWORK, c.height())
+                    .expect("accepted"),
+            );
+        }
+        assert_eq!(m.announcement(u64::MAX), ids, "parents first");
+        assert_eq!(m.announcement(2), ids[..2].to_vec(), "a start of the chain");
+        assert!(m.announcement(0).is_empty());
+        assert_eq!(m.ancestors_up_to(&ids[2], 10), 2);
+        assert_eq!(
+            m.ancestors_up_to(&ids[2], 1),
+            1,
+            "the walk stops at its limit"
+        );
     }
 
     #[test]

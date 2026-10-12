@@ -1006,12 +1006,7 @@ fn write_wallet(d: &Path, w: &Wallet) -> Result<(), String> {
     }
     let sealed = passphrase.is_some();
     let bytes = match &passphrase {
-        Some(passphrase) => q21_core::kdf::seal(
-            passphrase.as_bytes(),
-            content.as_bytes(),
-            q21_core::kdf::DEFAULT_COST,
-        )
-        .map_err(|e| e.to_string())?,
+        Some(passphrase) => seal_for_session(passphrase.as_bytes(), content.as_bytes())?,
         // Plaintext: a copy, wiped like the original on return.
         None => content.as_bytes().to_vec(),
     };
@@ -1108,6 +1103,27 @@ fn write_wallet(d: &Path, w: &Wallet) -> Result<(), String> {
 /// there is no passphrase", which are not the same thing: the second allows
 /// writing a plaintext wallet, the first does not.
 static PASSPHRASE: std::sync::Mutex<Option<Option<Secret>>> = std::sync::Mutex::new(None);
+
+/// The session's sealing key, and the SHA-256 of the passphrase it was
+/// derived from. Argon2id runs once per session instead of at every write of
+/// the wallet (twice per payment): see `q21_core::kdf::SealingKey`. A new
+/// passphrase, a new key.
+static SEALING_KEY: std::sync::Mutex<Option<([u8; 32], q21_core::kdf::SealingKey)>> =
+    std::sync::Mutex::new(None);
+
+/// Seals with the session key, deriving it on first use or when the
+/// passphrase changed.
+fn seal_for_session(passphrase: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let fingerprint = q21_core::sha256::sha256(passphrase);
+    let mut g = SEALING_KEY.lock().unwrap_or_else(|e| e.into_inner());
+    if g.as_ref().map(|(f, _)| f != &fingerprint).unwrap_or(true) {
+        let key = q21_core::kdf::SealingKey::derive(passphrase, q21_core::kdf::DEFAULT_COST)
+            .map_err(|e| e.to_string())?;
+        *g = Some((fingerprint, key));
+    }
+    let (_, key) = g.as_ref().expect("set just above");
+    q21_core::kdf::seal_with(key, plaintext).map_err(|e| e.to_string())
+}
 
 /// A string wiped on drop: the passphrase must not survive in the heap when
 /// it is forgotten or replaced — nor the plaintext of the wallet, which
@@ -1509,8 +1525,8 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
         }
     } else if legacy_names {
         match write_wallet(d, &w) {
-            Ok(()) => println!("  Wallet converted to the 0.4 file format."),
-            Err(e) => eprintln!("warning: wallet not converted to the 0.4 file format ({e})"),
+            Ok(()) => println!("  Wallet converted to the current file format."),
+            Err(e) => eprintln!("warning: wallet not converted to the current file format ({e})"),
         }
     }
     Ok(w)
@@ -4947,6 +4963,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // does not erode the ability to reorg.
     const SNAPSHOT_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
     let mut last_snapshot = std::time::Instant::now();
+    // The pending transactions are offered again to the peers every ten
+    // minutes: one announced once and missed by a peer was otherwise never
+    // seen again by it. See `Node::announce_mempool`.
+    let mut last_rebroadcast = std::time::Instant::now();
     // The height of the last snapshot written: an idle node has no reason to
     // rewrite a hundred identical megabytes every five minutes, and a
     // Raspberry Pi SD card has a limited number of writes.
@@ -4968,6 +4988,27 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             p.kept_bodies * q21_core::consensus::TARGET_BLOCK_SECS / 86_400
         );
     }
+
+    // --- Mining waits for the node to be up to date.
+    //
+    // A node started with `--mine` used to mine at once, on whatever chain it
+    // had: a fresh one, from genesis. On the 2026-10-11 load test, an agent
+    // mined about 240 blocks of its own before it had heard of the real
+    // chain; the network refused them, its peers' blocks then looked invalid
+    // to it (28), and it banned honest peers 14 times before catching up. The
+    // gate below lets it mine only once no peer announces a longer chain.
+    //
+    // Two limits keep the gate from becoming a way to stop a miner:
+    // - a node with bootstrap addresses waits for its first peer, but not
+    //   forever: alone after five minutes, it mines (somebody has to mine the
+    //   first blocks of a network);
+    // - a peer can announce any height at the handshake. If the height does
+    //   not move for ten minutes while a peer claims more, the claim is not
+    //   backed by blocks: mining resumes, and that claim is not heeded again.
+    let mut mining_gate = MiningGate::new(!targets.is_empty(), std::time::Instant::now());
+    // Attempts per mining round, adjusted to last about a second: see
+    // `next_mining_round`.
+    let mut mining_round: u64 = MINING_ROUND_MIN;
 
     loop {
         if duration > 0 && start.elapsed().as_secs() >= duration {
@@ -4999,6 +5040,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 }
             }
             last_snapshot = std::time::Instant::now();
+        }
+        if last_rebroadcast.elapsed() >= q21_core::net::MEMPOOL_REBROADCAST {
+            last_rebroadcast = std::time::Instant::now();
+            node.announce_mempool();
         }
         // Ctrl-C: we leave the loop rather than being killed on the spot.
         // Everything this node must write — mempool, snapshot, address book,
@@ -5095,7 +5140,18 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
         }
 
-        if mining.is_active() {
+        let gate = mining_gate.check(
+            node.peer_count() > 0,
+            node.height(),
+            node.max_announced_height(),
+            std::time::Instant::now(),
+        );
+        if let Some(change) = gate.change {
+            if mining.is_active() && !quiet {
+                println!("  {change}");
+            }
+        }
+        if mining.is_active() && gate.allowed {
             // --- One address per block found, not per attempt.
             //
             // This line derived a new address **at every loop iteration**.
@@ -5159,15 +5215,17 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             };
             // The rate shown on screen is a measurement: `attempt` is the
             // index of the winner, so `attempt + 1` attempts took place.
+            let round_started = std::time::Instant::now();
             let (block, attempts) = match q21_core::pow::mine_with_table_parallel(
                 &mut candidate.header,
                 &table,
-                2_000_000,
+                mining_round,
                 threads,
             ) {
                 Ok(attempt) => (Some(candidate), attempt.saturating_add(1)),
                 Err(done) => (None, done),
             };
+            mining_round = next_mining_round(mining_round, round_started.elapsed());
             mining.count_attempts(attempts);
             if let Some(b) = block {
                 // Same discipline as for a received block (`Node::integrer`):
@@ -5360,6 +5418,33 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
 
     node.shutdown();
+    // --- The mempool survives shutdown.
+    //
+    // A sent transaction waits there for a miner to take it. It was written
+    // nowhere: stopping the software before it was mined erased it, without a
+    // word. A first user lived through it — send, stop to start mining,
+    // transaction gone.
+    //
+    // On a populated network, a peer would have relayed and kept it. It was
+    // therefore the isolated node — that of a desktop wallet — that paid for
+    // this defect.
+    //
+    // Written first: when a console window is closed, Windows grants a few
+    // seconds only, and the pending transactions are what the user would
+    // miss. The wallet itself is already written at every send.
+    if let Ok(key) = q21_core::state::datadir_key(datadir) {
+        let pending = node.with_mempool(|m| m.ordered_transactions());
+        let store = q21_core::state::MempoolStore::new(mempool_path(datadir), key);
+        if pending.is_empty() {
+            // An empty mempool deletes the file: leaving it would bring back
+            // to life, at the next start, transactions already confirmed.
+            let _ = store.remove();
+        } else if let Err(e) = store.save(&pending) {
+            eprintln!("warning: mempool not written: {e}");
+        } else {
+            println!("  {} pending transaction(s) kept", pending.len());
+        }
+    }
     if !wallet_less {
         if let Ok(w) = wallet.lock() {
             let _ = write_wallet(datadir, &w);
@@ -5375,29 +5460,6 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // everything.
     if let Err(e) = address_book.save_entries(&node.address_entries()) {
         eprintln!("warning: address book not written: {e}");
-    }
-    // --- The mempool survives shutdown.
-    //
-    // A sent transaction waits there for a miner to take it. It was written
-    // nowhere: stopping the software before it was mined erased it, without a
-    // word. A first user lived through it — send, stop to start mining,
-    // transaction gone.
-    //
-    // On a populated network, a peer would have relayed and kept it. It was
-    // therefore the isolated node — that of a desktop wallet — that paid for
-    // this defect.
-    if let Ok(key) = q21_core::state::datadir_key(datadir) {
-        let pending = node.with_mempool(|m| m.ordered_transactions());
-        let store = q21_core::state::MempoolStore::new(mempool_path(datadir), key);
-        if pending.is_empty() {
-            // An empty mempool deletes the file: leaving it would bring back
-            // to life, at the next start, transactions already confirmed.
-            let _ = store.remove();
-        } else if let Err(e) = store.save(&pending) {
-            eprintln!("warning: mempool not written: {e}");
-        } else {
-            println!("  {} pending transaction(s) kept", pending.len());
-        }
     }
     // The snapshot is written at shutdown, not at every block: it is a
     // startup saving, not data whose loss would cost anything.
@@ -6225,8 +6287,170 @@ fn cmd_explorer(datadir: &Path, args: &[String]) -> Result<(), String> {
     cmd_node(datadir, &arguments)
 }
 
+/// Fewest and most attempts in one mining round.
+const MINING_ROUND_MIN: u64 = 4_096;
+const MINING_ROUND_MAX: u64 = 2_000_000;
+
+/// The size of the next mining round, so that a round lasts about a second.
+///
+/// A round was two million attempts whatever the machine: with the testnet
+/// table, tens of seconds on a PC, minutes on an older laptop. The node's
+/// loop does nothing else meanwhile — no shutdown seen, no peer maintenance,
+/// no new transaction in the block being mined. Closing the console window
+/// of a mining node on Windows, which grants a few seconds, therefore lost
+/// the pending transactions: the loop saw the request too late (load test of
+/// 11 October 2026). A new round costs a block template, a few milliseconds.
+fn next_mining_round(tries: u64, took: std::time::Duration) -> u64 {
+    let next = if took > std::time::Duration::from_millis(1500) {
+        tries / 2
+    } else if took < std::time::Duration::from_millis(500) {
+        tries.saturating_mul(2)
+    } else {
+        tries
+    };
+    next.clamp(MINING_ROUND_MIN, MINING_ROUND_MAX)
+}
+
+/// Decides whether a node may mine now. See the comment where it is created.
+struct MiningGate {
+    expects_peers: bool,
+    started: std::time::Instant,
+    ever_connected: bool,
+    last_height: u64,
+    last_progress: std::time::Instant,
+    allowed: bool,
+    /// The highest claim already found to bring no block: ignored from then
+    /// on, so that it cannot pause the miner again after each block it finds.
+    ignored_claim: u64,
+}
+
+/// The gate's answer, and the sentence to print when it changes.
+struct GateAnswer {
+    allowed: bool,
+    change: Option<&'static str>,
+}
+
+/// Alone this long with bootstrap addresses, a node mines anyway.
+const MINING_WAIT_FOR_PEER: std::time::Duration = std::time::Duration::from_secs(300);
+/// A claimed longer chain that brings no block for this long is ignored.
+const MINING_WAIT_FOR_PROGRESS: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl MiningGate {
+    fn new(expects_peers: bool, now: std::time::Instant) -> MiningGate {
+        MiningGate {
+            expects_peers,
+            started: now,
+            ever_connected: false,
+            last_height: 0,
+            last_progress: now,
+            allowed: true,
+            ignored_claim: 0,
+        }
+    }
+
+    fn check(
+        &mut self,
+        connected: bool,
+        height: u64,
+        announced: u64,
+        now: std::time::Instant,
+    ) -> GateAnswer {
+        if connected {
+            self.ever_connected = true;
+        }
+        if height != self.last_height {
+            self.last_height = height;
+            self.last_progress = now;
+        }
+        let waiting_first_peer = self.expects_peers
+            && !self.ever_connected
+            && now.duration_since(self.started) < MINING_WAIT_FOR_PEER;
+        if announced > height && now.duration_since(self.last_progress) >= MINING_WAIT_FOR_PROGRESS
+        {
+            self.ignored_claim = self.ignored_claim.max(announced);
+        }
+        let behind = announced > height && announced > self.ignored_claim;
+        let allowed = !waiting_first_peer && !behind;
+        let change = match (self.allowed, allowed) {
+            (true, false) if waiting_first_peer => {
+                Some("mining paused: waiting for a first peer before mining")
+            }
+            (true, false) => Some("mining paused: catching up with the network first"),
+            (false, true) => Some("mining resumed: the node is up to date"),
+            _ => None,
+        };
+        self.allowed = allowed;
+        GateAnswer { allowed, change }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{MiningGate, MINING_WAIT_FOR_PEER, MINING_WAIT_FOR_PROGRESS};
+
+    /// A fresh node does not mine on its own chain while a peer announces a
+    /// longer one: the 2026-10-11 agent mined 240 blocks nobody wanted.
+    #[test]
+    fn a_node_behind_its_peers_does_not_mine() {
+        let t0 = std::time::Instant::now();
+        let mut g = MiningGate::new(true, t0);
+        // No peer yet: wait for one.
+        assert!(!g.check(false, 0, 0, t0).allowed);
+        // A peer announces 2080 while we are at 715: still catching up.
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        assert!(!g.check(true, 715, 2080, t1).allowed);
+        // Caught up: mining starts.
+        let t2 = t1 + std::time::Duration::from_secs(5);
+        let a = g.check(true, 2080, 2080, t2);
+        assert!(a.allowed);
+        assert!(a.change.is_some(), "resuming is announced");
+    }
+
+    /// Alone for five minutes, a node mines: someone must mine the first
+    /// blocks of a network.
+    #[test]
+    fn a_lone_node_mines_after_waiting() {
+        let t0 = std::time::Instant::now();
+        let mut g = MiningGate::new(true, t0);
+        assert!(!g.check(false, 0, 0, t0).allowed);
+        let later = t0 + MINING_WAIT_FOR_PEER + std::time::Duration::from_secs(1);
+        assert!(g.check(false, 0, 0, later).allowed);
+        // Without bootstrap addresses, it mines at once (a local test chain).
+        assert!(MiningGate::new(false, t0).check(false, 0, 0, t0).allowed);
+    }
+
+    /// A mining round settles around a second, within its bounds.
+    #[test]
+    fn a_mining_round_lasts_about_a_second() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(next_mining_round(2_000_000, ms(30_000)), 1_000_000);
+        assert_eq!(next_mining_round(100_000, ms(100)), 200_000);
+        assert_eq!(next_mining_round(100_000, ms(900)), 100_000);
+        assert_eq!(
+            next_mining_round(MINING_ROUND_MIN, ms(5_000)),
+            MINING_ROUND_MIN
+        );
+        assert_eq!(next_mining_round(MINING_ROUND_MAX, ms(1)), MINING_ROUND_MAX);
+    }
+
+    /// A peer claiming a huge height cannot stop a miner for good: if the
+    /// height does not move for ten minutes, the claim is ignored.
+    #[test]
+    fn a_false_height_claim_does_not_stop_mining_forever() {
+        let t0 = std::time::Instant::now();
+        let mut g = MiningGate::new(true, t0);
+        g.check(true, 2200, 2200, t0);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(!g.check(true, 2200, 1_000_000, t1).allowed);
+        let t2 = t1 + MINING_WAIT_FOR_PROGRESS + std::time::Duration::from_secs(1);
+        assert!(g.check(true, 2200, 1_000_000, t2).allowed);
+        // The block it then mines does not revive the same claim.
+        let t3 = t2 + std::time::Duration::from_secs(1);
+        assert!(g.check(true, 2201, 1_000_000, t3).allowed);
+        // A higher claim pauses it again, for a while only.
+        assert!(!g.check(true, 2201, 2_000_000, t3).allowed);
+    }
+
     use super::*;
     use std::collections::HashMap;
 

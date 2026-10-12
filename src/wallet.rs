@@ -26,7 +26,7 @@ use crate::hash::{tagged_hash_parts, tags, Hash256};
 use crate::lamport::SecretKey;
 use crate::sig::{pubkey_hash, SchemeId};
 use crate::tx::{OutPoint, Transaction, TxIn, TxOut, Witness};
-use crate::utxo::UtxoSet;
+use crate::utxo::{UtxoSet, UtxoView};
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -1253,7 +1253,12 @@ impl Wallet {
         height: u64,
         needed: u64,
     ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
-        self.select_coins_avoiding(utxo, height, needed, &|_| false)
+        self.select_coins_avoiding(utxo, height, needed, &|_| false, &[])
+    }
+
+    /// Does this output pay one of the wallet's keys?
+    pub fn owns_output(&self, output: &TxOut) -> bool {
+        output.scheme == self.scheme && self.known.contains_key(&output.pubkey_hash)
     }
 
     /// [`Self::select_coins`], leaving out the coins `avoid` designates: those
@@ -1267,6 +1272,14 @@ impl Wallet {
     /// **one** payment per block, about one every two minutes. Lamport hid the
     /// defect (its keys are reserved after a single use); ML-DSA, the default
     /// scheme, showed it on the second send.
+    ///
+    /// # Pending coins
+    ///
+    /// `pending` lists outputs that transactions still waiting for a block
+    /// create (in practice: the change of the wallet's own sends). They come
+    /// **after** the confirmed coins: a chain of unconfirmed payments is only
+    /// built when nothing confirmed is left, never by preference. Those that
+    /// do not pay this wallet are ignored.
     #[allow(clippy::type_complexity)]
     pub fn select_coins_avoiding(
         &self,
@@ -1274,9 +1287,25 @@ impl Wallet {
         height: u64,
         needed: u64,
         avoid: &dyn Fn(&OutPoint) -> bool,
+        pending: &[(OutPoint, TxOut)],
     ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
         let mut available = self.spendable(utxo, height);
         available.retain(|e| !avoid(&e.0));
+        let one_time_scheme = self.scheme.is_one_time();
+        for (o, output) in pending {
+            if avoid(o) || !self.owns_output(output) {
+                continue;
+            }
+            let Some(index) = self.known.get(&output.pubkey_hash).copied() else {
+                continue;
+            };
+            if one_time_scheme
+                && (self.consumed.contains(&index) || self.reserved.contains_key(&index))
+            {
+                continue;
+            }
+            available.push((*o, *output, index));
+        }
 
         // A one-time scheme (Lamport) can sign only once per key, never
         // twice: signing two different messages with the same key reveals
@@ -1416,11 +1445,11 @@ impl Wallet {
         destinations: &[(Address, Amount)],
         fee: Amount,
     ) -> Result<PreparedSpend, WalletError> {
-        self.prepare_spend_avoiding(utxo, height, destinations, fee, &|_| false)
+        self.prepare_spend_avoiding(utxo, height, destinations, fee, &|_| false, &[])
     }
 
-    /// [`Self::prepare_spend`], without the coins that `avoid` designates
-    /// (see [`Self::select_coins_avoiding`]).
+    /// [`Self::prepare_spend`], without the coins that `avoid` designates and
+    /// with the `pending` ones (see [`Self::select_coins_avoiding`]).
     pub fn prepare_spend_avoiding(
         &mut self,
         utxo: &UtxoSet,
@@ -1428,6 +1457,7 @@ impl Wallet {
         destinations: &[(Address, Amount)],
         fee: Amount,
         avoid: &dyn Fn(&OutPoint) -> bool,
+        pending: &[(OutPoint, TxOut)],
     ) -> Result<PreparedSpend, WalletError> {
         if destinations.is_empty() {
             return Err(WalletError::ZeroAmount);
@@ -1471,7 +1501,7 @@ impl Wallet {
             .checked_add(fee.units())
             .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
             .ok_or(WalletError::AmountOutOfRange)?;
-        let (chosen, total) = self.select_coins_avoiding(utxo, height, needed, avoid)?;
+        let (chosen, total) = self.select_coins_avoiding(utxo, height, needed, avoid, pending)?;
 
         let mut outputs: Vec<TxOut> = destinations
             .iter()
@@ -1559,15 +1589,18 @@ impl Wallet {
     ///
     /// After signing, the indices move from reserved to consumed: the key is
     /// revealed, whether the transaction is broadcast or not — it exists.
+    ///
+    /// `utxo` is the set the coins are checked against: the confirmed set, or
+    /// the mempool's view of it when pending coins may have been chosen.
     pub fn sign_spend(
         &mut self,
-        utxo: &UtxoSet,
+        utxo: &dyn UtxoView,
         spend: PreparedSpend,
     ) -> Result<Transaction, WalletError> {
         let still_there = spend
             .chosen
             .iter()
-            .all(|(o, output, _)| utxo.get(o).map(|e| e.output == *output).unwrap_or(false));
+            .all(|(o, output, _)| utxo.lookup(o).map(|e| e.output == *output).unwrap_or(false));
         if !still_there {
             self.cancel_spend(spend);
             return Err(WalletError::CoinsGone);

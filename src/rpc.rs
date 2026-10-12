@@ -168,12 +168,130 @@ pub const MAX_BATCH_RESPONSE: usize = 8 * 1024 * 1024;
 /// so** in the response rather than lie by omission.
 pub const MAX_SCANNED_BLOCKS: u64 = 2_000;
 
-/// Fee used when the caller proposes none, in units.
+/// Smallest fee a send pays when the caller proposes none, in units.
 ///
 /// Deliberately modest: on a lightly loaded chain, paying more speeds nothing
-/// up. `estimatefee` proposes a value measured on the real state of the
-/// mempool; this one is only a fallback.
+/// up. Since 0.4.5 a send without a fee pays what its real weight requires at
+/// the rate of the pending transactions ([`automatic_fee`]), and never less
+/// than this floor. Before, this fixed value was used as is: a send that took
+/// fifteen coins paid less than the minimum rate and was refused.
 pub const DEFAULT_FEE: u64 = 1_000;
+
+/// Longest chain of unconfirmed transactions the wallet extends, counted with
+/// the transaction it builds.
+///
+/// The wallet spends the change of its own pending sends (0.4.5), which
+/// builds chains. A long chain is fragile: a peer that misses one link refuses
+/// every following one until the link comes back. Past this length, the
+/// wallet waits for a block rather than go deeper.
+pub const MAX_UNCONFIRMED_CHAIN: usize = 25;
+
+/// The change of the wallet's own pending sends, which a send may spend
+/// before the next block, as long as the chain behind it stays under
+/// [`MAX_UNCONFIRMED_CHAIN`].
+///
+/// Only the change of its **own** sends: a pending payment received from
+/// someone else can still be replaced by its sender, and a payment built on
+/// it would vanish with it. Confirmed, it becomes an ordinary coin.
+fn own_pending_coins(
+    w: &Wallet,
+    c: &crate::chain::Chain,
+    m: &crate::mempool::Mempool,
+) -> Vec<(crate::tx::OutPoint, crate::tx::TxOut)> {
+    // The parent, its ancestors, and the transaction being built.
+    let room = MAX_UNCONFIRMED_CHAIN.saturating_sub(2);
+    let mine = |o: &crate::tx::TxOut| w.owns_output(o);
+    m.unspent_created(&mine)
+        .into_iter()
+        .filter(|(o, _)| {
+            m.spends_only(&o.txid, &c.utxo, &mine) && m.ancestors_up_to(&o.txid, room + 1) <= room
+        })
+        .collect()
+}
+
+/// The figures of the transaction a send would build now.
+struct FeeEstimate {
+    fee: u64,
+    inputs: u64,
+    size: u64,
+    weight: u64,
+    change: u64,
+    total: u64,
+    rate: u64,
+}
+
+/// Fee for paying `total_out` units to `n_destinations` recipients, measured
+/// on the coins the selection really takes.
+///
+/// The rate is the median of the pending transactions, never below the relay
+/// floor; the fee never goes below [`DEFAULT_FEE`]. A higher fee can require
+/// one more coin, hence a few passes; the last one is checked.
+fn automatic_fee(
+    g: &Wallet,
+    c: &crate::chain::Chain,
+    m: &crate::mempool::Mempool,
+    total_out: u64,
+    n_destinations: u64,
+    pending: &[(crate::tx::OutPoint, crate::tx::TxOut)],
+) -> Result<FeeEstimate, crate::wallet::WalletError> {
+    let scheme = g.scheme();
+    let rate = m
+        .median_fee_rate()
+        .unwrap_or(0)
+        .max(crate::mempool::MIN_FEE_RATE);
+    let mut fee = DEFAULT_FEE;
+    for _ in 0..4 {
+        let needed = total_out
+            .checked_add(fee)
+            .filter(|t| *t <= MAX_SUPPLY)
+            .ok_or(crate::wallet::WalletError::AmountOutOfRange)?;
+        let (chosen, total) =
+            g.select_coins_avoiding(&c.utxo, c.height(), needed, &|o| m.spends(o), pending)?;
+        let n = chosen.len() as u64;
+        let change = total - needed;
+        // The recipients, plus the change if there is any.
+        let n_outputs = n_destinations + u64::from(change > 0);
+        let base_size = 8 + n * 48 + n_outputs * 41;
+        let witness = n * (scheme.pubkey_len() as u64 + scheme.sig_len() as u64);
+        let weight = base_size * WITNESS_DISCOUNT + witness + n_outputs * WEIGHT_PER_OUTPUT;
+        // Rounded up: below the floor, the transaction is not relayed at all.
+        let computed = weight.saturating_mul(rate).div_ceil(1000).max(DEFAULT_FEE);
+        if computed <= fee {
+            return Ok(FeeEstimate {
+                fee,
+                inputs: n,
+                size: base_size + witness,
+                weight,
+                change,
+                total,
+                rate,
+            });
+        }
+        fee = computed;
+    }
+    // Still growing after four passes: pay a quarter more than the last
+    // measure rather than risk a refusal.
+    let fee = fee.saturating_add(fee / 4);
+    let needed = total_out
+        .checked_add(fee)
+        .filter(|t| *t <= MAX_SUPPLY)
+        .ok_or(crate::wallet::WalletError::AmountOutOfRange)?;
+    let (chosen, total) =
+        g.select_coins_avoiding(&c.utxo, c.height(), needed, &|o| m.spends(o), pending)?;
+    let n = chosen.len() as u64;
+    let n_outputs = n_destinations + 1;
+    let base_size = 8 + n * 48 + n_outputs * 41;
+    let witness = n * (scheme.pubkey_len() as u64 + scheme.sig_len() as u64);
+    Ok(FeeEstimate {
+        fee,
+        inputs: n,
+        size: base_size + witness,
+        weight: base_size * WITNESS_DISCOUNT + witness + n_outputs * WEIGHT_PER_OUTPUT,
+        change: total - needed,
+        total,
+        rate,
+    })
+}
 
 /// Blocks walked back by `listtransactions`.
 ///
@@ -704,6 +822,17 @@ fn block_json(b: &Block, network: Network) -> Json {
     Json::obj()
         .set("header", header_json(&b.header))
         .set("size_bytes", Json::u64(b.encode().len() as u64))
+        // The weight of its transactions, the measure a block template fills
+        // up to `TARGET_BLOCK_WEIGHT`: how full the block is.
+        .set(
+            "weight",
+            Json::u64(
+                b.transactions
+                    .iter()
+                    .map(|t| t.weight(WITNESS_DISCOUNT))
+                    .sum(),
+            ),
+        )
         .set(
             "subsidy",
             amount_json(emission::block_subsidy(b.header.height)),
@@ -2573,51 +2702,23 @@ impl RpcContext {
         let g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
-        let scheme = g.scheme();
 
-        let (median_rate, pending_count) = self
-            .node
-            .with_mempool(|m| (m.median_fee_rate().unwrap_or(0), m.len() as u64));
-        let rate = median_rate.max(crate::mempool::MIN_FEE_RATE);
-
-        // Two passes: the first to know the number of inputs, the second
-        // because a higher fee can require one more. Two are enough in
-        // practice; we do not loop indefinitely.
-        let mut fee = DEFAULT_FEE;
-        let mut result = None;
-        for _ in 0..2 {
-            let needed = units
-                .checked_add(fee)
-                .ok_or_else(|| rpc_error(ERR_PARAMS, "amount plus fee overflows"))?;
-            // The same coins as the real send will take: not those that a
-            // pending transaction already spends.
-            let (chosen, total) = self
-                .node
-                .with_chain_and_mempool(|c, m| {
-                    g.select_coins_avoiding(&c.utxo, c.height(), needed, &|o| m.spends(o))
-                })
-                .map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
-
-            let n = chosen.len() as u64;
-            let change = total - needed;
-            // One output for the recipient, one for the change if there is any.
-            let n_outputs = if change > 0 { 2 } else { 1 };
-            let base_size = 8 + n * 48 + n_outputs * 41;
-            let witness = n * (scheme.pubkey_len() as u64 + scheme.sig_len() as u64);
-            let weight = base_size * WITNESS_DISCOUNT + witness + n_outputs * WEIGHT_PER_OUTPUT;
-            // Rounded up: below the floor, the transaction is not relayed at
-            // all.
-            let computed = weight.saturating_mul(rate).div_ceil(1000).max(1);
-
-            result = Some((n, base_size + witness, weight, change, total));
-            if computed <= fee {
-                break;
-            }
-            fee = computed;
-        }
-
-        let (n_inputs, size, weight, change, total) =
-            result.ok_or_else(|| rpc_error(ERR_INTERNAL, "selection failed"))?;
+        // The same coins and the same fee as the real send will take: not the
+        // coins a pending transaction already spends, plus the change of the
+        // wallet's own pending sends.
+        let (estimate, pending_count) = self.node.with_chain_and_mempool(|c, m| {
+            let pending = own_pending_coins(&g, c, m);
+            (automatic_fee(&g, c, m, units, 1, &pending), m.len() as u64)
+        });
+        let FeeEstimate {
+            fee,
+            inputs: n_inputs,
+            size,
+            weight,
+            change,
+            total,
+            rate,
+        } = estimate.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
 
         Ok(Json::obj()
             .set("address", Json::str(dest.to_string_bech32()))
@@ -3097,25 +3198,21 @@ impl RpcContext {
         // value with the default value: the transaction built was not the one
         // the client had written. A field that is present and invalid is an
         // error, not an invitation to guess.
-        let fee = match params.get("fee") {
-            None | Some(Json::Null) => DEFAULT_FEE,
-            Some(v) => v.as_u64().ok_or_else(|| {
-                rpc_error(
-                    ERR_PARAMS,
-                    "parameter 'fee' present but unreadable: an integer number of units is expected",
-                )
-            })?,
-        };
+        //
+        // Absent, the fee is computed on the transaction really built (see
+        // `automatic_fee`).
+        let fee = read_fee(params)?;
 
         let dest = Address::parse_on(address, self.network)
             .map_err(|e| rpc_error(ERR_PARAMS, &format!("invalid address: {e:?}")))?;
 
-        let (tx, txid) = self.spend(w, &[(dest, Amount::from_units(units))], fee)?;
+        let (tx, txid, fee) = self.spend(w, &[(dest, Amount::from_units(units))], fee)?;
 
         self.node.announce_tx(txid);
 
         Ok(Json::obj()
             .set("txid", Json::str(txid.to_hex()))
+            .set("fee", amount_json(Amount::from_units(fee)))
             .set("transaction", tx_json(&tx, self.network))
             .build())
     }
@@ -3144,12 +3241,19 @@ impl RpcContext {
     ///
     /// The wallet lock, on the other hand, is held from start to finish: it
     /// only protects the wallet, and nobody else waits for it during a send.
+    ///
+    /// `fee`: `None` computes it on the transaction really built. The fee
+    /// paid is returned with the transaction.
+    ///
+    /// The change of the wallet's own pending sends can be spent (see
+    /// [`own_pending_coins`]): the confirmed coins all committed no longer
+    /// mean waiting for a block.
     fn spend(
         &self,
         w: &Arc<Mutex<Wallet>>,
         destinations: &[(crate::address::Address, Amount)],
-        fee: u64,
-    ) -> Result<(crate::tx::Transaction, crate::hash::Hash256), Json> {
+        fee: Option<u64>,
+    ) -> Result<(crate::tx::Transaction, crate::hash::Hash256, u64), Json> {
         let mut g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
@@ -3178,9 +3282,31 @@ impl RpcContext {
                     }));
                 }
             }
-            let fee = Amount::from_units(fee);
-            let r =
-                g.prepare_spend_avoiding(&c.utxo, c.height(), destinations, fee, &|o| m.spends(o));
+            let pending = own_pending_coins(&g, c, m);
+            let fee = match fee {
+                Some(f) => Ok(f),
+                None => {
+                    let total_out = destinations
+                        .iter()
+                        .try_fold(0u64, |a, (_, v)| a.checked_add(v.units()))
+                        .ok_or(crate::wallet::WalletError::AmountOutOfRange);
+                    total_out.and_then(|t| {
+                        automatic_fee(&g, c, m, t, destinations.len() as u64, &pending)
+                            .map(|e| e.fee)
+                    })
+                }
+            };
+            let r = fee.and_then(|fee| {
+                g.prepare_spend_avoiding(
+                    &c.utxo,
+                    c.height(),
+                    destinations,
+                    Amount::from_units(fee),
+                    &|o| m.spends(o),
+                    &pending,
+                )
+                .map(|p| (p, fee))
+            });
             // Short only because of the pending sends? Then the funds exist:
             // they are waiting for a block, and the user must hear that, not
             // "insufficient funds".
@@ -3191,7 +3317,7 @@ impl RpcContext {
             }
             r.map_err(Some)
         });
-        let prepare = prepare.map_err(|e| match e {
+        let (prepare, fee) = prepare.map_err(|e| match e {
             Some(e) => rpc_error(ERR_WALLET, wallet_message(&e)),
             None => rpc_error(ERR_WALLET, PENDING_FUNDS),
         })?;
@@ -3210,8 +3336,11 @@ impl RpcContext {
         // 3. Signature and acceptance, under the chain and mempool lock: both
         //    live under the same one, and taking one inside the other would
         //    freeze the node.
+        //    The coins are checked against the mempool's view: a pending coin
+        //    must still be there, and a confirmed one must not have been taken
+        //    by another pending send in the meantime.
         let result = self.node.with_chain_and_mempool(|c, m| {
-            let tx = g.sign_spend(&c.utxo, prepare)?;
+            let tx = g.sign_spend(&m.view(&c.utxo), prepare)?;
             let r = m.accept(&tx, &c.utxo, self.network, c.height());
             Ok((tx, r))
         });
@@ -3223,7 +3352,7 @@ impl RpcContext {
         }
         let (tx, accepted) = result.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
         let txid = accepted.map_err(|e| rpc_error(ERR_WALLET, &mempool_message(&e)))?;
-        Ok((tx, txid))
+        Ok((tx, txid, fee))
     }
 
     /// Pays several recipients in **a single** transaction.
@@ -3272,51 +3401,40 @@ impl RpcContext {
             destinations.push((dest, Amount::from_units(units)));
         }
 
-        let fee = match params.get("fee") {
-            None | Some(Json::Null) => DEFAULT_FEE,
-            Some(v) => v.as_u64().ok_or_else(|| {
-                rpc_error(
-                    ERR_PARAMS,
-                    "parameter 'fee' present but unreadable: an integer number of units is expected",
-                )
-            })?,
-        };
+        let fee = read_fee(params)?;
 
-        let (tx, txid) = {
-            let mut g = w
-                .lock()
-                .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
-            let result = self.node.with_chain_and_mempool(|c, m| {
-                let tx = g.create_transaction_multi_guarded(
-                    &c.utxo,
-                    c.height(),
-                    &destinations,
-                    Amount::from_units(fee),
-                    &mut |w| self.save_wallet(w),
-                );
-                match tx {
-                    Ok(tx) => {
-                        let r = m.accept(&tx, &c.utxo, self.network, c.height());
-                        Ok((tx, r))
-                    }
-                    Err(e) => Err(e),
-                }
-            });
-            if let Err(e) = self.save_wallet(&g) {
-                eprintln!("WARNING: wallet not saved after the send: {e}");
-            }
-            let (tx, accepted) = result.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
-            let txid = accepted.map_err(|e| rpc_error(ERR_WALLET, &mempool_message(&e)))?;
-            (tx, txid)
-        };
+        // The same path as `sendtoaddress`. Before 0.4.5, a batch took coins
+        // already spent by a pending send (refused as a double spend), and
+        // sealed the wallet under the chain lock.
+        let (tx, txid, fee) = self.spend(w, &destinations, fee)?;
 
         self.node.announce_tx(txid);
 
         Ok(Json::obj()
             .set("txid", Json::str(txid.to_hex()))
+            .set("fee", amount_json(Amount::from_units(fee)))
             .set("recipients", Json::u64(destinations.len() as u64))
             .set("transaction", tx_json(&tx, self.network))
             .build())
+    }
+}
+
+/// The `fee` parameter of a send: `None` when absent (computed then), an
+/// error when present but unreadable.
+///
+/// `.and_then(as_u64).unwrap_or(1_000)` once silently replaced any unreadable
+/// value with the default: the transaction built was not the one the client
+/// had written. A field that is present and invalid is an error, not an
+/// invitation to guess.
+fn read_fee(params: &Json) -> Result<Option<u64>, Json> {
+    match params.get("fee") {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            rpc_error(
+                ERR_PARAMS,
+                "parameter 'fee' present but unreadable: an integer number of units is expected",
+            )
+        }),
     }
 }
 
@@ -3869,8 +3987,10 @@ mod tests {
         assert_eq!(c.node.with_mempool(|m| m.len()), 4);
     }
 
-    /// When every coin is pending, the refusal says so, rather than
-    /// "insufficient funds" for money the wallet does have.
+    /// A single coin: each send spends the change of the previous one, up
+    /// to [`MAX_UNCONFIRMED_CHAIN`] transactions; past that, the refusal says
+    /// to wait for a block, rather than "insufficient funds" for money the
+    /// wallet does have.
     #[cfg(feature = "mldsa")]
     #[test]
     fn spending_pending_coins_says_to_wait_for_a_block() {
@@ -3878,7 +3998,8 @@ mod tests {
         let mut other = Wallet::from_seed([0x13; 32], NETWORK);
         let to = other.new_address().to_string_bech32();
         let mut refused = None;
-        for _ in 0..8 {
+        let mut sent = 0;
+        for _ in 0..(MAX_UNCONFIRMED_CHAIN + 5) {
             let r = call(
                 &c,
                 "sendtoaddress",
@@ -3892,8 +4013,216 @@ mod tests {
                 refused = Some(m.to_string());
                 break;
             }
+            sent += 1;
         }
+        assert_eq!(sent, MAX_UNCONFIRMED_CHAIN, "the chain stops at its limit");
         assert_eq!(refused.as_deref(), Some(PENDING_FUNDS));
+    }
+
+    /// The inputs of a send, as `txid:index`.
+    fn inputs_of(r: &Json) -> Vec<String> {
+        r.get("transaction")
+            .and_then(|t| t.get("inputs"))
+            .and_then(|v| v.as_array())
+            .expect("inputs")
+            .iter()
+            .map(|i| {
+                format!(
+                    "{}:{}",
+                    i.get("txid").and_then(|v| v.as_str()).unwrap_or(""),
+                    i.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                )
+            })
+            .collect()
+    }
+
+    /// Mines the pending transactions as a block template would, and connects
+    /// the block. Returns how many went in.
+    fn mine_pending(c: &RpcContext) -> usize {
+        let mut miner = Wallet::from_seed([0x77; 32], NETWORK);
+        let a = miner.new_address();
+        c.node.with_chain_and_mempool(|ch, m| {
+            let txs = m.select_for_block(TARGET_BLOCK_WEIGHT);
+            let t = crate::chain::GENESIS_TIME + (ch.height() + 1) * TARGET_BLOCK_SECS;
+            let b = ch
+                .mine_block(a.hash, a.scheme, &txs, t, 5_000_000)
+                .expect("mining");
+            ch.connect(&b, t + 1).expect("connect");
+            m.on_block_connected(&b);
+            txs.len()
+        })
+    }
+
+    /// 0.4.5: the confirmed coin committed, the next sends spend the change
+    /// of the previous ones, and the whole chain fits in the next block.
+    /// Before, the wallet had to wait two minutes for a block between two
+    /// payments once its coins were committed.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_wallet_spends_its_own_pending_change() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 1);
+        let mut other = Wallet::from_seed([0x14; 32], NETWORK);
+        let to = other.new_address().to_string_bech32();
+        let mut previous: Option<String> = None;
+        for k in 0..6 {
+            let r = call_ok(
+                &c,
+                "sendtoaddress",
+                &format!(r#"{{"address":"{to}","units":{}}}"#, 200_000 + k),
+            );
+            let txid = r
+                .get("txid")
+                .and_then(|v| v.as_str())
+                .expect("txid")
+                .to_string();
+            let inputs = inputs_of(&r);
+            if let Some(p) = &previous {
+                assert!(
+                    inputs.iter().any(|i| i.starts_with(p.as_str())),
+                    "send {k} does not spend the change of the previous one"
+                );
+            }
+            previous = Some(txid);
+        }
+        assert_eq!(c.node.with_mempool(|m| m.len()), 6);
+        assert_eq!(mine_pending(&c), 6, "the whole chain goes in one block");
+        assert_eq!(c.node.with_mempool(|m| m.len()), 0);
+    }
+
+    /// A pending payment received from someone else is not spent before its
+    /// block: its sender can still replace it. Only the change of the
+    /// wallet's own sends is.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_pending_payment_from_someone_else_is_not_spent() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 1);
+        // The wallet of `context_with_funds`, rebuilt from its seed.
+        let mut payer = Wallet::from_seed([0x5a; 32], NETWORK);
+        for _ in 0..(COINBASE_MATURITY + 3) {
+            payer.new_address();
+        }
+        let to_us = c
+            .wallet
+            .as_ref()
+            .expect("wallet")
+            .lock()
+            .expect("lock")
+            .new_address();
+        c.node.with_chain_and_mempool(|ch, m| {
+            let tx = payer
+                .create_transaction(
+                    &ch.utxo,
+                    ch.height(),
+                    &to_us,
+                    Amount::from_units(50_000_000),
+                    Amount::from_units(20_000),
+                )
+                .expect("payment to us");
+            m.accept(&tx, &ch.utxo, NETWORK, ch.height())
+                .expect("accepted");
+        });
+        let mut other = Wallet::from_seed([0x18; 32], NETWORK);
+        let to = other.new_address().to_string_bech32();
+        // More than the wallet's own coin: only the incoming payment could
+        // pay it.
+        let r = call(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":40000000}}"#),
+        );
+        assert!(r.get("error").is_some(), "{}", r.encode());
+        assert_eq!(c.node.with_mempool(|m| m.len()), 1);
+    }
+
+    /// A child paying a higher rate than its parent goes in the same block,
+    /// right after it. Before 0.4.5 it was met first, skipped, and waited for
+    /// the next block: a chain of ten payments took ten blocks.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_child_paying_more_than_its_parent_goes_in_the_same_block() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 1);
+        let mut other = Wallet::from_seed([0x15; 32], NETWORK);
+        let to = other.new_address().to_string_bech32();
+        let parent = call_ok(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":300000,"fee":1000}}"#),
+        );
+        let child = call_ok(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":300000,"fee":90000}}"#),
+        );
+        let parent_id = parent.get("txid").and_then(|v| v.as_str()).expect("txid");
+        assert!(inputs_of(&child).iter().any(|i| i.starts_with(parent_id)));
+        let order: Vec<String> = c.node.with_mempool(|m| {
+            m.select_for_block(TARGET_BLOCK_WEIGHT)
+                .iter()
+                .map(|t| t.txid().to_hex())
+                .collect()
+        });
+        assert_eq!(order.len(), 2, "the child waits for nothing");
+        assert_eq!(order[0], parent_id, "the parent goes first");
+    }
+
+    /// Without a fee, a send pays for its real weight. Fourteen ML-DSA-87
+    /// inputs weigh over 100,000: the old fixed default (1,000 units) paid
+    /// under the relay floor and was refused.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_send_without_fee_pays_for_its_weight() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 20);
+        let mut other = Wallet::from_seed([0x16; 32], NETWORK);
+        let to = other.new_address().to_string_bech32();
+        // Nine tenths of twenty coins: at least fourteen inputs, where 1,000
+        // units fall under the floor of ten per thousand weight units.
+        let spendable = call_ok(&c, "getbalance", "{}")
+            .get("spendable")
+            .and_then(|s| s.get("units"))
+            .and_then(|v| v.as_u64())
+            .expect("spendable");
+        let units = spendable / 10 * 9;
+
+        let fixed = call(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":{units},"fee":{DEFAULT_FEE}}}"#),
+        );
+        assert!(fixed.get("error").is_some(), "the old default was refused");
+
+        let r = call_ok(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":{units}}}"#),
+        );
+        assert!(inputs_of(&r).len() >= 14, "{} inputs", inputs_of(&r).len());
+        let fee = r
+            .get("fee")
+            .and_then(|f| f.get("units"))
+            .and_then(|v| v.as_u64())
+            .expect("fee");
+        assert!(fee > DEFAULT_FEE, "fee {fee}");
+        assert_eq!(c.node.with_mempool(|m| m.len()), 1);
+    }
+
+    /// Two batches in a row take different coins. Before 0.4.5, `sendmany`
+    /// did not leave out the coins of a pending send: the second batch was
+    /// refused as a double spend.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn two_batches_in_a_row_use_different_coins() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 4);
+        let mut other = Wallet::from_seed([0x17; 32], NETWORK);
+        let a = other.new_address().to_string_bech32();
+        let b = other.new_address().to_string_bech32();
+        let batch = format!(
+            r#"{{"destinations":[{{"address":"{a}","units":150000}},{{"address":"{b}","units":250000}}]}}"#
+        );
+        let first = call_ok(&c, "sendmany", &batch);
+        let second = call_ok(&c, "sendmany", &batch);
+        let one = inputs_of(&first);
+        assert!(inputs_of(&second).iter().all(|i| !one.contains(i)));
+        assert_eq!(c.node.with_mempool(|m| m.len()), 2);
     }
 
     /// A send without a recipient is cleanly refused, not built empty.

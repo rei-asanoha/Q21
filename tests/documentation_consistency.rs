@@ -385,6 +385,27 @@ fn the_public_explorer_is_watched_and_restarted() {
     );
 }
 
+/// A network where nobody mines is not a stuck node: the monitoring asks
+/// whether any peer knows a longer chain before restarting anything.
+#[test]
+fn the_monitoring_does_not_restart_an_idle_network() {
+    let script = read("tools/monitor.sh");
+    let frozen = script
+        .find("minutes=$(( (now - since) / 60 ))")
+        .expect("frozen branch");
+    let tail = &script[frozen..];
+    let idle = tail
+        .find("getsyncstatus")
+        .expect("the frozen branch asks for the sync status");
+    let restart = tail
+        .find("systemctl restart \"$SERVICE\"")
+        .expect("restart of the service");
+    assert!(
+        idle < restart,
+        "the idle-network check must come before the restart"
+    );
+}
+
 /// A refusal is a configuration error, never a stuck node: the monitoring
 /// must not restart a node that answered "no". Both refusals the RPC can
 /// give are handled before the restart.

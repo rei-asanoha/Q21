@@ -150,6 +150,25 @@ fi
 # The height has not moved: for how long?
 minutes=$(( (now - since) / 60 ))
 if [ "$minutes" -ge "$THRESHOLD" ]; then
+  # A frozen height is not always this node's fault. When nobody mines, the
+  # whole network stops, and restarting changes nothing: on 2026-10-12 both
+  # entry points were restarted every hour for a morning, while they were
+  # fine and simply waiting for a miner. So we first ask the node whether any
+  # peer knows a longer chain. Connected, and no peer ahead: the network is
+  # idle, the node is not stuck. We note it about once an hour and leave the
+  # service alone. No peer at all, or a peer ahead: the node is the problem,
+  # and the restart below applies.
+  sync=$(curl -s -m 10 -X POST "http://$RPC/rpc" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getsyncstatus","params":{}}' 2>/dev/null)
+  peers=$(printf '%s' "$sync" | sed -n 's/.*"peers":\([0-9]*\).*/\1/p')
+  network=$(printf '%s' "$sync" | sed -n 's/.*"network_height":\([0-9]*\).*/\1/p')
+  if [ -n "$peers" ] && [ "$peers" -gt 0 ] && [ -n "$network" ] && [ "$network" -le "$height" ]; then
+    if [ $(( (minutes - THRESHOLD) % 60 )) -lt 10 ]; then
+      logger -t q21-monitor "height frozen at $height for $minutes min, but none of the $peers peers knows a longer chain: the network is idle (nobody mining), service $SERVICE left running"
+    fi
+    exit 0
+  fi
   # A height frozen right after a restart is the catch-up, not a failure:
   # we never restart twice within the same hour.
   service_since=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$SERVICE" 2>/dev/null)

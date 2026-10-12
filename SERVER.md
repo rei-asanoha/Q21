@@ -616,7 +616,10 @@ A node that stops at three in the morning warns no one. The repository's
 `tools/monitor.sh` script reads the height from the local RPC every ten
 minutes; if it has not moved for thirty minutes, or if the RPC no longer
 answers, it restarts the service and — if you give it an **ntfy topic** —
-sends a notification to your phone. [ntfy](https://ntfy.sh) is free and needs
+sends a notification to your phone. Since 0.4.5, a height that stops while
+peers are connected and none of them knows a longer chain is not a fault: the
+network is idle (nobody is mining). The service is then left running, and the
+log says so about once an hour. [ntfy](https://ntfy.sh) is free and needs
 no account: install the app, subscribe to a topic of your choice (long and
 unpredictable, for example `q21-server-k8s2m7x`), and put the same name below.
 
@@ -697,7 +700,8 @@ sudo cat /run/q21-monitor/state
 ```
 
 Two numbers, the height and the time it was recorded. Run it again ten
-minutes later: the height must have grown. If the file does not exist, the
+minutes later: the height must have grown — unless nobody is mining on the
+network, in which case the log says the network is idle. If the file does not exist, the
 `RuntimeDirectoryPreserve=yes` line is missing from the unit.
 
 ---

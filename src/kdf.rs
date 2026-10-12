@@ -43,14 +43,25 @@
 //! |---|---|---|---|
 //! | 1 | PBKDF2 | legacy | read, never written |
 //! | 2 | Argon2id | legacy | read, never written (0.3.x) |
-//! | 3 | Argon2id | `Q21/keystream` | written since 0.4 |
+//! | 3 | Argon2id | `Q21/keystream` | read; written by 0.4 to 0.4.4 |
+//! | 4 | Argon2id, then a per-write nonce | `Q21/keystream` | written since 0.4.5 |
 //!
 //! Formats 3 and 2 differ only by their magic and the keystream label: 0.4
 //! renamed the label, and a new label needs a new magic, or a file could not
 //! say which label it was sealed under. The magics and the label of formats 1
-//! and 2 live in [`crate::legacy`]. An older file is resealed in format 3 at
-//! its next write, which happens as soon as the first address is drawn or the
-//! first spend is made.
+//! and 2 live in [`crate::legacy`]. An older file is resealed in the current
+//! format at its next write, which happens as soon as the first address is
+//! drawn or the first spend is made.
+//!
+//! Format 4 exists for speed, not strength. Formats 1 to 3 draw a new salt and
+//! run Argon2id at **every** write, and a wallet writes twice per payment: the
+//! 2026-10-11 load test measured 0.7 s per payment on a desktop and about ten
+//! seconds on a laptop that was also mining. Format 4 derives a master key
+//! once per session ([`SealingKey`], same Argon2id cost, same salt in the
+//! header) and then, at each write, two fresh subkeys from a random 16-byte
+//! nonce stored next to the salt. An attacker who steals the file still pays
+//! the full Argon2id cost per guess; two versions of the file never share a
+//! keystream.
 
 use crate::sha256::{sha256, Sha256};
 
@@ -318,9 +329,14 @@ impl std::fmt::Display for SealError {
 const MAGIC_V1: &[u8; 8] = crate::legacy::LEGACY_SEAL_V1_MAGIC;
 /// Magic of format 2 (Argon2id, legacy keystream label). Read, never written.
 const MAGIC_V2: &[u8; 8] = crate::legacy::LEGACY_SEAL_V2_MAGIC;
-/// Magic of the current format, 3. Frozen: changing it would orphan existing
-/// sealed files, including encrypted wallets.
+/// Magic of format 3. Read, no longer written. Frozen: changing it would
+/// orphan existing sealed files, including encrypted wallets.
 const MAGIC_V3: &[u8; 8] = b"Q21SEAL3";
+/// Magic of the current format, 4. Frozen, for the same reason.
+const MAGIC_V4: &[u8; 8] = b"Q21SEAL4";
+/// Labels of the two per-write subkeys of format 4. Frozen.
+const SUBKEY_ENCRYPTION: &[u8] = b"Q21/seal4/encryption";
+const SUBKEY_AUTHENTICATION: &[u8] = b"Q21/seal4/authentication";
 
 /// Keystream label of the current format. Frozen, for the same reason.
 pub const KEYSTREAM_LABEL: &[u8] = b"Q21/keystream";
@@ -332,30 +348,88 @@ pub const KEYSTREAM_LABEL: &[u8] = b"Q21/keystream";
 /// door to denial of service by simply rewriting four bytes.
 pub const MAX_ITERATIONS: u32 = 50_000_000;
 
-/// Encrypts then authenticates.
+/// The Argon2id master key of a session, and the salt it was derived with.
 ///
-/// Format 3: `MAGIC_V3(8) || memory_kib(4) || passes(4) || salt(16) ||
-/// ciphertext(n) || mac(32)`.
+/// Derived once (the slow part), then reused for every write of the
+/// session; each write still gets its own subkeys (see [`seal_with`]). Wiped
+/// when dropped, like the keys it produces.
+pub struct SealingKey {
+    salt: [u8; 16],
+    cost: Cost,
+    master: [u8; 64],
+}
+
+impl Drop for SealingKey {
+    fn drop(&mut self) {
+        wipe(&mut self.master);
+    }
+}
+
+impl SealingKey {
+    /// Draws a salt and runs Argon2id once, at `cost`.
+    pub fn derive(passphrase: &[u8], cost: Cost) -> Result<SealingKey, crate::rng::RngError> {
+        let salt: [u8; 16] = crate::rng::bytes()?;
+        Ok(SealingKey {
+            salt,
+            cost,
+            master: derive_argon2_master(passphrase, &salt, cost),
+        })
+    }
+}
+
+/// The 64-byte Argon2id output of format 4, kept whole: it is the master
+/// key, not yet split.
+fn derive_argon2_master(passphrase: &[u8], salt: &[u8; 16], cost: Cost) -> [u8; 64] {
+    let p = crate::argon2::Params {
+        variant: crate::argon2::Variant::Id,
+        memory_kib: cost.memory_kib,
+        passes: cost.passes,
+        lanes: 1,
+    };
+    let mut raw = crate::argon2::derive_key(p, passphrase, salt, &[], &[], 64);
+    let mut master = [0u8; 64];
+    master.copy_from_slice(&raw);
+    wipe(&mut raw);
+    master
+}
+
+/// The two subkeys of one write: HMAC of the master key over a label and the
+/// write's nonce. A new nonce, new keys: no keystream is ever reused.
+fn subkeys(master: &[u8; 64], nonce: &[u8; 16]) -> Keys {
+    let mut input = Vec::with_capacity(32 + 16);
+    input.extend_from_slice(SUBKEY_ENCRYPTION);
+    input.extend_from_slice(nonce);
+    let encryption = hmac_sha256(master, &input);
+    input.clear();
+    input.extend_from_slice(SUBKEY_AUTHENTICATION);
+    input.extend_from_slice(nonce);
+    let authentication = hmac_sha256(master, &input);
+    Keys {
+        encryption,
+        authentication,
+    }
+}
+
+/// Encrypts then authenticates, with a key derived beforehand.
+///
+/// Format 4: `MAGIC_V4(8) || memory_kib(4) || passes(4) || salt(16) ||
+/// nonce(16) || ciphertext(n) || mac(32)`.
 ///
 /// The authenticator covers **everything before it**, header included:
 /// without that, an attacker could bring the cost down to nothing and turn
-/// the protection into a formality.
-///
-/// The order is encrypt-**then**-authenticate: nothing is ever decrypted
-/// before checking that it really comes from the holder of the passphrase.
-pub fn seal(
-    passphrase: &[u8],
-    plaintext: &[u8],
-    cost: Cost,
-) -> Result<Vec<u8>, crate::rng::RngError> {
-    let salt: [u8; 16] = crate::rng::bytes()?;
-    let k = derive_argon2(passphrase, &salt, cost);
+/// the protection into a formality. The order is encrypt-**then**-
+/// authenticate: nothing is ever decrypted before checking that it really
+/// comes from the holder of the passphrase.
+pub fn seal_with(key: &SealingKey, plaintext: &[u8]) -> Result<Vec<u8>, crate::rng::RngError> {
+    let nonce: [u8; 16] = crate::rng::bytes()?;
+    let k = subkeys(&key.master, &nonce);
 
-    let mut out = Vec::with_capacity(8 + 4 + 4 + 16 + plaintext.len() + 32);
-    out.extend_from_slice(MAGIC_V3);
-    out.extend_from_slice(&cost.memory_kib.to_le_bytes());
-    out.extend_from_slice(&cost.passes.to_le_bytes());
-    out.extend_from_slice(&salt);
+    let mut out = Vec::with_capacity(8 + 4 + 4 + 16 + 16 + plaintext.len() + 32);
+    out.extend_from_slice(MAGIC_V4);
+    out.extend_from_slice(&key.cost.memory_kib.to_le_bytes());
+    out.extend_from_slice(&key.cost.passes.to_le_bytes());
+    out.extend_from_slice(&key.salt);
+    out.extend_from_slice(&nonce);
 
     let ciphertext_start = out.len();
     out.extend_from_slice(plaintext);
@@ -366,18 +440,33 @@ pub fn seal(
     Ok(out)
 }
 
+/// Encrypts then authenticates, deriving the key for this one write.
+///
+/// The slow path: one Argon2id run per call. A program that writes the same
+/// file many times keeps a [`SealingKey`] and calls [`seal_with`].
+pub fn seal(
+    passphrase: &[u8],
+    plaintext: &[u8],
+    cost: Cost,
+) -> Result<Vec<u8>, crate::rng::RngError> {
+    seal_with(&SealingKey::derive(passphrase, cost)?, plaintext)
+}
+
 /// Is this content a sealed file?
 ///
 /// Useful to warn the user *before* asking for their passphrase: a bare
 /// prompt, with nothing announcing it, looks like a failure. We never guess
 /// — either the file carries the magic, or it is not sealed.
 pub fn is_sealed(content: &[u8]) -> bool {
-    content.starts_with(MAGIC_V1) || content.starts_with(MAGIC_V2) || content.starts_with(MAGIC_V3)
+    content.starts_with(MAGIC_V1)
+        || content.starts_with(MAGIC_V2)
+        || content.starts_with(MAGIC_V3)
+        || content.starts_with(MAGIC_V4)
 }
 
-/// Is this sealed content in the current format (3)?
+/// Is this sealed content in the current format (4)?
 pub fn is_current_format(content: &[u8]) -> bool {
-    content.starts_with(MAGIC_V3)
+    content.starts_with(MAGIC_V4)
 }
 
 /// Is this sealed content in format 1 (PBKDF2), to be resealed?
@@ -393,7 +482,11 @@ pub fn is_legacy_format(content: &[u8]) -> bool {
 /// in [`unseal`]: it is only used to decide on a reseal once the passphrase
 /// has been verified, never to grant anything.
 pub fn stored_cost(content: &[u8]) -> Option<Cost> {
-    if !(content.starts_with(MAGIC_V2) || content.starts_with(MAGIC_V3)) || content.len() < 16 {
+    if !(content.starts_with(MAGIC_V2)
+        || content.starts_with(MAGIC_V3)
+        || content.starts_with(MAGIC_V4))
+        || content.len() < 16
+    {
         return None;
     }
     Some(Cost {
@@ -442,6 +535,9 @@ pub fn unseal(passphrase: &[u8], sealed: &[u8]) -> Result<Vec<u8>, SealError> {
     // is unreadable, it is the same message as a wrong passphrase.
     if sealed.len() < 8 {
         return Err(SealError::InvalidFormat);
+    }
+    if &sealed[..8] == MAGIC_V4 {
+        return unseal_v4(passphrase, sealed);
     }
     if &sealed[..8] == MAGIC_V3 {
         return unseal_argon2(passphrase, sealed, KEYSTREAM_LABEL);
@@ -523,9 +619,112 @@ fn unseal_argon2(passphrase: &[u8], sealed: &[u8], label: &[u8]) -> Result<Vec<u
     Ok(plaintext)
 }
 
+/// Format 4. Same discipline as the others: the cost is bounded before any
+/// derivation, the MAC is verified before any decryption.
+fn unseal_v4(passphrase: &[u8], sealed: &[u8]) -> Result<Vec<u8>, SealError> {
+    const HEADER: usize = 8 + 4 + 4 + 16 + 16;
+    if sealed.len() < HEADER + 32 {
+        return Err(SealError::AuthenticationFailed);
+    }
+    let memory_kib = u32::from_le_bytes([sealed[8], sealed[9], sealed[10], sealed[11]]);
+    let passes = u32::from_le_bytes([sealed[12], sealed[13], sealed[14], sealed[15]]);
+    if !(8..=MAX_MEMORY_KIB).contains(&memory_kib) || !(1..=MAX_PASSES).contains(&passes) {
+        return Err(SealError::CostOutOfRange { memory_kib, passes });
+    }
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&sealed[16..32]);
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&sealed[32..48]);
+
+    let (body, received_mac) = sealed.split_at(sealed.len() - 32);
+    let mut master = derive_argon2_master(passphrase, &salt, Cost { memory_kib, passes });
+    let k = subkeys(&master, &nonce);
+    wipe(&mut master);
+    let mac = hmac_sha256(&k.authentication, body);
+    if !constant_time_eq(&mac, received_mac) {
+        return Err(SealError::AuthenticationFailed);
+    }
+    let mut plaintext = body[HEADER..].to_vec();
+    keystream_xor(KEYSTREAM_LABEL, &k.encryption, &mut plaintext);
+    Ok(plaintext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Format 3 as 0.4 to 0.4.4 wrote it: kept to prove those files still
+    /// open.
+    fn seal_v3(passphrase: &[u8], plaintext: &[u8], cost: Cost) -> Vec<u8> {
+        let salt = [0x5au8; 16];
+        let k = derive_argon2(passphrase, &salt, cost);
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC_V3);
+        out.extend_from_slice(&cost.memory_kib.to_le_bytes());
+        out.extend_from_slice(&cost.passes.to_le_bytes());
+        out.extend_from_slice(&salt);
+        let start = out.len();
+        out.extend_from_slice(plaintext);
+        keystream_xor(KEYSTREAM_LABEL, &k.encryption, &mut out[start..]);
+        let mac = hmac_sha256(&k.authentication, &out);
+        out.extend_from_slice(&mac);
+        out
+    }
+
+    /// One session key, many writes: every write opens with the passphrase
+    /// alone, and no two writes share a keystream.
+    #[test]
+    fn a_session_key_seals_many_writes_without_reusing_a_keystream() {
+        let key = SealingKey::derive(b"phrase", TEST_COST).unwrap();
+        let a = seal_with(&key, &[0u8; 96]).unwrap();
+        let b = seal_with(&key, &[0u8; 96]).unwrap();
+        assert!(is_current_format(&a) && is_current_format(&b));
+        assert_eq!(&a[16..32], &b[16..32], "same session salt");
+        assert_ne!(&a[32..48], &b[32..48], "a fresh nonce per write");
+        // Equal plaintexts (zeros) expose the keystream: they must differ.
+        assert_ne!(&a[48..144], &b[48..144], "a keystream was reused");
+        assert_eq!(unseal(b"phrase", &a).unwrap(), vec![0u8; 96]);
+        assert_eq!(unseal(b"phrase", &b).unwrap(), vec![0u8; 96]);
+        assert_eq!(unseal(b"wrong", &a), Err(SealError::AuthenticationFailed));
+        assert_eq!(stored_cost(&a), Some(TEST_COST));
+    }
+
+    /// Every byte of a format-4 file is covered: nonce, salt, cost or body
+    /// altered, it no longer opens.
+    #[test]
+    fn a_format_4_file_cannot_be_altered() {
+        let sealed = seal(b"phrase", b"seed=abc", TEST_COST).unwrap();
+        for i in [16usize, 32, 40, 48, sealed.len() - 1] {
+            let mut d = sealed.clone();
+            d[i] ^= 1;
+            assert!(
+                unseal(b"phrase", &d).is_err(),
+                "byte {i} altered and accepted"
+            );
+        }
+        let mut cheaper = sealed.clone();
+        cheaper[8..12].copy_from_slice(&8u32.to_le_bytes());
+        assert!(unseal(b"phrase", &cheaper).is_err());
+    }
+
+    /// The point of format 4: after the first derivation, a write costs no
+    /// Argon2id. Measured at the default cost, against a fresh seal.
+    #[test]
+    fn a_session_key_makes_writes_cheap() {
+        let key = SealingKey::derive(b"phrase", DEFAULT_COST).unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            seal_with(&key, &[7u8; 4096]).unwrap();
+        }
+        let twenty_writes = t.elapsed();
+        let t = std::time::Instant::now();
+        seal(b"phrase", &[7u8; 4096], DEFAULT_COST).unwrap();
+        let one_full_seal = t.elapsed();
+        assert!(
+            twenty_writes < one_full_seal,
+            "20 session writes ({twenty_writes:?}) should cost less than one full seal ({one_full_seal:?})"
+        );
+    }
 
     fn hex(o: &[u8]) -> String {
         o.iter().map(|b| format!("{b:02x}")).collect()
@@ -776,7 +975,7 @@ mod tests {
     /// still opens, and what is sealed now is format 3. Moving a file from one
     /// format to the other by rewriting its magic fails: the MAC covers it.
     #[test]
-    fn a_seal_in_format_2_still_opens_and_new_seals_are_format_3() {
+    fn seals_in_formats_2_and_3_still_open() {
         let passphrase = b"passphrase from 0.3";
         let plaintext = b"seed=deadbeef\nnext_index=3\nserial=4\n";
         let salt = [9u8; 16];
@@ -802,7 +1001,7 @@ mod tests {
         assert_eq!(unseal(passphrase, &v2).unwrap(), plaintext);
         assert_eq!(unseal(b"other", &v2), Err(SealError::AuthenticationFailed));
 
-        let v3 = seal(passphrase, plaintext, TEST_COST).unwrap();
+        let v3 = seal_v3(passphrase, plaintext, TEST_COST);
         assert_eq!(&v3[..8], MAGIC_V3);
         assert_eq!(stored_cost(&v3), Some(TEST_COST));
         assert_eq!(unseal(passphrase, &v3).unwrap(), plaintext);

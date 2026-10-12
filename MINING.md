@@ -118,6 +118,12 @@ anything, and shows the rate, the blocks found and the memory actually in
 use. The `--mine` option at launch remains available for a machine without a
 screen.)*
 
+*(Since 0.4.5, a node asked to mine first waits until it is up to date: for a
+first peer, five minutes at most, then until it has caught up with the height
+its peers announce. The console says `mining paused` and `mining resumed`.
+A node that mined during its synchronization built a chain of its own from
+where it stood, which every other node refused.)*
+
 ### The machine
 
 > **The figures in this section are those of the main chain**, the only one

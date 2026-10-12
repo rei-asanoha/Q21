@@ -390,6 +390,27 @@ pub const FLOOD_INPUT_THRESHOLD: u64 = 16;
 /// two inputs) is still served unhindered.
 pub const TX_RATE_PER_SEC: u64 = 8;
 
+/// Inputs announced at most when the pool is offered to a peer, at the
+/// handshake and every [`MEMPOOL_REBROADCAST`] (see
+/// [`crate::mempool::Mempool::announcement`]).
+///
+/// A quarter of the receiving peer's budget ([`TX_BUCKET_MAX`]): fetching
+/// everything announced can never pass for a flood, even on a link already
+/// busy relaying.
+pub const MEMPOOL_ANNOUNCE_INPUTS: u64 = TX_BUCKET_MAX / 4;
+
+/// How often the node offers its pool again to its peers.
+pub const MEMPOOL_REBROADCAST: Duration = Duration::from_secs(600);
+
+/// How long after connecting a peer that was behind gets the pool offered.
+///
+/// Offered at the handshake, the pending transactions reached a node that
+/// was still catching up: it could not find their inputs and refused them
+/// all — measured on two local nodes, a fresh node got none of five. A minute
+/// lets a node of today's testnet catch up; the ten-minute round covers a
+/// slower one.
+pub const MEMPOOL_OFFER_DELAY: Duration = Duration::from_secs(60);
+
 /// Token bucket bounding how much snapshot data a peer can get served.
 ///
 /// # The defect this closes
@@ -613,6 +634,11 @@ struct Peer {
     /// nodes, invisible in unit tests because both shared the same genesis
     /// there.
     consecutive_orphans: u32,
+    /// Has the pool been offered to this peer since it connected? At the
+    /// handshake if it is up to date, otherwise a minute later: a node that
+    /// is still catching up cannot check a pending transaction, and refuses
+    /// it. See [`MEMPOOL_OFFER_DELAY`].
+    mempool_offered: bool,
 }
 
 impl Peer {
@@ -695,6 +721,21 @@ impl Peer {
             return;
         }
         self.requested_bodies.retain(|h, _| !chain.has_block(h));
+        // --- Catching up: whole blocks, not compact ones (0.4.5).
+        //
+        // A compact block saves bandwidth only when its transactions are
+        // already in our mempool: true of a fresh block, never of an old one.
+        // During a catch-up, each compact block carrying transactions cost a
+        // second round trip, and they came one after the other: the next one
+        // waits for its parent before asking for what it lacks. Measured
+        // through a link with a 300 ms delay: one block every 2.5 seconds as
+        // soon as the blocks carried transactions. Whole blocks travel sixteen
+        // at a time, in one round trip.
+        //
+        // One request per block: a reply is capped at `REPLY_BYTE_BUDGET`,
+        // and sixteen large blocks in one request would have left the last
+        // ones unserved, then waited for the body deadline.
+        let catching_up = self.start_height > chain.height() + MAX_BODIES_IN_FLIGHT as u64;
         let mut items = Vec::new();
         while self.requested_bodies.len() < MAX_BODIES_IN_FLIGHT {
             let Some(h) = self.bodies_to_request.pop_front() else {
@@ -705,16 +746,29 @@ impl Peer {
             }
             if self.note_body_requested(h, now) {
                 items.push(InvItem {
-                    kind: InvKind::CompactBlock,
+                    kind: if catching_up {
+                        InvKind::Block
+                    } else {
+                        InvKind::CompactBlock
+                    },
                     hash: h,
                 });
             }
         }
         if !items.is_empty() {
-            outgoing.push(Outgoing {
-                peer: id,
-                message: Message::GetData(items),
-            });
+            if catching_up {
+                for i in items {
+                    outgoing.push(Outgoing {
+                        peer: id,
+                        message: Message::GetData(vec![i]),
+                    });
+                }
+            } else {
+                outgoing.push(Outgoing {
+                    peer: id,
+                    message: Message::GetData(items),
+                });
+            }
             return;
         }
         let drained = self.bodies_to_request.is_empty() && self.requested_bodies.is_empty();
@@ -1154,6 +1208,7 @@ impl Node {
             let mut g = self.shared.lock().unwrap();
             let Shared {
                 ref chain,
+                ref mempool,
                 ref mut peers,
                 ..
             } = *g;
@@ -1214,6 +1269,40 @@ impl Node {
                     });
                     if let Some(p) = peers.get_mut(&id) {
                         p.continue_sync(id, chain, &mut to_rerequest, now, false);
+                    }
+                }
+            }
+            // --- The pool, offered to the peers that were catching up when
+            // they connected.
+            let late: Vec<u64> = peers
+                .iter()
+                .filter(|(id, p)| {
+                    p.handshaked
+                        && !p.mempool_offered
+                        && !dead.contains(id)
+                        && now.duration_since(p.connected_at) >= MEMPOOL_OFFER_DELAY
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if !late.is_empty() {
+                let pending = mempool.announcement(MEMPOOL_ANNOUNCE_INPUTS);
+                for id in late {
+                    if let Some(p) = peers.get_mut(&id) {
+                        p.mempool_offered = true;
+                    }
+                    if !pending.is_empty() {
+                        to_rerequest.push(Outgoing {
+                            peer: id,
+                            message: Message::Inv(
+                                pending
+                                    .iter()
+                                    .map(|hash| InvItem {
+                                        kind: InvKind::Tx,
+                                        hash: *hash,
+                                    })
+                                    .collect(),
+                            ),
+                        });
                     }
                 }
             }
@@ -1368,6 +1457,7 @@ impl Node {
                     start_height: 0,
                     pending: HashMap::new(),
                     consecutive_orphans: 0,
+                    mempool_offered: false,
                     last_received: Instant::now(),
                     pending_ping: None,
                     connected_at: Instant::now(),
@@ -1643,6 +1733,38 @@ impl Node {
                                 stop: Hash256::ZERO,
                             },
                         });
+                    }
+                    // The pending transactions, offered to the new peer: those
+                    // sent before it connected reach it now, not never. See
+                    // `Mempool::announcement`. Only if it is up to date: a peer
+                    // still catching up gets them later, see
+                    // `MEMPOOL_OFFER_DELAY`.
+                    let height = g.chain.height();
+                    let offer_now = match g.peers.get_mut(&id) {
+                        Some(p)
+                            if p.handshaked && !p.mempool_offered && p.start_height >= height =>
+                        {
+                            p.mempool_offered = true;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if offer_now {
+                        let pending = g.mempool.announcement(MEMPOOL_ANNOUNCE_INPUTS);
+                        if !pending.is_empty() {
+                            outgoing.push(Outgoing {
+                                peer: id,
+                                message: Message::Inv(
+                                    pending
+                                        .into_iter()
+                                        .map(|hash| InvItem {
+                                            kind: InvKind::Tx,
+                                            hash,
+                                        })
+                                        .collect(),
+                                ),
+                            });
+                        }
                     }
                     // We ask every new peer for its address book. It is the
                     // only discovery mechanism: without it, a node only ever
@@ -2775,6 +2897,40 @@ impl Node {
         }
     }
 
+    /// Offers the pending transactions again to every established peer.
+    /// Called every [`MEMPOOL_REBROADCAST`] by the node's loop: a peer that
+    /// missed one (refused child, connection cut, restart) gets it back.
+    /// Returns the number of transactions announced.
+    pub fn announce_mempool(&self) -> usize {
+        let (targets, pending): (Vec<Arc<Mutex<TcpStream>>>, Vec<Hash256>) = {
+            let g = self.shared.lock().unwrap();
+            let pending = g.mempool.announcement(MEMPOOL_ANNOUNCE_INPUTS);
+            let targets = g
+                .peers
+                .values()
+                .filter(|p| p.handshaked)
+                .map(|p| p.writer.clone())
+                .collect();
+            (targets, pending)
+        };
+        if pending.is_empty() {
+            return 0;
+        }
+        let m = Message::Inv(
+            pending
+                .iter()
+                .map(|hash| InvItem {
+                    kind: InvKind::Tx,
+                    hash: *hash,
+                })
+                .collect(),
+        );
+        for s in targets {
+            let _ = write_message(&s, &m, self.magic);
+        }
+        pending.len()
+    }
+
     pub fn announce_tx(&self, txid: Hash256) {
         let targets: Vec<Arc<Mutex<TcpStream>>> = {
             let g = self.shared.lock().unwrap();
@@ -3410,6 +3566,7 @@ mod tests {
                 start_height: 0,
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
+                mempool_offered: false,
                 last_received: Instant::now(),
                 pending_ping: None,
                 connected_at: Instant::now(),
@@ -3742,6 +3899,7 @@ mod tests_hardening {
                 start_height: 0,
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
+                mempool_offered: false,
                 last_received: Instant::now(),
                 pending_ping: None,
                 connected_at: Instant::now(),
@@ -4271,6 +4429,7 @@ mod tests_handler_fuzz {
                 start_height: 0,
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
+                mempool_offered: false,
                 last_received: now,
                 pending_ping: None,
                 connected_at: now,
@@ -5094,12 +5253,62 @@ mod tests_handler_review {
                 start_height: 0,
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
+                mempool_offered: false,
                 last_received: now,
                 pending_ping: None,
                 connected_at: now,
             },
         );
         listener
+    }
+
+    /// The requests a peer's synchronization sends for `bodies` when it
+    /// announced `ahead` blocks more than we have.
+    fn body_requests(ahead: u64, bodies: usize) -> Vec<Outgoing> {
+        let n = node();
+        let _l = anonymous_peer(&n, 7);
+        let mut g = n.shared.lock().unwrap();
+        let Shared {
+            ref chain,
+            ref mut peers,
+            ..
+        } = *g;
+        let p = peers.get_mut(&7).expect("peer");
+        p.handshaked = true;
+        p.start_height = chain.height() + ahead;
+        p.bodies_to_request
+            .extend((0..bodies as u8).map(|i| Hash256([i.wrapping_add(1); 32])));
+        let mut out = Vec::new();
+        p.continue_sync(7, chain, &mut out, Instant::now(), false);
+        out
+    }
+
+    /// Catching up, the bodies are asked for whole, one request each; near
+    /// the tip, as compact blocks in one request. A compact block of the past
+    /// cost a second round trip per block: one block every 2.5 s through a
+    /// 300 ms link, against sixteen per round trip whole.
+    #[test]
+    fn a_catch_up_asks_for_whole_blocks_one_per_request() {
+        let far = body_requests(1_000, 5);
+        assert_eq!(far.len(), 5);
+        for o in &far {
+            match &o.message {
+                Message::GetData(items) => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].kind, InvKind::Block);
+                }
+                m => panic!("unexpected {m:?}"),
+            }
+        }
+        let near = body_requests(3, 5);
+        assert_eq!(near.len(), 1);
+        match &near[0].message {
+            Message::GetData(items) => {
+                assert_eq!(items.len(), 5);
+                assert!(items.iter().all(|i| i.kind == InvKind::CompactBlock));
+            }
+            m => panic!("unexpected {m:?}"),
+        }
     }
 
     /// A thousand addresses from all-distinct /16 groups, starting at `start`.

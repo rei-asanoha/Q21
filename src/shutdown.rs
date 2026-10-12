@@ -29,6 +29,17 @@
 //! `SetConsoleCtrlHandler` on Windows. These are exactly the functions the
 //! library we could have imported would call.
 //!
+//! # Closing the window (0.4.5)
+//!
+//! Closing a Terminal window on macOS or Linux sends `SIGHUP`, which was not
+//! handled: the node died on the spot and its pending transactions with it.
+//! A load test lost them that way. `SIGHUP` now asks for the same clean
+//! shutdown, with one more step: the terminal is gone, and the first message
+//! printed to it would fail — a failed print stops a Rust program. The
+//! handler therefore points the output at `/dev/null` first, with `open` and
+//! `dup2`, two calls POSIX allows in a handler. A node started with `nohup`,
+//! which asked to ignore the signal, keeps ignoring it.
+//!
 //! # What remains true
 //!
 //! A second Ctrl-C, a power cut or a `kill -9` leaves no chance: that is why
@@ -62,10 +73,16 @@ pub fn install() -> bool {
     {
         unsafe extern "C" {
             fn signal(sig: i32, handler: usize) -> usize;
+            fn open(path: *const u8, flags: i32, ...) -> i32;
+            fn dup2(from: i32, to: i32) -> i32;
+            fn close(fd: i32) -> i32;
         }
+        const SIGHUP: i32 = 1;
         const SIGINT: i32 = 2;
         const SIGTERM: i32 = 15;
+        const SIG_IGN: usize = 1;
         const SIG_ERR: usize = usize::MAX;
+        const O_WRONLY: i32 = 1;
 
         extern "C" fn handler(_sig: i32) {
             // One atomic write, and nothing else. Everything else happens in
@@ -73,11 +90,38 @@ pub fn install() -> bool {
             REQUESTED.store(true, Ordering::Relaxed);
         }
 
-        // SAFETY: we install a handler that calls nothing but an atomic
-        // store. `signal` returns the previous handler, or SIG_ERR.
+        extern "C" fn hangup(_sig: i32) {
+            // The terminal is gone: printing to it would now fail, and a
+            // failed print stops the program before it writes anything. The
+            // output goes to /dev/null. `open`, `dup2` and `close` are
+            // async-signal-safe (POSIX.1-2008, 2.4.3).
+            // SAFETY: a static NUL-terminated path; file descriptors only.
+            unsafe {
+                let fd = open(b"/dev/null\0".as_ptr(), O_WRONLY);
+                if fd >= 0 {
+                    dup2(fd, 1);
+                    dup2(fd, 2);
+                    if fd > 2 {
+                        close(fd);
+                    }
+                }
+            }
+            REQUESTED.store(true, Ordering::Relaxed);
+        }
+
+        // SAFETY: we install handlers that call nothing but an atomic store,
+        // and for SIGHUP, async-signal-safe calls. `signal` returns the
+        // previous handler, or SIG_ERR.
         unsafe {
             let h = handler as *const () as usize;
-            signal(SIGINT, h) != SIG_ERR && signal(SIGTERM, h) != SIG_ERR
+            let installed = signal(SIGINT, h) != SIG_ERR && signal(SIGTERM, h) != SIG_ERR;
+            // `nohup` set SIGHUP to "ignore": the user asked for the node to
+            // outlive the terminal, and it must.
+            let previous = signal(SIGHUP, hangup as *const () as usize);
+            if previous == SIG_IGN {
+                signal(SIGHUP, SIG_IGN);
+            }
+            installed
         }
     }
     #[cfg(windows)]

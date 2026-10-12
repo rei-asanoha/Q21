@@ -65,6 +65,57 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.4 to 0.4.5
+
+0.4.5 is a drop-in replacement for the node: same protocol (3), same chain,
+same data directory. It comes out of a load test of the testnet on
+11 October 2026: two wallets, about 1,800 payments in two hours, over the
+France and Singapore entry points. No payment was lost, but the test showed
+the weak points below.
+
+## What changes
+
+| | 0.4.4 | 0.4.5 |
+|---|---|---|
+| A node asked to mine before it has caught up | Mines a chain of its own from where it stands; every peer refuses its blocks | Waits for a first peer (five minutes at most) and for the height its peers announce; the console says `mining paused` and `mining resumed` |
+| Monitoring while nobody mines | `monitor.sh` restarts a healthy node every hour | Peers connected and none knows a longer chain: the network is idle, the node is left running, the log says so about once an hour |
+| Cost of a payment in the wallet | Two Argon2id derivations (the wallet is written twice): about 0.7 s on a PC, several seconds on a small board | One derivation per session, then a fresh nonce for each write: about 25 ms |
+| Every confirmed coin already used by pending payments | Wait for the next block | The wallet spends the change of its own pending payments, up to a chain of 25 unconfirmed transactions |
+| A pending payment that pays more than the one it depends on | Left out of the next block, which cost one block per link | Goes into the block right after its parent |
+| Closing the Terminal window of a node (macOS, Linux) | The node is killed on the spot; pending transactions are lost | Clean shutdown: pending transactions are written to `mempool.dat`. A node started with `nohup` still ignores the window |
+| Closing the PowerShell window of a node (Windows) | A mining node could take tens of seconds to notice, and Windows gives a few: the pending transactions were lost | A mining round lasts about a second, and the pending transactions are written first |
+| A peer that connects after a payment was sent, or missed it | Never hears of it | Pending transactions are offered to each new peer, and to every peer every ten minutes |
+| `sendtoaddress` and `sendmany` without a `fee` | 1,000 units whatever the size: a payment that needs 14 coins or more was refused | Computed on the real transaction at the rate of the pending ones, never below 1,000 units; the answer gives the `fee` paid |
+| `sendmany` | Could take coins already used by a pending payment (refused as a double spend), and wrote the wallet under the node's lock | Same path as `sendtoaddress` |
+
+## ⚠ Wallets: back up the data folder first
+
+The first time 0.4.5 writes a wallet, it converts the file to a new sealed
+format (`Q21SEAL4`), the one that makes a payment cheap. **0.4.4 and earlier
+cannot open it.** Before installing 0.4.5, copy the `q21-data` folder aside,
+for example as `q21-data-backup-0.4.4`.
+
+Opened by 0.4.4, a converted wallet is refused with a message saying the
+directory "was protected by a passphrase; this file is not". In this case the
+message is wrong about the cause: **delete nothing**. Put back the copy you
+made, or go on with 0.4.5. Your backup code restores the wallet with any
+version.
+
+## Who needs it
+
+Everyone, in this order:
+
+1. the entry points (servers), so that they offer pending transactions to
+   the wallets that connect, and so that `monitor.sh` stops restarting them
+   when the network is idle — copy the new `tools/monitor.sh` to
+   `/opt/q21/monitor.sh`;
+2. the wallets, after backing up `q21-data`.
+
+A 0.4.4 node and a 0.4.5 node talk to each other: nothing in the protocol
+changes.
+
+---
+
 # Upgrading from 0.4.3 to 0.4.4
 
 0.4.4 is a drop-in replacement: same protocol (3), same chain, same data
