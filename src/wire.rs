@@ -37,7 +37,17 @@ use crate::tx::Transaction;
 /// the witness, dust rejected, uncles removed.
 /// 3: wire command names in English (`getsnapshot`, `snapshotinfo`,
 /// `getsnapchunk`, `snapchunk`); a version-2 peer would not understand them.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4: `onionaddr`, the addresses of Tor onion services (0.4.7). Sent only to
+/// peers that announced version 4: a version-3 node treats an unknown command
+/// as a malformed frame. Everything else is unchanged, and version-3 peers
+/// stay welcome.
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// First version that understands `onionaddr`.
+pub const ONION_ADDR_VERSION: u32 = 4;
+
+/// Length of a Tor v3 onion name, without `.onion`: 56 base32 characters.
+pub const ONION_NAME_LEN: usize = 56;
 
 /// Minimum version accepted from a peer.
 ///
@@ -140,6 +150,53 @@ pub struct NetAddr {
     pub last_seen: u64,
 }
 
+/// Address of a Tor onion service (v3), as it travels over the network: the
+/// 56 characters before `.onion`, lowercase base32. Tor checks the rest
+/// (key and checksum) when someone connects; a malformed name only costs a
+/// failed connection, through Tor, to the node that tries it.
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct OnionAddr {
+    pub name: String,
+    pub port: u16,
+    pub last_seen: u64,
+}
+
+impl OnionAddr {
+    /// Reads `name.onion` (or `name.onion:port`, with `default_port` when
+    /// absent). `None` when it is not a v3 onion name.
+    pub fn parse(raw: &str, default_port: u16) -> Option<OnionAddr> {
+        let raw = raw.trim().to_ascii_lowercase();
+        let (host, port) = match raw.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+            None => (raw.clone(), default_port),
+        };
+        let name = host.strip_suffix(".onion")?;
+        if !valid_onion_name(name) || port == 0 {
+            return None;
+        }
+        Some(OnionAddr {
+            name: name.to_string(),
+            port,
+            last_seen: 0,
+        })
+    }
+
+    /// `name.onion`
+    pub fn host(&self) -> String {
+        format!("{}.onion", self.name)
+    }
+}
+
+/// 56 characters of the base32 alphabet Tor uses (a-z, 2-7), ending in `d`:
+/// the version byte 3 always encodes to a final `d`.
+pub fn valid_onion_name(name: &str) -> bool {
+    name.len() == ONION_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+        && name.ends_with('d')
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Message {
     Version {
@@ -174,6 +231,8 @@ pub enum Message {
     },
     GetAddr,
     Addr(Vec<NetAddr>),
+    /// Onion service addresses (protocol 4). See [`OnionAddr`].
+    OnionAddr(Vec<OnionAddr>),
     /// Rejection with a reason, so that the other end knows why.
     Reject {
         command: String,
@@ -219,6 +278,7 @@ impl Message {
             Message::BlockTxn { .. } => "blocktxn",
             Message::GetAddr => "getaddr",
             Message::Addr(_) => "addr",
+            Message::OnionAddr(_) => "onionaddr",
             Message::Reject { .. } => "reject",
             Message::GetSnapshot => "getsnapshot",
             Message::SnapshotInfo { .. } => "snapshotinfo",
@@ -294,6 +354,14 @@ impl Message {
                 w.varint(v.len() as u64);
                 for a in v {
                     w.bytes(&a.ip);
+                    w.u32(a.port as u32);
+                    w.u64(a.last_seen);
+                }
+            }
+            Message::OnionAddr(v) => {
+                w.varint(v.len() as u64);
+                for a in v {
+                    w.bytes(a.name.as_bytes());
                     w.u32(a.port as u32);
                     w.u64(a.last_seen);
                 }
@@ -533,6 +601,34 @@ impl Message {
                 }
                 r.expect_end()?;
                 Message::Addr(v)
+            }
+            "onionaddr" => {
+                let n = bound_with(&mut r, MAX_ADDR, ONION_NAME_LEN + 12)?;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let mut raw = [0u8; ONION_NAME_LEN];
+                    for o in raw.iter_mut() {
+                        *o = r.u8()?;
+                    }
+                    let name = std::str::from_utf8(&raw)
+                        .ok()
+                        .filter(|n| valid_onion_name(n))
+                        .ok_or(WireError::InvalidContent("onion name"))?
+                        .to_string();
+                    // Same canonical port rule as `addr`.
+                    let raw_port = r.u32()?;
+                    if raw_port == 0 || raw_port > u16::MAX as u32 {
+                        return Err(WireError::InvalidContent("onion port"));
+                    }
+                    let last_seen = r.u64()?;
+                    v.push(OnionAddr {
+                        name,
+                        port: raw_port as u16,
+                        last_seen,
+                    });
+                }
+                r.expect_end()?;
+                Message::OnionAddr(v)
             }
             "reject" => {
                 let c = r.var_bytes()?;
@@ -906,5 +1002,30 @@ mod tests {
         let (b, m) = Message::parse(&stream[n..], MAGIC).unwrap();
         assert_eq!(b, Message::Pong(2));
         assert_eq!(n + m, stream.len());
+    }
+
+    #[test]
+    fn onion_addresses_round_trip_and_bad_ones_are_refused() {
+        let good = OnionAddr {
+            name: format!("{}d", "a2".repeat(27) + "z"),
+            port: 21121,
+            last_seen: 7,
+        };
+        let m = Message::OnionAddr(vec![good.clone()]);
+        let frame = m.frame(MAGIC);
+        let (back, _) = Message::parse(&frame, MAGIC).expect("parse");
+        assert_eq!(back, m);
+        assert_eq!(
+            OnionAddr::parse(&format!("{}.onion:9", good.name.to_uppercase()), 1)
+                .map(|a| (a.name, a.port)),
+            Some((good.name.clone(), 9))
+        );
+        assert!(OnionAddr::parse("short.onion", 1).is_none());
+        assert!(OnionAddr::parse(&format!("{}a.onion", "a".repeat(55)), 1).is_none());
+        // A name with a character outside the alphabet does not decode.
+        let mut bad = good.clone();
+        bad.name = format!("{}1d", "a".repeat(54));
+        let frame = Message::OnionAddr(vec![bad]).frame(MAGIC);
+        assert!(Message::parse(&frame, MAGIC).is_err());
     }
 }

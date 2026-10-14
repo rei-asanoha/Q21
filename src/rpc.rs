@@ -1187,6 +1187,17 @@ impl RpcContext {
                 ),
             )
             .set("tor_session", Json::Bool(self.node.proxy().is_some()))
+            // Counts only: the onion name itself is not returned, since an
+            // explorer served in public would tie it to its domain.
+            .set("onion", {
+                let o = self.node.onion_status();
+                Json::obj()
+                    .set("service", Json::Bool(o.serving))
+                    .set("known", Json::u64(o.known as u64))
+                    .set("peers_out", Json::u64(o.outbound as u64))
+                    .set("peers_in", Json::u64(o.inbound as u64))
+                    .build()
+            })
             .set(
                 "port_mapping",
                 match &self.router_status {

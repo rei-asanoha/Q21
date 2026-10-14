@@ -1055,7 +1055,7 @@ const I18N_PATTERNS = {
     [/^(\d+) B$/, "$1 B"]
   ]
 };
-const I18N_PREFIXES = {"fr": {"The Tor setting could not be changed: ": "Le réglage Tor n'a pas pu être changé : ", "Could not reach the node: ": "Impossible d'interroger le nœud : ", "Fee estimate failed: ": "Frais non estimés : ", "Information unavailable: ": "Informations indisponibles : ", "Could not read the balance again; payment stopped: ": "Solde non relu, envoi interrompu : ", "Name not saved: ": "Nom non enregistré : ", "The setting could not be changed: ": "Le réglage n'a pas pu être changé : ", "Mining could not be turned on: ": "Le minage n'a pas pu être activé : ", "Mining could not be turned off: ": "Le minage n'a pas pu être arrêté : "}, "ja": {"Could not reach the node: ": "ノードに問い合わせできません: ", "Fee estimate failed: ": "手数料を見積れません: ", "Insufficient funds: ": "残高不足: ", "Name not saved: ": "名前を保存できませんでした: "}};
+const I18N_PREFIXES = {"fr": {"The Tor setting could not be changed: ": "Le réglage Tor n'a pas pu être changé : ", "Onion services known, connected, reaching this wallet: ": "Services onion connus, joints, qui joignent ce portefeuille : ", "Could not reach the node: ": "Impossible d'interroger le nœud : ", "Fee estimate failed: ": "Frais non estimés : ", "Information unavailable: ": "Informations indisponibles : ", "Could not read the balance again; payment stopped: ": "Solde non relu, envoi interrompu : ", "Name not saved: ": "Nom non enregistré : ", "The setting could not be changed: ": "Le réglage n'a pas pu être changé : ", "Mining could not be turned on: ": "Le minage n'a pas pu être activé : ", "Mining could not be turned off: ": "Le minage n'a pas pu être arrêté : "}, "ja": {"Onion services known, connected, reaching this wallet: ": "既知・接続中・このウォレットへ接続中のオニオンサービス: ", "Could not reach the node: ": "ノードに問い合わせできません: ", "Fee estimate failed: ": "手数料を見積れません: ", "Insufficient funds: ": "残高不足: ", "Name not saved: ": "名前を保存できませんでした: "}};
 let LANG = "en";
 
 // Dates and numbers follow the language too: "08/12/2025" does not read like
@@ -2552,6 +2552,11 @@ function paintTor(info){
       : "Tor will no longer be used the next time the wallet starts.";
   } else if (session && Number(info.peers || 0) === 0){
     state.textContent = "Tor is on, but no connection could be made through it: is Tor (or Tor Browser) running?";
+  } else if (session && info.onion){
+    // Counts only: what the node knows, reaches, and is reached by.
+    const o = info.onion;
+    state.textContent = "Onion services known, connected, reaching this wallet: "
+      + Number(o.known || 0) + " · " + Number(o.peers_out || 0) + " · " + Number(o.peers_in || 0);
   } else {
     state.textContent = "";
   }

@@ -539,6 +539,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// What Tor brings a node, see [`Node::onion_status`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OnionStatus {
+    /// This node announces an onion service of its own.
+    pub serving: bool,
+    /// Onion names in the book.
+    pub known: usize,
+    /// Established connections to onion services.
+    pub outbound: usize,
+    /// Established inbound connections from the local Tor.
+    pub inbound: usize,
+}
+
 /// Connected peer.
 struct Peer {
     addr: SocketAddr,
@@ -639,6 +652,8 @@ struct Peer {
     /// is still catching up cannot check a pending transaction, and refuses
     /// it. See [`MEMPOOL_OFFER_DELAY`].
     mempool_offered: bool,
+    /// Protocol version the peer announced (0 before its `version`).
+    version: u32,
 }
 
 impl Peer {
@@ -797,6 +812,8 @@ struct Shared {
     /// the locks would save time that does not exist at the cost of a deadlock
     /// risk that does.
     book: AddrBook,
+    /// Onion service addresses (protocol 4): see [`crate::addr::OnionBook`].
+    onions: crate::addr::OnionBook,
     peers: HashMap<u64, Peer>,
     network: Network,
     /// The node's nonce: used to detect a connection to oneself.
@@ -887,6 +904,8 @@ pub struct Node {
     /// SOCKS5 proxy (Tor) through which every outgoing connection goes.
     /// `None`: direct connections. See [`Node::set_proxy`].
     proxy: Arc<std::sync::RwLock<Option<SocketAddr>>>,
+    /// This node's own onion service, announced to protocol-4 peers.
+    own_onion: Arc<std::sync::RwLock<Option<crate::wire::OnionAddr>>>,
 }
 
 #[derive(Default, Debug)]
@@ -951,8 +970,9 @@ impl Node {
                 // Loopback and private ranges only make sense on regtest,
                 // where everything runs on a single machine. The testnet is a
                 // public network since 0.4: accepting them there let a home
-                // network address travel from book to book (0.4.6).
+                // network address travel from book to book (0.4.7).
                 book: AddrBook::new(matches!(network, Network::Regtest)),
+                onions: crate::addr::OnionBook::default(),
                 peers: HashMap::new(),
                 network,
                 nonce,
@@ -965,7 +985,87 @@ impl Node {
             stop: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
             proxy: Arc::new(std::sync::RwLock::new(None)),
+            own_onion: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Declares this node's own onion service, announced to every
+    /// protocol-4 peer at the handshake and in replies to `getaddr`.
+    pub fn set_own_onion(&self, a: Option<crate::wire::OnionAddr>) {
+        if let Ok(mut g) = self.own_onion.write() {
+            *g = a;
+        }
+    }
+
+    fn own_onion(&self) -> Option<crate::wire::OnionAddr> {
+        self.own_onion
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|mut a| {
+                a.last_seen = unix_now();
+                a
+            })
+    }
+
+    /// Onion names to try, at most `count`: neither already connected nor
+    /// this node's own.
+    pub fn onions_to_try(&self, count: usize) -> Vec<crate::wire::OnionAddr> {
+        let own = self.own_onion();
+        let g = self.shared.lock().unwrap();
+        g.onions
+            .to_announce(crate::addr::MAX_ONIONS)
+            .into_iter()
+            .filter(|a| own.as_ref().map(|o| o.name != a.name).unwrap_or(true))
+            .filter(|a| {
+                let label = crate::socks::Target::Name(a.host(), a.port).label();
+                !g.peers.values().any(|p| p.addr == label)
+            })
+            .take(count)
+            .collect()
+    }
+
+    pub fn note_onion_result(&self, a: &crate::wire::OnionAddr, ok: bool) {
+        let mut g = self.shared.lock().unwrap();
+        if ok {
+            g.onions.note_success(&a.name, a.port, unix_now());
+        } else {
+            g.onions.note_failure(&a.name, a.port);
+        }
+    }
+
+    /// Number of onion names known.
+    pub fn onion_count(&self) -> usize {
+        self.shared.lock().unwrap().onions.len()
+    }
+
+    /// What Tor brings this node, in numbers: onion names known, established
+    /// connections to onion services, and established inbound connections
+    /// handed over by the local Tor (they come from the loopback). The last
+    /// one is counted only when this node announces an onion service: on a
+    /// machine running several nodes, loopback peers are not Tor's.
+    pub fn onion_status(&self) -> OnionStatus {
+        let serving = self.own_onion().is_some();
+        let g = self.shared.lock().unwrap();
+        let labels: HashSet<SocketAddr> = g
+            .onions
+            .to_announce(crate::addr::MAX_ONIONS)
+            .into_iter()
+            .map(|a| crate::socks::Target::Name(a.host(), a.port).label())
+            .collect();
+        let mut s = OnionStatus {
+            serving,
+            known: g.onions.len(),
+            ..OnionStatus::default()
+        };
+        for p in g.peers.values().filter(|p| p.handshaked) {
+            if p.outbound && labels.contains(&p.addr) {
+                s.outbound += 1;
+            } else if serving && !p.outbound && p.addr.ip().is_loopback() {
+                s.inbound += 1;
+            }
+        }
+        s
     }
 
     /// Sends every outgoing connection through the SOCKS5 proxy at `p`
@@ -1511,6 +1611,7 @@ impl Node {
                     pending: HashMap::new(),
                     consecutive_orphans: 0,
                     mempool_offered: false,
+                    version: 0,
                     last_received: Instant::now(),
                     pending_ping: None,
                     connected_at: Instant::now(),
@@ -1740,6 +1841,7 @@ impl Node {
                             if !p.version_received {
                                 p.version_received = true;
                                 p.start_height = start_height;
+                                p.version = version;
                                 if !p.version_sent {
                                     p.version_sent = true;
                                     outgoing.push(Outgoing {
@@ -1816,6 +1918,20 @@ impl Node {
                                         })
                                         .collect(),
                                 ),
+                            });
+                        }
+                    }
+                    // Our own onion service, to a peer that understands it.
+                    let modern = g
+                        .peers
+                        .get(&id)
+                        .map(|p| p.version >= crate::wire::ONION_ADDR_VERSION)
+                        .unwrap_or(false);
+                    if modern {
+                        if let Some(own) = self.own_onion() {
+                            outgoing.push(Outgoing {
+                                peer: id,
+                                message: Message::OnionAddr(vec![own]),
                             });
                         }
                     }
@@ -2430,7 +2546,7 @@ impl Node {
                                     port: a.port(),
                                     last_seen: unix_now(),
                                 };
-                                // --- A home address stays at home (0.4.6).
+                                // --- A home address stays at home (0.4.7).
                                 //
                                 // An outbound peer on the local network — a
                                 // wallet told to use the Raspberry next to it —
@@ -2467,6 +2583,34 @@ impl Node {
                                 peer: id,
                                 message: Message::Addr(v),
                             });
+                        }
+                    }
+                    // The onion names, to a protocol-4 peer only: a version-3
+                    // node takes an unknown command for a malformed frame.
+                    let modern = g
+                        .peers
+                        .get(&id)
+                        .map(|p| p.handshaked && p.version >= crate::wire::ONION_ADDR_VERSION)
+                        .unwrap_or(false);
+                    if modern {
+                        let mut o = g.onions.to_announce(crate::wire::MAX_ADDR - 1);
+                        if let Some(own) = self.own_onion() {
+                            o.retain(|a| a.name != own.name);
+                            o.insert(0, own);
+                        }
+                        if !o.is_empty() {
+                            let cost = (o.len() as u64).saturating_mul(70);
+                            let allowed = g
+                                .peers
+                                .get_mut(&id)
+                                .map(|p| p.snapshot_bucket.allow(cost, Instant::now()))
+                                .unwrap_or(false);
+                            if allowed {
+                                outgoing.push(Outgoing {
+                                    peer: id,
+                                    message: Message::OnionAddr(o),
+                                });
+                            }
                         }
                     }
                 }
@@ -2510,6 +2654,31 @@ impl Node {
                             let mut a = a;
                             a.last_seen = a.last_seen.min(now);
                             book.add(a, now);
+                        }
+                    }
+                }
+                Message::OnionAddr(v) if !handshaked => {
+                    let _ = v;
+                }
+                Message::OnionAddr(v) => {
+                    // Same rules as `addr`: the peer's bucket first, then the
+                    // book, and nothing is dialed because a peer said so.
+                    let now = unix_now();
+                    let instant = Instant::now();
+                    let Shared {
+                        ref mut onions,
+                        ref mut peers,
+                        ..
+                    } = *g;
+                    if let Some(bucket) = peers.get_mut(&id).map(|p| &mut p.addr_bucket) {
+                        for a in v.into_iter().take(crate::wire::MAX_ADDR) {
+                            if !bucket.allow_with(1, instant, ADDR_BUCKET_MAX, ADDR_RATE_PER_SEC) {
+                                self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            let mut a = a;
+                            a.last_seen = a.last_seen.min(now);
+                            onions.add(a, now);
                         }
                     }
                 }
@@ -3646,6 +3815,7 @@ mod tests {
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
                 mempool_offered: false,
+                version: 0,
                 last_received: Instant::now(),
                 pending_ping: None,
                 connected_at: Instant::now(),
@@ -3979,6 +4149,7 @@ mod tests_hardening {
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
                 mempool_offered: false,
+                version: 0,
                 last_received: Instant::now(),
                 pending_ping: None,
                 connected_at: Instant::now(),
@@ -4509,6 +4680,7 @@ mod tests_handler_fuzz {
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
                 mempool_offered: false,
+                version: 0,
                 last_received: now,
                 pending_ping: None,
                 connected_at: now,
@@ -5333,6 +5505,7 @@ mod tests_handler_review {
                 pending: HashMap::new(),
                 consecutive_orphans: 0,
                 mempool_offered: false,
+                version: 0,
                 last_received: now,
                 pending_ping: None,
                 connected_at: now,
@@ -5376,6 +5549,133 @@ mod tests_handler_review {
         let direct = SocketAddr::from(([10, 1, 2, 3], 21121));
         assert!(b.connect(direct).is_err());
         assert!(asked.lock().unwrap().iter().any(|x| x == "10.1.2.3:21121"));
+    }
+
+    fn test_onion() -> crate::wire::OnionAddr {
+        crate::wire::OnionAddr {
+            name: format!("{}d", "k".repeat(55)),
+            port: 21121,
+            last_seen: 0,
+        }
+    }
+
+    /// Reads every frame the node wrote to `other` within 300 ms.
+    fn frames_from(other: &mut TcpStream, net: Network) -> Vec<Message> {
+        other
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(k) = other.read(&mut chunk) {
+            if k == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..k]);
+        }
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < buf.len() {
+            match Message::parse(&buf[at..], magic_for(net)) {
+                Ok((m, used)) => {
+                    out.push(m);
+                    at += used;
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// A node announces its onion service to a protocol-4 peer at the
+    /// handshake, and never to a protocol-3 one, which would take the
+    /// unknown command for a malformed frame.
+    #[test]
+    fn the_onion_service_is_announced_to_modern_peers_only() {
+        for (version, expected) in [(3u32, false), (4u32, true)] {
+            let n = node();
+            n.set_own_onion(Some(test_onion()));
+            let listener = anonymous_peer(&n, 7);
+            assert!(n.handle(
+                7,
+                Message::Version {
+                    version,
+                    timestamp: unix_now(),
+                    nonce: 0x0123_4567,
+                    user_agent: "peer".into(),
+                    start_height: 0,
+                }
+            ));
+            assert!(n.handle(7, Message::VerAck));
+            let (mut other, _) = listener.accept().expect("accept");
+            let got = frames_from(&mut other, NETWORK)
+                .into_iter()
+                .any(|m| matches!(&m, Message::OnionAddr(v) if v[0].name == test_onion().name));
+            assert_eq!(got, expected, "protocol {version}");
+        }
+    }
+
+    /// An `onionaddr` from an established peer fills the onion book; from a
+    /// stranger, it is not read.
+    #[test]
+    fn onion_names_are_learned_from_established_peers_only() {
+        let n = node();
+        let _l = anonymous_peer(&n, 7);
+        assert!(n.handle(7, Message::OnionAddr(vec![test_onion()])));
+        assert_eq!(n.onion_count(), 0, "before the handshake: ignored");
+        {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).expect("peer");
+            p.version_received = true;
+            p.handshaked = true;
+            p.version = 4;
+        }
+        assert!(n.handle(7, Message::OnionAddr(vec![test_onion()])));
+        assert_eq!(n.onion_count(), 1);
+        assert_eq!(n.onions_to_try(5).len(), 1);
+        n.set_own_onion(Some(test_onion()));
+        assert!(n.onions_to_try(5).is_empty(), "never this node's own");
+    }
+
+    /// The Tor counts: an outbound peer filed under an onion name's stand-in
+    /// is a connection to an onion service; an inbound loopback peer is one
+    /// handed over by Tor, but only when this node serves an onion.
+    #[test]
+    fn the_onion_status_counts_what_tor_brings() {
+        let n = node();
+        let _a = anonymous_peer(&n, 7);
+        let _b = anonymous_peer(&n, 8);
+        let onion = test_onion();
+        let label = crate::socks::Target::Name(onion.host(), onion.port).label();
+        {
+            let mut g = n.shared.lock().unwrap();
+            for p in g.peers.values_mut() {
+                p.version_received = true;
+                p.handshaked = true;
+            }
+            let p = g.peers.get_mut(&7).expect("peer");
+            p.outbound = true;
+            p.addr = label;
+            g.onions.add(onion.clone(), unix_now());
+        }
+        let s = n.onion_status();
+        assert_eq!(
+            (s.serving, s.known, s.outbound, s.inbound),
+            (false, 1, 1, 0)
+        );
+        n.set_own_onion(Some(crate::wire::OnionAddr {
+            name: "b".repeat(55) + "d",
+            ..onion
+        }));
+        let s = n.onion_status();
+        assert_eq!((s.serving, s.outbound, s.inbound), (true, 1, 1));
+        n.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&8)
+            .unwrap()
+            .handshaked = false;
+        assert_eq!(n.onion_status().inbound, 0, "established peers only");
     }
 
     /// An outbound peer on a private or loopback address is never handed out

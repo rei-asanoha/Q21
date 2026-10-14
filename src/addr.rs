@@ -501,6 +501,105 @@ impl AddrStore {
     }
 }
 
+/// Onion service addresses learned from peers (protocol 4).
+///
+/// Kept apart from the IPv4 book: an onion name has no network group, and
+/// it is only of use to a node that goes through Tor. Bounded, refreshed in
+/// place, the stalest dropped first; a name that keeps failing is dropped
+/// too. In memory only: a node through Tor learns them again from its
+/// entry points at every start.
+#[derive(Debug, Default)]
+pub struct OnionBook {
+    entries: Vec<OnionEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnionEntry {
+    pub addr: crate::wire::OnionAddr,
+    pub failures: u32,
+}
+
+/// Onion names kept at most.
+pub const MAX_ONIONS: usize = 1_000;
+
+/// Failures after which an onion name is forgotten.
+pub const MAX_ONION_FAILURES: u32 = 5;
+
+impl OnionBook {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Adds or refreshes a name. A timestamp from the future is brought back
+    /// to `now`, as for IPv4 addresses.
+    pub fn add(&mut self, a: crate::wire::OnionAddr, now: u64) {
+        let mut a = a;
+        a.last_seen = a.last_seen.min(now.saturating_add(FUTURE_TOLERANCE));
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.addr.name == a.name && e.addr.port == a.port)
+        {
+            e.addr.last_seen = e.addr.last_seen.max(a.last_seen);
+            return;
+        }
+        if self.entries.len() >= MAX_ONIONS {
+            if let Some((pos, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.addr.last_seen)
+            {
+                self.entries.swap_remove(pos);
+            }
+        }
+        self.entries.push(OnionEntry {
+            addr: a,
+            failures: 0,
+        });
+    }
+
+    /// The freshest names, at most `count`.
+    pub fn to_announce(&self, count: usize) -> Vec<crate::wire::OnionAddr> {
+        let mut v: Vec<&OnionEntry> = self.entries.iter().collect();
+        v.sort_by(|a, b| {
+            b.addr
+                .last_seen
+                .cmp(&a.addr.last_seen)
+                .then(a.addr.name.cmp(&b.addr.name))
+        });
+        v.into_iter().take(count).map(|e| e.addr.clone()).collect()
+    }
+
+    pub fn note_failure(&mut self, name: &str, port: u16) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.addr.name == name && e.addr.port == port)
+        {
+            self.entries[pos].failures += 1;
+            if self.entries[pos].failures >= MAX_ONION_FAILURES {
+                self.entries.swap_remove(pos);
+            }
+        }
+    }
+
+    pub fn note_success(&mut self, name: &str, port: u16, now: u64) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.addr.name == name && e.addr.port == port)
+        {
+            e.failures = 0;
+            e.addr.last_seen = now;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Reference clock for the tests: well beyond the timestamps used below,
@@ -696,5 +795,38 @@ mod tests {
         assert!(b.add(a([93, 184, 216, 34], 21021, 500), NOW));
         assert_eq!(b.len(), 1);
         assert_eq!(b.all()[0].addr.last_seen, 500);
+    }
+
+    fn onion(c: char, port: u16, seen: u64) -> crate::wire::OnionAddr {
+        crate::wire::OnionAddr {
+            name: format!("{}d", c.to_string().repeat(55)),
+            port,
+            last_seen: seen,
+        }
+    }
+
+    #[test]
+    fn the_onion_book_is_bounded_fresh_and_forgetful() {
+        let mut b = OnionBook::default();
+        b.add(onion('a', 21121, 10), 100);
+        b.add(onion('a', 21121, 50), 100);
+        assert_eq!(b.len(), 1, "refreshed in place");
+        assert_eq!(b.to_announce(5)[0].last_seen, 50);
+        b.add(onion('b', 21121, u64::MAX), 100);
+        assert!(b.to_announce(5)[0].last_seen <= 100 + FUTURE_TOLERANCE);
+        for _ in 0..MAX_ONION_FAILURES {
+            b.note_failure(&onion('b', 0, 0).name, 21121);
+        }
+        assert_eq!(b.len(), 1, "a name that keeps failing is forgotten");
+        for k in 0..(MAX_ONIONS as u64 + 10) {
+            let mut o = onion('c', 1, k);
+            o.name = format!("{:0>55}d", k)
+                .replace('0', "a")
+                .replace('1', "b")
+                .replace('8', "c")
+                .replace('9', "e");
+            b.add(o, 10_000);
+        }
+        assert!(b.len() <= MAX_ONIONS);
     }
 }

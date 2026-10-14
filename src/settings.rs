@@ -57,6 +57,23 @@ pub fn tor(datadir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Key of this node's own onion service, written by hand once Tor has
+/// created it: `onion=….onion`.
+pub const ONION_KEY: &str = "onion";
+
+/// Reads the onion service name, if any.
+pub fn onion(datadir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(datadir.join(FILE_NAME)).ok()?;
+    for line in text.lines() {
+        if let Some((key, value)) = line.trim().split_once('=') {
+            if key.trim() == ONION_KEY && !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Is `key` set to exactly `yes` in this text?
 pub fn yes_in_text(text: &str, wanted: &str) -> bool {
     for line in text.lines() {

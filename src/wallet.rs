@@ -1312,7 +1312,7 @@ impl Wallet {
     ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
         let mut available = self.spendable(utxo, height);
         available.retain(|e| !avoid(&e.0));
-        // --- The largest coins first (0.4.6).
+        // --- The largest coins first (0.4.7).
         //
         // The order was the outpoint's: arbitrary as to value. After a load
         // test, a wallet held thousands of small coins next to large ones,
@@ -1635,7 +1635,7 @@ impl Wallet {
     }
 
     /// Prepares the gathering of the wallet's smallest confirmed coins into
-    /// a single one, on a fresh address of its own (0.4.6).
+    /// a single one, on a fresh address of its own (0.4.7).
     ///
     /// # Why
     ///

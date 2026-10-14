@@ -105,6 +105,15 @@ COMMANDS
                                                   --assume-tip)
                              --assume-tip <hex>   the trusted tip that goes
                                                   with the commitment
+                             --tor                every outgoing connection
+                                                  through the local Tor
+                                                  (127.0.0.1:9050 or 9150),
+                                                  never in the clear. See
+                                                  TOR.md
+                             --proxy <ip:port>    same, through this SOCKS5
+                                                  proxy
+                             --onion <name.onion> announces this node's onion
+                                                  service (requires --tor)
                              --address-index      search index (see
                                                   EXPLORER.md)
                              --prune              keeps only recent block bodies
@@ -4311,6 +4320,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // proxy. See `q21_core::socks`.
     let mut tor = false;
     let mut proxy_arg: Option<String> = None;
+    let mut onion_arg: Option<String> = None;
     let mut assume_commitment: Option<String> = None;
     let mut assume_tip: Option<String> = None;
 
@@ -4350,6 +4360,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
             "--proxy" if i + 1 < args.len() => {
                 proxy_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--onion" if i + 1 < args.len() => {
+                onion_arg = Some(args[i + 1].clone());
                 i += 2;
             }
             "--rpc" if i + 1 < args.len() => {
@@ -4450,6 +4464,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // follows then resumes from the adopted state, and ordinary sync catches
     // up with the tip. A folder that is already populated is never touched.
     if let (Some(ch), Some(th)) = (&assume_commitment, &assume_tip) {
+        // The snapshot download connects directly: through Tor it would
+        // reveal the very address the person asked to hide.
+        if tor || proxy_arg.is_some() {
+            return Err("--assume-commitment does not go through Tor: sync from \
+                        genesis with --tor, or adopt the snapshot first without it"
+                .into());
+        }
         let network = forced_network.ok_or(
             "--assume-commitment requires --network: a new node has no \
              wallet to infer the chain from",
@@ -4528,6 +4549,31 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         })),
         (None, false) => None,
     };
+    // --- This node's own onion service, announced to protocol-4 peers.
+    //
+    // Tor creates the address (HiddenServiceDir) and forwards to the port
+    // this node listens on; the node only needs to know its name. Without
+    // Tor for the outgoing side, announcing it would tie the onion name to
+    // this machine's IP address in every peer's eyes: refused.
+    if let Some(raw) = &onion_arg {
+        let port = q21_core::bootstrap::default_port(network);
+        let own = q21_core::wire::OnionAddr::parse(raw, port)
+            .ok_or_else(|| format!("--onion {raw}: not a Tor v3 onion address"))?;
+        if proxy.is_none() {
+            return Err(
+                "--onion needs --tor (or --proxy): announcing an onion service \
+                        from a node that connects in the clear would link it to this \
+                        machine's address"
+                    .to_string(),
+            );
+        }
+        println!(
+            "  Tor: this node announces its onion service {}:{}",
+            own.host(),
+            own.port
+        );
+        node.set_own_onion(Some(own));
+    }
     if let Some(p) = proxy {
         node.set_proxy(Some(p));
         println!("  Tor: every outgoing connection goes through {p}");
@@ -4722,6 +4768,12 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
     targets.sort();
     targets.dedup();
+    if proxy.is_some() && !targets.is_empty() {
+        println!(
+            "  Tor: {} bootstrap address(es), dialed in the background",
+            targets.len()
+        );
+    }
     if targets.is_empty() && listen_on.is_none() {
         println!(
             "  no bootstrap: this node will not look for anyone. Give it\n               --bootstrap <host>, or a bootstrap.txt file in {}\n               (the program also looks for one next to itself)",
@@ -4731,17 +4783,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     for a in &targets {
         // Through Tor, a name goes to the proxy as a name: resolving it here
         // would send a DNS query from this machine.
+        //
+        // A connection through Tor can take a minute to fail. These
+        // are left to the maintenance loop, which dials on a thread of its
+        // own from its first turn (see `dial_missing`): startup, and the
+        // wallet's page, do not wait for the slowest, and the same peer is
+        // never dialed twice at once.
         if proxy.is_some() {
-            match q21_core::socks::Target::parse(a, q21_core::bootstrap::default_port(network)) {
-                Ok(t) if node.is_connected_to(t.label()) => {
-                    println!("  {a}: already connected");
-                }
-                Ok(t) => match node.connect_target(&t) {
-                    Ok(_) => println!("  connecting to {a} through Tor"),
-                    Err(e) => eprintln!("  failed to reach {a} through Tor: {e}"),
-                },
-                Err(e) => eprintln!("  unreadable bootstrap: {e}"),
-            }
             continue;
         }
         if a.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':')
@@ -5028,6 +5076,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             })
             .map_err(|e| format!("sleep-watch thread: {e}"))?;
     }
+    // One batch of Tor dials at a time, see `dial_missing`.
+    let dialing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut last_search = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(60))
         .unwrap_or_else(std::time::Instant::now);
@@ -5189,49 +5239,27 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 
             let missing = target_peers.saturating_sub(node.peer_count_outbound());
             if missing > 0 {
-                // --- Explicit bootstrap addresses first.
-                //
-                // They are not in the address book as long as no handshake
-                // has succeeded — and it is precisely when nothing succeeds
-                // that they are needed. What the user wrote on the command
-                // line must be retried as long as peers are missing.
-                for a in &targets {
-                    if proxy.is_some() {
-                        if let Ok(t) = q21_core::socks::Target::parse(
-                            a,
-                            q21_core::bootstrap::default_port(network),
-                        ) {
-                            if !node.is_connected_to(t.label())
-                                && node.connect_target(&t).is_ok()
-                                && !quiet
-                            {
-                                println!("  reconnecting to {a} through Tor");
-                            }
-                        }
-                        continue;
-                    }
-                    if let Ok(addresses) = q21_core::bootstrap::resolve(a, network) {
-                        for sa in addresses {
-                            if node.is_connected_to(sa) {
-                                continue;
-                            }
-                            if node.connect(sa).is_ok() {
-                                if !quiet {
-                                    println!("  reconnecting to {a} ({sa})");
-                                }
-                                break;
-                            }
+                // Through Tor a connection takes up to a minute to
+                // fail, and a dozen of them would hold this loop — mining,
+                // the wallet, the status line — for minutes. They run on a
+                // thread of their own, one batch at a time.
+                if proxy.is_some() {
+                    if !dialing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let node = node.clone();
+                        let targets = targets.clone();
+                        let busy = dialing.clone();
+                        let spawned = std::thread::Builder::new()
+                            .name("tor-dial".to_string())
+                            .spawn(move || {
+                                dial_missing(&node, &targets, network, proxy, target_peers, quiet);
+                                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                            });
+                        if spawned.is_err() {
+                            dialing.store(false, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
-                }
-                // --- Then the address book, for the remaining slots.
-                let missing = target_peers.saturating_sub(node.peer_count_outbound());
-                for a in node.addresses_to_try(missing) {
-                    let sa = std::net::SocketAddr::from((a.ip, a.port));
-                    match node.connect(sa) {
-                        Ok(_) => node.note_connect_success(a.ip, a.port),
-                        Err(_) => node.note_connect_failure(a.ip, a.port),
-                    }
+                } else {
+                    dial_missing(&node, &targets, network, proxy, target_peers, quiet);
                 }
             }
         }
@@ -5493,10 +5521,21 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         if !quiet && last_report.elapsed().as_secs() >= 2 {
             let h = node.height();
             let s = &node.stats;
+            // Behind Tor, what the onion services bring: names known,
+            // connections to them, connections handed over by Tor.
+            let onion = node.onion_status();
+            let tor_part = if node.proxy().is_some() || onion.serving {
+                format!(
+                    "  onion {} known, {} out, {} in",
+                    onion.known, onion.outbound, onion.inbound
+                )
+            } else {
+                String::new()
+            };
             println!(
                 "height {h} (+{})  peers {} ({} groups, address book {})  mempool {}  \
                  blocks received {}  compacts {} of which {} without round trip  \
-                 orphans {}  invalid {}",
+                 orphans {}  invalid {}{tor_part}",
                 h.saturating_sub(last_height),
                 node.peer_count(),
                 node.peer_groups(),
@@ -5864,6 +5903,14 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     let tor_on = q21_core::settings::tor(datadir);
     if tor_on && !rest.iter().any(|a| a == "--tor" || a == "--proxy") {
         arguments.push("--tor".to_string());
+    }
+    // An onion service set up by hand (`onion=….onion` in settings.txt),
+    // announced only when Tor is on and the wallet is reachable.
+    if let Some(onion) = q21_core::settings::onion(datadir) {
+        if tor_on && read_reachable(datadir) && !rest.iter().any(|a| a == "--onion") {
+            arguments.push("--onion".to_string());
+            arguments.push(onion);
+        }
     }
     if read_reachable(datadir) && !rest.iter().any(|a| a == "--listen") {
         arguments.push("--listen".to_string());
@@ -6491,6 +6538,67 @@ impl MiningGate {
         };
         self.allowed = allowed;
         GateAnswer { allowed, change }
+    }
+}
+
+/// Dials what the node lacks: the bootstrap addresses given, then (through
+/// Tor) the onion services learned from peers, then the address book.
+fn dial_missing(
+    node: &q21_core::net::Node,
+    targets: &[String],
+    network: Network,
+    proxy: Option<std::net::SocketAddr>,
+    target_peers: usize,
+    quiet: bool,
+) {
+    // --- Explicit bootstrap addresses first.
+    //
+    // They are not in the address book as long as no handshake
+    // has succeeded — and it is precisely when nothing succeeds
+    // that they are needed. What the user wrote on the command
+    // line must be retried as long as peers are missing.
+    for a in targets {
+        if proxy.is_some() {
+            if let Ok(t) =
+                q21_core::socks::Target::parse(a, q21_core::bootstrap::default_port(network))
+            {
+                if !node.is_connected_to(t.label()) && node.connect_target(&t).is_ok() && !quiet {
+                    println!("  connected to {a} through Tor");
+                }
+            }
+            continue;
+        }
+        if let Ok(addresses) = q21_core::bootstrap::resolve(a, network) {
+            for sa in addresses {
+                if node.is_connected_to(sa) {
+                    continue;
+                }
+                if node.connect(sa).is_ok() {
+                    if !quiet {
+                        println!("  reconnecting to {a} ({sa})");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // --- Through Tor, the onion services learned from peers.
+    if proxy.is_some() {
+        let missing = target_peers.saturating_sub(node.peer_count_outbound());
+        for o in node.onions_to_try(missing) {
+            let t = q21_core::socks::Target::Name(o.host(), o.port);
+            let ok = node.connect_target(&t).is_ok();
+            node.note_onion_result(&o, ok);
+        }
+    }
+    // --- Then the address book, for the remaining slots.
+    let missing = target_peers.saturating_sub(node.peer_count_outbound());
+    for a in node.addresses_to_try(missing) {
+        let sa = std::net::SocketAddr::from((a.ip, a.port));
+        match node.connect(sa) {
+            Ok(_) => node.note_connect_success(a.ip, a.port),
+            Err(_) => node.note_connect_failure(a.ip, a.port),
+        }
     }
 }
 

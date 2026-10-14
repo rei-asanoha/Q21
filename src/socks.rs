@@ -28,9 +28,11 @@ pub const TOR_SERVICE_PORT: u16 = 9050;
 /// Where Tor Browser listens while it is open (Windows, macOS, Linux).
 pub const TOR_BROWSER_PORT: u16 = 9150;
 
-/// Time allowed for a whole connection through Tor: building a circuit to an
-/// onion service regularly takes several seconds.
-pub const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time allowed for a whole connection through Tor. Building a circuit to an
+/// onion service regularly takes several seconds, and the first visit to one
+/// also fetches its descriptor: half a minute was sometimes not enough. The
+/// node dials on a thread of its own, so the wait holds up nothing else.
+pub const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Destination of a connection through the proxy.
 #[derive(Clone, Debug, PartialEq, Eq)]

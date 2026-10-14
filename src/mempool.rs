@@ -1399,7 +1399,7 @@ mod tests_chains {
     /// A block that confirms a parent but has no room for its children keeps
     /// the children waiting: their input is now a confirmed coin.
     ///
-    /// Before 0.4.6, confirming a transaction removed it **with all its
+    /// Before 0.4.7, confirming a transaction removed it **with all its
     /// descendants**. As soon as the wallet chained payments on its pending
     /// change (0.4.5) and blocks were full, every block that took a parent
     /// without its children erased them: on the load test of 14 October 2026,
