@@ -138,6 +138,14 @@ fn wallet_message(e: &crate::wallet::WalletError) -> &'static str {
             "one of the chosen coins disappeared while the wallet was being \
              saved (spent elsewhere, or a reorg): nothing was signed, try again"
         }
+        W::NothingToConsolidate => {
+            "nothing to gather: fewer than two free confirmed coins, or too \
+             little value to pay the fee"
+        }
+        W::TooManyCoins { .. } => {
+            "this amount needs more coins than one transaction can carry: send \
+             less at a time, or gather your small coins first (consolidate)"
+        }
         W::VerificationBehind { .. } => {
             "one-time keys: the chain could not be scanned up to the current \
              height (missing block bodies). Signing without knowing which keys \
@@ -978,6 +986,10 @@ impl RpcContext {
                 "[wallet] Send to several recipients in one transaction",
             ),
             (
+                "consolidate",
+                "[wallet] Gather the smallest coins into one (max_inputs, optional)",
+            ),
+            (
                 "getwalletinfo",
                 "[wallet] Scheme, network, addresses, keys consumed",
             ),
@@ -1067,6 +1079,7 @@ impl RpcContext {
             "getnewaddress" => self.getnewaddress(),
             "sendtoaddress" => self.sendtoaddress(params),
             "sendmany" => self.sendmany(params),
+            "consolidate" => self.consolidate(params),
             "getwalletinfo" => self.getwalletinfo(),
             "listaddresses" => self.listaddresses(),
             "setaddresslabel" => self.setaddresslabel(params),
@@ -2882,6 +2895,10 @@ impl RpcContext {
             .collect();
         Json::obj()
             .set("active", Json::Bool(active))
+            // Listening for incoming connections this session: with mining
+            // on, the blocks found leave from a public address first. The
+            // wallet page warns about it.
+            .set("reachable", Json::Bool(self.reachable_session))
             .set(
                 "possible",
                 Json::Bool(self.mining.is_some() && self.wallet.is_some()),
@@ -3355,6 +3372,69 @@ impl RpcContext {
         Ok((tx, txid, fee))
     }
 
+    /// Gathers the wallet's smallest confirmed coins into one, on a fresh
+    /// address of its own. Same three steps as a send (prepare under the
+    /// lock, write the wallet outside it, sign and accept under it again);
+    /// the fee is computed on the transaction built.
+    fn consolidate(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let max_inputs = match params.get("max_inputs") {
+            None | Some(Json::Null) => DEFAULT_CONSOLIDATION_INPUTS,
+            Some(v) => v.as_u64().filter(|n| *n >= 2).ok_or_else(|| {
+                rpc_error(
+                    ERR_PARAMS,
+                    "parameter 'max_inputs': an integer of at least 2",
+                )
+            })? as usize,
+        };
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let scheme = g.scheme();
+        let prepared = self.node.with_chain_and_mempool(|c, m| {
+            let rate = m
+                .median_fee_rate()
+                .unwrap_or(0)
+                .max(crate::mempool::MIN_FEE_RATE);
+            let fee_for = |n: usize| {
+                let n = n as u64;
+                let base_size = 8 + n * 48 + 41;
+                let witness = n * (scheme.pubkey_len() as u64 + scheme.sig_len() as u64);
+                let weight = base_size * WITNESS_DISCOUNT + witness + WEIGHT_PER_OUTPUT;
+                weight.saturating_mul(rate).div_ceil(1000).max(DEFAULT_FEE)
+            };
+            g.prepare_consolidation(&c.utxo, c.height(), max_inputs, &|o| m.spends(o), &fee_for)
+        });
+        let (prepare, fee) = prepared.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
+        let inputs = prepare.indices().len() as u64;
+        if self.save_wallet(&g).is_err() {
+            g.cancel_spend(prepare);
+            return Err(rpc_error(
+                ERR_WALLET,
+                wallet_message(&crate::wallet::WalletError::SaveFailed),
+            ));
+        }
+        let result = self.node.with_chain_and_mempool(|c, m| {
+            let tx = g.sign_spend(&m.view(&c.utxo), prepare)?;
+            let r = m.accept(&tx, &c.utxo, self.network, c.height());
+            Ok((tx, r))
+        });
+        if let Err(e) = self.save_wallet(&g) {
+            eprintln!("WARNING: wallet not saved after the consolidation: {e}");
+        }
+        drop(g);
+        let (tx, accepted) = result.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
+        let txid = accepted.map_err(|e| rpc_error(ERR_WALLET, &mempool_message(&e)))?;
+        self.node.announce_tx(txid);
+        let gathered = tx.outputs.first().map(|o| o.value).unwrap_or(Amount::ZERO);
+        Ok(Json::obj()
+            .set("txid", Json::str(txid.to_hex()))
+            .set("coins_gathered", Json::u64(inputs))
+            .set("amount", amount_json(gathered))
+            .set("fee", amount_json(Amount::from_units(fee)))
+            .build())
+    }
+
     /// Pays several recipients in **a single** transaction.
     ///
     /// Same path as `sendtoaddress` - a single lock to build and accept, the
@@ -3437,6 +3517,10 @@ fn read_fee(params: &Json) -> Result<Option<u64>, Json> {
         }),
     }
 }
+
+/// Coins gathered by one `consolidate` call when the caller does not say:
+/// enough to make a difference, little enough for a modest transaction.
+pub const DEFAULT_CONSOLIDATION_INPUTS: usize = 100;
 
 /// Default wallet scheme, exposed for the documentation.
 ///
@@ -4203,6 +4287,50 @@ mod tests {
             .expect("fee");
         assert!(fee > DEFAULT_FEE, "fee {fee}");
         assert_eq!(c.node.with_mempool(|m| m.len()), 1);
+    }
+
+    /// `consolidate` gathers the smallest coins into one: twenty coins, ten
+    /// gathered, eleven after the block. A second call right away takes the
+    /// other ten, not the ones already gathered.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn consolidation_gathers_the_smallest_coins() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 20);
+        let count = |c: &RpcContext| {
+            call_ok(c, "getbalance", "{}")
+                .get("spendable_outputs")
+                .and_then(|v| v.as_u64())
+                .expect("count")
+        };
+        assert_eq!(count(&c), 20);
+        let r = call_ok(&c, "consolidate", r#"{"max_inputs":10}"#);
+        assert_eq!(r.get("coins_gathered").and_then(|v| v.as_u64()), Some(10));
+        let first = inputs_of(&call_ok(
+            &c,
+            "gettransaction",
+            &format!(
+                r#"{{"txid":"{}"}}"#,
+                r.get("txid").and_then(|v| v.as_str()).expect("txid")
+            ),
+        ));
+        let r2 = call_ok(&c, "consolidate", r#"{"max_inputs":10}"#);
+        let second = inputs_of(&call_ok(
+            &c,
+            "gettransaction",
+            &format!(
+                r#"{{"txid":"{}"}}"#,
+                r2.get("txid").and_then(|v| v.as_str()).expect("txid")
+            ),
+        ));
+        assert!(second.iter().all(|i| !first.contains(i)));
+        assert_eq!(mine_pending(&c), 2);
+        // Twenty coins became two, plus the mining reward that this block
+        // brought to maturity.
+        assert_eq!(count(&c), 3);
+        // A single coin: nothing to gather.
+        let lone = context_with_coins(crate::sig::SchemeId::MlDsa87, 1);
+        let r = call(&lone, "consolidate", "{}");
+        assert!(r.get("error").is_some(), "{}", r.encode());
     }
 
     /// Two batches in a row take different coins. Before 0.4.5, `sendmany`

@@ -134,6 +134,11 @@ impl Default for AddrBook {
 }
 
 impl AddrBook {
+    /// Does this book accept local and private addresses (test networks)?
+    pub fn allows_local(&self) -> bool {
+        self.local
+    }
+
     pub fn new(allow_local: bool) -> AddrBook {
         // An unpredictable salt if the system can provide one; failing that, a
         // fixed salt. A generator failure must not prevent a node from

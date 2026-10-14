@@ -4609,6 +4609,17 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         match node.listen(&q21_core::bootstrap::listen_address(a, network)) {
             Ok(local) => {
                 println!("  listening on {local}");
+                // Reachable and mining from the start: the blocks found leave
+                // from this public address first, and can be linked to their
+                // rewards. Said once, at launch; the wallet page says it too.
+                if mine && !local.ip().is_loopback() {
+                    eprintln!(
+                        "  warning: this node is reachable and mines. The blocks it finds leave \
+                         from its public address first: anyone watching the network can link \
+                         that address to the rewards. To mine privately, mine from a node \
+                         that does not listen."
+                    );
+                }
                 // Layer 2: ask the router to open this port, in a dedicated
                 // thread that renews the lease and announces our address.
                 // Reserved for the wallet (`--upnp`): the public bootstrap

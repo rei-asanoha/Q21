@@ -945,9 +945,11 @@ impl Node {
             shared: Arc::new(Mutex::new(Shared {
                 chain,
                 mempool: Mempool::new(),
-                // Loopback only makes sense on test networks, where everything
-                // runs on a single machine.
-                book: AddrBook::new(!matches!(network, Network::Mainnet)),
+                // Loopback and private ranges only make sense on regtest,
+                // where everything runs on a single machine. The testnet is a
+                // public network since 0.4: accepting them there let a home
+                // network address travel from book to book (0.4.6).
+                book: AddrBook::new(matches!(network, Network::Regtest)),
                 peers: HashMap::new(),
                 network,
                 nonce,
@@ -2359,6 +2361,7 @@ impl Node {
                     // `getaddr` does not turn into a bandwidth amplification
                     // under the lock.
                     let mut v = g.book.to_announce(crate::wire::MAX_ADDR);
+                    let local = g.book.allows_local();
                     if v.len() < crate::wire::MAX_ADDR {
                         for p in g.peers.values() {
                             // ONLY the OUTBOUND peers: their `addr` carries the
@@ -2376,6 +2379,18 @@ impl Node {
                                     port: a.port(),
                                     last_seen: unix_now(),
                                 };
+                                // --- A home address stays at home (0.4.6).
+                                //
+                                // An outbound peer on the local network — a
+                                // wallet told to use the Raspberry next to it —
+                                // was handed to every node asking for
+                                // addresses: a private address published, and
+                                // a hint about the owner's home network. The
+                                // address book already refused those ranges;
+                                // this reply bypassed it.
+                                if !crate::addr::routable(n.ip, local) {
+                                    continue;
+                                }
                                 if !v.iter().any(|x| x.ip == n.ip && x.port == n.port) {
                                     v.push(n);
                                 }
@@ -2712,6 +2727,19 @@ impl Node {
                 }
                 g.mempool.on_block_connected(b);
                 let height = g.chain.height();
+                // A reorganization: the transactions of the abandoned blocks
+                // go back to the pool, those the winning branch does not
+                // already carry. See `Chain::take_disconnected`.
+                let abandoned = g.chain.take_disconnected();
+                if !abandoned.is_empty() {
+                    let shared = &mut *g;
+                    shared.mempool.return_abandoned(
+                        &abandoned,
+                        &shared.chain.utxo,
+                        shared.network,
+                        height,
+                    );
+                }
                 // Same rule as when receiving a transaction: the mempool reads
                 // the UTXO set in place, it does not copy it.
                 g.mempool.revalidate(&g.chain.utxo, g.network, height);
@@ -5260,6 +5288,53 @@ mod tests_handler_review {
             },
         );
         listener
+    }
+
+    /// An outbound peer on a private or loopback address is never handed out
+    /// in a reply to `getaddr` on a public network.
+    #[test]
+    fn a_private_peer_address_is_not_handed_out() {
+        let net = Network::Testnet;
+        let n = Node::new(net, Chain::new(net, genesis_block(net)));
+        let listener = anonymous_peer(&n, 7);
+        {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).expect("peer");
+            p.outbound = true;
+            p.version_received = true;
+            p.version_sent = true;
+            p.handshaked = true;
+        }
+        assert!(n.handle(7, Message::GetAddr));
+        let (mut other, _) = listener.accept().expect("accept");
+        other
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(k) = other.read(&mut chunk) {
+            if k == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..k]);
+        }
+        let mut handed_out = Vec::new();
+        let mut at = 0;
+        while at < buf.len() {
+            match Message::parse(&buf[at..], magic_for(net)) {
+                Ok((m, used)) => {
+                    if let Message::Addr(v) = m {
+                        handed_out.extend(v);
+                    }
+                    at += used;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            handed_out.iter().all(|a| a.ip[0] != 127),
+            "a loopback peer was handed out: {handed_out:?}"
+        );
     }
 
     /// The requests a peer's synchronization sends for `bodies` when it

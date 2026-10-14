@@ -592,6 +592,31 @@ impl Mempool {
         self.children.get(txid).map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Puts back the transactions of the blocks a reorganization abandoned
+    /// (oldest block first, in block order, so that a parent comes before
+    /// its children). Those the winning branch already confirmed, or made
+    /// impossible, are refused by `accept` and dropped. Returns how many came
+    /// back.
+    pub fn return_abandoned(
+        &mut self,
+        blocks: &[crate::block::Block],
+        utxo: &UtxoSet,
+        network: Network,
+        height: u64,
+    ) -> usize {
+        let mut back = 0;
+        for b in blocks {
+            // The first transaction of a block is its coinbase: it has no
+            // place in a pool.
+            for tx in b.transactions.iter().skip(1) {
+                if self.accept(tx, utxo, network, height).is_ok() {
+                    back += 1;
+                }
+            }
+        }
+        back
+    }
+
     /// Removes what a block has just confirmed, or made invalid.
     ///
     /// Two distinct cases: a transaction of the block is now confirmed, and a
@@ -1424,6 +1449,103 @@ mod tests_chains {
         assert!(m.is_empty());
         assert!(m.created.is_empty() && m.committed.is_empty());
     }
+    /// The largest coins pay first; and an amount that would need more coins
+    /// than a transaction can carry is refused with a clear reason, not
+    /// built into a transaction no block can hold.
+    #[test]
+    fn selection_takes_the_largest_coins_and_knows_its_limit() {
+        let mut w = Wallet::from_seed([0x2f; 32], NETWORK);
+        let max = w.max_inputs() as u64;
+        let c = funded_chain(&mut w, crate::consensus::COINBASE_MATURITY + max + 2);
+        let coins = w.spendable(&c.utxo, c.height());
+        assert!(coins.len() as u64 > max);
+        let largest = coins
+            .iter()
+            .map(|(_, o, _)| o.value.units())
+            .max()
+            .expect("coins");
+        let all: u64 = coins.iter().map(|(_, o, _)| o.value.units()).sum();
+
+        // One coin's worth: the largest one alone.
+        let (chosen, _) = w
+            .select_coins(&c.utxo, c.height(), largest)
+            .expect("selection");
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].1.value.units(), largest);
+
+        // Everything: more coins than one transaction can carry.
+        assert_eq!(
+            w.select_coins(&c.utxo, c.height(), all).err(),
+            Some(crate::wallet::WalletError::TooManyCoins {
+                max_inputs: max as usize
+            })
+        );
+        // More than everything: really not enough money.
+        assert!(matches!(
+            w.select_coins(&c.utxo, c.height(), all + 1),
+            Err(crate::wallet::WalletError::InsufficientFunds { .. })
+        ));
+    }
+
+    /// A payment that only the abandoned block carried comes back to the pool
+    /// after a reorganization, instead of vanishing.
+    #[test]
+    fn a_reorg_puts_the_abandoned_payments_back() {
+        let n = crate::consensus::COINBASE_MATURITY + 1;
+        let mut w = Wallet::from_seed([0x2c; 32], NETWORK);
+        let mut x = funded_chain(&mut w, n);
+        // The same chain, built a second time: the competing miner.
+        let mut y = funded_chain(&mut Wallet::from_seed([0x2c; 32], NETWORK), n);
+        assert_eq!(x.tip_id(), y.tip_id());
+
+        let mut m = Mempool::new();
+        let payment = spend_with_pending(&mut w, &x, &m, 300);
+        let id = m
+            .accept(&payment, &x.utxo, NETWORK, x.height())
+            .expect("accepted");
+
+        // This node's block carries the payment.
+        let t = x.tip().time + crate::consensus::TARGET_BLOCK_SECS;
+        let mut ours = Wallet::from_seed([0x2d; 32], NETWORK);
+        let a = ours.new_address();
+        let mine = x
+            .mine_block(a.hash, SchemeId::LamportOts, &[payment], t, 5_000_000)
+            .expect("mining");
+        x.connect(&mine, t + 1).expect("connect");
+        m.on_block_connected(&mine);
+        assert!(!m.contains(&id));
+
+        // The other miner finds two empty blocks: its branch wins.
+        let mut theirs = Wallet::from_seed([0x2e; 32], NETWORK);
+        let b = theirs.new_address();
+        let b1 = y
+            .mine_block(b.hash, SchemeId::LamportOts, &[], t, 5_000_000)
+            .expect("mining");
+        y.connect(&b1, t + 1).expect("connect");
+        let t2 = t + crate::consensus::TARGET_BLOCK_SECS;
+        let b2 = y
+            .mine_block(b.hash, SchemeId::LamportOts, &[], t2, 5_000_000)
+            .expect("mining");
+        assert!(matches!(
+            x.submit(&b1, t2),
+            Ok(crate::chain::Accept::SideBranch)
+        ));
+        assert!(matches!(
+            x.submit(&b2, t2 + 1),
+            Ok(crate::chain::Accept::Reorganized { depth: 1 })
+        ));
+
+        let abandoned = x.take_disconnected();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(
+            m.return_abandoned(&abandoned, &x.utxo, NETWORK, x.height()),
+            1
+        );
+        m.revalidate(&x.utxo, NETWORK, x.height());
+        assert!(m.contains(&id), "the payment is waiting again");
+        assert!(x.take_disconnected().is_empty(), "handed over once");
+    }
+
     /// The same on the path of a reorg, where only `revalidate` runs for the
     /// blocks of the new branch: the confirmed parent leaves, its child stays.
     #[test]

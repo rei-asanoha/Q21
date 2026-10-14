@@ -103,6 +103,17 @@ pub enum WalletError {
         verified: u64,
         height: u64,
     },
+    /// The funds exist, but paying this amount takes more coins than one
+    /// transaction can carry and still fit in a block. Building it anyway
+    /// gave a transaction the network refuses as unmineable; better to say
+    /// what to do: send less, or gather the small coins first.
+    TooManyCoins {
+        /// Coins one transaction can carry.
+        max_inputs: usize,
+    },
+    /// Fewer than two confirmed coins free, or too little value to pay the
+    /// fee: there is nothing worth gathering.
+    NothingToConsolidate,
 }
 
 /// Below this number of addresses, a cache is re-probed **in full**.
@@ -1256,6 +1267,16 @@ impl Wallet {
         self.select_coins_avoiding(utxo, height, needed, &|_| false, &[])
     }
 
+    /// Coins one transaction can spend and still fit in a block, with room
+    /// left for its outputs: nine tenths of the usable block weight, divided
+    /// by the weight of one input of this wallet's scheme.
+    pub fn max_inputs(&self) -> usize {
+        let per_input = (self.scheme.pubkey_len() + self.scheme.sig_len()) as u64
+            + 48 * crate::consensus::WITNESS_DISCOUNT;
+        let room = crate::mempool::MAX_USABLE_WEIGHT / 10 * 9;
+        (room / per_input.max(1)).max(1) as usize
+    }
+
     /// Does this output pay one of the wallet's keys?
     pub fn owns_output(&self, output: &TxOut) -> bool {
         output.scheme == self.scheme && self.known.contains_key(&output.pubkey_hash)
@@ -1291,6 +1312,21 @@ impl Wallet {
     ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
         let mut available = self.spendable(utxo, height);
         available.retain(|e| !avoid(&e.0));
+        // --- The largest coins first (0.4.6).
+        //
+        // The order was the outpoint's: arbitrary as to value. After a load
+        // test, a wallet held thousands of small coins next to large ones,
+        // and a payment of a few Q21 could gather hundreds of inputs — a
+        // transaction too heavy for any block. Largest first pays with the
+        // fewest coins, hence the smallest fee; the outpoint keeps the order
+        // deterministic at equal value.
+        available.sort_by(|a, b| {
+            b.1.value
+                .units()
+                .cmp(&a.1.value.units())
+                .then(a.0.cmp(&b.0))
+        });
+        let mut pending_coins: Vec<(OutPoint, TxOut, u32)> = Vec::new();
         let one_time_scheme = self.scheme.is_one_time();
         for (o, output) in pending {
             if avoid(o) || !self.owns_output(output) {
@@ -1304,8 +1340,17 @@ impl Wallet {
             {
                 continue;
             }
-            available.push((*o, *output, index));
+            pending_coins.push((*o, *output, index));
         }
+        // Pending coins after every confirmed one, largest first too.
+        pending_coins.sort_by(|a, b| {
+            b.1.value
+                .units()
+                .cmp(&a.1.value.units())
+                .then(a.0.cmp(&b.0))
+        });
+        available.extend(pending_coins);
+        let max_inputs = self.max_inputs();
 
         // A one-time scheme (Lamport) can sign only once per key, never
         // twice: signing two different messages with the same key reveals
@@ -1321,17 +1366,24 @@ impl Wallet {
 
         let mut chosen: Vec<(OutPoint, TxOut, u32)> = Vec::new();
         let mut total: u64 = 0;
+        let mut usable: u64 = 0;
         for e in available {
             if one_time && !taken_indices.insert(e.2) {
                 continue;
             }
+            usable = usable.saturating_add(e.1.value.units());
+            if total >= needed || chosen.len() >= max_inputs {
+                // Still counted in `usable`: to tell "not enough money" from
+                // "too many coins".
+                continue;
+            }
             total += e.1.value.units();
             chosen.push(e);
-            if total >= needed {
-                break;
-            }
         }
         if total < needed {
+            if usable >= needed {
+                return Err(WalletError::TooManyCoins { max_inputs });
+            }
             return Err(WalletError::InsufficientFunds {
                 available: total,
                 requested: needed,
@@ -1526,7 +1578,18 @@ impl Wallet {
                 pubkey_hash: change_address.hash,
             });
         }
+        self.finish_prepare(chosen, outputs, height)
+    }
 
+    /// The part of a prepared spend that does not depend on how the coins
+    /// were chosen: the stripped transaction, the key barrier, the
+    /// reservation.
+    fn finish_prepare(
+        &mut self,
+        chosen: Vec<(OutPoint, TxOut, u32)>,
+        outputs: Vec<TxOut>,
+        height: u64,
+    ) -> Result<PreparedSpend, WalletError> {
         let tx = Transaction {
             version: 1,
             inputs: chosen
@@ -1569,6 +1632,78 @@ impl Wallet {
             self.reserved.entry(*index).or_insert(height);
         }
         Ok(PreparedSpend { chosen, keys, tx })
+    }
+
+    /// Prepares the gathering of the wallet's smallest confirmed coins into
+    /// a single one, on a fresh address of its own (0.4.6).
+    ///
+    /// # Why
+    ///
+    /// Every payment received is a coin. After a load test, a wallet held
+    /// thousands of small ones: each later payment needed many inputs, hence
+    /// a heavy transaction and a high fee, and some amounts could no longer
+    /// be paid at all ([`WalletError::TooManyCoins`]). Gathering them once,
+    /// at a quiet moment, puts things right.
+    ///
+    /// Takes at most `max_inputs` coins, smallest first, leaving out those
+    /// `avoid` designates (already spent by a pending transaction). `fee_for`
+    /// gives the fee for a number of inputs. At least two coins are needed,
+    /// and the result must be worth more than the dust floor.
+    pub fn prepare_consolidation(
+        &mut self,
+        utxo: &UtxoSet,
+        height: u64,
+        max_inputs: usize,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+        fee_for: &dyn Fn(usize) -> u64,
+    ) -> Result<(PreparedSpend, u64), WalletError> {
+        if !self.scheme.is_available() {
+            return Err(WalletError::UnsupportedScheme(self.scheme));
+        }
+        let mut available = self.spendable(utxo, height);
+        available.retain(|e| !avoid(&e.0));
+        available.sort_by(|a, b| {
+            a.1.value
+                .units()
+                .cmp(&b.1.value.units())
+                .then(a.0.cmp(&b.0))
+        });
+        let one_time = self.scheme.is_one_time();
+        let mut taken_indices: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let limit = max_inputs.min(self.max_inputs()).max(2);
+        let mut chosen: Vec<(OutPoint, TxOut, u32)> = Vec::new();
+        for e in available {
+            if chosen.len() >= limit {
+                break;
+            }
+            if one_time
+                && (!taken_indices.insert(e.2)
+                    || self.consumed.contains(&e.2)
+                    || self.reserved.contains_key(&e.2))
+            {
+                continue;
+            }
+            chosen.push(e);
+        }
+        if chosen.len() < 2 {
+            return Err(WalletError::NothingToConsolidate);
+        }
+        let total = chosen
+            .iter()
+            .try_fold(0u64, |a, (_, o, _)| a.checked_add(o.value.units()))
+            .ok_or(WalletError::AmountOutOfRange)?;
+        let fee = fee_for(chosen.len());
+        let value = total.saturating_sub(fee);
+        if value < crate::consensus::MIN_OUTPUT_VALUE {
+            return Err(WalletError::NothingToConsolidate);
+        }
+        let to = self.new_address();
+        let outputs = vec![TxOut {
+            value: Amount::from_units(value),
+            scheme: to.scheme,
+            pubkey_hash: to.hash,
+        }];
+        Ok((self.finish_prepare(chosen, outputs, height)?, fee))
     }
 
     /// Gives up a prepared spend: the reserved indices become free again. To

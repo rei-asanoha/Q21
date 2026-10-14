@@ -540,7 +540,17 @@ pub struct Chain {
     table: RefCell<Option<std::sync::Arc<PowTable>>>,
     /// Threads used by the miner. All cores by default.
     miner_threads: usize,
+    /// The blocks the last reorganization took off the active chain, oldest
+    /// first, at most [`RETURNED_BLOCKS`]: their transactions go back to the
+    /// mempool. See [`Chain::take_disconnected`].
+    disconnected: Vec<Block>,
 }
+
+/// Blocks of an abandoned branch whose transactions are offered back to the
+/// mempool. A reorg of the last block or two is what happens when two miners
+/// find a block at almost the same time; deeper ones are rare, and their
+/// transactions mostly sit in the winning branch already.
+pub const RETURNED_BLOCKS: usize = 6;
 
 impl Chain {
     pub fn new(network: Network, genesis: Block) -> Chain {
@@ -582,6 +592,7 @@ impl Chain {
             issued,
             table: RefCell::new(None),
             miner_threads: default_threads(),
+            disconnected: Vec::new(),
         }
     }
 
@@ -1041,6 +1052,7 @@ impl Chain {
                 issued: snapshot.issued,
                 table: RefCell::new(None),
                 miner_threads: default_threads(),
+                disconnected: Vec::new(),
             },
             to_replay,
         })
@@ -2084,7 +2096,18 @@ impl Chain {
                 return Err(ChainError::Validation(e));
             }
         }
+        // The abandoned blocks, for their transactions: without this, a
+        // payment that only the losing block carried left every mempool (each
+        // node had removed it on receiving that block) and never happened.
+        let keep = old_bodies.len().saturating_sub(RETURNED_BLOCKS);
+        self.disconnected = old_bodies.split_off(keep);
         Ok(depth)
+    }
+
+    /// The blocks the last reorganization abandoned, oldest first, once: the
+    /// caller puts their transactions back in the mempool.
+    pub fn take_disconnected(&mut self) -> Vec<Block> {
+        std::mem::take(&mut self.disconnected)
     }
 
     // -----------------------------------------------------------------------
