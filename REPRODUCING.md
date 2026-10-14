@@ -90,13 +90,13 @@ of compilation on a desktop machine, about ten on a Raspberry Pi.
 ```bash
 git clone https://github.com/<account>/q21.git
 cd q21
-git checkout v0.4.5        # or the published commit hash
+git checkout v0.4.7        # or the published commit hash
 ```
 
 **What you should see**
 
 ```
-Note: switching to 'v0.4.5'.
+Note: switching to 'v0.4.7'.
 You are in 'detached HEAD' state. ...
 HEAD is now at <commit> ...
 ```
@@ -105,7 +105,7 @@ HEAD is now at <commit> ...
 version and not at a branch that moves forward", which is exactly what we
 want.
 
-**If this fails** — `pathspec 'v0.4.5' did not match`: the tag does not
+**If this fails** — `pathspec 'v0.4.7' did not match`: the tag does not
 exist yet. Use the commit hash published with the release:
 `git checkout <commit>`.
 
@@ -153,7 +153,7 @@ Toolchain:    rustc 1.95.0 (59807616e 2026-04-14)
    Compiling hybrid-array v0.4.44
    ...
    Compiling ml-dsa v0.1.1
-   Compiling q21-core v0.4.5 (/home/you/q21)
+   Compiling q21-core v0.4.7 (/home/you/q21)
     Finished `release` profile [optimized] target(s) in 37.49s
 
 Binary: target/release/q21

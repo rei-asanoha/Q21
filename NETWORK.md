@@ -95,6 +95,14 @@ Add `--mine`. On a network where others mine, the difficulty adjusts: it is no
 longer one block per second as on a local machine, but one block every two
 minutes for the whole network, shared among everyone who is searching.
 
+## 5 · Without showing your address
+
+Add `--tor`: every connection then goes through a Tor installed on the same
+machine, and the nodes you talk to see a Tor relay instead of your IP
+address. In the wallet, it is a switch in the Network tab. Installing Tor,
+and running a node that others reach without knowing where it is: see
+[TOR.md](TOR.md).
+
 ---
 
 # Part 2 — Running an entry point

@@ -65,6 +65,42 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.5 to 0.4.7
+
+0.4.7 is a drop-in replacement: same chain, same data directory, same wallet
+file (still `Q21SEAL4`), so going back to 0.4.5 stays possible. It comes out
+of a second load test of the testnet, on 14 October 2026: two wallets, about
+6,400 payments, blocks full at 227 payments. Every payment was accepted, but
+a part of those built on top of pending ones never reached a block. There is
+no 0.4.6: the fix ships in 0.4.7, together with Tor.
+
+## What changes
+
+| | 0.4.5 | 0.4.7 |
+|---|---|---|
+| A block confirms a payment that others depend on | The node also dropped every pending payment built on it: accepted, never confirmed. In a replay of the test, 111 and 231 payments out of 1,080 were lost | They stay in the queue and go into the next blocks. Same replay: 0 lost |
+| A block replaced by a longer chain (reorganization) | Its payments were forgotten | They go back into the queue (six blocks deep at most) |
+| Which coins pay | The oldest first: a wallet with hundreds of small coins could not pay 50 Q21 ("insufficient funds") | The largest first. When even they need more coins than a transaction can carry (about 240), the message says so |
+| Many small coins | Nothing to gather them | `consolidate` (RPC) gathers the smallest ones, 100 by default, into a single coin paid to yourself |
+| Private addresses (`192.168.…`, `10.…`) heard from a peer | Kept and passed on to the whole testnet | Refused, and never passed on |
+| Mining while reachable without Tor | Nothing said | A warning at startup and in the wallet: the blocks found first appear coming from this IP address |
+| Tor | — | `--tor`, `--proxy`, `--onion`, and a switch in the Network tab. See [TOR.md](TOR.md) |
+| Protocol | 3 | 4: one new message, `onionaddr`, sent only to peers of version 4 |
+
+## Who needs it
+
+Everyone, in this order:
+
+1. the entry points (servers): they keep the pending payments that depend on
+   a confirmed one, and pass on onion addresses;
+2. the wallets. No backup is needed this time: the wallet file does not
+   change. Copying `q21-data` aside before any update remains a good habit.
+
+A 0.4.5 node and a 0.4.7 node talk to each other: a version 3 peer is never
+sent the new message.
+
+---
+
 # Upgrading from 0.4.4 to 0.4.5
 
 0.4.5 is a drop-in replacement for the node: same protocol (3), same chain,

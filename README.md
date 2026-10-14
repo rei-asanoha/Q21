@@ -223,6 +223,10 @@ curl -sX POST localhost:21080/rpc -d '{"jsonrpc":"2.0","id":1,"method":"listmeth
   entry point is turned away.
 - **Burst mining** beyond ~7,200 blocks at once pushes timestamps past the
   2-hour tolerance.
+- **Tor is not bundled.** `--tor` and the wallet switch use a Tor installed
+  separately (Tor Browser, or the Tor service); see [TOR.md](TOR.md). A
+  payment is relayed to every peer at once (no Dandelion++ yet): without
+  Tor, the first node to relay it is a good guess of where it comes from.
 - **Block archive pruning** (`node --prune`) keeps about eight days of block
   bodies; a pruned node cannot serve as an explorer.
 
@@ -291,6 +295,7 @@ WHITEPAPER.md        Whitepaper
 JOIN.md              Join in ten minutes
 UPGRADING.md         Upgrading your wallet
 NETWORK.md           Testnet entry points, and running one
+TOR.md               Running a node or a wallet through Tor, hidden node
 SERVER.md            Setting up an entry point step by step (from a Mac)
 SERVER-WINDOWS.md    Same, from PowerShell
 MINING.md            Mining explained without jargon
