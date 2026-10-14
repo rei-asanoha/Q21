@@ -26,13 +26,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+// --- Only the measuring thread is counted.
+//
+// The test runner runs the tests of this file on several threads at once.
+// With one switch for the whole process, the allocations of the other tests
+// were counted too: `inv` once came out at 720 times its size on a release
+// run, for a parse that allocates a few bytes. And a thread could see the
+// switch off, then on, inside a single `realloc`, take the shrinking branch
+// for a block that grew, and underflow (`attempt to subtract with overflow`).
+// The switch is now per thread, read once per call.
+thread_local! {
+    static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is this thread being measured? `try_with`: during thread teardown, the
+/// variable may already be gone, and the allocator must never panic.
+fn counting() -> bool {
+    MEASURING.try_with(|m| m.get()).unwrap_or(false)
+}
 
 struct Counter;
 
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if ACTIVE.load(Ordering::Relaxed) == 1 {
+        if counting() {
             ALLOCATED.fetch_add(l.size(), Ordering::Relaxed);
             // --- The measuring tool overflowed, not the product.
             //
@@ -52,7 +70,7 @@ unsafe impl GlobalAlloc for Counter {
         System.alloc(l)
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if ACTIVE.load(Ordering::Relaxed) == 1 {
+        if counting() {
             let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(l.size()))
             });
@@ -63,14 +81,15 @@ unsafe impl GlobalAlloc for Counter {
         // Saturated at both ends, as in `alloc` and `dealloc`: a block grown
         // or shrunk by another thread during the measurement must not wrap
         // the counter around.
-        if ACTIVE.load(Ordering::Relaxed) == 1 && n > l.size() {
+        let on = counting();
+        if on && n > l.size() {
             let grown = n - l.size();
             ALLOCATED.fetch_add(grown, Ordering::Relaxed);
             let v = LIVE
                 .fetch_add(grown, Ordering::Relaxed)
                 .saturating_add(grown);
             PEAK.fetch_max(v, Ordering::Relaxed);
-        } else if ACTIVE.load(Ordering::Relaxed) == 1 {
+        } else if on {
             let shrunk = l.size() - n;
             let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(shrunk))
@@ -88,9 +107,9 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, usize) {
     ALLOCATED.store(0, Ordering::SeqCst);
     PEAK.store(0, Ordering::SeqCst);
     LIVE.store(0, Ordering::SeqCst);
-    ACTIVE.store(1, Ordering::SeqCst);
+    MEASURING.with(|m| m.set(true));
     let r = f();
-    ACTIVE.store(0, Ordering::SeqCst);
+    MEASURING.with(|m| m.set(false));
     (r, PEAK.load(Ordering::SeqCst))
 }
 
