@@ -597,9 +597,14 @@ impl Mempool {
     /// Two distinct cases: a transaction of the block is now confirmed, and a
     /// mempool transaction that spent the same output is now a double spend.
     /// Both must go.
+    ///
+    /// A confirmed transaction leaves **alone**: its descendants still waiting
+    /// here stay, since what they spend is now a confirmed output. Removing
+    /// them with it, as `remove` does, erased every payment chained on change
+    /// that did not fit in the same block (load test of 14 October 2026).
     pub fn on_block_connected(&mut self, block: &crate::block::Block) {
         for tx in &block.transactions {
-            self.remove(&tx.txid());
+            self.remove_one(&tx.txid());
             for input in &tx.inputs {
                 if let Some(conflict) = self.committed.get(&input.prev_out).copied() {
                     self.remove(&conflict);
@@ -743,6 +748,25 @@ impl Mempool {
         // the **availability of the inputs** and the **maturity of
         // coinbases**. So we only check that, and cascade to the descendants.
         // It is also much faster: no post-quantum signature is rechecked.
+        //
+        // First, what is already confirmed leaves on its own, without its
+        // descendants: a reorg connects several blocks while only the tip
+        // goes through `on_block_connected`. Treated as an orphan below (its
+        // inputs are spent: by itself), it took its still-valid children
+        // with it. A confirmed transaction is recognized by an output of its
+        // own present in the confirmed set.
+        let confirmed: Vec<Hash256> = self
+            .entries
+            .iter()
+            .filter(|(id, e)| {
+                (0..e.tx.outputs.len() as u32)
+                    .any(|index| utxo.get(&OutPoint { txid: **id, index }).is_some())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in confirmed {
+            self.remove_one(&id);
+        }
         loop {
             let mut orphans: Vec<Hash256> = Vec::new();
 
@@ -1346,5 +1370,85 @@ mod tests_chains {
         assert_eq!(m.bytes(), 0);
         assert!(m.created.is_empty(), "no ghost output must remain");
         assert!(m.committed.is_empty());
+    }
+    /// A block that confirms a parent but has no room for its children keeps
+    /// the children waiting: their input is now a confirmed coin.
+    ///
+    /// Before 0.4.6, confirming a transaction removed it **with all its
+    /// descendants**. As soon as the wallet chained payments on its pending
+    /// change (0.4.5) and blocks were full, every block that took a parent
+    /// without its children erased them: on the load test of 14 October 2026,
+    /// 208 of the last 600 payments checked had vanished from every node.
+    #[test]
+    fn confirming_a_parent_keeps_its_children_waiting() {
+        let mut w = Wallet::from_seed([0x2a; 32], NETWORK);
+        let mut c = funded_chain(&mut w, crate::consensus::COINBASE_MATURITY + 1);
+        let mut m = Mempool::new();
+        let mut ids = Vec::new();
+        let mut txs = Vec::new();
+        for k in 0..3u64 {
+            let tx = spend_with_pending(&mut w, &c, &m, 300 + 100 * k);
+            ids.push(
+                m.accept(&tx, &c.utxo, NETWORK, c.height())
+                    .expect("accepted"),
+            );
+            txs.push(tx);
+        }
+        // A full block: only the parent fits.
+        let t = c.tip().time + crate::consensus::TARGET_BLOCK_SECS;
+        let a = w.new_address();
+        let block = c
+            .mine_block(a.hash, SchemeId::LamportOts, &txs[..1], t, 5_000_000)
+            .expect("mining");
+        c.connect(&block, t + 1).expect("connect");
+        m.on_block_connected(&block);
+        m.revalidate(&c.utxo, NETWORK, c.height());
+
+        assert_eq!(m.len(), 2, "the children must still be waiting");
+        assert!(!m.contains(&ids[0]));
+        assert_eq!(m.announcement(u64::MAX), ids[1..].to_vec());
+        assert_eq!(
+            m.ancestors_up_to(&ids[2], 10),
+            1,
+            "only the child remains above"
+        );
+
+        // And the next block takes them, in order.
+        let next = m.select_for_block(u64::MAX);
+        let t = c.tip().time + crate::consensus::TARGET_BLOCK_SECS;
+        let block = c
+            .mine_block(a.hash, SchemeId::LamportOts, &next, t, 5_000_000)
+            .expect("mining");
+        c.connect(&block, t + 1).expect("the children are valid");
+        m.on_block_connected(&block);
+        assert!(m.is_empty());
+        assert!(m.created.is_empty() && m.committed.is_empty());
+    }
+    /// The same on the path of a reorg, where only `revalidate` runs for the
+    /// blocks of the new branch: the confirmed parent leaves, its child stays.
+    #[test]
+    fn revalidation_keeps_the_children_of_a_confirmed_parent() {
+        let mut w = Wallet::from_seed([0x2b; 32], NETWORK);
+        let mut c = funded_chain(&mut w, crate::consensus::COINBASE_MATURITY + 1);
+        let mut m = Mempool::new();
+        let parent = spend_with_pending(&mut w, &c, &m, 300);
+        let p = m
+            .accept(&parent, &c.utxo, NETWORK, c.height())
+            .expect("parent");
+        let child = spend_with_pending(&mut w, &c, &m, 400);
+        let k = m
+            .accept(&child, &c.utxo, NETWORK, c.height())
+            .expect("child");
+        let t = c.tip().time + crate::consensus::TARGET_BLOCK_SECS;
+        let a = w.new_address();
+        let block = c
+            .mine_block(a.hash, SchemeId::LamportOts, &[parent], t, 5_000_000)
+            .expect("mining");
+        c.connect(&block, t + 1).expect("connect");
+        // No `on_block_connected`: the reorg path.
+        m.revalidate(&c.utxo, NETWORK, c.height());
+        assert!(!m.contains(&p), "the confirmed parent leaves");
+        assert!(m.contains(&k), "its child stays");
+        assert_eq!(m.len(), 1);
     }
 }
