@@ -79,6 +79,7 @@ pub mod sha256;
 pub mod shutdown;
 pub mod sig;
 pub mod siphash;
+pub mod socks;
 pub mod state;
 pub mod store;
 pub mod tx;

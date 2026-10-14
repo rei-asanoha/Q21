@@ -344,6 +344,17 @@ pub type OnChange = Arc<dyn Fn(&Wallet) -> Result<(), String> + Send + Sync>;
 /// Callback that persists the "reachable" setting. See [`RpcContext`].
 pub type SetReachable = Arc<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
 
+/// The Tor setting of a wallet (0.4.7): what is wanted from the next launch,
+/// what this session does, and how to write the choice.
+pub struct TorSetting {
+    /// Wanted from the next launch (`tor=yes` in `settings.txt`).
+    pub wanted: std::sync::atomic::AtomicBool,
+    /// The proxy every connection of this session goes through, if any.
+    pub session: Option<std::net::SocketAddr>,
+    /// Writes the choice to disk.
+    pub set: SetReachable,
+}
+
 pub struct RpcContext {
     pub node: Arc<Node>,
     /// Absent if the wallet methods are disabled.
@@ -406,6 +417,8 @@ pub struct RpcContext {
     /// Persists a change of the "reachable" setting. Supplied by the caller,
     /// which alone knows where the file lives. Absent in pure memory (tests).
     pub set_reachable: Option<SetReachable>,
+    /// The Tor setting; absent in pure memory (tests) and on servers.
+    pub tor: Option<Arc<TorSetting>>,
 }
 
 /// Chain scans a public service grants: a budget **per client**, and a net
@@ -590,6 +603,7 @@ impl RpcContext {
             reachable_session: true,
             router_status: None,
             set_reachable: None,
+            tor: None,
         }
     }
 
@@ -1024,6 +1038,10 @@ impl RpcContext {
                 "[wallet] Makes this node reachable or not (takes effect at the next launch)",
             ),
             (
+                "settor",
+                "[wallet] Every connection through Tor, or not (takes effect at the next launch)",
+            ),
+            (
                 "getsyncstatus",
                 "Status of synchronization with the network",
             ),
@@ -1091,6 +1109,7 @@ impl RpcContext {
             "getnetworkhashrate" => Ok(self.getnetworkhashrate()),
             "setmining" => self.setmining(params),
             "setreachable" => self.setreachable(params),
+            "settor" => self.settor(params),
             "stop" => self.stop(),
             "search" => self.search(params, client),
             "getaddress" => self.getaddress(params, client),
@@ -1156,6 +1175,18 @@ impl RpcContext {
                 Json::Bool(self.reachable.load(std::sync::atomic::Ordering::SeqCst)),
             )
             .set("reachable_session", Json::Bool(self.reachable_session))
+            // Tor: wanted (from the next launch), and in use now. The proxy's
+            // address is local and says nothing about the owner.
+            .set(
+                "tor",
+                Json::Bool(
+                    self.tor
+                        .as_ref()
+                        .map(|t| t.wanted.load(std::sync::atomic::Ordering::SeqCst))
+                        .unwrap_or(false),
+                ),
+            )
+            .set("tor_session", Json::Bool(self.node.proxy().is_some()))
             .set(
                 "port_mapping",
                 match &self.router_status {
@@ -3090,6 +3121,29 @@ impl RpcContext {
             .build())
     }
 
+    /// Changes the Tor setting. Like `setreachable`: written to disk, in
+    /// effect at the next launch, and reserved for the wallet.
+    fn settor(&self, params: &Json) -> Result<Json, Json> {
+        self.require_wallet()?;
+        let on = match params.get("active") {
+            Some(Json::Bool(b)) => *b,
+            _ => return Err(rpc_error(-32602, "boolean parameter `active` expected")),
+        };
+        let t = self.tor.as_ref().ok_or_else(|| {
+            rpc_error(
+                ERR_INTERNAL,
+                "this node does not know where to write this setting",
+            )
+        })?;
+        (t.set)(on).map_err(|e| rpc_error(ERR_INTERNAL, &format!("setting not saved: {e}")))?;
+        t.wanted.store(on, std::sync::atomic::Ordering::SeqCst);
+        Ok(Json::obj()
+            .set("tor", Json::Bool(on))
+            .set("tor_session", Json::Bool(self.node.proxy().is_some()))
+            .set("takes_effect", Json::str("at the next launch"))
+            .build())
+    }
+
     fn getbalance(&self) -> Result<Json, Json> {
         let w = self.require_wallet()?;
         // --- Do not copy the whole UTXO set at every call.
@@ -3572,6 +3626,7 @@ mod tests {
             reachable_session: true,
             router_status: None,
             set_reachable: None,
+            tor: None,
             index: None,
             // The RPC tests see mining as possible: that is what makes it
             // possible to check that the switch responds, and that without a
@@ -3616,6 +3671,7 @@ mod tests {
             reachable_session: true,
             router_status: None,
             set_reachable: None,
+            tor: None,
             index: None,
             mining: Some(Arc::new(crate::mining::Mining::new(false))),
             node: Arc::new(Node::new(NETWORK, c)),
@@ -4755,6 +4811,7 @@ mod tests {
             reachable_session: true,
             router_status: None,
             set_reachable: None,
+            tor: None,
             index: None,
             mining: None,
             node: Arc::new(Node::new(NETWORK, chain)),
@@ -5197,6 +5254,7 @@ mod tests {
             reachable_session: true,
             router_status: None,
             set_reachable: None,
+            tor: None,
             index: None,
             mining: None,
             node,

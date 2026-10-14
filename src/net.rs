@@ -884,6 +884,9 @@ pub struct Node {
     stop: Arc<AtomicBool>,
     /// Observation counters, useful for tests and operations.
     pub stats: Arc<Stats>,
+    /// SOCKS5 proxy (Tor) through which every outgoing connection goes.
+    /// `None`: direct connections. See [`Node::set_proxy`].
+    proxy: Arc<std::sync::RwLock<Option<SocketAddr>>>,
 }
 
 #[derive(Default, Debug)]
@@ -961,7 +964,34 @@ impl Node {
             next_id: Arc::new(AtomicU64::new(1)),
             stop: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
+            proxy: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Sends every outgoing connection through the SOCKS5 proxy at `p`
+    /// (Tor), from now on. There is no fallback to a direct connection: a
+    /// node asked to hide its address that quietly connected in the clear
+    /// when the proxy failed would betray the person who asked.
+    pub fn set_proxy(&self, p: Option<SocketAddr>) {
+        if let Ok(mut g) = self.proxy.write() {
+            *g = p;
+        }
+    }
+
+    /// The proxy in use, if any.
+    pub fn proxy(&self) -> Option<SocketAddr> {
+        self.proxy.read().ok().and_then(|g| *g)
+    }
+
+    /// Connects to a target through the proxy: an IPv4 address, a host name
+    /// or an onion service, the name being resolved by the proxy. The peer is
+    /// filed under [`crate::socks::Target::label`]. Refused without a proxy.
+    pub fn connect_target(&self, target: &crate::socks::Target) -> std::io::Result<u64> {
+        let proxy = self.proxy().ok_or_else(|| {
+            std::io::Error::other("a name or an onion address needs the proxy (--tor)")
+        })?;
+        let stream = crate::socks::connect(proxy, target, crate::socks::TOR_CONNECT_TIMEOUT)?;
+        Ok(self.start_peer_as(stream, true, Some(target.label())))
     }
 
     /// Plugs in the journal where accepted blocks are recorded.
@@ -1410,6 +1440,19 @@ impl Node {
 
     /// Connects to a peer and starts the handshake.
     pub fn connect(&self, addr: SocketAddr) -> std::io::Result<u64> {
+        // Through the proxy when there is one: never in the clear.
+        if let Some(proxy) = self.proxy() {
+            let target = match addr {
+                SocketAddr::V4(a) => crate::socks::Target::V4(a.ip().octets(), a.port()),
+                SocketAddr::V6(_) => {
+                    return Err(std::io::Error::other(
+                        "IPv6 is not supported through a proxy",
+                    ))
+                }
+            };
+            let stream = crate::socks::connect(proxy, &target, crate::socks::TOR_CONNECT_TIMEOUT)?;
+            return Ok(self.start_peer_as(stream, true, Some(addr)));
+        }
         // Four seconds: enough for a slow link, not enough for a batch of
         // silent addresses to hold the maintenance loop for a minute.
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))?;
@@ -1417,6 +1460,12 @@ impl Node {
     }
 
     fn start_peer(&self, stream: TcpStream, outbound: bool) -> u64 {
+        self.start_peer_as(stream, outbound, None)
+    }
+
+    /// Like `start_peer`, filing the peer under `label` instead of the
+    /// socket's remote end: behind a proxy, that end is the proxy itself.
+    fn start_peer_as(&self, stream: TcpStream, outbound: bool, label: Option<SocketAddr>) -> u64 {
         let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
         // Without a write timeout, a peer that never takes in its bytes blocks
         // the thread writing to it indefinitely — while holding the mutex of
@@ -1424,9 +1473,11 @@ impl Node {
         // peer ended up blocking the entire propagation.
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         let _ = stream.set_nodelay(true);
-        let addr = stream
-            .peer_addr()
-            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let addr = label.unwrap_or_else(|| {
+            stream
+                .peer_addr()
+                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+        });
         let reader = match stream.try_clone() {
             Ok(f) => f,
             Err(_) => return 0,
@@ -5288,6 +5339,43 @@ mod tests_handler_review {
             },
         );
         listener
+    }
+
+    /// Two nodes meet through the proxy: one connects to the other by its
+    /// onion name, the proxy alone resolves it, the handshake completes, and
+    /// the peer is filed under its reserved stand-in, never under the
+    /// proxy's address.
+    #[test]
+    fn two_nodes_meet_through_the_proxy_by_onion_name() {
+        let a = node();
+        let listening = a.listen("127.0.0.1:0").expect("listen");
+        let onion = format!("{}.onion", "x".repeat(56));
+        let (proxy, asked) = crate::socks::tests::fake_proxy(vec![(onion.clone(), listening)]);
+        let b = node();
+        let target = crate::socks::Target::Name(onion.clone(), 21121);
+        assert!(b.connect_target(&target).is_err(), "no proxy: refused");
+        b.set_proxy(Some(proxy));
+        b.connect_target(&target).expect("through the proxy");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let handshaked = |n: &Node| {
+            n.shared
+                .lock()
+                .unwrap()
+                .peers
+                .values()
+                .any(|p| p.handshaked)
+        };
+        while !(handshaked(&a) && handshaked(&b)) {
+            assert!(Instant::now() < deadline, "no handshake through the proxy");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(b.is_connected_to(target.label()));
+        assert!(!b.is_connected_to(proxy));
+        assert_eq!(asked.lock().unwrap()[0], format!("{onion}:21121"));
+        // And an IPv4 address goes through the proxy too, never directly.
+        let direct = SocketAddr::from(([10, 1, 2, 3], 21121));
+        assert!(b.connect(direct).is_err());
+        assert!(asked.lock().unwrap().iter().any(|x| x == "10.1.2.3:21121"));
     }
 
     /// An outbound peer on a private or loopback address is never handed out

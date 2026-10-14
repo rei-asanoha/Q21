@@ -4,9 +4,10 @@
 //! ignored, so that a later version can add one without an older version
 //! getting lost in it.
 //!
-//! The only key today is `reachable`: does this node accept incoming
-//! connections and ask the router to open its port? It is **off** unless the
-//! user turns it on. Up to 0.3.x the file
+//! Two keys today. `reachable`: does this node accept incoming connections
+//! and ask the router to open its port? `tor` (0.4.7): does every outgoing
+//! connection go through Tor? Both are **off** unless the user turns them on.
+//! Up to 0.3.x the file
 //! had another name and other keys; [`crate::legacy::migrate_data_dir`]
 //! translates it before anything reads it.
 
@@ -17,6 +18,9 @@ pub const FILE_NAME: &str = "settings.txt";
 
 /// Key of the reachability setting.
 pub const REACHABLE_KEY: &str = "reachable";
+
+/// Key of the Tor setting.
+pub const TOR_KEY: &str = "tor";
 
 /// Reads the "is this node reachable from outside" setting.
 ///
@@ -42,9 +46,22 @@ pub fn reachable(datadir: &Path) -> bool {
 
 /// The parsing half of [`reachable`], on the file's text.
 pub fn reachable_from_text(text: &str) -> bool {
+    yes_in_text(text, REACHABLE_KEY)
+}
+
+/// Reads the Tor setting: only an explicit `tor=yes` turns it on, as for
+/// [`reachable`].
+pub fn tor(datadir: &Path) -> bool {
+    std::fs::read_to_string(datadir.join(FILE_NAME))
+        .map(|t| yes_in_text(&t, TOR_KEY))
+        .unwrap_or(false)
+}
+
+/// Is `key` set to exactly `yes` in this text?
+pub fn yes_in_text(text: &str, wanted: &str) -> bool {
     for line in text.lines() {
         if let Some((key, value)) = line.trim().split_once('=') {
-            if key.trim() == REACHABLE_KEY {
+            if key.trim() == wanted {
                 return value.trim() == "yes";
             }
         }
@@ -56,21 +73,27 @@ pub fn reachable_from_text(text: &str) -> bool {
 /// rename), like `wallet.anchor`: a power cut leaves the old file whole,
 /// never a half-written one. Other keys already in the file are kept.
 pub fn set_reachable(datadir: &Path, reachable: bool) -> Result<(), String> {
+    set_yes_no(datadir, REACHABLE_KEY, reachable)
+}
+
+/// Writes the Tor setting, like [`set_reachable`].
+pub fn set_tor(datadir: &Path, on: bool) -> Result<(), String> {
+    set_yes_no(datadir, TOR_KEY, on)
+}
+
+fn set_yes_no(datadir: &Path, wanted: &str, on: bool) -> Result<(), String> {
     let path = datadir.join(FILE_NAME);
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     let mut text = String::new();
     for line in old.lines() {
         let key = line.trim().split_once('=').map(|(c, _)| c.trim());
-        if key == Some(REACHABLE_KEY) {
+        if key == Some(wanted) {
             continue;
         }
         text.push_str(line);
         text.push('\n');
     }
-    text.push_str(&format!(
-        "{REACHABLE_KEY}={}\n",
-        if reachable { "yes" } else { "no" }
-    ));
+    text.push_str(&format!("{wanted}={}\n", if on { "yes" } else { "no" }));
     write_atomic(&path, &text)
 }
 
@@ -138,6 +161,21 @@ mod tests {
         assert!(text.contains("future=42"));
         set_reachable(&d, true).unwrap();
         assert!(reachable(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The Tor key lives next to the other one, off unless `yes`, and
+    /// writing one keeps the other.
+    #[test]
+    fn tor_is_off_unless_yes_and_keeps_the_other_keys() {
+        let d = dir("tor");
+        assert!(!tor(&d));
+        set_reachable(&d, true).unwrap();
+        set_tor(&d, true).unwrap();
+        assert!(tor(&d) && reachable(&d));
+        set_tor(&d, false).unwrap();
+        assert!(!tor(&d) && reachable(&d));
+        assert!(!yes_in_text("tor=YES\n", TOR_KEY));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

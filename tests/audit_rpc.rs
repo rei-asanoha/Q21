@@ -59,6 +59,7 @@ fn server(with_wallet: bool, token: Option<&str>) -> ServerHandle {
         reachable_session: true,
         router_status: None,
         set_reachable: None,
+        tor: None,
         node,
         wallet: if with_wallet {
             Some(Arc::new(Mutex::new(Wallet::from_seed([7u8; 32], NETWORK))))
@@ -147,6 +148,7 @@ fn server_and_node() -> (ServerHandle, Arc<Node>) {
         reachable_session: true,
         router_status: None,
         set_reachable: None,
+        tor: None,
     };
     let h = http::serve("127.0.0.1:0", None, move |req| router(&ctx, req)).expect("server startup");
     (h, node)

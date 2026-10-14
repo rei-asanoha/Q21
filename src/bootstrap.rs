@@ -230,6 +230,10 @@ pub fn listen_address(raw: &str, network: Network) -> String {
         format!("0.0.0.0:{}", default_port(network))
     } else if raw.chars().all(|c| c.is_ascii_digit()) {
         format!("0.0.0.0:{raw}")
+    } else if raw.parse::<std::net::Ipv4Addr>().is_ok() {
+        // An address alone: the network's port. `127.0.0.1` is what a node
+        // behind a Tor onion service listens on.
+        format!("{raw}:{}", default_port(network))
     } else {
         raw.to_string()
     }
@@ -341,6 +345,12 @@ mod tests {
         assert_eq!(
             listen_address("", Network::Testnet),
             format!("0.0.0.0:{}", default_port(Network::Testnet))
+        );
+        // An address alone: the network's port (a node behind an onion
+        // service listens on the machine only).
+        assert_eq!(
+            listen_address("127.0.0.1", Network::Testnet),
+            format!("127.0.0.1:{}", default_port(Network::Testnet))
         );
     }
 

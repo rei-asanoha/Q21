@@ -4307,6 +4307,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut forced_network: Option<Network> = None;
     let mut no_bootstrap = false;
     let mut upnp = false;
+    // Tor (0.4.7): `--tor` finds the local Tor, `--proxy` names any SOCKS5
+    // proxy. See `q21_core::socks`.
+    let mut tor = false;
+    let mut proxy_arg: Option<String> = None;
     let mut assume_commitment: Option<String> = None;
     let mut assume_tip: Option<String> = None;
 
@@ -4339,6 +4343,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             "--upnp" => {
                 upnp = true;
                 i += 1;
+            }
+            "--tor" => {
+                tor = true;
+                i += 1;
+            }
+            "--proxy" if i + 1 < args.len() => {
+                proxy_arg = Some(args[i + 1].clone());
+                i += 2;
             }
             "--rpc" if i + 1 < args.len() => {
                 rpc = Some(args[i + 1].clone());
@@ -4496,6 +4508,36 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // accepted block — including those received from the network, and those
     // of side branches — is written to disk at the moment it is accepted.
     node.set_journal(archive.clone());
+
+    // --- Tor: every outgoing connection through the proxy, or none.
+    //
+    // Set before the first connection. If Tor cannot be found, the node
+    // still uses the usual port and every connection fails: connecting in
+    // the clear instead would reveal exactly what the person wanted to hide.
+    let proxy: Option<std::net::SocketAddr> = match (&proxy_arg, tor) {
+        (Some(p), _) => Some(
+            p.parse()
+                .map_err(|_| format!("--proxy {p}: expected an address such as 127.0.0.1:9050"))?,
+        ),
+        (None, true) => Some(q21_core::socks::find_local_tor().unwrap_or_else(|| {
+            eprintln!(
+                "  Tor not found (nothing listens on 127.0.0.1:9050 nor 9150). Start Tor, or \
+                 Tor Browser. This node will not connect in the clear: it waits for Tor."
+            );
+            std::net::SocketAddr::from(([127, 0, 0, 1], q21_core::socks::TOR_SERVICE_PORT))
+        })),
+        (None, false) => None,
+    };
+    if let Some(p) = proxy {
+        node.set_proxy(Some(p));
+        println!("  Tor: every outgoing connection goes through {p}");
+        if upnp {
+            // Asking the router to open a port and announcing the public
+            // address would undo everything Tor hides.
+            println!("  Tor: the router port and the address announcement stay off");
+            upnp = false;
+        }
+    }
 
     // --- The address index, if requested.
     //
@@ -4687,6 +4729,27 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         );
     }
     for a in &targets {
+        // Through Tor, a name goes to the proxy as a name: resolving it here
+        // would send a DNS query from this machine.
+        if proxy.is_some() {
+            match q21_core::socks::Target::parse(a, q21_core::bootstrap::default_port(network)) {
+                Ok(t) if node.is_connected_to(t.label()) => {
+                    println!("  {a}: already connected");
+                }
+                Ok(t) => match node.connect_target(&t) {
+                    Ok(_) => println!("  connecting to {a} through Tor"),
+                    Err(e) => eprintln!("  failed to reach {a} through Tor: {e}"),
+                },
+                Err(e) => eprintln!("  unreadable bootstrap: {e}"),
+            }
+            continue;
+        }
+        if a.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':')
+            .ends_with(".onion")
+        {
+            eprintln!("  {a}: an onion address needs Tor (--tor), skipped");
+            continue;
+        }
         match q21_core::bootstrap::resolve(a, network) {
             Ok(addresses) => {
                 // A name can yield several addresses. We stop at the first one
@@ -4859,6 +4922,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 let d = datadir.to_path_buf();
                 std::sync::Arc::new(move |v: bool| write_reachable(&d, v))
             }),
+            tor: Some(std::sync::Arc::new(q21_core::rpc::TorSetting {
+                wanted: std::sync::atomic::AtomicBool::new(q21_core::settings::tor(datadir)),
+                session: proxy,
+                set: {
+                    let d = datadir.to_path_buf();
+                    std::sync::Arc::new(move |v: bool| q21_core::settings::set_tor(&d, v))
+                },
+            })),
         };
         // The explorer shell is served without a token: it carries no data,
         // and it is the one that asks the user for the token. Every RPC
@@ -5125,6 +5196,20 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 // that they are needed. What the user wrote on the command
                 // line must be retried as long as peers are missing.
                 for a in &targets {
+                    if proxy.is_some() {
+                        if let Ok(t) = q21_core::socks::Target::parse(
+                            a,
+                            q21_core::bootstrap::default_port(network),
+                        ) {
+                            if !node.is_connected_to(t.label())
+                                && node.connect_target(&t).is_ok()
+                                && !quiet
+                            {
+                                println!("  reconnecting to {a} through Tor");
+                            }
+                        }
+                        continue;
+                    }
                     if let Ok(addresses) = q21_core::bootstrap::resolve(a, network) {
                         for sa in addresses {
                             if node.is_connected_to(sa) {
@@ -5770,10 +5855,24 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     // announces its owner's public address to the whole network, see
     // `q21_core::settings::reachable`. Nothing is added if the user already
     // set `--listen` by hand: their choice wins.
+    // --- Tor (0.4.7), from the Network tab.
+    //
+    // Every outgoing connection goes through the local Tor. Reachable on
+    // top of it means an onion service: the wallet then listens on the
+    // machine itself only (127.0.0.1), where Tor hands it the incoming
+    // connections, and never asks the router for anything. See TOR.md.
+    let tor_on = q21_core::settings::tor(datadir);
+    if tor_on && !rest.iter().any(|a| a == "--tor" || a == "--proxy") {
+        arguments.push("--tor".to_string());
+    }
     if read_reachable(datadir) && !rest.iter().any(|a| a == "--listen") {
         arguments.push("--listen".to_string());
-        arguments.push(String::new()); // default P2P port of the network
-        arguments.push("--upnp".to_string());
+        if tor_on {
+            arguments.push("127.0.0.1".to_string());
+        } else {
+            arguments.push(String::new()); // default P2P port of the network
+            arguments.push("--upnp".to_string());
+        }
     }
     // The address index, on by default since 0.4.2. Without it, the explorer
     // opened from the wallet lost every transaction older than two thousand
