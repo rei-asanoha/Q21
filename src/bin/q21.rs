@@ -4911,30 +4911,34 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         if in_sync {
             node.with_chain(|c| i.prime(&c.utxo));
             println!("  address index: {} block(s) resumed", i.indexed_blocks());
+            Some(std::sync::Arc::new(std::sync::Mutex::new(i)))
         } else {
+            // Behind, ahead, or on another branch: the same steps as in the
+            // node's loop take it back to the tip — from the last common
+            // block, not from genesis, whenever the undo window allows it.
             if !i.is_empty() {
-                println!("  address index: out of sync, rebuilding");
+                println!(
+                    "  address index: at block {}, the chain at {height}: catching up",
+                    i.height()
+                );
             }
-            i.clear();
             let start = std::time::Instant::now();
-            node.with_chain(|c| {
-                for h in 0..=c.height() {
-                    if let Some(b) = c.block_at(h) {
-                        if let Err(e) = i.index_block(&b) {
-                            eprintln!("warning: {e}");
-                            break;
-                        }
-                    }
+            let i = std::sync::Arc::new(std::sync::Mutex::new(i));
+            while !follow_index(&i, &node, std::time::Duration::from_secs(10)) {
+                if let Ok(g) = i.lock() {
+                    println!("  address index: block {} of {}", g.height(), node.height());
                 }
-            });
-            println!(
-                "  address index: {} block(s), {} address(es), in {:.2} s",
-                i.indexed_blocks(),
-                i.known_addresses(),
-                start.elapsed().as_secs_f64()
-            );
+            }
+            if let Ok(g) = i.lock() {
+                println!(
+                    "  address index: {} block(s), {} address(es), in {:.2} s",
+                    g.indexed_blocks(),
+                    g.known_addresses(),
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            Some(i)
         }
-        Some(std::sync::Arc::new(std::sync::Mutex::new(i)))
     } else {
         None
     };
@@ -5861,9 +5865,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // program. We observe it from the outside, at the pace of the loop,
         // without being able to break anything in consensus.
         if let Some(index) = &index {
-            if let Ok(mut i) = index.lock() {
-                follow_index(&mut i, &node);
-            }
+            // A bounded share of each pass: a long catch-up spreads over
+            // several passes, and the rest of the loop keeps its pace.
+            follow_index(index, &node, std::time::Duration::from_millis(250));
         }
 
         // --- Addresses used beyond the recorded index, spent ones included.
@@ -6696,50 +6700,57 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Brings the index up to the level of the chain.
+/// Brings the address index to the chain's tip, a few blocks at a time.
 ///
-/// Three cases, and a single behavior for the two bad ones:
+/// Each step is decided under the chain's lock — the node's lock — which is
+/// held only to copy a few blocks, and carried out after it is released: see
+/// [`q21_core::index::Step`] for the defect this closes. The index's own lock
+/// is released between steps too, so the explorer keeps answering.
 ///
-/// - **nothing to do**: the index is already at the top, and on the same
-///   block;
-/// - **extension**: the chain has moved on, the index follows block by block.
-///   The outputs these blocks spend are either earlier and still alive —
-///   hence known to the owners table — or created by the blocks themselves;
-/// - **divergence**: a reorg changed the past. The index is rebuilt from zero.
-///
-/// Rebuilding on a reorg is more brutal than necessary: we could remove only
-/// the abandoned branch. But the owners table would then have to be brought
-/// back to its state before the fork, which requires journaling the consumed
-/// outputs. A reorg is rare; a wrong address attribution goes unnoticed.
-/// Between the two, we choose what cannot lie.
-fn follow_index(index: &mut q21_core::index::Index, node: &std::sync::Arc<q21_core::net::Node>) {
-    let height = node.height();
-    if !index.is_empty() && index.height() == height {
-        return;
-    }
-    let divergence = !index.is_empty() && {
-        let h = index.height();
-        node.with_chain(|c| c.active_at(h)) != index.block_id(h)
-    };
-    if divergence {
-        eprintln!("  address index: reorg detected, rebuilding");
-        index.clear();
-    }
-    let start = if index.is_empty() {
-        0
-    } else {
-        index.height() + 1
-    };
-    node.with_chain(|c| {
-        for h in start..=c.height() {
-            if let Some(b) = c.block_at(h) {
-                if let Err(e) = index.index_block(&b) {
-                    eprintln!("warning: {e}");
-                    return;
+/// Gives up after `budget` and returns `false` if the tip is not reached yet;
+/// the next call resumes where this one stopped.
+fn follow_index(
+    index: &std::sync::Mutex<q21_core::index::Index>,
+    node: &std::sync::Arc<q21_core::net::Node>,
+    budget: std::time::Duration,
+) -> bool {
+    use q21_core::index::Step;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    /// Blocks copied under the chain's lock per step.
+    const BLOCKS_PER_STEP: usize = 16;
+    /// The last height reported missing, so that it is said once.
+    static MISSING: AtomicU64 = AtomicU64::new(u64::MAX);
+    let start = std::time::Instant::now();
+    loop {
+        let Ok(mut i) = index.lock() else {
+            return true;
+        };
+        let step = node.with_chain(|c| i.plan(c, BLOCKS_PER_STEP));
+        match &step {
+            Step::UpToDate => return true,
+            Step::Missing(h) => {
+                if MISSING.swap(*h, Ordering::Relaxed) != *h {
+                    eprintln!("  address index: block {h} is not available here, index paused");
                 }
+                return true;
             }
+            Step::Rewind { fork, .. } if *fork < i.height() => {
+                eprintln!("  address index: reorg, back to block {fork}");
+            }
+            Step::Clear => {
+                eprintln!("  address index: no common block within reach, rebuilding");
+            }
+            _ => {}
         }
-    });
+        if let Err(e) = i.apply(step) {
+            eprintln!("warning: {e}");
+            return true;
+        }
+        drop(i);
+        if start.elapsed() >= budget {
+            return false;
+        }
+    }
 }
 
 /// Opens the chain explorer in the browser.

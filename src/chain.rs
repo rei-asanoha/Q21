@@ -1572,6 +1572,25 @@ impl Chain {
         self.undos.len()
     }
 
+    /// The outputs consumed by the active blocks above `height`, each with the
+    /// key hash it paid — what the address index needs to go back to the fork
+    /// of a reorg without rereading the whole chain. `None` when the undo
+    /// window does not reach that far down.
+    pub fn spent_above(&self, height: u64) -> Option<Vec<(crate::tx::OutPoint, Hash256)>> {
+        let depth = usize::try_from(self.height().checked_sub(height)?).ok()?;
+        if depth > self.undos.len() {
+            return None;
+        }
+        Some(
+            self.undos
+                .iter()
+                .rev()
+                .take(depth)
+                .flat_map(|u| u.spent().iter().map(|(o, e)| (*o, e.output.pubkey_hash)))
+                .collect(),
+        )
+    }
+
     pub fn has_block(&self, id: &Hash256) -> bool {
         self.index.contains_key(id)
     }

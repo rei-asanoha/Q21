@@ -93,6 +93,14 @@ pub struct UndoRecord {
     created: Vec<OutPoint>,
 }
 
+impl UndoRecord {
+    /// The outputs this block consumed, with what they were. An output both
+    /// created and consumed inside the block appears here too.
+    pub fn spent(&self) -> &[(OutPoint, UtxoEntry)] {
+        &self.spent
+    }
+}
+
 impl UtxoSet {
     pub fn new() -> Self {
         Self::default()

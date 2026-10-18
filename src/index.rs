@@ -113,6 +113,10 @@ pub struct Index {
     owners: HashMap<OutPoint, Hash256>,
     /// Indexed blocks, in order: (height, block id).
     blocks: Vec<(u64, Hash256)>,
+    /// Does `owners` match the last indexed block? Not after reopening a
+    /// non-empty log, which does not keep it: [`Index::plan`] then rebuilds
+    /// it from the chain before extending anything.
+    owners_valid: bool,
 }
 
 impl Index {
@@ -127,10 +131,12 @@ impl Index {
             by_txid: HashMap::new(),
             owners: HashMap::new(),
             blocks: Vec::new(),
+            owners_valid: true,
         };
         if let Ok(raw) = std::fs::read(path) {
             index.replay(&raw);
         }
+        index.owners_valid = index.blocks.is_empty();
         index
     }
 
@@ -174,6 +180,7 @@ impl Index {
         for (outpoint, entry) in utxo.iter() {
             self.owners.insert(*outpoint, entry.output.pubkey_hash);
         }
+        self.owners_valid = true;
     }
 
     /// Height of the last indexed block. Zero if the index is empty.
@@ -321,9 +328,14 @@ impl Index {
     /// no longer appear in the index, otherwise an address would show
     /// transactions that never happened.
     ///
-    /// The log is rewritten in full. A reorg is rare and shallow; a rewrite is
-    /// cheaper there than a table of positions to keep up to date at every
-    /// block for a case that almost never comes up.
+    /// The log is rewritten in full, into a temporary file renamed over the
+    /// old one: a shutdown in the middle leaves either the old log or the new
+    /// one, never half of each. Up to v0.4.8 the rewrite searched the whole
+    /// transaction table once **per block** and reopened the file each time:
+    /// quadratic, minutes on a long chain. It is now one pass and one write.
+    ///
+    /// The owner table is left as it is: see [`Index::apply`], which sets it
+    /// for the fork.
     pub fn truncate(&mut self, height: u64) {
         self.blocks.retain(|(h, _)| *h <= height);
         self.by_txid.retain(|_, p| p.height <= height);
@@ -331,14 +343,13 @@ impl Index {
             positions.retain(|p| p.height <= height);
         }
         self.by_address.retain(|_, v| !v.is_empty());
-        // The owners are taken back from the node's UTXO set, which has
-        // already been brought back to the winning branch: `prime` will be
-        // called again.
-        let _ = std::fs::remove_file(&self.path);
-        // Rewrite, in order. Nothing would be worse than a log whose order no
-        // longer matches the memory that produced it.
-        // The key hashes are rebuilt from `by_address`, the only table that
-        // still holds them.
+        let _ = self.rewrite_log();
+    }
+
+    /// Writes the whole log again from memory. The key hashes are rebuilt
+    /// from `by_address`, the only table that still holds them.
+    fn rewrite_log(&self) -> std::io::Result<()> {
+        use std::io::Write;
         let mut hashes_by_position: HashMap<(u64, u32), Vec<Hash256>> = HashMap::new();
         for (key_hash, positions) in &self.by_address {
             for p in positions {
@@ -348,25 +359,39 @@ impl Index {
                     .push(*key_hash);
             }
         }
-        let blocks = self.blocks.clone();
-        for (h, id) in blocks {
-            let mut transactions: Vec<(Hash256, Vec<Hash256>)> = Vec::new();
-            let mut ranks: Vec<(u32, Hash256)> = self
-                .by_txid
-                .iter()
-                .filter(|(_, p)| p.height == h)
-                .map(|(txid, p)| (p.rank, *txid))
-                .collect();
-            ranks.sort_by_key(|(r, _)| *r);
-            for (rank, txid) in ranks {
-                let hashes = hashes_by_position
-                    .get(&(h, rank))
-                    .cloned()
-                    .unwrap_or_default();
-                transactions.push((txid, hashes));
-            }
-            let _ = self.append_to_log(h, id, &transactions);
+        // The order of the hashes inside a transaction is not kept by
+        // `by_address`; sorting makes the rewrite deterministic.
+        for v in hashes_by_position.values_mut() {
+            v.sort_by_key(|h| h.0);
         }
+        let mut by_height: HashMap<u64, Vec<(u32, Hash256)>> = HashMap::new();
+        for (txid, p) in &self.by_txid {
+            by_height.entry(p.height).or_default().push((p.rank, *txid));
+        }
+        let mut out = Vec::with_capacity(MAGIC.len() + self.blocks.len() * 128);
+        out.extend_from_slice(MAGIC);
+        for (h, id) in &self.blocks {
+            let mut ranks = by_height.remove(h).unwrap_or_default();
+            ranks.sort_by_key(|(r, _)| *r);
+            let transactions: Vec<(Hash256, Vec<Hash256>)> = ranks
+                .into_iter()
+                .map(|(rank, txid)| {
+                    let hashes = hashes_by_position
+                        .get(&(*h, rank))
+                        .cloned()
+                        .unwrap_or_default();
+                    (txid, hashes)
+                })
+                .collect();
+            out.extend_from_slice(&write_record(*h, *id, &transactions));
+        }
+        let tmp = self.path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&out)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)
     }
 
     /// Erases everything, log included. Used when the index has diverged.
@@ -375,7 +400,197 @@ impl Index {
         self.by_txid.clear();
         self.owners.clear();
         self.blocks.clear();
+        self.owners_valid = true;
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Following the chain
+// ---------------------------------------------------------------------------
+
+/// What the index needs to read from the chain. Implemented by
+/// [`crate::chain::Chain`]; the tests implement it on a simulated chain.
+pub trait ChainView {
+    /// Height of the active tip.
+    fn tip_height(&self) -> u64;
+    /// Id of the active block at this height.
+    fn active_id(&self, height: u64) -> Option<Hash256>;
+    /// The active block at this height, if its body is available.
+    fn active_block(&self, height: u64) -> Option<Block>;
+    /// Every unspent output of the active tip, with the key hash it pays.
+    fn unspent_owners(&self) -> Vec<(OutPoint, Hash256)>;
+    /// The outputs consumed by the active blocks above `height`, with the key
+    /// hash each paid. `None` beyond the undo window.
+    fn spent_above(&self, height: u64) -> Option<Vec<(OutPoint, Hash256)>>;
+}
+
+impl ChainView for crate::chain::Chain {
+    fn tip_height(&self) -> u64 {
+        self.height()
+    }
+    fn active_id(&self, height: u64) -> Option<Hash256> {
+        self.active_at(height)
+    }
+    fn active_block(&self, height: u64) -> Option<Block> {
+        self.block_at(height)
+    }
+    fn unspent_owners(&self) -> Vec<(OutPoint, Hash256)> {
+        self.utxo
+            .iter()
+            .map(|(o, e)| (*o, e.output.pubkey_hash))
+            .collect()
+    }
+    fn spent_above(&self, height: u64) -> Option<Vec<(OutPoint, Hash256)>> {
+        crate::chain::Chain::spent_above(self, height)
+    }
+}
+
+/// One step of following the chain, decided under the chain's lock by
+/// [`Index::plan`] and carried out after it is released by [`Index::apply`].
+///
+/// # The defect this closes
+///
+/// Up to v0.4.8, the index followed the chain **inside** the chain's lock —
+/// which is the node's lock — and answered any reorg by erasing itself and
+/// reindexing every block from genesis, still inside the lock. During the
+/// endurance test, a one-block reorg on a two-thousand-five-hundred-block
+/// chain froze the France and Singapore nodes for more than ten minutes: no
+/// peer served, no block relayed, no wallet answered.
+///
+/// Now:
+///
+/// - a reorg rewinds the index to the **fork** only, and the owners of the
+///   outputs that the new branch consumes come from the chain's undo records;
+///   erasing everything is the last resort, when the undo window does not
+///   reach the fork;
+/// - the work is cut into steps of a few blocks: the chain's lock is held only
+///   to copy those blocks, and the indexing itself happens outside it.
+#[derive(Debug)]
+pub enum Step {
+    /// The index is on the active tip.
+    UpToDate,
+    /// Index these blocks, which follow the last indexed one.
+    Extend(Vec<Block>),
+    /// A reorg: go back to `fork`, take `owners` as the owner table — the
+    /// unspent outputs of the tip plus those the new branch consumes — then
+    /// index `blocks`, the first ones of the new branch.
+    Rewind {
+        fork: u64,
+        owners: Vec<(OutPoint, Hash256)>,
+        blocks: Vec<Block>,
+    },
+    /// No common point within reach: start again from genesis, in steps.
+    Clear,
+    /// The body at this height is not available: nothing is indexed, rather
+    /// than an index with a hole. Retried at the next step.
+    Missing(u64),
+}
+
+impl Index {
+    /// Decides the next step. Reads only; meant to be called under the
+    /// chain's lock, and to be quick: at most `max_blocks` bodies are copied.
+    pub fn plan(&self, chain: &impl ChainView, max_blocks: usize) -> Step {
+        let tip = chain.tip_height();
+        let max_blocks = max_blocks.max(1) as u64;
+        let fetch = |from: u64| -> Result<Vec<Block>, u64> {
+            let to = tip.min(from.saturating_add(max_blocks - 1));
+            let mut blocks = Vec::new();
+            if from > tip {
+                return Ok(blocks);
+            }
+            for h in from..=to {
+                match chain.active_block(h) {
+                    Some(b) => blocks.push(b),
+                    None => return Err(h),
+                }
+            }
+            Ok(blocks)
+        };
+        if self.is_empty() {
+            return match fetch(0) {
+                Ok(b) => Step::Extend(b),
+                Err(h) => Step::Missing(h),
+            };
+        }
+        let top = self.height();
+        if self.owners_valid && top <= tip && chain.active_id(top) == self.block_id(top) {
+            if top == tip {
+                return Step::UpToDate;
+            }
+            return match fetch(top + 1) {
+                Ok(b) => Step::Extend(b),
+                Err(h) => Step::Missing(h),
+            };
+        }
+        // Divergence, an index ahead of the chain, or an owner table to
+        // rebuild after reopening: look for the fork — the last indexed block
+        // itself, in the last case — and rebuild the table there.
+        let first = self.blocks.first().map(|(h, _)| *h).unwrap_or(0);
+        let mut h = top.min(tip);
+        let fork = loop {
+            if chain.active_id(h).is_some() && chain.active_id(h) == self.block_id(h) {
+                break Some(h);
+            }
+            if h == first {
+                break None;
+            }
+            h -= 1;
+        };
+        let Some(fork) = fork else {
+            return Step::Clear;
+        };
+        let Some(spent) = chain.spent_above(fork) else {
+            return Step::Clear;
+        };
+        let blocks = match fetch(fork + 1) {
+            Ok(b) => b,
+            Err(h) => return Step::Missing(h),
+        };
+        let mut owners = chain.unspent_owners();
+        owners.extend(spent);
+        Step::Rewind {
+            fork,
+            owners,
+            blocks,
+        }
+    }
+
+    /// Carries out a step decided by [`Index::plan`]. Needs no lock on the
+    /// chain. Returns the number of blocks indexed.
+    pub fn apply(&mut self, step: Step) -> Result<usize, IndexError> {
+        let blocks = match step {
+            Step::UpToDate | Step::Missing(_) => return Ok(0),
+            Step::Clear => {
+                self.clear();
+                return Ok(0);
+            }
+            Step::Extend(blocks) => blocks,
+            Step::Rewind {
+                fork,
+                owners,
+                blocks,
+            } => {
+                if fork < self.height() {
+                    self.truncate(fork);
+                }
+                self.owners = owners.into_iter().collect();
+                self.owners_valid = true;
+                blocks
+            }
+        };
+        let mut n = 0;
+        for b in &blocks {
+            // A step planned before another one was applied no longer
+            // follows: dropped, the next plan starts from the right place.
+            let expected = if self.is_empty() { 0 } else { self.height() + 1 };
+            if b.header.height != expected {
+                break;
+            }
+            self.index_block(b)?;
+            n += 1;
+        }
+        Ok(n)
     }
 }
 
@@ -731,5 +946,544 @@ mod tests {
     #[test]
     fn the_index_does_not_depend_on_the_network() {
         let _ = Network::Regtest;
+    }
+}
+
+/// The follower against a simulated chain: hundreds of random extensions and
+/// reorgs, with intra-block spends and transactions mined again on the new
+/// branch. After each one, the index followed step by step must be **exactly**
+/// the index rebuilt from genesis — memory, owners and log.
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+    use crate::amount::Amount;
+    use crate::block::BlockHeader;
+    use crate::sig::SchemeId;
+    use crate::tx::{Transaction, TxIn, TxOut, Witness};
+    use crate::utxo::{UndoRecord, UtxoSet};
+
+    struct Fake {
+        blocks: Vec<Block>,
+        utxo: UtxoSet,
+        undos: Vec<UndoRecord>,
+        /// Undo records the chain still keeps.
+        window: usize,
+        /// A height whose body is unavailable.
+        missing: Option<u64>,
+    }
+
+    impl ChainView for Fake {
+        fn tip_height(&self) -> u64 {
+            self.blocks.len() as u64 - 1
+        }
+        fn active_id(&self, h: u64) -> Option<Hash256> {
+            self.blocks.get(h as usize).map(|b| b.header.block_id())
+        }
+        fn active_block(&self, h: u64) -> Option<Block> {
+            if self.missing == Some(h) {
+                return None;
+            }
+            self.blocks.get(h as usize).cloned()
+        }
+        fn unspent_owners(&self) -> Vec<(OutPoint, Hash256)> {
+            self.utxo
+                .iter()
+                .map(|(o, e)| (*o, e.output.pubkey_hash))
+                .collect()
+        }
+        fn spent_above(&self, h: u64) -> Option<Vec<(OutPoint, Hash256)>> {
+            let depth = (self.tip_height().checked_sub(h)?) as usize;
+            if depth > self.window.min(self.undos.len()) {
+                return None;
+            }
+            Some(
+                self.undos
+                    .iter()
+                    .rev()
+                    .take(depth)
+                    .flat_map(|u| u.spent().iter().map(|(o, e)| (*o, e.output.pubkey_hash)))
+                    .collect(),
+            )
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn out(key: u64, value: u64) -> TxOut {
+        TxOut {
+            value: Amount::from_units(value),
+            scheme: SchemeId::LamportOts,
+            pubkey_hash: Hash256([(key % 7) as u8 + 1; 32]),
+        }
+    }
+
+    fn input(o: OutPoint) -> TxIn {
+        TxIn {
+            prev_out: o,
+            witness: Witness {
+                pubkey: Vec::new(),
+                signature: Vec::new(),
+            },
+            sequence: 0,
+        }
+    }
+
+    impl Fake {
+        fn new() -> Fake {
+            let mut f = Fake {
+                blocks: Vec::new(),
+                utxo: UtxoSet::new(),
+                undos: Vec::new(),
+                window: usize::MAX,
+                missing: None,
+            };
+            let mut rng = Rng(1);
+            let mut counter = 0;
+            let g = f.make(&mut rng, &mut counter, &[]);
+            f.push(g);
+            f
+        }
+
+        fn push(&mut self, b: Block) {
+            let mut u = UndoRecord::default();
+            for tx in &b.transactions {
+                self.utxo.apply_transaction(tx, b.header.height, &mut u);
+            }
+            self.undos.push(u);
+            self.blocks.push(b);
+        }
+
+        /// Takes the tip off, and returns its spending transactions so that
+        /// the new branch can mine some of them again, as a real reorg does.
+        fn pop(&mut self) -> Vec<Transaction> {
+            let u = self.undos.pop().unwrap();
+            self.utxo.undo(&u);
+            let b = self.blocks.pop().unwrap();
+            b.transactions.into_iter().skip(1).collect()
+        }
+
+        /// A random block on the tip: a coinbase, then spends of live outputs —
+        /// including outputs created earlier in the same block — and some of
+        /// the `again` transactions when they still apply.
+        fn make(&self, rng: &mut Rng, counter: &mut u64, again: &[Transaction]) -> Block {
+            *counter += 1;
+            let height = self.blocks.len() as u64;
+            let mut live: Vec<OutPoint> = self.utxo.iter().map(|(o, _)| *o).collect();
+            live.sort_by_key(|o| (o.txid.0, o.index));
+            let mut used: std::collections::HashSet<OutPoint> = Default::default();
+            let mut txs = vec![Transaction {
+                version: 1,
+                inputs: vec![TxIn::coinbase(counter.to_le_bytes().to_vec())],
+                outputs: vec![out(rng.next(), 1_000_000 + *counter)],
+                lock_time: 0,
+            }];
+            for tx in again {
+                if rng.below(2) == 0
+                    && tx
+                        .inputs
+                        .iter()
+                        .all(|i| live.contains(&i.prev_out) && !used.contains(&i.prev_out))
+                {
+                    for i in &tx.inputs {
+                        used.insert(i.prev_out);
+                    }
+                    txs.push(tx.clone());
+                }
+            }
+            for _ in 0..rng.below(5) {
+                let mut inputs = Vec::new();
+                for _ in 0..1 + rng.below(2) {
+                    if live.is_empty() {
+                        break;
+                    }
+                    let o = live[rng.below(live.len() as u64) as usize];
+                    if used.insert(o) {
+                        inputs.push(input(o));
+                    }
+                }
+                if inputs.is_empty() {
+                    continue;
+                }
+                let n = 1 + rng.below(3);
+                let tx = Transaction {
+                    version: 1,
+                    inputs,
+                    outputs: (0..n).map(|i| out(rng.next(), 10 + i)).collect(),
+                    lock_time: 0,
+                };
+                let txid = tx.txid();
+                // Its outputs can be spent by the next transactions of the
+                // same block.
+                for i in 0..n as u32 {
+                    live.push(OutPoint { txid, index: i });
+                }
+                txs.push(tx);
+            }
+            Block {
+                header: BlockHeader {
+                    version: 1,
+                    prev_block: self
+                        .blocks
+                        .last()
+                        .map(|b| b.header.block_id())
+                        .unwrap_or(Hash256::ZERO),
+                    merkle_root: Hash256::ZERO,
+                    uncles_root: Hash256::ZERO,
+                    miner: Hash256::ZERO,
+                    time: 1_700_000_000 + height,
+                    bits: 0x2000_ffff,
+                    height,
+                    nonce: *counter,
+                },
+                transactions: txs,
+                uncles: Vec::new(),
+            }
+        }
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("q21-follow-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Follows to the tip, in steps of `max` blocks. Returns the steps taken.
+    fn follow(index: &mut Index, chain: &Fake, max: usize) -> usize {
+        for n in 0..10_000 {
+            match index.plan(chain, max) {
+                Step::UpToDate => return n,
+                Step::Missing(h) => panic!("missing {h}"),
+                step => {
+                    index.apply(step).unwrap();
+                }
+            }
+        }
+        panic!("the follower does not converge");
+    }
+
+    /// The reference: everything indexed again from genesis.
+    fn rebuilt(chain: &Fake, path: &Path) -> Index {
+        let _ = std::fs::remove_file(path);
+        let mut i = Index::open(path);
+        for b in &chain.blocks {
+            i.index_block(b).unwrap();
+        }
+        i
+    }
+
+    fn assert_same(a: &Index, b: &Index, chain: &Fake, context: &str) {
+        assert_eq!(a.blocks, b.blocks, "{context}: blocks");
+        assert_eq!(a.by_txid, b.by_txid, "{context}: transactions");
+        assert_eq!(a.by_address, b.by_address, "{context}: addresses");
+        // Every live output's owner is known, and right: the next block
+        // spending it will be attributed correctly.
+        for (o, e) in chain.utxo.iter() {
+            assert_eq!(
+                a.owners.get(o),
+                Some(&e.output.pubkey_hash),
+                "{context}: owner of a live output"
+            );
+        }
+        // The log says the same as the memory.
+        let reread = Index::open(&a.path);
+        assert_eq!(reread.blocks, a.blocks, "{context}: log blocks");
+        assert_eq!(reread.by_txid, a.by_txid, "{context}: log transactions");
+        assert_eq!(reread.by_address, a.by_address, "{context}: log addresses");
+    }
+
+    fn scenario(seed: u64, window: usize, max: usize, rounds: usize) {
+        let d = dir(&format!("s{seed}-{window}-{max}"));
+        let mut chain = Fake::new();
+        chain.window = window;
+        let mut rng = Rng(seed);
+        let mut counter = 1000 * seed;
+        let mut index = Index::open(&d.join("index.dat"));
+        let mut reorgs = 0;
+        for round in 0..rounds {
+            match rng.below(10) {
+                0..=5 => {
+                    for _ in 0..1 + rng.below(3) {
+                        let b = chain.make(&mut rng, &mut counter, &[]);
+                        chain.push(b);
+                    }
+                }
+                6..=8 if chain.blocks.len() > 2 => {
+                    let depth = 1 + rng.below(5.min(chain.blocks.len() as u64 - 1));
+                    let mut again = Vec::new();
+                    for _ in 0..depth {
+                        again.extend(chain.pop());
+                    }
+                    for _ in 0..depth + rng.below(3) {
+                        let b = chain.make(&mut rng, &mut counter, &again);
+                        chain.push(b);
+                    }
+                    reorgs += 1;
+                }
+                _ => {
+                    // A single step, then the chain moves again before the
+                    // follower has finished: the step in flight is stale.
+                    let step = index.plan(&chain, max);
+                    if rng.below(2) == 0 && chain.blocks.len() > 2 {
+                        chain.pop();
+                    }
+                    let b = chain.make(&mut rng, &mut counter, &[]);
+                    chain.push(b);
+                    index.apply(step).unwrap();
+                }
+            }
+            if rng.below(3) == 0 {
+                follow(&mut index, &chain, max);
+                let reference = rebuilt(&chain, &d.join("reference.dat"));
+                assert_same(&index, &reference, &chain, &format!("seed {seed} round {round}"));
+            }
+            if rng.below(25) == 0 {
+                // Restart: the log is reread, the owner table is not kept.
+                drop(index);
+                index = Index::open(&d.join("index.dat"));
+            }
+        }
+        follow(&mut index, &chain, max);
+        let reference = rebuilt(&chain, &d.join("reference.dat"));
+        assert_same(&index, &reference, &chain, &format!("seed {seed} end"));
+        assert!(reorgs > 10, "the scenario must contain reorgs");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn following_equals_rebuilding_through_random_reorgs() {
+        for seed in 1..=8 {
+            scenario(seed * 7919, usize::MAX, 3, 250);
+        }
+    }
+
+    /// A short undo window: deep reorgs fall back to a rebuild — in steps —
+    /// and the result is the same.
+    #[test]
+    fn following_equals_rebuilding_with_a_short_undo_window() {
+        for seed in 1..=4 {
+            scenario(seed * 104_729, 2, 2, 200);
+        }
+    }
+
+    /// A one-block reorg on a long chain costs a handful of blocks, not the
+    /// whole chain — the freeze of the endurance test.
+    #[test]
+    fn a_shallow_reorg_reindexes_only_the_new_branch() {
+        let d = dir("shallow");
+        let mut chain = Fake::new();
+        let mut rng = Rng(42);
+        let mut counter = 0;
+        for _ in 0..300 {
+            let b = chain.make(&mut rng, &mut counter, &[]);
+            chain.push(b);
+        }
+        let mut index = Index::open(&d.join("index.dat"));
+        follow(&mut index, &chain, 16);
+        let again = chain.pop();
+        let b = chain.make(&mut rng, &mut counter, &again);
+        chain.push(b);
+        match index.plan(&chain, 16) {
+            Step::Rewind { fork, blocks, .. } => {
+                assert_eq!(fork, 299);
+                assert_eq!(blocks.len(), 1, "only the new block is copied");
+                index.apply(Step::Rewind {
+                    fork,
+                    owners: chain.unspent_owners().into_iter().chain(chain.spent_above(fork).unwrap()).collect(),
+                    blocks,
+                })
+                .unwrap();
+            }
+            other => panic!("expected a rewind, got {other:?}"),
+        }
+        assert!(matches!(index.plan(&chain, 16), Step::UpToDate));
+        let reference = rebuilt(&chain, &d.join("reference.dat"));
+        assert_same(&index, &reference, &chain, "shallow");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// End to end on a real chain: signed spends, a reorg through
+    /// `Chain::submit`, and the owners of the new branch's inputs taken from
+    /// the chain's own undo records.
+    #[test]
+    fn a_real_reorg_is_followed_from_the_fork() {
+        use crate::address::Network;
+        use crate::chain::{genesis_block, Accept, Chain, GENESIS_TIME};
+        use crate::consensus::{COINBASE_MATURITY, TARGET_BLOCK_SECS};
+        use crate::wallet::Wallet;
+        const NET: Network = Network::Regtest;
+
+        fn funded(w: &mut Wallet) -> Chain {
+            let _ = w.new_address();
+            let mut c = Chain::new(NET, genesis_block(NET));
+            for i in 1..=COINBASE_MATURITY + 6 {
+                let a = w.new_address();
+                let t = GENESIS_TIME + i * TARGET_BLOCK_SECS;
+                let b = c
+                    .mine_block(a.hash, SchemeId::LamportOts, &[], t, 5_000_000)
+                    .unwrap();
+                c.connect(&b, t + 1).unwrap();
+            }
+            c
+        }
+        fn pay(w: &mut Wallet, c: &Chain, seed: u8) -> Transaction {
+            let mut dest = Wallet::from_seed([seed; 32], NET);
+            let a = dest.new_address();
+            w.create_transaction(
+                &c.utxo,
+                c.height(),
+                &a,
+                Amount::from_units(10_000),
+                Amount::from_units(5_000),
+            )
+            .unwrap()
+        }
+        fn mine_on(c: &mut Chain, txs: &[Transaction]) -> Block {
+            let t = c.tip().time + TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(Hash256([3u8; 32]), SchemeId::LamportOts, txs, t, 5_000_000)
+                .unwrap();
+            c.connect(&b, t + 1).unwrap();
+            b
+        }
+
+        let d = dir("real");
+        let mut w1 = Wallet::from_seed([0x31; 32], NET);
+        let mut w2 = Wallet::from_seed([0x31; 32], NET);
+        let mut a = funded(&mut w1);
+        let mut b = funded(&mut w2);
+        assert_eq!(a.tip_id(), b.tip_id(), "same history up to the fork");
+        let base = a.height();
+
+        // Branch A: one payment. Branch B: two payments, two blocks.
+        let tx_a = pay(&mut w1, &a, 0xa1);
+        mine_on(&mut a, &[tx_a]);
+        let tx_b1 = pay(&mut w2, &b, 0xb1);
+        let b1 = mine_on(&mut b, &[tx_b1]);
+        let tx_b2 = pay(&mut w2, &b, 0xb2);
+        let b2 = mine_on(&mut b, &[tx_b2]);
+
+        let mut index = Index::open(&d.join("index.dat"));
+        for _ in 0..100 {
+            let step = index.plan(&a, 16);
+            if matches!(step, Step::UpToDate) {
+                break;
+            }
+            index.apply(step).unwrap();
+        }
+        assert_eq!(index.height(), base + 1);
+
+        let now = b2.header.time + 10;
+        a.submit(&b1, now).unwrap();
+        assert!(matches!(
+            a.submit(&b2, now).unwrap(),
+            Accept::Reorganized { depth: 1 }
+        ));
+        match index.plan(&a, 16) {
+            Step::Rewind { fork, ref blocks, .. } => {
+                assert_eq!(fork, base);
+                assert_eq!(blocks.len(), 2);
+            }
+            ref other => panic!("expected a rewind, got {other:?}"),
+        }
+        for _ in 0..100 {
+            let step = index.plan(&a, 16);
+            if matches!(step, Step::UpToDate) {
+                break;
+            }
+            index.apply(step).unwrap();
+        }
+        let _ = std::fs::remove_file(d.join("reference.dat"));
+        let mut reference = Index::open(&d.join("reference.dat"));
+        for h in 0..=a.height() {
+            reference.index_block(&a.block_at(h).unwrap()).unwrap();
+        }
+        assert_eq!(index.blocks, reference.blocks);
+        assert_eq!(index.by_txid, reference.by_txid);
+        assert_eq!(index.by_address, reference.by_address);
+        // The spender of the new branch is attributed: its input's owner came
+        // from the undo records, not from the UTXO set of the tip.
+        let spender = a.block_at(base + 1).unwrap().transactions[1].clone();
+        let position = index.position(&spender.txid()).unwrap();
+        let attributed = index
+            .by_address
+            .values()
+            .filter(|v| v.contains(&position))
+            .count();
+        assert!(attributed >= 3, "payee, change and spender: {attributed}");
+        for (o, e) in a.utxo.iter() {
+            assert_eq!(index.owners.get(o), Some(&e.output.pubkey_hash));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A missing body pauses the index instead of leaving a hole in it.
+    #[test]
+    fn a_missing_body_never_leaves_a_hole() {
+        let d = dir("missing");
+        let mut chain = Fake::new();
+        let mut rng = Rng(5);
+        let mut counter = 0;
+        for _ in 0..10 {
+            let b = chain.make(&mut rng, &mut counter, &[]);
+            chain.push(b);
+        }
+        chain.missing = Some(6);
+        let mut index = Index::open(&d.join("index.dat"));
+        for _ in 0..10 {
+            let step = index.plan(&chain, 4);
+            index.apply(step).unwrap();
+        }
+        assert_eq!(index.height(), 3, "stops before the missing block's batch");
+        assert!(matches!(index.plan(&chain, 4), Step::Missing(6)));
+        chain.missing = None;
+        follow(&mut index, &chain, 4);
+        let reference = rebuilt(&chain, &d.join("reference.dat"));
+        assert_same(&index, &reference, &chain, "missing");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Reopened behind the chain, the index catches up from where it was —
+    /// with the owner table rebuilt first — and not from genesis.
+    #[test]
+    fn a_reopened_index_resumes_from_its_last_block() {
+        let d = dir("resume");
+        let mut chain = Fake::new();
+        let mut rng = Rng(9);
+        let mut counter = 0;
+        for _ in 0..50 {
+            let b = chain.make(&mut rng, &mut counter, &[]);
+            chain.push(b);
+        }
+        let mut index = Index::open(&d.join("index.dat"));
+        follow(&mut index, &chain, 8);
+        drop(index);
+        for _ in 0..5 {
+            let b = chain.make(&mut rng, &mut counter, &[]);
+            chain.push(b);
+        }
+        let mut index = Index::open(&d.join("index.dat"));
+        match index.plan(&chain, 8) {
+            Step::Rewind { fork, blocks, .. } => {
+                assert_eq!(fork, 50);
+                assert_eq!(blocks.len(), 5);
+            }
+            other => panic!("expected a resume, got {other:?}"),
+        }
+        follow(&mut index, &chain, 8);
+        let reference = rebuilt(&chain, &d.join("reference.dat"));
+        assert_same(&index, &reference, &chain, "resume");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
