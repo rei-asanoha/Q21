@@ -95,16 +95,17 @@ fn main() {
         // released here, once, as `Troubleshooting/Q21 Wallet - Terminal.command`
         // does — by name. Up to 0.4.8 the whole folder was: unpacked straight
         // into Downloads, that released every other file downloaded there.
-        let shipped: Vec<PathBuf> = ARCHIVE_ENTRIES
+        // One call per entry: a name without the mark must not stop the
+        // others.
+        for path in ARCHIVE_ENTRIES
             .iter()
             .map(|name| folder.join(name))
             .filter(|p| p.exists())
-            .collect();
-        if !shipped.is_empty() {
+        {
             let _ = Command::new("/usr/bin/xattr")
                 .arg("-dr")
                 .arg("com.apple.quarantine")
-                .args(&shipped)
+                .arg(&path)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();

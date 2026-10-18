@@ -550,7 +550,12 @@ pub struct Chain {
 /// mempool. A reorg of the last block or two is what happens when two miners
 /// find a block at almost the same time; deeper ones are rare, and their
 /// transactions mostly sit in the winning branch already.
-pub const RETURNED_BLOCKS: usize = 6;
+///
+/// Twelve since 0.4.9, six before. In the lab, a miner that had found a burst
+/// of blocks on its own lost them to a longer branch nine blocks deep: the
+/// payments of the three oldest, which no other branch carried, never came
+/// back. Twelve blocks of payments are re-checked in under a second.
+pub const RETURNED_BLOCKS: usize = 12;
 
 impl Chain {
     pub fn new(network: Network, genesis: Block) -> Chain {
