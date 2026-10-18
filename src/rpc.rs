@@ -2017,18 +2017,16 @@ impl RpcContext {
 
         // --- What waits in the mempool. Someone who has just paid this address
         // looks it up at once; until 0.4.2 it showed nothing for the two
-        // minutes a block takes, and the payment looked lost. Mempool lock
-        // first, chain lock second: the order `listtransactions` uses.
-        let pending_txs: Vec<Transaction> = self.node.with_mempool(|m| {
+        // minutes a block takes, and the payment looked lost.
+        //
+        // Read in place, under the one lock both live under. Up to v0.4.8 the
+        // whole mempool was copied first: at its 64 MiB cap, every look-up of
+        // an address copied 64 MiB while holding the node's lock.
+        let now = now_utc();
+        let pending: Vec<Json> = self.node.with_chain_and_mempool(|c, m| {
             m.txids()
                 .iter()
-                .filter_map(|id| m.get(id).cloned())
-                .collect()
-        });
-        let now = now_utc();
-        let pending: Vec<Json> = self.node.with_chain(|c| {
-            pending_txs
-                .iter()
+                .filter_map(|id| m.get(id))
                 .filter_map(|tx| {
                     let received: u64 = tx
                         .outputs
@@ -2476,10 +2474,22 @@ impl RpcContext {
         // The mempool lock is taken and released **before** the chain lock:
         // two locks nested in two different orders are the recipe for a
         // deadlock.
+        //
+        // Only the wallet's own transactions are copied out: up to v0.4.8 the
+        // whole mempool was, 64 MiB at its cap, under the node's lock, at
+        // every refresh of the Activity tab.
         let pending_txs: Vec<Transaction> = self.node.with_mempool(|m| {
             m.txids()
                 .iter()
-                .filter_map(|id| m.get(id).cloned())
+                .filter_map(|id| m.get(id))
+                .filter(|tx| {
+                    tx.outputs.iter().any(|o| g.owns(&o.pubkey_hash))
+                        || tx.inputs.iter().any(|e| {
+                            !e.witness.pubkey.is_empty()
+                                && g.owns(&crate::sig::pubkey_hash(scheme, &e.witness.pubkey))
+                        })
+                })
+                .cloned()
                 .collect()
         });
 
@@ -3449,7 +3459,7 @@ impl RpcContext {
         //    by another pending send in the meantime.
         let result = self.node.with_chain_and_mempool(|c, m| {
             let tx = g.sign_spend(&m.view(&c.utxo), prepare)?;
-            let r = m.accept(&tx, &c.utxo, self.network, c.height());
+            let r = m.accept_local(&tx, &c.utxo, self.network, c.height());
             Ok((tx, r))
         });
         // The reserved indices are on disk; we save again for what has moved
@@ -3507,7 +3517,7 @@ impl RpcContext {
         }
         let result = self.node.with_chain_and_mempool(|c, m| {
             let tx = g.sign_spend(&m.view(&c.utxo), prepare)?;
-            let r = m.accept(&tx, &c.utxo, self.network, c.height());
+            let r = m.accept_local(&tx, &c.utxo, self.network, c.height());
             Ok((tx, r))
         });
         if let Err(e) = self.save_wallet(&g) {
