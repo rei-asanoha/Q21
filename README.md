@@ -35,8 +35,8 @@ The deeper documents (audits, red-team reports, server guides) are listed
 Download the archive for your system from the
 [latest release](https://github.com/rei-asanoha/Q21/releases/latest), check it
 (see [Verifying a release](#verifying-a-release)), unzip it, and double-click
-the launcher — `Q21 Wallet.bat` on Windows, `Q21 Wallet.command`
-on macOS, `./q21 wallet` on Linux. Your browser opens and walks you through
+the launcher — `Q21 Wallet` on Windows and macOS (no window opens), `./q21
+wallet` on Linux. Your browser opens and walks you through
 creating or restoring a wallet. The archive already contains the testnet entry
 point; there is nothing to type.
 
@@ -223,10 +223,12 @@ curl -sX POST localhost:21080/rpc -d '{"jsonrpc":"2.0","id":1,"method":"listmeth
   entry point is turned away.
 - **Burst mining** beyond ~7,200 blocks at once pushes timestamps past the
   2-hour tolerance.
-- **Tor is not bundled.** `--tor` and the wallet switch use a Tor installed
-  separately (Tor Browser, or the Tor service); see [TOR.md](TOR.md). A
-  payment is relayed to every peer at once (no Dandelion++ yet): without
-  Tor, the first node to relay it is a good guess of where it comes from.
+- **Tor is bundled except on Linux ARM.** The Windows, macOS and Linux
+  x86_64 archives carry the Tor Expert Bundle; on a Raspberry Pi, `--tor`
+  uses the Tor of the system. No bridges for censored networks. See
+  [TOR.md](TOR.md). A payment is relayed to every peer at once (no
+  Dandelion++ yet): without Tor, the first node to relay it is a good guess
+  of where it comes from.
 - **Block archive pruning** (`node --prune`) keeps about eight days of block
   bodies; a pruned node cannot serve as an explorer.
 
@@ -283,9 +285,13 @@ record their result in `attestations/`.
 src/                 Consensus, networking, wallet, RPC and explorer.
                      consensus.rs holds every parameter; validate.rs every rule.
 src/bin/q21.rs       Node, wallet, explorer and benchmarks
+src/bin/q21-wallet.rs
+                     The launcher without a window (Windows, macOS)
+packaging/macos/     The Info.plist of Q21 Wallet.app
 examples/            Mining benchmark, signature benchmark, century projection
 tests/               Integration, attack and regression tests
-tools/               Reproducible build scripts, action pinning, node monitor
+tools/               Reproducible build scripts, action pinning, node monitor,
+                     the note shipped with the bundled Tor
 vendor/              ml-dsa and its transitive dependencies (offline build,
                      checksums verified by cargo)
 whitepaper/          Reference whitepaper: HTML page and PDF

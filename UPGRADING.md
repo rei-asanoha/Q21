@@ -65,6 +65,49 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.7 to 0.4.8
+
+0.4.8 is a drop-in replacement: same protocol (4), same chain, same data
+directory, same wallet file. It comes out of the testnet load test of
+15 October 2026 (0 payments lost out of 600 followed) and of the first Tor
+test on a Raspberry Pi, on 17 October.
+
+## What changes
+
+| | 0.4.7 | 0.4.8 |
+|---|---|---|
+| Tor in the wallet | Tor Browser had to be installed, opened, and kept open | **Tor comes in the archive** (Windows, macOS, Linux x86_64). The switch in the Network tab is enough: the wallet starts Tor, shows its progress, starts it again if it stops, and stops it when it closes |
+| A reachable wallet behind Tor | An onion service set up by hand in Tor's configuration | **A hidden node by itself**: the bundled Tor creates its onion address, the wallet announces it. The address is kept in `q21-data/tor/onion/` |
+| Onion addresses learned from the network | Forgotten at every restart, and after five failed attempts | Written to `onions.dat`; forgotten only when one keeps failing **and** has not been seen for three days |
+| The entry points | Reachable through Tor exit relays only | Also onion services, named in `bootstrap.txt`: a node through Tor still finds the network when their usual addresses are blocked or down |
+| Several dials through Tor | One after the other: a server that was down held up the rest for a minute each | All at once |
+| New addresses on the network | Learned only when connecting to a peer | Also asked again every ten minutes |
+| A server named twice in `bootstrap.txt` (name and address), through Tor | Counted as two peers | Recognized as one |
+| A body of the chain that never reached the disk | Cut the chain in two at the next restart; an old side branch could pass for the best chain, and the node fell back hundreds of blocks | Written again from memory every five minutes; at restart, a hole sends the node back to the genesis to resync, never onto an old branch |
+| Paying when the large coins are all held by pending payments | A dozen confirmed crumbs: a transaction ten times heavier | One pending coin that covers the payment, when there is one |
+| An onion address in `bootstrap.txt` without Tor | A line per address at every start | Skipped quietly, never handed to the system resolver |
+| Opening the wallet (Windows, macOS) | `Q21 Wallet.bat` / `Q21 Wallet.command`: a PowerShell or Terminal window next to the browser | `Q21 Wallet.exe` / `Q21 Wallet.app`: **no window**, only the page. Launched again, the wallet opens its page again; an error at startup shows in a dialog box, and in `q21-data/wallet.log`. The scripts stay as `Q21 Wallet - console.bat` and `Q21 Wallet - Terminal.command` |
+
+## Who needs it
+
+Everyone. The wallets first, this time: they are the ones that gain Tor. The
+entry points then, for the onion addresses and the fixes; on a server, the
+onion service itself is two lines of Tor configuration (TOR.md, section 4).
+
+Unzipped over an older folder, the archive leaves the old `Q21 Wallet.bat`
+or `Q21 Wallet.command` in place: they still work, with their window. The
+launcher without a window is `Q21 Wallet.exe` on Windows and `Q21 Wallet.app`
+on macOS; the old files can be deleted.
+
+A 0.4.7 node and a 0.4.8 node talk to each other: the protocol does not
+change. Given the 0.4.8 `bootstrap.txt`, a 0.4.7 node on Tor uses its
+`.onion` lines; one that is not on Tor skips them at startup, but its
+maintenance loop asks the system resolver about them, which fails (an onion
+name has no DNS record) and tells the resolver which names were asked. They
+are public names; updating ends it.
+
+---
+
 # Upgrading from 0.4.5 to 0.4.7
 
 0.4.7 is a drop-in replacement: same chain, same data directory, same wallet

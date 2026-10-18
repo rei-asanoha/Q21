@@ -121,15 +121,21 @@ a rich-text document. The command line above avoids both pitfalls.
 
 ### 4. Launch
 
-- **Windows**: double-click `Q21 Wallet.bat`.
-- **Mac**: double-click `Q21 Wallet.command`.
+- **Windows**: double-click `Q21 Wallet` (`Q21 Wallet.exe`).
+- **Mac**: double-click `Q21 Wallet` (`Q21 Wallet.app`).
 - **Linux and Raspberry Pi**: in the Terminal, from inside the folder,
   `./q21 wallet`.
 
-A black window opens and stays open — that is the node, so leave it alone.
-Then your browser opens on a page that walks you through the rest: create a
-wallet, or restore yours from its backup code. There is nothing to type in the
-black window.
+No window opens: the wallet runs in the background, and your browser opens on
+a page that walks you through the rest: create a wallet, or restore yours from
+its backup code. Closed the browser tab? Double-click the launcher again: the
+same wallet opens its page again. To stop the wallet: the **Close the wallet**
+button, **Info** tab. If something goes wrong at startup, a dialog box says
+what, and the whole message is in `q21-data/wallet.log`.
+
+`Q21 Wallet - console.bat` (Windows) and `Q21 Wallet - Terminal.command` (Mac)
+do the same with a window that shows what the wallet prints, for whoever
+wants to see it.
 
 **Copy the backup code onto paper.** It is the only way to recover your funds
 if this disk is lost — and it is all you need: on a brand-new computer, that
@@ -140,11 +146,13 @@ no commercial certificate was bought for this program. That is true, and the
 check in step 2 takes its place.
 
 **Windows** shows a SmartScreen screen: click "More info", then "Run anyway".
+If an antivirus program quarantines `tor\tor.exe`, allow it: it is Tor, from
+the Tor Project, and the wallet needs it only when Tor is turned on.
 
 **Mac** refuses to open the launcher — "from an unidentified developer" — or
 offers to move it to the Trash. Don't. Open **System Settings → Privacy &
 Security** and scroll all the way down: a line there says that
-`Q21 Wallet.command` was blocked, with an **"Open Anyway"** button. Click it,
+`Q21 Wallet` was blocked, with an **"Open Anyway"** button. Click it,
 confirm, and you're done: the launcher itself removes the quarantine flag from
 the rest of the folder, and you will never be asked again, either for the
 launcher or for `q21`. On a Mac older than macOS 15, right-clicking the
@@ -195,17 +203,12 @@ The test network exists to put the protocol through its paces, not to defend a
 currency: it has no reason to ask for that much, and requiring a powerful
 computer to take part would shut out precisely the people it needs.
 
-Add `--mine` when launching:
-
-- **Windows**: open `Q21 Wallet.bat` in Notepad (right-click → Edit), and
-  replace the line `q21.exe wallet` with `q21.exe wallet --mine`.
-- **Mac**: same thing in `Q21 Wallet.command`, using TextEdit: replace the
-  line `./q21 wallet` with `./q21 wallet --mine`.
-- **Linux and Raspberry Pi**: `./q21 wallet --mine`.
+Turn it on in the wallet: **Mine** tab, one switch. From the command line, the
+same is `./q21 wallet --mine`.
 
 The first time you launch in mining mode, the program builds its table in
 memory — a few seconds on the test network, and only once per 71-day period.
-After that, it mines as long as the window is open, using all cores;
+After that, it mines as long as the wallet runs, using all cores;
 `--threads 2` limits how many it uses if you want to keep the computer
 responsive.
 

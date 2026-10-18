@@ -34,8 +34,8 @@ quarantines everything that comes from a browser, and offers to **move it to
 the Trash**. This is not a malfunction, and refusing is the right reflex on
 its part.
 
-**If you want the wallet**, you have nothing to type: the `Q21 Wallet.command`
-launcher removes the quarantine from the whole folder itself before starting.
+**If you want the wallet**, you have nothing to type: the `Q21 Wallet`
+application removes the quarantine from the whole folder itself before starting.
 macOS will block the launcher once — "from an unidentified developer" — and
 **System Settings → Privacy & Security → Open Anyway** settles the matter for
 good. `JOIN.md` describes this step in detail.
@@ -216,6 +216,8 @@ bootstrap.q21.dev:21121
 92.222.86.135:21121
 bootstrap2.q21.dev:21121
 15.235.197.229:21121
+n2ju7wo2n3p6wm2cks6l7dri54chr2h2arxm7uuhvmtacr6a55mhwaid.onion:21121
+lqqbezwgwbnfqwcjs4yk5apomly5d2jlgjcday4ucumvf74y4xxgohad.onion:21121
 ```
 
 Two machines, on two continents (France and Singapore), with two different
@@ -226,6 +228,12 @@ both, and losing one leaves it connected. The second entry point connects to
 the first on its
 own (`--connect`, see SERVER.md), so whichever one a newcomer reaches, they
 see the same chain.
+
+The last two lines are the same two machines as onion services: France,
+then Singapore. A node through Tor reaches them without any exit relay, and
+keeps reaching them if the addresses above are blocked or down. A node
+without Tor skips them. Setting one up on an entry point takes two lines of
+Tor configuration: see [TOR.md](TOR.md), section 4.
 
 The name **and** the address are published side by side, on purpose. A domain
 name may one day expire and be bought by someone else; an address stays
