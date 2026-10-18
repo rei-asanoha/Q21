@@ -810,6 +810,14 @@ impl BlockArchive {
         Ok(())
     }
 
+    /// Is this block's body in the file?
+    pub fn contains(&self, id: &crate::hash::Hash256) -> bool {
+        self.positions
+            .lock()
+            .map(|g| g.contains_key(id))
+            .unwrap_or(false)
+    }
+
     /// Reads a block back. The lock is held during the read, for the same
     /// reason as in [`Self::append`]: a position read before a pruning no
     /// longer designates anything after it.

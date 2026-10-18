@@ -1485,6 +1485,70 @@ mod tests_chains {
             w.select_coins(&c.utxo, c.height(), all + 1),
             Err(crate::wallet::WalletError::InsufficientFunds { .. })
         ));
+
+        // Too many coins, but one pending coin of ours covers it alone: it
+        // pays, instead of "too many coins".
+        let addr = w.new_address();
+        let pending_point = crate::tx::OutPoint {
+            txid: crate::hash::Hash256([0x78; 32]),
+            index: 0,
+        };
+        let pending_out = crate::tx::TxOut {
+            value: crate::amount::Amount::from_units(all * 2),
+            scheme: coins[0].1.scheme,
+            pubkey_hash: addr.hash,
+        };
+        let (chosen, _) = w
+            .select_coins_avoiding(
+                &c.utxo,
+                c.height(),
+                all,
+                &|_| false,
+                &[(pending_point, pending_out)],
+            )
+            .expect("the pending coin pays");
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].0, pending_point);
+    }
+
+    /// When only crumbs are confirmed, one pending coin that covers the
+    /// payment alone is preferred to a handful of them; when a confirmed
+    /// coin covers it, nothing changes.
+    #[test]
+    fn one_pending_coin_is_preferred_to_many_confirmed_crumbs() {
+        let mut w = Wallet::from_seed([0x31; 32], NETWORK);
+        let c = funded_chain(&mut w, crate::consensus::COINBASE_MATURITY + 6);
+        let coins = w.spendable(&c.utxo, c.height());
+        assert!(coins.len() >= 4);
+        let smallest = coins.iter().map(|e| e.1.value.units()).min().unwrap();
+        let largest = coins.iter().map(|e| e.1.value.units()).max().unwrap();
+        // A pending coin of ours (the change of a send waiting for a block),
+        // larger than any confirmed one.
+        let addr = w.new_address();
+        let pending_out = crate::tx::TxOut {
+            value: crate::amount::Amount::from_units(largest * 10),
+            pubkey_hash: addr.hash,
+            scheme: coins[0].1.scheme,
+        };
+        let pending_point = crate::tx::OutPoint {
+            txid: crate::hash::Hash256([0x77; 32]),
+            index: 1,
+        };
+        let pending = [(pending_point, pending_out)];
+        // Three crumbs' worth: the pending coin alone.
+        let need = smallest.saturating_mul(3).max(largest * 2 + 1);
+        let (chosen, total) = w
+            .select_coins_avoiding(&c.utxo, c.height(), need, &|_| false, &pending)
+            .expect("selection");
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].0, pending_point);
+        assert_eq!(total, largest * 10);
+        // One confirmed coin's worth: the confirmed coin, as before.
+        let (chosen, _) = w
+            .select_coins_avoiding(&c.utxo, c.height(), largest, &|_| false, &pending)
+            .expect("selection");
+        assert_eq!(chosen.len(), 1);
+        assert_ne!(chosen[0].0, pending_point);
     }
 
     /// A payment that only the abandoned block carried comes back to the pool

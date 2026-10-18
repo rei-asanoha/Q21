@@ -1,0 +1,38 @@
+Tor, shipped with the Q21 wallet
+================================
+
+This folder holds Tor, from the Tor Project (https://www.torproject.org),
+unchanged: the "Tor Expert Bundle" of a stable Tor Browser release. The Q21
+wallet starts it when Tor is turned on in the Network tab, and stops it when
+the wallet closes. You have nothing to install and nothing to keep open.
+
+Where it comes from
+-------------------
+
+The release workflow of Q21 (.github/workflows/release.yml, step "Tor, from
+the Tor Project, signature verified") downloads the bundle from
+dist.torproject.org and refuses it unless its OpenPGP signature verifies
+with the Tor Browser Developers signing key, fingerprint
+
+    EF6E 286D DA85 EA2A 4BA7  DE68 4E2C 6E87 9329 8290
+
+The last line of this file names the version and the platform.
+
+To check it yourself, download the same bundle and its .asc signature from
+https://www.torproject.org/download/tor/ and compare the files.
+
+What was left out
+-----------------
+
+The pluggable transports (bridges for censored networks) are not included.
+Without them Tor connects normally; on a network that blocks Tor, it does not
+connect, and the wallet waits instead of connecting in the clear.
+
+License
+-------
+
+Tor is free software under the 3-clause BSD license; the files it is built
+with keep their own licenses. The license texts found in the bundle are next
+to this file. Q21 is not part of the Tor Project, and the Tor Project does not
+endorse it.
+

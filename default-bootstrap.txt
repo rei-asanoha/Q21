@@ -18,7 +18,13 @@
 # The name and the numeric address are given side by side, on purpose: a
 # domain name can expire, an address stays reachable as long as the machine
 # exists. The failure of one isolates no one.
+#
+# The `.onion` lines are the same two machines, reached through Tor. A node
+# without Tor skips them; a node with Tor (the switch in the Network tab)
+# uses them even when the two addresses above are blocked or down.
 bootstrap.q21.dev:21121
 92.222.86.135:21121
 bootstrap2.q21.dev:21121
 15.235.197.229:21121
+n2ju7wo2n3p6wm2cks6l7dri54chr2h2arxm7uuhvmtacr6a55mhwaid.onion:21121
+lqqbezwgwbnfqwcjs4yk5apomly5d2jlgjcday4ucumvf74y4xxgohad.onion:21121

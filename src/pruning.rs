@@ -386,14 +386,42 @@ pub fn resume_chain(
     }
 
     // --- 2. Resume from the snapshot, if we have one and it is consistent.
+    //
+    // A snapshot off the most-worked chain **and higher than its tip** is
+    // the sign of a hole in the block file: a body missing somewhere below,
+    // so that the real chain no longer links to the genesis, and an old side
+    // branch — blocks this node once mined alone, for instance — passes for
+    // the best chain. Rebuilding that branch made the node fall back hundreds
+    // of blocks and present it to its peers, who disconnected it. In that
+    // case only the genesis is kept, the block file is left as it is, and
+    // the network supplies the chain again, as for a new node.
+    let mut hole_below: Option<u64> = None;
     let resumed = match state_store.load(network) {
-        Ok(i) => match Chain::from_snapshot(network, i, &bare_headers) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("warning: unusable snapshot ({e}) — full revalidation");
-                None
+        Ok(i) => {
+            let snapshot_height = i.height;
+            match Chain::from_snapshot(network, i, &bare_headers) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    let best = Chain::block_tree(&bare_headers)
+                        .map(|t| t.active.len().saturating_sub(1) as u64)
+                        .unwrap_or(0);
+                    if matches!(e, crate::chain::ResumeError::SnapshotOffChain)
+                        && best < snapshot_height
+                    {
+                        hole_below = Some(snapshot_height);
+                        eprintln!(
+                            "warning: the block file has a hole: its best linked chain stops at \
+                             height {best}, below this node's own snapshot ({snapshot_height}).\n               \
+                             Starting again from the genesis instead of an old side branch; the \
+                             network will supply the chain again. The wallet is not touched."
+                        );
+                    } else {
+                        eprintln!("warning: unusable snapshot ({e}) — full revalidation");
+                    }
+                    None
+                }
             }
-        },
+        }
         Err(e) if state_store.exists() => {
             eprintln!("warning: {e}");
             None
@@ -485,6 +513,9 @@ pub fn resume_chain(
     )?;
     let mut c = Chain::new(network, genesis_body);
     c.set_body_source(archive.clone());
+    if hole_below.is_some() {
+        return Ok(c);
+    }
     for id in tree.active.iter().skip(1) {
         let Some(b) = archive.read(id) else {
             truncate_archive_at(
@@ -563,6 +594,59 @@ mod tests {
             c.connect(&b, t + 1).expect("connect");
             archive.append(&b).unwrap();
         }
+    }
+
+    /// A hole in the block file must not bring back an old side branch.
+    ///
+    /// Seen on a testnet agent: blocks it had once mined alone were still in
+    /// its file, a body of the real chain was missing below, and at restart
+    /// the old branch passed for the best chain. The node fell back hundreds
+    /// of blocks and presented that branch to its peers.
+    #[test]
+    fn a_hole_in_the_block_file_does_not_revive_an_old_side_branch() {
+        let d = test_dir("hole");
+        let (archive, _, _) = BlockArchive::open(d.join("blocks.dat"), NETWORK).unwrap();
+        let archive = Arc::new(archive);
+        archive.append(&genesis_block(NETWORK)).unwrap();
+
+        // The old branch, mined alone: 10 blocks.
+        let mut alone = Chain::new(NETWORK, genesis_block(NETWORK));
+        for _ in 0..10 {
+            let t = alone.tip().time + TARGET_BLOCK_SECS;
+            let b = alone
+                .mine_block(Hash256([7u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
+                .expect("mining");
+            alone.connect(&b, t + 1).expect("connect");
+            archive.append(&b).unwrap();
+        }
+        // The real chain: 30 blocks, the body at height 3 never written.
+        let mut c = Chain::new(NETWORK, genesis_block(NETWORK));
+        for _ in 0..30 {
+            let t = c.tip().time + TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
+                .expect("mining");
+            c.connect(&b, t + 1).expect("connect");
+            if b.header.height != 3 {
+                archive.append(&b).unwrap();
+            }
+        }
+        let state_store = state_store_in(&d);
+        state_store
+            .save(&c.snapshot_at_depth(5).expect("snapshot"))
+            .expect("snapshot written");
+        drop(archive);
+
+        let (archive, headers, _) = BlockArchive::open(d.join("blocks.dat"), NETWORK).unwrap();
+        let archive = Arc::new(archive);
+        let store = HeaderStore::new(d.join("headers.dat"));
+        let r = resume_chain(NETWORK, &archive, headers, &store, &state_store).expect("starts");
+        assert_eq!(r.height(), 0, "the genesis, not the old branch");
+        assert!(
+            archive.contains(&c.active_at(20).unwrap()),
+            "the file is left as it is: its bodies serve the resync"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A pruned node restarts exactly where it was.

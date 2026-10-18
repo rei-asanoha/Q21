@@ -353,6 +353,13 @@ pub struct TorSetting {
     pub session: Option<std::net::SocketAddr>,
     /// Writes the choice to disk.
     pub set: SetReachable,
+    /// Where this session's Tor comes from: `bundled` (shipped with the
+    /// program and started by the node), `system` (a Tor already running, or
+    /// one found on the `PATH`), `proxy` (given with `--proxy`), or empty.
+    pub source: String,
+    /// Bootstrap progress of a Tor the node started itself, 0 to 100. Absent
+    /// for a Tor the node did not start: its progress is not known here.
+    pub progress: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 pub struct RpcContext {
@@ -1187,6 +1194,22 @@ impl RpcContext {
                 ),
             )
             .set("tor_session", Json::Bool(self.node.proxy().is_some()))
+            .set(
+                "tor_source",
+                Json::str(
+                    self.tor
+                        .as_ref()
+                        .map(|t| t.source.clone())
+                        .unwrap_or_default(),
+                ),
+            )
+            .set(
+                "tor_bootstrap",
+                match self.tor.as_ref().and_then(|t| t.progress.as_ref()) {
+                    Some(p) => Json::u64(p.load(std::sync::atomic::Ordering::SeqCst) as u64),
+                    None => Json::Null,
+                },
+            )
             // Counts only: the onion name itself is not returned, since an
             // explorer served in public would tie it to its domain.
             .set("onion", {
@@ -2941,6 +2964,9 @@ impl RpcContext {
             // on, the blocks found leave from a public address first. The
             // wallet page warns about it.
             .set("reachable", Json::Bool(self.reachable_session))
+            // Behind Tor, being reachable is an onion service: nothing ties
+            // the blocks found to an IP address, and no warning is due.
+            .set("tor", Json::Bool(self.node.proxy().is_some()))
             .set(
                 "possible",
                 Json::Bool(self.mining.is_some() && self.wallet.is_some()),

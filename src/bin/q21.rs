@@ -106,14 +106,18 @@ COMMANDS
                              --assume-tip <hex>   the trusted tip that goes
                                                   with the commitment
                              --tor                every outgoing connection
-                                                  through the local Tor
-                                                  (127.0.0.1:9050 or 9150),
-                                                  never in the clear. See
-                                                  TOR.md
+                                                  through Tor, never in the
+                                                  clear: the one shipped in
+                                                  tor/ next to the program
+                                                  (started by the node), else
+                                                  one running on 9050 or 9150.
+                                                  With --listen 127.0.0.1, a
+                                                  hidden node. See TOR.md
                              --proxy <ip:port>    same, through this SOCKS5
                                                   proxy
-                             --onion <name.onion> announces this node's onion
-                                                  service (requires --tor)
+                             --onion <name.onion> announces an onion service
+                                                  set up by hand (requires
+                                                  --tor, or a public --listen)
                              --address-index      search index (see
                                                   EXPLORER.md)
                              --prune              keeps only recent block bodies
@@ -283,8 +287,20 @@ fn main() {
         match q21_core::lock::acquire(&datadir) {
             Ok(v) => Some(v),
             Err(e) => {
+                // The wallet launched a second time: the running one opens
+                // its page again, and that is all the user wanted.
+                if first_command == "wallet" && ask_running_wallet_to_reopen(&datadir) {
+                    println!("  The wallet is already open: its page opens again in your browser.");
+                    std::process::exit(0);
+                }
                 eprintln!("error: {e}");
-                if q21_core::prompt::is_interactive() {
+                if std::env::var_os("Q21_NO_WINDOW").is_some() {
+                    q21_core::dialog::alert(
+                        "Another Q21 program is already using the wallet's folder (q21-data): \
+                         a node, or a wallet opened another way.\n\nClose it, then open the \
+                         wallet again.",
+                    );
+                } else if q21_core::prompt::is_interactive() {
                     println!();
                     println!("  Press Enter to close.");
                     let mut _l = String::new();
@@ -332,6 +348,9 @@ fn main() {
         let r = cmd_wallet(&datadir, &[]);
         if let Err(e) = r {
             eprintln!("error: {e}");
+            if std::env::var_os("Q21_NO_WINDOW").is_some() {
+                q21_core::dialog::alert(&format!("The wallet stopped with an error:\n\n{e}"));
+            }
             if q21_core::prompt::is_interactive() {
                 println!();
                 println!("  Press Enter to close.");
@@ -391,6 +410,14 @@ fn main() {
 
     if let Err(e) = r {
         eprintln!("error: {e}");
+        // Without a window, the launcher has usually left by now: the error
+        // is shown here, before the process ends (not on another thread).
+        if std::env::var_os("Q21_NO_WINDOW").is_some() {
+            q21_core::dialog::alert(&format!(
+                "The wallet stopped with an error:\n\n{e}\n\nThe details are in \
+                 q21-data/wallet.log."
+            ));
+        }
         std::process::exit(1);
     }
 }
@@ -1749,6 +1776,118 @@ fn addresses_path(d: &Path) -> PathBuf {
     d.join("addresses.dat")
 }
 
+/// The request a second launch leaves for the running wallet.
+fn reopen_path(d: &Path) -> PathBuf {
+    d.join("wallet.reopen")
+}
+
+/// The page a second launch opens again: the server that serves it, and its
+/// path (`/welcome` while setup runs, `/wallet` once the node does).
+type ReopenTarget = (std::sync::Arc<q21_core::http::ServerHandle>, &'static str);
+
+/// Set by `start_reopen_watcher`, hence only in `wallet`.
+static REOPEN: std::sync::OnceLock<std::sync::Mutex<Option<ReopenTarget>>> =
+    std::sync::OnceLock::new();
+
+/// Names the page a second launch must open again, or none for now.
+fn reopen_target(target: Option<ReopenTarget>) {
+    if let Some(slot) = REOPEN.get() {
+        if let Ok(mut g) = slot.lock() {
+            *g = target;
+        }
+    }
+}
+
+/// Watches for a second launch, from the start of `wallet` to its end.
+///
+/// Without a window, a wallet whose browser tab was closed keeps running out
+/// of sight — on the passphrase screen, while the chain loads, or once open.
+/// Launched again, it used to answer "another q21 is already using this data
+/// directory", an error with nothing to act on. The second launch now leaves
+/// a request file (see `ask_running_wallet_to_reopen`); this thread takes it
+/// at once, so that the second launch knows it was heard, and opens the
+/// current page with a new one-time launch token — as soon as there is a
+/// page to open. The data directory belongs to its owner alone: nobody else
+/// can leave the request.
+fn start_reopen_watcher(datadir: &Path) {
+    if REOPEN.set(std::sync::Mutex::new(None)).is_err() {
+        return;
+    }
+    // A request already there is kept: a second launch may have come between
+    // the folder lock and this point. At worst, the page opens once more.
+    let request = reopen_path(datadir);
+    let _ = std::thread::Builder::new()
+        .name("wallet-reopen".into())
+        .spawn(move || {
+            let mut pending = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if request.exists() {
+                    let _ = std::fs::remove_file(&request);
+                    pending = true;
+                }
+                if !pending {
+                    continue;
+                }
+                let target = REOPEN
+                    .get()
+                    .and_then(|slot| slot.lock().ok().and_then(|g| g.clone()));
+                let Some((server, page)) = target else {
+                    continue;
+                };
+                pending = false;
+                let Ok(secret) = draw_launch_token() else {
+                    continue;
+                };
+                if server.rearm_launch_token(secret.clone()) {
+                    let url = format!("http://{}{page}#{secret}", server.addr);
+                    match open_browser(&url) {
+                        Ok(()) => println!("  launched again: the page is open once more"),
+                        Err(e) => tell_user(&format!(
+                            "The browser could not be opened ({e}).\n\n\
+                             Open this address in your browser:\n{url}"
+                        )),
+                    }
+                }
+            }
+        });
+}
+
+/// A message the user must see. Without a window (`Q21 Wallet.exe`,
+/// `Q21 Wallet.app`), in a dialog box; otherwise in the window.
+fn tell_user(text: &str) {
+    eprintln!("  {}", text.replace('\n', "\n  "));
+    if std::env::var_os("Q21_NO_WINDOW").is_some() {
+        let text = text.to_string();
+        // On its own thread: a dialog waits for a click, the wallet does not.
+        std::thread::spawn(move || q21_core::dialog::alert(&text));
+    }
+}
+
+/// Asks the wallet that holds `datadir` to open its page again, and says
+/// whether it did: the request file is taken within a few seconds by a
+/// running wallet, and stays where something else holds the folder (a node,
+/// a wallet of an older version). Then it is removed, and the usual message
+/// about the folder in use is given.
+fn ask_running_wallet_to_reopen(datadir: &Path) -> bool {
+    let request = reopen_path(datadir);
+    if std::fs::write(&request, b"open the page again\n").is_err() {
+        return false;
+    }
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if !request.exists() {
+            return true;
+        }
+    }
+    let _ = std::fs::remove_file(&request);
+    false
+}
+
+fn onions_path(d: &Path) -> PathBuf {
+    d.join("onions.dat")
+}
+
 fn peers_path(d: &Path) -> PathBuf {
     d.join("peers.dat")
 }
@@ -2544,6 +2683,14 @@ fn cmd_diagnostic(datadir: &Path, args: &[String]) -> Result<(), String> {
     for target in &targets {
         println!();
         println!("  --- {target}");
+
+        // An onion address is reached through Tor only; the diagnostic
+        // connects directly, on purpose, and does not hand it to the system
+        // resolver either.
+        if is_onion_target(target) {
+            println!("      onion        reachable through Tor only — not tested here");
+            continue;
+        }
 
         // --- 2. Resolution.
         let addresses = match q21_core::bootstrap::resolve(target, network) {
@@ -4532,38 +4679,182 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 
     // --- Tor: every outgoing connection through the proxy, or none.
     //
-    // Set before the first connection. If Tor cannot be found, the node
-    // still uses the usual port and every connection fails: connecting in
-    // the clear instead would reveal exactly what the person wanted to hide.
+    // Set before the first connection. If Tor cannot be found or started,
+    // the node still uses the usual port and every connection fails:
+    // connecting in the clear instead would reveal exactly what the person
+    // wanted to hide.
+    //
+    // Where `--tor` takes its Tor from, in this order (see
+    // `q21_core::tor_process`):
+    //
+    // 1. the one shipped in the archive (`tor/` next to the program), started
+    //    by the node: nothing to install, nothing to keep open;
+    // 2. a Tor already running on this machine (the Tor service on 9050, Tor
+    //    Browser on 9150);
+    // 3. a `tor` on the PATH, started by the node.
+    let listen_socket: Option<std::net::SocketAddr> = listen_on
+        .as_deref()
+        .and_then(|a| q21_core::bootstrap::listen_address(a, network).parse().ok());
+    let listens_publicly = listen_socket
+        .map(|s| !s.ip().is_loopback())
+        .unwrap_or(false);
+    let mut managed_tor: Option<std::sync::Arc<q21_core::tor_process::ManagedTor>> = None;
+    let mut tor_source = String::new();
+    let tor_unreachable =
+        std::net::SocketAddr::from(([127, 0, 0, 1], q21_core::socks::TOR_SERVICE_PORT));
     let proxy: Option<std::net::SocketAddr> = match (&proxy_arg, tor) {
-        (Some(p), _) => Some(
-            p.parse()
-                .map_err(|_| format!("--proxy {p}: expected an address such as 127.0.0.1:9050"))?,
-        ),
-        (None, true) => Some(q21_core::socks::find_local_tor().unwrap_or_else(|| {
-            eprintln!(
-                "  Tor not found (nothing listens on 127.0.0.1:9050 nor 9150). Start Tor, or \
-                 Tor Browser. This node will not connect in the clear: it waits for Tor."
-            );
-            std::net::SocketAddr::from(([127, 0, 0, 1], q21_core::socks::TOR_SERVICE_PORT))
-        })),
+        (Some(p), _) => {
+            tor_source = "proxy".to_string();
+            Some(
+                p.parse().map_err(|_| {
+                    format!("--proxy {p}: expected an address such as 127.0.0.1:9050")
+                })?,
+            )
+        }
+        (None, true) => {
+            let bundled = q21_core::tor_process::find_bundled_next_to_program();
+            let running = if bundled.is_none() {
+                q21_core::socks::find_local_tor()
+            } else {
+                None
+            };
+            let executable = match (&bundled, running) {
+                (Some(b), _) => Some(b.clone()),
+                (None, None) => q21_core::tor_process::find_on_path(),
+                (None, Some(_)) => None,
+            };
+            if let Some(a) = running {
+                tor_source = "system".to_string();
+                println!("  Tor: using the Tor already running on {a}");
+                Some(a)
+            } else if let Some(exe) = executable {
+                // A node that listens gets an onion service of its own, unless
+                // it was given one by hand (`--onion`): the network reaches it
+                // through Tor, and nobody edits a configuration file.
+                // Tor forwards to where this node listens: the loopback when
+                // it listens everywhere (or on the loopback), its own address
+                // otherwise.
+                let hidden_service = if onion_arg.is_none() {
+                    listen_socket.map(|s| {
+                        let target = if s.ip().is_unspecified() {
+                            std::net::SocketAddr::from(([127, 0, 0, 1], s.port()))
+                        } else {
+                            s
+                        };
+                        (q21_core::bootstrap::default_port(network), target)
+                    })
+                } else {
+                    None
+                };
+                let options = q21_core::tor_process::Options {
+                    executable: exe.clone(),
+                    data_dir: datadir.join("tor"),
+                    hidden_service,
+                };
+                match q21_core::tor_process::ManagedTor::start(&options) {
+                    Ok(t) => {
+                        tor_source = if bundled.is_some() {
+                            "bundled"
+                        } else {
+                            "system"
+                        }
+                        .to_string();
+                        println!(
+                            "  Tor: started {} — it takes from a few seconds to a minute to connect",
+                            exe.display()
+                        );
+                        let a = t.socks();
+                        managed_tor = Some(std::sync::Arc::new(t));
+                        Some(a)
+                    }
+                    Err(e) => {
+                        // An antivirus that blocks the bundled Tor must not
+                        // also hide a Tor Browser left open.
+                        match q21_core::socks::find_local_tor() {
+                            Some(a) => {
+                                tor_source = "system".to_string();
+                                eprintln!(
+                                    "  Tor could not be started ({}): {e}. Using the Tor already \
+                                     running on {a}.",
+                                    exe.display()
+                                );
+                                Some(a)
+                            }
+                            None => {
+                                eprintln!(
+                                    "  Tor could not be started ({}): {e}. This node will not \
+                                     connect in the clear: it waits for Tor.",
+                                    exe.display()
+                                );
+                                Some(tor_unreachable)
+                            }
+                        }
+                    }
+                }
+            } else {
+                eprintln!(
+                    "  Tor not found: no tor/ folder next to the program, nothing listening on \
+                     127.0.0.1:9050 nor 9150, no tor on the PATH. This node will not connect \
+                     in the clear: it waits for Tor."
+                );
+                Some(tor_unreachable)
+            }
+        }
         (None, false) => None,
     };
-    // --- This node's own onion service, announced to protocol-4 peers.
+    // --- The onion service a started Tor creates, announced once Tor has
+    // written its name (at once on a known key, a few seconds on a new one).
+    // A weak reference: the thread must not keep Tor alive when the node
+    // stops or fails early.
+    if let Some(t) = managed_tor.as_ref().filter(|t| t.serves_onion()) {
+        let weak = std::sync::Arc::downgrade(t);
+        let node = node.clone();
+        let port = q21_core::bootstrap::default_port(network);
+        let _ = std::thread::Builder::new()
+            .name("tor-onion".to_string())
+            .spawn(move || {
+                for _ in 0..180 {
+                    let Some(t) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Some(name) = t.onion_name() {
+                        if let Some(own) = q21_core::wire::OnionAddr::parse(&name, port) {
+                            println!(
+                                "  Tor: this node is reachable as {}:{}",
+                                own.host(),
+                                own.port
+                            );
+                            node.set_own_onion(Some(own));
+                        }
+                        return;
+                    }
+                    // A Tor that stopped before writing its name is started
+                    // again by the maintenance loop: keep waiting for it.
+                    drop(t);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            });
+    }
+    // --- This node's own onion service, given by hand, announced to
+    // protocol-4 peers.
     //
     // Tor creates the address (HiddenServiceDir) and forwards to the port
-    // this node listens on; the node only needs to know its name. Without
-    // Tor for the outgoing side, announcing it would tie the onion name to
-    // this machine's IP address in every peer's eyes: refused.
+    // this node listens on; the node only needs to know its name. A node
+    // that connects in the clear and listens only on the loopback would tie
+    // the onion name to this machine's IP address in every peer's eyes:
+    // refused. An entry point that listens on a public address is a
+    // different case: its address is public anyway, and its onion name is
+    // meant to be published next to it.
     if let Some(raw) = &onion_arg {
         let port = q21_core::bootstrap::default_port(network);
         let own = q21_core::wire::OnionAddr::parse(raw, port)
             .ok_or_else(|| format!("--onion {raw}: not a Tor v3 onion address"))?;
-        if proxy.is_none() {
+        if proxy.is_none() && !listens_publicly {
             return Err(
                 "--onion needs --tor (or --proxy): announcing an onion service \
                         from a node that connects in the clear would link it to this \
-                        machine's address"
+                        machine's address. An entry point that listens on a public \
+                        address (--listen 21121) may announce one without Tor."
                     .to_string(),
             );
         }
@@ -4768,6 +5059,40 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
     targets.sort();
     targets.dedup();
+    // Through Tor, the links to the configured addresses are the ones a
+    // later link to the same node is compared with (see `q21_core::net`).
+    if proxy.is_some() {
+        let port = q21_core::bootstrap::default_port(network);
+        node.set_configured_targets(
+            targets
+                .iter()
+                .filter_map(|a| q21_core::socks::Target::parse(a, port).ok())
+                .map(|t| t.label())
+                .collect(),
+        );
+    }
+    let onion_targets = targets.iter().filter(|a| is_onion_target(a)).count();
+    // The onion addresses of the bootstrap file go into the onion book too:
+    // they are then counted, kept in `onions.dat`, and passed on to peers
+    // like those learned from the network.
+    let port = q21_core::bootstrap::default_port(network);
+    let from_file: Vec<q21_core::wire::OnionAddr> = targets
+        .iter()
+        .filter(|a| is_onion_target(a))
+        .filter_map(|a| q21_core::wire::OnionAddr::parse(a, port))
+        .map(|mut o| {
+            o.last_seen = unix_now();
+            o
+        })
+        .collect();
+    if !from_file.is_empty() {
+        node.seed_onions(from_file);
+    }
+    if proxy.is_none() && onion_targets > 0 {
+        println!(
+            "  bootstrap: {onion_targets} onion address(es) kept for Tor (the Network tab turns it on)"
+        );
+    }
     if proxy.is_some() && !targets.is_empty() {
         println!(
             "  Tor: {} bootstrap address(es), dialed in the background",
@@ -4792,10 +5117,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         if proxy.is_some() {
             continue;
         }
-        if a.trim_end_matches(|c: char| c.is_ascii_digit() || c == ':')
-            .ends_with(".onion")
-        {
-            eprintln!("  {a}: an onion address needs Tor (--tor), skipped");
+        // An onion address in the shipped bootstrap file is for nodes that go
+        // through Tor. Without it, it is skipped without a word per line (and
+        // never handed to the system resolver, which would ask a DNS server
+        // about it in the clear); one line sums them up below.
+        if is_onion_target(a) {
             continue;
         }
         match q21_core::bootstrap::resolve(a, network) {
@@ -4849,6 +5175,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     if !learned.is_empty() {
         let n = node.seed_addresses(&learned);
         println!("  address book: {n} addresses reloaded");
+    }
+    // The onion names learned before: a node through Tor finds the onion
+    // services again even when the entry points are down.
+    let onions = q21_core::addr::load_onions(&onions_path(datadir), unix_now());
+    if !onions.is_empty() {
+        let n = node.seed_onions(onions);
+        println!("  onion addresses: {n} reloaded");
     }
     // The mining switch. It starts from the value of the `--mine` flag, but
     // no longer stops there: the interface can turn it on and off without
@@ -4977,6 +5310,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     let d = datadir.to_path_buf();
                     std::sync::Arc::new(move |v: bool| q21_core::settings::set_tor(&d, v))
                 },
+                source: tor_source.clone(),
+                progress: managed_tor.as_ref().map(|t| t.progress_handle()),
             })),
         };
         // The explorer shell is served without a token: it carries no data,
@@ -5035,10 +5370,19 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 println!("  Token required. The pages ask for it when opened.");
             }
         }
-        Some(h)
+        Some(std::sync::Arc::new(h))
     } else {
         None
     };
+
+    // --- A second launch of the wallet opens this page again (see
+    // `start_reopen_watcher`). Only `wallet` starts the watcher: for any
+    // other command this does nothing.
+    if let Some(server) = &_server {
+        if NODE_LAUNCH_TOKEN.get().is_some() {
+            reopen_target(Some((server.clone(), "/wallet")));
+        }
+    }
 
     if !quiet {
         println!("  Ctrl-C to stop");
@@ -5076,6 +5420,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             })
             .map_err(|e| format!("sleep-watch thread: {e}"))?;
     }
+    let mut last_tor_restart = std::time::Instant::now();
     // One batch of Tor dials at a time, see `dial_missing`.
     let dialing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut last_search = std::time::Instant::now()
@@ -5094,6 +5439,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // replay. The snapshot is taken a little behind the tip, so writing often
     // does not erode the ability to reorg.
     const SNAPSHOT_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+    // Where the next check for holes in the block file starts: the whole
+    // chain the first time, then only what is recent.
+    let mut holes_checked_from: u64 = 1;
     let mut last_snapshot = std::time::Instant::now();
     // The pending transactions are offered again to the peers every ten
     // minutes: one announced once and missed by a peer was otherwise never
@@ -5147,6 +5495,15 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             break;
         }
         if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
+            // Holes first: a body of the active chain that never reached the
+            // disk (a write refused by the system, an antivirus holding the
+            // file) is written again while it is still in memory. Left
+            // alone, it cut the chain in two at the next restart. A pruned
+            // node, an adopted or once-pruned folder (it has a header store)
+            // lack old bodies by design: nothing to repair there.
+            if !prune && !headers_path(datadir).exists() {
+                repair_archive_holes(&node, archive.as_ref(), &mut holes_checked_from);
+            }
             // Taken under the lock, written outside: see `write_taken_snapshot`.
             let taken = node.with_chain(|c| c.snapshot());
             if let Some(i) = taken {
@@ -5176,6 +5533,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         if last_rebroadcast.elapsed() >= q21_core::net::MEMPOOL_REBROADCAST {
             last_rebroadcast = std::time::Instant::now();
             node.announce_mempool();
+            node.ask_addresses();
         }
         // Ctrl-C: we leave the loop rather than being killed on the spot.
         // Everything this node must write — mempool, snapshot, address book,
@@ -5223,6 +5581,30 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 
         if last_search.elapsed().as_secs() >= 15 {
             last_search = std::time::Instant::now();
+
+            // --- The Tor this node started, started again if it stopped
+            // (killed by the system, an antivirus, a crash). Once a minute at
+            // most: a Tor that cannot run must not be relaunched in a loop.
+            if let Some(t) = &managed_tor {
+                if !t.is_running() && last_tor_restart.elapsed().as_secs() >= 60 {
+                    last_tor_restart = std::time::Instant::now();
+                    let why = t.last_problem();
+                    match t.restart() {
+                        Ok(a) => {
+                            node.set_proxy(Some(a));
+                            println!(
+                                "  Tor had stopped{}; started again",
+                                if why.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({why})")
+                                }
+                            );
+                        }
+                        Err(e) => eprintln!("  Tor stopped and could not be started again: {e}"),
+                    }
+                }
+            }
 
             // --- First, free the slots held by dead peers.
             //
@@ -5553,6 +5935,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
 
     node.shutdown();
+    // The Tor this node started goes with it.
+    if let Some(t) = &managed_tor {
+        t.stop();
+    }
     // --- The mempool survives shutdown.
     //
     // A sent transaction waits there for a miner to take it. It was written
@@ -5595,6 +5981,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // everything.
     if let Err(e) = address_book.save_entries(&node.address_entries()) {
         eprintln!("warning: address book not written: {e}");
+    }
+    if let Err(e) = q21_core::addr::save_onions(&onions_path(datadir), &node.onion_entries()) {
+        eprintln!("warning: onion addresses not written: {e}");
     }
     // The snapshot is written at shutdown, not at every block: it is a
     // startup saving, not data whose loss would cost anything.
@@ -5727,6 +6116,9 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     println!("Q21 Wallet");
     println!();
 
+    // A second launch opens the page again, from now on (setup included).
+    start_reopen_watcher(datadir);
+
     // 1. A free port for the node, unless one is forced.
     //
     // It is drawn **before** setup: the setup page must know where to send
@@ -5834,25 +6226,45 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         // on a loaded machine and too long elsewhere.
         let a = address.clone();
         let u = url.clone();
+        // Up to ten minutes: on a small machine, the chain takes a while to
+        // load before the server listens, and there may be no window in
+        // which to say "open it by hand".
         std::thread::spawn(move || {
-            for _ in 0..100 {
+            for _ in 0..6000 {
                 if std::net::TcpStream::connect(&a).is_ok() {
                     if let Err(e) = open_browser(&u) {
-                        eprintln!("  The browser could not be opened ({e}).");
-                        eprintln!("  Open the address above by hand.");
+                        tell_user(&format!(
+                            "The browser could not be opened ({e}).\n\n\
+                             Open this address in your browser:\n{u}"
+                        ));
                     }
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            eprintln!("  The server did not answer. Open the address above by hand.");
+            tell_user(&format!(
+                "The wallet did not start listening in ten minutes. The details are in \
+                 q21-data/wallet.log.\n\nIts address: {u}"
+            ));
         });
     }
     println!("  The same node also serves the chain explorer, on the same");
     println!("  port: link at the bottom of the page, or http://{address}/");
     println!();
-    println!("  This window runs the wallet. Leave it open.");
-    println!();
+    // Started by the launcher without a window (`Q21 Wallet.exe`,
+    // `Q21 Wallet.app`): there is no window to leave open or to close, and
+    // these lines go to `q21-data/wallet.log`.
+    let without_window = std::env::var_os("Q21_NO_WINDOW").is_some();
+    if without_window {
+        println!("  The wallet runs in the background, without a window. Launching it");
+        println!("  again opens its page again.");
+        println!();
+        println!("  To stop it: the \"Close the wallet\" button, Info tab.");
+        println!();
+    } else {
+        println!("  This window runs the wallet. Leave it open.");
+        println!();
+    }
 
     // --- How to stop.
     //
@@ -5863,19 +6275,22 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     // user read it as a failure, and stopped daring to stop their wallet.
     //
     // We therefore first give the way that asks no question: the button.
-    println!("  To stop, either:");
-    println!("    - the \"Close the wallet\" button, Info tab;");
-    println!("    - close this window;");
-    // The batch-file question exists only on Windows: elsewhere, mentioning
-    // it made users look for a question that never comes.
-    if cfg!(windows) {
-        println!("    - Ctrl-C here. Windows then asks \"Terminate batch job");
-        println!("      (Y/N)?\": answer Y. This is not an error,");
-        println!("      everything is already saved when this question appears.");
-    } else {
-        println!("    - Ctrl-C here. Everything is saved before the program exits.");
+    // Without a window, the button is the only way, and was given above.
+    if !without_window {
+        println!("  To stop, either:");
+        println!("    - the \"Close the wallet\" button, Info tab;");
+        println!("    - close this window;");
+        // The batch-file question exists only on Windows: elsewhere, mentioning
+        // it made users look for a question that never comes.
+        if cfg!(windows) {
+            println!("    - Ctrl-C here. Windows then asks \"Terminate batch job");
+            println!("      (Y/N)?\": answer Y. This is not an error,");
+            println!("      everything is already saved when this question appears.");
+        } else {
+            println!("    - Ctrl-C here. Everything is saved before the program exits.");
+        }
+        println!();
     }
-    println!();
 
     // 5. The node, with the wallet methods and the token.
     let mut arguments = vec![
@@ -6031,6 +6446,8 @@ fn run_setup(
         "http://127.0.0.1:{}/welcome#{setup_launch_token}",
         server.addr.port()
     );
+    let server = std::sync::Arc::new(server);
+    reopen_target(Some((server.clone(), "/welcome")));
 
     if sealed {
         println!("  This wallet is protected by a passphrase.");
@@ -6045,8 +6462,10 @@ fn run_setup(
 
     if !no_browser {
         if let Err(e) = open_browser(&url) {
-            eprintln!("  The browser could not be opened ({e}).");
-            eprintln!("  Open the address above by hand.");
+            tell_user(&format!(
+                "The browser could not be opened ({e}).\n\n\
+                 Open this address in your browser:\n{url}"
+            ));
         }
     }
 
@@ -6056,6 +6475,8 @@ fn run_setup(
     while !finished.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
+    // The setup page is done: a second launch now waits for the wallet's.
+    reopen_target(None);
 
     // This server does not die right away: the page still queries it to know
     // when the node is listening — it cannot ask the node itself, which is on
@@ -6267,7 +6688,11 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         c.arg(url);
         c
     };
-    c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    let mut child = c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    // Reaped, so that each page opened leaves no zombie process behind.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -6541,6 +6966,63 @@ impl MiningGate {
     }
 }
 
+/// Writes again the bodies of the active chain that the block file lacks,
+/// from memory, and says how many could not be.
+///
+/// The first call goes over the whole chain (a lookup in the in-memory index
+/// per block, no disk read); the following ones over what came since, with a
+/// margin for reorganizations.
+fn repair_archive_holes(
+    node: &q21_core::net::Node,
+    archive: &q21_core::store::BlockArchive,
+    from: &mut u64,
+) {
+    let (found, lost, top) = node.with_chain(|c| {
+        let mut found = Vec::new();
+        let mut lost = 0u64;
+        for h in (*from).max(1)..=c.height() {
+            if let Some(id) = c.active_at(h) {
+                if !archive.contains(&id) {
+                    match c.block_by_id(&id) {
+                        Some(b) => found.push(b),
+                        None => lost += 1,
+                    }
+                }
+            }
+        }
+        (found, lost, c.height())
+    });
+    let mut written = 0usize;
+    for b in &found {
+        match archive.append(b) {
+            Ok(()) => written += 1,
+            Err(e) => eprintln!(
+                "warning: block {} still not written to disk: {e}",
+                b.header.block_id()
+            ),
+        }
+    }
+    if written > 0 {
+        println!("  block file: {written} missing block(s) written again");
+    }
+    if lost > 0 {
+        eprintln!(
+            "warning: {lost} block(s) of the chain are missing from the block file and no \
+             longer in memory. The node keeps running; at its next start it will take the \
+             chain again from the network."
+        );
+    }
+    *from = top.saturating_sub(q21_core::consensus::MAX_REORG_DEPTH);
+}
+
+/// `name.onion` or `name.onion:port`: reachable through Tor only.
+fn is_onion_target(a: &str) -> bool {
+    a.trim()
+        .trim_end_matches(|c: char| c.is_ascii_digit() || c == ':')
+        .to_ascii_lowercase()
+        .ends_with(".onion")
+}
+
 /// Dials what the node lacks: the bootstrap addresses given, then (through
 /// Tor) the onion services learned from peers, then the address book.
 fn dial_missing(
@@ -6557,38 +7039,68 @@ fn dial_missing(
     // has succeeded — and it is precisely when nothing succeeds
     // that they are needed. What the user wrote on the command
     // line must be retried as long as peers are missing.
-    for a in targets {
-        if proxy.is_some() {
-            if let Ok(t) =
-                q21_core::socks::Target::parse(a, q21_core::bootstrap::default_port(network))
-            {
-                if !node.is_connected_to(t.label()) && node.connect_target(&t).is_ok() && !quiet {
-                    println!("  connected to {a} through Tor");
-                }
-            }
-            continue;
-        }
-        if let Ok(addresses) = q21_core::bootstrap::resolve(a, network) {
-            for sa in addresses {
-                if node.is_connected_to(sa) {
-                    continue;
-                }
-                if node.connect(sa).is_ok() {
-                    if !quiet {
-                        println!("  reconnecting to {a} ({sa})");
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    // --- Through Tor, the onion services learned from peers.
     if proxy.is_some() {
+        // --- Through Tor, all at once.
+        //
+        // A connection through Tor can take a minute to fail. One after the
+        // other, a bootstrap server that is down held up every onion service
+        // behind it: with both entry points off, a node took minutes to reach
+        // the hidden node it knew. The bootstrap addresses and the onion
+        // services learned from peers are dialed together, each on its own
+        // thread; the same node reached twice is recognized by its nonce
+        // (see `q21_core::net`).
+        let port = q21_core::bootstrap::default_port(network);
+        let mut jobs: Vec<(
+            String,
+            q21_core::socks::Target,
+            Option<q21_core::wire::OnionAddr>,
+        )> = Vec::new();
+        for a in targets {
+            if let Ok(t) = q21_core::socks::Target::parse(a, port) {
+                if !node.is_connected_to(t.label()) {
+                    jobs.push((a.clone(), t, None));
+                }
+            }
+        }
         let missing = target_peers.saturating_sub(node.peer_count_outbound());
         for o in node.onions_to_try(missing) {
             let t = q21_core::socks::Target::Name(o.host(), o.port);
-            let ok = node.connect_target(&t).is_ok();
-            node.note_onion_result(&o, ok);
+            if jobs.iter().any(|j| j.1 == t) {
+                continue;
+            }
+            jobs.push((o.host(), t, Some(o)));
+        }
+        std::thread::scope(|scope| {
+            for (label, t, onion) in &jobs {
+                scope.spawn(move || {
+                    let ok = node.connect_target(t).is_ok();
+                    if let Some(o) = onion {
+                        node.note_onion_result(o, ok);
+                    }
+                    if ok && !quiet {
+                        println!("  connected to {label} through Tor");
+                    }
+                });
+            }
+        });
+    } else {
+        for a in targets {
+            if is_onion_target(a) {
+                continue;
+            }
+            if let Ok(addresses) = q21_core::bootstrap::resolve(a, network) {
+                for sa in addresses {
+                    if node.is_connected_to(sa) {
+                        continue;
+                    }
+                    if node.connect(sa).is_ok() {
+                        if !quiet {
+                            println!("  reconnecting to {a} ({sa})");
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
     // --- Then the address book, for the remaining slots.

@@ -50,6 +50,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Tor shipped in the archives (see the "Tor" step). The version is the Tor
+  # Expert Bundle of a stable Tor Browser release; the fingerprint is the one
+  # the Tor Project publishes for the "Tor Browser Developers" signing key.
+  # The download is refused unless its signature verifies with that key.
+  TOR_BUNDLE_VERSION: "15.0.25"
+  # The tor inside it, for its license text when the binary cannot tell (an
+  # Intel binary on an ARM runner): see the "Tor" step.
+  TOR_VERSION: "0.4.9.14"
+  TOR_SIGNING_KEY: "EF6E286DDA85EA2A4BA7DE684E2C6E8793298290"
 
 jobs:
   build:
@@ -68,21 +77,25 @@ jobs:
             target: aarch64-apple-darwin
             binary: q21
             archive: q21-macos-arm64.tar.gz
+            tor: macos-aarch64
           - name: macOS (Intel)
             os: macos-latest
             target: x86_64-apple-darwin
             binary: q21
             archive: q21-macos-x86_64.tar.gz
+            tor: macos-x86_64
           - name: Windows
             os: windows-latest
             target: x86_64-pc-windows-msvc
             binary: q21.exe
             archive: q21-windows-x86_64.zip
+            tor: windows-x86_64
           - name: Linux
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: q21
             archive: q21-linux-x86_64.tar.gz
+            tor: linux-x86_64
           # 64-bit ARM Linux: Raspberry Pi 5, Ampere machines, Hetzner CAX
           # servers. Built on an ARM machine and not cross-compiled, like the
           # other four, so the tests run on the architecture they check.
@@ -93,6 +106,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
             binary: q21
             archive: q21-linux-arm64.tar.gz
+            # No stable Tor Expert Bundle exists for 64-bit ARM Linux: a
+            # Raspberry Pi uses the Tor of its system (`apt install tor`).
+            tor: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -185,24 +201,87 @@ jobs:
         shell: bash
         run: |
           set -eu
-          BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
           FAILED=0
-          for PATH_FORM in "$(pwd -P)" "$(pwd)"; do
-            [ -n "$PATH_FORM" ] || continue
-            if grep -a -c -F -- "$PATH_FORM" "$BIN" >/dev/null 2>&1; then
-              echo "::error::the path \"$PATH_FORM\" is written in $BIN; the remapping did not take"
-              FAILED=1
+          # The program, and the launcher without a window that ships with it.
+          LAUNCHER="target/${{ matrix.target }}/release/q21-wallet"
+          [ "${{ runner.os }}" = "Windows" ] && LAUNCHER="$LAUNCHER.exe"
+          for BIN in "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$LAUNCHER"; do
+            for PATH_FORM in "$(pwd -P)" "$(pwd)"; do
+              [ -n "$PATH_FORM" ] || continue
+              if grep -a -c -F -- "$PATH_FORM" "$BIN" >/dev/null 2>&1; then
+                echo "::error::the path \"$PATH_FORM\" is written in $BIN; the remapping did not take"
+                FAILED=1
+              fi
+            done
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              PATH_FORM=$(pwd -W | tr '/' '\\')
+              if grep -a -c -F -- "$PATH_FORM" "$BIN" >/dev/null 2>&1; then
+                echo "::error::the path \"$PATH_FORM\" is written in $BIN; the remapping did not take"
+                FAILED=1
+              fi
             fi
           done
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            PATH_FORM=$(pwd -W | tr '/' '\\')
-            if grep -a -c -F -- "$PATH_FORM" "$BIN" >/dev/null 2>&1; then
-              echo "::error::the path \"$PATH_FORM\" is written in $BIN; the remapping did not take"
-              FAILED=1
-            fi
-          fi
+          BIN="target/${{ matrix.target }}/release/${{ matrix.binary }}"
           [ "$FAILED" -eq 0 ] || exit 1
           echo "no build path in $BIN"
+
+      # --- Tor, so that nobody has to install it.
+      #
+      # The wallet starts it itself when Tor is turned on (see
+      # src/tor_process.rs). It comes from the Tor Project, never from a
+      # mirror we cannot check: the archive is refused unless its signature
+      # verifies with the Tor Browser Developers key, identified by the
+      # fingerprint pinned at the top of this file. The key is fetched by WKD
+      # (the method the Tor Project documents), keys.openpgp.org otherwise;
+      # whatever is fetched, only a signature by that fingerprint is accepted.
+      #
+      # dist.torproject.org keeps only the current releases; older ones move
+      # to archive.torproject.org, tried second.
+      - name: Tor, from the Tor Project, signature verified
+        if: matrix.tor != ''
+        shell: bash
+        run: |
+          set -eu
+          NAME="tor-expert-bundle-${{ matrix.tor }}-${TOR_BUNDLE_VERSION}.tar.gz"
+          mkdir -p tor-download && cd tor-download
+          fetched=0
+          for BASE in "https://dist.torproject.org/torbrowser/${TOR_BUNDLE_VERSION}" \
+                      "https://archive.torproject.org/tor-package-archive/torbrowser/${TOR_BUNDLE_VERSION}"; do
+            if curl -fsSL -o "$NAME" "$BASE/$NAME" && curl -fsSL -o "$NAME.asc" "$BASE/$NAME.asc"; then
+              fetched=1; echo "downloaded from $BASE"; break
+            fi
+          done
+          [ "$fetched" -eq 1 ] || { echo "::error::$NAME could not be downloaded"; exit 1; }
+          command -v gpg >/dev/null || brew install gnupg
+          export GNUPGHOME="$PWD/gnupg"
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          gpg --batch --auto-key-locate nodefault,wkd --locate-keys torbrowser@torproject.org >/dev/null 2>&1 \
+            || curl -fsSL "https://keys.openpgp.org/vks/v1/by-fingerprint/${TOR_SIGNING_KEY}" | gpg --batch --import
+          STATUS=$(gpg --batch --status-fd 1 --verify "$NAME.asc" "$NAME" 2>/dev/null || true)
+          printf '%s\n' "$STATUS" | grep -E '^\[GNUPG:\] (GOODSIG|VALIDSIG|ERRSIG|BADSIG|EXPKEYSIG)' || true
+          if ! printf '%s\n' "$STATUS" | grep -q '^\[GNUPG:\] GOODSIG ' \
+             || ! printf '%s\n' "$STATUS" | grep -q "^\[GNUPG:\] VALIDSIG .*${TOR_SIGNING_KEY}"; then
+            echo "::error::$NAME is not signed by the Tor Browser Developers key ${TOR_SIGNING_KEY}: not shipped"
+            exit 1
+          fi
+          echo "signature verified: ${TOR_SIGNING_KEY}"
+          if command -v sha256sum >/dev/null; then sha256sum "$NAME"; else shasum -a 256 "$NAME"; fi
+          mkdir -p ../tor-bundle
+          tar xzf "$NAME" -C ../tor-bundle
+          cd ../tor-bundle
+          echo "--- bundle contents ---"; find . -maxdepth 3 | sort
+          # The executable is where the bundle puts it, nowhere else.
+          EXE=tor/tor
+          [ "${{ runner.os }}" = "Windows" ] && EXE=tor/tor.exe
+          [ -f "$EXE" ] || { echo "::error::$EXE is not in the bundle"; exit 1; }
+          # Tor's license (3-clause BSD) travels with it. The version comes
+          # from the binary when it runs here, from TOR_VERSION otherwise.
+          V=$(LD_LIBRARY_PATH=tor "$EXE" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+          [ -n "$V" ] || V="$TOR_VERSION"
+          echo "tor $V"
+          curl -fsSL -o TOR-LICENSE.txt "https://gitlab.torproject.org/tpo/core/tor/-/raw/tor-${V}/LICENSE" \
+            || { echo "::error::the license of tor $V could not be downloaded"; exit 1; }
+          echo "$V" > TOR-VERSION.txt
 
       - name: Assemble
         shell: bash
@@ -213,12 +292,36 @@ jobs:
           # REPRODUCING.md travels with the binary: the instructions for
           # verifying a file are useless if they stay on a web page that the
           # person downloading it will not visit.
-          cp README.md JOIN.md WHITEPAPER.md AUDIT.md WALLET.md REPRODUCING.md SUCCESSION.md dist/ 2>/dev/null || true
+          cp README.md JOIN.md WHITEPAPER.md AUDIT.md WALLET.md REPRODUCING.md SUCCESSION.md TOR.md dist/ 2>/dev/null || true
           # The double-click launcher, specific to each system. Without it,
           # the user has to open a command window and type `wallet`, which no
           # desktop application asks for.
+          #
+          # On Windows and macOS, it opens no window at all
+          # (src/bin/q21-wallet.rs): `Q21 Wallet.exe`, and `Q21 Wallet.app`,
+          # a bundle macOS opens without a Terminal. The script launchers stay,
+          # renamed so that they are not taken for the application: they
+          # show what the wallet prints, for whoever wants to see it.
+          LAUNCHER="target/${{ matrix.target }}/release/q21-wallet"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "Q21 Wallet.bat" dist/
+            cp "$LAUNCHER.exe" "dist/Q21 Wallet.exe"
+            cp "Q21 Wallet.bat" "dist/Q21 Wallet - console.bat"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            APP="dist/Q21 Wallet.app"
+            mkdir -p "$APP/Contents/MacOS"
+            cp "$LAUNCHER" "$APP/Contents/MacOS/q21-wallet"
+            chmod +x "$APP/Contents/MacOS/q21-wallet"
+            VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+            plutil -lint "$APP/Contents/Info.plist"
+            # Ad hoc signature of the whole bundle: no identity, but a
+            # consistent one. Unsigned, or with only its executable signed,
+            # a downloaded bundle is reported "damaged" by macOS instead of
+            # "from an unidentified developer", which the guides explain.
+            codesign --force --sign - "$APP"
+            codesign --verify --verbose "$APP"
+            cp "Q21 Wallet.command" "dist/Q21 Wallet - Terminal.command"
+            chmod +x "dist/Q21 Wallet - Terminal.command"
           else
             cp "Q21 Wallet.command" dist/
             chmod +x "dist/Q21 Wallet.command"
@@ -245,6 +348,28 @@ jobs:
           cp default-bootstrap.txt dist/bootstrap.txt
           mkdir -p dist/q21-data
           cp default-bootstrap.txt dist/q21-data/bootstrap.txt
+          # Tor, verified in the previous step: the executable and the files
+          # next to it, the GeoIP tables in tor/data/, and where it comes from.
+          # The pluggable transports (bridges) are left out: they are for
+          # censored networks, and weigh more than Tor itself.
+          if [ -d tor-bundle ]; then
+            TOR_EXE=tor-bundle/tor/tor
+            [ "${{ runner.os }}" = "Windows" ] && TOR_EXE=tor-bundle/tor/tor.exe
+            mkdir -p dist/tor/data
+            find tor-bundle/tor -maxdepth 1 -type f -exec cp {} dist/tor/ \;
+            chmod +x "dist/tor/$(basename "$TOR_EXE")"
+            for G in geoip geoip6; do
+              F=$(find tor-bundle -type f -name "$G" | head -n 1)
+              [ -n "$F" ] && cp "$F" dist/tor/data/
+            done
+            cp tor-bundle/TOR-LICENSE.txt dist/tor/LICENSE.txt
+            # The bundle's own documents (licenses of what Tor is built
+            # with), whole, when it has them.
+            [ -d tor-bundle/docs ] && cp -R tor-bundle/docs dist/tor/docs
+            cp tools/TOR-IN-THIS-ARCHIVE.txt dist/tor/README.txt
+            echo "Tor Expert Bundle ${TOR_BUNDLE_VERSION} (${{ matrix.tor }}), tor $(cat tor-bundle/TOR-VERSION.txt), signature verified with ${TOR_SIGNING_KEY}" >> dist/tor/README.txt
+            echo "--- dist/tor ---"; ls -la dist/tor dist/tor/data
+          fi
           cd dist
           # Explicit `-r` on 7z: how `./*` behaves with a subfolder depends on
           # the version and on the shell that expands the pattern. `q21-data/`
@@ -254,7 +379,9 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a -r "../${{ matrix.archive }}" ./*
           else
-            tar czf "../${{ matrix.archive }}" ./*
+            # No AppleDouble `._` files for extended attributes (macOS tar):
+            # they would clutter the archive and the application bundle.
+            COPYFILE_DISABLE=1 tar czf "../${{ matrix.archive }}" ./*
           fi
 
       # --- Does the archive really contain what we think we put in it?
@@ -288,6 +415,31 @@ jobs:
               MISSING=1
             fi
           done
+          # The launcher without a window, on the systems that have one.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            printf '%s\n' "$LISTING" | tr -d '\r' | grep -qF "Q21 Wallet.exe" \
+              || { echo "::error::Q21 Wallet.exe is missing from ${{ matrix.archive }}"; MISSING=1; }
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            for EXPECTED in "Q21 Wallet.app/Contents/MacOS/q21-wallet" "Q21 Wallet.app/Contents/Info.plist"; do
+              printf '%s\n' "$LISTING" | grep -qF "$EXPECTED" \
+                || { echo "::error::$EXPECTED is missing from ${{ matrix.archive }}"; MISSING=1; }
+            done
+          fi
+          # Tor, on the platforms that ship it: the switch in the wallet does
+          # nothing visible without it.
+          if [ -n "${{ matrix.tor }}" ]; then
+            # 7z lists Windows paths with backslashes: both separators.
+            for EXPECTED in 'tor[/\\]README\.txt' 'tor[/\\]LICENSE\.txt' 'tor[/\\]data[/\\]geoip$'; do
+              if ! printf '%s\n' "$LISTING" | tr -d '\r' | grep -qE -- "$EXPECTED"; then
+                echo "::error::$EXPECTED is missing from ${{ matrix.archive }}"
+                MISSING=1
+              fi
+            done
+            if ! printf '%s\n' "$LISTING" | tr -d '\r' | grep -qE 'tor[/\\]tor(\.exe)?$'; then
+              echo "::error::the tor executable is missing from ${{ matrix.archive }}"
+              MISSING=1
+            fi
+          fi
           [ "$MISSING" -eq 0 ] || exit 1
           echo "archive complete."
 
@@ -506,9 +658,13 @@ jobs:
             Download the archive for your system, unzip it, then
             **double-click the launcher**:
 
-            - Windows: `Q21 Wallet.bat`
-            - macOS: `Q21 Wallet.command`
+            - Windows: `Q21 Wallet.exe`
+            - macOS: `Q21 Wallet.app`
             - Linux: `./q21 wallet` in a terminal
+
+            No window opens: the wallet is the page in your browser. Launched
+            again, it opens its page again; it stops with the "Close the
+            wallet" button, Info tab.
 
             The archive already contains `bootstrap.txt`, a plain-text file
             naming the testnet entry point: there is nothing to type. The
@@ -525,6 +681,16 @@ jobs:
             recover your funds if this disk is lost — and it is enough: on a
             new machine, that code alone restores the whole wallet, addresses
             included.
+
+            ### Tor, included
+
+            The Windows, macOS and Linux x86_64 archives carry Tor, in the
+            `tor/` folder: the Tor Expert Bundle published by the Tor Project,
+            unchanged, its signature verified against the Tor Browser
+            Developers key before it is packed (`tor/README.txt`). In the
+            wallet, **Network** tab, one switch: every connection then goes
+            through Tor, and nothing else needs installing. On a Raspberry Pi,
+            install Tor with `sudo apt install tor`. See `TOR.md`.
 
             ### Once inside
 
@@ -543,11 +709,11 @@ jobs:
 
             ### These files are not code-signed
 
-            macOS blocks the launcher ("unidentified developer") or offers to
-            move it to the Trash. Don't: open System Settings, Privacy &
+            macOS blocks `Q21 Wallet.app` ("unidentified developer") or offers
+            to move it to the Trash. Don't: open System Settings, Privacy &
             Security, scroll to the bottom, "Open Anyway". Once is enough: the
-            launcher then removes the quarantine from the rest of the folder
-            itself. Before macOS 15, right-click the launcher and choose
+            application then removes the quarantine from the rest of the
+            folder itself. Before macOS 15, right-click the launcher and choose
             "Open".
 
             Windows shows a SmartScreen warning: "More info", then

@@ -1349,6 +1349,25 @@ impl Wallet {
                 .cmp(&a.1.value.units())
                 .then(a.0.cmp(&b.0))
         });
+        // --- One pending coin rather than a handful of crumbs (0.4.8).
+        //
+        // Confirmed coins come first, which is right as long as one of them
+        // covers the payment. When the large ones are all held by pending
+        // sends, the remaining confirmed coins are often crumbs received from
+        // others: a payment of 0.01 Q21 then took fifteen of them, a fifteen
+        // times heavier transaction, and full blocks carried 17 payments
+        // instead of 200. The change of a pending send that covers the
+        // payment on its own is kept aside, to replace them.
+        let single_pending = pending_coins
+            .iter()
+            .filter(|e| e.1.value.units() >= needed)
+            .min_by(|a, b| {
+                a.1.value
+                    .units()
+                    .cmp(&b.1.value.units())
+                    .then(a.0.cmp(&b.0))
+            })
+            .copied();
         available.extend(pending_coins);
         let max_inputs = self.max_inputs();
 
@@ -1379,6 +1398,15 @@ impl Wallet {
             }
             total += e.1.value.units();
             chosen.push(e);
+        }
+        // More than a few confirmed crumbs — or more than a transaction can
+        // carry — while one pending coin would do on its own.
+        const FEW_INPUTS: usize = 2;
+        if total < needed || chosen.len() > FEW_INPUTS {
+            if let Some(single) = single_pending {
+                total = single.1.value.units();
+                chosen = vec![single];
+            }
         }
         if total < needed {
             if usable >= needed {

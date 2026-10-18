@@ -506,8 +506,10 @@ impl AddrStore {
 /// Kept apart from the IPv4 book: an onion name has no network group, and
 /// it is only of use to a node that goes through Tor. Bounded, refreshed in
 /// place, the stalest dropped first; a name that keeps failing is dropped
-/// too. In memory only: a node through Tor learns them again from its
-/// entry points at every start.
+/// too, once it has not been seen for [`ONION_FORGET_AFTER`]. Written to
+/// `onions.dat` at shutdown (see [`save_onions`]): a node that restarts
+/// while the entry points are down still knows where the onion services
+/// are.
 #[derive(Debug, Default)]
 pub struct OnionBook {
     entries: Vec<OnionEntry>,
@@ -522,8 +524,13 @@ pub struct OnionEntry {
 /// Onion names kept at most.
 pub const MAX_ONIONS: usize = 1_000;
 
-/// Failures after which an onion name is forgotten.
+/// Failures after which an onion name may be forgotten.
 pub const MAX_ONION_FAILURES: u32 = 5;
+
+/// An onion name that keeps failing is forgotten only once it has not been
+/// seen for this long: a Raspberry Pi unplugged for an afternoon must not
+/// disappear from every book that knew it.
+pub const ONION_FORGET_AFTER: u64 = 3 * 24 * 3600;
 
 impl OnionBook {
     pub fn len(&self) -> usize {
@@ -575,17 +582,32 @@ impl OnionBook {
         v.into_iter().take(count).map(|e| e.addr.clone()).collect()
     }
 
-    pub fn note_failure(&mut self, name: &str, port: u16) {
+    pub fn note_failure(&mut self, name: &str, port: u16, now: u64) {
         if let Some(pos) = self
             .entries
             .iter()
             .position(|e| e.addr.name == name && e.addr.port == port)
         {
-            self.entries[pos].failures += 1;
-            if self.entries[pos].failures >= MAX_ONION_FAILURES {
+            let e = &mut self.entries[pos];
+            e.failures = e.failures.saturating_add(1);
+            if e.failures >= MAX_ONION_FAILURES
+                && now.saturating_sub(e.addr.last_seen) > ONION_FORGET_AFTER
+            {
                 self.entries.swap_remove(pos);
             }
         }
+    }
+
+    /// The names to dial first: those that answered, then the freshest.
+    pub fn to_try(&self) -> Vec<crate::wire::OnionAddr> {
+        let mut v: Vec<&OnionEntry> = self.entries.iter().collect();
+        v.sort_by(|a, b| {
+            a.failures
+                .cmp(&b.failures)
+                .then(b.addr.last_seen.cmp(&a.addr.last_seen))
+                .then(a.addr.name.cmp(&b.addr.name))
+        });
+        v.into_iter().map(|e| e.addr.clone()).collect()
     }
 
     pub fn note_success(&mut self, name: &str, port: u16, now: u64) {
@@ -598,6 +620,45 @@ impl OnionBook {
             e.addr.last_seen = now;
         }
     }
+}
+
+/// Writes the onion names to `path`, one per line: name, port, last seen.
+/// Through a temporary file and a rename: a shutdown in the middle leaves the
+/// previous file, never half of one.
+pub fn save_onions(path: &Path, names: &[crate::wire::OnionAddr]) -> std::io::Result<()> {
+    let mut text = String::from("# q21 onion addresses: name port last_seen\n");
+    for a in names.iter().take(MAX_ONIONS) {
+        text.push_str(&format!("{} {} {}\n", a.host(), a.port, a.last_seen));
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Reads what [`save_onions`] wrote. A line that does not parse, a name that
+/// is not a valid v3 onion address or a port of 0 is skipped: the file is
+/// read back as the network would be, not trusted.
+pub fn load_onions(path: &Path, now: u64) -> Vec<crate::wire::OnionAddr> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let name = it.next()?;
+            let port: u16 = it.next()?.parse().ok()?;
+            let seen: u64 = it.next()?.parse().ok()?;
+            let mut a = crate::wire::OnionAddr::parse(name, port)?;
+            if port == 0 {
+                return None;
+            }
+            a.port = port;
+            a.last_seen = seen.min(now);
+            Some(a)
+        })
+        .take(MAX_ONIONS)
+        .collect()
 }
 
 #[cfg(test)]
@@ -806,6 +867,26 @@ mod tests {
     }
 
     #[test]
+    fn onion_names_survive_a_restart_and_bad_lines_are_skipped() {
+        let d = std::env::temp_dir().join(format!("q21-onions-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let p = d.join("onions.dat");
+        save_onions(&p, &[onion('a', 21121, 50), onion('b', 21500, 70)]).expect("write");
+        let mut text = std::fs::read_to_string(&p).unwrap();
+        text.push_str("notanonion 21121 5\n");
+        text.push_str(&format!("{} 0 5\n", onion('c', 0, 0).host()));
+        text.push_str(&format!("{} 21121 99999999999\n", onion('e', 0, 0).host()));
+        std::fs::write(&p, text).unwrap();
+        let back = load_onions(&p, 1_000);
+        assert_eq!(back.len(), 3, "{back:?}");
+        assert_eq!(back[0], onion('a', 21121, 50));
+        assert_eq!(back[1].port, 21500);
+        assert_eq!(back[2].last_seen, 1_000, "no date from the future");
+        assert!(load_onions(&d.join("absent.dat"), 1_000).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn the_onion_book_is_bounded_fresh_and_forgetful() {
         let mut b = OnionBook::default();
         b.add(onion('a', 21121, 10), 100);
@@ -815,9 +896,24 @@ mod tests {
         b.add(onion('b', 21121, u64::MAX), 100);
         assert!(b.to_announce(5)[0].last_seen <= 100 + FUTURE_TOLERANCE);
         for _ in 0..MAX_ONION_FAILURES {
-            b.note_failure(&onion('b', 0, 0).name, 21121);
+            b.note_failure(&onion('b', 0, 0).name, 21121, 200);
         }
-        assert_eq!(b.len(), 1, "a name that keeps failing is forgotten");
+        assert_eq!(
+            b.len(),
+            2,
+            "a name seen recently is kept despite its failures"
+        );
+        assert_eq!(
+            b.to_try()[0].name,
+            onion('a', 0, 0).name,
+            "the failing one comes last"
+        );
+        b.note_failure(&onion('b', 0, 0).name, 21121, 10_000_000);
+        assert_eq!(
+            b.len(),
+            1,
+            "a name that keeps failing, unseen for days, is forgotten"
+        );
         for k in 0..(MAX_ONIONS as u64 + 10) {
             let mut o = onion('c', 1, k);
             o.name = format!("{:0>55}d", k)

@@ -287,11 +287,33 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 pub struct ServerHandle {
     pub addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    launch_token: Option<SharedLaunchToken>,
 }
 
 impl ServerHandle {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Arms a new one-time launch token, replacing the previous one, used or
+    /// not. This is how a running wallet opens its page again when it is
+    /// launched a second time: the new address carries a token that is
+    /// worth one exchange, within [`LAUNCH_TOKEN_VALIDITY`], like the first.
+    /// Returns `false` on a server started without launch tokens.
+    pub fn rearm_launch_token(&self, secret: String) -> bool {
+        let Some(slot) = &self.launch_token else {
+            return false;
+        };
+        match slot.lock() {
+            Ok(mut g) => {
+                *g = Some(LaunchToken {
+                    secret,
+                    created: std::time::Instant::now(),
+                });
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -435,6 +457,7 @@ where
             created: std::time::Instant::now(),
         })))
     });
+    let launch_slot = launch_token.clone();
     // Counter of connections in progress: without it, a connection cost one
     // system thread, with no cap.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -507,7 +530,11 @@ where
         }
     });
 
-    Ok(ServerHandle { addr: local, stop })
+    Ok(ServerHandle {
+        addr: local,
+        stop,
+        launch_token: launch_slot,
+    })
 }
 
 /// What the kernel knows about the account holding the other end of a
@@ -2026,6 +2053,45 @@ mod tests {
         );
         assert!(r.contains("client=Some(198.51.100.7)"), "{r}");
         h.shutdown();
+    }
+
+    /// A wallet launched a second time arms a new launch token: it opens the
+    /// page once, the old one opens nothing.
+    #[test]
+    fn a_rearmed_launch_token_opens_the_page_once_more() {
+        let h = serve_with_launch_token(
+            "127.0.0.1:0",
+            "session-token".into(),
+            "first".into(),
+            &["/wallet"],
+            echo(),
+        )
+        .expect("startup");
+        let exchange = |secret: &str| {
+            request(
+                h.addr,
+                &format!(
+                    "POST {SESSION_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                     Content-Type: application/json\r\nContent-Length: 0\r\n\
+                     Authorization: Bearer {secret}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+        };
+        assert!(exchange("first").starts_with("HTTP/1.1 200"));
+        assert!(h.rearm_launch_token("second".into()));
+        assert!(exchange("first").starts_with("HTTP/1.1 401"), "the old one");
+        assert!(
+            exchange("second").starts_with("HTTP/1.1 200"),
+            "the new one"
+        );
+        assert!(exchange("second").starts_with("HTTP/1.1 401"), "once only");
+        h.shutdown();
+        let plain = serve("127.0.0.1:0", Some("t".into()), echo()).expect("startup");
+        assert!(
+            !plain.rearm_launch_token("x".into()),
+            "no launch tokens here"
+        );
+        plain.shutdown();
     }
 
     /// The launch token is exchanged once, and is then worth nothing.

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Q21 Wallet.app: the wallet launcher without a Terminal (src/bin/q21-wallet.rs).
+  The release workflow copies this file into the bundle and replaces the
+  version marker with the version of Cargo.toml.
+  LSUIElement: no Dock icon and no menu bar. The wallet is the page in the
+  browser; the launcher only waits for it, out of sight.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>Q21 Wallet</string>
+  <key>CFBundleExecutable</key>
+  <string>q21-wallet</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.q21.wallet</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Q21 Wallet</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.13</string>
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

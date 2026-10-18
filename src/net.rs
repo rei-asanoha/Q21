@@ -654,6 +654,9 @@ struct Peer {
     mempool_offered: bool,
     /// Protocol version the peer announced (0 before its `version`).
     version: u32,
+    /// The nonce this peer introduced itself with: two connections that
+    /// carry the same one lead to the same node. See the `Version` arm.
+    remote_nonce: Option<u64>,
 }
 
 impl Peer {
@@ -814,6 +817,10 @@ struct Shared {
     book: AddrBook,
     /// Onion service addresses (protocol 4): see [`crate::addr::OnionBook`].
     onions: crate::addr::OnionBook,
+    /// Addresses found to lead to a node this one is already connected to
+    /// (same nonce, through Tor), with that nonce. Bounded: see the
+    /// `Version` arm.
+    aliases: HashMap<SocketAddr, u64>,
     peers: HashMap<u64, Peer>,
     network: Network,
     /// The node's nonce: used to detect a connection to oneself.
@@ -906,6 +913,10 @@ pub struct Node {
     proxy: Arc<std::sync::RwLock<Option<SocketAddr>>>,
     /// This node's own onion service, announced to protocol-4 peers.
     own_onion: Arc<std::sync::RwLock<Option<crate::wire::OnionAddr>>>,
+    /// The labels of the bootstrap addresses the operator configured. Only a
+    /// link to one of them can make a later link to the same node redundant:
+    /// see the `Version` arm.
+    configured: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
 }
 
 #[derive(Default, Debug)]
@@ -973,6 +984,7 @@ impl Node {
                 // network address travel from book to book (0.4.7).
                 book: AddrBook::new(matches!(network, Network::Regtest)),
                 onions: crate::addr::OnionBook::default(),
+                aliases: HashMap::new(),
                 peers: HashMap::new(),
                 network,
                 nonce,
@@ -986,6 +998,15 @@ impl Node {
             stats: Arc::new(Stats::default()),
             proxy: Arc::new(std::sync::RwLock::new(None)),
             own_onion: Arc::new(std::sync::RwLock::new(None)),
+            configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Records the bootstrap addresses the operator configured, by the
+    /// label their links are filed under (see `socks::Target::label`).
+    pub fn set_configured_targets(&self, labels: Vec<SocketAddr>) {
+        if let Ok(mut g) = self.configured.write() {
+            *g = labels.into_iter().collect();
         }
     }
 
@@ -1014,12 +1035,15 @@ impl Node {
         let own = self.own_onion();
         let g = self.shared.lock().unwrap();
         g.onions
-            .to_announce(crate::addr::MAX_ONIONS)
+            .to_try()
             .into_iter()
             .filter(|a| own.as_ref().map(|o| o.name != a.name).unwrap_or(true))
             .filter(|a| {
                 let label = crate::socks::Target::Name(a.host(), a.port).label();
-                !g.peers.values().any(|p| p.addr == label)
+                let alias_of = g.aliases.get(&label).copied();
+                !g.peers
+                    .values()
+                    .any(|p| p.addr == label || (alias_of.is_some() && p.remote_nonce == alias_of))
             })
             .take(count)
             .collect()
@@ -1030,8 +1054,28 @@ impl Node {
         if ok {
             g.onions.note_success(&a.name, a.port, unix_now());
         } else {
-            g.onions.note_failure(&a.name, a.port);
+            g.onions.note_failure(&a.name, a.port, unix_now());
         }
+    }
+
+    /// The onion names known, to write at shutdown.
+    pub fn onion_entries(&self) -> Vec<crate::wire::OnionAddr> {
+        self.shared
+            .lock()
+            .unwrap()
+            .onions
+            .to_announce(crate::addr::MAX_ONIONS)
+    }
+
+    /// Pours onion names back into the book: from `onions.dat` at startup.
+    pub fn seed_onions(&self, v: Vec<crate::wire::OnionAddr>) -> usize {
+        let mut g = self.shared.lock().unwrap();
+        let now = unix_now();
+        let before = g.onions.len();
+        for a in v {
+            g.onions.add(a, now);
+        }
+        g.onions.len() - before
     }
 
     /// Number of onion names known.
@@ -1308,12 +1352,13 @@ impl Node {
     /// we retry periodically: two links to the same peer waste a slot and
     /// double the traffic without bringing anything.
     pub fn is_connected_to(&self, addr: SocketAddr) -> bool {
-        self.shared
-            .lock()
-            .unwrap()
-            .peers
+        let g = self.shared.lock().unwrap();
+        // An alias of a node we are linked to counts as connected, as long as
+        // that link lasts: dialing it again would only be dropped again.
+        let alias_of = g.aliases.get(&addr).copied();
+        g.peers
             .values()
-            .any(|p| p.addr == addr)
+            .any(|p| p.addr == addr || (alias_of.is_some() && p.remote_nonce == alias_of))
     }
 
     /// Queries silent peers, and frees the slot of those that are dead.
@@ -1612,6 +1657,7 @@ impl Node {
                     consecutive_orphans: 0,
                     mempool_offered: false,
                     version: 0,
+                    remote_nonce: None,
                     last_received: Instant::now(),
                     pending_ping: None,
                     connected_at: Instant::now(),
@@ -1822,7 +1868,47 @@ impl Node {
                     // peer from another era of the protocol too: it would not
                     // validate the same rules, and each would punish the other
                     // for blocks the other considers valid.
-                    if nonce == local_nonce || version < MIN_PROTOCOL_VERSION {
+                    // --- The same node reached twice.
+                    //
+                    // Through Tor, a server named in the bootstrap file by its
+                    // name and by its address is dialed twice: the proxy
+                    // resolves the name, this node never learns that both lead
+                    // to the same machine, and it counts two peers where there
+                    // is one. The nonce gives it away. Only outbound links
+                    // through Tor are compared, and the newer one is dropped:
+                    // a stranger who copied a nonce can never push out a
+                    // connection that was there first.
+                    //
+                    // The nonce is chosen by the remote side, and a stranger
+                    // can copy an entry point's. So a link counts as the
+                    // original only if it goes to an address the operator
+                    // configured: an onion name learned from gossip that
+                    // claims an entry point's nonce never pushes the real
+                    // entry point out.
+                    let configured = self.configured.read();
+                    let is_configured = |a: &SocketAddr| {
+                        configured.as_ref().map(|c| c.contains(a)).unwrap_or(false)
+                    };
+                    let duplicate = self.proxy().is_some()
+                        && g.peers
+                            .get(&id)
+                            .map(|p| p.outbound && !p.version_received)
+                            .unwrap_or(false)
+                        && g.peers.iter().any(|(other, p)| {
+                            *other != id
+                                && p.outbound
+                                && p.remote_nonce == Some(nonce)
+                                && is_configured(&p.addr)
+                        });
+                    if duplicate {
+                        if let Some(addr) = g.peers.get(&id).map(|p| p.addr) {
+                            if g.aliases.len() >= 64 {
+                                g.aliases.clear();
+                            }
+                            g.aliases.insert(addr, nonce);
+                        }
+                    }
+                    if nonce == local_nonce || version < MIN_PROTOCOL_VERSION || duplicate {
                         drop_peer = true;
                     } else {
                         let height = g.chain.height();
@@ -1842,6 +1928,7 @@ impl Node {
                                 p.version_received = true;
                                 p.start_height = start_height;
                                 p.version = version;
+                                p.remote_nonce = Some(nonce);
                                 if !p.version_sent {
                                     p.version_sent = true;
                                     outgoing.push(Outgoing {
@@ -3149,6 +3236,26 @@ impl Node {
     /// Called every [`MEMPOOL_REBROADCAST`] by the node's loop: a peer that
     /// missed one (refused child, connection cut, restart) gets it back.
     /// Returns the number of transactions announced.
+    /// Asks the outbound peers for their addresses again. The address books
+    /// were filled only at the handshake: an onion service that appeared
+    /// afterwards — a Raspberry Pi turned into a hidden node — stayed unknown
+    /// to every node already connected, until its next restart. Called every
+    /// ten minutes; the reply is bounded by each peer's bucket.
+    pub fn ask_addresses(&self) -> usize {
+        let targets: Vec<Arc<Mutex<TcpStream>>> = {
+            let g = self.shared.lock().unwrap();
+            g.peers
+                .values()
+                .filter(|p| p.handshaked && p.outbound)
+                .map(|p| p.writer.clone())
+                .collect()
+        };
+        for s in &targets {
+            let _ = write_message(s, &Message::GetAddr, self.magic);
+        }
+        targets.len()
+    }
+
     pub fn announce_mempool(&self) -> usize {
         let (targets, pending): (Vec<Arc<Mutex<TcpStream>>>, Vec<Hash256>) = {
             let g = self.shared.lock().unwrap();
@@ -3816,6 +3923,7 @@ mod tests {
                 consecutive_orphans: 0,
                 mempool_offered: false,
                 version: 0,
+                remote_nonce: None,
                 last_received: Instant::now(),
                 pending_ping: None,
                 connected_at: Instant::now(),
@@ -4150,6 +4258,7 @@ mod tests_hardening {
                 consecutive_orphans: 0,
                 mempool_offered: false,
                 version: 0,
+                remote_nonce: None,
                 last_received: Instant::now(),
                 pending_ping: None,
                 connected_at: Instant::now(),
@@ -4681,6 +4790,7 @@ mod tests_handler_fuzz {
                 consecutive_orphans: 0,
                 mempool_offered: false,
                 version: 0,
+                remote_nonce: None,
                 last_received: now,
                 pending_ping: None,
                 connected_at: now,
@@ -5506,6 +5616,7 @@ mod tests_handler_review {
                 consecutive_orphans: 0,
                 mempool_offered: false,
                 version: 0,
+                remote_nonce: None,
                 last_received: now,
                 pending_ping: None,
                 connected_at: now,
@@ -5634,6 +5745,59 @@ mod tests_handler_review {
         assert_eq!(n.onions_to_try(5).len(), 1);
         n.set_own_onion(Some(test_onion()));
         assert!(n.onions_to_try(5).is_empty(), "never this node's own");
+    }
+
+    /// Through Tor, the second outbound link to the same node (same nonce) is
+    /// dropped; without Tor, or for inbound links, nothing changes.
+    #[test]
+    fn the_same_node_reached_twice_through_tor_counts_once() {
+        for tor in [true, false] {
+            let n = node();
+            if tor {
+                n.set_proxy(Some(SocketAddr::from(([127, 0, 0, 1], 9))));
+            }
+            let _a = anonymous_peer(&n, 7);
+            let _b = anonymous_peer(&n, 8);
+            let first = {
+                let mut g = n.shared.lock().unwrap();
+                for p in g.peers.values_mut() {
+                    p.outbound = true;
+                }
+                g.peers[&7].addr
+            };
+            let version = |nonce| Message::Version {
+                version: PROTOCOL_VERSION,
+                timestamp: unix_now(),
+                nonce,
+                user_agent: "peer".into(),
+                start_height: 0,
+            };
+            // A gossip-learned link that came first never makes the
+            // configured one redundant: here, 7 is not configured yet.
+            assert!(n.handle(7, version(0x5151)), "the first link is kept");
+            let alias = n.shared.lock().unwrap().peers[&8].addr;
+            if tor {
+                let _c = anonymous_peer(&n, 9);
+                n.shared.lock().unwrap().peers.get_mut(&9).unwrap().outbound = true;
+                assert!(
+                    n.handle(9, version(0x5151)),
+                    "the first link is no configured target: nothing is dropped"
+                );
+                n.shared.lock().unwrap().peers.remove(&9);
+            }
+            n.set_configured_targets(vec![first]);
+            let second = n.handle(8, version(0x5151));
+            if tor {
+                assert!(!second, "the newer link to the same node is dropped");
+                n.shared.lock().unwrap().peers.remove(&8);
+                assert!(
+                    n.is_connected_to(alias),
+                    "its address is not dialed again while the first link lasts"
+                );
+            } else {
+                assert!(second, "without Tor, nothing is compared");
+            }
+        }
     }
 
     /// The Tor counts: an outbound peer filed under an onion name's stand-in
