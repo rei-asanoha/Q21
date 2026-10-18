@@ -614,9 +614,11 @@ it.)*
 
 A node that stops at three in the morning warns no one. The repository's
 `tools/monitor.sh` script reads the height from the local RPC every ten
-minutes; if it has not moved for thirty minutes, or if the RPC no longer
-answers, it restarts the service and — if you give it an **ntfy topic** —
-sends a notification to your phone. Since 0.4.5, a height that stops while
+minutes; if it has not moved for thirty minutes, or if the RPC has not
+answered three runs in a row (half an hour; `Q21_SILENT_RUNS`), it restarts
+the service and — if you give it an **ntfy topic** — sends a notification to
+your phone. Up to 0.4.8 a single silent run was enough, and a node busy for a
+few minutes was restarted in the middle of its work. Since 0.4.5, a height that stops while
 peers are connected and none of them knows a longer chain is not a fault: the
 network is idle (nobody is mining). The service is then left running, and the
 log says so about once an hour. [ntfy](https://ntfy.sh) is free and needs

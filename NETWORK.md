@@ -35,7 +35,8 @@ the Trash**. This is not a malfunction, and refusing is the right reflex on
 its part.
 
 **If you want the wallet**, you have nothing to type: the `Q21 Wallet`
-application removes the quarantine from the whole folder itself before starting.
+application removes the quarantine from the files of the archive itself before
+starting — those files only, not the rest of the folder.
 macOS will block the launcher once — "from an unidentified developer" — and
 **System Settings → Privacy & Security → Open Anyway** settles the matter for
 good. `JOIN.md` describes this step in detail.

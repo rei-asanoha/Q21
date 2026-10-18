@@ -65,6 +65,52 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.8 to 0.4.9
+
+0.4.9 is a drop-in replacement: same protocol (4), same chain, same data
+directory, same wallet file. A 0.4.8 node and a 0.4.9 node talk to each
+other. It comes out of the two-hour endurance test of 18 October 2026: three
+agents at three payments a second each, about 23,000 payments accepted.
+Nothing was lost to the chain itself, but the entry points froze for minutes
+at a time, the wallets showed "no response" all at once, and about 4 % of
+the accepted payments never reached a block.
+
+## What changes
+
+| | 0.4.8 | 0.4.9 |
+|---|---|---|
+| A peer that stops reading (a stalled Tor circuit, a laptop that slept) | Every broadcast wrote to each peer in turn and waited up to 30 seconds on that one; dropping it waited too, while holding the node's lock. A few such peers froze a node for minutes: no block relayed, no wallet answering | Each peer has its own send queue and writer: nobody waits for anybody. A peer that does not read is dropped by its own timeout |
+| A reorganization on a node with the address index (the entry points, every wallet) | The index erased itself and reindexed the whole chain while holding the node's lock: more than ten minutes frozen on the entry points | The index goes back to the fork only, a few blocks at a time, outside the node's lock |
+| A full pool (64 MiB) | A payment paying one unit more pushed out another, and every payment built on it went too: about a thousand accepted payments vanished in the test | A newcomer must pay clearly more than what it pushes out. Payments nothing depends on go first; a chain goes out as a whole only when the newcomer pays clearly more than the chain does on average. The node's own wallet payments are never pushed out of its own pool, even through a reorganization. A newcomer that cannot get in is refused before its signature is checked |
+| A payment that arrives before the one it builds on | Refused, and heard of again only at the next offer of a peer's pool: up to ten minutes | Waits for it, and goes in the moment it arrives |
+| A payment a miner missed | Offered again after ten minutes | After two minutes, one block. A payment refused for a full pool is not downloaded again before the next block |
+| A reorganization deeper than six blocks | The payments of the older abandoned blocks were not put back in the queue | Put back up to twelve blocks deep |
+| A relay passing on many payments | Eight signature checks a second granted to each peer, and what it sent beyond counted as misconduct | Sixteen; a peer is only asked for what that allows, and what it was asked for is never misconduct |
+| A tip that stops moving | Nothing done until the next block arrived | After ten minutes, the peers are asked what follows it |
+| The machine "woke up from sleep" | Every link cut, onion ones included, even on a false alarm | Every peer is pinged; only those that do not answer within twenty seconds are dropped |
+| A wallet through Tor | Reached the entry points both by onion and through Tor exits | Onion first; the exits only with fewer than two onion links |
+| The wallet's log | Silent between two events | A status line every five minutes: height, peers, pool, Tor |
+| The monitor (`tools/monitor.sh`) | Restarted a running node after one run without an answer | After three runs in a row: a busy node is not a dead node |
+| Address and history lookups | Copied the whole mempool under the node's lock | Read it in place |
+| The macOS launchers | Removed the quarantine from the whole folder, including any other download sitting next to it | Only from the files of the archive, by name |
+| The console launchers | `Q21 Wallet - console.bat` and `Q21 Wallet - Terminal.command` next to the application | In the `Troubleshooting` folder, so that they are not opened instead of it |
+
+## Who needs it
+
+Everyone, the entry points first: they are the ones that froze. Then every
+wallet.
+
+On a server, replace the binary and restart the service, then copy the new
+`tools/monitor.sh` over the old one. Its state file gains a companion,
+`state.silent`, in the same directory: nothing to configure. The number of
+silent runs before a restart is `Q21_SILENT_RUNS` (3 by default).
+
+Unzipped over an older folder, the archive leaves the old console
+launchers in place, next to the application: they still work. The new ones
+are in `Troubleshooting`, and the old ones can be deleted.
+
+---
+
 # Upgrading from 0.4.7 to 0.4.8
 
 0.4.8 is a drop-in replacement: same protocol (4), same chain, same data
