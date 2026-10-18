@@ -303,9 +303,13 @@ jobs:
           # renamed so that they are not taken for the application: they
           # show what the wallet prints, for whoever wants to see it.
           LAUNCHER="target/${{ matrix.target }}/release/q21-wallet"
+          # The console variants go into Troubleshooting/ (0.4.9): side by
+          # side with the application, a user double-clicked the script and
+          # saw a Terminal open behind the browser, which looked like a fault.
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "$LAUNCHER.exe" "dist/Q21 Wallet.exe"
-            cp "Q21 Wallet.bat" "dist/Q21 Wallet - console.bat"
+            mkdir -p dist/Troubleshooting
+            cp "Q21 Wallet.bat" "dist/Troubleshooting/Q21 Wallet - console.bat"
           elif [ "${{ runner.os }}" = "macOS" ]; then
             APP="dist/Q21 Wallet.app"
             mkdir -p "$APP/Contents/MacOS"
@@ -320,8 +324,9 @@ jobs:
             # "from an unidentified developer", which the guides explain.
             codesign --force --sign - "$APP"
             codesign --verify --verbose "$APP"
-            cp "Q21 Wallet.command" "dist/Q21 Wallet - Terminal.command"
-            chmod +x "dist/Q21 Wallet - Terminal.command"
+            mkdir -p dist/Troubleshooting
+            cp "Q21 Wallet.command" "dist/Troubleshooting/Q21 Wallet - Terminal.command"
+            chmod +x "dist/Troubleshooting/Q21 Wallet - Terminal.command"
           else
             cp "Q21 Wallet.command" dist/
             chmod +x "dist/Q21 Wallet.command"
@@ -419,8 +424,10 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             printf '%s\n' "$LISTING" | tr -d '\r' | grep -qF "Q21 Wallet.exe" \
               || { echo "::error::Q21 Wallet.exe is missing from ${{ matrix.archive }}"; MISSING=1; }
+            printf '%s\n' "$LISTING" | tr -d '\r' | grep -qE 'Troubleshooting[/\\]Q21 Wallet - console\.bat$' \
+              || { echo "::error::Troubleshooting/Q21 Wallet - console.bat is missing from ${{ matrix.archive }}"; MISSING=1; }
           elif [ "${{ runner.os }}" = "macOS" ]; then
-            for EXPECTED in "Q21 Wallet.app/Contents/MacOS/q21-wallet" "Q21 Wallet.app/Contents/Info.plist"; do
+            for EXPECTED in "Q21 Wallet.app/Contents/MacOS/q21-wallet" "Q21 Wallet.app/Contents/Info.plist" "Troubleshooting/Q21 Wallet - Terminal.command"; do
               printf '%s\n' "$LISTING" | grep -qF "$EXPECTED" \
                 || { echo "::error::$EXPECTED is missing from ${{ matrix.archive }}"; MISSING=1; }
             done

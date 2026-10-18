@@ -34,8 +34,16 @@ rem  down; the Windows question comes afterwards. But no one is asked to trust
 rem  a message that looks like an error: the wallet offers a "Close the
 rem  wallet" button, and closing this window is intercepted as well.
 rem ---------------------------------------------------------------------------
+rem
+rem  Where it lives
+rem
+rem  It ships in the Troubleshooting folder, next to Q21 Wallet.exe rather
+rem  than in its place: it shows in a window what the wallet prints. It finds
+rem  q21.exe next to it, or one folder up.
+rem ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
+if not exist q21.exe cd ..
 title Q21 Wallet
 
 q21.exe wallet

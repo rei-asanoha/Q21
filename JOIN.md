@@ -133,9 +133,10 @@ same wallet opens its page again. To stop the wallet: the **Close the wallet**
 button, **Info** tab. If something goes wrong at startup, a dialog box says
 what, and the whole message is in `q21-data/wallet.log`.
 
-`Q21 Wallet - console.bat` (Windows) and `Q21 Wallet - Terminal.command` (Mac)
-do the same with a window that shows what the wallet prints, for whoever
-wants to see it.
+In the `Troubleshooting` folder, `Q21 Wallet - console.bat` (Windows) and
+`Q21 Wallet - Terminal.command` (Mac) do the same with a window that shows
+what the wallet prints, for whoever wants to see it. Use one or the other,
+not both at once.
 
 **Copy the backup code onto paper.** It is the only way to recover your funds
 if this disk is lost — and it is all you need: on a brand-new computer, that

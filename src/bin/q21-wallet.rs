@@ -35,6 +35,27 @@ use std::time::{Duration, Instant};
 
 const LOG_NAME: &str = "wallet.log";
 
+/// What the release archive ships next to the launcher, by name: the files
+/// whose quarantine mark the launcher removes on macOS, and nothing else.
+/// Keep in step with the "Assemble" step of `.github/workflows/release.yml`.
+#[cfg(any(target_os = "macos", test))]
+const ARCHIVE_ENTRIES: &[&str] = &[
+    "q21",
+    "Q21 Wallet.app",
+    "Troubleshooting",
+    "tor",
+    "bootstrap.txt",
+    "q21-data/bootstrap.txt",
+    "README.md",
+    "JOIN.md",
+    "WHITEPAPER.md",
+    "AUDIT.md",
+    "WALLET.md",
+    "REPRODUCING.md",
+    "SUCCESSION.md",
+    "TOR.md",
+];
+
 /// How long the launcher watches the wallet before leaving it: long enough
 /// for the wallet to fail to start (a program that cannot run, a folder in
 /// use: within a second or two), short enough not to stand in the way of the
@@ -70,15 +91,24 @@ fn main() {
     {
         // Every file a browser downloads carries a quarantine mark, and macOS
         // refuses to run a program that carries it without asking. The
-        // launcher was allowed by the user; the rest of the folder is
-        // released here, once, as `Q21 Wallet - Terminal.command` does.
-        let _ = Command::new("/usr/bin/xattr")
-            .arg("-dr")
-            .arg("com.apple.quarantine")
-            .arg(&folder)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // launcher was allowed by the user; the files of the archive are
+        // released here, once, as `Troubleshooting/Q21 Wallet - Terminal.command`
+        // does — by name. Up to 0.4.8 the whole folder was: unpacked straight
+        // into Downloads, that released every other file downloaded there.
+        let shipped: Vec<PathBuf> = ARCHIVE_ENTRIES
+            .iter()
+            .map(|name| folder.join(name))
+            .filter(|p| p.exists())
+            .collect();
+        if !shipped.is_empty() {
+            let _ = Command::new("/usr/bin/xattr")
+                .arg("-dr")
+                .arg("com.apple.quarantine")
+                .args(&shipped)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 
     let data = folder.join("q21-data");
@@ -361,5 +391,26 @@ mod tests {
             "(the wallet printed nothing)"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod tests_archive {
+    use super::ARCHIVE_ENTRIES;
+
+    /// The launcher releases from quarantine what the release ships, and
+    /// nothing else: each name it knows is put in the archive by the
+    /// release pipeline.
+    #[test]
+    fn the_archive_entries_are_those_the_release_ships() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        for entry in ARCHIVE_ENTRIES {
+            let name = entry.rsplit('/').next().unwrap();
+            assert!(
+                workflow.contains(name),
+                "{entry} is not put in the archive by release.yml"
+            );
+        }
+        assert!(!ARCHIVE_ENTRIES.contains(&"."), "never the whole folder");
     }
 }

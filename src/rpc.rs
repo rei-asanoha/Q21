@@ -93,8 +93,9 @@ fn mempool_message(e: &crate::mempool::MempoolError) -> String {
             "transaction too heavy to fit in a block: {size} bytes, \
              weight {weight}. Send an amount that needs fewer inputs."
         ),
-        M::FullAndUnderpaid => "the mempool is full and this transaction pays less \
-             than the lowest bidder. Raise the fee."
+        M::FullAndUnderpaid => "the mempool is full, and this transaction does not pay \
+             clearly more than the ones it would push out. Raise the fee, or send again \
+             after the next block: each one makes room."
             .to_string(),
         M::Validation(v) => format!("rejected by validation: {v:?}"),
     }

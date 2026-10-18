@@ -36,11 +36,29 @@
 #  "from an unidentified developer". That is the only step left to the user,
 #  and it is documented in JOIN.md. Once allowed, everything else goes
 #  through here.
+#
+#  Only the files of the archive (0.4.9)
+#
+#  Up to 0.4.8 the mark was removed from the whole folder. Unpacked straight
+#  into Downloads, that released every other file downloaded there, which
+#  macOS had good reason to keep an eye on. Only what this archive ships is
+#  released now, by name.
+#
+#  Where it lives
+#
+#  On macOS this launcher ships in the Troubleshooting folder, next to the
+#  application rather than in its place: it shows in a Terminal what the
+#  wallet prints. It finds `q21` next to it, or one folder up.
 # ---------------------------------------------------------------------------
 cd "$(dirname "$0")" || exit 1
+[ -f ./q21 ] || cd .. || exit 1
 
-# Remove the quarantine on the whole folder, quietly if there is nothing to remove.
-xattr -dr com.apple.quarantine . 2>/dev/null || true
+# The files of the archive, by name, quietly if there is nothing to remove.
+for f in q21 "Q21 Wallet.app" "Q21 Wallet.command" Troubleshooting tor \
+         bootstrap.txt q21-data/bootstrap.txt README.md JOIN.md WHITEPAPER.md \
+         AUDIT.md WALLET.md REPRODUCING.md SUCCESSION.md TOR.md; do
+  [ -e "$f" ] && xattr -dr com.apple.quarantine "$f" 2>/dev/null
+done
 # The archive keeps the execute permission; we set it again to be safe.
 chmod +x ./q21 2>/dev/null || true
 

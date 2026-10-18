@@ -293,16 +293,26 @@ fn release_puts_the_bootstrap_file_in_the_archive() {
 /// opened" on `q21` — a message that blames the file and sends the newcomer to
 /// the Trash. The step it performs is the one NETWORK.md used to ask for by
 /// hand; there was no reason to leave it to the user.
+///
+/// Since 0.4.9, from the files of the archive only, by name: removing it from
+/// the whole folder released every other download sitting next to it when the
+/// archive was unpacked straight into Downloads.
 #[test]
 fn macos_launcher_removes_the_quarantine() {
     let launcher = read("Q21 Wallet.command");
     assert!(
-        launcher.contains("xattr -dr com.apple.quarantine ."),
-        "the macOS launcher no longer removes the quarantine: q21 will be \
+        launcher.contains("for f in q21 ")
+            && launcher.contains("xattr -dr com.apple.quarantine \"$f\""),
+        "the macOS launcher no longer removes the quarantine from q21: it will be \
          \"damaged\" at every first launch."
     );
     assert!(
-        launcher.contains("2>/dev/null || true"),
+        !launcher.contains("xattr -dr com.apple.quarantine ."),
+        "the quarantine must be removed from the archive's files, not from the \
+         whole folder and whatever else was downloaded into it."
+    );
+    assert!(
+        launcher.contains("\"$f\" 2>/dev/null"),
         "removing the quarantine must stay silent where there is nothing to \
          remove, otherwise the launcher stops on Linux or after an archive \
          opened from the Terminal."
