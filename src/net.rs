@@ -393,7 +393,13 @@ pub const FLOOD_INPUT_THRESHOLD: u64 = 16;
 /// verification work a peer can impose is bounded to ~0.33 ms per unit, that
 /// is a negligible fraction of a core, while an ordinary transaction (one or
 /// two inputs) is still served unhindered.
-pub const TX_RATE_PER_SEC: u64 = 8;
+///
+/// Sixteen since 0.4.9, eight before. In the endurance test, an entry point
+/// relaying three agents to a wallet passed on nine payments a second, about
+/// twelve verifications: more than one peer's budget, for a peer doing nothing
+/// but its job. Sixteen covers that with room to spare, and still bounds what
+/// one peer can impose to about five milliseconds of verification a second.
+pub const TX_RATE_PER_SEC: u64 = 16;
 
 /// Inputs announced at most when the pool is offered to a peer, at the
 /// handshake and every [`MEMPOOL_REBROADCAST`] (see
@@ -415,9 +421,17 @@ pub const MEMPOOL_ANNOUNCE_INPUTS: u64 = TX_BUCKET_MAX / 4;
 /// it again.
 pub const MEMPOOL_REBROADCAST: Duration = Duration::from_secs(120);
 
-/// Transactions remembered as requested from one peer. Beyond, the memory is
-/// cleared: a peer then pays for its overruns as before.
-pub const MAX_REQUESTED_TXS: usize = 4 * TX_BUCKET_MAX as usize;
+/// Transactions requested from one peer and not yet received, at most. Fewer
+/// in practice: a request is only made within the peer's budget.
+pub const MAX_REQUESTED_TXS: usize = TX_BUCKET_MAX as usize;
+
+/// Transactions remembered as refused until the next block. See
+/// `Shared::rejected`.
+pub const MAX_RECENT_REJECTS: usize = 20_000;
+
+/// How long a transaction request is remembered. A peer that announced a
+/// transaction and no longer has it never answers; its slot is freed.
+pub const TX_REQUEST_MEMORY: Duration = Duration::from_secs(60);
 
 /// How long after connecting a peer that was behind gets the pool offered.
 ///
@@ -483,6 +497,14 @@ impl TokenBucket {
             tokens: CMPCT_BUCKET_MAX,
             last: now,
         }
+    }
+
+    /// Units the bucket holds now, refill included. Removes nothing.
+    pub fn level(&self, now: Instant, max: u64, rate: u64) -> u64 {
+        let elapsed = now.saturating_duration_since(self.last).as_millis() as u64;
+        self.tokens
+            .saturating_add(elapsed.saturating_mul(rate) / 1000)
+            .min(max)
     }
 
     /// Would the bucket grant `cost` units now? Removes nothing.
@@ -656,7 +678,7 @@ struct Peer {
     /// Transactions we asked this peer for and that have not arrived yet.
     /// Sending them is no misconduct, budget or not: see the `Tx` arm.
     /// Bounded by [`MAX_REQUESTED_TXS`].
-    requested_txs: HashSet<Hash256>,
+    requested_txs: HashMap<Hash256, Instant>,
     /// Instant the connection was opened, fixed at creation. Used for the
     /// handshake deadline: see [`HANDSHAKE_TIMEOUT`]. Unlike `last_received`,
     /// no frame pushes it back — a connection that does not introduce itself
@@ -844,6 +866,15 @@ struct Shared {
     /// (same nonce, through Tor), with that nonce. Bounded: see the
     /// `Version` arm.
     aliases: HashMap<SocketAddr, u64>,
+    /// Transactions refused since the tip `rejected_at` for a reason only a
+    /// new block can change — full pool, conflict, fee too low — so that they
+    /// are not downloaded again at every offer. Bounded by
+    /// [`MAX_RECENT_REJECTS`]; emptied when the tip moves.
+    rejected: HashSet<Hash256>,
+    rejected_at: Hash256,
+    /// Transactions that arrived before their parent. See
+    /// [`crate::mempool::OrphanPool`].
+    orphans: crate::mempool::OrphanPool,
     peers: HashMap<u64, Peer>,
     network: Network,
     /// The node's nonce: used to detect a connection to oneself.
@@ -990,6 +1021,11 @@ pub struct Stats {
     /// Requested transactions that arrived beyond the peer's budget: dropped,
     /// never penalized.
     pub solicited_over_budget: AtomicU64,
+    /// Transactions announced by a peer and not requested from it, for lack
+    /// of budget: they come again with the next offer.
+    pub tx_requests_deferred: AtomicU64,
+    /// Transactions that arrived before their parent and went in once it did.
+    pub orphans_adopted: AtomicU64,
 }
 
 impl Node {
@@ -1014,6 +1050,9 @@ impl Node {
                 book: AddrBook::new(matches!(network, Network::Regtest)),
                 onions: crate::addr::OnionBook::default(),
                 aliases: HashMap::new(),
+                rejected: HashSet::new(),
+                rejected_at: Hash256::ZERO,
+                orphans: crate::mempool::OrphanPool::new(),
                 peers: HashMap::new(),
                 network,
                 nonce,
@@ -1364,15 +1403,19 @@ impl Node {
     /// moment loses it — and a node that missed a block only heard of the
     /// chain again at the next one. In the endurance test, a wallet stayed at
     /// one height while the network moved on. One `getheaders` per peer
-    /// costs a few hundred bytes; a peer with nothing new answers an empty
-    /// list. Returns the number of peers asked.
+    /// costs a few hundred bytes; a peer with nothing new sends nothing back,
+    /// and is not asked again while that request is outstanding. Returns the
+    /// number of peers asked.
     pub fn ask_headers_from_all(&self) -> usize {
         let (ids, locator): (Vec<u64>, Vec<Hash256>) = {
             let g = self.shared.lock().unwrap();
             (
+                // Only peers with no header request outstanding: a peer with
+                // nothing new sends no answer, and asking again would pile up
+                // expected answers that never come.
                 g.peers
                     .iter()
-                    .filter(|(_, p)| p.handshaked)
+                    .filter(|(_, p)| p.handshaked && p.expected_headers == 0)
                     .map(|(id, _)| *id)
                     .collect(),
                 g.chain.locator(),
@@ -1412,7 +1455,9 @@ impl Node {
                 .checked_sub(MAX_SILENCE.saturating_sub(PROBE_GRACE))
                 .unwrap_or(now);
             let mut writers = Vec::new();
-            for p in g.peers.values_mut() {
+            // Established peers only: the others have their handshake
+            // timeout, and a ping must not overtake our `Version`.
+            for p in g.peers.values_mut().filter(|p| p.handshaked) {
                 if p.last_received > deadline {
                     p.last_received = deadline;
                 }
@@ -1422,7 +1467,12 @@ impl Node {
             (writers, g.nonce)
         };
         let n = writers.len();
-        self.broadcast(&writers, &Message::Ping(nonce));
+        let frame = frame_of(&Message::Ping(nonce), self.magic);
+        for w in &writers {
+            // Forced: a peer whose queue is full must still be asked, or a
+            // slow but live one would be dropped for a ping it never got.
+            let _ = w.push_force(frame.clone());
+        }
         n
     }
 
@@ -1608,7 +1658,8 @@ impl Node {
         if !to_ping.is_empty() {
             let frame = frame_of(&Message::Ping(nonce), magic);
             for writer in to_ping {
-                self.queue(&writer, frame.clone());
+                // Forced: its answer is awaited — `pending_ping` is set.
+                let _ = writer.push_force(frame.clone());
             }
         }
         let dropped = dead.len();
@@ -1764,7 +1815,7 @@ impl Node {
                     remote_nonce: None,
                     last_received: Instant::now(),
                     pending_ping: None,
-                    requested_txs: HashSet::new(),
+                    requested_txs: HashMap::new(),
                     connected_at: Instant::now(),
                 },
             );
@@ -1783,7 +1834,7 @@ impl Node {
                 user_agent: "q21:0.4".into(),
                 start_height: height,
             };
-            self.queue(&writer, frame_of(&v, self.magic));
+            let _ = writer.push_force(frame_of(&v, self.magic));
         }
 
         let node = self.clone();
@@ -2310,20 +2361,36 @@ impl Node {
                                 }
                             }
                             InvKind::Tx => {
-                                if !g.mempool.contains(&i.hash) {
+                                let refused = g.rejected_at == g.chain.tip_id()
+                                    && g.rejected.contains(&i.hash);
+                                if !g.mempool.contains(&i.hash) && !refused {
                                     wanted.push(i);
                                 }
                             }
                         }
                     }
+                    // Only what the peer's budget can pay for is requested:
+                    // the rest comes again with the next offer, from it or
+                    // from another peer. A request is remembered for a minute,
+                    // so that its answer is never misconduct (see the `Tx`
+                    // arm) — and bounding the requests by the budget is what
+                    // keeps that exemption from becoming free work.
                     if let Some(p) = g.peers.get_mut(&id) {
-                        if p.requested_txs.len() + wanted.len() > MAX_REQUESTED_TXS {
-                            p.requested_txs.clear();
+                        let now = Instant::now();
+                        p.requested_txs
+                            .retain(|_, at| now.duration_since(*at) < TX_REQUEST_MEMORY);
+                        let room = (p.tx_bucket.level(now, TX_BUCKET_MAX, TX_RATE_PER_SEC)
+                            as usize)
+                            .min(MAX_REQUESTED_TXS)
+                            .saturating_sub(p.requested_txs.len());
+                        if wanted.len() > room {
+                            self.stats
+                                .tx_requests_deferred
+                                .fetch_add((wanted.len() - room) as u64, Ordering::Relaxed);
+                            wanted.truncate(room);
                         }
                         for i in &wanted {
-                            if p.requested_txs.len() < MAX_REQUESTED_TXS {
-                                p.requested_txs.insert(i.hash);
-                            }
+                            p.requested_txs.insert(i.hash, now);
                         }
                     }
                     // Blocks go through the same cap as headers: what has no
@@ -2649,20 +2716,23 @@ impl Node {
                         // In both cases: neither verification nor relay. The work
                         // is bounded because we stop here.
                         //
-                        // A transaction **we asked for** is never misconduct,
-                        // whatever the budget says: a relay that answers our
-                        // own `getdata` is doing its job (0.4.9). Recognizing
-                        // it costs one hash, which an unsolicited flood pays
-                        // ten times at most before the ban. It is dropped all
-                        // the same, and forgotten as requested: sent again, it
-                        // would be unsolicited.
-                        let solicited = g
-                            .peers
-                            .get_mut(&id)
-                            .map(|p| {
-                                !p.requested_txs.is_empty() && p.requested_txs.remove(&t.txid())
-                            })
-                            .unwrap_or(false);
+                        // A small transaction **we asked for** is never
+                        // misconduct, whatever the budget says: a relay that
+                        // answers our own `getdata` is doing its job (0.4.9).
+                        // Recognizing it costs one hash. What we ask for is
+                        // bounded by the budget itself (see the `Inv` arm), so
+                        // the exemption cannot be turned into free work, and an
+                        // answer counts only once: sent again, it would be
+                        // unsolicited. A large one is never penalized anyway,
+                        // and is not even hashed.
+                        let solicited = cost <= FLOOD_INPUT_THRESHOLD
+                            && g.peers
+                                .get_mut(&id)
+                                .map(|p| {
+                                    !p.requested_txs.is_empty()
+                                        && p.requested_txs.remove(&t.txid()).is_some()
+                                })
+                                .unwrap_or(false);
                         if solicited {
                             self.stats
                                 .solicited_over_budget
@@ -2718,8 +2788,34 @@ impl Node {
                                         }]),
                                     });
                                 }
+                                Self::adopt_orphans(&mut g, txid, &self.stats, &mut outgoing);
+                            }
+                            Err(crate::mempool::MempoolError::UnconfirmedDependency(_)) => {
+                                // Its parent has not reached us yet: it waits for
+                                // it, instead of being forgotten until the next
+                                // offer.
+                                g.orphans.add((*t).clone(), id, Instant::now());
                             }
                             Err(e) => {
+                                // Refused until the next block, whatever peer
+                                // offers it again: not downloaded again for
+                                // nothing at every offer (0.4.9, offers every
+                                // two minutes).
+                                if matches!(
+                                    e,
+                                    crate::mempool::MempoolError::FullAndUnderpaid
+                                        | crate::mempool::MempoolError::SpendConflict(_)
+                                        | crate::mempool::MempoolError::FeeRateTooLow { .. }
+                                ) {
+                                    let tip = g.chain.tip_id();
+                                    if g.rejected_at != tip
+                                        || g.rejected.len() >= MAX_RECENT_REJECTS
+                                    {
+                                        g.rejected.clear();
+                                        g.rejected_at = tip;
+                                    }
+                                    g.rejected.insert(txid);
+                                }
                                 // A rejected transaction is not necessarily an
                                 // aggression: it may already be known, or spend
                                 // an output that a block has just consumed. But a
@@ -2987,11 +3083,14 @@ impl Node {
             };
             if let Some(s) = writer {
                 let frame = frame_of(&e.message, self.magic);
-                if e.peer == id {
+                if must_deliver(&e.message) {
+                    // Recorded as sent just above: it must not be dropped.
+                    let _ = s.push_force(frame);
+                } else if e.peer == id {
                     // A reply to the peer whose message we are handling: if it
                     // asks faster than it reads, it waits — only its own read
                     // loop is held, as before, and nobody else.
-                    if s.push_wait(frame, WRITE_TIMEOUT) != Push::Queued {
+                    if s.push_wait(frame) != Push::Queued {
                         self.stats.outbox_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
@@ -3003,6 +3102,51 @@ impl Node {
         }
 
         !drop_peer
+    }
+
+    /// Tries again the orphans waiting for `parent`, and those waiting for
+    /// them in turn, now that `parent` is in the pool or in a block. Each one
+    /// accepted is announced to the established peers but the one that sent
+    /// it. Bounded by the orphan pool: each orphan is taken out once.
+    fn adopt_orphans(g: &mut Shared, parent: Hash256, stats: &Stats, outgoing: &mut Vec<Outgoing>) {
+        if g.orphans.is_empty() {
+            return;
+        }
+        let mut queue = vec![parent];
+        while let Some(p) = queue.pop() {
+            for (tx, from) in g.orphans.take_children(&p) {
+                let height = g.chain.height();
+                let shared = &mut *g;
+                match shared
+                    .mempool
+                    .accept(&tx, &shared.chain.utxo, shared.network, height)
+                {
+                    Ok(id) => {
+                        stats.orphans_adopted.fetch_add(1, Ordering::Relaxed);
+                        let others: Vec<u64> = g
+                            .peers
+                            .iter()
+                            .filter(|(p, e)| **p != from && e.handshaked)
+                            .map(|(p, _)| *p)
+                            .collect();
+                        for peer in others {
+                            outgoing.push(Outgoing {
+                                peer,
+                                message: Message::Inv(vec![InvItem {
+                                    kind: InvKind::Tx,
+                                    hash: id,
+                                }]),
+                            });
+                        }
+                        queue.push(id);
+                    }
+                    Err(crate::mempool::MempoolError::UnconfirmedDependency(_)) => {
+                        g.orphans.add(tx, from, Instant::now());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
     }
 
     /// Submits a block to the chain and prepares its broadcast.
@@ -3203,6 +3347,10 @@ impl Node {
                 // Same rule as when receiving a transaction: the mempool reads
                 // the UTXO set in place, it does not copy it.
                 g.mempool.revalidate(&g.chain.utxo, g.network, height);
+                // Orphans whose parent this block confirms can go in now.
+                for tx in &b.transactions {
+                    Self::adopt_orphans(g, tx.txid(), stats, outgoing);
+                }
 
                 // Broadcast: compact announcement, not the full block.
                 //
@@ -3376,7 +3524,12 @@ impl Node {
             })
         };
         if let Some(s) = writer {
-            self.queue(&s, frame_of(m, self.magic));
+            let frame = frame_of(m, self.magic);
+            if must_deliver(m) {
+                let _ = s.push_force(frame);
+            } else {
+                self.queue(&s, frame);
+            }
         }
     }
 
@@ -3472,6 +3625,22 @@ impl Node {
 /// A message framed for the wire, ready to be shared between queues.
 fn frame_of(m: &Message, magic: [u8; 4]) -> Arc<[u8]> {
     m.frame(magic).into()
+}
+
+/// The small frames that are never dropped from a full queue: their sending
+/// is recorded (`note_sent`, `pending_ping`) or the handshake depends on
+/// them. Dropping a request while noting it as sent would later blame an
+/// honest peer for not answering a question it never received.
+fn must_deliver(m: &Message) -> bool {
+    matches!(
+        m,
+        Message::GetData(_)
+            | Message::GetHeaders { .. }
+            | Message::Ping(_)
+            | Message::Pong(_)
+            | Message::Version { .. }
+            | Message::VerAck
+    )
 }
 
 #[cfg(test)]
@@ -3927,8 +4096,17 @@ mod tests {
         // A second link whose other end never answers: a machine gone.
         let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let s = TcpStream::connect(dead.local_addr().unwrap()).unwrap();
-        b.start_peer(s, true);
+        let dead_id = b.start_peer(s, true);
         assert!(wait_until(|| b.peer_count() == 2, 5));
+        // As if its handshake had completed before the machine went away:
+        // the check is for established links.
+        b.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&dead_id)
+            .unwrap()
+            .handshaked = true;
 
         assert_eq!(b.probe_all_peers(), 2);
         // Within the grace, nobody is dropped yet.
@@ -4134,7 +4312,7 @@ mod tests {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 pending_ping: None,
-                requested_txs: HashSet::new(),
+                requested_txs: HashMap::new(),
                 connected_at: Instant::now(),
             },
         );
@@ -4470,7 +4648,7 @@ mod tests_hardening {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 pending_ping: None,
-                requested_txs: HashSet::new(),
+                requested_txs: HashMap::new(),
                 connected_at: Instant::now(),
             },
         );
@@ -4610,6 +4788,37 @@ mod tests_hardening {
             score(&b),
             2 * MISCONDUCT_MALFORMED,
             "unsolicited still pays"
+        );
+    }
+
+    /// What a peer announces is requested only within its budget: the
+    /// exemption for requested transactions cannot become free work.
+    #[test]
+    fn transaction_requests_stay_within_the_peer_s_budget() {
+        let (_a, b) = node_pair();
+        let _e = established_peer(&b, 7);
+        let items: Vec<InvItem> = (0..600u32)
+            .map(|n| {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&n.to_le_bytes());
+                InvItem {
+                    kind: InvKind::Tx,
+                    hash: Hash256(h),
+                }
+            })
+            .collect();
+        assert!(b.handle(7, Message::Inv(items.clone())));
+        let asked = b.shared.lock().unwrap().peers[&7].requested_txs.len();
+        assert_eq!(asked, TX_BUCKET_MAX as usize);
+        assert_eq!(
+            b.stats.tx_requests_deferred.load(Ordering::Relaxed),
+            600 - TX_BUCKET_MAX
+        );
+        // Announced again at once: nothing more is asked while those wait.
+        assert!(b.handle(7, Message::Inv(items)));
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].requested_txs.len(),
+            asked
         );
     }
 
@@ -5126,7 +5335,7 @@ mod tests_handler_fuzz {
                 remote_nonce: None,
                 last_received: now,
                 pending_ping: None,
-                requested_txs: HashSet::new(),
+                requested_txs: HashMap::new(),
                 connected_at: now,
             },
         );
@@ -5953,7 +6162,7 @@ mod tests_handler_review {
                 remote_nonce: None,
                 last_received: now,
                 pending_ping: None,
-                requested_txs: HashSet::new(),
+                requested_txs: HashMap::new(),
                 connected_at: now,
             },
         );

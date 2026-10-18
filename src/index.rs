@@ -134,15 +134,23 @@ impl Index {
             owners_valid: true,
         };
         if let Ok(raw) = std::fs::read(path) {
-            index.replay(&raw);
+            // A log that stops short — a record cut in half by a power cut —
+            // is rewritten at once, down to its last good record. Left as it
+            // was, every block appended after the bad record would be lost
+            // at the next start, and the index would go back to the same
+            // point at every restart.
+            if !index.replay(&raw) {
+                let _ = index.rewrite_log();
+            }
         }
         index.owners_valid = index.blocks.is_empty();
         index
     }
 
-    fn replay(&mut self, raw: &[u8]) {
+    /// Reads the log back. Returns `false` if it stopped before the end.
+    fn replay(&mut self, raw: &[u8]) -> bool {
         if raw.len() < MAGIC.len() || &raw[..MAGIC.len()] != MAGIC {
-            return;
+            return raw.is_empty();
         }
         let mut p = MAGIC.len();
         while let Some((record, next)) = read_record(raw, p) {
@@ -152,7 +160,7 @@ impl Index {
             // each record taken separately.
             if let Some((last, _)) = self.blocks.last() {
                 if height != last + 1 {
-                    return;
+                    return false;
                 }
             }
             for (rank, (txid, hashes)) in transactions.into_iter().enumerate() {
@@ -168,6 +176,7 @@ impl Index {
             self.blocks.push((height, id));
             p = next;
         }
+        p == raw.len()
     }
 
     /// Rebuilds the owner table from the node's UTXO set.
@@ -446,6 +455,11 @@ impl ChainView for crate::chain::Chain {
     }
 }
 
+/// Transactions copied under the chain's lock in one step at most — beyond
+/// the first block, which is always taken. About seven mebibytes of ML-DSA-87
+/// payments.
+pub const STEP_MAX_TRANSACTIONS: usize = 1000;
+
 /// One step of following the chain, decided under the chain's lock by
 /// [`Index::plan`] and carried out after it is released by [`Index::apply`].
 ///
@@ -493,15 +507,24 @@ impl Index {
     pub fn plan(&self, chain: &impl ChainView, max_blocks: usize) -> Step {
         let tip = chain.tip_height();
         let max_blocks = max_blocks.max(1) as u64;
+        // Bounded in blocks and in transactions: sixteen full blocks are tens
+        // of mebibytes to copy under the chain's lock.
         let fetch = |from: u64| -> Result<Vec<Block>, u64> {
             let to = tip.min(from.saturating_add(max_blocks - 1));
             let mut blocks = Vec::new();
             if from > tip {
                 return Ok(blocks);
             }
+            let mut transactions = 0usize;
             for h in from..=to {
+                if transactions >= STEP_MAX_TRANSACTIONS {
+                    break;
+                }
                 match chain.active_block(h) {
-                    Some(b) => blocks.push(b),
+                    Some(b) => {
+                        transactions += b.transactions.len();
+                        blocks.push(b);
+                    }
                     None => return Err(h),
                 }
             }
@@ -847,9 +870,21 @@ mod tests {
         // Cut five bytes: the last record becomes unreadable.
         std::fs::write(&path, &raw[..raw.len() - 5]).unwrap();
 
-        let index = Index::open(&path);
+        let mut index = Index::open(&path);
         assert_eq!(index.height(), 1, "the index did not recover the first two");
         assert_eq!(index.positions(&key_hash(9)).len(), 0);
+
+        // The torn record is gone from the file too: what is appended now
+        // reads back at the next start, instead of sitting behind garbage.
+        index.index_block(&block(2, 4, vec![coinbase(10)])).unwrap();
+        drop(index);
+        let index = Index::open(&path);
+        assert_eq!(
+            index.height(),
+            2,
+            "the block appended after the cut was lost"
+        );
+        assert_eq!(index.positions(&key_hash(10)).len(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }
 

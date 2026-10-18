@@ -26,9 +26,17 @@
 //!   costs the others nothing. If that peer's queue is already full, the
 //!   message is dropped **for that peer only** — it is not reading anyway, and
 //!   the write timeout of its own thread will soon drop the connection.
-//! - [`Outbox::push_wait`] waits for room, up to a deadline. It is what a
-//!   peer's **own** read loop uses to answer it: a peer asking for more than it
-//!   reads is slowed down, as it was before, but now it only slows itself.
+//! - [`Outbox::push_wait`] waits for room. It is what a peer's **own** read
+//!   loop uses to answer it: a peer asking for more than it reads is slowed
+//!   down, as it was before, but now it only slows itself. It has no deadline
+//!   of its own: a slow peer that keeps reading is served at its pace, and one
+//!   that stops reading is dropped by the write timeout of its writer, which
+//!   only fires when **no byte** moved for that long — as in v0.4.8.
+//! - [`Outbox::push_force`] never waits and never drops: for the few small
+//!   frames whose sending is recorded — requests, whose answer is then
+//!   expected, and pings. Dropping one of those while noting it as sent would
+//!   later hold an honest peer responsible for an answer to a question it
+//!   never received.
 //! - [`Outbox::close`] never waits either: it marks the queue closed and shuts
 //!   the socket down through a clone of its own, without any mutex a writer
 //!   could be holding.
@@ -47,7 +55,6 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
 
 /// Bytes a peer's queue may hold beyond the frame being written.
 ///
@@ -140,10 +147,15 @@ impl Outbox {
         Push::Queued
     }
 
-    /// Queues `frame`, waiting up to `timeout` for room. A peer that leaves no
-    /// room for that long is not reading: its connection is closed.
-    pub fn push_wait(&self, frame: Arc<[u8]>, timeout: Duration) -> Push {
-        let deadline = Instant::now() + timeout;
+    /// Queues `frame`, waiting for room as long as the connection lasts.
+    ///
+    /// No deadline here: a fixed one cut a slow peer that was still reading —
+    /// a block of four mebibytes takes more than thirty seconds below
+    /// 140 KB/s, which a Tor circuit often is. The writer's own timeout is
+    /// the judge: it fires only when no byte moved for
+    /// [`WRITE_TIMEOUT`](crate::net::WRITE_TIMEOUT), and its `close` wakes
+    /// this wait.
+    pub fn push_wait(&self, frame: Arc<[u8]>) -> Push {
         let mut s = self.lock();
         loop {
             if s.closed {
@@ -153,18 +165,19 @@ impl Outbox {
                 self.enqueue(&mut s, frame);
                 return Push::Queued;
             }
-            let now = Instant::now();
-            if now >= deadline {
-                drop(s);
-                self.close();
-                return Push::Closed;
-            }
-            s = self
-                .room
-                .wait_timeout(s, deadline - now)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            s = self.room.wait(s).unwrap_or_else(|e| e.into_inner());
         }
+    }
+
+    /// Queues `frame` whatever the queue holds. Only for small frames whose
+    /// sending is recorded: see the [module documentation](self).
+    pub fn push_force(&self, frame: Arc<[u8]>) -> Push {
+        let mut s = self.lock();
+        if s.closed {
+            return Push::Closed;
+        }
+        self.enqueue(&mut s, frame);
+        Push::Queued
     }
 
     /// Closes the connection: pending frames are dropped, the socket is shut
@@ -236,6 +249,7 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;
+    use std::time::{Duration, Instant};
 
     fn pair() -> (TcpStream, TcpStream) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -325,49 +339,92 @@ mod tests {
         assert!(matches!(reader.read(&mut buf), Ok(0) | Err(_)));
     }
 
-    /// A reply waits for room, within its deadline, then gives up and closes.
+    /// A reply waits for room as long as the peer reads, however slowly; a
+    /// close wakes it.
     #[test]
-    fn push_wait_waits_for_room_then_closes() {
+    fn push_wait_serves_a_slow_reader_and_wakes_on_close() {
         let (a, mut b) = pair();
-        a.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        // A short write timeout: what is tested is that a slow reader that
+        // keeps reading is never cut, even far beyond it.
+        a.set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         let o = Outbox::start(a).unwrap();
-        while o.push(frame(256 * 1024, 2)) == Push::Queued {}
-        // The peer starts reading: room is made, the wait succeeds.
+        let total = 2 * OUTBOX_MAX_BYTES;
         let reader = std::thread::spawn(move || {
-            let mut buf = vec![0u8; 1 << 20];
-            let mut total = 0usize;
-            b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            while total < 8 << 20 {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut got = 0usize;
+            b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            while got < total {
                 match b.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => total += n,
+                    Ok(n) => got += n,
                 }
+                // Slow: a few hundred kilobytes a second.
+                std::thread::sleep(Duration::from_millis(20));
             }
-            b
+            (got, b)
         });
-        assert_eq!(
-            o.push_wait(frame(256 * 1024, 2), Duration::from_secs(10)),
-            Push::Queued
+        let start = Instant::now();
+        let mut sent = 0;
+        while sent < total {
+            assert_eq!(o.push_wait(frame(OUTBOX_MAX_BYTES / 2, 4)), Push::Queued);
+            sent += OUTBOX_MAX_BYTES / 2;
+        }
+        let (got, b) = reader.join().unwrap();
+        assert_eq!(got, total, "every byte reached the slow reader");
+        assert!(
+            start.elapsed() > Duration::from_millis(500),
+            "slower than the timeout"
         );
-        let b = reader.join().unwrap();
-        // Now nobody reads. Fill until the kernel buffers are saturated too:
-        // the queue stays full even after a pause.
+        assert!(
+            !o.is_closed(),
+            "a slow reader that keeps reading is never cut"
+        );
+
+        // A wait in progress is woken by a close.
+        while o.push(frame(256 * 1024, 2)) == Push::Queued {}
+        let o2 = o.clone();
+        let waiter = std::thread::spawn(move || o2.push_wait(frame(OUTBOX_MAX_BYTES, 2)));
+        std::thread::sleep(Duration::from_millis(100));
+        o.close();
+        assert_eq!(waiter.join().unwrap(), Push::Closed);
+        drop(b);
+    }
+
+    /// A peer that stops reading is dropped by its writer's timeout, and a
+    /// reply waiting for room is woken by it.
+    #[test]
+    fn a_stalled_reader_is_dropped_by_the_write_timeout() {
+        let (a, _b) = pair(); // never read
+        a.set_write_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let o = Outbox::start(a).unwrap();
+        let start = Instant::now();
+        let mut r = Push::Queued;
+        while r == Push::Queued && start.elapsed() < Duration::from_secs(20) {
+            r = o.push_wait(frame(256 * 1024, 5));
+        }
+        assert_eq!(r, Push::Closed);
+        assert!(o.is_closed());
+    }
+
+    /// A forced frame goes in even when the queue is full.
+    #[test]
+    fn a_forced_frame_is_never_dropped() {
+        let (a, _b) = pair();
+        a.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        let o = Outbox::start(a).unwrap();
         loop {
-            while o.push(frame(256 * 1024, 2)) == Push::Queued {}
-            std::thread::sleep(Duration::from_millis(200));
-            if o.push(frame(256 * 1024, 2)) == Push::Full {
+            while o.push(frame(256 * 1024, 6)) == Push::Queued {}
+            std::thread::sleep(Duration::from_millis(100));
+            if o.push(frame(256 * 1024, 6)) == Push::Full {
                 break;
             }
         }
-        // The wait times out and closes the connection.
-        let start = Instant::now();
-        assert_eq!(
-            o.push_wait(frame(256 * 1024, 2), Duration::from_millis(300)),
-            Push::Closed
-        );
-        assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(o.is_closed());
-        drop(b);
+        assert_eq!(o.push(frame(24, 1)), Push::Full);
+        assert_eq!(o.push_force(frame(24, 1)), Push::Queued);
+        o.close();
+        assert_eq!(o.push_force(frame(24, 1)), Push::Closed);
     }
 
     /// A write that fails closes the outbox: the peer's read loop then ends,

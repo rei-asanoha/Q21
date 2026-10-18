@@ -66,6 +66,18 @@ pub const MIN_FEE_RATE: u64 = 10;
 /// more for it. Bitcoin Core calls this the incremental relay fee.
 pub const INCREMENTAL_FEE_RATE: u64 = MIN_FEE_RATE;
 
+/// Packages a full pool examines at most for one newcomer, cheapest first.
+/// See `Mempool::room_for`.
+pub const PACKAGE_CANDIDATES: usize = 256;
+
+/// Transactions in one package at most, for eviction. A longer chain is not
+/// pushed out as a package: its leaves still are, one by one.
+pub const PACKAGE_MAX: usize = 64;
+
+/// The node's own confirmed transactions remembered, for a reorganization
+/// that would bring them back. Far beyond what six blocks can hold.
+pub const LOCAL_CONFIRMED_MAX: usize = 4096;
+
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
     pub tx: Transaction,
@@ -199,6 +211,10 @@ pub struct Mempool {
     /// other pending transaction depends on, and that this node's wallet did
     /// not submit. Key: fee rate, then the most recent first, then the id.
     evictable: BTreeSet<(u64, u64, Hash256)>,
+    /// The node's own transactions recently confirmed: if a reorganization
+    /// brings one back, it comes back as the node's own. Bounded by
+    /// [`LOCAL_CONFIRMED_MAX`].
+    local_confirmed: HashSet<Hash256>,
     bytes: usize,
     counter: u64,
     /// Bound in bytes; zero means [`MEMPOOL_MAX_BYTES`]. Only tests lower it.
@@ -562,8 +578,29 @@ impl Mempool {
             }
         }
         self.parents.insert(txid, parents);
-        if !local {
+        // --- Children already waiting for it.
+        //
+        // A parent can arrive after its child: a reorganization undoes the
+        // block that had confirmed it, and puts it back here while the child
+        // never left. Not linked, the parent passed for a leaf — evictable
+        // alone, leaving its child spending outputs that no longer exist.
+        let mut adopted: Vec<Hash256> = (0..tx.outputs.len() as u32)
+            .filter_map(|index| self.committed.get(&OutPoint { txid, index }).copied())
+            .filter(|c| *c != txid && self.entries.contains_key(c))
+            .collect();
+        adopted.sort_unstable();
+        adopted.dedup();
+        for c in &adopted {
+            let p = self.parents.entry(*c).or_default();
+            if !p.contains(&txid) {
+                p.push(txid);
+            }
+        }
+        if !local && adopted.is_empty() {
             self.evictable.insert(Self::eviction_key(&txid, &entry));
+        }
+        if !adopted.is_empty() {
+            self.children.entry(txid).or_default().extend(adopted);
         }
         self.entries.insert(txid, entry);
         Ok(txid)
@@ -574,29 +611,112 @@ impl Mempool {
     }
 
     /// The transactions to push out so that `size` more bytes fit, for a
-    /// newcomer paying `rate`; `None` if it cannot get in.
+    /// newcomer paying `rate`; `None` if it cannot get in. Each one returned
+    /// is removed with its descendants by [`Mempool::make_room`].
     ///
-    /// Only leaves are considered — transactions nothing else in the pool
-    /// depends on — so an eviction never takes a chain of descendants along.
-    /// Up to v0.4.8, evicting a parent removed every descendant with it: one
-    /// newcomer could wipe out a whole chain of payments that paid as much as
-    /// it did. Each one pushed out must pay at least
-    /// [`INCREMENTAL_FEE_RATE`] less than the newcomer.
+    /// Two passes, and in both, what goes out pays at least
+    /// [`INCREMENTAL_FEE_RATE`] less than the newcomer:
+    ///
+    /// 1. **Leaves first**, cheapest first — transactions nothing else in the
+    ///    pool depends on. An eviction then takes no chain along: up to
+    ///    v0.4.8, evicting a parent removed every descendant with it, and one
+    ///    newcomer paying a unit more wiped out whole chains of payments that
+    ///    paid as much as it did.
+    /// 2. **Then whole packages** — a transaction and all its descendants —
+    ///    judged on the rate of the package as a whole, when the leaves are
+    ///    not enough. Without this pass, large cheap parents each holding up
+    ///    a tiny well-paying child would pin a full pool: the child is too
+    ///    dear to push out, and the parent is never a leaf.
+    ///
+    /// The node's own wallet transactions are never in either pass. The work
+    /// is bounded: [`PACKAGE_CANDIDATES`] packages of at most
+    /// [`PACKAGE_MAX`] transactions are examined.
     fn room_for(&self, rate: u64, size: usize) -> Option<Vec<Hash256>> {
         let need = (self.bytes + size).saturating_sub(self.capacity());
         let mut freed = 0usize;
         let mut out = Vec::new();
         for (r, _, id) in &self.evictable {
-            if freed >= need {
+            if freed >= need || r.saturating_add(INCREMENTAL_FEE_RATE) > rate {
                 break;
-            }
-            if r.saturating_add(INCREMENTAL_FEE_RATE) > rate {
-                return None;
             }
             freed += self.entries[id].size;
             out.push(*id);
         }
+        if freed >= need {
+            return Some(out);
+        }
+
+        // --- 2. Packages.
+        let mut candidates: Vec<(u64, u64, Hash256)> = self
+            .entries
+            .iter()
+            .filter(|(id, e)| {
+                !e.local
+                    && self.children.get(*id).is_some_and(|v| !v.is_empty())
+                    && e.fee_rate().saturating_add(INCREMENTAL_FEE_RATE) <= rate
+            })
+            .map(|(id, e)| Self::eviction_key(id, e))
+            .collect();
+        candidates.sort_unstable();
+        candidates.truncate(PACKAGE_CANDIDATES);
+        let mut packages: Vec<(u64, Hash256, Vec<Hash256>)> = Vec::new();
+        for (_, _, id) in candidates {
+            let Some(members) = self.descendant_package(&id) else {
+                continue;
+            };
+            let (fee, weight) = members.iter().fold((0u64, 0u64), |(f, w), m| {
+                let e = &self.entries[m];
+                (f.saturating_add(e.fee.units()), w.saturating_add(e.weight))
+            });
+            let package_rate = fee.saturating_mul(1000) / weight.max(1);
+            if package_rate.saturating_add(INCREMENTAL_FEE_RATE) <= rate {
+                packages.push((package_rate, id, members));
+            }
+        }
+        packages.sort_unstable_by_key(|(r, id, _)| (*r, *id));
+        let mut taken: HashSet<Hash256> = out.iter().copied().collect();
+        for (_, root, members) in packages {
+            if freed >= need {
+                break;
+            }
+            let mut added = false;
+            for m in members {
+                if taken.insert(m) {
+                    freed += self.entries[&m].size;
+                    added = true;
+                }
+            }
+            if added {
+                out.push(root);
+            }
+        }
         (freed >= need).then_some(out)
+    }
+
+    /// A transaction and every descendant of it in the pool; `None` if one of
+    /// them is the node's own, or if there are more than [`PACKAGE_MAX`].
+    fn descendant_package(&self, root: &Hash256) -> Option<Vec<Hash256>> {
+        let mut members = vec![*root];
+        let mut seen: HashSet<Hash256> = HashSet::new();
+        seen.insert(*root);
+        let mut i = 0;
+        while i < members.len() {
+            if self.entries.get(&members[i]).is_some_and(|e| e.local) {
+                return None;
+            }
+            if let Some(children) = self.children.get(&members[i]) {
+                for c in children {
+                    if seen.insert(*c) {
+                        members.push(*c);
+                        if members.len() > PACKAGE_MAX {
+                            return None;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        Some(members)
     }
 
     /// Evicts the lowest-paying transactions to make room for `size` bytes.
@@ -609,7 +729,8 @@ impl Mempool {
             return false;
         };
         for id in to_evict {
-            self.remove_one(&id);
+            // A leaf leaves alone; a package root takes its descendants.
+            self.remove(&id);
         }
         self.bytes + size <= self.capacity()
     }
@@ -713,7 +834,8 @@ impl Mempool {
             // The first transaction of a block is its coinbase: it has no
             // place in a pool.
             for tx in b.transactions.iter().skip(1) {
-                if self.accept(tx, utxo, network, height).is_ok() {
+                let local = self.local_confirmed.remove(&tx.txid());
+                if self.accept_with(tx, utxo, network, height, local).is_ok() {
                     back += 1;
                 }
             }
@@ -733,7 +855,13 @@ impl Mempool {
     /// that did not fit in the same block (load test of 14 October 2026).
     pub fn on_block_connected(&mut self, block: &crate::block::Block) {
         for tx in &block.transactions {
-            self.remove_one(&tx.txid());
+            let txid = tx.txid();
+            if self.remove_one(&txid).is_some_and(|e| e.local) {
+                if self.local_confirmed.len() >= LOCAL_CONFIRMED_MAX {
+                    self.local_confirmed.clear();
+                }
+                self.local_confirmed.insert(txid);
+            }
             for input in &tx.inputs {
                 if let Some(conflict) = self.committed.get(&input.prev_out).copied() {
                     self.remove(&conflict);
@@ -894,7 +1022,12 @@ impl Mempool {
             .map(|(id, _)| *id)
             .collect();
         for id in confirmed {
-            self.remove_one(&id);
+            if self.remove_one(&id).is_some_and(|e| e.local) {
+                if self.local_confirmed.len() >= LOCAL_CONFIRMED_MAX {
+                    self.local_confirmed.clear();
+                }
+                self.local_confirmed.insert(id);
+            }
         }
         loop {
             let mut orphans: Vec<Hash256> = Vec::new();
@@ -926,6 +1059,153 @@ impl Mempool {
                 self.remove(&id);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transactions waiting for a parent
+// ---------------------------------------------------------------------------
+
+/// Orphans kept at most. See [`OrphanPool`].
+pub const MAX_ORPHANS: usize = 256;
+
+/// Bytes of orphans kept at most.
+pub const MAX_ORPHAN_BYTES: usize = 4 * 1024 * 1024;
+
+/// A larger transaction is not kept as an orphan: payments are a few
+/// kilobytes, and the pool must not be filled by a handful of large ones.
+pub const MAX_ORPHAN_SIZE: usize = 100 * 1024;
+
+/// How long an orphan waits for its parent.
+pub const ORPHAN_EXPIRY: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Transactions that arrived before their parent, kept until it comes.
+///
+/// # The defect this closes
+///
+/// A payment built on the change of another travels behind it, but not
+/// always by the same route: a node can hear of the child from one peer
+/// before the parent from another. The child was then refused —
+/// "unconfirmed dependency" — and forgotten; the node only heard of it again
+/// at the next offer of a peer's pool. In the endurance test, about forty
+/// payments waited ten minutes that way, while the blocks went out almost
+/// empty; in the lab, the last ones took three minutes to drain.
+///
+/// Kept here instead, the child is tried again the moment its parent is
+/// accepted, or confirmed by a block. Nothing is verified when it is kept —
+/// the refusal comes before any signature — and the pool is bounded in count
+/// and in bytes; the oldest goes first.
+#[derive(Default)]
+pub struct OrphanPool {
+    by_id: HashMap<Hash256, (Transaction, u64, std::time::Instant, usize)>,
+    /// Missing parent -> orphans that spend it.
+    by_parent: HashMap<Hash256, Vec<Hash256>>,
+    bytes: usize,
+}
+
+impl OrphanPool {
+    pub fn new() -> OrphanPool {
+        OrphanPool::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    pub fn contains(&self, txid: &Hash256) -> bool {
+        self.by_id.contains_key(txid)
+    }
+
+    /// Keeps `tx`, received from `peer`. Returns `false` if it is not kept
+    /// (too large, or already there).
+    pub fn add(&mut self, tx: Transaction, peer: u64, now: std::time::Instant) -> bool {
+        let txid = tx.txid();
+        let size = tx.encode().len();
+        if size > MAX_ORPHAN_SIZE || self.by_id.contains_key(&txid) {
+            return false;
+        }
+        self.expire(now);
+        while !self.by_id.is_empty()
+            && (self.by_id.len() >= MAX_ORPHANS || self.bytes + size > MAX_ORPHAN_BYTES)
+        {
+            let oldest = self
+                .by_id
+                .iter()
+                .min_by_key(|(id, (_, _, at, _))| (*at, **id))
+                .map(|(id, _)| *id)
+                .expect("not empty");
+            self.remove(&oldest);
+        }
+        let mut parents: Vec<Hash256> = tx.inputs.iter().map(|i| i.prev_out.txid).collect();
+        parents.sort_unstable();
+        parents.dedup();
+        for p in parents {
+            self.by_parent.entry(p).or_default().push(txid);
+        }
+        self.bytes += size;
+        self.by_id.insert(txid, (tx, peer, now, size));
+        true
+    }
+
+    /// Takes out the orphans that spend an output of `parent`, oldest first,
+    /// with the peer each came from.
+    pub fn take_children(&mut self, parent: &Hash256) -> Vec<(Transaction, u64)> {
+        let Some(ids) = self.by_parent.remove(parent) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(std::time::Instant, Hash256)> = ids
+            .iter()
+            .filter_map(|id| self.by_id.get(id).map(|(_, _, at, _)| (*at, *id)))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out.into_iter()
+            .filter_map(|(_, id)| self.remove(&id))
+            .collect()
+    }
+
+    /// Drops the orphans older than [`ORPHAN_EXPIRY`].
+    pub fn expire(&mut self, now: std::time::Instant) {
+        let old: Vec<Hash256> = self
+            .by_id
+            .iter()
+            .filter(|(_, (_, _, at, _))| now.saturating_duration_since(*at) >= ORPHAN_EXPIRY)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in old {
+            self.remove(&id);
+        }
+    }
+
+    /// Drops every orphan received from `peer`.
+    pub fn forget_peer(&mut self, peer: u64) {
+        let from: Vec<Hash256> = self
+            .by_id
+            .iter()
+            .filter(|(_, (_, p, _, _))| *p == peer)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in from {
+            self.remove(&id);
+        }
+    }
+
+    fn remove(&mut self, txid: &Hash256) -> Option<(Transaction, u64)> {
+        let (tx, peer, _, size) = self.by_id.remove(txid)?;
+        self.bytes -= size;
+        for i in &tx.inputs {
+            if let Some(v) = self.by_parent.get_mut(&i.prev_out.txid) {
+                v.retain(|c| c != txid);
+                if v.is_empty() {
+                    self.by_parent.remove(&i.prev_out.txid);
+                }
+            }
+        }
+        Some((tx, peer))
     }
 }
 
@@ -1936,5 +2216,186 @@ mod tests_chains {
         m.remove(&ids[0]);
         check_evictable(&m);
         assert!(m.evictable.len() <= m.len());
+    }
+
+    /// Large cheap parents each holding up a dearer child no longer pin a
+    /// full pool: the package goes out as a whole when the newcomer pays
+    /// clearly more than the package does.
+    #[test]
+    fn a_cheap_parent_cannot_pin_the_pool_behind_a_dear_child() {
+        let (mut single, mut many, c) = two_wallets();
+        let mut probe = Mempool::new();
+        let parent = spend_with_pending(&mut single, &c, &probe, 1_000);
+        let pid = probe.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        let child = spend_with_pending(&mut single, &c, &probe, 40_000);
+        let cid = probe.accept(&child, &c.utxo, NETWORK, c.height()).unwrap();
+        let newcomer = spend_with_pending(&mut many, &c, &probe, 30_000);
+        // The rates as the pool computes them.
+        let (p, ch) = (&probe.entries[&pid], &probe.entries[&cid]);
+        let package_rate = (p.fee.units() + ch.fee.units()) * 1000 / (p.weight + ch.weight);
+        let r_new = {
+            let mut q = Mempool::new();
+            let id = q.accept(&newcomer, &c.utxo, NETWORK, c.height()).unwrap();
+            q.entries[&id].fee_rate()
+        };
+        assert!(
+            ch.fee_rate() + INCREMENTAL_FEE_RATE > r_new,
+            "the child alone is too dear"
+        );
+        assert!(
+            package_rate + INCREMENTAL_FEE_RATE <= r_new,
+            "the package is cheaper"
+        );
+
+        let (sp, sc) = (parent.encode().len(), child.encode().len());
+        let mut m = Mempool::with_capacity(sp + sc + newcomer.encode().len() / 2);
+        let pid = m.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        let cid = m.accept(&child, &c.utxo, NETWORK, c.height()).unwrap();
+        let nid = m
+            .accept(&newcomer, &c.utxo, NETWORK, c.height())
+            .expect("the package makes room");
+        assert!(!m.contains(&pid) && !m.contains(&cid));
+        assert!(m.contains(&nid));
+        check_evictable(&m);
+    }
+
+    /// A parent that comes back after a reorganization finds its child
+    /// again: it is no leaf, and cannot be pushed out alone.
+    #[test]
+    fn a_returning_parent_finds_its_waiting_child() {
+        let (mut single, _, mut c) = two_wallets();
+        let mut m = Mempool::new();
+        let parent = spend_with_pending(&mut single, &c, &m, 1_000);
+        let pid = m.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        let child = spend_with_pending(&mut single, &c, &m, 1_000);
+        let cid = m.accept(&child, &c.utxo, NETWORK, c.height()).unwrap();
+
+        // A block confirms the parent alone; the child waits.
+        let t = c.tip().time + TARGET_BLOCK_SECS;
+        let b = c
+            .mine_block(
+                Hash256([9; 32]),
+                SchemeId::LamportOts,
+                std::slice::from_ref(&parent),
+                t,
+                ATTEMPTS,
+            )
+            .unwrap();
+        c.connect(&b, t + 1).unwrap();
+        m.on_block_connected(&b);
+        assert!(!m.contains(&pid) && m.contains(&cid));
+        check_evictable(&m);
+
+        // The block is undone: the parent comes back.
+        assert!(c.disconnect());
+        assert_eq!(m.return_abandoned(&[b], &c.utxo, NETWORK, c.height()), 1);
+        assert!(m.contains(&pid) && m.contains(&cid));
+        assert_eq!(m.child_count(&pid), 1, "the child is linked again");
+        check_evictable(&m);
+        assert!(
+            !m.evictable.iter().any(|(_, _, id)| *id == pid),
+            "a parent with a child is no leaf"
+        );
+        // Removing the parent takes the child: nothing left spending outputs
+        // that no longer exist.
+        m.remove(&pid);
+        assert!(!m.contains(&cid));
+    }
+
+    /// The wallet's own payment, confirmed then undone by a reorganization,
+    /// comes back as the wallet's own.
+    #[test]
+    fn a_local_payment_stays_local_through_a_reorganization() {
+        let (mut single, _, mut c) = two_wallets();
+        let mut m = Mempool::new();
+        let tx = spend_with_pending(&mut single, &c, &m, 1_000);
+        let id = m.accept_local(&tx, &c.utxo, NETWORK, c.height()).unwrap();
+        let t = c.tip().time + TARGET_BLOCK_SECS;
+        let b = c
+            .mine_block(
+                Hash256([9; 32]),
+                SchemeId::LamportOts,
+                std::slice::from_ref(&tx),
+                t,
+                ATTEMPTS,
+            )
+            .unwrap();
+        c.connect(&b, t + 1).unwrap();
+        m.on_block_connected(&b);
+        assert!(!m.contains(&id));
+        assert!(c.disconnect());
+        m.return_abandoned(&[b], &c.utxo, NETWORK, c.height());
+        assert!(m.entries[&id].local);
+        check_evictable(&m);
+    }
+
+    /// A child that arrives before its parent waits for it, and goes in the
+    /// moment the parent does.
+    #[test]
+    fn an_orphan_waits_for_its_parent() {
+        let (mut single, _, c) = two_wallets();
+        let mut probe = Mempool::new();
+        let parent = spend_with_pending(&mut single, &c, &probe, 1_000);
+        let pid = probe.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        let child = spend_with_pending(&mut single, &c, &probe, 1_000);
+
+        let mut m = Mempool::new();
+        let mut orphans = OrphanPool::new();
+        assert!(matches!(
+            m.accept(&child, &c.utxo, NETWORK, c.height()),
+            Err(MempoolError::UnconfirmedDependency(_))
+        ));
+        let now = std::time::Instant::now();
+        assert!(orphans.add(child.clone(), 7, now));
+        assert!(!orphans.add(child.clone(), 7, now), "kept once");
+        m.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        let waiting = orphans.take_children(&pid);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].1, 7, "the peer it came from");
+        m.accept(&waiting[0].0, &c.utxo, NETWORK, c.height())
+            .unwrap();
+        assert!(orphans.is_empty());
+        assert_eq!(orphans.bytes, 0);
+        assert!(orphans.by_parent.is_empty());
+    }
+
+    /// Bounded in count, oldest first; expired after a while; forgotten with
+    /// the peer that sent them.
+    #[test]
+    fn the_orphan_pool_stays_bounded() {
+        let mut o = OrphanPool::new();
+        let t0 = std::time::Instant::now();
+        let tx = |n: u32| Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn {
+                prev_out: OutPoint {
+                    txid: Hash256([(n % 251) as u8; 32]),
+                    index: n,
+                },
+                witness: crate::tx::Witness {
+                    pubkey: Vec::new(),
+                    signature: Vec::new(),
+                },
+                sequence: 0,
+            }],
+            outputs: Vec::new(),
+            lock_time: 0,
+        };
+        for n in 0..(MAX_ORPHANS as u32 + 50) {
+            assert!(o.add(
+                tx(n),
+                u64::from(n % 3),
+                t0 + std::time::Duration::from_millis(n as u64)
+            ));
+        }
+        assert_eq!(o.len(), MAX_ORPHANS);
+        assert!(!o.contains(&tx(0).txid()), "the oldest went first");
+        assert!(o.contains(&tx(MAX_ORPHANS as u32 + 49).txid()));
+        o.forget_peer(1);
+        assert!(o.by_id.values().all(|(_, p, _, _)| *p != 1));
+        o.expire(t0 + ORPHAN_EXPIRY + std::time::Duration::from_secs(1));
+        assert!(o.is_empty());
+        assert_eq!(o.bytes, 0);
+        assert!(o.by_parent.is_empty());
     }
 }
