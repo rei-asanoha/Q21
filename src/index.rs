@@ -583,7 +583,11 @@ impl Index {
         for b in &blocks {
             // A step planned before another one was applied no longer
             // follows: dropped, the next plan starts from the right place.
-            let expected = if self.is_empty() { 0 } else { self.height() + 1 };
+            let expected = if self.is_empty() {
+                0
+            } else {
+                self.height() + 1
+            };
             if b.header.height != expected {
                 break;
             }
@@ -1246,7 +1250,12 @@ mod follow_tests {
             if rng.below(3) == 0 {
                 follow(&mut index, &chain, max);
                 let reference = rebuilt(&chain, &d.join("reference.dat"));
-                assert_same(&index, &reference, &chain, &format!("seed {seed} round {round}"));
+                assert_same(
+                    &index,
+                    &reference,
+                    &chain,
+                    &format!("seed {seed} round {round}"),
+                );
             }
             if rng.below(25) == 0 {
                 // Restart: the log is reread, the owner table is not kept.
@@ -1298,12 +1307,17 @@ mod follow_tests {
             Step::Rewind { fork, blocks, .. } => {
                 assert_eq!(fork, 299);
                 assert_eq!(blocks.len(), 1, "only the new block is copied");
-                index.apply(Step::Rewind {
-                    fork,
-                    owners: chain.unspent_owners().into_iter().chain(chain.spent_above(fork).unwrap()).collect(),
-                    blocks,
-                })
-                .unwrap();
+                index
+                    .apply(Step::Rewind {
+                        fork,
+                        owners: chain
+                            .unspent_owners()
+                            .into_iter()
+                            .chain(chain.spent_above(fork).unwrap())
+                            .collect(),
+                        blocks,
+                    })
+                    .unwrap();
             }
             other => panic!("expected a rewind, got {other:?}"),
         }
@@ -1391,7 +1405,9 @@ mod follow_tests {
             Accept::Reorganized { depth: 1 }
         ));
         match index.plan(&a, 16) {
-            Step::Rewind { fork, ref blocks, .. } => {
+            Step::Rewind {
+                fork, ref blocks, ..
+            } => {
                 assert_eq!(fork, base);
                 assert_eq!(blocks.len(), 2);
             }

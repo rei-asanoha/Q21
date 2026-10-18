@@ -265,6 +265,10 @@ pub const PING_AFTER: Duration = Duration::from_secs(45);
 /// that answers something else stays alive.
 pub const MAX_SILENCE: Duration = Duration::from_secs(100);
 
+/// How long a peer has to answer the ping sent after a possible sleep before
+/// it is dropped. See [`Node::probe_all_peers`].
+pub const PROBE_GRACE: Duration = Duration::from_secs(20);
+
 /// Maximum time to complete the handshake.
 ///
 /// An inbound connection that has not introduced itself — `Version` **then**
@@ -401,7 +405,19 @@ pub const TX_RATE_PER_SEC: u64 = 8;
 pub const MEMPOOL_ANNOUNCE_INPUTS: u64 = TX_BUCKET_MAX / 4;
 
 /// How often the node offers its pool again to its peers.
-pub const MEMPOOL_REBROADCAST: Duration = Duration::from_secs(600);
+///
+/// Ten minutes up to v0.4.8. In the endurance test, about forty payments
+/// waited ten minutes after the queue had drained, while the blocks went out
+/// almost empty: the miners had missed them while their pool was full, and
+/// heard of them again only at the next offer. One block interval now. The
+/// offer is bounded by [`MEMPOOL_ANNOUNCE_INPUTS`] and costs a few kilobytes
+/// of identifiers per peer; a peer that holds a transaction does not ask for
+/// it again.
+pub const MEMPOOL_REBROADCAST: Duration = Duration::from_secs(120);
+
+/// Transactions remembered as requested from one peer. Beyond, the memory is
+/// cleared: a peer then pays for its overruns as before.
+pub const MAX_REQUESTED_TXS: usize = 4 * TX_BUCKET_MAX as usize;
 
 /// How long after connecting a peer that was behind gets the pool offered.
 ///
@@ -637,6 +653,10 @@ struct Peer {
     last_received: Instant,
     /// Instant of the last `Ping` sent that has gone unanswered.
     pending_ping: Option<Instant>,
+    /// Transactions we asked this peer for and that have not arrived yet.
+    /// Sending them is no misconduct, budget or not: see the `Tx` arm.
+    /// Bounded by [`MAX_REQUESTED_TXS`].
+    requested_txs: HashSet<Hash256>,
     /// Instant the connection was opened, fixed at creation. Used for the
     /// handshake deadline: see [`HANDSHAKE_TIMEOUT`]. Unlike `last_received`,
     /// no frame pushes it back — a connection that does not introduce itself
@@ -967,6 +987,9 @@ pub struct Stats {
     /// Frames dropped for a peer whose outgoing queue was full, or that could
     /// not take a reply in time. See [`crate::outbox`].
     pub outbox_dropped: AtomicU64,
+    /// Requested transactions that arrived beyond the peer's budget: dropped,
+    /// never penalized.
+    pub solicited_over_budget: AtomicU64,
 }
 
 impl Node {
@@ -1334,6 +1357,75 @@ impl Node {
             .count()
     }
 
+    /// Asks every established peer for the headers past our tip.
+    ///
+    /// Called when the tip has not moved for a while: an announcement can be
+    /// missed — a peer whose queue was full drops it, a link cut at the wrong
+    /// moment loses it — and a node that missed a block only heard of the
+    /// chain again at the next one. In the endurance test, a wallet stayed at
+    /// one height while the network moved on. One `getheaders` per peer
+    /// costs a few hundred bytes; a peer with nothing new answers an empty
+    /// list. Returns the number of peers asked.
+    pub fn ask_headers_from_all(&self) -> usize {
+        let (ids, locator): (Vec<u64>, Vec<Hash256>) = {
+            let g = self.shared.lock().unwrap();
+            (
+                g.peers
+                    .iter()
+                    .filter(|(_, p)| p.handshaked)
+                    .map(|(id, _)| *id)
+                    .collect(),
+                g.chain.locator(),
+            )
+        };
+        let m = Message::GetHeaders {
+            locator,
+            stop: Hash256::ZERO,
+        };
+        for id in &ids {
+            self.send_to(*id, &m);
+        }
+        ids.len()
+    }
+
+    /// Checks every connection after the machine may have slept: each peer
+    /// is pinged, and the ones that do not answer within [`PROBE_GRACE`] are
+    /// dropped by the next [`Node::maintain_peers`] — the others stay.
+    ///
+    /// # Why not drop them all
+    ///
+    /// Up to v0.4.8 every link was cut on the spot, on the reasoning that
+    /// after a sleep they are dead anyway. But the detector can be fooled — a
+    /// clock stepped by the system, a process frozen for a minute without the
+    /// machine sleeping — and every false alarm cut live links, including the
+    /// onion ones that take a minute to rebuild through Tor. Asking costs
+    /// twenty seconds after a real sleep, and nothing after a false alarm.
+    ///
+    /// Returns the number of peers probed.
+    pub fn probe_all_peers(&self) -> usize {
+        let (writers, nonce) = {
+            let mut g = self.shared.lock().unwrap();
+            let now = Instant::now();
+            // Silent, as far as the timeout is concerned, for all but the last
+            // `PROBE_GRACE`: an answer — any frame — refreshes it.
+            let deadline = now
+                .checked_sub(MAX_SILENCE.saturating_sub(PROBE_GRACE))
+                .unwrap_or(now);
+            let mut writers = Vec::new();
+            for p in g.peers.values_mut() {
+                if p.last_received > deadline {
+                    p.last_received = deadline;
+                }
+                p.pending_ping = Some(now);
+                writers.push(p.writer.clone());
+            }
+            (writers, g.nonce)
+        };
+        let n = writers.len();
+        self.broadcast(&writers, &Message::Ping(nonce));
+        n
+    }
+
     /// Drops every connection, and returns how many there were.
     ///
     /// Used when a machine wakes up from sleep: after a few minutes of
@@ -1672,6 +1764,7 @@ impl Node {
                     remote_nonce: None,
                     last_received: Instant::now(),
                     pending_ping: None,
+                    requested_txs: HashSet::new(),
                     connected_at: Instant::now(),
                 },
             );
@@ -2223,6 +2316,16 @@ impl Node {
                             }
                         }
                     }
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        if p.requested_txs.len() + wanted.len() > MAX_REQUESTED_TXS {
+                            p.requested_txs.clear();
+                        }
+                        for i in &wanted {
+                            if p.requested_txs.len() < MAX_REQUESTED_TXS {
+                                p.requested_txs.insert(i.hash);
+                            }
+                        }
+                    }
                     // Blocks go through the same cap as headers: what has no
                     // in-flight slot waits in the queue, and an `inv` of fifty
                     // thousand identifiers records nothing more than a batch of
@@ -2543,9 +2646,28 @@ impl Node {
                         //   will resend when its bucket refills — because a ban
                         //   score never decreases and a legitimate relay would
                         //   end up excluded.
-                        // In both cases: neither hash nor verification. The work
+                        // In both cases: neither verification nor relay. The work
                         // is bounded because we stop here.
-                        if cost <= FLOOD_INPUT_THRESHOLD {
+                        //
+                        // A transaction **we asked for** is never misconduct,
+                        // whatever the budget says: a relay that answers our
+                        // own `getdata` is doing its job (0.4.9). Recognizing
+                        // it costs one hash, which an unsolicited flood pays
+                        // ten times at most before the ban. It is dropped all
+                        // the same, and forgotten as requested: sent again, it
+                        // would be unsolicited.
+                        let solicited = g
+                            .peers
+                            .get_mut(&id)
+                            .map(|p| {
+                                !p.requested_txs.is_empty() && p.requested_txs.remove(&t.txid())
+                            })
+                            .unwrap_or(false);
+                        if solicited {
+                            self.stats
+                                .solicited_over_budget
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if cost <= FLOOD_INPUT_THRESHOLD {
                             if let Some(p) = g.peers.get_mut(&id) {
                                 p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
                                 if p.ban_score >= BAN_THRESHOLD {
@@ -2556,6 +2678,9 @@ impl Node {
                         }
                     } else {
                         let txid = t.txid();
+                        if let Some(p) = g.peers.get_mut(&id) {
+                            p.requested_txs.remove(&txid);
+                        }
                         let is_new = !g.mempool.contains(&txid);
                         let height = g.chain.height();
                         // On a reference, never on a copy: duplicating the UTXO
@@ -3788,6 +3913,56 @@ mod tests {
         b.shutdown();
     }
 
+    /// After a possible sleep, live links are kept and dead ones dropped:
+    /// the check is a ping, not a cut.
+    #[test]
+    fn a_sleep_check_keeps_live_links_and_drops_dead_ones() {
+        let (a, b) = node_pair();
+        let addr = a.listen("127.0.0.1:0").expect("listen");
+        b.connect(addr).expect("connection");
+        assert!(
+            wait_until(|| b.peer_count_established() == 1, 20),
+            "no peer"
+        );
+        // A second link whose other end never answers: a machine gone.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = TcpStream::connect(dead.local_addr().unwrap()).unwrap();
+        b.start_peer(s, true);
+        assert!(wait_until(|| b.peer_count() == 2, 5));
+
+        assert_eq!(b.probe_all_peers(), 2);
+        // Within the grace, nobody is dropped yet.
+        assert_eq!(b.maintain_peers(), 0);
+        // The live peer answers the ping.
+        assert!(wait_until(
+            || {
+                let g = b.shared.lock().unwrap();
+                g.peers
+                    .values()
+                    .filter(|p| p.pending_ping.is_none())
+                    .count()
+                    == 1
+            },
+            10
+        ));
+        // Past the grace: as if PROBE_GRACE had elapsed for the silent one.
+        {
+            let mut g = b.shared.lock().unwrap();
+            for p in g.peers.values_mut() {
+                if p.pending_ping.is_some() {
+                    p.last_received = p
+                        .last_received
+                        .checked_sub(PROBE_GRACE + Duration::from_secs(1))
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(b.maintain_peers(), 1, "the dead link is dropped");
+        assert_eq!(b.peer_count_established(), 1, "the live link is kept");
+        a.shutdown();
+        b.shutdown();
+    }
+
     /// A shorter silence triggers a `Ping`, without disconnecting.
     ///
     /// Disconnecting at the first silence would be as wrong as never
@@ -3959,6 +4134,7 @@ mod tests {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 pending_ping: None,
+                requested_txs: HashSet::new(),
                 connected_at: Instant::now(),
             },
         );
@@ -4294,6 +4470,7 @@ mod tests_hardening {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 pending_ping: None,
+                requested_txs: HashSet::new(),
                 connected_at: Instant::now(),
             },
         );
@@ -4356,7 +4533,11 @@ mod tests_hardening {
         let t = Instant::now();
         a.announce_block(&block);
         a.announce_tx(Hash256([5u8; 32]));
-        assert!(t.elapsed() < Duration::from_secs(1), "announcing waited {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "announcing waited {:?}",
+            t.elapsed()
+        );
 
         // The node keeps answering — what the wallet and the RPC server see.
         let t = Instant::now();
@@ -4368,13 +4549,68 @@ mod tests_hardening {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(b.height(), 1, "the healthy peer must get the block");
-        assert!(t.elapsed() < Duration::from_secs(10), "propagation took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "propagation took {:?}",
+            t.elapsed()
+        );
 
         // Dropping a stalled peer does not wait for its write.
         let t = Instant::now();
         a.disconnect(900);
-        assert!(t.elapsed() < Duration::from_millis(500), "disconnect waited {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "disconnect waited {:?}",
+            t.elapsed()
+        );
         assert!(a.stats.outbox_dropped.load(Ordering::Relaxed) > 0);
+    }
+
+    /// A relay that answers our own `getdata` beyond its budget is not
+    /// flooding: the transactions we asked for cost it nothing. An
+    /// unsolicited one beyond the budget still does.
+    #[test]
+    fn requested_transactions_are_never_misconduct() {
+        let (_a, b) = node_pair();
+        let _e = established_peer(&b, 7);
+        let tx = |n: u8| Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn::coinbase(vec![n])],
+            outputs: Vec::new(),
+            lock_time: 0,
+        };
+        let asked = tx(1);
+        assert!(b.handle(
+            7,
+            Message::Inv(vec![InvItem {
+                kind: InvKind::Tx,
+                hash: asked.txid(),
+            }])
+        ));
+        let drain = |b: &Node| {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.tx_bucket = TokenBucket {
+                tokens: 0,
+                last: Instant::now(),
+            };
+        };
+        let score = |b: &Node| b.shared.lock().unwrap().peers[&7].ban_score;
+        drain(&b);
+        assert!(b.handle(7, Message::Tx(Box::new(asked.clone()))));
+        assert_eq!(score(&b), 0, "a requested transaction is no misconduct");
+        assert_eq!(b.stats.solicited_over_budget.load(Ordering::Relaxed), 1);
+        // Sent again, it was not asked for any more.
+        drain(&b);
+        assert!(b.handle(7, Message::Tx(Box::new(asked))));
+        assert_eq!(score(&b), MISCONDUCT_MALFORMED);
+        drain(&b);
+        assert!(b.handle(7, Message::Tx(Box::new(tx(2)))));
+        assert_eq!(
+            score(&b),
+            2 * MISCONDUCT_MALFORMED,
+            "unsolicited still pays"
+        );
     }
 
     /// The work of a received block is checked before the lock, and the chain
@@ -4890,6 +5126,7 @@ mod tests_handler_fuzz {
                 remote_nonce: None,
                 last_received: now,
                 pending_ping: None,
+                requested_txs: HashSet::new(),
                 connected_at: now,
             },
         );
@@ -5716,6 +5953,7 @@ mod tests_handler_review {
                 remote_nonce: None,
                 last_received: now,
                 pending_ping: None,
+                requested_txs: HashSet::new(),
                 connected_at: now,
             },
         );

@@ -213,7 +213,11 @@ impl Outbox {
             self.room.notify_all();
             // The write happens with no lock held: a stalled peer stalls this
             // thread, and nothing else.
-            if stream.write_all(&frame).and_then(|_| stream.flush()).is_err() {
+            if stream
+                .write_all(&frame)
+                .and_then(|_| stream.flush())
+                .is_err()
+            {
                 self.close();
                 return;
             }
@@ -274,7 +278,11 @@ mod tests {
                 full += 1;
             }
         }
-        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
         assert!(full > 0, "the queue must have filled up");
         assert!(o.queued_bytes() <= OUTBOX_MAX_BYTES);
     }
@@ -310,7 +318,9 @@ mod tests {
         assert!(o.is_closed());
         assert_eq!(o.push(frame(10, 1)), Push::Closed);
         // The read side of our own socket sees the shutdown.
-        reader.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut buf = [0u8; 16];
         assert!(matches!(reader.read(&mut buf), Ok(0) | Err(_)));
     }

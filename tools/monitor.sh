@@ -19,6 +19,9 @@
 #                  the unit needs RuntimeDirectoryPreserve=yes, or systemd
 #                  deletes the file after every run, see SERVER.md)
 #   Q21_THRESHOLD  minutes without a block before acting (default: 30)
+#   Q21_SILENT_RUNS consecutive runs without an RPC answer before a running
+#                  service is restarted (default: 3, half an hour at one run
+#                  every ten minutes)
 #   Q21_NTFY       ntfy topic, for example q21-my-server-a7f3 (default: none;
 #                  to be provided through an EnvironmentFile with mode 0600,
 #                  not in the unit)
@@ -37,18 +40,20 @@ RPC="${Q21_RPC:-127.0.0.1:21080}"
 SERVICE="${Q21_SERVICE:-q21}"
 STATE="${Q21_STATE:-${RUNTIME_DIRECTORY:-/run/q21-monitor}/state}"
 THRESHOLD="${Q21_THRESHOLD:-30}"
+SILENT_RUNS="${Q21_SILENT_RUNS:-3}"
+SILENT="$STATE.silent"
 NTFY="${Q21_NTFY:-}"
 PUBLIC_URL="${Q21_PUBLIC_URL:-}"
 PROXY="${Q21_PROXY:-caddy}"
 
-if [ -L "$STATE" ]; then
+if [ -L "$STATE" ] || [ -L "$SILENT" ]; then
   logger -t q21-monitor "state file $STATE: symbolic link refused"
   exit 1
 fi
 mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
 
 now=$(date +%s)
-response=$(curl -s -m 10 -X POST "http://$RPC/rpc" \
+response=$(curl -s -m 30 -X POST "http://$RPC/rpc" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getinfo","params":{}}' 2>/dev/null)
 height=$(printf '%s' "$response" | sed -n 's/.*"height":\([0-9]*\).*/\1/p')
@@ -105,7 +110,13 @@ fi
 #   account, from a node older than 0.4.3 that did not admit root): that is a
 #   configuration error in the monitoring, not in the node. We notify, we do
 #   not restart; restarting would change nothing.
-# - The service is dead, or has been silent for more than an hour: restart.
+# - The service runs but did not answer this time: busy is not dead. Up to
+#   0.4.8 a single silent run was enough: during the endurance test of
+#   2026-10-18, a node held up for a few minutes by a reorg was restarted in
+#   the middle of its work, and had to start it all over again. A running
+#   service is now restarted only after Q21_SILENT_RUNS runs in a row without
+#   an answer.
+# - The service is dead, or has been silent for that long: restart.
 if [ -z "$height" ]; then
   if printf '%s' "$response" | grep -qi 'access token'; then
     notify "the RPC $RPC requires a token: monitoring misconfigured, service $SERVICE left as is"
@@ -126,14 +137,27 @@ if [ -z "$height" ]; then
         exit 0
       fi
     fi
-    notify "node unreachable on $RPC after more than an hour of service: restarting $SERVICE"
+    silent=0
+    if [ -f "$SILENT" ]; then
+      read -r silent < "$SILENT" 2>/dev/null || silent=0
+      case "$silent" in ''|*[!0-9]*) silent=0 ;; esac
+    fi
+    silent=$((silent + 1))
+    if [ "$silent" -lt "$SILENT_RUNS" ]; then
+      printf '%s\n' "$silent" > "$SILENT"
+      logger -t q21-monitor "node unreachable on $RPC ($silent run(s) in a row out of $SILENT_RUNS): busy, not restarted yet"
+      exit 0
+    fi
+    notify "node unreachable on $RPC for $silent runs in a row: restarting $SERVICE"
   else
     notify "service $SERVICE stopped: restarting"
   fi
   systemctl restart "$SERVICE"
+  rm -f "$SILENT"
   printf '0 %s\n' "$now" > "$STATE"
   exit 0
 fi
+rm -f "$SILENT"
 
 # First measurement: record it, and wait.
 if [ ! -f "$STATE" ]; then

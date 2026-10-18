@@ -5396,6 +5396,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let start = std::time::Instant::now();
     let mut last_report = std::time::Instant::now();
     let mut last_height = node.height();
+    // The tip as last seen moving, for the stale tip check and the quiet
+    // status line. See below.
+    let mut tip_seen = (node.height(), std::time::Instant::now());
+    let mut last_headers_probe = std::time::Instant::now();
+    let mut last_quiet_report = std::time::Instant::now();
     // --- The sleep detector, on its own thread.
     //
     // It sleeps one second, looks at the wall clock, and starts again. If the
@@ -5573,10 +5578,16 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // every iteration. A peer that slipped such addresses into the address
         // book isolated the node in a loop. The detector now lives on its own
         // thread and only looks at the wall clock.
+        //
+        // Since 0.4.9 the links are not cut but checked: each peer is pinged,
+        // and only the silent ones are dropped. A false alarm — a clock
+        // stepped by the system, a process frozen without the machine having
+        // slept — no longer costs the live links, Tor ones included. See
+        // `Node::probe_all_peers`.
         if sleep_detected.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            let n = node.disconnect_all_peers();
+            let n = node.probe_all_peers();
             if n > 0 {
-                println!("  waking up after sleep: {n} link(s) cut, starting over");
+                println!("  clock jump (sleep?): checking {n} link(s)");
             }
             last_search = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(60))
@@ -5902,6 +5913,51 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     }
                 }
             }
+        }
+
+        // --- A tip that no longer moves.
+        //
+        // Ten minutes is five blocks on average. The peers are asked for
+        // what lies past our tip — at most once every ten minutes, a few
+        // hundred bytes each — and a peer with nothing new says so. A network
+        // where nobody mines costs that and nothing else: no connection is
+        // cut for it.
+        {
+            let h = node.height();
+            if h != tip_seen.0 {
+                tip_seen = (h, std::time::Instant::now());
+            } else if tip_seen.1.elapsed() >= STALE_TIP_AFTER
+                && last_headers_probe.elapsed() >= STALE_TIP_AFTER
+            {
+                last_headers_probe = std::time::Instant::now();
+                let asked = node.ask_headers_from_all();
+                println!(
+                    "  no new block for {} min: {asked} peer(s) asked for what follows {h}",
+                    tip_seen.1.elapsed().as_secs() / 60
+                );
+            }
+        }
+
+        // --- A status line in the log, even in quiet mode.
+        //
+        // The wallet runs its node quietly, and its log said nothing between
+        // two events: when a wallet stopped following the chain during the
+        // endurance test, nothing showed when, nor with how many peers. One
+        // line every five minutes says it.
+        if quiet && last_quiet_report.elapsed() >= QUIET_STATUS_EVERY {
+            last_quiet_report = std::time::Instant::now();
+            let onion = node.onion_status();
+            println!(
+                "  [{} UTC] height {}  peers {} ({} out)  mempool {}  onion {} out, {} in  dropped sends {}",
+                utc_clock(),
+                node.height(),
+                node.peer_count_established(),
+                node.peer_count_outbound(),
+                node.mempool_len(),
+                onion.outbound,
+                onion.inbound,
+                node.stats.outbox_dropped.load(Ordering::Relaxed),
+            );
         }
 
         if !quiet && last_report.elapsed().as_secs() >= 2 {
@@ -6700,6 +6756,23 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The time of day in UTC, `HH:MM:SS`, for the log.
+fn utc_clock() -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60)
+}
+
+/// How long the tip may stay put before the peers are asked for what
+/// follows it. See the node's loop.
+const STALE_TIP_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How often a quiet node — the wallet's — writes a status line to its log.
+const QUIET_STATUS_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Brings the address index to the chain's tip, a few blocks at a time.
 ///
 /// Each step is decided under the chain's lock — the node's lock — which is
@@ -7081,19 +7154,45 @@ fn dial_missing(
             }
             jobs.push((o.host(), t, Some(o)));
         }
-        std::thread::scope(|scope| {
-            for (label, t, onion) in &jobs {
-                scope.spawn(move || {
-                    let ok = node.connect_target(t).is_ok();
-                    if let Some(o) = onion {
-                        node.note_onion_result(o, ok);
-                    }
-                    if ok && !quiet {
-                        println!("  connected to {label} through Tor");
-                    }
-                });
-            }
-        });
+        // --- Onion services first, Tor exits only as a last resort.
+        //
+        // A clear address dialed through Tor leaves by an exit relay, and the
+        // exits are few: up to v0.4.8, every Tor wallet reached the entry
+        // points both by their onion names and through exits, so that the
+        // entry points saw dozens of wallets arrive from the same few exit
+        // ranges, which their per-range quota is there to bound. The onion
+        // name reaches the same machine, end to end inside Tor. The clear
+        // addresses are now dialed only when fewer than two onion services
+        // answered, so that a node never stays alone nor on a single path.
+        let (onion_jobs, clear_jobs): (Vec<_>, Vec<_>) =
+            jobs.into_iter().partition(|(label, t, onion)| {
+                onion.is_some()
+                    || is_onion_target(label)
+                    || matches!(t, q21_core::socks::Target::Name(h, _) if h.ends_with(".onion"))
+            });
+        let dial = |jobs: &[(
+            String,
+            q21_core::socks::Target,
+            Option<q21_core::wire::OnionAddr>,
+        )]| {
+            std::thread::scope(|scope| {
+                for (label, t, onion) in jobs {
+                    scope.spawn(move || {
+                        let ok = node.connect_target(t).is_ok();
+                        if let Some(o) = onion {
+                            node.note_onion_result(o, ok);
+                        }
+                        if ok && !quiet {
+                            println!("  connected to {label} through Tor");
+                        }
+                    });
+                }
+            });
+        };
+        dial(&onion_jobs);
+        if node.peer_count_outbound() < 2 {
+            dial(&clear_jobs);
+        }
     } else {
         for a in targets {
             if is_onion_target(a) {

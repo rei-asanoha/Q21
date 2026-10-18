@@ -1805,7 +1805,9 @@ mod tests_chains {
         );
         let clearly = spend_with_pending(&mut w, &c, &m, 50_000);
         assert!(rate_of(&clearly, 50_000) >= rate_of(&barely, 5_000) + INCREMENTAL_FEE_RATE);
-        let id = m.accept(&clearly, &c.utxo, NETWORK, c.height()).expect("clearly");
+        let id = m
+            .accept(&clearly, &c.utxo, NETWORK, c.height())
+            .expect("clearly");
         assert_eq!(m.len(), 2);
         assert!(m.contains(&id));
         assert!(m.contains(&a), "the oldest of two equals stays");
@@ -1823,7 +1825,10 @@ mod tests_chains {
         let parent_size = parent.encode().len();
         let pid = m.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
         let child = spend_with_pending(&mut single, &c, &m, 1_000);
-        assert_eq!(child.inputs[0].prev_out.txid, pid, "the child spends the change");
+        assert_eq!(
+            child.inputs[0].prev_out.txid, pid,
+            "the child spends the change"
+        );
         let child_size = child.encode().len();
         let mut m2 = Mempool::with_capacity(parent_size + child_size + child_size / 2);
         m2.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
@@ -1855,9 +1860,13 @@ mod tests_chains {
         let parent = spend_with_pending(&mut single, &c, &probe, 1_000);
         let size = parent.encode().len();
         let mut m = Mempool::with_capacity(size * 2 + size / 2);
-        let pid = m.accept_local(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        let pid = m
+            .accept_local(&parent, &c.utxo, NETWORK, c.height())
+            .unwrap();
         let child = spend_with_pending(&mut single, &c, &m, 1_000);
-        let cid = m.accept_local(&child, &c.utxo, NETWORK, c.height()).unwrap();
+        let cid = m
+            .accept_local(&child, &c.utxo, NETWORK, c.height())
+            .unwrap();
         check_evictable(&m);
         assert!(m.evictable.is_empty());
         let rich = spend_with_pending(&mut many, &c, &m, 500_000);
