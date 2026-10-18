@@ -29,13 +29,14 @@ use crate::compact::{CompactBlock, Reconstruction};
 use crate::consensus::{NETWORK_MAGIC_MAINNET, NETWORK_MAGIC_TESTNET};
 use crate::hash::Hash256;
 use crate::mempool::Mempool;
+use crate::outbox::{Outbox, Push};
 use crate::tx::Transaction;
 use crate::wire::{
     InvItem, InvKind, Message, WireError, HEADER_LEN, MAX_PAYLOAD, MIN_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -555,7 +556,9 @@ pub struct OnionStatus {
 /// Connected peer.
 struct Peer {
     addr: SocketAddr,
-    writer: Arc<Mutex<TcpStream>>,
+    /// Outgoing queue, drained by a thread of its own: no producer ever
+    /// writes to the socket. See [`crate::outbox`].
+    writer: Arc<Outbox>,
     /// True if **we** initiated this connection (outbound). An inbound
     /// connection is chosen by the other end; only outbound ones are chosen
     /// by us, from the address book, with its group diversity. Counting
@@ -961,6 +964,9 @@ pub struct Stats {
     /// Proofs of work verified **outside** the global lock, before the block
     /// or announcement is processed. See [`Node::check_work_outside_lock`].
     pub work_outside_lock: AtomicU64,
+    /// Frames dropped for a peer whose outgoing queue was full, or that could
+    /// not take a reply in time. See [`crate::outbox`].
+    pub outbox_dropped: AtomicU64,
 }
 
 impl Node {
@@ -1377,7 +1383,7 @@ impl Node {
     /// Returns the number of peers disconnected.
     pub fn maintain_peers(&self) -> usize {
         let now = Instant::now();
-        let mut to_ping: Vec<(u64, Arc<Mutex<TcpStream>>)> = Vec::new();
+        let mut to_ping: Vec<Arc<Outbox>> = Vec::new();
         let mut dead: Vec<u64> = Vec::new();
         let magic = self.magic;
         let mut to_rerequest: Vec<Outgoing> = Vec::new();
@@ -1497,7 +1503,7 @@ impl Node {
                     dead.push(*id);
                 } else if silence >= PING_AFTER && p.pending_ping.is_none() {
                     p.pending_ping = Some(now);
-                    to_ping.push((*id, p.writer.clone()));
+                    to_ping.push(p.writer.clone());
                 }
             }
             g.nonce
@@ -1505,10 +1511,13 @@ impl Node {
         for e in to_rerequest {
             self.send_to(e.peer, &e.message);
         }
-        // The write happens outside the lock: a clogged socket would otherwise
-        // block the whole node for the duration of the write timeout.
-        for (_, writer) in to_ping {
-            let _ = write_message(&writer, &Message::Ping(nonce), magic);
+        // Queued outside the lock, and never waited for: a clogged peer only
+        // misses its ping, and its own silence timeout drops it.
+        if !to_ping.is_empty() {
+            let frame = frame_of(&Message::Ping(nonce), magic);
+            for writer in to_ping {
+                self.queue(&writer, frame.clone());
+            }
         }
         let dropped = dead.len();
         for id in dead {
@@ -1628,8 +1637,11 @@ impl Node {
             Err(_) => return 0,
         };
 
+        let writer = match Outbox::start(stream) {
+            Ok(w) => w,
+            Err(_) => return 0,
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let writer = Arc::new(Mutex::new(stream));
 
         {
             let mut g = self.shared.lock().unwrap();
@@ -1678,7 +1690,7 @@ impl Node {
                 user_agent: "q21:0.4".into(),
                 start_height: height,
             };
-            let _ = write_message(&writer, &v, self.magic);
+            self.queue(&writer, frame_of(&v, self.magic));
         }
 
         let node = self.clone();
@@ -1690,9 +1702,13 @@ impl Node {
     }
 
     fn disconnect(&self, id: u64) {
-        let mut g = self.shared.lock().unwrap();
-        if let Some(p) = g.peers.remove(&id) {
-            let _ = p.writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        // The peer leaves the table under the lock; its socket is closed after.
+        // Closing never waits — up to v0.4.8 it took the socket's mutex, held
+        // by any write in progress, for up to WRITE_TIMEOUT, **while holding
+        // the node's lock**: one stalled peer then froze the whole node.
+        let removed = self.shared.lock().unwrap().peers.remove(&id);
+        if let Some(p) = removed {
+            p.writer.close();
         }
     }
 
@@ -2845,7 +2861,19 @@ impl Node {
                 })
             };
             if let Some(s) = writer {
-                let _ = write_message(&s, &e.message, self.magic);
+                let frame = frame_of(&e.message, self.magic);
+                if e.peer == id {
+                    // A reply to the peer whose message we are handling: if it
+                    // asks faster than it reads, it waits — only its own read
+                    // loop is held, as before, and nobody else.
+                    if s.push_wait(frame, WRITE_TIMEOUT) != Push::Queued {
+                        self.stats.outbox_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    // A relay to another peer: never wait for it, or a slow
+                    // peer would stop us reading this one.
+                    self.queue(&s, frame);
+                }
             }
         }
 
@@ -3179,7 +3207,7 @@ impl Node {
     /// peer's address book applies its own routability rules anyway before
     /// keeping it.
     pub fn announce_address(&self, n: crate::wire::NetAddr) {
-        let targets: Vec<Arc<Mutex<TcpStream>>> = {
+        let targets: Vec<Arc<Outbox>> = {
             let g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             g.peers
                 .values()
@@ -3187,16 +3215,13 @@ impl Node {
                 .map(|p| p.writer.clone())
                 .collect()
         };
-        let m = Message::Addr(vec![n]);
-        for s in targets {
-            let _ = write_message(&s, &m, self.magic);
-        }
+        self.broadcast(&targets, &Message::Addr(vec![n]));
     }
 
     /// Announces a block we have just mined ourselves.
     pub fn announce_block(&self, b: &Block) {
         let bid = b.header.block_id();
-        let targets: Vec<Arc<Mutex<TcpStream>>> = {
+        let targets: Vec<Arc<Outbox>> = {
             let g = self.shared.lock().unwrap();
             // Only peers whose handshake is complete: announcing earlier would
             // trigger a request that would reach us before their `verack`, and
@@ -3211,9 +3236,7 @@ impl Node {
             kind: InvKind::CompactBlock,
             hash: bid,
         }]);
-        for s in targets {
-            let _ = write_message(&s, &m, self.magic);
-        }
+        self.broadcast(&targets, &m);
     }
 
     /// Broadcasts a local transaction.
@@ -3228,7 +3251,7 @@ impl Node {
             })
         };
         if let Some(s) = writer {
-            let _ = write_message(&s, m, self.magic);
+            self.queue(&s, frame_of(m, self.magic));
         }
     }
 
@@ -3242,7 +3265,7 @@ impl Node {
     /// to every node already connected, until its next restart. Called every
     /// ten minutes; the reply is bounded by each peer's bucket.
     pub fn ask_addresses(&self) -> usize {
-        let targets: Vec<Arc<Mutex<TcpStream>>> = {
+        let targets: Vec<Arc<Outbox>> = {
             let g = self.shared.lock().unwrap();
             g.peers
                 .values()
@@ -3250,14 +3273,12 @@ impl Node {
                 .map(|p| p.writer.clone())
                 .collect()
         };
-        for s in &targets {
-            let _ = write_message(s, &Message::GetAddr, self.magic);
-        }
+        self.broadcast(&targets, &Message::GetAddr);
         targets.len()
     }
 
     pub fn announce_mempool(&self) -> usize {
-        let (targets, pending): (Vec<Arc<Mutex<TcpStream>>>, Vec<Hash256>) = {
+        let (targets, pending): (Vec<Arc<Outbox>>, Vec<Hash256>) = {
             let g = self.shared.lock().unwrap();
             let pending = g.mempool.announcement(MEMPOOL_ANNOUNCE_INPUTS);
             let targets = g
@@ -3280,14 +3301,12 @@ impl Node {
                 })
                 .collect(),
         );
-        for s in targets {
-            let _ = write_message(&s, &m, self.magic);
-        }
+        self.broadcast(&targets, &m);
         pending.len()
     }
 
     pub fn announce_tx(&self, txid: Hash256) {
-        let targets: Vec<Arc<Mutex<TcpStream>>> = {
+        let targets: Vec<Arc<Outbox>> = {
             let g = self.shared.lock().unwrap();
             g.peers
                 .values()
@@ -3299,21 +3318,35 @@ impl Node {
             kind: InvKind::Tx,
             hash: txid,
         }]);
+        self.broadcast(&targets, &m);
+    }
+
+    /// Queues a frame for a peer without ever waiting. A full queue drops the
+    /// frame for that peer only, and is counted.
+    fn queue(&self, writer: &Outbox, frame: Arc<[u8]>) {
+        if writer.push(frame) == Push::Full {
+            self.stats.outbox_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Queues one message for several peers: serialized once, shared by all,
+    /// and never waited for — the defect of v0.4.8 was exactly this loop
+    /// writing to each peer in turn, and stopping at the first that did not
+    /// read.
+    fn broadcast(&self, targets: &[Arc<Outbox>], m: &Message) {
+        if targets.is_empty() {
+            return;
+        }
+        let frame = frame_of(m, self.magic);
         for s in targets {
-            let _ = write_message(&s, &m, self.magic);
+            self.queue(s, frame.clone());
         }
     }
 }
 
-fn write_message(
-    stream: &Arc<Mutex<TcpStream>>,
-    m: &Message,
-    magic: [u8; 4],
-) -> std::io::Result<()> {
-    let frame = m.frame(magic);
-    let mut g = stream.lock().unwrap();
-    g.write_all(&frame)?;
-    g.flush()
+/// A message framed for the wire, ready to be shared between queues.
+fn frame_of(m: &Message, magic: [u8; 4]) -> Arc<[u8]> {
+    m.frame(magic).into()
 }
 
 #[cfg(test)]
@@ -3903,7 +3936,7 @@ mod tests {
             id,
             Peer {
                 addr,
-                writer: Arc::new(Mutex::new(stream)),
+                writer: Outbox::start(stream).unwrap(),
                 outbound,
                 snapshot_bucket: TokenBucket::new(Instant::now()),
                 tx_bucket: TokenBucket::for_transactions(Instant::now()),
@@ -4090,7 +4123,7 @@ mod tests {
                     g = g.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                     *o = (g >> 33) as u8;
                 }
-                let _ = s.write_all(&raw);
+                let _ = std::io::Write::write_all(&mut s, &raw);
             }
         }
 
@@ -4238,7 +4271,7 @@ mod tests_hardening {
             id,
             Peer {
                 addr,
-                writer: Arc::new(Mutex::new(stream)),
+                writer: Outbox::start(stream).unwrap(),
                 outbound: true,
                 snapshot_bucket: TokenBucket::new(Instant::now()),
                 tx_bucket: TokenBucket::for_transactions(Instant::now()),
@@ -4278,6 +4311,70 @@ mod tests_hardening {
 
     fn memo(n: &Node) -> std::sync::Arc<crate::pow::WorkMemo> {
         n.with_chain(|c| c.work_memo())
+    }
+
+    /// Fills a peer's pipe to the brim: its queue full and the kernel buffers
+    /// behind it saturated, as with a Tor circuit that stopped moving.
+    fn clog(n: &Node, id: u64) {
+        let w = n.shared.lock().unwrap().peers[&id].writer.clone();
+        let big: Arc<[u8]> = vec![0u8; 256 * 1024].into();
+        loop {
+            while w.push(big.clone()) == Push::Queued {}
+            std::thread::sleep(Duration::from_millis(200));
+            if w.push(big.clone()) == Push::Full {
+                return;
+            }
+        }
+    }
+
+    /// The defect of the endurance test, end to end.
+    ///
+    /// Three established peers have stopped reading. Up to v0.4.8, announcing
+    /// a block wrote to each of them in turn and waited `WRITE_TIMEOUT` on
+    /// each — a minute and a half — before the healthy peer heard of it; and
+    /// dropping one of them waited for its write while holding the node's
+    /// lock. Now the announcement returns at once, the healthy peer fetches
+    /// the block within seconds, and the node answers throughout.
+    #[test]
+    fn stalled_peers_delay_neither_propagation_nor_the_node() {
+        let (a, b) = node_pair();
+        let addr = a.listen("127.0.0.1:0").expect("listen");
+        b.connect(addr).expect("connection");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5)
+            && !(a.peer_count_established() == 1 && b.peer_count_established() == 1)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _stalled: Vec<TcpListener> = (900..903u64).map(|id| established_peer(&a, id)).collect();
+        for id in 900..903u64 {
+            clog(&a, id);
+        }
+
+        let block = next_block(&a);
+        a.with_chain(|c| c.connect(&block, block.header.time + 1).expect("local"));
+        let t = Instant::now();
+        a.announce_block(&block);
+        a.announce_tx(Hash256([5u8; 32]));
+        assert!(t.elapsed() < Duration::from_secs(1), "announcing waited {:?}", t.elapsed());
+
+        // The node keeps answering — what the wallet and the RPC server see.
+        let t = Instant::now();
+        let _ = a.height();
+        assert!(t.elapsed() < Duration::from_millis(200));
+
+        let t = Instant::now();
+        while b.height() < 1 && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(b.height(), 1, "the healthy peer must get the block");
+        assert!(t.elapsed() < Duration::from_secs(10), "propagation took {:?}", t.elapsed());
+
+        // Dropping a stalled peer does not wait for its write.
+        let t = Instant::now();
+        a.disconnect(900);
+        assert!(t.elapsed() < Duration::from_millis(500), "disconnect waited {:?}", t.elapsed());
+        assert!(a.stats.outbox_dropped.load(Ordering::Relaxed) > 0);
     }
 
     /// The work of a received block is checked before the lock, and the chain
@@ -4770,7 +4867,7 @@ mod tests_handler_fuzz {
             id,
             Peer {
                 addr,
-                writer: Arc::new(Mutex::new(stream)),
+                writer: Outbox::start(stream).unwrap(),
                 outbound,
                 snapshot_bucket: TokenBucket::new(now),
                 tx_bucket: TokenBucket::for_transactions(now),
@@ -5596,7 +5693,7 @@ mod tests_handler_review {
             id,
             Peer {
                 addr,
-                writer: Arc::new(Mutex::new(stream)),
+                writer: Outbox::start(stream).unwrap(),
                 outbound: false,
                 snapshot_bucket: TokenBucket::new(now),
                 tx_bucket: TokenBucket::for_transactions(now),

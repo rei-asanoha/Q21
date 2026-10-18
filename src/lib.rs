@@ -68,6 +68,7 @@ pub mod mining;
 pub mod muhash;
 pub mod nat;
 pub mod net;
+pub mod outbox;
 pub mod pow;
 pub mod prompt;
 pub mod pruning;
