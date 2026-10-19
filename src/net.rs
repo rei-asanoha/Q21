@@ -416,9 +416,8 @@ pub const MEMPOOL_ANNOUNCE_INPUTS: u64 = TX_BUCKET_MAX / 4;
 /// waited ten minutes after the queue had drained, while the blocks went out
 /// almost empty: the miners had missed them while their pool was full, and
 /// heard of them again only at the next offer. One block interval now. The
-/// offer is bounded by [`MEMPOOL_ANNOUNCE_INPUTS`] and costs a few kilobytes
-/// of identifiers per peer; a peer that holds a transaction does not ask for
-/// it again.
+/// offer covers the whole pool ([`MEMPOOL_REOFFER_MAX_TXS`]); a peer that
+/// holds a transaction does not ask for it again.
 pub const MEMPOOL_REBROADCAST: Duration = Duration::from_secs(120);
 
 /// Transactions requested from one peer and not yet received, at most. Fewer
@@ -430,9 +429,17 @@ pub const MAX_REQUESTED_TXS: usize = TX_BUCKET_MAX as usize;
 pub const MAX_RECENT_REJECTS: usize = 20_000;
 
 /// Announced transactions waiting, per peer, for its budget to refill before
-/// they are requested. Beyond, the oldest are forgotten: the next offer of
-/// the pool brings them back.
-pub const MAX_ANNOUNCED_WAITING: usize = 4096;
+/// they are requested. Sized to hold a re-offer of a full pool
+/// ([`MEMPOOL_REOFFER_MAX_TXS`]), so that a node catching up never has to
+/// drop part of what a peer offered and wait for the next round.
+pub const MAX_ANNOUNCED_WAITING: usize = 9000;
+
+/// Transactions re-offered to a peer on the periodic mempool broadcast and at
+/// the handshake: the whole pool, capped so the inventory stays bounded (a
+/// full pool is about eight thousand one hundred transactions). At thirty-six
+/// bytes per identifier this is roughly three hundred kibibytes, once every
+/// [`MEMPOOL_REBROADCAST`], to each peer.
+pub const MEMPOOL_REOFFER_MAX_TXS: usize = 9000;
 
 /// How long a transaction request is remembered. A peer that announced a
 /// transaction and no longer has it never answers; its slot is freed.
@@ -1637,7 +1644,7 @@ impl Node {
                 .map(|(id, _)| *id)
                 .collect();
             if !late.is_empty() {
-                let pending = mempool.announcement(MEMPOOL_ANNOUNCE_INPUTS);
+                let pending = mempool.announcement_window(MEMPOOL_REOFFER_MAX_TXS);
                 for id in late {
                     if let Some(p) = peers.get_mut(&id) {
                         p.mempool_offered = true;
@@ -2192,7 +2199,7 @@ impl Node {
                         _ => false,
                     };
                     if offer_now {
-                        let pending = g.mempool.announcement(MEMPOOL_ANNOUNCE_INPUTS);
+                        let pending = g.mempool.announcement_window(MEMPOOL_REOFFER_MAX_TXS);
                         if !pending.is_empty() {
                             outgoing.push(Outgoing {
                                 peer: id,
@@ -3658,7 +3665,10 @@ impl Node {
     pub fn announce_mempool(&self) -> usize {
         let (targets, pending): (Vec<Arc<Outbox>>, Vec<Hash256>) = {
             let g = self.shared.lock().unwrap();
-            let pending = g.mempool.announcement(MEMPOOL_ANNOUNCE_INPUTS);
+            // The whole pool, not just its top: a peer behind by thousands
+            // reconciles the rest here, bounding its own intake. See
+            // `Mempool::announcement_window`.
+            let pending = g.mempool.announcement_window(MEMPOOL_REOFFER_MAX_TXS);
             let targets = g
                 .peers
                 .values()
@@ -4894,6 +4904,74 @@ mod tests_hardening {
             2 * MISCONDUCT_MALFORMED,
             "unsolicited still pays"
         );
+    }
+
+    /// A peer behind by a whole pool reconciles all of it, not a prefix.
+    ///
+    /// The lab of 19 October: a node that connected to a peer holding more
+    /// than a thousand transactions received about a hundred and forty, then
+    /// nothing. The offer now covers the whole pool, and the receiver pulls
+    /// it in within its budget.
+    #[test]
+    fn a_peer_reconciles_the_whole_pool_not_a_prefix() {
+        let (a, b) = node_pair();
+        // Fill A's pool with many transactions on one chain.
+        let mut w = crate::wallet::Wallet::from_seed([0x71; 32], NETWORK);
+        let _ = w.new_address();
+        a.with_chain(|c| {
+            for _ in 1..=crate::consensus::COINBASE_MATURITY + 200 {
+                let addr = w.new_address();
+                let t = c.tip().time + TARGET_BLOCK_SECS;
+                let blk = c
+                    .mine_block(addr.hash, SchemeId::LamportOts, &[], t, 5_000_000)
+                    .expect("mine");
+                c.connect(&blk, blk.header.time + 1).expect("connect");
+            }
+        });
+        let mut dest = crate::wallet::Wallet::from_seed([0x72; 32], NETWORK);
+        let to = dest.new_address();
+        let n = 120;
+        a.with_chain_and_mempool(|c, m| {
+            for _ in 0..n {
+                let tx = w
+                    .create_transaction(
+                        &c.utxo,
+                        c.height(),
+                        &to,
+                        crate::amount::Amount::from_units(100_000),
+                        crate::amount::Amount::from_units(2_000),
+                    )
+                    .expect("build");
+                m.accept(&tx, &c.utxo, NETWORK, c.height()).expect("accept");
+            }
+        });
+        let pool = a.with_mempool(|m| m.len());
+        assert!(pool >= n, "pool has {pool}");
+        // B must reach A's height first, so the transactions' inputs resolve.
+        let addr = a.listen("127.0.0.1:0").expect("listen");
+        b.connect(addr).expect("connect");
+        let synced = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < synced
+            && !(b.height() == a.height() && b.peer_count_established() == 1)
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(b.height(), a.height(), "B did not sync the chain");
+        // Drive both maintenance loops: A re-offers its whole pool, B pulls it.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        a.announce_mempool();
+        while Instant::now() < deadline {
+            b.maintain_peers();
+            a.maintain_peers();
+            if b.with_mempool(|m| m.len()) >= pool {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let got = b.with_mempool(|m| m.len());
+        assert_eq!(got, pool, "B reconciled {got} of {pool}");
+        a.shutdown();
+        b.shutdown();
     }
 
     /// What waited for a peer's budget is requested as soon as it refills,

@@ -4956,9 +4956,31 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 Ok(pending) => {
                     let mut restored = 0usize;
                     let total = pending.len();
+                    // The wallet's own payments are its own again: a full pool
+                    // never pushes them out of this node (see
+                    // `Mempool::accept_local`). The flag is not written with the
+                    // pool; the wallet recognizes its keys in the inputs.
+                    let own = |tx: &q21_core::tx::Transaction| -> bool {
+                        if wallet_less {
+                            return false;
+                        }
+                        let Ok(w) = wallet.lock() else {
+                            return false;
+                        };
+                        let scheme = w.scheme();
+                        tx.inputs.iter().any(|i| {
+                            !i.witness.pubkey.is_empty()
+                                && w.owns(&q21_core::sig::pubkey_hash(scheme, &i.witness.pubkey))
+                        })
+                    };
                     for tx in &pending {
+                        let local = own(tx);
                         let ok = node.with_chain_and_mempool(|c, m| {
-                            m.accept(tx, &c.utxo, network, c.height()).is_ok()
+                            if local {
+                                m.accept_local(tx, &c.utxo, network, c.height()).is_ok()
+                            } else {
+                                m.accept(tx, &c.utxo, network, c.height()).is_ok()
+                            }
                         });
                         if ok {
                             restored += 1;

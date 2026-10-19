@@ -914,6 +914,31 @@ impl Mempool {
         out
     }
 
+    /// Identifiers of the **whole** pool to re-offer a peer, in block order
+    /// (parents before children), up to `max_txs`.
+    ///
+    /// # The defect this closes (0.4.9, lab of 19 October)
+    ///
+    /// [`Self::announcement`] offers only a prefix bounded by inputs — about a
+    /// hundred and thirty transactions. The periodic re-offer kept sending
+    /// that same prefix, which a peer already holds, so the rest of a large
+    /// pool was never reconciled: a node that connected to a peer holding one
+    /// thousand three hundred transactions received one hundred and
+    /// forty-five, then nothing, for ever. A miner then mined near-empty
+    /// blocks while its peers held thousands of accepted payments.
+    ///
+    /// The re-offer now covers the whole pool. The receiver bounds its own
+    /// intake — it requests within its per-peer budget and queues the rest —
+    /// so a full offer is never a flood; a peer that holds a transaction does
+    /// not ask for it again.
+    pub fn announcement_window(&self, max_txs: usize) -> Vec<Hash256> {
+        self.block_order(u64::MAX)
+            .into_iter()
+            .take(max_txs)
+            .map(|e| e.tx.txid())
+            .collect()
+    }
+
     /// The order of [`Self::select_for_block`], without copying anything.
     fn block_order(&self, max_weight: u64) -> Vec<&MempoolEntry> {
         // The identifiers are computed **once**, not on each comparison of the
