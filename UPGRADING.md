@@ -73,7 +73,12 @@ other. It comes out of the two-hour endurance test of 18 October 2026: three
 agents at three payments a second each, about 23,000 payments accepted.
 Nothing was lost to the chain itself, but the entry points froze for minutes
 at a time, the wallets showed "no response" all at once, and about 4 % of
-the accepted payments never reached a block.
+the accepted payments never reached a block. A second round of local testing,
+on 19 October, with ten nodes, congested-Tor wallets, payments to many
+recipients at once, crashes and freezes, found two more faults, fixed here: a
+node that fell behind only ever recovered the top of a peer's pool, and a
+payment larger than what a wallet would be left with was wrongly told to wait
+for a block.
 
 ## What changes
 
@@ -84,6 +89,9 @@ the accepted payments never reached a block.
 | A full pool (64 MiB) | A payment paying one unit more pushed out another, and every payment built on it went too: about a thousand accepted payments vanished in the test | A newcomer must pay clearly more than what it pushes out. Payments nothing depends on go first; a chain goes out as a whole only when the newcomer pays clearly more than the chain does on average. The node's own wallet payments are never pushed out of its own pool, even through a reorganization. A newcomer that cannot get in is refused before its signature is checked |
 | A payment that arrives before the one it builds on | Refused, and heard of again only at the next offer of a peer's pool: up to ten minutes | Waits for it, and goes in the moment it arrives |
 | A payment a miner missed | Offered again after ten minutes | After two minutes, one block. A payment refused for a full pool is not downloaded again before the next block |
+| A node behind by a full pool (a fresh wallet, a node back from a bad link) | The periodic offer re-sent only the top of the pool, which the node already held: it received about a hundred and forty transactions and then nothing, and a miner mined near-empty blocks while its peers held thousands | The offer covers the whole pool; a node catches up a backlog of two thousand transactions in about three minutes, and the miner's blocks stay full |
+| A requested transaction larger than the per-peer budget (a consolidation of a hundred coins) | Dropped and re-requested at the next offer: it crossed the network one transaction per offer | Served whatever its size, since we asked for it; the budget still bounds what a peer pushes unasked |
+| Paying more than what the wallet will be left with once its pending sends are mined | Told to "wait for a block", which changed nothing | Told there are not enough funds — and, when the funds are only scattered across many small coins, offered a button to gather them |
 | A reorganization deeper than six blocks | The payments of the older abandoned blocks were not put back in the queue | Put back up to twelve blocks deep |
 | A relay passing on many payments | Eight signature checks a second granted to each peer, and what it sent beyond counted as misconduct | Sixteen; a peer is only asked for what that allows, and what it was asked for is never misconduct |
 | A tip that stops moving | Nothing done until the next block arrived | After ten minutes, the peers are asked what follows it |
