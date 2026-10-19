@@ -3429,8 +3429,28 @@ impl RpcContext {
             // Short only because of the pending sends? Then the funds exist:
             // they are waiting for a block, and the user must hear that, not
             // "insufficient funds".
+            //
+            // "Exist" means: what the wallet will hold once its pending sends
+            // are in a block — its coins they do not spend, plus their change.
+            // Up to 0.4.8 the coins they spend were counted too: a payment
+            // larger than what would be left was told to wait for a block,
+            // and after the block it was refused for lack of funds.
             if let Err(crate::wallet::WalletError::InsufficientFunds { requested, .. }) = &r {
-                if g.select_coins(&c.utxo, c.height(), *requested).is_ok() {
+                let mine = |o: &crate::tx::TxOut| g.owns_output(o);
+                let free: u64 = g
+                    .spendable(&c.utxo, c.height())
+                    .iter()
+                    .filter(|(o, _, _)| !m.spends(o))
+                    .map(|(_, t, _)| t.value.units())
+                    .sum();
+                let change: u64 = m
+                    .unspent_created(&mine)
+                    .iter()
+                    .map(|(_, t)| t.value.units())
+                    .sum();
+                if free.saturating_add(change) >= *requested
+                    && g.select_coins(&c.utxo, c.height(), *requested).is_ok()
+                {
                     return Err(None);
                 }
             }
@@ -4205,6 +4225,45 @@ mod tests {
         }
         assert_eq!(sent, MAX_UNCONFIRMED_CHAIN, "the chain stops at its limit");
         assert_eq!(refused.as_deref(), Some(PENDING_FUNDS));
+    }
+
+    /// A payment larger than what will be left once the pending sends are in
+    /// a block is told "insufficient funds", not "wait for a block": waiting
+    /// would change nothing.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_payment_beyond_what_will_be_left_is_not_told_to_wait() {
+        let c = context_with_coins(crate::sig::SchemeId::MlDsa87, 2);
+        let mut other = Wallet::from_seed([0x14; 32], NETWORK);
+        let to = other.new_address().to_string_bech32();
+        let units = |r: &Json| {
+            r.get("spendable")
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+                .expect("spendable")
+        };
+        let total = units(&call_ok(&c, "getbalance", "{}"));
+        // Most of one coin goes out; its small change waits for a block.
+        let first = total / 2 * 9 / 10;
+        call_ok(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":{first}}}"#),
+        );
+        // What will be left: one coin and the change, about 0.55 of the total.
+        let too_much = total * 3 / 4;
+        let r = call(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":{too_much}}}"#),
+        );
+        let m = r
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .expect("refused");
+        assert_ne!(m, PENDING_FUNDS, "waiting for a block would change nothing");
+        assert!(m.contains("insufficient"), "{m}");
     }
 
     /// The inputs of a send, as `txid:index`.

@@ -429,6 +429,11 @@ pub const MAX_REQUESTED_TXS: usize = TX_BUCKET_MAX as usize;
 /// `Shared::rejected`.
 pub const MAX_RECENT_REJECTS: usize = 20_000;
 
+/// Announced transactions waiting, per peer, for its budget to refill before
+/// they are requested. Beyond, the oldest are forgotten: the next offer of
+/// the pool brings them back.
+pub const MAX_ANNOUNCED_WAITING: usize = 4096;
+
 /// How long a transaction request is remembered. A peer that announced a
 /// transaction and no longer has it never answers; its slot is freed.
 pub const TX_REQUEST_MEMORY: Duration = Duration::from_secs(60);
@@ -497,6 +502,13 @@ impl TokenBucket {
             tokens: CMPCT_BUCKET_MAX,
             last: now,
         }
+    }
+
+    /// Empties the bucket: what was granted beyond it is paid by waiting for
+    /// it to refill.
+    pub fn drain(&mut self, now: Instant) {
+        self.tokens = 0;
+        self.last = now;
     }
 
     /// Units the bucket holds now, refill included. Removes nothing.
@@ -679,6 +691,10 @@ struct Peer {
     /// Sending them is no misconduct, budget or not: see the `Tx` arm.
     /// Bounded by [`MAX_REQUESTED_TXS`].
     requested_txs: HashMap<Hash256, Instant>,
+    /// Transactions this peer announced that its budget could not pay for
+    /// yet: requested as soon as it refills, instead of waiting for the next
+    /// offer of its pool. Bounded by [`MAX_ANNOUNCED_WAITING`].
+    announced_waiting: VecDeque<Hash256>,
     /// Instant the connection was opened, fixed at creation. Used for the
     /// handshake deadline: see [`HANDSHAKE_TIMEOUT`]. Unlike `last_received`,
     /// no frame pushes it back — a connection that does not introduce itself
@@ -705,6 +721,17 @@ struct Peer {
 }
 
 impl Peer {
+    /// How many more transactions can be requested from this peer now: its
+    /// budget, less what is already asked and not received. Forgets the
+    /// requests older than [`TX_REQUEST_MEMORY`].
+    fn tx_request_room(&mut self, now: Instant) -> usize {
+        self.requested_txs
+            .retain(|_, at| now.duration_since(*at) < TX_REQUEST_MEMORY);
+        (self.tx_bucket.level(now, TX_BUCKET_MAX, TX_RATE_PER_SEC) as usize)
+            .min(MAX_REQUESTED_TXS)
+            .saturating_sub(self.requested_txs.len())
+    }
+
     /// Notes a body requested from this peer, if the in-flight room allows it.
     ///
     /// This is the only entry point into `requested_bodies`: whatever path an
@@ -1653,6 +1680,18 @@ impl Node {
         for e in to_rerequest {
             self.send_to(e.peer, &e.message);
         }
+        // Announced transactions that waited for a peer's budget: asked for
+        // now if it has refilled, even if that peer has gone quiet since.
+        let waiting: Vec<(u64, Message)> = {
+            let mut g = self.shared.lock().unwrap();
+            let ids: Vec<u64> = g.peers.keys().copied().collect();
+            ids.into_iter()
+                .filter_map(|id| Self::request_waiting_txs(&mut g, id, now).map(|m| (id, m)))
+                .collect()
+        };
+        for (id, m) in waiting {
+            self.send_to(id, &m);
+        }
         // Queued outside the lock, and never waited for: a clogged peer only
         // misses its ping, and its own silence timeout drops it.
         if !to_ping.is_empty() {
@@ -1816,6 +1855,7 @@ impl Node {
                     last_received: Instant::now(),
                     pending_ping: None,
                     requested_txs: HashMap::new(),
+                    announced_waiting: VecDeque::new(),
                     connected_at: Instant::now(),
                 },
             );
@@ -2369,25 +2409,26 @@ impl Node {
                             }
                         }
                     }
-                    // Only what the peer's budget can pay for is requested:
-                    // the rest comes again with the next offer, from it or
-                    // from another peer. A request is remembered for a minute,
-                    // so that its answer is never misconduct (see the `Tx`
-                    // arm) — and bounding the requests by the budget is what
-                    // keeps that exemption from becoming free work.
+                    // Only what the peer's budget can pay for is requested
+                    // now; the rest waits, per peer, and is requested as the
+                    // budget refills (see `request_waiting_txs`). A request
+                    // is remembered for a minute, so that its answer is never
+                    // misconduct (see the `Tx` arm) — and bounding the
+                    // requests by the budget is what keeps that exemption
+                    // from becoming free work.
                     if let Some(p) = g.peers.get_mut(&id) {
                         let now = Instant::now();
-                        p.requested_txs
-                            .retain(|_, at| now.duration_since(*at) < TX_REQUEST_MEMORY);
-                        let room = (p.tx_bucket.level(now, TX_BUCKET_MAX, TX_RATE_PER_SEC)
-                            as usize)
-                            .min(MAX_REQUESTED_TXS)
-                            .saturating_sub(p.requested_txs.len());
+                        let room = p.tx_request_room(now);
                         if wanted.len() > room {
                             self.stats
                                 .tx_requests_deferred
                                 .fetch_add((wanted.len() - room) as u64, Ordering::Relaxed);
-                            wanted.truncate(room);
+                            for i in wanted.drain(room..) {
+                                if p.announced_waiting.len() >= MAX_ANNOUNCED_WAITING {
+                                    p.announced_waiting.pop_front();
+                                }
+                                p.announced_waiting.push_back(i.hash);
+                            }
                         }
                         for i in &wanted {
                             p.requested_txs.insert(i.hash, now);
@@ -2691,7 +2732,7 @@ impl Node {
                     // refills. A really invalid transaction, on the other hand,
                     // is always penalized further down (`tx_invalid_in_itself`).
                     let cost = (t.inputs.len() as u64).clamp(1, TX_BUCKET_MAX);
-                    let allowed = g
+                    let mut allowed = g
                         .peers
                         .get_mut(&id)
                         .map(|p| {
@@ -2703,6 +2744,40 @@ impl Node {
                             )
                         })
                         .unwrap_or(false);
+                    // --- A transaction **we asked for** is served, whatever
+                    // its size (0.4.9).
+                    //
+                    // The budget bounds what a peer pushes unasked. What we
+                    // ask for is bounded already: by the budget, when asked
+                    // (see the `Inv` arm). Refusing the answer only made us
+                    // ask again at the next offer: in the lab, consolidations
+                    // of a hundred inputs crossed the network one per offer,
+                    // twelve of them in half an hour. Served, a heavy answer
+                    // empties the budget instead, which slows down what we ask
+                    // this peer next. An answer is served once: sent again, it
+                    // is unsolicited. Recognizing it costs one hash, and only
+                    // while a request is outstanding.
+                    if !allowed {
+                        let now = Instant::now();
+                        let solicited = g
+                            .peers
+                            .get_mut(&id)
+                            .map(|p| {
+                                let asked = !p.requested_txs.is_empty()
+                                    && p.requested_txs.remove(&t.txid()).is_some();
+                                if asked {
+                                    p.tx_bucket.drain(now);
+                                }
+                                asked
+                            })
+                            .unwrap_or(false);
+                        if solicited {
+                            self.stats
+                                .solicited_over_budget
+                                .fetch_add(1, Ordering::Relaxed);
+                            allowed = true;
+                        }
+                    }
                     if !allowed {
                         // Budget overrun, two distinct cases:
                         // - small transaction: the peer sends too many MESSAGES,
@@ -2716,28 +2791,8 @@ impl Node {
                         // In both cases: neither verification nor relay. The work
                         // is bounded because we stop here.
                         //
-                        // A small transaction **we asked for** is never
-                        // misconduct, whatever the budget says: a relay that
-                        // answers our own `getdata` is doing its job (0.4.9).
-                        // Recognizing it costs one hash. What we ask for is
-                        // bounded by the budget itself (see the `Inv` arm), so
-                        // the exemption cannot be turned into free work, and an
-                        // answer counts only once: sent again, it would be
-                        // unsolicited. A large one is never penalized anyway,
-                        // and is not even hashed.
-                        let solicited = cost <= FLOOD_INPUT_THRESHOLD
-                            && g.peers
-                                .get_mut(&id)
-                                .map(|p| {
-                                    !p.requested_txs.is_empty()
-                                        && p.requested_txs.remove(&t.txid()).is_some()
-                                })
-                                .unwrap_or(false);
-                        if solicited {
-                            self.stats
-                                .solicited_over_budget
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else if cost <= FLOOD_INPUT_THRESHOLD {
+                        // What we asked for never comes this far: see above.
+                        if cost <= FLOOD_INPUT_THRESHOLD {
                             if let Some(p) = g.peers.get_mut(&id) {
                                 p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
                                 if p.ban_score >= BAN_THRESHOLD {
@@ -2833,6 +2888,14 @@ impl Node {
                                 }
                             }
                         }
+                    }
+                    // The budget this message did not use asks for what
+                    // waits, in the same breath.
+                    if let Some(m) = Self::request_waiting_txs(&mut g, id, Instant::now()) {
+                        outgoing.push(Outgoing {
+                            peer: id,
+                            message: m,
+                        });
                     }
                 }
 
@@ -3102,6 +3165,43 @@ impl Node {
         }
 
         !drop_peer
+    }
+
+    /// Requests, from peer `id`, the announced transactions that waited for
+    /// its budget, as far as the budget now allows. Those that reached the
+    /// pool meanwhile, or were refused until the next block, are skipped.
+    fn request_waiting_txs(g: &mut Shared, id: u64, now: Instant) -> Option<Message> {
+        let tip = g.chain.tip_id();
+        let Shared {
+            ref mut peers,
+            ref mempool,
+            ref rejected,
+            ref rejected_at,
+            ..
+        } = *g;
+        let p = peers.get_mut(&id)?;
+        if p.announced_waiting.is_empty() || !p.handshaked {
+            return None;
+        }
+        let room = p.tx_request_room(now);
+        let mut items = Vec::new();
+        while items.len() < room {
+            let Some(h) = p.announced_waiting.pop_front() else {
+                break;
+            };
+            if mempool.contains(&h)
+                || p.requested_txs.contains_key(&h)
+                || (*rejected_at == tip && rejected.contains(&h))
+            {
+                continue;
+            }
+            p.requested_txs.insert(h, now);
+            items.push(InvItem {
+                kind: InvKind::Tx,
+                hash: h,
+            });
+        }
+        (!items.is_empty()).then_some(Message::GetData(items))
     }
 
     /// Tries again the orphans waiting for `parent`, and those waiting for
@@ -4313,6 +4413,7 @@ mod tests {
                 last_received: Instant::now(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
+                announced_waiting: VecDeque::new(),
                 connected_at: Instant::now(),
             },
         );
@@ -4649,6 +4750,7 @@ mod tests_hardening {
                 last_received: Instant::now(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
+                announced_waiting: VecDeque::new(),
                 connected_at: Instant::now(),
             },
         );
@@ -4778,6 +4880,9 @@ mod tests_hardening {
         assert!(b.handle(7, Message::Tx(Box::new(asked.clone()))));
         assert_eq!(score(&b), 0, "a requested transaction is no misconduct");
         assert_eq!(b.stats.solicited_over_budget.load(Ordering::Relaxed), 1);
+        // And it was examined, not dropped: its parent being unknown here, it
+        // waits among the orphans.
+        assert_eq!(b.shared.lock().unwrap().orphans.len(), 1);
         // Sent again, it was not asked for any more.
         drain(&b);
         assert!(b.handle(7, Message::Tx(Box::new(asked))));
@@ -4789,6 +4894,49 @@ mod tests_hardening {
             2 * MISCONDUCT_MALFORMED,
             "unsolicited still pays"
         );
+    }
+
+    /// What waited for a peer's budget is requested as soon as it refills,
+    /// not at the next offer of its pool.
+    #[test]
+    fn waiting_announcements_are_requested_when_the_budget_refills() {
+        let (_a, b) = node_pair();
+        let _e = established_peer(&b, 7);
+        let items: Vec<InvItem> = (0..600u32)
+            .map(|n| {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&n.to_le_bytes());
+                h[31] = 1;
+                InvItem {
+                    kind: InvKind::Tx,
+                    hash: Hash256(h),
+                }
+            })
+            .collect();
+        assert!(b.handle(7, Message::Inv(items)));
+        let waiting = |b: &Node| b.shared.lock().unwrap().peers[&7].announced_waiting.len();
+        assert_eq!(waiting(&b), 600 - TX_BUCKET_MAX as usize);
+        // Nothing more can be asked while the first requests are outstanding.
+        let now = Instant::now();
+        assert!(Node::request_waiting_txs(&mut b.shared.lock().unwrap(), 7, now).is_none());
+        // A minute later the unanswered requests are forgotten and the budget
+        // has refilled: the waiting ones are asked for.
+        {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            let past = now
+                .checked_sub(TX_REQUEST_MEMORY + Duration::from_secs(1))
+                .unwrap();
+            for at in p.requested_txs.values_mut() {
+                *at = past;
+            }
+        }
+        let later = now + Duration::from_secs(40);
+        match Node::request_waiting_txs(&mut b.shared.lock().unwrap(), 7, later) {
+            Some(Message::GetData(v)) => assert_eq!(v.len(), 600 - TX_BUCKET_MAX as usize),
+            other => panic!("expected a request, got {other:?}"),
+        }
+        assert_eq!(waiting(&b), 0);
     }
 
     /// What a peer announces is requested only within its budget: the
@@ -5336,6 +5484,7 @@ mod tests_handler_fuzz {
                 last_received: now,
                 pending_ping: None,
                 requested_txs: HashMap::new(),
+                announced_waiting: VecDeque::new(),
                 connected_at: now,
             },
         );
@@ -6163,6 +6312,7 @@ mod tests_handler_review {
                 last_received: now,
                 pending_ping: None,
                 requested_txs: HashMap::new(),
+                announced_waiting: VecDeque::new(),
                 connected_at: now,
             },
         );
