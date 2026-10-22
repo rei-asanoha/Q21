@@ -135,6 +135,8 @@ pub enum PolicyError {
     },
     /// Bytes left in the satisfaction once the chosen path is read.
     ExtraWitnessData(usize),
+    /// The leaf named by a lone signature check is not a key leaf.
+    NotAKeyLeaf(u8),
 }
 
 impl From<ReadError> for PolicyError {
@@ -149,12 +151,16 @@ impl From<ReadError> for PolicyError {
 /// the block's own height in block validation, the tip plus one in the
 /// mempool.
 pub fn is_active(network: Network, height: u64) -> bool {
-    let activation = match network {
+    height >= activation_height(network)
+}
+
+/// Height from which the rule is in force; `u64::MAX` means never.
+fn activation_height(network: Network) -> u64 {
+    match network {
         Network::Mainnet => POLICY_ACTIVATION_MAINNET,
         Network::Testnet => POLICY_ACTIVATION_TESTNET,
         Network::Regtest => POLICY_ACTIVATION_REGTEST,
-    };
-    height >= activation
+    }
 }
 
 /// May an output locked under `scheme` be created or spent at `height`?
@@ -589,6 +595,53 @@ pub fn check_spend(
             .map_err(ValidationError::Signature)?;
     }
     Ok(())
+}
+
+/// Checks ONE key's signature, for leaf `leaf` of `policy`, on input
+/// `input_index` of `tx` spending `spent`.
+///
+/// This is what a channel party needs when the counterparty sends its half of
+/// a 2-of-2 spend: the same lock, decoding, key, size and message checks as
+/// [`check_spend`], applied to one key, so that it need not sign its own half
+/// just to run the full validation. It says nothing about the other keys, the
+/// preimages or the time locks of the spend.
+#[allow(clippy::too_many_arguments)]
+pub fn check_signature(
+    tx: &Transaction,
+    input_index: u32,
+    network: Network,
+    spent: &TxOut,
+    policy: &[u8],
+    leaf: u8,
+    pubkey: &[u8],
+    signature: &[u8],
+) -> Result<(), ValidationError> {
+    // No height here: refused on any network where the rule never opens.
+    if spent.scheme != SchemeId::Policy || activation_height(network) == u64::MAX {
+        return Err(ValidationError::SchemeForbiddenOnNetwork(spent.scheme));
+    }
+    let p = ValidationError::Policy;
+    if policy.len() > MAX_POLICY_SIZE {
+        return Err(p(PolicyError::TooLarge { size: policy.len() }));
+    }
+    if lock_hash_of(policy) != spent.pubkey_hash {
+        return Err(p(PolicyError::DoesNotMatchLock));
+    }
+    let decoded = Policy::decode(policy).map_err(p)?;
+    let (_, scheme, hash) = decoded
+        .key_leaves()
+        .into_iter()
+        .find(|(pos, _, _)| *pos == leaf)
+        .ok_or(p(PolicyError::NotAKeyLeaf(leaf)))?;
+    if !scheme.allowed_on(network) {
+        return Err(ValidationError::SchemeForbiddenOnNetwork(scheme));
+    }
+    sig::check_sizes(scheme, pubkey, signature).map_err(|e| p(PolicyError::WitnessSize(e)))?;
+    if sig::pubkey_hash(scheme, pubkey) != hash {
+        return Err(ValidationError::KeyDoesNotMatchLock);
+    }
+    let message = tx.policy_sighash(input_index, network, spent, policy, leaf);
+    sig::verify(scheme, pubkey, &message, signature).map_err(ValidationError::Signature)
 }
 
 /// First block height at which the time locks of an already validated
@@ -1044,6 +1097,55 @@ mod spend_tests {
         assert_eq!(available_at(&e, &tx.inputs[0].witness), BORN + 5);
         assert!(check(&u, &tx, NET, BORN + 4).is_err());
         assert!(check(&u, &tx, NET, BORN + 5).is_ok());
+    }
+
+    /// One counterparty signature, checked alone: accepted for its leaf,
+    /// refused for another leaf, another policy, another transaction.
+    #[test]
+    fn lone_signature_check() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let p = Policy::All(vec![a.leaf(), b.leaf()]);
+        let (_, op, e) = fixture(&p);
+        let tx = spend(op, vec![b.output(VALUE - 20_000)]);
+        let pb = p.encode();
+        let sig_b = b.sign(&sighash(&tx, 0, NET, &e.output, &p, 1));
+        let lone = |tx: &Transaction, out: &TxOut, pol: &[u8], leaf: u8, sig: &[u8]| {
+            check_signature(tx, 0, NET, out, pol, leaf, &b.pk, sig)
+        };
+        assert_eq!(lone(&tx, &e.output, &pb, 1, &sig_b), Ok(()));
+        // Another leaf: A's slot (key mismatch), or a leaf that is no key.
+        assert_eq!(
+            lone(&tx, &e.output, &pb, 0, &sig_b),
+            Err(ValidationError::KeyDoesNotMatchLock)
+        );
+        assert_eq!(
+            lone(&tx, &e.output, &pb, 5, &sig_b),
+            Err(ValidationError::Policy(PolicyError::NotAKeyLeaf(5)))
+        );
+        // Another transaction.
+        let other = spend(op, vec![b.output(VALUE - 30_000)]);
+        assert_eq!(
+            lone(&other, &e.output, &pb, 1, &sig_b),
+            Err(ValidationError::Signature(VerifyError::InvalidSignature))
+        );
+        // Another policy with B at the same leaf: the signature does not
+        // carry over, and a policy that is not the lock is refused.
+        let p2 = Policy::Any(vec![a.leaf(), b.leaf()]);
+        let out2 = p2.output(Amount::from_units(VALUE));
+        assert_eq!(
+            lone(&tx, &out2, &p2.encode(), 1, &sig_b),
+            Err(ValidationError::Signature(VerifyError::InvalidSignature))
+        );
+        assert_eq!(
+            lone(&tx, &e.output, &p2.encode(), 1, &sig_b),
+            Err(ValidationError::Policy(PolicyError::DoesNotMatchLock))
+        );
+        // Not a policy output at all, or not on a network where it is active.
+        assert!(lone(&tx, &b.output(VALUE), &pb, 1, &sig_b).is_err());
+        assert_eq!(
+            check_signature(&tx, 0, Network::Testnet, &e.output, &pb, 1, &b.pk, &sig_b),
+            Err(ValidationError::SchemeForbiddenOnNetwork(SchemeId::Policy))
+        );
     }
 
     // --- Channel shapes ------------------------------------------------

@@ -58,6 +58,7 @@ mod sim {
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -161,9 +162,13 @@ mod sim {
             let mut outs = Vec::new();
             if side[holder] >= MIN_OUTPUT_VALUE {
                 outs.push(to_local.output(Amount::from_units(side[holder])));
+            } else {
+                trim(side[holder]);
             }
             if side[other] >= MIN_OUTPUT_VALUE {
                 outs.push(key_out(self.hashes[other], side[other]));
+            } else {
+                trim(side[other]);
             }
             (one_input(self.fund_op, outs), to_local)
         }
@@ -182,6 +187,18 @@ mod sim {
                     .collect(),
             );
             tx.inputs[0].witness = policy::witness(&self.fund_p, &s);
+        }
+    }
+
+    /// Outputs below the dust floor are never created: their value goes to
+    /// the fee, and every such trim is counted here and reported.
+    static TRIMMED: AtomicU64 = AtomicU64::new(0);
+    static TRIMMED_UNITS: AtomicU64 = AtomicU64::new(0);
+
+    fn trim(v: u64) {
+        if v > 0 {
+            TRIMMED.fetch_add(1, Ordering::Relaxed);
+            TRIMMED_UNITS.fetch_add(v, Ordering::Relaxed);
         }
     }
 
@@ -313,10 +330,9 @@ mod sim {
         their_hashes: Vec<Hash256>,
         /// The other side's revoked commitments: txid, state, secret.
         revoked: Vec<(Hash256, usize, [u8; 32])>,
-        /// My latest commitment, fully signed, ready to broadcast.
-        latest: Option<Transaction>,
-        /// Every commitment of mine, fully signed (to cheat with, for A).
-        history: Vec<Transaction>,
+        /// Every commitment of mine with the counterparty's signature (the
+        /// last one is current; the others are there to cheat with, for A).
+        history: Vec<(Transaction, Vec<u8>)>,
         cpu: Cpu,
     }
 
@@ -348,23 +364,40 @@ mod sim {
         /// validated as for a broadcast. Panics if it is not valid.
         fn accept_mine(&mut self, n: usize, bal: [u64; 2], theirs: Vec<u8>) {
             let rev = self.secret(n);
-            let (mut tx, _) = self.ch.commitment(self.me, bal, rev);
-            let m = self.ch.sighash(&tx, self.me);
-            let mine = self.sign(&m);
+            let (tx, _) = self.ch.commitment(self.me, bal, rev);
+            // Only the counterparty's half is checked: the holder signs its
+            // own half when, and if, it broadcasts.
+            let t = Instant::now();
+            policy::check_signature(
+                &tx,
+                0,
+                NET,
+                &self.ch.fund_out,
+                &self.ch.fund_p.encode(),
+                (1 - self.me) as u8,
+                &self.their_pk,
+                &theirs,
+            )
+            .expect("the counterparty's signature must be valid");
+            self.cpu.verify += t.elapsed();
+            self.cpu.verifies += 1;
+            self.history.push((tx, theirs));
+        }
+
+        /// My commitment of state `n`, completed with my own signature and
+        /// validated in full, ready to broadcast.
+        fn broadcastable(&self, n: usize) -> Transaction {
+            let (mut tx, theirs) = self.history[n].clone();
             let mut sigs = [Vec::new(), Vec::new()];
-            sigs[self.me] = mine;
+            sigs[self.me] = self.key.sign(&self.ch.sighash(&tx, self.me));
             sigs[1 - self.me] = theirs;
             let mut pks: [&[u8]; 2] = [&[], &[]];
             pks[self.me] = &self.key.pk;
             pks[1 - self.me] = &self.their_pk;
             self.ch.complete(&mut tx, sigs, pks);
-            let t = Instant::now();
             check_transaction(&tx, &self.utxo, NET, self.height, &mut HashSet::new())
                 .expect("the commitment must be valid");
-            self.cpu.verify += t.elapsed();
-            self.cpu.verifies += 2;
-            self.history.push(tx.clone());
-            self.latest = Some(tx);
+            tx
         }
 
         /// Checks the other's revocation of its state `n`.
@@ -603,7 +636,6 @@ mod sim {
             my_secrets: Vec::new(),
             their_hashes: Vec::new(),
             revoked: Vec::new(),
-            latest: None,
             history: Vec::new(),
             cpu: Cpu::default(),
         }
@@ -774,36 +806,55 @@ mod sim {
                     run.wall.as_secs_f64()
                 );
             }
+            println!(
+                "  dust trimmed into fees: {} outputs, {} units",
+                TRIMMED.swap(0, Ordering::Relaxed),
+                TRIMMED_UNITS.swap(0, Ordering::Relaxed)
+            );
             last = Some(run);
         }
         let run = last.expect("at least one link");
-        let latest = run.a.latest.clone().expect("a commitment");
+        let latest = run.a.broadcastable(run.a.history.len() - 1);
         println!("\ncommitment weight (2 outputs): {}", weight(&latest));
 
         // --- Cooperative close of the last run, on the chain.
         let bal = run.a.bal;
         assert_eq!(bal, run.b.bal, "both sides agree on the balance");
-        let mut close = one_input(
-            ch.fund_op,
-            vec![
-                key_out(a.hash(), bal[0] - CLOSE_FEE),
-                key_out(b.hash(), bal[1]),
-            ],
-        );
+        let owed = [bal[0] - CLOSE_FEE, bal[1]];
+        let mut outs = Vec::new();
+        for (i, h) in [a.hash(), b.hash()].into_iter().enumerate() {
+            if owed[i] >= MIN_OUTPUT_VALUE {
+                outs.push(key_out(h, owed[i]));
+            } else {
+                trim(owed[i]);
+                println!(
+                    "  close: {}'s {} units are dust, trimmed into the fee",
+                    ["A", "B"][i],
+                    owed[i]
+                );
+            }
+        }
+        let trimmed = TRIMMED_UNITS.swap(0, Ordering::Relaxed);
+        let mut close = one_input(ch.fund_op, outs);
         let sigs = [
             a.sign(&ch.sighash(&close, 0)),
             b.sign(&ch.sighash(&close, 1)),
         ];
         ch.complete(&mut close, sigs, [&a.pk, &b.pk]);
         r.mine(std::slice::from_ref(&close));
-        let got = |i: u32| {
-            r.c.utxo
-                .get(&OutPoint {
-                    txid: close.txid(),
-                    index: i,
+        // What each side holds on chain from the close, found by its key.
+        let got = |i: usize| {
+            let h = [a.hash(), b.hash()][i];
+            (0..close.outputs.len() as u32)
+                .filter_map(|index| {
+                    r.c.utxo.get(&OutPoint {
+                        txid: close.txid(),
+                        index,
+                    })
                 })
+                .filter(|e| e.output.pubkey_hash == h)
                 .map(|e| e.output.value.units())
-                .unwrap_or(0)
+                .sum::<u64>()
         };
         println!(
             "\nCLOSE cooperative, confirmed at height {} (1 block, weight {})",
@@ -818,9 +869,11 @@ mod sim {
             q21(CLOSE_FEE),
             q21(got(1))
         );
-        assert_eq!(got(0), bal[0] - CLOSE_FEE);
-        assert_eq!(got(1), bal[1]);
-        assert_eq!(got(0) + got(1) + CLOSE_FEE, CAPACITY);
+        for (i, &o) in owed.iter().enumerate() {
+            let expected = if o >= MIN_OUTPUT_VALUE { o } else { 0 };
+            assert_eq!(got(i), expected);
+        }
+        assert_eq!(got(0) + got(1) + CLOSE_FEE + trimmed, CAPACITY);
         println!("  exact to the unit: yes");
 
         // --- The second run: A broadcasts its old state 1 instead.
@@ -836,7 +889,7 @@ mod sim {
             r2.c.connect(blk, blk.header.time + 1).expect("replay");
             r2.blocks.push(blk.clone());
         }
-        let old = run.a.history[1].clone();
+        let old = run.a.broadcastable(1);
         r2.mine(std::slice::from_ref(&old));
         let hc = r2.height();
         // B watches the chain: the funding output was spent by a txid it
