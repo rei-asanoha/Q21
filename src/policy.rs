@@ -1286,6 +1286,91 @@ mod spend_tests {
         );
     }
 
+    // --- Through blocks ------------------------------------------------
+
+    /// A policy output funded and spent on a real regtest chain: the time
+    /// lock counts blocks from the one that created the output, so a spend in
+    /// that same block, or too soon after it, makes the block invalid.
+    #[test]
+    fn time_lock_through_blocks() {
+        use crate::chain::{genesis_block, Chain};
+        use crate::consensus::{COINBASE_MATURITY, TARGET_BLOCK_SECS};
+        use crate::utxo::UtxoView;
+
+        let a = Key::new(1);
+        let mut c = Chain::new(NET, genesis_block(NET));
+        let candidate = |c: &Chain, txs: &[Transaction]| {
+            let t = c.tip().time + TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(a.hash(), SchemeId::MlDsa87, txs, t, 5_000_000)
+                .expect("mining");
+            (b, t + 1)
+        };
+        let (first, now) = candidate(&c, &[]);
+        c.connect(&first, now).expect("block 1");
+        for _ in 0..COINBASE_MATURITY {
+            let (b, now) = candidate(&c, &[]);
+            c.connect(&b, now).expect("maturing");
+        }
+
+        let coin = OutPoint {
+            txid: first.transactions[0].txid(),
+            index: 0,
+        };
+        let coin_entry = c.utxo.lookup(&coin).expect("mature coinbase");
+        let p = Policy::All(vec![a.leaf(), Policy::Older(2)]);
+        let funded = coin_entry.output.value.units() - 20_000;
+        let mut funding = spend(coin, vec![p.output(Amount::from_units(funded))]);
+        let m = funding.sighash(0, NET, &coin_entry.output);
+        funding.inputs[0].witness = Witness {
+            pubkey: a.pk.clone(),
+            signature: a.sign(&m),
+        };
+        let locked = OutPoint {
+            txid: funding.txid(),
+            index: 0,
+        };
+        let spend_tx = |born: u64| {
+            let e = UtxoEntry {
+                output: p.output(Amount::from_units(funded)),
+                height: born,
+                is_coinbase: false,
+            };
+            let mut tx = spend(locked, vec![a.output(funded - 20_000)]);
+            let s = Satisfaction::All(vec![sign_leaf(&tx, &e, &p, 0, &a), Satisfaction::Older]);
+            tx.inputs[0].witness = witness(&p, &s);
+            tx
+        };
+        let child = spend_tx(0);
+
+        // Funding and spend in the same block: age zero.
+        let (b, now) = candidate(&c, &[funding.clone(), child.clone()]);
+        assert!(matches!(
+            c.connect(&b, now),
+            Err(ValidationError::Policy(PolicyError::TooEarly { .. }))
+        ));
+
+        // Funding alone, then the spend one block later: age one, still early.
+        let (b, now) = candidate(&c, &[funding]);
+        c.connect(&b, now).expect("funding");
+        let born = c.height();
+        let (b, now) = candidate(&c, std::slice::from_ref(&child));
+        assert_eq!(
+            c.connect(&b, now),
+            Err(ValidationError::Policy(PolicyError::TooEarly {
+                available_at: born + 2,
+                height: born + 1
+            }))
+        );
+
+        // Two blocks after the funding: accepted.
+        let (b, now) = candidate(&c, &[]);
+        c.connect(&b, now).expect("empty block");
+        let (b, now) = candidate(&c, &[child]);
+        c.connect(&b, now).expect("spend after the delay");
+        assert!(c.utxo.lookup(&locked).is_none());
+    }
+
     // --- Weights -------------------------------------------------------
 
     /// Weight of each channel transaction, with real keys and signatures.
