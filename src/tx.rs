@@ -253,6 +253,45 @@ impl Transaction {
         tagged_hash(tags::SIGHASH, w.as_slice())
     }
 
+    /// Hash signed by a key inside a spending policy ([`crate::policy`]).
+    ///
+    /// Everything [`Self::sighash`] covers, under its own tag, plus:
+    ///
+    /// - **the revealed policy, byte for byte**. The spent output already
+    ///   commits to its hash; signing the policy itself states it for a
+    ///   signer that sees only the transaction, and makes a signature made
+    ///   under one policy worthless under any other;
+    /// - **the position of the signing leaf** in the policy (pre-order, over
+    ///   the whole tree). The same key may sit on two branches — the
+    ///   revocable and the delayed branch of a channel output, say — and its
+    ///   signature for one must not open the other. The position determines
+    ///   every `Any` choice above the leaf, so it pins the branch as well.
+    ///
+    /// Choices made elsewhere in the tree (in a sibling of an `All`) are not
+    /// signed: each key commits to its own path, not to its co-signers'.
+    ///
+    /// [`Self::sighash`] is left exactly as it was, so spends of key outputs
+    /// are unchanged.
+    pub fn policy_sighash(
+        &self,
+        input_index: u32,
+        network: Network,
+        spent: &TxOut,
+        policy: &[u8],
+        leaf: u8,
+    ) -> Hash256 {
+        let mut w = Writer::new();
+        w.var_bytes(network.hrp().as_bytes());
+        w.bytes(&self.encode_without_witness());
+        w.u32(input_index);
+        w.u64(spent.value.units());
+        w.u8(spent.scheme.as_u8());
+        w.bytes(spent.pubkey_hash.as_bytes());
+        w.var_bytes(policy);
+        w.u8(leaf);
+        tagged_hash(tags::POLICY_SIGHASH, w.as_slice())
+    }
+
     pub fn is_coinbase(&self) -> bool {
         self.inputs.len() == 1 && self.inputs[0].prev_out.is_coinbase()
     }
@@ -441,6 +480,45 @@ mod tests {
 
         // And it stays deterministic.
         assert_eq!(reference, tx.sighash(0, Network::Testnet, &d));
+    }
+
+    #[test]
+    fn sighash_is_pinned() {
+        // Spends of key outputs must keep the exact message they had: a
+        // change here invalidates every signature already made.
+        let h = simple_tx().sighash(0, Network::Testnet, &spent());
+        assert_eq!(
+            h.to_hex(),
+            "6b421e2078621bb09dce568cfe18e36a238de23646691fe6d4f6f34d4294fadb"
+        );
+    }
+
+    #[test]
+    fn policy_sighash_binds_policy_and_leaf() {
+        let tx = simple_tx();
+        let d = spent();
+        let base = tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0);
+        assert_ne!(base, tx.sighash(0, Network::Regtest, &d));
+        assert_ne!(
+            base,
+            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 1)
+        );
+        assert_ne!(
+            base,
+            tx.policy_sighash(0, Network::Regtest, &d, b"policz", 0)
+        );
+        assert_ne!(
+            base,
+            tx.policy_sighash(1, Network::Regtest, &d, b"policy", 0)
+        );
+        assert_ne!(
+            base,
+            tx.policy_sighash(0, Network::Testnet, &d, b"policy", 0)
+        );
+        assert_eq!(
+            base,
+            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0)
+        );
     }
 
     #[test]

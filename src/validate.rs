@@ -19,6 +19,7 @@ use crate::amount::Amount;
 use crate::block::{Block, BlockError};
 use crate::consensus::*;
 use crate::emission::block_subsidy;
+use crate::policy::{self, PolicyError};
 use crate::pow::{PowEngine, PowError};
 use crate::sig::{self, SchemeId, VerifyError};
 use crate::tx::{OutPoint, Transaction, TxError};
@@ -128,6 +129,12 @@ pub enum ValidationError {
         minimum: u64,
         received: u64,
     },
+
+    // --- Policies ---
+    /// The spend of a policy output does not satisfy it. Signature failures
+    /// inside a policy are reported as [`ValidationError::Signature`], so that
+    /// an unavailable scheme keeps excusing the sender the same way.
+    Policy(PolicyError),
 }
 
 impl ValidationError {
@@ -343,7 +350,9 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
     // Before the inputs: these checks cost nothing, signature verification
     // costs a lot. We refuse the cheap things first.
     for output in &tx.outputs {
-        if !output.scheme.allowed_on(network) {
+        // A policy output is gated by height as well as network; until its
+        // activation it is refused here, as an unknown lock always was.
+        if !policy::scheme_allowed(output.scheme, network, height) {
             return Err(ValidationError::SchemeForbiddenOnNetwork(output.scheme));
         }
         if output.value.units() < MIN_OUTPUT_VALUE {
@@ -376,8 +385,21 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
         }
 
         // --- Rule: the scheme must be allowed on this network.
-        if !e.output.scheme.allowed_on(network) {
+        if !policy::scheme_allowed(e.output.scheme, network, height) {
             return Err(ValidationError::SchemeForbiddenOnNetwork(e.output.scheme));
+        }
+
+        // --- Rule: a policy output is spent by satisfying its policy.
+        //
+        // The witness carries the policy and its satisfaction in place of a
+        // key and a signature; `policy::check_spend` verifies every key of
+        // the chosen path and the time lock against this block's height.
+        if e.output.scheme == SchemeId::Policy {
+            policy::check_spend(tx, i as u32, network, &e, height, &input.witness)?;
+            total_inputs = total_inputs
+                .checked_add(e.output.value.units())
+                .ok_or(ValidationError::FeeOverflow)?;
+            continue;
         }
 
         // --- Rule: the key presented must match the lock.
@@ -644,7 +666,7 @@ pub fn check_block<E: PowEngine>(
 
     // --- Rule: the coinbase outputs respect the network.
     for output in &block.transactions[0].outputs {
-        if !output.scheme.allowed_on(ctx.network) {
+        if !policy::scheme_allowed(output.scheme, ctx.network, ctx.height) {
             return Err(ValidationError::SchemeForbiddenOnNetwork(output.scheme));
         }
     }

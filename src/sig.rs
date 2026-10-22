@@ -77,6 +77,24 @@ pub enum SchemeId {
     /// [`SchemeId::allowed_on`] therefore forbids it on mainnet, and this ban
     /// is a consensus rule, not a recommendation.
     LamportOts = 4,
+    /// Not a key: the output commits to the hash of a spending policy (see
+    /// [`crate::policy`]), and the witness reveals the policy and how it is
+    /// satisfied.
+    ///
+    /// # Why a scheme value, and not a new kind of output
+    ///
+    /// An output is forty-one bytes everywhere: on the wire, in the UTXO
+    /// set, in the snapshots, in the explorer. A second output layout would
+    /// have touched every one of them. A new value of the scheme byte keeps
+    /// the layout: the thirty-two bytes of `pubkey_hash` simply hold the
+    /// policy hash, computed under its own tag so that it can never be
+    /// mistaken for the hash of a key.
+    ///
+    /// It is **not** in [`SchemeId::ALL`], which lists the key schemes, and
+    /// [`SchemeId::allowed_on`] refuses it everywhere: whether a policy output
+    /// is valid depends on the height as well as the network, and is decided
+    /// by [`crate::policy::is_active`].
+    Policy = 5,
 }
 
 impl SchemeId {
@@ -86,6 +104,7 @@ impl SchemeId {
             2 => Some(SchemeId::MlDsa87),
             3 => Some(SchemeId::SphincsPlus),
             4 => Some(SchemeId::LamportOts),
+            5 => Some(SchemeId::Policy),
             _ => None,
         }
     }
@@ -100,6 +119,7 @@ impl SchemeId {
             SchemeId::MlDsa87 => "ML-DSA-87",
             SchemeId::SphincsPlus => "SPHINCS+-SHA2-192s",
             SchemeId::LamportOts => "Lamport-OTS (test only)",
+            SchemeId::Policy => "policy",
         }
     }
 
@@ -110,6 +130,9 @@ impl SchemeId {
             SchemeId::MlDsa87 => 2592,
             SchemeId::SphincsPlus => 48,
             SchemeId::LamportOts => crate::lamport::PUBKEY_LEN,
+            // No key, hence no fixed size: the revealed policy and its
+            // satisfaction are bounded by `crate::policy`.
+            SchemeId::Policy => 0,
         }
     }
 
@@ -123,10 +146,12 @@ impl SchemeId {
             SchemeId::MlDsa87 => 4627,
             SchemeId::SphincsPlus => 16224,
             SchemeId::LamportOts => crate::lamport::SIG_LEN,
+            SchemeId::Policy => 0,
         }
     }
 
-    /// All the schemes recognized by the protocol.
+    /// All the key schemes recognized by the protocol. [`SchemeId::Policy`]
+    /// is not one of them: no key, no wallet, no address derivation.
     pub const ALL: [SchemeId; 4] = [
         SchemeId::MlDsa65,
         SchemeId::MlDsa87,
@@ -155,6 +180,10 @@ impl SchemeId {
             // burn found by the phase 8b red team. The day a backend exists,
             // this arm opens — not before.
             SchemeId::SphincsPlus => false,
+            // Not a key scheme: refused wherever a key scheme is expected (a
+            // wallet, a policy leaf). Policy outputs are admitted by
+            // `crate::policy::is_active`, which also knows the height.
+            SchemeId::Policy => false,
         }
     }
 
@@ -178,6 +207,9 @@ impl SchemeId {
             SchemeId::LamportOts => true,
             SchemeId::MlDsa65 | SchemeId::MlDsa87 => cfg!(feature = "mldsa"),
             SchemeId::SphincsPlus => false,
+            // Evaluated by `crate::policy`, which needs nothing optional; the
+            // keys inside a policy are checked against their own scheme.
+            SchemeId::Policy => true,
         }
     }
 }
@@ -237,6 +269,14 @@ pub fn verify(
     message: &Hash256,
     sig: &[u8],
 ) -> Result<(), VerifyError> {
+    // A policy hash is not a key: nothing can be signed under it. Invalid,
+    // and above all not `SchemeUnavailable`, which would excuse the sender as
+    // if this binary were the one lacking. Validation never routes a policy
+    // here; this arm makes sure no other caller can.
+    if scheme == SchemeId::Policy {
+        return Err(VerifyError::InvalidSignature);
+    }
+
     check_sizes(scheme, pubkey, sig)?;
 
     // Lamport depends on no external crate: always available.
@@ -320,6 +360,7 @@ mod mldsa_backend {
             // SPHINCS+ is still to be wired in: see the roadmap.
             SchemeId::SphincsPlus => None,
             SchemeId::LamportOts => None,
+            SchemeId::Policy => None,
         }
     }
 }
@@ -524,6 +565,22 @@ mod tests {
         assert_eq!(SchemeId::MlDsa87.as_u8(), 2);
         assert_eq!(SchemeId::SphincsPlus.as_u8(), 3);
         assert_eq!(SchemeId::LamportOts.as_u8(), 4);
+        assert_eq!(SchemeId::Policy.as_u8(), 5);
+    }
+
+    /// The policy value is never a key scheme: no network allows it as one,
+    /// and nothing verifies a signature under it.
+    #[test]
+    fn policy_is_not_a_key_scheme() {
+        use crate::address::Network;
+        assert!(!SchemeId::ALL.contains(&SchemeId::Policy));
+        for r in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            assert!(!SchemeId::Policy.allowed_on(r));
+        }
+        assert_eq!(
+            verify(SchemeId::Policy, &[], &Hash256::ZERO, &[]),
+            Err(VerifyError::InvalidSignature)
+        );
     }
 
     #[test]
@@ -532,7 +589,8 @@ mod tests {
             assert_eq!(SchemeId::from_u8(s.as_u8()), Some(s));
         }
         assert_eq!(SchemeId::from_u8(0), None);
-        assert_eq!(SchemeId::from_u8(5), None);
+        assert_eq!(SchemeId::from_u8(5), Some(SchemeId::Policy));
+        assert_eq!(SchemeId::from_u8(6), None);
         assert_eq!(SchemeId::from_u8(255), None);
     }
 

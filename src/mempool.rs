@@ -149,6 +149,20 @@ pub const MAX_USABLE_BLOCK_SIZE: usize = MAX_BLOCK_SIZE - 64 * 1024;
 /// someone with no intention of paying.
 pub const MAX_USABLE_WEIGHT: u64 = TARGET_BLOCK_WEIGHT;
 
+/// Does the spend of `spent` by `witness` still meet the relative time lock
+/// of its policy, in the block after `height`?
+///
+/// The same reasoning as coinbase maturity: a reorganization lowers the tip,
+/// or moves the spent output to a later block (or back into the pool, where
+/// it counts as entering the next block), and a time lock that was met can
+/// be in the future again. Kept, the transaction would make the miner build
+/// an invalid block. Nothing but the age is rechecked: the signatures do not
+/// depend on the chain.
+fn policy_age_reached(spent: &UtxoEntry, witness: &crate::tx::Witness, height: u64) -> bool {
+    let age = crate::policy::required_age(&spent.output, witness);
+    age == 0 || height + 1 >= spent.height.saturating_add(age)
+}
+
 /// Apparent fees of a transaction, without verifying a single signature.
 ///
 /// The input amounts are read from the UTXO set; knowing that a transaction
@@ -1063,11 +1077,15 @@ impl Mempool {
                         Some(u) => {
                             // A reorg can make the height *go down*: a mature
                             // coinbase can become immature again.
-                            !u.is_coinbase || height + 1 >= u.height + COINBASE_MATURITY
+                            (!u.is_coinbase || height + 1 >= u.height + COINBASE_MATURITY)
+                                && policy_age_reached(u, &input.witness, height)
                         }
                         // Otherwise, the output must come from another
                         // transaction of the pool, still present.
-                        None => self.created.contains_key(&input.prev_out),
+                        None => self
+                            .created
+                            .get(&input.prev_out)
+                            .is_some_and(|u| policy_age_reached(u, &input.witness, height)),
                     };
                     if !available {
                         orphans.push(*id);
@@ -1244,6 +1262,45 @@ mod tests {
 
     const NETWORK: Network = Network::Regtest;
     const ATTEMPTS: u64 = 5_000_000;
+
+    /// A reorganization can put a policy time lock back in the future: the
+    /// pool must then let go of the spend, as it does of an immature coinbase.
+    /// Reading the age needs no signature check, so placeholder bytes of the
+    /// right sizes are enough here.
+    #[test]
+    fn policy_time_lock_is_rechecked_against_the_tip() {
+        use crate::policy::{Policy, Satisfaction};
+        let s = SchemeId::MlDsa87;
+        let p = Policy::All(vec![
+            Policy::Key {
+                scheme: s,
+                pubkey_hash: Hash256([1; 32]),
+            },
+            Policy::Older(10),
+        ]);
+        let spent = UtxoEntry {
+            output: p.output(Amount::from_units(100_000)),
+            height: 50,
+            is_coinbase: false,
+        };
+        let w = crate::policy::witness(
+            &p,
+            &Satisfaction::All(vec![
+                Satisfaction::Key {
+                    pubkey: vec![0; s.pubkey_len()],
+                    signature: vec![0; s.sig_len()],
+                },
+                Satisfaction::Older,
+            ]),
+        );
+        // The next block is at tip + 1: 59 + 1 = 60 = 50 + 10.
+        assert!(policy_age_reached(&spent, &w, 59));
+        assert!(!policy_age_reached(&spent, &w, 58));
+        // A key output has no age to reach.
+        let mut plain = spent;
+        plain.output.scheme = s;
+        assert!(policy_age_reached(&plain, &w, 0));
+    }
 
     pub fn funded_chain(w: &mut Wallet, n: u64) -> Chain {
         chain_with_funds(w, n)

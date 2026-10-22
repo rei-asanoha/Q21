@@ -593,6 +593,48 @@ pub const NETWORK_MAGIC_MAINNET: [u8; 4] = [0x51, 0x32, 0x31, 0x01];
 pub const NETWORK_MAGIC_TESTNET: [u8; 4] = [0x51, 0x32, 0x31, 0x75];
 
 // ---------------------------------------------------------------------------
+// Pay-to-policy outputs (see `src/policy.rs`)
+// ---------------------------------------------------------------------------
+
+/// First height at which a block may create or spend a policy output, per
+/// network.
+///
+/// Mainnet and testnet: `u64::MAX`, that is never. The rule is a prototype:
+/// until it has been reviewed and scheduled, nothing changes for the live
+/// networks, and a policy output there is invalid exactly as an unknown lock
+/// was before.
+///
+/// Regtest: height 1, the first block that can carry a transaction at all
+/// (height 0 is the genesis, a lone coinbase). The rule is therefore open from
+/// the start of any regtest chain, while the gate itself stays exercised by
+/// the tests on the one network where it opens.
+pub const POLICY_ACTIVATION_MAINNET: u64 = u64::MAX;
+pub const POLICY_ACTIVATION_TESTNET: u64 = u64::MAX;
+pub const POLICY_ACTIVATION_REGTEST: u64 = 1;
+
+/// Deepest nesting of a policy, the root counting as level one and a leaf
+/// as a level of its own.
+///
+/// Four levels hold every shape a payment channel needs (`Any[All[Key,
+/// Preimage]]` is three) with one to spare. Evaluation recurses, so the bound
+/// is also what keeps a hostile policy from exhausting the stack.
+pub const MAX_POLICY_DEPTH: usize = 4;
+
+/// Most leaves a policy may hold. Bounds the signatures one input can make a
+/// node verify along any branch.
+pub const MAX_POLICY_LEAVES: usize = 8;
+
+/// Largest serialized policy, in bytes. Eight key leaves take 8 * 34 bytes
+/// plus their combinators: 512 leaves room without ever being reached by a
+/// policy that respects the two bounds above, so it is a belt, not a rule
+/// anyone should hit.
+pub const MAX_POLICY_SIZE: usize = 512;
+
+/// Largest relative time lock, in blocks: about three months at the target
+/// spacing. Encoded on two bytes, so the bound is the encoding itself.
+pub const MAX_POLICY_OLDER: u64 = 65_535;
+
+// ---------------------------------------------------------------------------
 // Invariants checked at compile time
 // ---------------------------------------------------------------------------
 //
@@ -629,4 +671,13 @@ const _: () = {
     // reward, so that it only bites the tail of the curve and never its body.
     assert!(TAIL_REWARD > 0);
     assert!(TAIL_REWARD < INITIAL_REWARD / 1000);
+
+    // A policy within the depth and leaf bounds always fits the size bound:
+    // each leaf takes at most 34 bytes, each combinator two.
+    assert!(MAX_POLICY_LEAVES * 34 + (MAX_POLICY_LEAVES - 1) * 2 <= MAX_POLICY_SIZE);
+    // `Older` is encoded on two bytes: the bound is the encoding.
+    assert!(MAX_POLICY_OLDER == u16::MAX as u64);
+    // The live networks never open the prototype rule.
+    assert!(POLICY_ACTIVATION_MAINNET == u64::MAX);
+    assert!(POLICY_ACTIVATION_TESTNET == u64::MAX);
 };

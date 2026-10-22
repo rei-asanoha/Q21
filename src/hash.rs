@@ -67,6 +67,11 @@ pub mod tags {
     pub const MERKLE_BRANCH: &str = "Q21/merkle/branch";
     pub const ADDRESS: &str = "Q21/address";
     pub const SIGHASH: &str = "Q21/sighash/2";
+    /// Lock of a pay-to-policy output: the hash of its serialized policy.
+    pub const POLICY: &str = "Q21/policy";
+    /// Message signed by a key inside a policy. Its own tag, so that no
+    /// signature over it can ever pass for a plain spend's, nor the reverse.
+    pub const POLICY_SIGHASH: &str = "Q21/sighash/policy";
     /// Wallet key derivation. Purely local: no consensus rule depends on it,
     /// but changing this tag changes every address derived from an existing
     /// seed.
