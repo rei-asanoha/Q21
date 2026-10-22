@@ -44,6 +44,18 @@
 //! Frames are shared (`Arc<[u8]>`): a block relayed to twenty peers is
 //! serialized once and stored once.
 //!
+//! # Writing in bounded pieces
+//!
+//! The writer hands each frame to the system [`WRITE_CHUNK`] bytes at a time.
+//! The write timeout does not mean the same thing everywhere: Linux and
+//! macOS return a partial count when it fires, so a `write_all` only fails
+//! after a full timeout with no byte moved; Windows fails the **whole** call
+//! if it could not hand over the whole buffer in time, and leaves the socket
+//! in an undefined state. Written in one call, a block of four mebibytes to a
+//! peer reading below 140 KB/s was therefore cut on Windows, while it went
+//! through on Linux. In pieces of [`WRITE_CHUNK`] bytes, the timeout means
+//! "no progress for that long" on every system.
+//!
 //! # Memory
 //!
 //! A frame is accepted when the queue is empty, whatever its size — a single
@@ -63,6 +75,12 @@ use std::sync::{Arc, Condvar, Mutex};
 /// a reading peer ever lets pile up. A peer that does pile them up is not
 /// reading.
 pub const OUTBOX_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Largest slice handed to the system in one write. See the
+/// [module documentation](self#writing-in-bounded-pieces): with it, a peer is
+/// cut only if it reads less than this in a whole write timeout — about
+/// 550 bytes a second with the node's thirty seconds.
+pub const WRITE_CHUNK: usize = 16 * 1024;
 
 /// Stack of a writer thread. It does nothing but `write_all` on a slice.
 const WRITER_STACK: usize = 256 * 1024;
@@ -226,16 +244,21 @@ impl Outbox {
             self.room.notify_all();
             // The write happens with no lock held: a stalled peer stalls this
             // thread, and nothing else.
-            if stream
-                .write_all(&frame)
-                .and_then(|_| stream.flush())
-                .is_err()
-            {
+            if write_in_pieces(&mut stream, &frame).is_err() {
                 self.close();
                 return;
             }
         }
     }
+}
+
+/// Writes `frame` [`WRITE_CHUNK`] bytes at a time, so that each system call
+/// is bounded and the write timeout measures progress on every system.
+fn write_in_pieces<W: Write>(stream: &mut W, frame: &[u8]) -> std::io::Result<()> {
+    for piece in frame.chunks(WRITE_CHUNK) {
+        stream.write_all(piece)?;
+    }
+    stream.flush()
 }
 
 impl Drop for Outbox {
@@ -321,6 +344,11 @@ mod tests {
         let (a, _b) = pair();
         a.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut reader = a.try_clone().unwrap();
+        // Set before the close: macOS refuses any option on a socket that is
+        // already shut down (EINVAL).
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let o = Outbox::start(a).unwrap();
         for _ in 0..100 {
             o.push(frame(256 * 1024, 1));
@@ -332,26 +360,23 @@ mod tests {
         assert!(o.is_closed());
         assert_eq!(o.push(frame(10, 1)), Push::Closed);
         // The read side of our own socket sees the shutdown.
-        reader
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
         let mut buf = [0u8; 16];
         assert!(matches!(reader.read(&mut buf), Ok(0) | Err(_)));
     }
 
-    /// A reply waits for room as long as the peer reads, however slowly; a
-    /// close wakes it.
-    #[test]
-    fn push_wait_serves_a_slow_reader_and_wakes_on_close() {
-        let (a, mut b) = pair();
-        // A short write timeout: what is tested is that a slow reader that
-        // keeps reading is never cut, even far beyond it.
-        a.set_write_timeout(Some(Duration::from_millis(500)))
-            .unwrap();
-        let o = Outbox::start(a).unwrap();
-        let total = 2 * OUTBOX_MAX_BYTES;
-        let reader = std::thread::spawn(move || {
-            let mut buf = vec![0u8; 64 * 1024];
+    /// The write timeout of the slow-reader tests. Short, so that the transfers
+    /// last several times longer; not so short that a busy test machine,
+    /// pausing the reader thread, stalls the writer that long.
+    const SHORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Reads `total` bytes slowly — 32 KiB every 20 ms, at most 1.6 MB/s —
+    /// and returns how many arrived.
+    ///
+    /// Far below what the writer could send, yet every read moves more than a
+    /// [`WRITE_CHUNK`]: the writer always progresses, never quickly.
+    fn slow_reader(mut b: TcpStream, total: usize) -> std::thread::JoinHandle<(usize, TcpStream)> {
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 32 * 1024];
             let mut got = 0usize;
             b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             while got < total {
@@ -359,11 +384,77 @@ mod tests {
                     Ok(0) | Err(_) => break,
                     Ok(n) => got += n,
                 }
-                // Slow: a few hundred kilobytes a second.
                 std::thread::sleep(Duration::from_millis(20));
             }
             (got, b)
-        });
+        })
+    }
+
+    /// Records the size of every write it is handed.
+    struct Recorder {
+        data: Vec<u8>,
+        calls: Vec<usize>,
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.push(buf.len());
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// No system call is ever handed more than `WRITE_CHUNK` bytes: that is
+    /// what makes the write timeout mean "no progress" on Windows too.
+    #[test]
+    fn a_frame_is_written_in_bounded_pieces() {
+        let big: Vec<u8> = (0..OUTBOX_MAX_BYTES + 777).map(|i| i as u8).collect();
+        let mut r = Recorder {
+            data: Vec::new(),
+            calls: Vec::new(),
+        };
+        write_in_pieces(&mut r, &big).unwrap();
+        assert_eq!(r.data, big, "every byte, in order");
+        assert!(r.calls.iter().all(|n| *n <= WRITE_CHUNK), "{:?}", r.calls);
+        assert_eq!(r.calls.len(), big.len().div_ceil(WRITE_CHUNK));
+        let mut r = Recorder {
+            data: Vec::new(),
+            calls: Vec::new(),
+        };
+        write_in_pieces(&mut r, &[]).unwrap();
+        assert!(r.data.is_empty());
+    }
+
+    /// The case Windows cut: one block of four mebibytes, a peer that reads
+    /// it far more slowly than the write timeout, and keeps reading.
+    #[test]
+    fn a_whole_block_reaches_a_slow_reader_beyond_the_write_timeout() {
+        let (a, b) = pair();
+        a.set_write_timeout(Some(SHORT_TIMEOUT)).unwrap();
+        let o = Outbox::start(a).unwrap();
+        let reader = slow_reader(b, OUTBOX_MAX_BYTES);
+        let start = Instant::now();
+        assert_eq!(o.push(frame(OUTBOX_MAX_BYTES, 8)), Push::Queued);
+        let (got, b) = reader.join().unwrap();
+        assert_eq!(got, OUTBOX_MAX_BYTES, "the whole block arrived");
+        assert!(start.elapsed() > SHORT_TIMEOUT, "slower than the timeout");
+        assert!(!o.is_closed(), "a peer that keeps reading is never cut");
+        drop(b);
+    }
+
+    /// A reply waits for room as long as the peer reads, however slowly.
+    #[test]
+    fn push_wait_serves_a_slow_reader() {
+        let (a, b) = pair();
+        // A short write timeout: what is tested is that a slow reader that
+        // keeps reading is never cut, even far beyond it.
+        a.set_write_timeout(Some(SHORT_TIMEOUT)).unwrap();
+        let o = Outbox::start(a).unwrap();
+        let total = 2 * OUTBOX_MAX_BYTES;
+        let reader = slow_reader(b, total);
         let start = Instant::now();
         let mut sent = 0;
         while sent < total {
@@ -372,23 +463,37 @@ mod tests {
         }
         let (got, b) = reader.join().unwrap();
         assert_eq!(got, total, "every byte reached the slow reader");
-        assert!(
-            start.elapsed() > Duration::from_millis(500),
-            "slower than the timeout"
-        );
+        assert!(start.elapsed() > SHORT_TIMEOUT, "slower than the timeout");
         assert!(
             !o.is_closed(),
             "a slow reader that keeps reading is never cut"
         );
+        drop(b);
+    }
 
-        // A wait in progress is woken by a close.
-        while o.push(frame(256 * 1024, 2)) == Push::Queued {}
+    /// A reply waiting for room is woken by a close at once.
+    #[test]
+    fn a_close_wakes_a_waiting_reply() {
+        let (a, _b) = pair(); // never read
+        a.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        let o = Outbox::start(a).unwrap();
+        // Full and staying full: the socket buffers no longer take anything,
+        // so the queue cannot empty itself behind the test's back.
+        loop {
+            while o.push(frame(256 * 1024, 2)) == Push::Queued {}
+            std::thread::sleep(Duration::from_millis(100));
+            if o.push(frame(256 * 1024, 2)) == Push::Full {
+                break;
+            }
+        }
         let o2 = o.clone();
         let waiter = std::thread::spawn(move || o2.push_wait(frame(OUTBOX_MAX_BYTES, 2)));
         std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "the reply waits for room");
+        let start = Instant::now();
         o.close();
         assert_eq!(waiter.join().unwrap(), Push::Closed);
-        drop(b);
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 
     /// A peer that stops reading is dropped by its writer's timeout, and a
