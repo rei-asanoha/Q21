@@ -25,8 +25,10 @@
 //! ```
 //!
 //! Run: `cargo run --release --offline --locked --features mldsa --example
-//! channel_sim -- [burst_seconds]` (default 30: the burst of 1,000
-//! payments stops early on slow links, and its rate is reported as such).
+//! channel_sim -- [burst_seconds] [batch]` (defaults 30 and 25: the burst
+//! of 1,000 payments stops early on slow links, and its rate is reported as
+//! such; `batch` is how many queued payments one state update may carry, 1
+//! for one update per payment).
 
 #[cfg(feature = "mldsa")]
 fn main() {
@@ -51,11 +53,12 @@ mod sim {
     use q21_core::hash::Hash256;
     use q21_core::policy::{self, Policy, Satisfaction};
     use q21_core::sha256::sha256;
+    use q21_core::shachain;
     use q21_core::sig::{self, SchemeId};
     use q21_core::tx::{OutPoint, Transaction, TxIn, TxOut, Witness};
     use q21_core::utxo::{UtxoEntry, UtxoSet};
     use q21_core::validate::check_transaction;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,14 +154,17 @@ mod sim {
         /// `holder`'s commitment for balances `bal`, with `rev` the hash of
         /// the holder's secret for this state. Outputs below the dust floor
         /// are left out (they go to the fee).
-        fn commitment(&self, holder: usize, bal: [u64; 2], rev: Hash256) -> (Transaction, Policy) {
+        fn commitment(
+            &self,
+            holder: usize,
+            n: usize,
+            bal: [u64; 2],
+            rev: Hash256,
+        ) -> (Transaction, Policy) {
             let other = 1 - holder;
             let mut side = bal;
             side[0] -= COMMIT_FEE;
-            let to_local = Policy::Any(vec![
-                Policy::All(vec![leaf(self.hashes[other]), Policy::Preimage(rev)]),
-                Policy::All(vec![leaf(self.hashes[holder]), Policy::Older(DELAY)]),
-            ]);
+            let to_local = self.to_local(holder, rev);
             let mut outs = Vec::new();
             if side[holder] >= MIN_OUTPUT_VALUE {
                 outs.push(to_local.output(Amount::from_units(side[holder])));
@@ -170,7 +176,34 @@ mod sim {
             } else {
                 trim(side[other]);
             }
-            (one_input(self.fund_op, outs), to_local)
+            let mut tx = one_input(self.fund_op, outs);
+            // The state number, obscured, where the chain will show it: a
+            // watcher reads it back from a broadcast commitment and needs no
+            // record per state. `lock_time` is committed in the txid and the
+            // sighash, and is not enforced.
+            tx.lock_time = n as u64 ^ self.obscurer();
+            (tx, to_local)
+        }
+
+        fn to_local(&self, holder: usize, rev: Hash256) -> Policy {
+            Policy::Any(vec![
+                Policy::All(vec![leaf(self.hashes[1 - holder]), Policy::Preimage(rev)]),
+                Policy::All(vec![leaf(self.hashes[holder]), Policy::Older(DELAY)]),
+            ])
+        }
+
+        /// 48 bits derived from both keys, as BOLT 3 obscures the
+        /// commitment number from third parties.
+        fn obscurer(&self) -> u64 {
+            let mut b = self.hashes[0].0.to_vec();
+            b.extend_from_slice(self.hashes[1].as_bytes());
+            let h = sha256(&b);
+            u64::from_le_bytes(h[..8].try_into().unwrap()) & shachain::MAX_INDEX
+        }
+
+        /// The state of a commitment found on the chain.
+        fn state_of(&self, tx: &Transaction) -> usize {
+            (tx.lock_time ^ self.obscurer()) as usize
         }
 
         fn sighash(&self, tx: &Transaction, signer: usize) -> Hash256 {
@@ -326,10 +359,12 @@ mod sim {
         utxo: UtxoSet,
         height: u64,
         bal: [u64; 2],
-        my_secrets: Vec<[u8; 32]>,
-        their_hashes: Vec<Hash256>,
-        /// The other side's revoked commitments: txid, state, secret.
-        revoked: Vec<(Hash256, usize, [u8; 32])>,
+        /// Every secret of mine derives from it (BOLT 3 shachain).
+        seed: [u8; 32],
+        /// The other side's announced hashes not yet revoked: two at most.
+        their_hashes: HashMap<usize, Hash256>,
+        /// The other side's revealed secrets, compact: at most 49 entries.
+        store: shachain::Store,
         /// Every commitment of mine with the counterparty's signature (the
         /// last one is current; the others are there to cheat with, for A).
         history: Vec<(Transaction, Vec<u8>)>,
@@ -337,12 +372,12 @@ mod sim {
     }
 
     impl Party {
+        fn my_secret(&self, n: usize) -> [u8; 32] {
+            shachain::derive(&self.seed, shachain::MAX_INDEX - n as u64)
+        }
+
         fn secret(&mut self, n: usize) -> Hash256 {
-            while self.my_secrets.len() <= n {
-                self.my_secrets
-                    .push(q21_core::rng::bytes().expect("system randomness"));
-            }
-            Hash256(sha256(&self.my_secrets[n]))
+            Hash256(sha256(&self.my_secret(n)))
         }
 
         fn sign(&mut self, m: &Hash256) -> Vec<u8> {
@@ -355,7 +390,9 @@ mod sim {
 
         /// The other's commitment for state `n`, signed by me.
         fn sign_theirs(&mut self, n: usize, bal: [u64; 2]) -> Vec<u8> {
-            let (tx, _) = self.ch.commitment(1 - self.me, bal, self.their_hashes[n]);
+            let (tx, _) = self
+                .ch
+                .commitment(1 - self.me, n, bal, self.their_hashes[&n]);
             let m = self.ch.sighash(&tx, self.me);
             self.sign(&m)
         }
@@ -364,7 +401,7 @@ mod sim {
         /// validated as for a broadcast. Panics if it is not valid.
         fn accept_mine(&mut self, n: usize, bal: [u64; 2], theirs: Vec<u8>) {
             let rev = self.secret(n);
-            let (tx, _) = self.ch.commitment(self.me, bal, rev);
+            let (tx, _) = self.ch.commitment(self.me, n, bal, rev);
             // Only the counterparty's half is checked: the holder signs its
             // own half when, and if, it broadcasts.
             let t = Instant::now();
@@ -401,19 +438,17 @@ mod sim {
         }
 
         /// Checks the other's revocation of its state `n`.
-        fn take_revocation(&mut self, n: usize, bal: [u64; 2], secret: [u8; 32]) {
-            assert_eq!(
-                Hash256(sha256(&secret)),
-                self.their_hashes[n],
-                "bad revocation"
-            );
-            let (tx, _) = self.ch.commitment(1 - self.me, bal, self.their_hashes[n]);
-            self.revoked.push((tx.txid(), n, secret));
+        fn take_revocation(&mut self, n: usize, secret: [u8; 32]) {
+            let announced = self.their_hashes.remove(&n).expect("announced hash");
+            assert_eq!(Hash256(sha256(&secret)), announced, "bad revocation");
+            self.store
+                .insert(secret, shachain::MAX_INDEX - n as u64)
+                .expect("a secret consistent with the earlier ones");
         }
 
         fn revocation(&mut self, n: usize) -> Vec<u8> {
             let next = self.secret(n + 2);
-            let mut b = self.my_secrets[n].to_vec();
+            let mut b = self.my_secret(n).to_vec();
             b.extend_from_slice(next.as_bytes());
             b
         }
@@ -421,8 +456,9 @@ mod sim {
         fn note_next(&mut self, b: &[u8]) -> [u8; 32] {
             let mut s = [0u8; 32];
             s.copy_from_slice(&b[..32]);
+            let next = self.their_hashes.keys().max().map_or(0, |k| k + 1);
             self.their_hashes
-                .push(Hash256(b[32..64].try_into().unwrap()));
+                .insert(next, Hash256(b[32..64].try_into().unwrap()));
             s
         }
 
@@ -439,10 +475,10 @@ mod sim {
             hello.extend_from_slice(self.secret(1).as_bytes());
             send(s, HELLO, &hello);
             let (h, _) = recv(s, HELLO);
-            self.their_hashes = vec![
-                Hash256(h[..32].try_into().unwrap()),
-                Hash256(h[32..].try_into().unwrap()),
-            ];
+            self.their_hashes = HashMap::from([
+                (0, Hash256(h[..32].try_into().unwrap())),
+                (1, Hash256(h[32..].try_into().unwrap())),
+            ]);
             let mut bal = self.bal;
             let sig0 = self.sign_theirs(0, bal);
             send(s, SIG0, &sig0);
@@ -467,7 +503,7 @@ mod sim {
                     let ss = sig::SchemeId::MlDsa87.sig_len();
                     self.accept_mine(n, next, acc[..ss].to_vec());
                     let secret = self.note_next(&acc[ss..]);
-                    self.take_revocation(n - 1, bal, secret);
+                    self.take_revocation(n - 1, secret);
                     st.paid = now();
                     let rev = self.revocation(n - 1);
                     st.bytes += send(s, REVOKE, &rev);
@@ -483,7 +519,7 @@ mod sim {
                     let (rev, k) = recv(s, REVOKE);
                     st.bytes += k;
                     let secret = self.note_next(&rev);
-                    self.take_revocation(n - 1, bal, secret);
+                    self.take_revocation(n - 1, secret);
                     st.settled = now();
                 }
                 bal = next;
@@ -608,6 +644,29 @@ mod sim {
         s
     }
 
+    /// Groups the burst into state updates of up to `max` consecutive
+    /// payments in the same direction, each update moving their sum: what a
+    /// wallet does with the payments that queue up while an update is in
+    /// flight. The ten single payments stay one per update. Returns the
+    /// updates and the number of payments each carries.
+    fn batched(script: &[(usize, u64)], max: usize) -> (Vec<(usize, u64)>, Vec<usize>) {
+        let mut updates: Vec<(usize, u64)> = script[..SINGLES.len()].to_vec();
+        let mut counts = vec![1; SINGLES.len()];
+        for &(payer, v) in &script[SINGLES.len()..] {
+            let last = updates.len() - 1;
+            let joins =
+                updates.len() > SINGLES.len() && updates[last].0 == payer && counts[last] < max;
+            if joins {
+                updates[last].1 += v;
+                counts[last] += 1;
+            } else {
+                updates.push((payer, v));
+                counts.push(1);
+            }
+        }
+        (updates, counts)
+    }
+
     struct Run {
         stamps: Vec<Stamp>,
         a: Party,
@@ -633,9 +692,9 @@ mod sim {
             utxo,
             height: r.height() + 1,
             bal: [CAPACITY, 0],
-            my_secrets: Vec::new(),
-            their_hashes: Vec::new(),
-            revoked: Vec::new(),
+            seed: q21_core::rng::bytes().expect("system randomness"),
+            their_hashes: HashMap::new(),
+            store: shachain::Store::new(),
             history: Vec::new(),
             cpu: Cpu::default(),
         }
@@ -656,7 +715,8 @@ mod sim {
         let mut pa = party(0, Key::new(1), Key::new(2).pk, ch, r);
         let mut pb = party(1, Key::new(2), Key::new(1).pk, ch, r);
         let per_payment = 3.0 * link.latency_ms as f64 / 1000.0 + 0.01;
-        let n = SINGLES.len() + ((budget.as_secs_f64() / per_payment) as usize).min(BURST);
+        let n = SINGLES.len()
+            + ((budget.as_secs_f64() / per_payment) as usize).min(script.len() - SINGLES.len());
         let script = script[..n].to_vec();
         let epoch = Instant::now();
         let sc = script.clone();
@@ -711,6 +771,12 @@ mod sim {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30),
         );
+        // Payments per state update in the burst; 1 runs it one by one.
+        let batch: usize = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(25)
+            .max(1);
         let (a, b) = (Key::new(1), Key::new(2));
         let t = Instant::now();
         let (mut r, ch, funding) = chain_and_funding(&a, &b);
@@ -762,7 +828,11 @@ mod sim {
                 bandwidth: 0,
             },
         ];
-        let script = script(0x9e37_79b9_7f4a_7c15);
+        let (script, counts) = batched(&script(0x9e37_79b9_7f4a_7c15), batch);
+        println!(
+            "\nBURST {BURST} payments in {} state updates (up to {batch} per update)",
+            script.len() - SINGLES.len()
+        );
         let mut last = None;
         for link in links {
             let run = run_channel(&ch, &r, link, &script, budget);
@@ -782,18 +852,22 @@ mod sim {
                 );
             }
             let burst = &run.stamps[SINGLES.len()..];
+            let paid_count: usize = counts[SINGLES.len()..SINGLES.len() + burst.len()]
+                .iter()
+                .sum();
             if let (Some(first), Some(end)) = (burst.first(), burst.last()) {
                 let span = end.settled.max(end.paid) - first.t0;
                 let mut paid: Vec<f64> = burst.iter().map(|s| ms(s.paid - s.t0)).collect();
                 paid.sort_by(|x, y| x.partial_cmp(y).unwrap());
                 println!(
-                    "  burst: {} payments in {:.2} s = {:.1} payments/s; paid median {:.1} ms, p99 {:.1} ms{}",
+                    "  burst: {} payments in {} updates, {:.2} s = {:.1} payments/s; update paid median {:.1} ms, p99 {:.1} ms{}",
+                    paid_count,
                     burst.len(),
                     span.as_secs_f64(),
-                    burst.len() as f64 / span.as_secs_f64(),
+                    paid_count as f64 / span.as_secs_f64(),
                     paid[paid.len() / 2],
                     paid[paid.len() * 99 / 100],
-                    if burst.len() < BURST { " (cut by the time budget)" } else { "" }
+                    if paid_count < BURST { " (cut by the time budget)" } else { "" }
                 );
             }
             for (name, p) in [("A", &run.a), ("B", &run.b)] {
@@ -806,6 +880,14 @@ mod sim {
                     run.wall.as_secs_f64()
                 );
             }
+            println!(
+                "  revocation stores after {} states: A {} secrets / {} bytes, B {} secrets / {} bytes",
+                run.a.history.len(),
+                run.a.store.len(),
+                run.a.store.bytes(),
+                run.b.store.len(),
+                run.b.store.bytes()
+            );
             println!(
                 "  dust trimmed into fees: {} outputs, {} units",
                 TRIMMED.swap(0, Ordering::Relaxed),
@@ -892,24 +974,26 @@ mod sim {
         let old = run.a.broadcastable(1);
         r2.mine(std::slice::from_ref(&old));
         let hc = r2.height();
-        // B watches the chain: the funding output was spent by a txid it
-        // knows as revoked.
+        // B watches the chain: the funding output was spent by a commitment
+        // of A's whose state number, read from its lock_time, is older than
+        // the current one. Its secret comes from B's compact store, and the
+        // to_local policy is rebuilt from it: nothing was kept per state.
         let spender = r2.blocks.last().unwrap().transactions[1].clone();
-        let (_, n, secret) = *run
+        let n = ch.state_of(&spender);
+        let current = run.a.history.len() - 1;
+        assert!(n < current, "a revoked state");
+        let secret = run
             .b
-            .revoked
-            .iter()
-            .find(|(id, _, _)| *id == spender.txid())
-            .expect("B recognizes a revoked commitment");
-        let state_bal = {
-            let mut bb = [CAPACITY, 0];
-            for &(p, v) in &script[..n] {
-                bb[p] -= v;
-                bb[1 - p] += v;
-            }
-            bb
-        };
-        let (_, to_local) = ch.commitment(0, state_bal, Hash256(sha256(&secret)));
+            .store
+            .get(shachain::MAX_INDEX - n as u64)
+            .expect("B holds the secret of every revoked state");
+        let to_local = ch.to_local(0, Hash256(sha256(&secret)));
+        println!(
+            "\nWATCH B's store after {current} states: {} secrets, {} bytes (at most {} entries)",
+            run.b.store.len(),
+            run.b.store.bytes(),
+            shachain::MAX_ENTRIES
+        );
         let lout = spender.outputs[0];
         let mut penalty = one_input(
             OutPoint {

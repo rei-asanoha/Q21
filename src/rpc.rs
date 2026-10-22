@@ -4516,6 +4516,38 @@ mod tests {
         assert_eq!(c.node.with_mempool(|m| m.len()), 2);
     }
 
+    /// No RPC call can pay to a policy: a destination naming the policy
+    /// value is refused as an unreadable address, and nothing is built.
+    #[test]
+    fn no_rpc_send_pays_to_a_policy() {
+        let c = context_with_funds();
+        let policy = crate::address::Address {
+            network: NETWORK,
+            scheme: crate::sig::SchemeId::Policy,
+            hash: crate::hash::Hash256([9; 32]),
+        }
+        .to_string_bech32();
+        let ok = Wallet::from_seed([0x18; 32], NETWORK)
+            .new_address()
+            .to_string_bech32();
+        for (method, params) in [
+            (
+                "sendtoaddress",
+                format!(r#"{{"address":"{policy}","units":150000}}"#),
+            ),
+            (
+                "sendmany",
+                format!(
+                    r#"{{"destinations":[{{"address":"{ok}","units":150000}},{{"address":"{policy}","units":150000}}]}}"#
+                ),
+            ),
+        ] {
+            let r = call(&c, method, &params);
+            assert!(r.get("error").is_some(), "{method} accepted a policy");
+        }
+        assert_eq!(c.node.mempool_len(), 0, "nothing reached the pool");
+    }
+
     /// A send without a recipient is cleanly refused, not built empty.
     #[test]
     fn sendmany_refuses_an_empty_list() {

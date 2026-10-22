@@ -79,6 +79,7 @@ pub mod ser;
 pub mod settings;
 pub mod setup;
 pub mod sha256;
+pub mod shachain;
 pub mod shutdown;
 pub mod sig;
 pub mod siphash;
