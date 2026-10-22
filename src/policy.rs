@@ -9,6 +9,7 @@
 //! - `Key(scheme, pubkey_hash)`: a key matching the hash signs;
 //! - `Preimage(hash)`: a 32-byte secret whose SHA-256 is `hash` is revealed;
 //! - `Older(n)`: the spent output is at least `n` blocks old;
+//! - `After(h)`: the spending block is at height `h` or above;
 //! - `All[..]`: every child is satisfied;
 //! - `Any[..]`: the witness names one child, and that child is satisfied.
 //!
@@ -53,6 +54,7 @@ const NODE_PREIMAGE: u8 = 0x02;
 const NODE_OLDER: u8 = 0x03;
 const NODE_ALL: u8 = 0x04;
 const NODE_ANY: u8 = 0x05;
+const NODE_AFTER: u8 = 0x06;
 
 /// A spending policy.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -65,6 +67,10 @@ pub enum Policy {
     Preimage(Hash256),
     /// Relative time lock, in blocks, from 1 to [`crate::consensus::MAX_POLICY_OLDER`].
     Older(u16),
+    /// Absolute time lock: the height of the spending block, from 1 to
+    /// `u32::MAX`. Four bytes reach eight thousand years at the target
+    /// spacing; eight would only leave room for an encoding nobody can use.
+    After(u32),
     All(Vec<Policy>),
     Any(Vec<Policy>),
 }
@@ -79,6 +85,8 @@ pub enum Satisfaction {
     Preimage([u8; 32]),
     /// Nothing to reveal: the age of the spent output is read from the chain.
     Older,
+    /// Nothing to reveal: the height is that of the block.
+    After,
     All(Vec<Satisfaction>),
     Any {
         index: u8,
@@ -106,6 +114,9 @@ pub enum PolicyError {
     /// `Older(0)`: a lock that locks nothing has a second, shorter spelling
     /// (no lock at all), so it is refused.
     OlderOutOfRange,
+    /// `After(0)`: every block is at height zero or above, so the lock is
+    /// another spelling of no lock at all.
+    AfterOutOfRange,
     /// Trailing bytes after the policy.
     TrailingPolicyBytes(usize),
     /// An `Any` branch index beyond the children.
@@ -116,7 +127,8 @@ pub enum PolicyError {
     /// A key or signature whose length is not its scheme's.
     WitnessSize(VerifyError),
     WrongPreimage,
-    /// The relative time lock of the chosen path has not expired.
+    /// A time lock of the chosen path, relative or absolute, has not
+    /// expired: `available_at` is the first height at which all of them have.
     TooEarly {
         available_at: u64,
         height: u64,
@@ -180,6 +192,9 @@ impl Policy {
             }
             Policy::Older(n) => {
                 w.u8(NODE_OLDER).bytes(&n.to_le_bytes());
+            }
+            Policy::After(h) => {
+                w.u8(NODE_AFTER).u32(*h);
             }
             Policy::All(children) | Policy::Any(children) => {
                 let tag = if matches!(self, Policy::All(_)) {
@@ -253,6 +268,14 @@ impl Policy {
                 }
                 leaf()?;
                 Ok(Policy::Older(n))
+            }
+            NODE_AFTER => {
+                let h = r.u32()?;
+                if h == 0 {
+                    return Err(PolicyError::AfterOutOfRange);
+                }
+                leaf()?;
+                Ok(Policy::After(h))
             }
             tag @ (NODE_ALL | NODE_ANY) => {
                 let n = r.u8()? as usize;
@@ -338,7 +361,7 @@ impl Satisfaction {
             Satisfaction::Preimage(p) => {
                 w.bytes(p);
             }
-            Satisfaction::Older => {}
+            Satisfaction::Older | Satisfaction::After => {}
             Satisfaction::All(c) => c.iter().for_each(|c| c.write(w)),
             Satisfaction::Any { index, branch } => {
                 w.u8(*index);
@@ -384,6 +407,21 @@ struct Path<'a> {
     keys: Vec<KeyUse<'a>>,
     /// Largest `Older` on the chosen path; zero when there is none.
     min_age: u64,
+    /// Largest `After` on the chosen path; zero when there is none.
+    min_height: u64,
+}
+
+impl Path<'_> {
+    /// First block height at which every time lock of the path is met, for
+    /// an output created at `born`. Zero when the path has none.
+    fn available_at(&self, born: u64) -> u64 {
+        let relative = if self.min_age > 0 {
+            born.saturating_add(self.min_age)
+        } else {
+            0
+        };
+        relative.max(self.min_height)
+    }
 }
 
 /// Reads the satisfaction of `p` from `r`, following the branches it names.
@@ -424,6 +462,10 @@ fn walk<'a>(
         }
         Policy::Older(n) => {
             path.min_age = path.min_age.max(u64::from(*n));
+            *leaf += 1;
+        }
+        Policy::After(h) => {
+            path.min_height = path.min_height.max(u64::from(*h));
             *leaf += 1;
         }
         Policy::All(children) => {
@@ -471,6 +513,7 @@ fn read_spend<'a>(spent: &TxOut, witness: &'a Witness) -> Result<(Policy, Path<'
     let mut path = Path {
         keys: Vec::new(),
         min_age: 0,
+        min_height: 0,
     };
     walk(&policy, &mut r, &mut 0, &mut path)?;
     if r.remaining() != 0 {
@@ -487,9 +530,17 @@ fn read_spend<'a>(spent: &TxOut, witness: &'a Witness) -> Result<(Policy, Path<'
 /// `Older(n)` holds when `height >= spent.height + n`: the spend can enter the
 /// block `n` blocks after the one that created the output, never before. An
 /// output created earlier in the same block has age zero, so any `Older`
-/// refuses it. The mempool passes the height of the next block, as for
-/// coinbase maturity, and rechecks after a reorganization
-/// ([`required_age`]).
+/// refuses it.
+///
+/// # Absolute time lock
+///
+/// `After(h)` holds when `height >= h`, `height` being that of the block that
+/// includes the spend. The transaction's own `lock_time` plays no part: it
+/// stays unenforced, as it always was.
+///
+/// The mempool passes the height of the next block for both, as for
+/// coinbase maturity, and rechecks them after a reorganization
+/// ([`available_at`]).
 ///
 /// # Order
 ///
@@ -505,14 +556,12 @@ pub fn check_spend(
 ) -> Result<(), ValidationError> {
     let (_, path) = read_spend(&spent.output, witness).map_err(ValidationError::Policy)?;
 
-    if path.min_age > 0 {
-        let available_at = spent.height.saturating_add(path.min_age);
-        if height < available_at {
-            return Err(ValidationError::Policy(PolicyError::TooEarly {
-                available_at,
-                height,
-            }));
-        }
+    let available_at = path.available_at(spent.height);
+    if height < available_at {
+        return Err(ValidationError::Policy(PolicyError::TooEarly {
+            available_at,
+            height,
+        }));
     }
 
     for k in &path.keys {
@@ -524,26 +573,35 @@ pub fn check_spend(
         }
     }
 
+    // The stripped transaction is the bulk of every message: encoded once
+    // for all the keys of this input, not once per key.
+    let stripped = tx.encode_without_witness();
     for k in &path.keys {
-        let message =
-            tx.policy_sighash(input_index, network, &spent.output, &witness.pubkey, k.leaf);
+        let message = crate::tx::policy_sighash_of_stripped(
+            &stripped,
+            input_index,
+            network,
+            &spent.output,
+            &witness.pubkey,
+            k.leaf,
+        );
         sig::verify(k.scheme, k.pubkey, &message, k.signature)
             .map_err(ValidationError::Signature)?;
     }
     Ok(())
 }
 
-/// Age the chosen path of an already validated policy spend requires, in
-/// blocks; zero for anything else.
+/// First block height at which the time locks of an already validated
+/// policy spend are all met; zero for anything else.
 ///
 /// The mempool needs it after a reorganization: the signatures still hold,
-/// but a lower tip, or a parent moved to a later block, can put a time lock
-/// back in the future.
-pub fn required_age(spent: &TxOut, witness: &Witness) -> u64 {
-    if spent.scheme != SchemeId::Policy {
+/// but a lower tip, or a parent moved to a later block or back into the
+/// pool, can put a time lock back in the future.
+pub fn available_at(spent: &UtxoEntry, witness: &Witness) -> u64 {
+    if spent.output.scheme != SchemeId::Policy {
         return 0;
     }
-    read_spend(spent, witness).map_or(0, |(_, path)| path.min_age)
+    read_spend(&spent.output, witness).map_or(0, |(_, path)| path.available_at(spent.height))
 }
 
 #[cfg(test)]
@@ -605,6 +663,32 @@ mod tests {
     }
 
     #[test]
+    fn absolute_time_lock_encoding() {
+        let p = Policy::Any(vec![
+            Policy::All(vec![key_leaf(2), Policy::Preimage(h(9))]),
+            Policy::All(vec![key_leaf(1), Policy::After(u32::MAX)]),
+        ]);
+        let b = p.encode();
+        assert_eq!(Policy::decode(&b), Ok(p.clone()));
+        assert_eq!(
+            Policy::After(0x0102_0304).encode(),
+            [NODE_AFTER, 4, 3, 2, 1]
+        );
+        // Zero locks nothing: refused, like Older(0).
+        assert_eq!(
+            Policy::decode(&[NODE_AFTER, 0, 0, 0, 0]),
+            Err(PolicyError::AfterOutOfRange)
+        );
+        assert_eq!(
+            Policy::decode(&[NODE_AFTER, 1, 0, 0]),
+            Err(PolicyError::Malformed(ReadError::UnexpectedEnd))
+        );
+        // It counts as a leaf, and takes no witness byte.
+        assert_eq!(p.leaf_count(), 4);
+        assert!(Satisfaction::After.encode().is_empty());
+    }
+
+    #[test]
     fn non_canonical_policies_are_refused() {
         // A single-child combinator: the child spelled differently.
         let single = [NODE_ALL, 1, NODE_OLDER, 1, 0];
@@ -630,7 +714,7 @@ mod tests {
             Err(PolicyError::Malformed(ReadError::UnexpectedEnd))
         );
         // Unknown node.
-        assert_eq!(Policy::decode(&[0x06]), Err(PolicyError::UnknownNode(6)));
+        assert_eq!(Policy::decode(&[0x07]), Err(PolicyError::UnknownNode(7)));
         assert_eq!(Policy::decode(&[0x00]), Err(PolicyError::UnknownNode(0)));
         // A key leaf whose "scheme" is the policy value, or nothing known.
         for raw in [0u8, 5, 6, 255] {
@@ -915,7 +999,51 @@ mod spend_tests {
         }
         assert!(check(&u, &tx, NET, BORN + 5).is_ok());
         assert!(check(&u, &tx, NET, BORN + 500).is_ok());
-        assert_eq!(required_age(&e.output, &tx.inputs[0].witness), 5);
+        assert_eq!(available_at(&e, &tx.inputs[0].witness), BORN + 5);
+    }
+
+    /// `After(h)`: valid in the block at height `h`, not before, whatever the
+    /// age of the output. With `Older` on the same path, the later of the two
+    /// decides.
+    #[test]
+    fn after_leaf() {
+        let a = Key::new(1);
+        let p = Policy::All(vec![a.leaf(), Policy::After(BORN as u32 + 20)]);
+        let (u, op, e) = fixture(&p);
+        let mut tx = spend(op, vec![a.output(VALUE - 20_000)]);
+        let s = Satisfaction::All(vec![sign_leaf(&tx, &e, &p, 0, &a), Satisfaction::After]);
+        tx.inputs[0].witness = witness(&p, &s);
+        assert_eq!(
+            check(&u, &tx, NET, BORN + 19),
+            pol(PolicyError::TooEarly {
+                available_at: BORN + 20,
+                height: BORN + 19
+            })
+        );
+        assert!(check(&u, &tx, NET, BORN + 20).is_ok());
+        // The transaction's own lock_time is not what is checked.
+        let mut late = tx.clone();
+        late.lock_time = u64::MAX;
+        let s = Satisfaction::All(vec![sign_leaf(&late, &e, &p, 0, &a), Satisfaction::After]);
+        late.inputs[0].witness = witness(&p, &s);
+        assert!(check(&u, &late, NET, BORN + 20).is_ok());
+
+        let both = Policy::All(vec![
+            a.leaf(),
+            Policy::Older(5),
+            Policy::After(BORN as u32 + 3),
+        ]);
+        let (u, op, e) = fixture(&both);
+        let mut tx = spend(op, vec![a.output(VALUE - 20_000)]);
+        let s = Satisfaction::All(vec![
+            sign_leaf(&tx, &e, &both, 0, &a),
+            Satisfaction::Older,
+            Satisfaction::After,
+        ]);
+        tx.inputs[0].witness = witness(&both, &s);
+        assert_eq!(available_at(&e, &tx.inputs[0].witness), BORN + 5);
+        assert!(check(&u, &tx, NET, BORN + 4).is_err());
+        assert!(check(&u, &tx, NET, BORN + 5).is_ok());
     }
 
     // --- Channel shapes ------------------------------------------------
@@ -1369,6 +1497,511 @@ mod spend_tests {
         let (b, now) = candidate(&c, &[child]);
         c.connect(&b, now).expect("spend after the delay");
         assert!(c.utxo.lookup(&locked).is_none());
+    }
+
+    // --- A channel's life, through blocks -------------------------------
+
+    use crate::block::Block;
+    use crate::chain::{genesis_block, Chain};
+    use crate::consensus::{COINBASE_MATURITY, TARGET_BLOCK_SECS};
+    use crate::mempool::{Mempool, MempoolError};
+    use crate::utxo::UtxoView;
+    use std::slice::from_ref;
+
+    /// Fee of every channel transaction: far above the relay floor.
+    const FEE: u64 = 2_000;
+    /// The to_self delay of the commitments, in blocks.
+    const D: u16 = 5;
+
+    /// A regtest chain whose blocks all pay one miner, mined far enough that
+    /// sizeable coinbases are mature: the slow start makes the first rewards
+    /// too small to split between channel outputs.
+    struct Regtest {
+        c: Chain,
+        miner: Hash256,
+        /// Every connected block, from height 1.
+        blocks: Vec<Block>,
+    }
+
+    impl Regtest {
+        fn new(miner: &Key) -> Regtest {
+            let mut r = Regtest {
+                c: Chain::new(NET, genesis_block(NET)),
+                miner: miner.hash(),
+                blocks: Vec::new(),
+            };
+            r.mine_to(COINBASE_MATURITY + 210);
+            r
+        }
+
+        fn height(&self) -> u64 {
+            self.c.height()
+        }
+
+        fn candidate(&self, txs: &[Transaction]) -> (Block, u64) {
+            let t = self.c.tip().time + TARGET_BLOCK_SECS;
+            let b = self
+                .c
+                .mine_block(self.miner, SchemeId::MlDsa87, txs, t, 5_000_000)
+                .expect("mining");
+            (b, t + 1)
+        }
+
+        /// Mines `txs` into the next block; the chain refuses it or extends.
+        fn mine(&mut self, txs: &[Transaction]) -> Result<(), ValidationError> {
+            let (b, now) = self.candidate(txs);
+            self.c.connect(&b, now)?;
+            self.blocks.push(b);
+            Ok(())
+        }
+
+        fn mine_to(&mut self, height: u64) {
+            while self.height() < height {
+                self.mine(&[]).expect("empty block");
+            }
+        }
+
+        /// The miner's coinbase output of block `h`.
+        fn coin(&self, h: u64) -> (OutPoint, TxOut) {
+            let cb = &self.blocks[h as usize - 1].transactions[0];
+            let op = OutPoint {
+                txid: cb.txid(),
+                index: 0,
+            };
+            (op, cb.outputs[0])
+        }
+
+        fn unspent(&self, op: &OutPoint) -> bool {
+            self.c.utxo.lookup(op).is_some()
+        }
+    }
+
+    fn out(tx: &Transaction, index: u32) -> (OutPoint, TxOut) {
+        let op = OutPoint {
+            txid: tx.txid(),
+            index,
+        };
+        (op, tx.outputs[index as usize])
+    }
+
+    fn units(v: u64) -> Amount {
+        Amount::from_units(v)
+    }
+
+    fn sign_out(tx: &Transaction, spent: &TxOut, p: &Policy, leaf: u8, k: &Key) -> Satisfaction {
+        Satisfaction::Key {
+            pubkey: k.pk.clone(),
+            signature: k.sign(&sighash(tx, 0, NET, spent, p, leaf)),
+        }
+    }
+
+    /// Spends a key output of `k`'s.
+    fn plain_spend(op: OutPoint, spent: &TxOut, k: &Key, outputs: Vec<TxOut>) -> Transaction {
+        let mut tx = spend(op, outputs);
+        let m = tx.sighash(0, NET, spent);
+        tx.inputs[0].witness = Witness {
+            pubkey: k.pk.clone(),
+            signature: k.sign(&m),
+        };
+        tx
+    }
+
+    /// Spends a 2-of-2 output with both signatures.
+    fn both_sign(
+        op: OutPoint,
+        spent: &TxOut,
+        p: &Policy,
+        (a, b): (&Key, &Key),
+        outputs: Vec<TxOut>,
+    ) -> Transaction {
+        let mut tx = spend(op, outputs);
+        let s = Satisfaction::All(vec![
+            sign_out(&tx, spent, p, 0, a),
+            sign_out(&tx, spent, p, 1, b),
+        ]);
+        tx.inputs[0].witness = witness(p, &s);
+        tx
+    }
+
+    /// `Any[ All[Key first, Preimage(hash)], All[Key second, lock] ]`: the
+    /// shape of to_local (lock `Older`) and of an offered HTLC (lock `After`).
+    fn secret_or_lock(first: &Key, hash: Hash256, second: &Key, lock: Policy) -> Policy {
+        Policy::Any(vec![
+            Policy::All(vec![first.leaf(), Policy::Preimage(hash)]),
+            Policy::All(vec![second.leaf(), lock]),
+        ])
+    }
+
+    /// The first branch: `k` signs at leaf 0 and reveals the secret.
+    fn by_secret(
+        op: OutPoint,
+        spent: &TxOut,
+        p: &Policy,
+        k: &Key,
+        secret: [u8; 32],
+        to: &Key,
+    ) -> Transaction {
+        let mut tx = spend(op, vec![to.output(spent.value.units() - FEE)]);
+        let s = any(
+            0,
+            Satisfaction::All(vec![
+                sign_out(&tx, spent, p, 0, k),
+                Satisfaction::Preimage(secret),
+            ]),
+        );
+        tx.inputs[0].witness = witness(p, &s);
+        tx
+    }
+
+    /// The second branch: `k` signs at leaf 2, once the lock allows.
+    fn by_lock(
+        op: OutPoint,
+        spent: &TxOut,
+        p: &Policy,
+        k: &Key,
+        lock: Satisfaction,
+    ) -> Transaction {
+        let mut tx = spend(op, vec![k.output(spent.value.units() - FEE)]);
+        let s = any(
+            1,
+            Satisfaction::All(vec![sign_out(&tx, spent, p, 2, k), lock]),
+        );
+        tx.inputs[0].witness = witness(p, &s);
+        tx
+    }
+
+    /// Pays the coinbase of block `h` to `outputs`, in a block of its own.
+    fn fund(r: &mut Regtest, a: &Key, h: u64, outputs: impl Fn(u64) -> Vec<TxOut>) -> Transaction {
+        let (coin, coin_out) = r.coin(h);
+        let tx = plain_spend(coin, &coin_out, a, outputs(coin_out.value.units() - FEE));
+        r.mine(from_ref(&tx)).expect("funding");
+        tx
+    }
+
+    fn too_early(r: Result<(), ValidationError>) -> bool {
+        matches!(
+            r,
+            Err(ValidationError::Policy(PolicyError::TooEarly { .. }))
+        )
+    }
+
+    /// A opens a channel with B, moves to state 2 and revokes state 1 by
+    /// handing its secret to B — then broadcasts state 1 anyway. B takes the
+    /// whole to_local output at once; A's delayed sweep is refused before
+    /// the delay, would have been valid at it, and finds nothing left.
+    #[test]
+    fn lifecycle_revoked_commitment_is_punished() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let mut r = Regtest::new(&a);
+        let fund_p = Policy::All(vec![a.leaf(), b.leaf()]);
+        let funding = fund(&mut r, &a, 200, |v| vec![fund_p.output(units(v))]);
+        let (fop, fout) = out(&funding, 0);
+        let v = fout.value.units();
+
+        // A's commitments for states 1 and 2, signed by both, kept off-chain.
+        let (r1, rh1) = preimage(11);
+        let (_, rh2) = preimage(12);
+        let local1 = secret_or_lock(&b, rh1, &a, Policy::Older(D));
+        let state1 = both_sign(
+            fop,
+            &fout,
+            &fund_p,
+            (&a, &b),
+            vec![local1.output(units(v / 2)), b.output(v - v / 2 - FEE)],
+        );
+        let local2 = secret_or_lock(&b, rh2, &a, Policy::Older(D));
+        let state2 = both_sign(
+            fop,
+            &fout,
+            &fund_p,
+            (&a, &b),
+            vec![local2.output(units(v / 4)), b.output(v - v / 4 - FEE)],
+        );
+        // Moving to state 2, A revokes state 1: B now holds r1.
+        let revoked_secret_held_by_b = r1;
+
+        // A cheats: the revoked commitment is still a valid transaction.
+        r.mine(from_ref(&state1)).expect("revoked commitment");
+        let hc = r.height();
+        let (lop, lout) = out(&state1, 0);
+
+        // A's delayed sweep: too early in the next block...
+        let sweep = by_lock(lop, &lout, &local1, &a, Satisfaction::Older);
+        assert_eq!(
+            r.mine(from_ref(&sweep)),
+            Err(ValidationError::Policy(PolicyError::TooEarly {
+                available_at: hc + u64::from(D),
+                height: hc + 1
+            }))
+        );
+        // ...valid at the delay, had B not acted.
+        assert!(check(&r.c.utxo, &sweep, NET, hc + u64::from(D)).is_ok());
+
+        // B's penalty with the revocation secret: accepted at once.
+        let penalty = by_secret(lop, &lout, &local1, &b, revoked_secret_held_by_b, &b);
+        r.mine(from_ref(&penalty)).expect("penalty");
+        assert_eq!(r.height(), hc + 1);
+        assert!(!r.unspent(&lop));
+        // B's to_remote output of state 1 is B's as well, at once.
+        let (rop, rout) = out(&state1, 1);
+        r.mine(from_ref(&plain_spend(
+            rop,
+            &rout,
+            &b,
+            vec![b.output(rout.value.units() - FEE)],
+        )))
+        .expect("to_remote");
+
+        // At the delay, A's sweep spends nothing any more, and state 2 has
+        // lost its funding output.
+        r.mine_to(hc + u64::from(D) - 1);
+        assert!(matches!(
+            r.mine(from_ref(&sweep)),
+            Err(ValidationError::MissingInput(_))
+        ));
+        assert!(matches!(
+            r.mine(from_ref(&state2)),
+            Err(ValidationError::MissingInput(_))
+        ));
+    }
+
+    /// The honest unilateral close: A broadcasts the latest state and sweeps
+    /// to_local in the block exactly `D` after the commitment's.
+    #[test]
+    fn lifecycle_unilateral_close_waits_exactly_the_delay() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let mut r = Regtest::new(&a);
+        let fund_p = Policy::All(vec![a.leaf(), b.leaf()]);
+        let funding = fund(&mut r, &a, 201, |v| vec![fund_p.output(units(v))]);
+        let (fop, fout) = out(&funding, 0);
+        let v = fout.value.units();
+        let (_, rh2) = preimage(12);
+        let local2 = secret_or_lock(&b, rh2, &a, Policy::Older(D));
+        let state2 = both_sign(
+            fop,
+            &fout,
+            &fund_p,
+            (&a, &b),
+            vec![local2.output(units(v / 4)), b.output(v - v / 4 - FEE)],
+        );
+
+        r.mine(from_ref(&state2)).expect("latest commitment");
+        let hc = r.height();
+        let (lop, lout) = out(&state2, 0);
+        let sweep = by_lock(lop, &lout, &local2, &a, Satisfaction::Older);
+
+        r.mine_to(hc + u64::from(D) - 2);
+        assert!(
+            too_early(r.mine(from_ref(&sweep))),
+            "one block before the delay"
+        );
+        r.mine_to(hc + u64::from(D) - 1);
+        r.mine(from_ref(&sweep)).expect("at the delay");
+        assert_eq!(r.height(), hc + u64::from(D));
+        assert!(!r.unspent(&lop));
+    }
+
+    /// An HTLC offered by A to B, with an absolute timeout: B claims one with
+    /// the payment preimage; A takes another back at the deadline, not one
+    /// block before.
+    #[test]
+    fn lifecycle_htlc_success_and_absolute_timeout() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let mut r = Regtest::new(&a);
+        let fund_p = Policy::All(vec![a.leaf(), b.leaf()]);
+        let funding = fund(&mut r, &a, 202, |v| vec![fund_p.output(units(v))]);
+        let (fop, fout) = out(&funding, 0);
+        let v = fout.value.units();
+
+        let deadline = r.height() + 10;
+        let after = Policy::After(deadline as u32);
+        let (_, rh) = preimage(13);
+        let (pay1, ph1) = preimage(21);
+        let (_, ph2) = preimage(22);
+        let local = secret_or_lock(&b, rh, &a, Policy::Older(D));
+        let htlc1 = secret_or_lock(&b, ph1, &a, after.clone());
+        let htlc2 = secret_or_lock(&b, ph2, &a, after);
+        let htlc_value = 100_000;
+        let commitment = both_sign(
+            fop,
+            &fout,
+            &fund_p,
+            (&a, &b),
+            vec![
+                local.output(units(v / 2)),
+                b.output(v - v / 2 - 2 * htlc_value - FEE),
+                htlc1.output(units(htlc_value)),
+                htlc2.output(units(htlc_value)),
+            ],
+        );
+        r.mine(from_ref(&commitment))
+            .expect("commitment with two HTLCs");
+
+        // Success: B, with the preimage, long before the deadline.
+        let (h1op, h1out) = out(&commitment, 2);
+        let success = by_secret(h1op, &h1out, &htlc1, &b, pay1, &b);
+        r.mine(from_ref(&success)).expect("HTLC success");
+        assert!(!r.unspent(&h1op));
+
+        // Timeout: A, at the deadline and not one block before.
+        let (h2op, h2out) = out(&commitment, 3);
+        let timeout = by_lock(h2op, &h2out, &htlc2, &a, Satisfaction::After);
+        r.mine_to(deadline - 2);
+        assert_eq!(
+            r.mine(from_ref(&timeout)),
+            Err(ValidationError::Policy(PolicyError::TooEarly {
+                available_at: deadline,
+                height: deadline - 1
+            }))
+        );
+        r.mine_to(deadline - 1);
+        r.mine(from_ref(&timeout))
+            .expect("HTLC timeout at the deadline");
+        assert!(!r.unspent(&h2op));
+    }
+
+    /// The cooperative close: one transaction from the funding output to two
+    /// plain outputs, both signatures, no delay. One party alone cannot.
+    #[test]
+    fn lifecycle_cooperative_close() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let mut r = Regtest::new(&a);
+        let fund_p = Policy::All(vec![a.leaf(), b.leaf()]);
+        let funding = fund(&mut r, &a, 203, |v| vec![fund_p.output(units(v))]);
+        let (fop, fout) = out(&funding, 0);
+        let v = fout.value.units();
+        let outputs = vec![a.output(v / 3), b.output(v - v / 3 - FEE)];
+
+        // A alone, signing both slots.
+        let mut alone = spend(fop, outputs.clone());
+        let s = Satisfaction::All(vec![
+            sign_out(&alone, &fout, &fund_p, 0, &a),
+            sign_out(&alone, &fout, &fund_p, 1, &a),
+        ]);
+        alone.inputs[0].witness = witness(&fund_p, &s);
+        assert_eq!(
+            r.mine(from_ref(&alone)),
+            Err(ValidationError::KeyDoesNotMatchLock)
+        );
+
+        let close = both_sign(fop, &fout, &fund_p, (&a, &b), outputs);
+        r.mine(from_ref(&close)).expect("cooperative close");
+        assert!(!r.unspent(&fop));
+    }
+
+    // --- The mempool ---------------------------------------------------
+
+    /// A pool takes a time-locked spend only once the next block can hold it.
+    #[test]
+    fn mempool_waits_for_time_locks() {
+        let a = Key::new(1);
+        let mut r = Regtest::new(&a);
+        let hf = r.height() + 1;
+        let relative = Policy::All(vec![a.leaf(), Policy::Older(2)]);
+        let absolute = Policy::All(vec![a.leaf(), Policy::After(hf as u32 + 3)]);
+        let funding = fund(&mut r, &a, 204, |v| {
+            vec![
+                relative.output(units(v / 2)),
+                absolute.output(units(v - v / 2)),
+            ]
+        });
+        assert_eq!(r.height(), hf);
+
+        let lock_spend = |index: u32, p: &Policy, lock: Satisfaction| {
+            let (op, o) = out(&funding, index);
+            let mut tx = spend(op, vec![a.output(o.value.units() - FEE)]);
+            let s = Satisfaction::All(vec![sign_out(&tx, &o, p, 0, &a), lock]);
+            tx.inputs[0].witness = witness(p, &s);
+            tx
+        };
+        let s_rel = lock_spend(0, &relative, Satisfaction::Older);
+        let s_abs = lock_spend(1, &absolute, Satisfaction::After);
+        let refused = |r: Result<Hash256, MempoolError>| {
+            matches!(
+                r,
+                Err(MempoolError::Validation(ValidationError::Policy(
+                    PolicyError::TooEarly { .. }
+                )))
+            )
+        };
+
+        let mut m = Mempool::new();
+        // Tip hf: the next block, hf + 1, is too early for both.
+        assert!(refused(m.accept(&s_rel, &r.c.utxo, NET, r.height())));
+        assert!(refused(m.accept(&s_abs, &r.c.utxo, NET, r.height())));
+        // Tip hf + 1: Older(2) is met in hf + 2; After(hf + 3) is not.
+        r.mine(&[]).unwrap();
+        assert_eq!(
+            m.accept(&s_rel, &r.c.utxo, NET, r.height()),
+            Ok(s_rel.txid())
+        );
+        assert!(refused(m.accept(&s_abs, &r.c.utxo, NET, r.height())));
+        // Tip hf + 2: the next block is hf + 3.
+        r.mine(&[]).unwrap();
+        assert_eq!(
+            m.accept(&s_abs, &r.c.utxo, NET, r.height()),
+            Ok(s_abs.txid())
+        );
+    }
+
+    /// A one-block reorganization drops the block that confirmed a funding
+    /// transaction: it returns to the pool, so its output is unconfirmed
+    /// again, and the pending `Older` spend of it must leave the pool.
+    #[test]
+    fn reorg_evicts_a_pending_older_spend() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let mut x = Regtest::new(&a);
+        // The competing miner shares every block so far.
+        let mut y = Regtest {
+            c: Chain::new(NET, genesis_block(NET)),
+            miner: b.hash(),
+            blocks: x.blocks.clone(),
+        };
+        for blk in &x.blocks {
+            y.c.connect(blk, blk.header.time + 1)
+                .expect("shared prefix");
+        }
+
+        let p = Policy::All(vec![a.leaf(), Policy::Older(1)]);
+        let funding = fund(&mut x, &a, 205, |v| vec![p.output(units(v))]);
+        let (op, o) = out(&funding, 0);
+        let mut pending = spend(op, vec![a.output(o.value.units() - FEE)]);
+        let s = Satisfaction::All(vec![sign_out(&pending, &o, &p, 0, &a), Satisfaction::Older]);
+        pending.inputs[0].witness = witness(&p, &s);
+
+        let mut m = Mempool::new();
+        let id = m
+            .accept(&pending, &x.c.utxo, NET, x.height())
+            .expect("Older(1) is met in the next block");
+
+        // The other branch: two empty blocks, it wins by one.
+        y.mine(&[]).unwrap();
+        y.mine(&[]).unwrap();
+        let (y1, y2) = (&y.blocks[y.blocks.len() - 2], &y.blocks[y.blocks.len() - 1]);
+        assert!(matches!(
+            x.c.submit(y1, y1.header.time + 1),
+            Ok(crate::chain::Accept::SideBranch)
+        ));
+        assert!(matches!(
+            x.c.submit(y2, y2.header.time + 1),
+            Ok(crate::chain::Accept::Reorganized { depth: 1 })
+        ));
+
+        // What the node does after a reorganization: the abandoned
+        // transactions come back, then the pool is revalidated.
+        let abandoned = x.c.take_disconnected();
+        assert_eq!(
+            m.return_abandoned(&abandoned, &x.c.utxo, NET, x.c.height()),
+            1
+        );
+        assert!(m.contains(&funding.txid()));
+        assert!(m.contains(&id), "still there before revalidation");
+        m.revalidate(&x.c.utxo, NET, x.c.height());
+        assert!(m.contains(&funding.txid()), "the funding waits again");
+        assert!(
+            !m.contains(&id),
+            "its Older spend cannot enter the next block"
+        );
     }
 
     // --- Weights -------------------------------------------------------

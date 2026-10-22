@@ -17,7 +17,7 @@
 
 use crate::address::Network;
 use crate::amount::Amount;
-use crate::hash::{tagged_hash, tags, Hash256};
+use crate::hash::{tagged_hash, tagged_hash_parts, tags, Hash256};
 use crate::merkle::leaf_hash;
 use crate::ser::{ReadError, Reader, Writer};
 use crate::sig::SchemeId;
@@ -280,16 +280,14 @@ impl Transaction {
         policy: &[u8],
         leaf: u8,
     ) -> Hash256 {
-        let mut w = Writer::new();
-        w.var_bytes(network.hrp().as_bytes());
-        w.bytes(&self.encode_without_witness());
-        w.u32(input_index);
-        w.u64(spent.value.units());
-        w.u8(spent.scheme.as_u8());
-        w.bytes(spent.pubkey_hash.as_bytes());
-        w.var_bytes(policy);
-        w.u8(leaf);
-        tagged_hash(tags::POLICY_SIGHASH, w.as_slice())
+        policy_sighash_of_stripped(
+            &self.encode_without_witness(),
+            input_index,
+            network,
+            spent,
+            policy,
+            leaf,
+        )
     }
 
     pub fn is_coinbase(&self) -> bool {
@@ -361,6 +359,32 @@ impl Transaction {
         let outputs_weight = self.outputs.len() as u64 * crate::consensus::WEIGHT_PER_OUTPUT;
         base * witness_discount + witness + outputs_weight
     }
+}
+
+/// [`Transaction::policy_sighash`] from the already encoded stripped
+/// transaction, so that a validator checking several keys of one input
+/// encodes it once.
+pub fn policy_sighash_of_stripped(
+    stripped: &[u8],
+    input_index: u32,
+    network: Network,
+    spent: &TxOut,
+    policy: &[u8],
+    leaf: u8,
+) -> Hash256 {
+    let mut head = Writer::with_capacity(16);
+    head.var_bytes(network.hrp().as_bytes());
+    let mut tail = Writer::with_capacity(policy.len() + 64);
+    tail.u32(input_index);
+    tail.u64(spent.value.units());
+    tail.u8(spent.scheme.as_u8());
+    tail.bytes(spent.pubkey_hash.as_bytes());
+    tail.var_bytes(policy);
+    tail.u8(leaf);
+    tagged_hash_parts(
+        tags::POLICY_SIGHASH,
+        &[head.as_slice(), stripped, tail.as_slice()],
+    )
 }
 
 #[cfg(test)]
@@ -519,6 +543,19 @@ mod tests {
             base,
             tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0)
         );
+
+        // The message is the tagged hash of one contiguous byte string,
+        // whichever way it is fed to the hash.
+        let mut w = Writer::new();
+        w.var_bytes(Network::Regtest.hrp().as_bytes());
+        w.bytes(&tx.encode_without_witness());
+        w.u32(0);
+        w.u64(d.value.units());
+        w.u8(d.scheme.as_u8());
+        w.bytes(d.pubkey_hash.as_bytes());
+        w.var_bytes(b"policy");
+        w.u8(0);
+        assert_eq!(base, tagged_hash(tags::POLICY_SIGHASH, w.as_slice()));
     }
 
     #[test]

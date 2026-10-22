@@ -149,8 +149,8 @@ pub const MAX_USABLE_BLOCK_SIZE: usize = MAX_BLOCK_SIZE - 64 * 1024;
 /// someone with no intention of paying.
 pub const MAX_USABLE_WEIGHT: u64 = TARGET_BLOCK_WEIGHT;
 
-/// Does the spend of `spent` by `witness` still meet the relative time lock
-/// of its policy, in the block after `height`?
+/// Does the spend of `spent` by `witness` still meet the time locks of its
+/// policy, relative and absolute, in the block after `height`?
 ///
 /// The same reasoning as coinbase maturity: a reorganization lowers the tip,
 /// or moves the spent output to a later block (or back into the pool, where
@@ -158,9 +158,8 @@ pub const MAX_USABLE_WEIGHT: u64 = TARGET_BLOCK_WEIGHT;
 /// be in the future again. Kept, the transaction would make the miner build
 /// an invalid block. Nothing but the age is rechecked: the signatures do not
 /// depend on the chain.
-fn policy_age_reached(spent: &UtxoEntry, witness: &crate::tx::Witness, height: u64) -> bool {
-    let age = crate::policy::required_age(&spent.output, witness);
-    age == 0 || height + 1 >= spent.height.saturating_add(age)
+fn policy_locks_met(spent: &UtxoEntry, witness: &crate::tx::Witness, height: u64) -> bool {
+    height + 1 >= crate::policy::available_at(spent, witness)
 }
 
 /// Apparent fees of a transaction, without verifying a single signature.
@@ -1078,14 +1077,14 @@ impl Mempool {
                             // A reorg can make the height *go down*: a mature
                             // coinbase can become immature again.
                             (!u.is_coinbase || height + 1 >= u.height + COINBASE_MATURITY)
-                                && policy_age_reached(u, &input.witness, height)
+                                && policy_locks_met(u, &input.witness, height)
                         }
                         // Otherwise, the output must come from another
                         // transaction of the pool, still present.
                         None => self
                             .created
                             .get(&input.prev_out)
-                            .is_some_and(|u| policy_age_reached(u, &input.witness, height)),
+                            .is_some_and(|u| policy_locks_met(u, &input.witness, height)),
                     };
                     if !available {
                         orphans.push(*id);
@@ -1294,12 +1293,12 @@ mod tests {
             ]),
         );
         // The next block is at tip + 1: 59 + 1 = 60 = 50 + 10.
-        assert!(policy_age_reached(&spent, &w, 59));
-        assert!(!policy_age_reached(&spent, &w, 58));
+        assert!(policy_locks_met(&spent, &w, 59));
+        assert!(!policy_locks_met(&spent, &w, 58));
         // A key output has no age to reach.
         let mut plain = spent;
         plain.output.scheme = s;
-        assert!(policy_age_reached(&plain, &w, 0));
+        assert!(policy_locks_met(&plain, &w, 0));
     }
 
     pub fn funded_chain(w: &mut Wallet, n: u64) -> Chain {
