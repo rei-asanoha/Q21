@@ -93,8 +93,12 @@ impl Address {
         if payload.len() != 33 {
             return Err(AddressError::InvalidLength(payload.len()));
         }
-        let scheme =
-            SchemeId::from_u8(payload[0]).ok_or(AddressError::UnknownScheme(payload[0]))?;
+        // Key schemes only. The policy value (5) names no key: no address
+        // designates a policy, so that no wallet, RPC call or screen can pay
+        // to one by mistake, on any network.
+        let scheme = SchemeId::from_u8(payload[0])
+            .filter(|s| SchemeId::ALL.contains(s))
+            .ok_or(AddressError::UnknownScheme(payload[0]))?;
         let mut h = [0u8; 32];
         h.copy_from_slice(&payload[1..33]);
         Ok(Address {

@@ -302,6 +302,18 @@ pub const SNAPSHOT_BUCKET_MAX: u64 = 8 * 1024 * 1024;
 /// peer that fabricates it, never from an honest relay.
 pub const MISCONDUCT_BAD_TX: u32 = 20;
 
+/// Is `msg` unreadable on `network` for carrying a policy output?
+///
+/// Policies are dormant on testnet and mainnet (activation height
+/// `u64::MAX`). There, a message carrying a policy output gets exactly what
+/// 0.4.9 gave it — it did not decode: [`MISCONDUCT_MALFORMED`] and the
+/// connection dropped — rather than the milder penalty of an invalid
+/// transaction, so that a dormant rule changes nothing in how peers are
+/// treated.
+pub fn policy_output_is_malformed(network: Network, msg: &Message) -> bool {
+    !crate::policy::may_appear_on(network) && msg.carries_policy_output()
+}
+
 /// See [`crate::validate::ValidationError::locally_unverifiable_scheme`].
 pub fn locally_unverifiable_scheme(
     e: &crate::validate::ValidationError,
@@ -1911,6 +1923,7 @@ impl Node {
     fn read_loop(&self, id: u64, mut stream: TcpStream) {
         let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut chunk = [0u8; 32 * 1024];
+        let network = self.shared.lock().unwrap().network;
 
         loop {
             if self.is_stopped() {
@@ -1933,6 +1946,10 @@ impl Node {
                 match Message::parse(&buffer, self.magic) {
                     Ok((msg, consumed)) => {
                         buffer.drain(..consumed);
+                        if policy_output_is_malformed(network, &msg) {
+                            self.penalize(id, MISCONDUCT_MALFORMED);
+                            return;
+                        }
                         if !self.handle(id, msg) {
                             return;
                         }

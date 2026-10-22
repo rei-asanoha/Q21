@@ -154,6 +154,13 @@ pub fn is_active(network: Network, height: u64) -> bool {
     height >= activation_height(network)
 }
 
+/// Can a policy output ever be valid on `network`? False on testnet and
+/// mainnet, where the rule is dormant: there, anything carrying one is
+/// treated as 0.4.9 treated it, as unreadable.
+pub fn may_appear_on(network: Network) -> bool {
+    activation_height(network) != u64::MAX
+}
+
 /// Height from which the rule is in force; `u64::MAX` means never.
 fn activation_height(network: Network) -> u64 {
     match network {
@@ -2252,5 +2259,199 @@ mod spend_tests {
             + commitment.inputs[0].witness.signature.len();
         assert_eq!(two_of_two as u64, 2 * plain_wit + 70 + 2 * 6);
         assert!(w(&close) < 2 * w(&plain) + 200);
+    }
+}
+
+/// The rule is dormant on testnet and mainnet: nothing carrying a policy
+/// output is treated more leniently there than 0.4.9 treated it.
+#[cfg(test)]
+mod dormant_tests {
+    use super::*;
+    use crate::address::Address;
+    use crate::amount::Amount;
+    use crate::block::{Block, BlockHeader};
+    use crate::consensus::NETWORK_MAGIC_TESTNET;
+    use crate::mempool::{Mempool, MempoolError};
+    use crate::net::policy_output_is_malformed;
+    use crate::tx::{OutPoint, TxIn};
+    use crate::utxo::UtxoSet;
+    use crate::wire::{Message, WireError};
+
+    const S: SchemeId = SchemeId::MlDsa87;
+
+    fn policy() -> Policy {
+        Policy::All(vec![
+            Policy::Key {
+                scheme: S,
+                pubkey_hash: Hash256([1; 32]),
+            },
+            Policy::Older(1),
+        ])
+    }
+
+    fn key_out(v: u64) -> TxOut {
+        TxOut {
+            value: Amount::from_units(v),
+            scheme: S,
+            pubkey_hash: Hash256([2; 32]),
+        }
+    }
+
+    /// Placeholder witness of the right sizes: if anything verified it, the
+    /// answer would be a signature error, not the one these tests expect.
+    fn tx(prev: OutPoint, outputs: Vec<TxOut>) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                prev_out: prev,
+                witness: Witness {
+                    pubkey: vec![0; S.pubkey_len()],
+                    signature: vec![0; S.sig_len()],
+                },
+                sequence: u32::MAX,
+            }],
+            outputs,
+            lock_time: 0,
+        }
+    }
+
+    fn creating() -> (Transaction, UtxoSet) {
+        let prev = OutPoint {
+            txid: Hash256([3; 32]),
+            index: 0,
+        };
+        let mut u = UtxoSet::new();
+        u.insert(
+            prev,
+            UtxoEntry {
+                output: key_out(1_000_000),
+                height: 1,
+                is_coinbase: false,
+            },
+        );
+        (
+            tx(prev, vec![policy().output(Amount::from_units(900_000))]),
+            u,
+        )
+    }
+
+    fn frame_and_parse(m: &Message) -> Result<Message, WireError> {
+        Message::parse(&m.frame(NETWORK_MAGIC_TESTNET), NETWORK_MAGIC_TESTNET).map(|(m, _)| m)
+    }
+
+    /// A transaction or a block with a policy output, received on testnet
+    /// or mainnet: unreadable, as in 0.4.9 — the node penalizes the sender
+    /// with `MISCONDUCT_MALFORMED` and drops it (see `Node::read_loop`).
+    #[test]
+    fn a_live_node_treats_a_policy_output_as_unreadable() {
+        let (t, _) = creating();
+        let header = BlockHeader {
+            version: 1,
+            prev_block: Hash256::ZERO,
+            merkle_root: Hash256::ZERO,
+            uncles_root: Hash256::ZERO,
+            miner: Hash256::ZERO,
+            time: 0,
+            bits: 0,
+            height: 1,
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            transactions: vec![
+                Transaction {
+                    version: 1,
+                    inputs: vec![TxIn::coinbase(1u64.to_le_bytes().to_vec())],
+                    outputs: vec![key_out(50_000)],
+                    lock_time: 0,
+                },
+                t.clone(),
+            ],
+            uncles: Vec::new(),
+        };
+        for msg in [
+            Message::Tx(Box::new(t.clone())),
+            Message::Block(Box::new(block.clone())),
+            Message::BlockTxn {
+                block: Hash256::ZERO,
+                txs: vec![t.clone()],
+            },
+        ] {
+            let read = frame_and_parse(&msg).expect("the frame itself is well formed");
+            assert!(policy_output_is_malformed(Network::Testnet, &read));
+            assert!(policy_output_is_malformed(Network::Mainnet, &read));
+            // Regtest, where the rule is active, reads it normally.
+            assert!(!policy_output_is_malformed(Network::Regtest, &read));
+        }
+        // Without a policy output, nothing changes anywhere.
+        let mut plain = t.clone();
+        plain.outputs = vec![key_out(900_000)];
+        let read = frame_and_parse(&Message::Tx(Box::new(plain))).unwrap();
+        assert!(!policy_output_is_malformed(Network::Testnet, &read));
+
+        // The 0.4.9 path is unchanged: an unknown scheme byte still fails to
+        // decode at all.
+        let mut raw = t.encode();
+        // Version, one input (40 bytes and its count), output count, value.
+        let pos = 4 + 1 + 40 + 1 + 8;
+        assert_eq!(raw[pos], SchemeId::Policy.as_u8());
+        raw[pos] = 200;
+        assert!(Transaction::decode(&raw).is_err());
+    }
+
+    /// The mempool of a live network refuses a policy output, created or
+    /// spent, before any signature is verified.
+    #[test]
+    fn a_live_mempool_refuses_policies_before_any_signature() {
+        let (t, u) = creating();
+        for net in [Network::Testnet, Network::Mainnet] {
+            assert_eq!(
+                Mempool::new().accept(&t, &u, net, 10),
+                Err(MempoolError::Validation(
+                    ValidationError::SchemeForbiddenOnNetwork(SchemeId::Policy)
+                ))
+            );
+        }
+        // A spend of one that would somehow exist.
+        let locked = OutPoint {
+            txid: Hash256([4; 32]),
+            index: 0,
+        };
+        let mut u = UtxoSet::new();
+        u.insert(
+            locked,
+            UtxoEntry {
+                output: policy().output(Amount::from_units(1_000_000)),
+                height: 1,
+                is_coinbase: false,
+            },
+        );
+        let spend = tx(locked, vec![key_out(900_000)]);
+        assert_eq!(
+            Mempool::new().accept(&spend, &u, Network::Testnet, 10),
+            Err(MempoolError::Validation(
+                ValidationError::SchemeForbiddenOnNetwork(SchemeId::Policy)
+            ))
+        );
+    }
+
+    /// No address designates a policy: the wallet, the RPC calls that take a
+    /// destination (`sendtoaddress`, `sendmany`) and the screens all parse
+    /// through `Address::parse`, so none can create a policy output.
+    #[test]
+    fn no_address_designates_a_policy() {
+        for network in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            let text = Address {
+                network,
+                scheme: SchemeId::Policy,
+                hash: policy().lock_hash(),
+            }
+            .to_string();
+            assert_eq!(
+                Address::parse(&text),
+                Err(crate::address::AddressError::UnknownScheme(5))
+            );
+            assert!(Address::parse_on(&text, network).is_err());
+        }
     }
 }

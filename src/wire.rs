@@ -697,6 +697,30 @@ impl Message {
         out
     }
 
+    /// Does this message carry a transaction with a policy output
+    /// ([`crate::sig::SchemeId::Policy`])?
+    ///
+    /// Up to 0.4.9 such an output did not decode at all. Where policies are
+    /// dormant, the node uses this to treat the message exactly as it did
+    /// then: unreadable. Inputs need no look: an input spending a policy
+    /// output only exists if one was created.
+    pub fn carries_policy_output(&self) -> bool {
+        fn any<'a>(mut txs: impl Iterator<Item = &'a Transaction>) -> bool {
+            txs.any(|t| {
+                t.outputs
+                    .iter()
+                    .any(|o| o.scheme == crate::sig::SchemeId::Policy)
+            })
+        }
+        match self {
+            Message::Tx(t) => any(std::iter::once(t.as_ref())),
+            Message::Block(b) => any(b.transactions.iter()),
+            Message::BlockTxn { txs, .. } => any(txs.iter()),
+            Message::CmpctBlock(c) => any(c.prefilled.iter().map(|(_, t)| t)),
+            _ => false,
+        }
+    }
+
     /// Tries to read a frame from a buffer.
     ///
     /// Returns the message and the number of bytes consumed, or
