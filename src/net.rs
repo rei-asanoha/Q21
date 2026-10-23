@@ -1032,6 +1032,11 @@ struct Outgoing {
 /// calls it off the chain lock, so the component may do cryptography freely.
 pub trait ChannelSink: Send + Sync {
     fn deliver(&self, peer: u64, bytes: &[u8]) -> ChannelOutcome;
+
+    /// Called with a connected block's transactions, off the chain lock, so the
+    /// channel watcher can detect a spend of a funding output and react. The
+    /// default does nothing.
+    fn on_block(&self, _txs: &[crate::tx::Transaction]) {}
 }
 
 /// The result of handing a channel message to the [`ChannelSink`].

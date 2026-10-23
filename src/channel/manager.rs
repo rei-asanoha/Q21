@@ -522,6 +522,23 @@ impl ChannelManager {
         }
     }
 
+    /// Scans a connected block's transactions for a spend of any watched
+    /// funding output and acts on it (penalty, claim, or a scheduled sweep).
+    /// Called off the chain lock, so it may sign and broadcast.
+    pub fn on_block(&self, txs: &[Transaction]) {
+        let watched = self.watched_funding();
+        if watched.is_empty() {
+            return;
+        }
+        for tx in txs {
+            for inp in &tx.inputs {
+                if let Some((cid, _)) = watched.iter().find(|(_, o)| *o == inp.prev_out) {
+                    let _ = self.on_funding_spend(*cid, tx);
+                }
+            }
+        }
+    }
+
     /// The funding outpoints this manager is watching, with their channel ids.
     pub fn watched_funding(&self) -> Vec<(Hash256, OutPoint)> {
         let g = self.inner.lock().unwrap();
@@ -624,5 +641,9 @@ impl crate::net::ChannelSink for ChannelManager {
             replies: r.frames,
             penalize: r.penalize,
         }
+    }
+
+    fn on_block(&self, txs: &[Transaction]) {
+        ChannelManager::on_block(self, txs);
     }
 }
