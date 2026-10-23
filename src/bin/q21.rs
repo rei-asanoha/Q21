@@ -5660,7 +5660,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // machine kept mining.
             let cut = node.maintain_peers();
             if cut > 0 && !quiet {
-                println!("  {cut} silent peer(s) disconnected");
+                println!("  {cut} silent or withholding peer(s) disconnected");
             }
 
             let missing = target_peers.saturating_sub(node.peer_count_outbound());

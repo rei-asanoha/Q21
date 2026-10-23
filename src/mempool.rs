@@ -359,6 +359,31 @@ impl Mempool {
         self.entries.contains_key(txid)
     }
 
+    /// The apparent fee rate of `tx` — units per thousand weight units — as
+    /// this pool would value it, read from the UTXO set without verifying a
+    /// single signature; `None` if an input is unknown.
+    ///
+    /// The relay remembers at what rate a transaction was refused for lack of
+    /// room, so it can tell later whether the pool could finally take it.
+    pub fn apparent_fee_rate(&self, tx: &Transaction, confirmed: &UtxoSet) -> Option<u64> {
+        let view = self.view(confirmed);
+        let fees = apparent_fees(tx, &view).ok()?;
+        let weight = tx.weight(WITNESS_DISCOUNT);
+        Some(fees.saturating_mul(1000) / weight.max(1))
+    }
+
+    /// Could a transaction paying `rate` and occupying `size` bytes get into
+    /// the pool right now — either because there is free space, or because it
+    /// pays clearly more than cheap enough entries it could evict?
+    ///
+    /// Read-only and signature-free: the relay calls it to decide whether a
+    /// transaction refused earlier for lack of room is worth requesting again,
+    /// instead of downloading it at every offer only to refuse it once more.
+    pub fn would_admit(&self, rate: u64, size: usize) -> bool {
+        self.bytes + size <= self.capacity()
+            || self.room_for(rate, size, &HashSet::new(), false).is_some()
+    }
+
     pub fn get(&self, txid: &Hash256) -> Option<&Transaction> {
         self.entries.get(txid).map(|e| &e.tx)
     }
