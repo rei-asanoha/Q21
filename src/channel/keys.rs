@@ -21,6 +21,7 @@ pub const CHANNEL_SCHEME: SchemeId = SchemeId::MlDsa87;
 /// Derivation tag of a channel's funding (signing) key.
 const TAG_FUND: &str = "Q21/channel/fund-key";
 /// Derivation tag of a channel's revocation shachain root.
+#[cfg(feature = "mldsa")]
 const TAG_REVOKE: &str = "Q21/channel/revoke-root";
 
 /// The 32-byte seed of a channel's signing key, from the wallet seed and a
