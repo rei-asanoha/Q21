@@ -427,6 +427,10 @@ pub struct RpcContext {
     pub set_reachable: Option<SetReachable>,
     /// The Tor setting; absent in pure memory (tests) and on servers.
     pub tor: Option<Arc<TorSetting>>,
+    /// The payment-channel manager, when this node runs channels (regtest).
+    /// Absent off regtest and wherever channels are not wired.
+    #[cfg(feature = "mldsa")]
+    pub channels: Option<Arc<crate::channel::manager::ChannelManager>>,
 }
 
 /// Chain scans a public service grants: a budget **per client**, and a net
@@ -612,6 +616,8 @@ impl RpcContext {
             router_status: None,
             set_reachable: None,
             tor: None,
+            #[cfg(feature = "mldsa")]
+            channels: None,
         }
     }
 
@@ -634,6 +640,27 @@ impl RpcContext {
             ))
         }
     }
+}
+
+/// One channel as a small JSON object, for `channellist` and `channelinfo`.
+#[cfg(feature = "mldsa")]
+fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
+    Json::obj()
+        .set("channel_id", Json::str(s.channel_id.to_hex()))
+        .set("peer", Json::u64(s.peer))
+        .set("phase", Json::str(format!("{:?}", s.phase).to_lowercase()))
+        .set("capacity", Json::u64(s.capacity))
+        .set("local_balance", Json::u64(s.local_balance))
+        .set("remote_balance", Json::u64(s.remote_balance))
+        .set("state", Json::u64(s.state_number))
+        .set(
+            "funding_txid",
+            match s.funding {
+                Some(o) => Json::str(o.txid.to_hex()),
+                None => Json::Null,
+            },
+        )
+        .build()
 }
 
 fn rpc_error(code: i64, message: &str) -> Json {
@@ -981,7 +1008,8 @@ impl RpcContext {
 
     /// List of the exposed methods.
     pub fn methods() -> Vec<(&'static str, &'static str)> {
-        vec![
+        #[allow(unused_mut)]
+        let mut m = vec![
             ("getinfo", "State of the chain, the network and the mempool"),
             ("getblock", "Full block, by height or by id"),
             ("getblockheader", "Header only"),
@@ -1069,7 +1097,153 @@ impl RpcContext {
                 "getamount",
                 "Transactions carrying an output of a given amount, over a bounded window",
             ),
-        ]
+        ];
+        #[cfg(feature = "mldsa")]
+        m.extend([
+            (
+                "channelopen",
+                "[wallet] Open a payment channel to a peer (peer, capacity, [delay], [min_depth])",
+            ),
+            (
+                "channelpay",
+                "[wallet] Pay over a channel (channel_id, amount)",
+            ),
+            (
+                "channelclose",
+                "[wallet] Close a channel cooperatively, or force-close (channel_id, [force])",
+            ),
+            ("channellist", "[wallet] Open channels"),
+            ("channelinfo", "[wallet] One channel's state (channel_id)"),
+        ]);
+        m
+    }
+
+    // -----------------------------------------------------------------------
+    // Payment channels (regtest only)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "mldsa")]
+    fn channels(&self) -> Result<&Arc<crate::channel::manager::ChannelManager>, Json> {
+        if self.network != Network::Regtest {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "payment channels are available on regtest only",
+            ));
+        }
+        self.channels
+            .as_ref()
+            .ok_or_else(|| rpc_error(ERR_REQUEST, "this node does not run payment channels"))
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn channel_id_param(&self, params: &Json) -> Result<crate::hash::Hash256, Json> {
+        params
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .and_then(crate::hash::Hash256::from_hex)
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "channel_id must be a 32-byte hex string"))
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn channelopen(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels()?;
+        let peer = params.get("peer").and_then(|v| v.as_u64()).ok_or_else(|| {
+            rpc_error(ERR_PARAMS, "peer must be a numeric peer id (see getpeers)")
+        })?;
+        let capacity = params
+            .get("capacity")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "capacity (in units) is required"))?;
+        let delay = params
+            .get("delay")
+            .and_then(|v| v.as_u64())
+            .map(|d| d as u16);
+        let depth = params
+            .get("min_depth")
+            .and_then(|v| v.as_u64())
+            .map(|d| d as u16);
+        let frame = mgr
+            .open(peer, capacity, delay, depth)
+            .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+        if !self.node.send_channel(peer, frame) {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "peer is not connected or does not support payment channels",
+            ));
+        }
+        Ok(Json::obj()
+            .set("status", Json::str("opening"))
+            .set("peer", Json::u64(peer))
+            .set("capacity", Json::u64(capacity))
+            .build())
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn channelpay(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels()?;
+        let cid = self.channel_id_param(params)?;
+        let amount = params
+            .get("amount")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "amount (in units) is required"))?;
+        let peer = mgr
+            .peer_of(cid)
+            .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))?;
+        let frame = mgr
+            .pay(cid, amount)
+            .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+        if !self.node.send_channel(peer, frame) {
+            return Err(rpc_error(ERR_REQUEST, "peer is not connected"));
+        }
+        Ok(Json::obj()
+            .set("status", Json::str("sent"))
+            .set("channel_id", Json::str(cid.to_hex()))
+            .set("amount", Json::u64(amount))
+            .build())
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn channelclose(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels()?;
+        let cid = self.channel_id_param(params)?;
+        let force = matches!(params.get("force"), Some(Json::Bool(true)));
+        if force {
+            let tx = mgr
+                .force_close(cid)
+                .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+            return Ok(Json::obj()
+                .set("status", Json::str("force_closing"))
+                .set("txid", Json::str(tx.txid().to_hex()))
+                .build());
+        }
+        let peer = mgr
+            .peer_of(cid)
+            .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))?;
+        let frame = mgr.close(cid).map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+        if !self.node.send_channel(peer, frame) {
+            return Err(rpc_error(ERR_REQUEST, "peer is not connected"));
+        }
+        Ok(Json::obj()
+            .set("status", Json::str("closing"))
+            .set("channel_id", Json::str(cid.to_hex()))
+            .build())
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn channellist(&self) -> Result<Json, Json> {
+        let mgr = self.channels()?;
+        Ok(Json::array(
+            mgr.list().into_iter().map(channel_json).collect(),
+        ))
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn channelinfo(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels()?;
+        let cid = self.channel_id_param(params)?;
+        mgr.info(cid)
+            .map(channel_json)
+            .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))
     }
 
     fn dispatch(
@@ -1122,6 +1296,16 @@ impl RpcContext {
             "search" => self.search(params, client),
             "getaddress" => self.getaddress(params, client),
             "getamount" => self.getamount(params, client),
+            #[cfg(feature = "mldsa")]
+            "channelopen" => self.channelopen(params),
+            #[cfg(feature = "mldsa")]
+            "channelpay" => self.channelpay(params),
+            #[cfg(feature = "mldsa")]
+            "channelclose" => self.channelclose(params),
+            #[cfg(feature = "mldsa")]
+            "channellist" => self.channellist(),
+            #[cfg(feature = "mldsa")]
+            "channelinfo" => self.channelinfo(params),
             other => Err(rpc_error(
                 ERR_METHOD,
                 &format!("unknown method: {other}. Try listmethods."),
@@ -3695,6 +3879,8 @@ mod tests {
             router_status: None,
             set_reachable: None,
             tor: None,
+            #[cfg(feature = "mldsa")]
+            channels: None,
             index: None,
             // The RPC tests see mining as possible: that is what makes it
             // possible to check that the switch responds, and that without a
@@ -3740,6 +3926,8 @@ mod tests {
             router_status: None,
             set_reachable: None,
             tor: None,
+            #[cfg(feature = "mldsa")]
+            channels: None,
             index: None,
             mining: Some(Arc::new(crate::mining::Mining::new(false))),
             node: Arc::new(Node::new(NETWORK, c)),
@@ -3751,6 +3939,33 @@ mod tests {
     fn call(c: &RpcContext, method: &str, params: &str) -> Json {
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
         jparse(&c.handle(&body)).expect("valid JSON response")
+    }
+
+    /// The channel methods are listed and refuse cleanly when the node runs no
+    /// channel service — they never panic.
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn channel_methods_are_listed_and_refuse_cleanly_without_a_manager() {
+        let names: Vec<&str> = RpcContext::methods().into_iter().map(|(n, _)| n).collect();
+        for m in [
+            "channelopen",
+            "channelpay",
+            "channelclose",
+            "channellist",
+            "channelinfo",
+        ] {
+            assert!(names.contains(&m), "{m} must be listed");
+        }
+        let c = context(true);
+        // Regtest, but no manager installed: a clear refusal, not a panic.
+        let r = call(&c, "channellist", "{}");
+        assert!(
+            r.get("error").is_some(),
+            "channellist must refuse: {}",
+            r.encode()
+        );
+        let r = call(&c, "channelpay", r#"{"channel_id":"00","amount":1}"#);
+        assert!(r.get("error").is_some());
     }
 
     fn call_ok(c: &RpcContext, method: &str, params: &str) -> Json {
@@ -4951,6 +5166,8 @@ mod tests {
             router_status: None,
             set_reachable: None,
             tor: None,
+            #[cfg(feature = "mldsa")]
+            channels: None,
             index: None,
             mining: None,
             node: Arc::new(Node::new(NETWORK, chain)),
@@ -5394,6 +5611,8 @@ mod tests {
             router_status: None,
             set_reachable: None,
             tor: None,
+            #[cfg(feature = "mldsa")]
+            channels: None,
             index: None,
             mining: None,
             node,

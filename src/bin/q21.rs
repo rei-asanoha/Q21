@@ -5339,6 +5339,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 source: tor_source.clone(),
                 progress: managed_tor.as_ref().map(|t| t.progress_handle()),
             })),
+            // The payment-channel manager is constructed and installed by the
+            // channel service when the node runs channels (regtest); it is not
+            // part of the base RPC context.
+            #[cfg(feature = "mldsa")]
+            channels: None,
         };
         // The explorer shell is served without a token: it carries no data,
         // and it is the one that asks the user for the token. Every RPC

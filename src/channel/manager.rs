@@ -547,6 +547,26 @@ impl ChannelManager {
         g.channels.get(&cid).map(summary)
     }
 
+    /// The peer a channel is with.
+    pub fn peer_of(&self, cid: Hash256) -> Option<u64> {
+        let g = self.inner.lock().unwrap();
+        g.channels.get(&cid).map(|c| c.peer)
+    }
+
+    /// Force-closes a channel by broadcasting our latest commitment. Returns
+    /// the transaction broadcast.
+    pub fn force_close(&self, cid: Hash256) -> Result<Transaction, String> {
+        let mut g = self.inner.lock().unwrap();
+        let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        let tx = chan
+            .machine
+            .force_close(crate::channel::txbuild::FeeTier::Medium)
+            .map_err(err)?;
+        drop(g);
+        (self.hooks.broadcast)(&tx)?;
+        Ok(tx)
+    }
+
     /// A fully-signed commitment at state `n`, for exercising the watcher with
     /// a (possibly revoked) broadcast. An audit hook, never a production path.
     #[cfg(feature = "audit")]
