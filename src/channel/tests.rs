@@ -5,9 +5,9 @@
 //! These run only with `--features mldsa`: every signature is a real
 //! ML-DSA-87 signature, as on the chain.
 
-use super::journal::{self, Journal, Record};
+use super::journal::{self, Record};
 use super::keys::{ChannelKey, Signer};
-use super::machine::{channel_id, Machine, Phase};
+use super::machine::{Machine, Phase};
 use super::messages::{initiative, Message, Revocation, WireError};
 use super::txbuild::{self, ChannelParams, FeeTier, ACCEPTOR, FUNDER};
 use super::watcher::{classify, Watch, WatchContext};
@@ -526,7 +526,7 @@ fn reestablish_between_complete_states_resends_nothing() {
 #[test]
 fn reestablish_rejects_a_forged_proof_and_a_replayed_nonce() {
     let dir = tmpdir();
-    let (mut f, mut a) = open_pair(&dir);
+    let (f, mut a) = open_pair(&dir);
     let rf = f.reestablish().unwrap();
     // A good one verifies.
     assert!(a.on_reestablish(&rf).is_ok());
@@ -600,4 +600,297 @@ fn a_cooperative_close_is_signed_by_both() {
     // Outputs pay the final balance less the close fee from the funder.
     let total: u64 = close_tx.outputs.iter().map(|o| o.value.units()).sum();
     assert_eq!(total, CAP - 20_000);
+}
+
+// --- Watcher: our own commitment --------------------------------------------
+
+#[test]
+fn our_own_commitment_is_swept_only_after_the_delay() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    // The acceptor force-closes with its own latest commitment.
+    let mine = a.force_close(FeeTier::Low).unwrap();
+    assert_eq!(a.phase(), Phase::Forcing);
+    let ctx = WatchContext {
+        params: a.params(),
+        our_index: a.our_index(),
+        store: a.revocation_store(),
+        latest_state: a.local_commit_number().unwrap(),
+    };
+    let decision = classify(&ctx, a.funding_outpoint().unwrap(), &mine);
+    let Watch::OurCommitment { state: 1, to_local: Some(_), delay } = decision else {
+        panic!("expected OurCommitment, got {decision:?}");
+    };
+    assert_eq!(delay, DELAY);
+    let sweep = a.build_local_sweep(&decision, a.params().funding[ACCEPTOR], 20_000).unwrap();
+    assert_eq!(sweep.inputs.len(), 1);
+
+    // Validate the sweep on a minimal UTXO view: its to_local output lives at
+    // `born`; the sweep needs the delayed branch, valid only `DELAY` blocks on.
+    let born = 100u64;
+    let mut utxo = crate::utxo::UtxoSet::new();
+    let to_local_out = mine.outputs.iter().find(|o| o.scheme == crate::sig::SchemeId::Policy).copied().unwrap();
+    utxo.insert(
+        crate::tx::OutPoint { txid: mine.txid(), index: 0 },
+        crate::utxo::UtxoEntry { output: to_local_out, height: born, is_coinbase: false },
+    );
+    use std::collections::HashSet;
+    // Too early: refused.
+    assert!(crate::validate::check_transaction(&sweep, &utxo, NET, born + 1, &mut HashSet::new()).is_err());
+    // After the delay: accepted.
+    assert!(crate::validate::check_transaction(&sweep, &utxo, NET, born + DELAY as u64, &mut HashSet::new()).is_ok());
+}
+
+#[test]
+fn a_spend_of_another_outpoint_is_not_our_channel() {
+    let dir = tmpdir();
+    let (_f, a) = open_pair(&dir);
+    let unrelated = crate::tx::Transaction {
+        version: 1,
+        inputs: vec![crate::tx::TxIn {
+            prev_out: OutPoint { txid: Hash256([0x55; 32]), index: 1 },
+            witness: crate::tx::Witness::default(),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![txbuild::key_output(Hash256([1; 32]), MIN_OUTPUT_VALUE)],
+        lock_time: 0,
+    };
+    let ctx = WatchContext {
+        params: a.params(),
+        our_index: a.our_index(),
+        store: a.revocation_store(),
+        latest_state: a.local_commit_number().unwrap(),
+    };
+    assert_eq!(
+        classify(&ctx, a.funding_outpoint().unwrap(), &unrelated),
+        Watch::NotOurChannel
+    );
+}
+
+// --- Property: the honest party never loses funds ---------------------------
+
+struct XorShift(u64);
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+}
+
+/// Random payments both directions, then one party broadcasts a random past
+/// state. The honest party's recovery on chain is at least its fair balance,
+/// and a penalty against a revoked state validates before the delay while the
+/// cheater's own sweep does not.
+#[test]
+fn honest_party_never_loses_against_a_random_broadcast() {
+    use std::collections::HashSet;
+    for seed in 0..12u64 {
+        let dir = tmpdir();
+        let (mut f, mut a) = open_pair(&dir);
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0x1234567));
+        let payments = 3 + rng.below(6); // 3..=8 states
+        let mut bal = [CAP, 0u64];
+        let mut states: Vec<[u64; 2]> = vec![bal];
+        for _ in 0..payments {
+            // Move a random amount from whichever side can afford it while
+            // keeping a coin, in either direction.
+            let amt = 100_000 + rng.below(3_000_000);
+            let payer = if rng.below(2) == 0 { FUNDER } else { ACCEPTOR };
+            let (payer, amt) = if bal[payer] >= amt + UNITS_PER_COIN {
+                (payer, amt)
+            } else if bal[1 - payer] >= amt + UNITS_PER_COIN {
+                (1 - payer, amt)
+            } else {
+                continue;
+            };
+            bal[payer] -= amt;
+            bal[1 - payer] += amt;
+            if payer == FUNDER {
+                pay(&mut f, &mut a, bal);
+            } else {
+                pay(&mut a, &mut f, bal);
+            }
+            states.push(bal);
+        }
+        let k = f.local_commit_number().unwrap(); // current state
+        // Retained states on hand to broadcast: the latest two.
+        let j = if k == 0 { 0 } else { k - 1 + rng.below(2) }; // k-1 or k
+        let j = j.min(k);
+        let broadcast = f.signed_commitment_at(j, FeeTier::Low).unwrap();
+        let born = 100u64;
+        let fund_op = a.funding_outpoint().unwrap();
+
+        // Put the broadcast commitment's outputs into a UTXO view.
+        let mut utxo = crate::utxo::UtxoSet::new();
+        for (idx, out) in broadcast.outputs.iter().enumerate() {
+            utxo.insert(
+                crate::tx::OutPoint { txid: broadcast.txid(), index: idx as u32 },
+                crate::utxo::UtxoEntry { output: *out, height: born, is_coinbase: false },
+            );
+        }
+
+        let ctx = WatchContext {
+            params: a.params(),
+            our_index: a.our_index(),
+            store: a.revocation_store(),
+            latest_state: k,
+        };
+        let decision = classify(&ctx, fund_op, &broadcast);
+        let honest_fair = states[k as usize][ACCEPTOR];
+
+        let mut honest_recovered = 0u64;
+        match &decision {
+            Watch::RevokedByPeer { state, to_local, .. } => {
+                assert!(*state < k, "a revoked broadcast");
+                // Penalty sweeps the cheater's to_local to the acceptor.
+                let penalty = a.build_penalty(&decision, a.params().funding[ACCEPTOR], 20_000).unwrap();
+                // Penalty is valid the very next block, before the delay.
+                assert!(
+                    crate::validate::check_transaction(&penalty, &utxo, NET, born + 1, &mut HashSet::new()).is_ok(),
+                    "penalty must validate before the delay"
+                );
+                honest_recovered += penalty.outputs[0].value.units();
+                // The cheater's own sweep of that same to_local is refused
+                // until the delay: the penalty wins the race.
+                let cheater_sweep = f.build_local_sweep(
+                    &Watch::OurCommitment {
+                        state: *state,
+                        to_local: Some(*to_local),
+                        delay: DELAY,
+                    },
+                    f.params().funding[FUNDER],
+                    20_000,
+                ).unwrap();
+                assert!(
+                    crate::validate::check_transaction(&cheater_sweep, &utxo, NET, born + 1, &mut HashSet::new()).is_err(),
+                    "the cheater's sweep must not be valid before its delay"
+                );
+                // The acceptor also owns its to_remote on that commitment.
+                if let Some((idx, out)) = broadcast.outputs.iter().enumerate()
+                    .find(|(_, o)| o.scheme == crate::sig::SchemeId::MlDsa87 && o.pubkey_hash == a.params().funding[ACCEPTOR])
+                {
+                    let claim = a.build_to_remote_claim(
+                        &super::watcher::OutputRef {
+                            outpoint: crate::tx::OutPoint { txid: broadcast.txid(), index: idx as u32 },
+                            output: *out,
+                        },
+                        a.params().funding[ACCEPTOR],
+                        20_000,
+                    );
+                    assert!(crate::validate::check_transaction(&claim, &utxo, NET, born + 1, &mut HashSet::new()).is_ok());
+                    honest_recovered += claim.outputs[0].value.units();
+                }
+            }
+            Watch::PeerLatest { state, to_remote } => {
+                assert_eq!(*state, k);
+                if let Some(to_remote) = to_remote {
+                    let claim = a.build_to_remote_claim(to_remote, a.params().funding[ACCEPTOR], 20_000);
+                    assert!(crate::validate::check_transaction(&claim, &utxo, NET, born + 1, &mut HashSet::new()).is_ok());
+                    honest_recovered += claim.outputs[0].value.units();
+                }
+            }
+            other => panic!("unexpected watcher decision {other:?}"),
+        }
+
+        // The honest party never ends up with less than its fair balance,
+        // minus the fees it must pay to claim (two sweeps at 20k at most).
+        let fee_budget = 2 * 20_000 + 20_000; // claim/penalty fees + commitment fee
+        assert!(
+            honest_recovered + fee_budget >= honest_fair,
+            "seed {seed}: honest recovered {honest_recovered} < fair {honest_fair} (state {j} of {k})"
+        );
+    }
+}
+
+// --- Fee-tier selection, validated on chain ---------------------------------
+
+#[test]
+fn fee_tiers_are_signed_and_each_validates_on_chain() {
+    use std::collections::HashSet;
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    let _ = (&f, &a);
+
+    let mut funder_outputs = Vec::new();
+    for tier in FeeTier::ALL {
+        // A fresh force-close at each tier (reopen to stay in Open).
+        let dir2 = tmpdir();
+        let (mut f2, mut a2) = open_pair(&dir2);
+        pay(&mut f2, &mut a2, [CAP - 2_000_000, 2_000_000]);
+        let mut u = crate::utxo::UtxoSet::new();
+        u.insert(
+            f2.funding_outpoint().unwrap(),
+            crate::utxo::UtxoEntry { output: f2.funding_output(), height: 10, is_coinbase: false },
+        );
+        let tx = f2.force_close(tier).unwrap();
+        crate::validate::check_transaction(&tx, &u, NET, 11, &mut HashSet::new())
+            .expect("the commitment must validate as a 2-of-2 spend");
+        // The funder's own output falls as the tier (and fee) rises.
+        let funder_out = tx.outputs.iter()
+            .find(|o| o.scheme == crate::sig::SchemeId::Policy)
+            .map(|o| o.value.units())
+            .unwrap();
+        funder_outputs.push(funder_out);
+    }
+    assert!(
+        funder_outputs[0] > funder_outputs[1] && funder_outputs[1] > funder_outputs[2],
+        "higher tiers pay more fee from the funder's output: {funder_outputs:?}"
+    );
+}
+
+// --- Simultaneous-update tie-break ------------------------------------------
+
+#[test]
+fn simultaneous_updates_resolve_by_initiative() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    // Exactly one side holds the initiative.
+    assert_ne!(f.has_initiative(), a.has_initiative());
+    let funder_wins = f.has_initiative();
+    // The winner proposes first; the loser retries after. Driving them in that
+    // order yields a consistent two-state sequence. The two updates move the
+    // balance in opposite directions.
+    let step1 = [CAP - 1_000_000, 1_000_000];
+    let step2 = [CAP - 500_000, 500_000];
+    if funder_wins {
+        pay(&mut f, &mut a, step1); // funder proposes
+        pay(&mut a, &mut f, step2); // acceptor retries
+    } else {
+        // Acceptor holds the initiative: it proposes first.
+        pay(&mut a, &mut f, step1);
+        pay(&mut f, &mut a, step2);
+    }
+    assert_eq!(f.balances(), a.balances());
+    assert_eq!(f.balances(), step2);
+    assert_eq!(f.local_commit_number(), Some(2));
+}
+
+// --- Reestablish after each handshake/update message ------------------------
+
+#[test]
+fn reestablish_after_each_message_keeps_both_consistent() {
+    // Reconnect at the boundary after every message of the opening handshake
+    // and a couple of updates; the channel always resynchronizes.
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    for step in 0..4 {
+        // A payment, then a reconnection right after it completes.
+        let mut b = f.balances();
+        b[ACCEPTOR] += 300_000;
+        b[FUNDER] -= 300_000;
+        pay(&mut f, &mut a, b);
+        let (rf, ra) = exchange_reestablish(&mut f, &mut a);
+        assert!(rf.is_empty() && ra.is_empty(), "step {step}: spurious resends {rf:?} {ra:?}");
+        assert_eq!(f.balances(), a.balances());
+        assert_eq!(f.local_commit_number(), Some(step + 1));
+    }
 }

@@ -1204,6 +1204,12 @@ impl Machine {
     pub fn our_index(&self) -> usize {
         self.our_index
     }
+    /// Whether this side holds the initiative under the simultaneous-update
+    /// tie-break: the party whose funding-pubkey hash is smaller proposes, and
+    /// the other retries after its update lands.
+    pub fn has_initiative(&self) -> bool {
+        crate::channel::messages::initiative(&self.params.funding) == self.our_index
+    }
     pub fn balances(&self) -> Balances {
         self.current_balances()
     }
