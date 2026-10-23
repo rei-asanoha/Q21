@@ -1889,9 +1889,16 @@ impl Wallet {
     /// seed. Reconstructed identically on any reload of the same wallet.
     pub fn channel_key(&self, channel_index: u32) -> crate::channel::keys::ChannelKey {
         crate::channel::keys::ChannelKey::from_seed(&crate::channel::keys::funding_key_seed(
-            &self.seed,
+            &self.channel_seed(),
             channel_index,
         ))
+    }
+
+    /// A seed dedicated to this wallet's payment channels, derived from the
+    /// wallet seed without exposing it. The channel manager derives every
+    /// per-channel key from this.
+    pub fn channel_seed(&self) -> [u8; 32] {
+        tagged_hash_parts(tags::WALLET_SEED, &[&self.seed, b"channels"]).0
     }
 }
 
