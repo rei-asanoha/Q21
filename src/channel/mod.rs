@@ -17,6 +17,10 @@
 pub mod journal;
 pub mod keys;
 pub mod machine;
+/// The node's channel manager needs to construct signing keys, so it compiles
+/// only with the signing backend.
+#[cfg(feature = "mldsa")]
+pub mod manager;
 pub mod messages;
 pub mod txbuild;
 pub mod watcher;

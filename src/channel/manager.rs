@@ -1,0 +1,605 @@
+//! The node's channel manager: it owns the running [`Machine`]s, routes
+//! inbound messages to the right channel, drives the protocol, and persists
+//! through each channel's journal.
+//!
+//! # Framing
+//!
+//! A channel travels over the network as an opaque payload (see
+//! [`crate::wire::Message::Channel`]). This module gives that payload its
+//! structure: a 32-byte channel id, a one-byte kind, then a body. Two kinds are
+//! control frames the manager handles itself — `Hello` and `HelloBack`, which
+//! exchange the two parties' per-channel public keys before the funding policy
+//! (and thus the channel id) can exist — and one kind carries an engine
+//! [`crate::channel::messages::Message`] verbatim. Routing is by channel id,
+//! except the two control frames, which are routed by peer (one open in flight
+//! per peer).
+//!
+//! # Locking
+//!
+//! The manager holds its own mutex and never the node's chain lock. Signing and
+//! verification happen under the manager mutex only. Anything that touches the
+//! chain — building and broadcasting the funding transaction, broadcasting a
+//! cooperative close or a penalty — is delegated to hooks the node installs,
+//! which take the chain lock themselves, after the cryptography is done.
+
+use crate::address::Network;
+use crate::channel::keys::{funding_key_seed, ChannelKey, Signer, CHANNEL_SCHEME};
+use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
+use crate::channel::messages::Message as ChMsg;
+use crate::channel::watcher::{classify, Watch, WatchContext};
+use crate::hash::Hash256;
+use crate::ser::{Reader, Writer};
+use crate::sig;
+use crate::tx::{OutPoint, Transaction, TxOut};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+const KIND_ENGINE: u8 = 0;
+const KIND_HELLO: u8 = 1;
+const KIND_HELLO_BACK: u8 = 2;
+
+/// Fee reserved for a cooperative close, a penalty, or a sweep, in units.
+pub const CLOSE_FEE: u64 = 20_000;
+
+/// What the node must do for the manager when the chain is involved.
+pub struct Hooks {
+    /// Build, sign, reserve and broadcast the funding transaction paying
+    /// `funding_output`; return its outpoint. Takes the chain and wallet locks
+    /// itself.
+    pub fund: Box<dyn Fn(Hash256, TxOut) -> Result<OutPoint, String> + Send + Sync>,
+    /// Broadcast a transaction (cooperative close, penalty, sweep) through the
+    /// normal mempool and relay.
+    pub broadcast: Box<dyn Fn(&Transaction) -> Result<(), String> + Send + Sync>,
+    /// A fresh wallet address to receive swept or claimed funds.
+    pub sweep_address: Box<dyn Fn() -> Hash256 + Send + Sync>,
+}
+
+/// What handling one inbound frame produces.
+#[derive(Default)]
+pub struct Reaction {
+    /// Opaque payloads to send back to the peer (already framed).
+    pub frames: Vec<Vec<u8>>,
+    /// Misconduct points for a malformed or out-of-place frame.
+    pub penalize: u32,
+}
+
+/// A one-line summary of a channel, for the RPC.
+#[derive(Clone, Debug)]
+pub struct ChannelSummary {
+    pub channel_id: Hash256,
+    pub peer: u64,
+    pub phase: Phase,
+    pub capacity: u64,
+    pub local_balance: u64,
+    pub remote_balance: u64,
+    pub state_number: u64,
+    pub funding: Option<OutPoint>,
+}
+
+struct Chan {
+    machine: Machine,
+    peer: u64,
+    capacity: u64,
+    /// True while an update we proposed is still in flight.
+    in_flight: bool,
+}
+
+struct PendingFunder {
+    index: u32,
+    capacity: u64,
+    delay: u16,
+    depth: u16,
+}
+
+struct PendingAcceptor {
+    index: u32,
+    funder_pubkey: Vec<u8>,
+    capacity: u64,
+    delay: u16,
+    depth: u16,
+}
+
+struct Inner {
+    channels: HashMap<Hash256, Chan>,
+    pending_funder: HashMap<u64, PendingFunder>,
+    pending_acceptor: HashMap<u64, PendingAcceptor>,
+    next_index: u32,
+}
+
+pub struct ChannelManager {
+    network: Network,
+    base_fee_rate: u64,
+    wallet_seed: [u8; 32],
+    journal_dir: PathBuf,
+    default_delay: u16,
+    default_depth: u16,
+    hooks: Hooks,
+    inner: Mutex<Inner>,
+}
+
+fn write_frame(cid: Hash256, kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(33 + body.len());
+    w.bytes(cid.as_bytes());
+    w.u8(kind);
+    w.bytes(body);
+    w.finish()
+}
+
+impl ChannelManager {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        network: Network,
+        base_fee_rate: u64,
+        wallet_seed: [u8; 32],
+        journal_dir: PathBuf,
+        default_delay: u16,
+        default_depth: u16,
+        hooks: Hooks,
+    ) -> ChannelManager {
+        ChannelManager {
+            network,
+            base_fee_rate,
+            wallet_seed,
+            journal_dir,
+            default_delay,
+            default_depth,
+            hooks,
+            inner: Mutex::new(Inner {
+                channels: HashMap::new(),
+                pending_funder: HashMap::new(),
+                pending_acceptor: HashMap::new(),
+                next_index: 0,
+            }),
+        }
+    }
+
+    fn signer(&self, index: u32) -> Box<dyn Signer> {
+        Box::new(ChannelKey::from_seed(&funding_key_seed(
+            &self.wallet_seed,
+            index,
+        )))
+    }
+
+    fn journal_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.jrnl", cid.to_hex()))
+    }
+
+    // --- Operations the node/RPC initiate --------------------------------
+
+    /// Opens a channel to `peer` as funder, returning the control frame to
+    /// send. The funding policy — and thus the channel id — cannot exist until
+    /// the acceptor's key is known, so this first exchanges keys.
+    pub fn open(
+        &self,
+        peer: u64,
+        capacity: u64,
+        delay: Option<u16>,
+        depth: Option<u16>,
+    ) -> Result<Vec<u8>, String> {
+        let mut g = self.inner.lock().unwrap();
+        let index = g.next_index;
+        g.next_index += 1;
+        let delay = delay.unwrap_or(self.default_delay);
+        let depth = depth.unwrap_or(self.default_depth);
+        let our_pubkey = self.signer(index).pubkey().to_vec();
+        g.pending_funder.insert(
+            peer,
+            PendingFunder {
+                index,
+                capacity,
+                delay,
+                depth,
+            },
+        );
+        // Hello body: our funding pubkey, capacity, delay, depth.
+        let mut w = Writer::new();
+        w.var_bytes(&our_pubkey);
+        w.u64(capacity);
+        w.bytes(&delay.to_le_bytes());
+        w.bytes(&depth.to_le_bytes());
+        Ok(write_frame(Hash256::ZERO, KIND_HELLO, &w.finish()))
+    }
+
+    /// Makes a payment of `amount` to the peer on `cid`.
+    pub fn pay(&self, cid: Hash256, amount: u64) -> Result<Vec<u8>, String> {
+        let mut g = self.inner.lock().unwrap();
+        let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        if chan.machine.phase() != Phase::Open {
+            return Err("channel not open".into());
+        }
+        if chan.in_flight {
+            return Err("a payment is already in flight".into());
+        }
+        let us = chan.machine.our_index();
+        let mut bal = chan.machine.balances();
+        if bal[us] < amount {
+            return Err("insufficient channel balance".into());
+        }
+        bal[us] -= amount;
+        bal[1 - us] += amount;
+        let msg = chan.machine.propose(bal).map_err(err)?;
+        chan.in_flight = true;
+        Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
+    }
+
+    /// Proposes a cooperative close of `cid`.
+    pub fn close(&self, cid: Hash256) -> Result<Vec<u8>, String> {
+        let mut g = self.inner.lock().unwrap();
+        let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        let msg = chan.machine.propose_close(CLOSE_FEE).map_err(err)?;
+        Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
+    }
+
+    /// Signals that `cid`'s funding is buried to the agreed depth, returning
+    /// the `ready` frame to send.
+    pub fn funding_confirmed(&self, cid: Hash256) -> Result<Vec<u8>, String> {
+        let mut g = self.inner.lock().unwrap();
+        let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        let msg = chan.machine.funding_confirmed().map_err(err)?;
+        Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
+    }
+
+    /// The reestablish frames for every channel with `peer`, to send on
+    /// reconnection.
+    pub fn reestablish(&self, peer: u64) -> Vec<Vec<u8>> {
+        let g = self.inner.lock().unwrap();
+        g.channels
+            .values()
+            .filter(|c| c.peer == peer)
+            .filter_map(|c| {
+                c.machine
+                    .reestablish()
+                    .ok()
+                    .map(|m| write_frame(c.machine.channel_id(), KIND_ENGINE, &m.encode()))
+            })
+            .collect()
+    }
+
+    // --- Inbound ----------------------------------------------------------
+
+    /// Handles one inbound frame from `peer`.
+    pub fn deliver(&self, peer: u64, bytes: &[u8]) -> Reaction {
+        match self.deliver_inner(peer, bytes) {
+            Ok(frames) => Reaction {
+                frames,
+                penalize: 0,
+            },
+            Err(_) => Reaction {
+                frames: Vec::new(),
+                penalize: crate::net::MISCONDUCT_CHANNEL,
+            },
+        }
+    }
+
+    fn deliver_inner(&self, peer: u64, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        if bytes.len() < 33 {
+            return Err("short frame".into());
+        }
+        let mut r = Reader::new(bytes);
+        let cid = Hash256(r.array32().map_err(|_| "cid")?);
+        let kind = r.u8().map_err(|_| "kind")?;
+        let body = &bytes[33..];
+        match kind {
+            KIND_HELLO => self.on_hello(peer, body),
+            KIND_HELLO_BACK => self.on_hello_back(peer, body),
+            KIND_ENGINE => {
+                let msg = ChMsg::decode(body).map_err(|_| "bad engine message")?;
+                self.on_engine(peer, cid, msg)
+            }
+            _ => Err("unknown frame kind".into()),
+        }
+    }
+
+    fn on_hello(&self, peer: u64, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        let mut r = Reader::new(body);
+        let funder_pubkey = r.var_bytes().map_err(|_| "pubkey")?.to_vec();
+        if funder_pubkey.len() != CHANNEL_SCHEME.pubkey_len() {
+            return Err("pubkey length".into());
+        }
+        let capacity = r.u64().map_err(|_| "capacity")?;
+        let delay = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
+        let depth = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
+        let mut g = self.inner.lock().unwrap();
+        let index = g.next_index;
+        g.next_index += 1;
+        let our_pubkey = self.signer(index).pubkey().to_vec();
+        g.pending_acceptor.insert(
+            peer,
+            PendingAcceptor {
+                index,
+                funder_pubkey,
+                capacity,
+                delay,
+                depth,
+            },
+        );
+        let mut w = Writer::new();
+        w.var_bytes(&our_pubkey);
+        Ok(vec![write_frame(
+            Hash256::ZERO,
+            KIND_HELLO_BACK,
+            &w.finish(),
+        )])
+    }
+
+    fn on_hello_back(&self, peer: u64, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        let mut r = Reader::new(body);
+        let acceptor_pubkey = r.var_bytes().map_err(|_| "pubkey")?.to_vec();
+        if acceptor_pubkey.len() != CHANNEL_SCHEME.pubkey_len() {
+            return Err("pubkey length".into());
+        }
+        let mut g = self.inner.lock().unwrap();
+        let pending = g.pending_funder.remove(&peer).ok_or("no pending open")?;
+        let signer = self.signer(pending.index);
+        let funding = [
+            signer.pubkey_hash(),
+            sig::pubkey_hash(CHANNEL_SCHEME, &acceptor_pubkey),
+        ];
+        let cid = channel_id(&funding);
+        let (machine, open) = Machine::new_funder(
+            self.journal_path(cid),
+            self.network,
+            signer,
+            acceptor_pubkey,
+            pending.capacity,
+            pending.delay,
+            pending.depth,
+            self.base_fee_rate,
+        )
+        .map_err(err)?;
+        g.channels.insert(
+            cid,
+            Chan {
+                machine,
+                peer,
+                capacity: pending.capacity,
+                in_flight: false,
+            },
+        );
+        Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
+    }
+
+    fn on_engine(&self, peer: u64, cid: Hash256, msg: ChMsg) -> Result<Vec<Vec<u8>>, String> {
+        // The acceptor's first engine message is the funder's Open: build the
+        // channel from the pending acceptor state.
+        if matches!(msg, ChMsg::Open { .. }) {
+            return self.accept_open(peer, cid, msg);
+        }
+        let mut g = self.inner.lock().unwrap();
+        let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        let mut out = Vec::new();
+        match msg {
+            ChMsg::Accept { .. } => {
+                chan.machine.on_accept(&msg).map_err(err)?;
+                // Funder builds and broadcasts the funding transaction, then
+                // tells the acceptor the outpoint.
+                let funding_output = chan.machine.funding_output();
+                drop(g); // the fund hook takes the chain lock
+                let outpoint = (self.hooks.fund)(cid, funding_output)?;
+                let mut g = self.inner.lock().unwrap();
+                let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+                let m = chan.machine.funding_created(outpoint).map_err(err)?;
+                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+            }
+            ChMsg::Funding { .. } => {
+                let m = chan.machine.on_funding(&msg).map_err(err)?;
+                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+            }
+            ChMsg::FundingSigned { .. } => {
+                chan.machine.on_funding_signed(&msg).map_err(err)?;
+            }
+            ChMsg::Ready => {
+                chan.machine.on_ready(&msg).map_err(err)?;
+            }
+            ChMsg::Update { .. } => {
+                let m = chan.machine.on_update(&msg).map_err(err)?;
+                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+            }
+            ChMsg::Ack { .. } => {
+                let m = chan.machine.on_ack(&msg).map_err(err)?;
+                chan.in_flight = false;
+                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+            }
+            ChMsg::Revoke { .. } => {
+                chan.machine.on_revoke(&msg).map_err(err)?;
+            }
+            ChMsg::Close { .. } => {
+                let m = chan.machine.on_close(&msg).map_err(err)?;
+                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+            }
+            ChMsg::CloseSigned { .. } => {
+                let tx = chan.machine.on_close_signed(&msg).map_err(err)?;
+                drop(g);
+                (self.hooks.broadcast)(&tx)?;
+            }
+            ChMsg::Reestablish { .. } => {
+                let frames = chan.machine.on_reestablish(&msg).map_err(err)?;
+                for f in frames {
+                    out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
+                }
+            }
+            ChMsg::Error { .. } | ChMsg::Open { .. } => {}
+        }
+        Ok(out)
+    }
+
+    fn accept_open(&self, peer: u64, cid: Hash256, open: ChMsg) -> Result<Vec<Vec<u8>>, String> {
+        let mut g = self.inner.lock().unwrap();
+        let pending = g
+            .pending_acceptor
+            .remove(&peer)
+            .ok_or("no pending accept")?;
+        // The engine Open must match what the Hello promised: same funder key
+        // and same terms, or the peer changed its mind mid-handshake.
+        if let ChMsg::Open {
+            capacity,
+            delay,
+            funding_depth,
+            funder_pubkey,
+            ..
+        } = &open
+        {
+            if *funder_pubkey != pending.funder_pubkey
+                || *capacity != pending.capacity
+                || *delay != pending.delay
+                || *funding_depth != pending.depth
+            {
+                return Err("open does not match hello".into());
+            }
+        }
+        let signer = self.signer(pending.index);
+        let (machine, accept) = Machine::accept(
+            self.journal_path(cid),
+            self.network,
+            signer,
+            self.base_fee_rate,
+            &open,
+        )
+        .map_err(err)?;
+        if machine.channel_id() != cid {
+            return Err("channel id mismatch".into());
+        }
+        g.channels.insert(
+            cid,
+            Chan {
+                machine,
+                peer,
+                capacity: pending.capacity,
+                in_flight: false,
+            },
+        );
+        Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
+    }
+
+    // --- Watcher ----------------------------------------------------------
+
+    /// Examines a transaction that spends a channel's funding output and, if it
+    /// is a revoked broadcast, broadcasts the penalty; if it is our own, leaves
+    /// the delayed sweep to be scheduled; if it is the counterparty's latest,
+    /// notes the `to_remote`. Returns the penalty/claim transaction broadcast,
+    /// if any.
+    pub fn on_funding_spend(&self, cid: Hash256, tx: &Transaction) -> Option<Transaction> {
+        let mut g = self.inner.lock().unwrap();
+        let chan = g.channels.get_mut(&cid)?;
+        let funding = chan.machine.funding_outpoint()?;
+        let latest = chan.machine.local_commit_number().unwrap_or(0);
+        let decision = {
+            let ctx = WatchContext {
+                params: chan.machine.params(),
+                our_index: chan.machine.our_index(),
+                store: chan.machine.revocation_store(),
+                latest_state: latest,
+            };
+            classify(&ctx, funding, tx)
+        };
+        let sweep_to = (self.hooks.sweep_address)();
+        match decision {
+            Watch::RevokedByPeer { .. } => {
+                let penalty = chan
+                    .machine
+                    .build_penalty(&decision, sweep_to, CLOSE_FEE)
+                    .ok()?;
+                let _ = (self.hooks.broadcast)(&penalty);
+                Some(penalty)
+            }
+            Watch::PeerLatest {
+                to_remote: Some(to_remote),
+                ..
+            } => {
+                let claim = chan
+                    .machine
+                    .build_to_remote_claim(&to_remote, sweep_to, CLOSE_FEE);
+                let _ = (self.hooks.broadcast)(&claim);
+                Some(claim)
+            }
+            // Our own commitment: the delayed sweep is scheduled by the caller
+            // once the delay has elapsed; nothing to broadcast now.
+            _ => None,
+        }
+    }
+
+    /// The funding outpoints this manager is watching, with their channel ids.
+    pub fn watched_funding(&self) -> Vec<(Hash256, OutPoint)> {
+        let g = self.inner.lock().unwrap();
+        g.channels
+            .values()
+            .filter_map(|c| {
+                c.machine
+                    .funding_outpoint()
+                    .map(|o| (c.machine.channel_id(), o))
+            })
+            .collect()
+    }
+
+    // --- RPC views --------------------------------------------------------
+
+    pub fn list(&self) -> Vec<ChannelSummary> {
+        let g = self.inner.lock().unwrap();
+        g.channels.values().map(summary).collect()
+    }
+
+    pub fn info(&self, cid: Hash256) -> Option<ChannelSummary> {
+        let g = self.inner.lock().unwrap();
+        g.channels.get(&cid).map(summary)
+    }
+
+    /// A fully-signed commitment at state `n`, for exercising the watcher with
+    /// a (possibly revoked) broadcast. An audit hook, never a production path.
+    #[cfg(feature = "audit")]
+    pub fn signed_commitment(&self, cid: Hash256, n: u64) -> Option<Transaction> {
+        let g = self.inner.lock().unwrap();
+        g.channels.get(&cid).and_then(|c| {
+            c.machine
+                .signed_commitment_at(n, crate::channel::txbuild::FeeTier::Low)
+                .ok()
+        })
+    }
+
+    /// The channel id of the (single) channel with `peer`, if any — used by the
+    /// RPC to let an agent name a peer instead of a channel id when
+    /// unambiguous.
+    pub fn channel_with_peer(&self, peer: u64) -> Option<Hash256> {
+        let g = self.inner.lock().unwrap();
+        let mut found = None;
+        for c in g.channels.values() {
+            if c.peer == peer {
+                if found.is_some() {
+                    return None; // ambiguous
+                }
+                found = Some(c.machine.channel_id());
+            }
+        }
+        found
+    }
+}
+
+fn summary(c: &Chan) -> ChannelSummary {
+    let bal = c.machine.balances();
+    let us = c.machine.our_index();
+    ChannelSummary {
+        channel_id: c.machine.channel_id(),
+        peer: c.peer,
+        phase: c.machine.phase(),
+        capacity: c.capacity,
+        local_balance: bal[us],
+        remote_balance: bal[1 - us],
+        state_number: c.machine.local_commit_number().unwrap_or(0),
+        funding: c.machine.funding_outpoint(),
+    }
+}
+
+fn err(e: ChannelError) -> String {
+    format!("{e:?}")
+}
+
+/// Adapter so the node's [`crate::net::ChannelSink`] can drive the manager.
+impl crate::net::ChannelSink for ChannelManager {
+    fn deliver(&self, peer: u64, bytes: &[u8]) -> crate::net::ChannelOutcome {
+        let r = ChannelManager::deliver(self, peer, bytes);
+        crate::net::ChannelOutcome {
+            replies: r.frames,
+            penalize: r.penalize,
+        }
+    }
+}

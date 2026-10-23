@@ -35,7 +35,7 @@ pub fn funding_key_seed(wallet_seed: &[u8; 32], channel_index: u32) -> [u8; 32] 
 ///
 /// A blanket [`Self::pubkey_hash`] ties the key to its scheme the one way the
 /// rest of the protocol does ([`sig::pubkey_hash`]).
-pub trait Signer {
+pub trait Signer: Send + Sync {
     /// The public key, `CHANNEL_SCHEME.pubkey_len()` bytes.
     fn pubkey(&self) -> &[u8];
 
