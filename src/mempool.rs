@@ -475,6 +475,27 @@ impl Mempool {
             }
         }
 
+        // --- The newcomer's own in-pool ancestors, which making room must
+        // never evict.
+        //
+        // Room is made **before** the newcomer is linked to its parents below.
+        // A parent that is still a childless leaf is therefore a candidate for
+        // eviction at that moment: evicting it to seat its own child left the
+        // child spending an output that no longer exists, and the next block
+        // template was invalid (MissingInput). We collect the transitive set
+        // of ancestors here and shield them — and, since a package is rooted at
+        // one of them only if that root is itself an ancestor, shielding the
+        // ancestors shields every package that would carry one away.
+        let mut protected: HashSet<Hash256> = HashSet::new();
+        let mut todo: Vec<Hash256> = parents.clone();
+        while let Some(id) = todo.pop() {
+            if self.entries.contains_key(&id) && protected.insert(id) {
+                if let Some(ps) = self.parents.get(&id) {
+                    todo.extend(ps.iter().copied());
+                }
+            }
+        }
+
         // --- Abuse: occupying the pool with what can never be mined.
         //
         // A transaction heavier than a whole block used to be accepted, then
@@ -516,7 +537,9 @@ impl Mempool {
         // A full pool that this rate cannot get into is said before any
         // signature is checked: while the pool was full, every refused
         // transaction cost a post-quantum verification for nothing.
-        if self.bytes + size > self.capacity() && self.room_for(announced_rate, size).is_none() {
+        if self.bytes + size > self.capacity()
+            && self.room_for(announced_rate, size, &protected).is_none()
+        {
             return Err(MempoolError::FullAndUnderpaid);
         }
 
@@ -544,7 +567,7 @@ impl Mempool {
         }
 
         // --- Abuse: saturating the node's memory.
-        if self.bytes + size > self.capacity() && !self.make_room(rate, size) {
+        if self.bytes + size > self.capacity() && !self.make_room(rate, size, &protected) {
             return Err(MempoolError::FullAndUnderpaid);
         }
 
@@ -631,13 +654,26 @@ impl Mempool {
     /// The node's own wallet transactions are never in either pass. The work
     /// is bounded: [`PACKAGE_CANDIDATES`] packages of at most
     /// [`PACKAGE_MAX`] transactions are examined.
-    fn room_for(&self, rate: u64, size: usize) -> Option<Vec<Hash256>> {
+    ///
+    /// `protected` holds transactions that must never be pushed out — the
+    /// newcomer's own in-pool ancestors — and nothing rooted at one of them is
+    /// pushed out either (a package root carrying a protected member would
+    /// itself be a protected ancestor).
+    fn room_for(
+        &self,
+        rate: u64,
+        size: usize,
+        protected: &HashSet<Hash256>,
+    ) -> Option<Vec<Hash256>> {
         let need = (self.bytes + size).saturating_sub(self.capacity());
         let mut freed = 0usize;
         let mut out = Vec::new();
         for (r, _, id) in &self.evictable {
             if freed >= need || r.saturating_add(INCREMENTAL_FEE_RATE) > rate {
                 break;
+            }
+            if protected.contains(id) {
+                continue;
             }
             freed += self.entries[id].size;
             out.push(*id);
@@ -652,6 +688,7 @@ impl Mempool {
             .iter()
             .filter(|(id, e)| {
                 !e.local
+                    && !protected.contains(*id)
                     && self.children.get(*id).is_some_and(|v| !v.is_empty())
                     && e.fee_rate().saturating_add(INCREMENTAL_FEE_RATE) <= rate
             })
@@ -724,8 +761,8 @@ impl Mempool {
     /// Returns `false` if the newcomer does not pay enough more than what
     /// would have to be sacrificed: it is then refused rather than making the
     /// mempool poorer. See [`Mempool::room_for`].
-    fn make_room(&mut self, incoming_rate: u64, size: usize) -> bool {
-        let Some(to_evict) = self.room_for(incoming_rate, size) else {
+    fn make_room(&mut self, incoming_rate: u64, size: usize, protected: &HashSet<Hash256>) -> bool {
+        let Some(to_evict) = self.room_for(incoming_rate, size, protected) else {
             return false;
         };
         for id in to_evict {
@@ -2352,6 +2389,94 @@ mod tests_chains {
         m.return_abandoned(&[b], &c.utxo, NETWORK, c.height());
         assert!(m.entries[&id].local);
         check_evictable(&m);
+    }
+
+    /// At a full pool, a child never makes room by evicting the very parent it
+    /// depends on: the parent is the cheapest childless leaf, and room is made
+    /// before the child is linked to it.
+    ///
+    /// Before the fix, the parent was pushed out and the child then spent an
+    /// output that no longer existed, so the next block template was invalid
+    /// (MissingInput).
+    #[test]
+    fn a_newcomer_never_evicts_its_own_ancestor() {
+        let (mut single, _, c) = two_wallets();
+        let probe = Mempool::new();
+        let parent = spend_with_pending(&mut single, &c, &probe, 1_000);
+        let psize = parent.encode().len();
+        // Room for the parent alone.
+        let mut m = Mempool::with_capacity(psize + psize / 2);
+        let pid = m.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        // The child pays clearly more than its parent: without the fix, the
+        // margin would not save the parent — the richer child would push it
+        // out and then spend an output that no longer exists.
+        let child = spend_with_pending(&mut single, &c, &m, 40_000);
+        assert_eq!(
+            child.inputs[0].prev_out.txid, pid,
+            "the child spends the parent's change"
+        );
+        assert_eq!(
+            m.accept(&child, &c.utxo, NETWORK, c.height()),
+            Err(MempoolError::FullAndUnderpaid),
+            "the child cannot get in by evicting the only output it spends"
+        );
+        assert!(m.contains(&pid), "the parent stays");
+        assert_eq!(m.len(), 1);
+        check_evictable(&m);
+    }
+
+    /// With a cheap unrelated entry present, the newcomer evicts that stranger
+    /// rather than its own parent, and the template holds the parent then the
+    /// child.
+    #[test]
+    fn a_newcomer_evicts_a_stranger_before_its_own_ancestor() {
+        // `single` holds one coin, so its child is forced to spend its
+        // parent's change (a true in-pool ancestor); `many` funds the cheap
+        // stranger from one of its larger coins.
+        let (mut single, mut many, c) = two_wallets();
+        // Sizes learned on a probe pool, then replayed into a bounded one.
+        let mut probe = Mempool::new();
+        let parent = spend_with_pending(&mut single, &c, &probe, 1_000);
+        probe.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        let child = spend_with_pending(&mut single, &c, &probe, 40_000);
+        assert_eq!(
+            child.inputs[0].prev_out.txid,
+            parent.txid(),
+            "the child spends the parent's change"
+        );
+        let stranger = spend_with_pending(&mut many, &c, &probe, 1_000);
+        let (psize, ssize, csize) = (
+            parent.encode().len(),
+            stranger.encode().len(),
+            child.encode().len(),
+        );
+
+        // The stranger arrives first, the parent last: at equal fee rate the
+        // most recent leaf is the one eviction would take, so without the fix
+        // the parent — not the stranger — would be the one pushed out.
+        let mut m = Mempool::with_capacity(psize + ssize + csize / 2);
+        let sid = m.accept(&stranger, &c.utxo, NETWORK, c.height()).unwrap();
+        let pid = m.accept(&parent, &c.utxo, NETWORK, c.height()).unwrap();
+        check_evictable(&m);
+        let cid = m
+            .accept(&child, &c.utxo, NETWORK, c.height())
+            .expect("the stranger makes room, not the parent");
+        assert!(m.contains(&pid), "the parent stays");
+        assert!(m.contains(&cid), "the child gets in");
+        assert!(!m.contains(&sid), "the cheap stranger is evicted instead");
+        assert!(m.bytes() <= m.capacity(), "the pool stays within bounds");
+        check_evictable(&m);
+
+        let template: Vec<Hash256> = m
+            .select_for_block(u64::MAX)
+            .iter()
+            .map(|t| t.txid())
+            .collect();
+        assert_eq!(
+            template,
+            vec![pid, cid],
+            "parent then child, a valid template"
+        );
     }
 
     /// A child that arrives before its parent waits for it, and goes in the
