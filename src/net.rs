@@ -969,6 +969,12 @@ struct Shared {
     /// soon as their parent is connected. Bounded, and only for bodies this
     /// node asked for.
     parked: Vec<(u64, Box<CompactBlock>)>,
+    /// True once a payment-channel service is installed; gates the collection
+    /// below so a node without channels pays nothing.
+    channels_active: bool,
+    /// Transactions of blocks connected since the last drain, for the channel
+    /// watcher to scan off the chain lock. Only filled when `channels_active`.
+    channel_scan: Vec<crate::tx::Transaction>,
 }
 
 /// How many requested compact blocks may wait for their parent. Two batches
@@ -1158,6 +1164,8 @@ impl Node {
                 journal: None,
                 snapshot_cache: None,
                 parked: Vec::new(),
+                channels_active: false,
+                channel_scan: Vec::new(),
             })),
             magic: magic_for(network),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -1178,6 +1186,7 @@ impl Node {
         if let Ok(mut g) = self.channel_sink.write() {
             *g = Some(sink);
         }
+        self.shared.lock().unwrap().channels_active = true;
     }
 
     /// Whether this node speaks the channel protocol (a sink is installed).
@@ -1216,6 +1225,28 @@ impl Node {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Drains the transactions of blocks connected since the last call and
+    /// hands them to the channel watcher, off the chain lock. Called after
+    /// handling a message and usable by a startup rescan.
+    pub fn scan_connected_blocks_for_channels(&self) {
+        let sink = self
+            .channel_sink
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned());
+        let Some(sink) = sink else {
+            self.shared.lock().unwrap().channel_scan.clear();
+            return;
+        };
+        let txs = {
+            let mut g = self.shared.lock().unwrap();
+            std::mem::take(&mut g.channel_scan)
+        };
+        if !txs.is_empty() {
+            sink.on_block(&txs);
         }
     }
 
@@ -3358,6 +3389,10 @@ impl Node {
                 }
             }
         }
+        // Blocks connected during this handler are scanned by the channel
+        // watcher here, off the chain lock, so a penalty or sweep may be built
+        // and broadcast without holding it.
+        self.scan_connected_blocks_for_channels();
 
         for e in outgoing {
             let writer = {
@@ -3656,6 +3691,12 @@ impl Node {
                     j.record(b);
                 }
                 g.mempool.on_block_connected(b);
+                // A connected block: hand its transactions to the channel
+                // watcher, which scans them for a spend of a funding output
+                // after the lock is released.
+                if g.channels_active {
+                    g.channel_scan.extend(b.transactions.iter().cloned());
+                }
                 let height = g.chain.height();
                 // A reorganization: the transactions of the abandoned blocks
                 // go back to the pool, those the winning branch does not
@@ -5028,6 +5069,46 @@ mod tests_hardening {
             c.mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
         })
         .expect("regtest mining")
+    }
+
+    /// A sink that records the blocks and transactions handed to its watcher.
+    struct BlockRecorder {
+        blocks: AtomicU64,
+        txs: AtomicU64,
+    }
+
+    impl ChannelSink for BlockRecorder {
+        fn deliver(&self, _peer: u64, _bytes: &[u8]) -> ChannelOutcome {
+            ChannelOutcome::default()
+        }
+        fn on_block(&self, txs: &[crate::tx::Transaction]) {
+            self.blocks.fetch_add(1, Ordering::SeqCst);
+            self.txs.fetch_add(txs.len() as u64, Ordering::SeqCst);
+        }
+    }
+
+    /// A block connected through the node reaches the channel watcher, off the
+    /// chain lock — the hook that lets it punish a revoked broadcast.
+    #[test]
+    fn a_connected_block_reaches_the_channel_watcher() {
+        let (a, b) = node_pair();
+        let rec = Arc::new(BlockRecorder {
+            blocks: AtomicU64::new(0),
+            txs: AtomicU64::new(0),
+        });
+        b.set_channel_sink(rec.clone());
+        let _e = established_peer(&b, 7);
+        let block = next_block(&a);
+        assert!(b.handle(7, Message::Block(Box::new(block))));
+        assert_eq!(b.height(), 1, "the block was connected");
+        assert!(
+            rec.blocks.load(Ordering::SeqCst) >= 1,
+            "the watcher must see the connected block"
+        );
+        assert!(
+            rec.txs.load(Ordering::SeqCst) >= 1,
+            "the coinbase transaction must reach it"
+        );
     }
 
     fn memo(n: &Node) -> std::sync::Arc<crate::pow::WorkMemo> {
