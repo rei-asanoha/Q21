@@ -258,7 +258,28 @@ pub enum Message {
         index: u32,
         data: Vec<u8>,
     },
+    /// A payment-channel message ([`crate::channel::messages::Message`]), carried
+    /// opaquely. The payload is that message's own canonical encoding; this
+    /// layer only bounds it. It is sent only to a peer that advertised the
+    /// channel capability (see [`user_agent_advertises_channels`]), so a node
+    /// that does not understand it never receives one.
+    Channel(Vec<u8>),
 }
+
+/// Capability token a node appends to its user agent to advertise that it
+/// speaks the payment-channel protocol. A peer that does not carry it in its
+/// `Version` never receives a [`Message::Channel`]; an older node simply reads
+/// a slightly longer, still-bounded user-agent string and is untouched.
+pub const CHANNELS_CAPABILITY: &str = "+chan";
+
+/// Does this user agent advertise the channel capability?
+pub fn user_agent_advertises_channels(user_agent: &str) -> bool {
+    user_agent.contains(CHANNELS_CAPABILITY)
+}
+
+/// Largest channel message accepted on the wire. The heaviest is the funding
+/// message (its three tier signatures), well under this bound.
+pub const MAX_CHANNEL_MSG: usize = 16 * 1024;
 
 impl Message {
     pub fn command(&self) -> &'static str {
@@ -284,6 +305,7 @@ impl Message {
             Message::SnapshotInfo { .. } => "snapshotinfo",
             Message::GetSnapshotChunk { .. } => "getsnapchunk",
             Message::SnapshotChunk { .. } => "snapchunk",
+            Message::Channel(_) => "channel",
         }
     }
 
@@ -390,6 +412,11 @@ impl Message {
             Message::SnapshotChunk { index, data } => {
                 w.u32(*index);
                 w.var_bytes(data);
+            }
+            // The payload is the channel message's own encoding, verbatim; the
+            // frame length already bounds it.
+            Message::Channel(bytes) => {
+                w.bytes(bytes);
             }
         }
         w.finish()
@@ -674,6 +701,15 @@ impl Message {
                 r.expect_end()?;
                 Message::SnapshotChunk { index, data }
             }
+            "channel" => {
+                if data.len() > MAX_CHANNEL_MSG {
+                    return Err(WireError::TooManyElements {
+                        max: MAX_CHANNEL_MSG,
+                        received: data.len(),
+                    });
+                }
+                Message::Channel(data.to_vec())
+            }
             other => return Err(WireError::UnknownCommand(other.to_string())),
         };
         Ok(m)
@@ -794,6 +830,30 @@ mod tests {
             height: 42,
             nonce: 7,
         }
+    }
+
+    #[test]
+    fn channel_message_round_trips_and_is_bounded() {
+        round_trip(Message::Channel(vec![1, 2, 3, 4, 5]));
+        round_trip(Message::Channel(Vec::new()));
+        // At the bound: still accepted.
+        round_trip(Message::Channel(vec![7u8; MAX_CHANNEL_MSG]));
+        // One byte over the bound: refused, not decoded.
+        let framed = Message::Channel(vec![7u8; MAX_CHANNEL_MSG + 1]).frame(MAGIC);
+        assert!(matches!(
+            Message::parse(&framed, MAGIC),
+            Err(WireError::TooManyElements { .. })
+        ));
+    }
+
+    #[test]
+    fn the_capability_token_reads_back() {
+        assert!(user_agent_advertises_channels(&format!(
+            "q21:0.4{CHANNELS_CAPABILITY}"
+        )));
+        // A plain 0.4.9 user agent does not advertise it.
+        assert!(!user_agent_advertises_channels("q21:0.4"));
+        assert!(!user_agent_advertises_channels("q21:0.3"));
     }
 
     #[test]

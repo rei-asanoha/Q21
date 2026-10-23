@@ -1609,6 +1609,52 @@ impl Wallet {
         self.finish_prepare(chosen, outputs, height)
     }
 
+    /// Builds and reserves an unsigned transaction funding a payment channel:
+    /// it pays `funding_output` (a 2-of-2 policy output) and returns the change
+    /// to a fresh address, selecting coins to cover the capacity plus `fee`.
+    /// The caller signs it with [`Self::sign_spend`] and broadcasts it like any
+    /// other transaction; the chosen coins are reserved, so the wallet will not
+    /// pick them for a concurrent send.
+    pub fn prepare_funding(
+        &mut self,
+        utxo: &UtxoSet,
+        height: u64,
+        funding_output: TxOut,
+        fee: Amount,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+        pending: &[(OutPoint, TxOut)],
+    ) -> Result<PreparedSpend, WalletError> {
+        if !self.scheme.is_available() {
+            return Err(WalletError::UnsupportedScheme(self.scheme));
+        }
+        let value = funding_output.value.units();
+        if value < crate::consensus::MIN_OUTPUT_VALUE {
+            return Err(WalletError::AmountBelowFloor {
+                minimum: crate::consensus::MIN_OUTPUT_VALUE,
+                received: value,
+            });
+        }
+        if fee.units() > crate::consensus::MAX_SUPPLY {
+            return Err(WalletError::AmountOutOfRange);
+        }
+        let needed = value
+            .checked_add(fee.units())
+            .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
+            .ok_or(WalletError::AmountOutOfRange)?;
+        let (chosen, total) = self.select_coins_avoiding(utxo, height, needed, avoid, pending)?;
+        let mut outputs = vec![funding_output];
+        let change = total - needed;
+        if change >= crate::consensus::MIN_OUTPUT_VALUE {
+            let change_address = self.new_address();
+            outputs.push(TxOut {
+                value: Amount::from_units(change),
+                scheme: change_address.scheme,
+                pubkey_hash: change_address.hash,
+            });
+        }
+        self.finish_prepare(chosen, outputs, height)
+    }
+
     /// The part of a prepared spend that does not depend on how the coins
     /// were chosen: the stripped transaction, the key barrier, the
     /// reservation.

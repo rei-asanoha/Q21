@@ -413,6 +413,16 @@ pub const FLOOD_INPUT_THRESHOLD: u64 = 16;
 /// one peer can impose to about five milliseconds of verification a second.
 pub const TX_RATE_PER_SEC: u64 = 16;
 
+/// Per-peer budget for payment-channel messages (one unit each): a burst, then
+/// a steady rate. A channel update is at most three messages, so this is ample
+/// for an active channel and still bounds a flood to a trickle.
+pub const CHAN_BUCKET_MAX: u64 = 64;
+pub const CHAN_RATE_PER_SEC: u64 = 16;
+
+/// A malformed, oversized, or unsolicited channel message is misconduct of the
+/// same order as a bad transaction.
+pub const MISCONDUCT_CHANNEL: u32 = 20;
+
 /// Inputs announced at most when the pool is offered to a peer, at the
 /// handshake and every [`MEMPOOL_REBROADCAST`] (see
 /// [`crate::mempool::Mempool::announcement`]).
@@ -519,6 +529,14 @@ impl TokenBucket {
     pub fn for_compact_announcements(now: Instant) -> TokenBucket {
         TokenBucket {
             tokens: CMPCT_BUCKET_MAX,
+            last: now,
+        }
+    }
+
+    /// A channel-message bucket: same rule, one unit per message.
+    pub fn for_channel_messages(now: Instant) -> TokenBucket {
+        TokenBucket {
+            tokens: CHAN_BUCKET_MAX,
             last: now,
         }
     }
@@ -647,6 +665,13 @@ struct Peer {
     version_sent: bool,
     handshaked: bool,
     ban_score: u32,
+    /// The peer's advertised user agent, kept to read its capabilities.
+    user_agent: String,
+    /// True if the peer advertised the payment-channel capability in its
+    /// `Version`. A peer that did not must never receive a channel message.
+    channels: bool,
+    /// Per-peer budget for channel messages. See [`CHAN_BUCKET_MAX`].
+    chan_bucket: TokenBucket,
     /// Height announced by the peer at the handshake.
     start_height: u64,
     /// Compact block reconstructions waiting for transactions.
@@ -1000,6 +1025,24 @@ struct Outgoing {
     message: Message,
 }
 
+/// What a payment-channel component plugs into the node through. The node hands
+/// it the bytes of an inbound channel message and the peer they came from, and
+/// it returns the replies to send back (opaque bytes, each re-wrapped in a
+/// [`Message::Channel`]) and a misconduct score for a malformed one. The node
+/// calls it off the chain lock, so the component may do cryptography freely.
+pub trait ChannelSink: Send + Sync {
+    fn deliver(&self, peer: u64, bytes: &[u8]) -> ChannelOutcome;
+}
+
+/// The result of handing a channel message to the [`ChannelSink`].
+#[derive(Default)]
+pub struct ChannelOutcome {
+    /// Opaque channel-message payloads to send back to the same peer.
+    pub replies: Vec<Vec<u8>>,
+    /// Misconduct points for a malformed or unsolicited message; zero is none.
+    pub penalize: u32,
+}
+
 #[derive(Clone)]
 pub struct Node {
     shared: Arc<Mutex<Shared>>,
@@ -1017,6 +1060,11 @@ pub struct Node {
     /// link to one of them can make a later link to the same node redundant:
     /// see the `Version` arm.
     configured: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
+    /// The payment-channel component, when this node runs channels (regtest).
+    /// Its presence is what makes the node advertise the channel capability and
+    /// accept channel messages; without it, channel frames are never sent and a
+    /// received one is ignored.
+    channel_sink: Arc<std::sync::RwLock<Option<Arc<dyn ChannelSink>>>>,
 }
 
 #[derive(Default, Debug)]
@@ -1113,7 +1161,67 @@ impl Node {
             proxy: Arc::new(std::sync::RwLock::new(None)),
             own_onion: Arc::new(std::sync::RwLock::new(None)),
             configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            channel_sink: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Installs the payment-channel component. From then on this node
+    /// advertises the channel capability in its handshake and routes inbound
+    /// channel messages to `sink`. Meant for regtest, where channels are
+    /// active; the caller gates on the network.
+    pub fn set_channel_sink(&self, sink: Arc<dyn ChannelSink>) {
+        if let Ok(mut g) = self.channel_sink.write() {
+            *g = Some(sink);
+        }
+    }
+
+    /// Whether this node speaks the channel protocol (a sink is installed).
+    pub fn channels_enabled(&self) -> bool {
+        self.channel_sink
+            .read()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Our user agent, carrying the channel capability token when enabled.
+    fn user_agent(&self) -> String {
+        if self.channels_enabled() {
+            format!("q21:0.4{}", crate::wire::CHANNELS_CAPABILITY)
+        } else {
+            "q21:0.4".into()
+        }
+    }
+
+    /// Sends a channel message to `peer`, but only if that peer advertised the
+    /// channel capability. Returns false if the peer is unknown or did not
+    /// advertise it — so a node that does not speak the protocol is never sent
+    /// one.
+    pub fn send_channel(&self, peer: u64, payload: Vec<u8>) -> bool {
+        let writer = {
+            let g = self.shared.lock().unwrap();
+            match g.peers.get(&peer) {
+                Some(p) if p.handshaked && p.channels => Some(p.writer.clone()),
+                _ => None,
+            }
+        };
+        match writer {
+            Some(w) => {
+                let frame = frame_of(&Message::Channel(payload), self.magic);
+                self.queue(&w, frame);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The peers that advertised the channel capability, by id.
+    pub fn channel_peers(&self) -> Vec<u64> {
+        let g = self.shared.lock().unwrap();
+        g.peers
+            .iter()
+            .filter(|(_, p)| p.handshaked && p.channels)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Records the bootstrap addresses the operator configured, by the
@@ -1865,6 +1973,9 @@ impl Node {
                     version_sent: outbound,
                     handshaked: false,
                     ban_score: 0,
+                    user_agent: String::new(),
+                    channels: false,
+                    chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                     start_height: 0,
                     pending: HashMap::new(),
                     consecutive_orphans: 0,
@@ -1890,7 +2001,7 @@ impl Node {
                 version: PROTOCOL_VERSION,
                 timestamp: unix_now(),
                 nonce,
-                user_agent: "q21:0.4".into(),
+                user_agent: self.user_agent(),
                 start_height: height,
             };
             let _ = writer.push_force(frame_of(&v, self.magic));
@@ -2064,6 +2175,11 @@ impl Node {
     fn handle(&self, id: u64, msg: Message) -> bool {
         let mut outgoing: Vec<Outgoing> = Vec::new();
         let mut drop_peer = false;
+        // Set under the lock, acted on after it is released: a channel message
+        // to hand to the channel component (off the chain lock, so it may do
+        // cryptography), and a misconduct score for an unsolicited one.
+        let mut channel_in: Option<Vec<u8>> = None;
+        let mut channel_penalty: u32 = 0;
 
         // The work of a block or of an announcement is checked before the lock.
         match &msg {
@@ -2093,6 +2209,7 @@ impl Node {
                     version,
                     nonce,
                     start_height,
+                    ref user_agent,
                     ..
                 } => {
                     // Connection to oneself: we disconnect without ceremony. A
@@ -2160,6 +2277,9 @@ impl Node {
                                 p.start_height = start_height;
                                 p.version = version;
                                 p.remote_nonce = Some(nonce);
+                                p.channels =
+                                    crate::wire::user_agent_advertises_channels(user_agent);
+                                p.user_agent = user_agent.clone();
                                 if !p.version_sent {
                                     p.version_sent = true;
                                     outgoing.push(Outgoing {
@@ -2168,7 +2288,7 @@ impl Node {
                                             version: PROTOCOL_VERSION,
                                             timestamp: unix_now(),
                                             nonce: local_nonce,
-                                            user_agent: "q21:0.4".into(),
+                                            user_agent: self.user_agent(),
                                             start_height: height,
                                         },
                                     });
@@ -3169,8 +3289,70 @@ impl Node {
                 }
                 // A server does not receive snapshot replies: we ignore them.
                 Message::SnapshotInfo { .. } | Message::SnapshotChunk { .. } => {}
+
+                // A payment-channel message. Gated three ways: the handshake
+                // must be complete, the peer must have advertised the channel
+                // capability (otherwise it is unsolicited misconduct), and it
+                // must stay within its per-peer rate. The decoded bytes are
+                // handed to the channel component after the lock is released,
+                // never under it.
+                Message::Channel(bytes) => {
+                    let (hs, cap) = g
+                        .peers
+                        .get(&id)
+                        .map(|p| (p.handshaked, p.channels))
+                        .unwrap_or((false, false));
+                    if !hs {
+                        // Pre-handshake: ignored, like every other expensive
+                        // message, without penalty.
+                    } else if !cap {
+                        // The peer never told us it speaks the protocol, yet
+                        // sent a channel message: unsolicited.
+                        channel_penalty = MISCONDUCT_CHANNEL;
+                    } else {
+                        let now = Instant::now();
+                        let allowed = g
+                            .peers
+                            .get_mut(&id)
+                            .map(|p| {
+                                p.chan_bucket
+                                    .allow_with(1, now, CHAN_BUCKET_MAX, CHAN_RATE_PER_SEC)
+                            })
+                            .unwrap_or(false);
+                        if allowed {
+                            channel_in = Some(bytes);
+                        }
+                        // Beyond the rate we drop it silently: an honest peer
+                        // slows down and resends, as for snapshot chunks.
+                    }
+                }
             }
         } // --- lock released here, before any network write ---
+
+        // The channel component runs off the chain lock, so it is free to sign
+        // and verify. An unsolicited message is penalized the same way.
+        if channel_penalty > 0 && self.penalize(id, channel_penalty) {
+            drop_peer = true;
+        }
+        if let Some(bytes) = channel_in {
+            let sink = self
+                .channel_sink
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().cloned());
+            if let Some(sink) = sink {
+                let outcome = sink.deliver(id, &bytes);
+                if outcome.penalize > 0 && self.penalize(id, outcome.penalize) {
+                    drop_peer = true;
+                }
+                for payload in outcome.replies {
+                    outgoing.push(Outgoing {
+                        peer: id,
+                        message: Message::Channel(payload),
+                    });
+                }
+            }
+        }
 
         for e in outgoing {
             let writer = {
@@ -4465,6 +4647,9 @@ mod tests {
                 snapshot_bucket: TokenBucket::new(Instant::now()),
                 tx_bucket: TokenBucket::for_transactions(Instant::now()),
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
+                user_agent: String::new(),
+                channels: false,
+                chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 expected_headers: 0,
@@ -4802,6 +4987,9 @@ mod tests_hardening {
                 snapshot_bucket: TokenBucket::new(Instant::now()),
                 tx_bucket: TokenBucket::for_transactions(Instant::now()),
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
+                user_agent: String::new(),
+                channels: false,
+                chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 expected_headers: 0,
@@ -5604,6 +5792,9 @@ mod tests_handler_fuzz {
                 snapshot_bucket: TokenBucket::new(now),
                 tx_bucket: TokenBucket::for_transactions(now),
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
+                user_agent: String::new(),
+                channels: false,
+                chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 expected_headers: 0,
@@ -6432,6 +6623,9 @@ mod tests_handler_review {
                 snapshot_bucket: TokenBucket::new(now),
                 tx_bucket: TokenBucket::for_transactions(now),
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
+                user_agent: String::new(),
+                channels: false,
+                chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 expected_headers: 0,
