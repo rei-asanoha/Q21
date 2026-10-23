@@ -42,13 +42,21 @@ fn akey() -> Box<dyn Signer> {
 
 /// A funded, open channel pair, with a fixed funding outpoint. Returns
 /// `(funder, acceptor)`.
-fn open_pair(dir: &PathBuf) -> (Machine, Machine) {
+fn open_pair(dir: &std::path::Path) -> (Machine, Machine) {
     let f_signer = fkey();
     let a_signer = akey();
     let a_pub = a_signer.pubkey().to_vec();
-    let (mut f, open) =
-        Machine::new_funder(dir.join("f.jrnl"), NET, f_signer, a_pub, CAP, DELAY, DEPTH, RATE)
-            .unwrap();
+    let (mut f, open) = Machine::new_funder(
+        dir.join("f.jrnl"),
+        NET,
+        f_signer,
+        a_pub,
+        CAP,
+        DELAY,
+        DEPTH,
+        RATE,
+    )
+    .unwrap();
     let (mut a, accept) = Machine::accept(dir.join("a.jrnl"), NET, a_signer, RATE, &open).unwrap();
     f.on_accept(&accept).unwrap();
     let outpoint = OutPoint {
@@ -163,10 +171,16 @@ fn a_bad_version_and_type_are_refused() {
     let m = Message::Ready.encode();
     let mut wrong_ver = m.clone();
     wrong_ver[0] = 9;
-    assert_eq!(Message::decode(&wrong_ver), Err(WireError::UnknownVersion(9)));
+    assert_eq!(
+        Message::decode(&wrong_ver),
+        Err(WireError::UnknownVersion(9))
+    );
     let mut wrong_type = m.clone();
     wrong_type[1] = 200;
-    assert_eq!(Message::decode(&wrong_type), Err(WireError::UnknownType(200)));
+    assert_eq!(
+        Message::decode(&wrong_type),
+        Err(WireError::UnknownType(200))
+    );
 }
 
 #[test]
@@ -213,7 +227,10 @@ fn channel_transaction_weights() {
     let mut funding = crate::tx::Transaction {
         version: 1,
         inputs: vec![crate::tx::TxIn {
-            prev_out: OutPoint { txid: Hash256::ZERO, index: 0 },
+            prev_out: OutPoint {
+                txid: Hash256::ZERO,
+                index: 0,
+            },
             witness: crate::tx::Witness {
                 pubkey: fk.pubkey().to_vec(),
                 signature: vec![0u8; crate::sig::SchemeId::MlDsa87.sig_len()],
@@ -241,7 +258,10 @@ fn channel_transaction_weights() {
 
     // Cooperative close (two outputs).
     let close = params.cooperative_close(
-        OutPoint { txid: Hash256::ZERO, index: 0 },
+        OutPoint {
+            txid: Hash256::ZERO,
+            index: 0,
+        },
         [CAP - 2_000_000, 2_000_000],
         20_000,
     );
@@ -250,19 +270,54 @@ fn channel_transaction_weights() {
     let close_weight = w(&closetx);
 
     // Penalty, local sweep, to_remote claim — built against a real to_local.
-    let commit = params.commitment(ACCEPTOR, 3, [CAP - 2_000_000, 2_000_000], 0, Hash256([4u8; 32]));
-    let to_local_out = commit.tx.outputs.iter().find(|o| o.scheme == crate::sig::SchemeId::Policy).copied().unwrap();
-    let to_local_op = OutPoint { txid: commit.tx.txid(), index: 0 };
+    let commit = params.commitment(
+        ACCEPTOR,
+        3,
+        [CAP - 2_000_000, 2_000_000],
+        0,
+        Hash256([4u8; 32]),
+    );
+    let to_local_out = commit
+        .tx
+        .outputs
+        .iter()
+        .find(|o| o.scheme == crate::sig::SchemeId::Policy)
+        .copied()
+        .unwrap();
+    let to_local_op = OutPoint {
+        txid: commit.tx.txid(),
+        index: 0,
+    };
     let penalty = txbuild::penalty_tx(
-        to_local_op, &to_local_out, &commit.to_local, [5u8; 32], fk.pubkey_hash(), 20_000, NET, &fk,
+        to_local_op,
+        &to_local_out,
+        &commit.to_local,
+        [5u8; 32],
+        fk.pubkey_hash(),
+        20_000,
+        NET,
+        &fk,
     );
     let penalty_weight = w(&penalty);
     let sweep = txbuild::local_sweep_tx(
-        to_local_op, &to_local_out, &commit.to_local, ak.pubkey_hash(), 20_000, NET, &ak,
+        to_local_op,
+        &to_local_out,
+        &commit.to_local,
+        ak.pubkey_hash(),
+        20_000,
+        NET,
+        &ak,
     );
     let sweep_weight = w(&sweep);
     let to_remote_out = txbuild::key_output(fk.pubkey_hash(), 2_000_000);
-    let claim = txbuild::to_remote_claim_tx(to_local_op, &to_remote_out, fk.pubkey_hash(), 20_000, NET, &fk);
+    let claim = txbuild::to_remote_claim_tx(
+        to_local_op,
+        &to_remote_out,
+        fk.pubkey_hash(),
+        20_000,
+        NET,
+        &fk,
+    );
     let claim_weight = w(&claim);
 
     println!(
@@ -275,7 +330,10 @@ fn channel_transaction_weights() {
     assert_eq!(funding_weight, 8_563);
     assert_eq!(claim_weight, key_spend);
     assert!(std_commit > key_spend, "commitment carries two sigs");
-    assert!(penalty_weight > key_spend, "penalty reveals the policy and a preimage");
+    assert!(
+        penalty_weight > key_spend,
+        "penalty reveals the policy and a preimage"
+    );
 }
 
 #[test]
@@ -291,7 +349,13 @@ fn dust_trimming_is_exact() {
     assert_eq!(c.trimmed_units, 9_999);
     assert_eq!(c.trimmed_outputs, 1);
     // Exactly at the floor: kept.
-    let c = params.commitment(FUNDER, 1, [CAP - MIN_OUTPUT_VALUE, MIN_OUTPUT_VALUE], 0, Hash256([3u8; 32]));
+    let c = params.commitment(
+        FUNDER,
+        1,
+        [CAP - MIN_OUTPUT_VALUE, MIN_OUTPUT_VALUE],
+        0,
+        Hash256([3u8; 32]),
+    );
     assert_eq!(c.tx.outputs.len(), 2);
     assert_eq!(c.trimmed_units, 0);
 }
@@ -302,11 +366,11 @@ fn fee_tiers_climb_then_cap() {
     assert_eq!(FeeTier::Medium.multiplier(), 4);
     assert_eq!(FeeTier::High.multiplier(), 16);
     // Base below the relay minimum is lifted to it.
-    assert_eq!(txbuild::tier_rate(1, FeeTier::Low), crate::mempool::MIN_FEE_RATE);
     assert_eq!(
-        txbuild::tier_rate(RATE, FeeTier::High),
-        RATE * 16
+        txbuild::tier_rate(1, FeeTier::Low),
+        crate::mempool::MIN_FEE_RATE
     );
+    assert_eq!(txbuild::tier_rate(RATE, FeeTier::High), RATE * 16);
     // A huge base is capped.
     assert_eq!(
         txbuild::tier_rate(u64::MAX, FeeTier::High),
@@ -343,8 +407,8 @@ fn payments_both_directions_settle() {
     assert_eq!(f.local_commit_number(), Some(3));
     assert_eq!(a.local_commit_number(), Some(3));
     // Each holds the other's revocation for every past state.
-    assert_eq!(f.revocation_store().len() >= 1, true);
-    assert_eq!(a.revocation_store().len() >= 1, true);
+    assert!(!f.revocation_store().is_empty());
+    assert!(!a.revocation_store().is_empty());
 }
 
 #[test]
@@ -374,11 +438,9 @@ fn inv1_holds(records: &[Record]) -> bool {
             Record::LocalCommit { state, .. } => {
                 max_local = Some(max_local.map_or(*state, |m| m.max(*state)))
             }
-            Record::RevocationSent { state } => {
-                // Revealing secret for `state` requires LocalCommit >= state+1.
-                if max_local < Some(state + 1) {
-                    return false;
-                }
+            // Revealing the secret for `state` requires LocalCommit >= state+1.
+            Record::RevocationSent { state } if max_local < Some(state + 1) => {
+                return false;
             }
             _ => {}
         }
@@ -487,7 +549,9 @@ fn an_old_state_is_punished_and_the_latest_is_not() {
         other => panic!("expected RevokedByPeer, got {other:?}"),
     }
     // The acceptor can build a valid penalty.
-    let penalty = a.build_penalty(&decision, a.params().funding[ACCEPTOR], 20_000).unwrap();
+    let penalty = a
+        .build_penalty(&decision, a.params().funding[ACCEPTOR], 20_000)
+        .unwrap();
     assert_eq!(penalty.inputs.len(), 1);
     assert_eq!(penalty.outputs.len(), 1);
 
@@ -518,8 +582,14 @@ fn reestablish_between_complete_states_resends_nothing() {
     pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
     pay(&mut a, &mut f, [CAP - 400_000, 400_000]);
     let (for_f, for_a) = exchange_reestablish(&mut f, &mut a);
-    assert!(for_f.is_empty(), "nothing to resend to the funder: {for_f:?}");
-    assert!(for_a.is_empty(), "nothing to resend to the acceptor: {for_a:?}");
+    assert!(
+        for_f.is_empty(),
+        "nothing to resend to the funder: {for_f:?}"
+    );
+    assert!(
+        for_a.is_empty(),
+        "nothing to resend to the acceptor: {for_a:?}"
+    );
     assert_eq!(f.balances(), a.balances());
 }
 
@@ -568,7 +638,9 @@ fn reestablish_recovers_from_a_crash_mid_update() {
     // Reconnect. The acceptor must resend its Ack for state 2.
     let (_f_resends, a_resends) = exchange_reestablish(&mut f, &mut a);
     assert!(
-        a_resends.iter().any(|m| matches!(m, Message::Ack { state: 2, .. })),
+        a_resends
+            .iter()
+            .any(|m| matches!(m, Message::Ack { state: 2, .. })),
         "acceptor should resend Ack(2): {a_resends:?}"
     );
     // Drive the resend home: the acceptor's Ack reaches the recovered funder.
@@ -619,27 +691,56 @@ fn our_own_commitment_is_swept_only_after_the_delay() {
         latest_state: a.local_commit_number().unwrap(),
     };
     let decision = classify(&ctx, a.funding_outpoint().unwrap(), &mine);
-    let Watch::OurCommitment { state: 1, to_local: Some(_), delay } = decision else {
+    let Watch::OurCommitment {
+        state: 1,
+        to_local: Some(_),
+        delay,
+    } = decision
+    else {
         panic!("expected OurCommitment, got {decision:?}");
     };
     assert_eq!(delay, DELAY);
-    let sweep = a.build_local_sweep(&decision, a.params().funding[ACCEPTOR], 20_000).unwrap();
+    let sweep = a
+        .build_local_sweep(&decision, a.params().funding[ACCEPTOR], 20_000)
+        .unwrap();
     assert_eq!(sweep.inputs.len(), 1);
 
     // Validate the sweep on a minimal UTXO view: its to_local output lives at
     // `born`; the sweep needs the delayed branch, valid only `DELAY` blocks on.
     let born = 100u64;
     let mut utxo = crate::utxo::UtxoSet::new();
-    let to_local_out = mine.outputs.iter().find(|o| o.scheme == crate::sig::SchemeId::Policy).copied().unwrap();
+    let to_local_out = mine
+        .outputs
+        .iter()
+        .find(|o| o.scheme == crate::sig::SchemeId::Policy)
+        .copied()
+        .unwrap();
     utxo.insert(
-        crate::tx::OutPoint { txid: mine.txid(), index: 0 },
-        crate::utxo::UtxoEntry { output: to_local_out, height: born, is_coinbase: false },
+        crate::tx::OutPoint {
+            txid: mine.txid(),
+            index: 0,
+        },
+        crate::utxo::UtxoEntry {
+            output: to_local_out,
+            height: born,
+            is_coinbase: false,
+        },
     );
     use std::collections::HashSet;
     // Too early: refused.
-    assert!(crate::validate::check_transaction(&sweep, &utxo, NET, born + 1, &mut HashSet::new()).is_err());
+    assert!(
+        crate::validate::check_transaction(&sweep, &utxo, NET, born + 1, &mut HashSet::new())
+            .is_err()
+    );
     // After the delay: accepted.
-    assert!(crate::validate::check_transaction(&sweep, &utxo, NET, born + DELAY as u64, &mut HashSet::new()).is_ok());
+    assert!(crate::validate::check_transaction(
+        &sweep,
+        &utxo,
+        NET,
+        born + DELAY as u64,
+        &mut HashSet::new()
+    )
+    .is_ok());
 }
 
 #[test]
@@ -649,7 +750,10 @@ fn a_spend_of_another_outpoint_is_not_our_channel() {
     let unrelated = crate::tx::Transaction {
         version: 1,
         inputs: vec![crate::tx::TxIn {
-            prev_out: OutPoint { txid: Hash256([0x55; 32]), index: 1 },
+            prev_out: OutPoint {
+                txid: Hash256([0x55; 32]),
+                index: 1,
+            },
             witness: crate::tx::Witness::default(),
             sequence: u32::MAX,
         }],
@@ -721,7 +825,7 @@ fn honest_party_never_loses_against_a_random_broadcast() {
             states.push(bal);
         }
         let k = f.local_commit_number().unwrap(); // current state
-        // Retained states on hand to broadcast: the latest two.
+                                                  // Retained states on hand to broadcast: the latest two.
         let j = if k == 0 { 0 } else { k - 1 + rng.below(2) }; // k-1 or k
         let j = j.min(k);
         let broadcast = f.signed_commitment_at(j, FeeTier::Low).unwrap();
@@ -732,8 +836,15 @@ fn honest_party_never_loses_against_a_random_broadcast() {
         let mut utxo = crate::utxo::UtxoSet::new();
         for (idx, out) in broadcast.outputs.iter().enumerate() {
             utxo.insert(
-                crate::tx::OutPoint { txid: broadcast.txid(), index: idx as u32 },
-                crate::utxo::UtxoEntry { output: *out, height: born, is_coinbase: false },
+                crate::tx::OutPoint {
+                    txid: broadcast.txid(),
+                    index: idx as u32,
+                },
+                crate::utxo::UtxoEntry {
+                    output: *out,
+                    height: born,
+                    is_coinbase: false,
+                },
             );
         }
 
@@ -748,52 +859,91 @@ fn honest_party_never_loses_against_a_random_broadcast() {
 
         let mut honest_recovered = 0u64;
         match &decision {
-            Watch::RevokedByPeer { state, to_local, .. } => {
+            Watch::RevokedByPeer {
+                state, to_local, ..
+            } => {
                 assert!(*state < k, "a revoked broadcast");
                 // Penalty sweeps the cheater's to_local to the acceptor.
-                let penalty = a.build_penalty(&decision, a.params().funding[ACCEPTOR], 20_000).unwrap();
+                let penalty = a
+                    .build_penalty(&decision, a.params().funding[ACCEPTOR], 20_000)
+                    .unwrap();
                 // Penalty is valid the very next block, before the delay.
                 assert!(
-                    crate::validate::check_transaction(&penalty, &utxo, NET, born + 1, &mut HashSet::new()).is_ok(),
+                    crate::validate::check_transaction(
+                        &penalty,
+                        &utxo,
+                        NET,
+                        born + 1,
+                        &mut HashSet::new()
+                    )
+                    .is_ok(),
                     "penalty must validate before the delay"
                 );
                 honest_recovered += penalty.outputs[0].value.units();
                 // The cheater's own sweep of that same to_local is refused
                 // until the delay: the penalty wins the race.
-                let cheater_sweep = f.build_local_sweep(
-                    &Watch::OurCommitment {
-                        state: *state,
-                        to_local: Some(*to_local),
-                        delay: DELAY,
-                    },
-                    f.params().funding[FUNDER],
-                    20_000,
-                ).unwrap();
+                let cheater_sweep = f
+                    .build_local_sweep(
+                        &Watch::OurCommitment {
+                            state: *state,
+                            to_local: Some(*to_local),
+                            delay: DELAY,
+                        },
+                        f.params().funding[FUNDER],
+                        20_000,
+                    )
+                    .unwrap();
                 assert!(
-                    crate::validate::check_transaction(&cheater_sweep, &utxo, NET, born + 1, &mut HashSet::new()).is_err(),
+                    crate::validate::check_transaction(
+                        &cheater_sweep,
+                        &utxo,
+                        NET,
+                        born + 1,
+                        &mut HashSet::new()
+                    )
+                    .is_err(),
                     "the cheater's sweep must not be valid before its delay"
                 );
                 // The acceptor also owns its to_remote on that commitment.
-                if let Some((idx, out)) = broadcast.outputs.iter().enumerate()
-                    .find(|(_, o)| o.scheme == crate::sig::SchemeId::MlDsa87 && o.pubkey_hash == a.params().funding[ACCEPTOR])
-                {
+                if let Some((idx, out)) = broadcast.outputs.iter().enumerate().find(|(_, o)| {
+                    o.scheme == crate::sig::SchemeId::MlDsa87
+                        && o.pubkey_hash == a.params().funding[ACCEPTOR]
+                }) {
                     let claim = a.build_to_remote_claim(
                         &super::watcher::OutputRef {
-                            outpoint: crate::tx::OutPoint { txid: broadcast.txid(), index: idx as u32 },
+                            outpoint: crate::tx::OutPoint {
+                                txid: broadcast.txid(),
+                                index: idx as u32,
+                            },
                             output: *out,
                         },
                         a.params().funding[ACCEPTOR],
                         20_000,
                     );
-                    assert!(crate::validate::check_transaction(&claim, &utxo, NET, born + 1, &mut HashSet::new()).is_ok());
+                    assert!(crate::validate::check_transaction(
+                        &claim,
+                        &utxo,
+                        NET,
+                        born + 1,
+                        &mut HashSet::new()
+                    )
+                    .is_ok());
                     honest_recovered += claim.outputs[0].value.units();
                 }
             }
             Watch::PeerLatest { state, to_remote } => {
                 assert_eq!(*state, k);
                 if let Some(to_remote) = to_remote {
-                    let claim = a.build_to_remote_claim(to_remote, a.params().funding[ACCEPTOR], 20_000);
-                    assert!(crate::validate::check_transaction(&claim, &utxo, NET, born + 1, &mut HashSet::new()).is_ok());
+                    let claim =
+                        a.build_to_remote_claim(to_remote, a.params().funding[ACCEPTOR], 20_000);
+                    assert!(crate::validate::check_transaction(
+                        &claim,
+                        &utxo,
+                        NET,
+                        born + 1,
+                        &mut HashSet::new()
+                    )
+                    .is_ok());
                     honest_recovered += claim.outputs[0].value.units();
                 }
             }
@@ -829,13 +979,19 @@ fn fee_tiers_are_signed_and_each_validates_on_chain() {
         let mut u = crate::utxo::UtxoSet::new();
         u.insert(
             f2.funding_outpoint().unwrap(),
-            crate::utxo::UtxoEntry { output: f2.funding_output(), height: 10, is_coinbase: false },
+            crate::utxo::UtxoEntry {
+                output: f2.funding_output(),
+                height: 10,
+                is_coinbase: false,
+            },
         );
         let tx = f2.force_close(tier).unwrap();
         crate::validate::check_transaction(&tx, &u, NET, 11, &mut HashSet::new())
             .expect("the commitment must validate as a 2-of-2 spend");
         // The funder's own output falls as the tier (and fee) rises.
-        let funder_out = tx.outputs.iter()
+        let funder_out = tx
+            .outputs
+            .iter()
             .find(|o| o.scheme == crate::sig::SchemeId::Policy)
             .map(|o| o.value.units())
             .unwrap();
@@ -889,7 +1045,10 @@ fn reestablish_after_each_message_keeps_both_consistent() {
         b[FUNDER] -= 300_000;
         pay(&mut f, &mut a, b);
         let (rf, ra) = exchange_reestablish(&mut f, &mut a);
-        assert!(rf.is_empty() && ra.is_empty(), "step {step}: spurious resends {rf:?} {ra:?}");
+        assert!(
+            rf.is_empty() && ra.is_empty(),
+            "step {step}: spurious resends {rf:?} {ra:?}"
+        );
         assert_eq!(f.balances(), a.balances());
         assert_eq!(f.local_commit_number(), Some(step + 1));
     }

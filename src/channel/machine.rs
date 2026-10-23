@@ -373,10 +373,13 @@ impl Machine {
     /// revocation point is ours.
     fn our_commitment(&self, n: u64, bal: Balances, tier: FeeTier) -> Commitment {
         let rev = self.our_point(n);
-        self.with_funding_input(
-            self.params
-                .commitment(self.our_index, n, bal, self.commit_fee(tier), rev),
-        )
+        self.with_funding_input(self.params.commitment(
+            self.our_index,
+            n,
+            bal,
+            self.commit_fee(tier),
+            rev,
+        ))
     }
 
     /// Signs the counterparty's commitment at `n`, at every tier.
@@ -426,7 +429,9 @@ impl Machine {
     // --- Balance checks ------------------------------------------------------
 
     fn check_balances(&self, bal: Balances) -> Result<(), ChannelError> {
-        let sum = bal[0].checked_add(bal[1]).ok_or(ChannelError::BadBalances)?;
+        let sum = bal[0]
+            .checked_add(bal[1])
+            .ok_or(ChannelError::BadBalances)?;
         if sum != self.params.capacity.units() {
             return Err(ChannelError::BadBalances);
         }
@@ -606,7 +611,12 @@ impl Machine {
         // INV2: persist the counterparty's signature over our commitment `n`
         // before acknowledging.
         self.verify_our_commitment(n, *balances, tier_sigs)?;
-        self.persist_local_commit(n, *balances, tier_sigs.clone(), /*we_initiated=*/ false)?;
+        self.persist_local_commit(
+            n,
+            *balances,
+            tier_sigs.clone(),
+            /*we_initiated=*/ false,
+        )?;
         // Sign the counterparty's commitment `n` and persist that we did.
         let our_sigs = self.sign_their_commitment(n, *balances)?;
         self.persist_remote_commit(n, *balances)?;
@@ -673,10 +683,9 @@ impl Machine {
     }
 
     fn next_state(&self) -> u64 {
-        self.local_commit_number.map_or(0, |n| n + 1).max(
-            self.remote_commit_number
-                .map_or(0, |n| n + 1),
-        )
+        self.local_commit_number
+            .map_or(0, |n| n + 1)
+            .max(self.remote_commit_number.map_or(0, |n| n + 1))
     }
 
     fn make_revocation(&self, m: u64) -> Result<Revocation, ChannelError> {
@@ -742,8 +751,10 @@ impl Machine {
     }
 
     fn persist_remote_commit(&mut self, n: u64, bal: Balances) -> Result<(), ChannelError> {
-        self.journal
-            .append(&Record::RemoteCommit { state: n, balances: bal })?;
+        self.journal.append(&Record::RemoteCommit {
+            state: n,
+            balances: bal,
+        })?;
         self.remote_commit_number = Some(n);
         self.remote_balances.insert(n, bal);
         Ok(())
@@ -765,10 +776,9 @@ impl Machine {
     // --- Idempotent resends for reestablish ----------------------------------
 
     fn resend_ack(&self, n: u64) -> Result<Message, ChannelError> {
-        let bal = *self
-            .remote_balances
-            .get(&n)
-            .ok_or(ChannelError::Invariant("missing remote balances for resend"))?;
+        let bal = *self.remote_balances.get(&n).ok_or(ChannelError::Invariant(
+            "missing remote balances for resend",
+        ))?;
         let tier_sigs = self.sign_their_commitment(n, bal)?;
         let revocation = self.make_revocation(n - 1)?;
         Ok(Message::Ack {
@@ -786,10 +796,9 @@ impl Machine {
     }
 
     fn resend_update(&self, n: u64) -> Result<Message, ChannelError> {
-        let bal = *self
-            .remote_balances
-            .get(&n)
-            .ok_or(ChannelError::Invariant("missing remote balances for resend"))?;
+        let bal = *self.remote_balances.get(&n).ok_or(ChannelError::Invariant(
+            "missing remote balances for resend",
+        ))?;
         let tier_sigs = self.sign_their_commitment(n, bal)?;
         Ok(Message::Update {
             state: n,
@@ -1030,9 +1039,11 @@ impl Machine {
     /// before, so a captured message cannot be replayed.
     pub fn reestablish(&self) -> Result<Message, ChannelError> {
         let nonce = crate::rng::bytes::<32>().map_err(|_| ChannelError::NoRandomness)?;
-        let proof = self
-            .signer
-            .sign(&reestablish_message(self.channel_id, nonce, self.our_index as u8));
+        let proof = self.signer.sign(&reestablish_message(
+            self.channel_id,
+            nonce,
+            self.our_index as u8,
+        ));
         Ok(Message::Reestablish {
             channel_id: self.channel_id,
             local_commit_number: self.local_commit_number.map_or(0, |n| n + 1),
@@ -1151,11 +1162,7 @@ impl Machine {
 
     /// Builds (and keeps private) a commitment at `n` for `tier` at the
     /// balances we signed it at, for use in tests of a revoked broadcast.
-    pub fn signed_commitment_at(
-        &self,
-        n: u64,
-        tier: FeeTier,
-    ) -> Result<Transaction, ChannelError> {
+    pub fn signed_commitment_at(&self, n: u64, tier: FeeTier) -> Result<Transaction, ChannelError> {
         let (bal, their_sigs) = self
             .local_commits
             .get(&n)
@@ -1286,7 +1293,9 @@ impl Machine {
         else {
             return Err(ChannelError::Unexpected);
         };
-        let policy = self.params.to_local_policy(self.our_index, self.our_point(*state));
+        let policy = self
+            .params
+            .to_local_policy(self.our_index, self.our_point(*state));
         Ok(txbuild::local_sweep_tx(
             to_local.outpoint,
             &to_local.output,

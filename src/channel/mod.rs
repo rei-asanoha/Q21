@@ -21,9 +21,9 @@ pub mod messages;
 pub mod txbuild;
 pub mod watcher;
 
-pub use keys::Signer;
 #[cfg(feature = "mldsa")]
 pub use keys::ChannelKey;
+pub use keys::Signer;
 pub use machine::{channel_id, ChannelError, Machine, Phase};
 pub use messages::{initiative, Message, Revocation, WireError};
 pub use txbuild::{ChannelParams, FeeTier};

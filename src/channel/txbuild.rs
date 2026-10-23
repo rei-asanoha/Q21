@@ -150,7 +150,10 @@ impl ChannelParams {
         let other = 1 - holder;
         Policy::Any(vec![
             Policy::All(vec![key_leaf(self.funding[other]), Policy::Preimage(rev)]),
-            Policy::All(vec![key_leaf(self.funding[holder]), Policy::Older(self.delay)]),
+            Policy::All(vec![
+                key_leaf(self.funding[holder]),
+                Policy::Older(self.delay),
+            ]),
         ])
     }
 
@@ -253,22 +256,17 @@ impl ChannelParams {
 
     /// A cooperative close paying each party its final balance, the funder's
     /// side less the close fee, dropping dust into the fee.
-    pub fn cooperative_close(
-        &self,
-        funding: OutPoint,
-        bal: [u64; 2],
-        fee: u64,
-    ) -> Commitment {
+    pub fn cooperative_close(&self, funding: OutPoint, bal: [u64; 2], fee: u64) -> Commitment {
         let mut side = bal;
         side[FUNDER] = side[FUNDER].saturating_sub(fee);
         let mut outs = Vec::new();
         let mut trimmed_units = 0u64;
         let mut trimmed_outputs = 0u32;
-        for i in 0..2 {
-            if side[i] >= MIN_OUTPUT_VALUE {
-                outs.push(key_output(self.funding[i], side[i]));
-            } else if side[i] > 0 {
-                trimmed_units += side[i];
+        for (i, &v) in side.iter().enumerate() {
+            if v >= MIN_OUTPUT_VALUE {
+                outs.push(key_output(self.funding[i], v));
+            } else if v > 0 {
+                trimmed_units += v;
                 trimmed_outputs += 1;
             }
         }

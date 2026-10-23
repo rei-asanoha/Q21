@@ -171,9 +171,7 @@ mod sim {
             q21(CAP),
             handshake_bytes
         );
-        println!(
-            "  usable after 1 + {DEPTH} confirmations; to-self delay {DELAY} blocks"
-        );
+        println!("  usable after 1 + {DEPTH} confirmations; to-self delay {DELAY} blocks");
 
         let sc = script(n);
         println!(
@@ -242,7 +240,10 @@ mod sim {
                 q21(ga),
             );
             assert_eq!(gf + ga + CLOSE_FEE, CAP, "exact to the unit");
-            println!("  conserved to the unit: yes (weight {})", close_tx.weight(q21_core::consensus::WITNESS_DISCOUNT));
+            println!(
+                "  conserved to the unit: yes (weight {})",
+                close_tx.weight(q21_core::consensus::WITNESS_DISCOUNT)
+            );
         }
 
         // --- Penalty: F broadcasts a revoked state; A punishes before D.
@@ -269,8 +270,15 @@ mod sim {
             let mut utxo = UtxoSet::new();
             for (idx, out) in cheat.outputs.iter().enumerate() {
                 utxo.insert(
-                    OutPoint { txid: cheat.txid(), index: idx as u32 },
-                    UtxoEntry { output: *out, height: born, is_coinbase: false },
+                    OutPoint {
+                        txid: cheat.txid(),
+                        index: idx as u32,
+                    },
+                    UtxoEntry {
+                        output: *out,
+                        height: born,
+                        is_coinbase: false,
+                    },
                 );
             }
             let decision = {
@@ -282,7 +290,10 @@ mod sim {
                 };
                 classify(&ctx, a.funding_outpoint().unwrap(), &cheat)
             };
-            let Watch::RevokedByPeer { state, to_local, .. } = &decision else {
+            let Watch::RevokedByPeer {
+                state, to_local, ..
+            } = &decision
+            else {
                 panic!("expected a revoked broadcast, got {decision:?}");
             };
             assert_eq!(*state, revoked_state);
@@ -297,18 +308,29 @@ mod sim {
             // F's own sweep of the same output is refused until block born+DELAY.
             let cheater_sweep = f
                 .build_local_sweep(
-                    &Watch::OurCommitment { state: *state, to_local: Some(to_local), delay: DELAY },
+                    &Watch::OurCommitment {
+                        state: *state,
+                        to_local: Some(to_local),
+                        delay: DELAY,
+                    },
                     f.params().funding[FUNDER],
                     PENALTY_FEE,
                 )
                 .unwrap();
             assert!(
-                check_transaction(&cheater_sweep, &utxo, NET, born + 1, &mut HashSet::new()).is_err(),
+                check_transaction(&cheater_sweep, &utxo, NET, born + 1, &mut HashSet::new())
+                    .is_err(),
                 "cheater must not sweep before its delay"
             );
             assert!(
-                check_transaction(&cheater_sweep, &utxo, NET, born + DELAY as u64, &mut HashSet::new())
-                    .is_ok(),
+                check_transaction(
+                    &cheater_sweep,
+                    &utxo,
+                    NET,
+                    born + DELAY as u64,
+                    &mut HashSet::new()
+                )
+                .is_ok(),
                 "cheater could sweep only at born+DELAY — too late"
             );
 
@@ -319,7 +341,10 @@ mod sim {
             }) {
                 let claim = a.build_to_remote_claim(
                     &OutputRef {
-                        outpoint: OutPoint { txid: cheat.txid(), index: idx as u32 },
+                        outpoint: OutPoint {
+                            txid: cheat.txid(),
+                            index: idx as u32,
+                        },
                         output: *out,
                     },
                     a.params().funding[ACCEPTOR],
@@ -329,9 +354,7 @@ mod sim {
                 a_recovered += claim.outputs[0].value.units();
             }
             let fair = f.balances()[ACCEPTOR];
-            println!(
-                "\nPENALTY F broadcast revoked state {revoked_state} (current {k})"
-            );
+            println!("\nPENALTY F broadcast revoked state {revoked_state} (current {k})");
             println!(
                 "  A sweeps F's to_local in the next block (penalty weight {}), {} blocks before F's delay",
                 penalty.weight(q21_core::consensus::WITNESS_DISCOUNT),

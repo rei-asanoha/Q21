@@ -111,27 +111,36 @@ impl Record {
                 w.u8(R_OPENED).bytes(channel_id.as_bytes()).u8(*our_index);
                 w.bytes(funding[0].as_bytes()).bytes(funding[1].as_bytes());
                 w.u64(*capacity);
-                w.bytes(&delay.to_le_bytes()).bytes(&funding_depth.to_le_bytes());
+                w.bytes(&delay.to_le_bytes())
+                    .bytes(&funding_depth.to_le_bytes());
                 w.var_bytes(our_pubkey).var_bytes(their_pubkey);
             }
             Record::Funded {
                 funding_txid,
                 funding_index,
             } => {
-                w.u8(R_FUNDED).bytes(funding_txid.as_bytes()).u32(*funding_index);
+                w.u8(R_FUNDED)
+                    .bytes(funding_txid.as_bytes())
+                    .u32(*funding_index);
             }
             Record::LocalCommit {
                 state,
                 balances,
                 their_tier_sigs,
             } => {
-                w.u8(R_LOCAL_COMMIT).u64(*state).u64(balances[0]).u64(balances[1]);
+                w.u8(R_LOCAL_COMMIT)
+                    .u64(*state)
+                    .u64(balances[0])
+                    .u64(balances[1]);
                 for s in their_tier_sigs {
                     w.var_bytes(s);
                 }
             }
             Record::RemoteCommit { state, balances } => {
-                w.u8(R_REMOTE_COMMIT).u64(*state).u64(balances[0]).u64(balances[1]);
+                w.u8(R_REMOTE_COMMIT)
+                    .u64(*state)
+                    .u64(balances[0])
+                    .u64(balances[1]);
             }
             Record::RevocationSent { state } => {
                 w.u8(R_REVOCATION_SENT).u64(*state);
