@@ -5520,6 +5520,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // Attempts per mining round, adjusted to last about a second: see
     // `next_mining_round`.
     let mut mining_round: u64 = MINING_ROUND_MIN;
+    // The Merkle root of the last candidate this node mined that failed to
+    // connect for a reason other than a moved tip. An identical template is
+    // not hashed again: see the rejection handling below.
+    let mut last_rejected_root: Option<Hash256> = None;
+    // Whether the miner is currently waiting for the wall clock to catch up
+    // with a chain premined into the future, so the message is printed once.
+    let mut waiting_for_clock = false;
 
     loop {
         if duration > 0 && start.elapsed().as_secs() >= duration {
@@ -5694,7 +5701,34 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 println!("  {change}");
             }
         }
-        if mining.is_active() && gate.allowed {
+        let clock_too_far = mining.is_active()
+            && gate.allowed
+            && too_far_in_future(node.with_chain(|c| c.tip().time), unix_now());
+        if clock_too_far {
+            // The chain is premined into the future (the regtest fast-premine
+            // case): any block this node mined now would carry a timestamp
+            // more than MAX_FUTURE_TIME ahead of the wall clock, and every
+            // peer would reject it as coming from the future. Wait for the
+            // clock to catch up rather than burn work on blocks nobody accepts.
+            if !waiting_for_clock {
+                waiting_for_clock = true;
+                if !quiet {
+                    println!(
+                        "  mining paused: the chain's time is over {} s ahead of this \
+                         computer's clock; waiting rather than mining blocks that would be \
+                         refused as from the future",
+                        MAX_FUTURE_TIME
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        } else if mining.is_active() && gate.allowed {
+            if waiting_for_clock {
+                waiting_for_clock = false;
+                if !quiet {
+                    println!("  mining resumed: the clock has caught up with the chain");
+                }
+            }
             // --- One address per block found, not per attempt.
             //
             // This line derived a new address **at every loop iteration**.
@@ -5756,72 +5790,133 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     t
                 }
             };
-            // The rate shown on screen is a measurement: `attempt` is the
-            // index of the winner, so `attempt + 1` attempts took place.
-            let round_started = std::time::Instant::now();
-            let (block, attempts) = match q21_core::pow::mine_with_table_parallel(
-                &mut candidate.header,
-                &table,
-                mining_round,
-                threads,
-            ) {
-                Ok(attempt) => (Some(candidate), attempt.saturating_add(1)),
-                Err(done) => (None, done),
-            };
-            mining_round = next_mining_round(mining_round, round_started.elapsed());
-            mining.count_attempts(attempts);
-            if let Some(b) = block {
-                // Same discipline as for a received block (`Node::integrer`):
-                // connection, journal write and mempool cleanup under ONE
-                // SINGLE holding of the lock. Previously, the connection took
-                // the lock, released it, then it was taken again for the
-                // mempool: a reorg pushed by a peer could slip in between and
-                // make the mempool be cleaned against a block that had become
-                // a side block. The network announcement stays outside the
-                // lock.
-                let ok = node.with_chain_and_mempool(|c, m| {
-                    if c.connect(&b, unix_now()).is_ok() {
-                        // The write goes through the journal, as for any
-                        // accepted block: a single path to the disk.
-                        q21_core::chain::Journal::record(archive.as_ref(), &b);
-                        m.on_block_connected(&b);
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if ok {
-                    // What this block earns: the first output of the
-                    // coinbase, which consensus requires to pay the miner —
-                    // subsidy plus fees. It is the figure the mining screen
-                    // shows next to each find.
-                    let reward = b
-                        .transactions
-                        .first()
-                        .and_then(|c| c.outputs.first())
-                        .map(|o| o.value.units())
-                        .unwrap_or(0);
-                    mining.block_found(q21_core::mining::FoundBlock {
-                        height: b.header.height,
-                        block_id: b.header.block_id(),
-                        reward,
-                        timestamp: b.header.time,
+            if Some(candidate.header.merkle_root) == last_rejected_root {
+                // The same template that just failed to connect, unchanged.
+                // Hashing it again would only find another nonce for a block
+                // that cannot connect; we wait for the pool or the tip to move
+                // rather than spin on it.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            } else {
+                // The rate shown on screen is a measurement: `attempt` is the
+                // index of the winner, so `attempt + 1` attempts took place.
+                let round_started = std::time::Instant::now();
+                let (block, attempts) = match q21_core::pow::mine_with_table_parallel(
+                    &mut candidate.header,
+                    &table,
+                    mining_round,
+                    threads,
+                ) {
+                    Ok(attempt) => (Some(candidate), attempt.saturating_add(1)),
+                    Err(done) => (None, done),
+                };
+                mining_round = next_mining_round(mining_round, round_started.elapsed());
+                mining.count_attempts(attempts);
+                if let Some(b) = block {
+                    // Same discipline as for a received block (`Node::integrer`):
+                    // connection, journal write and mempool cleanup under ONE
+                    // SINGLE holding of the lock. Previously, the connection took
+                    // the lock, released it, then it was taken again for the
+                    // mempool: a reorg pushed by a peer could slip in between and
+                    // make the mempool be cleaned against a block that had become
+                    // a side block. The network announcement stays outside the
+                    // lock.
+                    let outcome = node.with_chain_and_mempool(|c, m| {
+                        match c.connect(&b, unix_now()) {
+                            Ok(_) => {
+                                // The write goes through the journal, as for any
+                                // accepted block: a single path to the disk.
+                                q21_core::chain::Journal::record(archive.as_ref(), &b);
+                                m.on_block_connected(&b);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                // The block does not connect. Identify the
+                                // transaction that made it invalid, if any, and
+                                // drop it so the next template is clean, instead
+                                // of silently discarding the block and retrying.
+                                let dropped = invalid_outpoint(&e)
+                                    .and_then(|op| {
+                                        b.transactions
+                                            .iter()
+                                            .skip(1)
+                                            .find(|tx| tx.inputs.iter().any(|i| i.prev_out == op))
+                                    })
+                                    .map(|tx| tx.txid())
+                                    .filter(|id| m.remove(id).is_some());
+                                Err((e, dropped))
+                            }
+                        }
                     });
-                    // The reward is collected: the address has served, the
-                    // next one will get another.
-                    mining_payee = None;
-                    // And the wallet is written right away: one block every
-                    // two minutes, a sealing of a few tenths of a second.
-                    // Without this, a hard shutdown moved `next_index` back on
-                    // disk and the following rewards became invisible.
-                    if !wallet_less {
-                        if let Ok(w) = wallet.lock() {
-                            if let Err(e) = write_wallet(datadir, &w) {
-                                eprintln!("warning: wallet not written after the block: {e}");
+                    match outcome {
+                        Ok(()) => {
+                            last_rejected_root = None;
+                            // What this block earns: the first output of the
+                            // coinbase, which consensus requires to pay the
+                            // miner — subsidy plus fees. It is the figure the
+                            // mining screen shows next to each find.
+                            let reward = b
+                                .transactions
+                                .first()
+                                .and_then(|c| c.outputs.first())
+                                .map(|o| o.value.units())
+                                .unwrap_or(0);
+                            mining.block_found(q21_core::mining::FoundBlock {
+                                height: b.header.height,
+                                block_id: b.header.block_id(),
+                                reward,
+                                timestamp: b.header.time,
+                            });
+                            // The reward is collected: the address has served,
+                            // the next one will get another.
+                            mining_payee = None;
+                            // And the wallet is written right away: one block
+                            // every two minutes, a sealing of a few tenths of a
+                            // second. Without this, a hard shutdown moved
+                            // `next_index` back on disk and the following
+                            // rewards became invisible.
+                            if !wallet_less {
+                                if let Ok(w) = wallet.lock() {
+                                    if let Err(e) = write_wallet(datadir, &w) {
+                                        eprintln!(
+                                            "warning: wallet not written after the block: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            node.announce_block(&b);
+                        }
+                        Err((e, dropped)) => {
+                            if matches!(
+                                e,
+                                q21_core::validate::ValidationError::BadParent
+                                    | q21_core::validate::ValidationError::BadHeight { .. }
+                            ) {
+                                // The tip moved while we were hashing: ordinary
+                                // when two miners race, and the next round starts
+                                // again from the new tip. Nothing to report, and
+                                // the template is not set aside — it will differ.
+                            } else {
+                                // Set this template aside so the identical one is
+                                // not hashed again; dropping the culprit already
+                                // changes it when one could be singled out.
+                                last_rejected_root = Some(b.header.merkle_root);
+                                match dropped {
+                                    Some(id) => eprintln!(
+                                        "warning: the block this node mined at height {} did \
+                                         not connect ({e:?}); dropped the offending \
+                                         transaction {id} from the pool",
+                                        b.header.height
+                                    ),
+                                    None => eprintln!(
+                                        "warning: the block this node mined at height {} did \
+                                         not connect ({e:?}); the template is set aside until \
+                                         the pool or the tip changes",
+                                        b.header.height
+                                    ),
+                                }
                             }
                         }
                     }
-                    node.announce_block(&b);
                 }
             }
         } else {
@@ -6999,6 +7094,29 @@ fn next_mining_round(tries: u64, took: std::time::Duration) -> u64 {
     next.clamp(MINING_ROUND_MIN, MINING_ROUND_MAX)
 }
 
+/// Would a block mined on top of a tip timestamped `tip_time` be refused as
+/// coming from the future, given the wall clock `now`?
+///
+/// The next block's timestamp is at least `tip_time + 1` (see
+/// `Chain::assemble_candidate`), and consensus refuses a block whose time is
+/// more than `MAX_FUTURE_TIME` ahead of the wall clock (`validate::check_block`).
+/// When the chain is premined far ahead — the regtest fast-premine case — the
+/// miner waits instead of hashing blocks the network would reject.
+fn too_far_in_future(tip_time: u64, now: u64) -> bool {
+    tip_time.saturating_add(1) > now.saturating_add(MAX_FUTURE_TIME)
+}
+
+/// The outpoint named by a block-validation error that singles out one input,
+/// so the transaction that spends it can be dropped from the pool. Errors that
+/// do not point at a specific input yield `None`.
+fn invalid_outpoint(e: &q21_core::validate::ValidationError) -> Option<q21_core::tx::OutPoint> {
+    use q21_core::validate::ValidationError as E;
+    match e {
+        E::MissingInput(op) | E::DoubleSpend(op) => Some(*op),
+        _ => None,
+    }
+}
+
 /// Decides whether a node may mine now. See the comment where it is created.
 struct MiningGate {
     expects_peers: bool,
@@ -7293,6 +7411,24 @@ mod tests {
             MINING_ROUND_MIN
         );
         assert_eq!(next_mining_round(MINING_ROUND_MAX, ms(1)), MINING_ROUND_MAX);
+    }
+
+    /// The miner waits rather than mine a block the network would refuse as
+    /// coming from the future: on a chain premined far ahead, the next block's
+    /// timestamp is already beyond the wall clock plus the tolerance.
+    #[test]
+    fn a_chain_premined_into_the_future_pauses_the_miner() {
+        use q21_core::consensus::MAX_FUTURE_TIME;
+        let now = 1_000_000u64;
+        // A tip at the wall clock: fine, mine.
+        assert!(!super::too_far_in_future(now, now));
+        // A tip right at the tolerance edge: the next block (tip + 1) is still
+        // within the window.
+        assert!(!super::too_far_in_future(now + MAX_FUTURE_TIME - 1, now));
+        // A tip whose successor sits exactly one second past the window: wait.
+        assert!(super::too_far_in_future(now + MAX_FUTURE_TIME, now));
+        // A tip far in the future (fast premine): wait.
+        assert!(super::too_far_in_future(now + 10 * MAX_FUTURE_TIME, now));
     }
 
     /// A peer claiming a huge height cannot stop a miner for good: if the
