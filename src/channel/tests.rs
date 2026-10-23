@@ -1053,3 +1053,126 @@ fn reestablish_after_each_message_keeps_both_consistent() {
         assert_eq!(f.local_commit_number(), Some(step + 1));
     }
 }
+
+// --- INV3: crash at every write point of an update, then reestablish --------
+
+/// Delivers queued messages between the two sides, following each with the
+/// reply it produces, until the protocol is quiescent. `to_f`/`to_a` are
+/// messages destined for the funder / acceptor.
+fn settle(f: &mut Machine, a: &mut Machine, mut to_f: Vec<Message>, mut to_a: Vec<Message>) {
+    for _ in 0..16 {
+        if let Some(m) = to_a.pop() {
+            match m {
+                Message::Update { .. } => {
+                    if let Ok(reply) = a.on_update(&m) {
+                        to_f.push(reply);
+                    }
+                }
+                Message::Ack { .. } => {
+                    if let Ok(reply) = a.on_ack(&m) {
+                        to_f.push(reply);
+                    }
+                }
+                Message::Revoke { .. } => {
+                    let _ = a.on_revoke(&m);
+                }
+                _ => {}
+            }
+        } else if let Some(m) = to_f.pop() {
+            match m {
+                Message::Update { .. } => {
+                    if let Ok(reply) = f.on_update(&m) {
+                        to_a.push(reply);
+                    }
+                }
+                Message::Ack { .. } => {
+                    if let Ok(reply) = f.on_ack(&m) {
+                        to_a.push(reply);
+                    }
+                }
+                Message::Revoke { .. } => {
+                    let _ = f.on_revoke(&m);
+                }
+                _ => {}
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+#[test]
+fn a_crash_at_every_update_write_point_reestablishes_without_loss() {
+    // For each number of messages exchanged in an update to state 3, crash the
+    // funder (reopen from its journal — which reflects exactly the writes made
+    // before the messages it had sent), reconnect, and drive to completion.
+    // Both sides must converge to the same state and balances, and the honest
+    // acceptor must never be worse off.
+    for crash_after in 0..=3u8 {
+        let dir = tmpdir();
+        let (mut f, mut a) = open_pair(&dir);
+        pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]); // state 1
+        pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]); // state 2
+        let target = [CAP - 3_000_000, 3_000_000];
+
+        // Drive the update to state 3 through exactly `crash_after` messages.
+        // Each engine call fsyncs its journal before returning the message it
+        // emits, so stopping here models a crash at that write point.
+        if crash_after >= 1 {
+            let upd = f.propose(target).unwrap();
+            if crash_after >= 2 {
+                let ack = a.on_update(&upd).unwrap();
+                if crash_after >= 3 {
+                    let rev = f.on_ack(&ack).unwrap();
+                    a.on_revoke(&rev).unwrap();
+                } else {
+                    // Funder has the Ack in hand but crashes before handling.
+                    let _ = ack;
+                }
+            } else {
+                // Funder proposed (RemoteCommit persisted) but the Update was
+                // not delivered.
+                let _ = upd;
+            }
+        }
+
+        // Crash the funder: drop it and reopen from its journal.
+        let before = f.balances();
+        drop(f);
+        let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+        let _ = before;
+
+        // Reconnect and converge. Each side verifies the other's proof and
+        // computes its own resends.
+        let rf = f.reestablish().unwrap();
+        let ra = a.reestablish().unwrap();
+        let f_resends = f.on_reestablish(&ra).unwrap(); // f sends these to a
+        let a_resends = a.on_reestablish(&rf).unwrap(); // a sends these to f
+        settle(&mut f, &mut a, a_resends, f_resends);
+
+        // Both sides agree on the balance and the state, with no loss.
+        assert_eq!(
+            f.balances(),
+            a.balances(),
+            "crash_after={crash_after}: balances diverged"
+        );
+        assert_eq!(
+            f.local_commit_number(),
+            a.local_commit_number(),
+            "crash_after={crash_after}: state diverged"
+        );
+        // The settled balance is either the old state 2 or the new state 3,
+        // and whichever it is, both sides hold it.
+        let b = f.balances();
+        assert!(
+            b == [CAP - 2_000_000, 2_000_000] || b == target,
+            "crash_after={crash_after}: unexpected balance {b:?}"
+        );
+        // Another reconnection now resends nothing: fully synchronized.
+        let (r1, r2) = exchange_reestablish(&mut f, &mut a);
+        assert!(
+            r1.is_empty() && r2.is_empty(),
+            "crash_after={crash_after}: not quiescent after recovery: {r1:?} {r2:?}"
+        );
+    }
+}
