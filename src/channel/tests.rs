@@ -1176,3 +1176,42 @@ fn a_crash_at_every_update_write_point_reestablishes_without_loss() {
         );
     }
 }
+
+// --- Wallet-derived channel keys & revocation-root secrecy ------------------
+
+#[test]
+fn wallet_derives_a_reproducible_channel_key() {
+    use crate::sig::SchemeId;
+    let w = crate::wallet::Wallet::from_seed_scheme([0x33u8; 32], NET, SchemeId::MlDsa87).unwrap();
+    let k0 = w.channel_key(0);
+    let k1 = w.channel_key(1);
+    assert_ne!(k0.pubkey(), k1.pubkey(), "each channel index is a new key");
+    // It signs verifiably through the ordinary verification path.
+    let m = Hash256([9u8; 32]);
+    let sig = k0.sign(&m);
+    assert_eq!(
+        crate::sig::verify(SchemeId::MlDsa87, k0.pubkey(), &m, &sig),
+        Ok(())
+    );
+    // The same wallet seed reconstructs the same key.
+    let w2 = crate::wallet::Wallet::from_seed_scheme([0x33u8; 32], NET, SchemeId::MlDsa87).unwrap();
+    assert_eq!(w2.channel_key(0).pubkey(), k0.pubkey());
+}
+
+#[test]
+fn the_revocation_root_depends_on_private_material() {
+    // Two keys that differ only in their private seed produce different
+    // revocation roots for the same channel: the root cannot be a function of
+    // the public key alone, or the counterparty could derive our secrets.
+    let cid = Hash256([7u8; 32]);
+    let a = ChannelKey::from_seed(&[1u8; 32]);
+    let b = ChannelKey::from_seed(&[2u8; 32]);
+    assert_ne!(a.revocation_root(&cid), b.revocation_root(&cid));
+    // And it is bound to the channel id.
+    assert_ne!(
+        a.revocation_root(&cid),
+        a.revocation_root(&Hash256([8u8; 32]))
+    );
+    // Stable for the same inputs.
+    assert_eq!(a.revocation_root(&cid), a.revocation_root(&cid));
+}

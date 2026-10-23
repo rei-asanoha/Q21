@@ -270,14 +270,7 @@ impl Machine {
         base_fee_rate: u64,
     ) -> Result<Machine, ChannelError> {
         let cid = channel_id(&params.funding);
-        let revocation_seed = sha256(
-            &[
-                b"Q21/channel/revocation-root".as_ref(),
-                signer.pubkey(),
-                cid.as_bytes(),
-            ]
-            .concat(),
-        );
+        let revocation_seed = signer.revocation_root(&cid);
         let (mut journal, existing) = Journal::open(journal_path)?;
         if !existing.is_empty() {
             return Err(ChannelError::Invariant("journal already in use"));
@@ -924,14 +917,7 @@ impl Machine {
             capacity: crate::amount::Amount::from_units(capacity),
             delay,
         };
-        let revocation_seed = sha256(
-            &[
-                b"Q21/channel/revocation-root".as_ref(),
-                signer.pubkey(),
-                cid.as_bytes(),
-            ]
-            .concat(),
-        );
+        let revocation_seed = signer.revocation_root(&cid);
         let mut m = Machine {
             params,
             network,

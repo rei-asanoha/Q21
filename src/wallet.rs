@@ -1830,6 +1830,25 @@ impl PreparedSpend {
     }
 }
 
+// --- Payment-channel key material -------------------------------------------
+//
+// A small, self-contained hook for the layer-two channel engine
+// (`crate::channel`). A channel uses one ML-DSA-87 key per party, derived from
+// the wallet seed and a channel index; the engine's revocation shachain then
+// branches off the channel key's own private seed. This exposes that key
+// without ever revealing the wallet seed, and touches no layer-one behaviour.
+#[cfg(feature = "mldsa")]
+impl Wallet {
+    /// The channel signing key for `channel_index`, derived from the wallet
+    /// seed. Reconstructed identically on any reload of the same wallet.
+    pub fn channel_key(&self, channel_index: u32) -> crate::channel::keys::ChannelKey {
+        crate::channel::keys::ChannelKey::from_seed(&crate::channel::keys::funding_key_seed(
+            &self.seed,
+            channel_index,
+        ))
+    }
+}
+
 /// Signing side of ML-DSA, isolated as verification is in `sig`.
 ///
 /// The node never compiles this module: it has no need to know how to sign.

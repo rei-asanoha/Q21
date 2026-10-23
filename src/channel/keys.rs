@@ -20,20 +20,17 @@ pub const CHANNEL_SCHEME: SchemeId = SchemeId::MlDsa87;
 
 /// Derivation tag of a channel's funding (signing) key.
 const TAG_FUND: &str = "Q21/channel/fund-key";
-/// Derivation tag of a channel's revocation seed (the shachain root).
-const TAG_REVOKE: &str = "Q21/channel/revoke-seed";
+/// Derivation tag of a channel's revocation shachain root.
+const TAG_REVOKE: &str = "Q21/channel/revoke-root";
 
-/// The 32-byte seed of a channel's signing key.
+/// The 32-byte seed of a channel's signing key, from the wallet seed and a
+/// channel index.
 pub fn funding_key_seed(wallet_seed: &[u8; 32], channel_index: u32) -> [u8; 32] {
     tagged_hash_parts(TAG_FUND, &[wallet_seed, &channel_index.to_le_bytes()]).0
 }
 
-/// The 32-byte root of a channel's revocation shachain.
-pub fn revocation_seed(wallet_seed: &[u8; 32], channel_index: u32) -> [u8; 32] {
-    tagged_hash_parts(TAG_REVOKE, &[wallet_seed, &channel_index.to_le_bytes()]).0
-}
-
-/// What the state machine needs of a key: to name itself and to sign.
+/// What the state machine needs of a key: to name itself, to sign, and to
+/// yield its private revocation root.
 ///
 /// A blanket [`Self::pubkey_hash`] ties the key to its scheme the one way the
 /// rest of the protocol does ([`sig::pubkey_hash`]).
@@ -48,12 +45,21 @@ pub trait Signer {
 
     /// Signs a 32-byte message. The result is `CHANNEL_SCHEME.sig_len()` bytes.
     fn sign(&self, message: &Hash256) -> Vec<u8>;
+
+    /// The root of this channel's revocation shachain, bound to `channel_id`.
+    ///
+    /// **Must derive from private material**: the counterparty, who knows our
+    /// public key and the channel id, must not be able to compute it, or it
+    /// could derive every revocation secret and so every penalty preimage. A
+    /// public-key-only derivation here would hand the channel away.
+    fn revocation_root(&self, channel_id: &Hash256) -> [u8; 32];
 }
 
 /// A concrete ML-DSA-87 channel key, holding the expanded signing key so a
 /// channel that signs thousands of states pays the key expansion only once.
 #[cfg(feature = "mldsa")]
 pub struct ChannelKey {
+    seed: [u8; 32],
     sk: ml_dsa::SigningKey<ml_dsa::MlDsa87>,
     pubkey: Vec<u8>,
 }
@@ -65,7 +71,11 @@ impl ChannelKey {
         use ml_dsa::{signature::Keypair, SigningKey, B32};
         let sk = SigningKey::<ml_dsa::MlDsa87>::from_seed(&B32::from(*seed));
         let pubkey = sk.verifying_key().encode()[..].to_vec();
-        ChannelKey { sk, pubkey }
+        ChannelKey {
+            seed: *seed,
+            sk,
+            pubkey,
+        }
     }
 
     /// Builds a channel's signing key from the wallet seed and the index.
@@ -87,5 +97,10 @@ impl Signer for ChannelKey {
         // determinism that the wallet avoids for fault resistance is harmless
         // here and keeps every test reproducible.
         self.sk.sign(message.as_bytes()).encode()[..].to_vec()
+    }
+
+    fn revocation_root(&self, channel_id: &Hash256) -> [u8; 32] {
+        // From the private seed, never the public key.
+        tagged_hash_parts(TAG_REVOKE, &[&self.seed, channel_id.as_bytes()]).0
     }
 }
