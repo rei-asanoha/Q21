@@ -42,17 +42,20 @@ const KIND_HELLO_BACK: u8 = 2;
 /// Fee reserved for a cooperative close, a penalty, or a sweep, in units.
 pub const CLOSE_FEE: u64 = 20_000;
 
+/// Builds, signs, reserves and broadcasts the funding transaction paying the
+/// given output; returns its outpoint. Takes the chain and wallet locks itself.
+pub type FundFn = dyn Fn(Hash256, TxOut) -> Result<OutPoint, String> + Send + Sync;
+/// Broadcasts a transaction (cooperative close, penalty, sweep) through the
+/// normal mempool and relay.
+pub type BroadcastFn = dyn Fn(&Transaction) -> Result<(), String> + Send + Sync;
+/// Yields a fresh wallet address to receive swept or claimed funds.
+pub type SweepAddrFn = dyn Fn() -> Hash256 + Send + Sync;
+
 /// What the node must do for the manager when the chain is involved.
 pub struct Hooks {
-    /// Build, sign, reserve and broadcast the funding transaction paying
-    /// `funding_output`; return its outpoint. Takes the chain and wallet locks
-    /// itself.
-    pub fund: Box<dyn Fn(Hash256, TxOut) -> Result<OutPoint, String> + Send + Sync>,
-    /// Broadcast a transaction (cooperative close, penalty, sweep) through the
-    /// normal mempool and relay.
-    pub broadcast: Box<dyn Fn(&Transaction) -> Result<(), String> + Send + Sync>,
-    /// A fresh wallet address to receive swept or claimed funds.
-    pub sweep_address: Box<dyn Fn() -> Hash256 + Send + Sync>,
+    pub fund: Box<FundFn>,
+    pub broadcast: Box<BroadcastFn>,
+    pub sweep_address: Box<SweepAddrFn>,
 }
 
 /// What handling one inbound frame produces.
