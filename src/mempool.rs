@@ -149,6 +149,72 @@ pub const MAX_USABLE_BLOCK_SIZE: usize = MAX_BLOCK_SIZE - 64 * 1024;
 /// someone with no intention of paying.
 pub const MAX_USABLE_WEIGHT: u64 = TARGET_BLOCK_WEIGHT;
 
+// --- Dormant policies: relative time locks on unconfirmed outputs --------
+//
+// An output created by a transaction still in the pool has no height yet:
+// its age is zero until its parent is in a block, and a block carrying both
+// the parent and an `Older` spend of it is invalid. Accepting such a spend
+// against the height the parent was *accepted* at let it through after one
+// block, the template then packed parent and child together, and every
+// upgraded miner built the same invalid block over and over. So an `Older`
+// spend of an unconfirmed output is refused (`TooEarly`, not penalized) and
+// waits for its parent's confirmation; revalidation evicts one that a
+// reorganization put back in that state; and the template drops any that
+// slipped through, with its descendants.
+
+/// Refuses `tx` if it spends, under a relative time lock, an output created
+/// by a transaction still in the pool.
+fn unconfirmed_relative_lock(
+    tx: &Transaction,
+    created: &HashMap<OutPoint, UtxoEntry>,
+    height: u64,
+) -> Result<(), MempoolError> {
+    for input in &tx.inputs {
+        if let Some(u) = created.get(&input.prev_out) {
+            if !unconfirmed_lock_free(u, &input.witness) {
+                return Err(MempoolError::Validation(ValidationError::Policy(
+                    crate::policy::PolicyError::TooEarly {
+                        // Unknown until the parent confirms: never before.
+                        available_at: u64::MAX,
+                        height: height + 1,
+                    },
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Can this spend of an unconfirmed output enter a block with its parent?
+fn unconfirmed_lock_free(spent: &UtxoEntry, witness: &crate::tx::Witness) -> bool {
+    crate::policy::relative_lock(&spent.output, witness) == 0
+}
+
+/// The block order minus every `Older` spend of an output of the pool, and
+/// minus what depends on one.
+fn without_unripe_policy_spends(
+    order: Vec<&MempoolEntry>,
+    created: &HashMap<OutPoint, UtxoEntry>,
+) -> Vec<Transaction> {
+    let mut dropped: HashSet<Hash256> = HashSet::new();
+    let mut out = Vec::with_capacity(order.len());
+    for e in order {
+        let unripe = e.tx.inputs.iter().any(|i| {
+            dropped.contains(&i.prev_out.txid)
+                || created
+                    .get(&i.prev_out)
+                    .is_some_and(|u| !unconfirmed_lock_free(u, &i.witness))
+        });
+        if unripe {
+            dropped.insert(e.tx.txid());
+        } else {
+            out.push(e.tx.clone());
+        }
+    }
+    out
+}
+// --- End of dormant policies ----------------------------------------------
+
 /// Does the spend of `spent` by `witness` still meet the time locks of its
 /// policy, relative and absolute, in the block after `height`?
 ///
@@ -537,6 +603,7 @@ impl Mempool {
         // used is that of the next block, since that is where this transaction
         // could get in.
         let mut seen: HashSet<OutPoint> = HashSet::new();
+        unconfirmed_relative_lock(tx, &self.created, height)?;
         let fee = validate::check_transaction(tx, &view, network, height + 1, &mut seen)?;
         let entry = MempoolEntry {
             tx: tx.clone(),
@@ -888,10 +955,8 @@ impl Mempool {
     /// Deterministic order at equal rate: without this, two miners starting
     /// from the same mempool would build different blocks for no reason.
     pub fn select_for_block(&self, max_weight: u64) -> Vec<Transaction> {
-        self.block_order(max_weight)
-            .into_iter()
-            .map(|e| e.tx.clone())
-            .collect()
+        let order = self.block_order(max_weight);
+        without_unripe_policy_spends(order, &self.created)
     }
 
     /// Identifiers to announce to a peer: the start of the block order
@@ -1081,10 +1146,10 @@ impl Mempool {
                         }
                         // Otherwise, the output must come from another
                         // transaction of the pool, still present.
-                        None => self
-                            .created
-                            .get(&input.prev_out)
-                            .is_some_and(|u| policy_locks_met(u, &input.witness, height)),
+                        None => self.created.get(&input.prev_out).is_some_and(|u| {
+                            unconfirmed_lock_free(u, &input.witness)
+                                && policy_locks_met(u, &input.witness, height)
+                        }),
                     };
                     if !available {
                         orphans.push(*id);

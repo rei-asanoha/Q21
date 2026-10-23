@@ -207,7 +207,8 @@ mod sim {
         }
 
         fn sighash(&self, tx: &Transaction, signer: usize) -> Hash256 {
-            policy::sighash(tx, 0, NET, &self.fund_out, &self.fund_p, signer as u8)
+            // The funding policy has no `Any`: no choices to sign.
+            policy::sighash(tx, 0, NET, &self.fund_out, &self.fund_p, signer as u8, &[])
         }
 
         fn complete(&self, tx: &mut Transaction, sigs: [Vec<u8>; 2], pks: [&[u8]; 2]) {
@@ -412,6 +413,7 @@ mod sim {
                 &self.ch.fund_out,
                 &self.ch.fund_p.encode(),
                 (1 - self.me) as u8,
+                &[],
                 &self.their_pk,
                 &theirs,
             )
@@ -1002,7 +1004,8 @@ mod sim {
             },
             vec![key_out(b.hash(), lout.value.units() - PENALTY_FEE)],
         );
-        let m = policy::sighash(&penalty, 0, NET, &lout, &to_local, 0);
+        // The revocation branch: choice 0 of the to_local `Any`.
+        let m = policy::sighash(&penalty, 0, NET, &lout, &to_local, 0, &[0]);
         let s = Satisfaction::Any {
             index: 0,
             branch: Box::new(Satisfaction::All(vec![

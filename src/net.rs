@@ -1981,6 +1981,13 @@ impl Node {
                 | V::SchemeForbiddenOnNetwork(_)
                 | V::DustOutput { .. },
             ) => true,
+            // A policy spend that does not satisfy its policy is made so by
+            // its author — wrong preimage, branch, lock, extra bytes — except
+            // a time lock not yet expired, which an honest relay can send a
+            // block early.
+            M::Validation(V::Policy(p)) => {
+                !matches!(p, crate::policy::PolicyError::TooEarly { .. })
+            }
             _ => false,
         }
     }
@@ -2755,7 +2762,15 @@ impl Node {
                     // never decreases). The peer will resend when its bucket
                     // refills. A really invalid transaction, on the other hand,
                     // is always penalized further down (`tx_invalid_in_itself`).
-                    let cost = (t.inputs.len() as u64).clamp(1, TX_BUCKET_MAX);
+                    // A policy input can make us verify up to eight
+                    // signatures: it is charged the keys on the path its
+                    // witness names, read without any lookup or hash.
+                    let cost = t
+                        .inputs
+                        .iter()
+                        .map(|i| crate::policy::verifications_claimed(&i.witness))
+                        .sum::<u64>()
+                        .clamp(1, TX_BUCKET_MAX);
                     let mut allowed = g
                         .peers
                         .get_mut(&id)
@@ -3793,6 +3808,35 @@ mod tests {
         let (local, bad) = (M::Validation(local), M::Validation(bad));
         assert!(!super::Node::tx_invalid_in_itself(&local));
         assert!(super::Node::tx_invalid_in_itself(&bad));
+    }
+
+    /// A policy spend that does not satisfy its policy is its author's doing
+    /// and is penalized; a time lock not yet expired is not.
+    #[test]
+    fn policy_failures_are_penalized_except_early_ones() {
+        use crate::mempool::MempoolError as M;
+        use crate::policy::PolicyError as P;
+        use crate::validate::ValidationError as V;
+        for p in [
+            P::WrongPreimage,
+            P::DoesNotMatchLock,
+            P::BadBranch { index: 3, arity: 2 },
+            P::ExtraWitnessData(1),
+            P::Malformed(crate::ser::ReadError::UnexpectedEnd),
+            P::Unsigned,
+        ] {
+            assert!(
+                super::Node::tx_invalid_in_itself(&M::Validation(V::Policy(p))),
+                "{p:?}"
+            );
+        }
+        let early = P::TooEarly {
+            available_at: 10,
+            height: 9,
+        };
+        assert!(!super::Node::tx_invalid_in_itself(&M::Validation(
+            V::Policy(early)
+        )));
     }
 
     /// ML-DSA is compiled by default: a bare `cargo build` gives a node that

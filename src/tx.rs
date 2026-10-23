@@ -267,8 +267,11 @@ impl Transaction {
     ///   signature for one must not open the other. The position determines
     ///   every `Any` choice above the leaf, so it pins the branch as well.
     ///
-    /// Choices made elsewhere in the tree (in a sibling of an `All`) are not
-    /// signed: each key commits to its own path, not to its co-signers'.
+    /// - **every `Any` choice of the satisfaction**, in the order it states
+    ///   them — not only those above the leaf. Without the choices made in a
+    ///   sibling of an `All`, a co-signer or a relay could swap that sibling's
+    ///   branch: same txid, another witness of another size, so another fee
+    ///   rate and a compact block that no longer matches.
     ///
     /// [`Self::sighash`] is left exactly as it was, so spends of key outputs
     /// are unchanged.
@@ -279,6 +282,7 @@ impl Transaction {
         spent: &TxOut,
         policy: &[u8],
         leaf: u8,
+        choices: &[u8],
     ) -> Hash256 {
         policy_sighash_of_stripped(
             &self.encode_without_witness(),
@@ -287,6 +291,7 @@ impl Transaction {
             spent,
             policy,
             leaf,
+            choices,
         )
     }
 
@@ -371,6 +376,7 @@ pub fn policy_sighash_of_stripped(
     spent: &TxOut,
     policy: &[u8],
     leaf: u8,
+    choices: &[u8],
 ) -> Hash256 {
     let mut head = Writer::with_capacity(16);
     head.var_bytes(network.hrp().as_bytes());
@@ -381,6 +387,7 @@ pub fn policy_sighash_of_stripped(
     tail.bytes(spent.pubkey_hash.as_bytes());
     tail.var_bytes(policy);
     tail.u8(leaf);
+    tail.var_bytes(choices);
     tagged_hash_parts(
         tags::POLICY_SIGHASH,
         &[head.as_slice(), stripped, tail.as_slice()],
@@ -521,27 +528,36 @@ mod tests {
     fn policy_sighash_binds_policy_and_leaf() {
         let tx = simple_tx();
         let d = spent();
-        let base = tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0);
+        let base = tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0, &[]);
         assert_ne!(base, tx.sighash(0, Network::Regtest, &d));
         assert_ne!(
             base,
-            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 1)
+            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 1, &[])
         );
         assert_ne!(
             base,
-            tx.policy_sighash(0, Network::Regtest, &d, b"policz", 0)
+            tx.policy_sighash(0, Network::Regtest, &d, b"policz", 0, &[])
         );
         assert_ne!(
             base,
-            tx.policy_sighash(1, Network::Regtest, &d, b"policy", 0)
+            tx.policy_sighash(1, Network::Regtest, &d, b"policy", 0, &[])
         );
         assert_ne!(
             base,
-            tx.policy_sighash(0, Network::Testnet, &d, b"policy", 0)
+            tx.policy_sighash(0, Network::Testnet, &d, b"policy", 0, &[])
         );
         assert_eq!(
             base,
-            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0)
+            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0, &[])
+        );
+        // The Any choices of the whole satisfaction are signed.
+        assert_ne!(
+            base,
+            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0, &[0])
+        );
+        assert_ne!(
+            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0, &[0, 1]),
+            tx.policy_sighash(0, Network::Regtest, &d, b"policy", 0, &[0, 0])
         );
 
         // The message is the tagged hash of one contiguous byte string,
@@ -555,6 +571,7 @@ mod tests {
         w.bytes(d.pubkey_hash.as_bytes());
         w.var_bytes(b"policy");
         w.u8(0);
+        w.var_bytes(&[]);
         assert_eq!(base, tagged_hash(tags::POLICY_SIGHASH, w.as_slice()));
     }
 

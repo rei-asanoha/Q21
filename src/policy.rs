@@ -137,6 +137,14 @@ pub enum PolicyError {
     ExtraWitnessData(usize),
     /// The leaf named by a lone signature check is not a key leaf.
     NotAKeyLeaf(u8),
+    /// A key leaf of a one-time scheme (Lamport): a policy output can be
+    /// spent along several paths and its keys signed more than once, which a
+    /// one-time key cannot survive.
+    OneTimeKey(u8),
+    /// A path that some satisfaction can take without any key: once its
+    /// preimage is public, or its time lock past, anyone could spend it, and
+    /// anyone relaying the spend could redirect it.
+    Unsigned,
 }
 
 impl From<ReadError> for PolicyError {
@@ -237,7 +245,51 @@ impl Policy {
         if r.remaining() != 0 {
             return Err(PolicyError::TrailingPolicyBytes(r.remaining()));
         }
+        if !p.always_signed() {
+            return Err(PolicyError::Unsigned);
+        }
         Ok(p)
+    }
+
+    /// Does every way of satisfying this policy require a signature? An
+    /// `All` needs one of its children to; an `Any`, every child.
+    pub fn always_signed(&self) -> bool {
+        match self {
+            Policy::Key { .. } => true,
+            Policy::Preimage(_) | Policy::Older(_) | Policy::After(_) => false,
+            Policy::All(c) => c.iter().any(Policy::always_signed),
+            Policy::Any(c) => c.iter().all(Policy::always_signed),
+        }
+    }
+
+    /// The `Any` choices leading to leaf `leaf`, in the order a satisfaction
+    /// states them: what a signer passes to [`sighash`] when every `Any` of
+    /// the policy lies on the path to its leaf, as in all the channel shapes.
+    /// Otherwise the signer takes them from the satisfaction it will use
+    /// ([`Satisfaction::choices`]).
+    pub fn choices_to(&self, leaf: u8) -> Vec<u8> {
+        fn go(p: &Policy, leaf: u8, pos: &mut u8, out: &mut Vec<u8>) -> bool {
+            match p {
+                Policy::All(c) => c.iter().any(|c| go(c, leaf, pos, out)),
+                Policy::Any(c) => {
+                    for (i, child) in c.iter().enumerate() {
+                        out.push(i as u8);
+                        if go(child, leaf, pos, out) {
+                            return true;
+                        }
+                        out.pop();
+                    }
+                    false
+                }
+                _ => {
+                    *pos += 1;
+                    *pos - 1 == leaf
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(self, leaf, &mut 0, &mut out);
+        out
     }
 
     fn read(r: &mut Reader<'_>, depth: usize, leaves: &mut usize) -> Result<Policy, PolicyError> {
@@ -262,6 +314,9 @@ impl Policy {
                 let scheme = SchemeId::from_u8(raw)
                     .filter(|s| SchemeId::ALL.contains(s))
                     .ok_or(PolicyError::NotAKeyScheme(raw))?;
+                if scheme.is_one_time() {
+                    return Err(PolicyError::OneTimeKey(raw));
+                }
                 let pubkey_hash = Hash256(r.array32()?);
                 leaf()?;
                 Ok(Policy::Key {
@@ -360,6 +415,24 @@ fn lock_hash_of(policy_bytes: &[u8]) -> Hash256 {
 }
 
 impl Satisfaction {
+    /// Every `Any` choice of this satisfaction, in the order it states them:
+    /// what each key signs along with its leaf ([`sighash`]).
+    pub fn choices(&self) -> Vec<u8> {
+        fn go(s: &Satisfaction, out: &mut Vec<u8>) {
+            match s {
+                Satisfaction::All(c) => c.iter().for_each(|c| go(c, out)),
+                Satisfaction::Any { index, branch } => {
+                    out.push(*index);
+                    go(branch, out);
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        go(self, &mut out);
+        out
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         self.write(&mut w);
@@ -392,8 +465,8 @@ pub fn witness(policy: &Policy, satisfaction: &Satisfaction) -> Witness {
     }
 }
 
-/// The message the key at leaf `leaf` signs. See
-/// [`Transaction::policy_sighash`].
+/// The message the key at leaf `leaf` signs, for a satisfaction making the
+/// `Any` choices `choices`. See [`Transaction::policy_sighash`].
 pub fn sighash(
     tx: &Transaction,
     input_index: u32,
@@ -401,8 +474,9 @@ pub fn sighash(
     spent: &TxOut,
     policy: &Policy,
     leaf: u8,
+    choices: &[u8],
 ) -> Hash256 {
-    tx.policy_sighash(input_index, network, spent, &policy.encode(), leaf)
+    tx.policy_sighash(input_index, network, spent, &policy.encode(), leaf, choices)
 }
 
 /// A key the chosen path requires, as read from the satisfaction.
@@ -422,6 +496,8 @@ struct Path<'a> {
     min_age: u64,
     /// Largest `After` on the chosen path; zero when there is none.
     min_height: u64,
+    /// Every `Any` choice, in the order the satisfaction states them.
+    choices: Vec<u8>,
 }
 
 impl Path<'_> {
@@ -488,6 +564,7 @@ fn walk<'a>(
         }
         Policy::Any(children) => {
             let index = r.u8()?;
+            path.choices.push(index);
             if usize::from(index) >= children.len() {
                 return Err(PolicyError::BadBranch {
                     index,
@@ -527,6 +604,7 @@ fn read_spend<'a>(spent: &TxOut, witness: &'a Witness) -> Result<(Policy, Path<'
         keys: Vec::new(),
         min_age: 0,
         min_height: 0,
+        choices: Vec::new(),
     };
     walk(&policy, &mut r, &mut 0, &mut path)?;
     if r.remaining() != 0 {
@@ -567,6 +645,46 @@ pub fn check_spend(
     height: u64,
     witness: &Witness,
 ) -> Result<(), ValidationError> {
+    let path = precheck(network, spent, height, witness)?;
+
+    // The stripped transaction is the bulk of every message: encoded once
+    // for all the keys of this input, not once per key.
+    let stripped = tx.encode_without_witness();
+    for k in &path.keys {
+        let message = crate::tx::policy_sighash_of_stripped(
+            &stripped,
+            input_index,
+            network,
+            &spent.output,
+            &witness.pubkey,
+            k.leaf,
+            &path.choices,
+        );
+        sig::verify(k.scheme, k.pubkey, &message, k.signature)
+            .map_err(ValidationError::Signature)?;
+    }
+    Ok(())
+}
+
+/// Everything [`check_spend`] checks short of the signatures: lock,
+/// decoding, branches, preimages, time locks, schemes, key hashes. A
+/// validator runs it on every policy input before verifying any signature,
+/// so that a transaction whose last input is malformed costs nothing.
+pub fn precheck_spend(
+    network: Network,
+    spent: &UtxoEntry,
+    height: u64,
+    witness: &Witness,
+) -> Result<(), ValidationError> {
+    precheck(network, spent, height, witness).map(|_| ())
+}
+
+fn precheck<'a>(
+    network: Network,
+    spent: &UtxoEntry,
+    height: u64,
+    witness: &'a Witness,
+) -> Result<Path<'a>, ValidationError> {
     let (_, path) = read_spend(&spent.output, witness).map_err(ValidationError::Policy)?;
 
     let available_at = path.available_at(spent.height);
@@ -585,23 +703,7 @@ pub fn check_spend(
             return Err(ValidationError::KeyDoesNotMatchLock);
         }
     }
-
-    // The stripped transaction is the bulk of every message: encoded once
-    // for all the keys of this input, not once per key.
-    let stripped = tx.encode_without_witness();
-    for k in &path.keys {
-        let message = crate::tx::policy_sighash_of_stripped(
-            &stripped,
-            input_index,
-            network,
-            &spent.output,
-            &witness.pubkey,
-            k.leaf,
-        );
-        sig::verify(k.scheme, k.pubkey, &message, k.signature)
-            .map_err(ValidationError::Signature)?;
-    }
-    Ok(())
+    Ok(path)
 }
 
 /// Checks ONE key's signature, for leaf `leaf` of `policy`, on input
@@ -620,6 +722,7 @@ pub fn check_signature(
     spent: &TxOut,
     policy: &[u8],
     leaf: u8,
+    choices: &[u8],
     pubkey: &[u8],
     signature: &[u8],
 ) -> Result<(), ValidationError> {
@@ -647,8 +750,51 @@ pub fn check_signature(
     if sig::pubkey_hash(scheme, pubkey) != hash {
         return Err(ValidationError::KeyDoesNotMatchLock);
     }
-    let message = tx.policy_sighash(input_index, network, spent, policy, leaf);
+    if choices.len() > MAX_POLICY_LEAVES {
+        return Err(p(PolicyError::TooManyLeaves));
+    }
+    let message = tx.policy_sighash(input_index, network, spent, policy, leaf, choices);
     sig::verify(scheme, pubkey, &message, signature).map_err(ValidationError::Signature)
+}
+
+/// The relative time lock (`Older`) the chosen path of a policy spend
+/// requires, in blocks; zero for anything else.
+///
+/// The mempool refuses a spend that needs one while the spent output is
+/// itself unconfirmed: its age is zero until the parent is in a block, and
+/// the block that would carry both would be invalid.
+pub fn relative_lock(spent: &TxOut, witness: &Witness) -> u64 {
+    if spent.scheme != SchemeId::Policy {
+        return 0;
+    }
+    read_spend(spent, witness).map_or(0, |(_, path)| path.min_age)
+}
+
+/// How many signature verifications this witness can make a validator do:
+/// the keys on the path a policy satisfaction names, one for anything else.
+///
+/// Read from the witness alone, without the spent output, for the relay
+/// budget, which is charged before any lookup. A witness that is not a
+/// readable policy spend costs one, as a plain spend does: if it does lock a
+/// policy output, it fails before any verification.
+pub fn verifications_claimed(witness: &Witness) -> u64 {
+    if witness.pubkey.len() > MAX_POLICY_SIZE {
+        return 1;
+    }
+    let Ok(policy) = Policy::decode(&witness.pubkey) else {
+        return 1;
+    };
+    let mut r = Reader::new(&witness.signature);
+    let mut path = Path {
+        keys: Vec::new(),
+        min_age: 0,
+        min_height: 0,
+        choices: Vec::new(),
+    };
+    if walk(&policy, &mut r, &mut 0, &mut path).is_err() {
+        return 1;
+    }
+    (path.keys.len() as u64).max(1)
 }
 
 /// First block height at which the time locks of an already validated
@@ -748,6 +894,67 @@ mod tests {
         assert!(Satisfaction::After.encode().is_empty());
     }
 
+    /// Lamport keys are one-time: never in a policy, whose keys can sign
+    /// along several paths.
+    #[test]
+    fn one_time_keys_are_refused_in_policies() {
+        let lamport = Policy::All(vec![
+            Policy::Key {
+                scheme: SchemeId::LamportOts,
+                pubkey_hash: h(1),
+            },
+            key_leaf(2),
+        ]);
+        assert_eq!(
+            Policy::decode(&lamport.encode()),
+            Err(PolicyError::OneTimeKey(SchemeId::LamportOts.as_u8()))
+        );
+    }
+
+    /// Every way through a policy needs a key: a path of preimages and time
+    /// locks alone is anyone's once the secret is out or the lock past.
+    #[test]
+    fn keyless_paths_are_refused() {
+        for p in [
+            Policy::Preimage(h(9)),
+            Policy::Any(vec![key_leaf(1), Policy::Preimage(h(9))]),
+            Policy::All(vec![Policy::Preimage(h(9)), Policy::Older(5)]),
+            Policy::Any(vec![
+                Policy::All(vec![key_leaf(2), Policy::Preimage(h(9))]),
+                Policy::After(100),
+            ]),
+        ] {
+            assert_eq!(
+                Policy::decode(&p.encode()),
+                Err(PolicyError::Unsigned),
+                "{p:?}"
+            );
+        }
+        assert!(htlc().always_signed());
+        assert!(Policy::All(vec![key_leaf(1), Policy::Older(5)]).always_signed());
+    }
+
+    /// The `Any` choices a signer of each leaf commits to.
+    #[test]
+    fn choices_to_a_leaf() {
+        assert_eq!(htlc().choices_to(0), vec![0]);
+        assert_eq!(htlc().choices_to(2), vec![1]);
+        assert!(Policy::All(vec![key_leaf(1), key_leaf(2)])
+            .choices_to(1)
+            .is_empty());
+        let s = Satisfaction::All(vec![
+            Satisfaction::Older,
+            Satisfaction::Any {
+                index: 1,
+                branch: Box::new(Satisfaction::Any {
+                    index: 0,
+                    branch: Box::new(Satisfaction::After),
+                }),
+            },
+        ]);
+        assert_eq!(s.choices(), vec![1, 0]);
+    }
+
     #[test]
     fn non_canonical_policies_are_refused() {
         // A single-child combinator: the child spelled differently.
@@ -818,7 +1025,7 @@ mod tests {
         }
         assert_eq!(Policy::decode(&deep.encode()), Err(PolicyError::TooDeep));
         // Depth four is fine.
-        let mut ok = Policy::All(vec![Policy::Older(1), Policy::Older(2)]);
+        let mut ok = Policy::All(vec![key_leaf(1), Policy::Older(2)]);
         for _ in 0..2 {
             ok = Policy::All(vec![ok, Policy::Older(3)]);
         }
@@ -933,7 +1140,15 @@ mod spend_tests {
     fn sign_leaf(tx: &Transaction, e: &UtxoEntry, p: &Policy, leaf: u8, k: &Key) -> Satisfaction {
         Satisfaction::Key {
             pubkey: k.pk.clone(),
-            signature: k.sign(&sighash(tx, 0, NET, &e.output, p, leaf)),
+            signature: k.sign(&sighash(
+                tx,
+                0,
+                NET,
+                &e.output,
+                p,
+                leaf,
+                &p.choices_to(leaf),
+            )),
         }
     }
 
@@ -1115,9 +1330,9 @@ mod spend_tests {
         let (_, op, e) = fixture(&p);
         let tx = spend(op, vec![b.output(VALUE - 20_000)]);
         let pb = p.encode();
-        let sig_b = b.sign(&sighash(&tx, 0, NET, &e.output, &p, 1));
+        let sig_b = b.sign(&sighash(&tx, 0, NET, &e.output, &p, 1, &[]));
         let lone = |tx: &Transaction, out: &TxOut, pol: &[u8], leaf: u8, sig: &[u8]| {
-            check_signature(tx, 0, NET, out, pol, leaf, &b.pk, sig)
+            check_signature(tx, 0, NET, out, pol, leaf, &[], &b.pk, sig)
         };
         assert_eq!(lone(&tx, &e.output, &pb, 1, &sig_b), Ok(()));
         // Another leaf: A's slot (key mismatch), or a leaf that is no key.
@@ -1150,7 +1365,17 @@ mod spend_tests {
         // Not a policy output at all, or not on a network where it is active.
         assert!(lone(&tx, &b.output(VALUE), &pb, 1, &sig_b).is_err());
         assert_eq!(
-            check_signature(&tx, 0, Network::Testnet, &e.output, &pb, 1, &b.pk, &sig_b),
+            check_signature(
+                &tx,
+                0,
+                Network::Testnet,
+                &e.output,
+                &pb,
+                1,
+                &[],
+                &b.pk,
+                &sig_b
+            ),
             Err(ValidationError::SchemeForbiddenOnNetwork(SchemeId::Policy))
         );
     }
@@ -1376,11 +1601,18 @@ mod spend_tests {
     fn extra_or_malformed_witness_data_is_refused() {
         let a = Key::new(1);
         let (secret, hash) = preimage(6);
-        let p = Policy::Any(vec![a.leaf(), Policy::Preimage(hash)]);
-        let (u, op, _) = fixture(&p);
+        let p = Policy::Any(vec![
+            a.leaf(),
+            Policy::All(vec![a.leaf(), Policy::Preimage(hash)]),
+        ]);
+        let (u, op, e) = fixture(&p);
         let mut tx = spend(op, vec![a.output(VALUE - 20_000)]);
+        let branch = Satisfaction::All(vec![
+            sign_leaf(&tx, &e, &p, 1, &a),
+            Satisfaction::Preimage(secret),
+        ]);
 
-        let good = witness(&p, &any(1, Satisfaction::Preimage(secret)));
+        let good = witness(&p, &any(1, branch.clone()));
         tx.inputs[0].witness = good.clone();
         assert!(check(&u, &tx, NET, BORN + 1).is_ok());
 
@@ -1410,7 +1642,7 @@ mod spend_tests {
         );
 
         // A branch that does not exist.
-        tx.inputs[0].witness = witness(&p, &any(2, Satisfaction::Preimage(secret)));
+        tx.inputs[0].witness = witness(&p, &any(2, branch));
         assert_eq!(
             check(&u, &tx, NET, BORN + 1),
             pol(PolicyError::BadBranch { index: 2, arity: 2 })
@@ -1465,7 +1697,7 @@ mod spend_tests {
     fn activation_gates_creation_and_spending() {
         let a = Key::new(1);
         let (secret, hash) = preimage(6);
-        let p = Policy::Any(vec![a.leaf(), Policy::Preimage(hash)]);
+        let p = Policy::All(vec![a.leaf(), Policy::Preimage(hash)]);
 
         // Creating a policy output: refused on the live networks at any
         // height, and on regtest below the activation height.
@@ -1507,9 +1739,13 @@ mod spend_tests {
         }
 
         // Spending one that somehow exists: refused as well.
-        let (u, op, _) = fixture(&p);
+        let (u, op, e) = fixture(&p);
         let mut tx = spend(op, vec![a.output(VALUE - 20_000)]);
-        tx.inputs[0].witness = witness(&p, &any(1, Satisfaction::Preimage(secret)));
+        let s = Satisfaction::All(vec![
+            sign_leaf(&tx, &e, &p, 0, &a),
+            Satisfaction::Preimage(secret),
+        ]);
+        tx.inputs[0].witness = witness(&p, &s);
         assert!(check(&u, &tx, NET, BORN + 1).is_ok());
         for net in [Network::Testnet, Network::Mainnet] {
             assert_eq!(
@@ -1700,7 +1936,7 @@ mod spend_tests {
     fn sign_out(tx: &Transaction, spent: &TxOut, p: &Policy, leaf: u8, k: &Key) -> Satisfaction {
         Satisfaction::Key {
             pubkey: k.pk.clone(),
-            signature: k.sign(&sighash(tx, 0, NET, spent, p, leaf)),
+            signature: k.sign(&sighash(tx, 0, NET, spent, p, leaf, &p.choices_to(leaf))),
         }
     }
 
@@ -2110,6 +2346,185 @@ mod spend_tests {
         assert!(
             !m.contains(&id),
             "its Older spend cannot enter the next block"
+        );
+    }
+
+    // --- Review fixes ---------------------------------------------------
+
+    /// A co-signer cannot swap the branch of an `Any` inside a sibling of an
+    /// `All`: every key signs all the choices of the satisfaction.
+    #[test]
+    fn a_co_signer_cannot_swap_a_sibling_branch() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let (secret, hash) = preimage(7);
+        // Leaves: A 0, B 1, B 2, preimage 3.
+        let p = Policy::All(vec![
+            a.leaf(),
+            Policy::Any(vec![
+                b.leaf(),
+                Policy::All(vec![b.leaf(), Policy::Preimage(hash)]),
+            ]),
+        ]);
+        let (u, op, e) = fixture(&p);
+        let mut tx = spend(op, vec![a.output(VALUE - 20_000)]);
+        let sig = |k: &Key, leaf: u8, choices: &[u8]| Satisfaction::Key {
+            pubkey: k.pk.clone(),
+            signature: k.sign(&sighash(&tx, 0, NET, &e.output, &p, leaf, choices)),
+        };
+        // A signs the spend through B's plain branch; B could later sign the
+        // other branch alone.
+        let a_for_0 = sig(&a, 0, &[0]);
+        let b_plain = sig(&b, 1, &[0]);
+        let b_other = sig(&b, 2, &[1]);
+        let first = Satisfaction::All(vec![a_for_0.clone(), any(0, b_plain)]);
+        // B re-signs the other branch alone: same txid, another witness.
+        let swapped = Satisfaction::All(vec![
+            a_for_0,
+            any(
+                1,
+                Satisfaction::All(vec![b_other, Satisfaction::Preimage(secret)]),
+            ),
+        ]);
+        tx.inputs[0].witness = witness(&p, &first);
+        assert!(check(&u, &tx, NET, BORN + 1).is_ok());
+        tx.inputs[0].witness = witness(&p, &swapped);
+        assert_eq!(
+            check(&u, &tx, NET, BORN + 1),
+            Err(ValidationError::Signature(VerifyError::InvalidSignature))
+        );
+    }
+
+    /// Cheap policy checks of every input come before any signature: a
+    /// malformed policy input after a plain one with a bad signature is
+    /// reported as the policy failure, without the verification.
+    #[test]
+    fn policy_inputs_are_prechecked_before_any_signature() {
+        let a = Key::new(1);
+        let (_, hash) = preimage(8);
+        let p = Policy::All(vec![a.leaf(), Policy::Preimage(hash)]);
+        let (mut u, op, e) = fixture(&p);
+        let plain = OutPoint {
+            txid: Hash256([0x77; 32]),
+            index: 0,
+        };
+        u.insert(
+            plain,
+            UtxoEntry {
+                output: a.output(VALUE),
+                height: BORN,
+                is_coinbase: false,
+            },
+        );
+        let mut tx = spend(plain, vec![a.output(2 * VALUE - 40_000)]);
+        tx.inputs.push(TxIn {
+            prev_out: op,
+            witness: Witness::default(),
+            sequence: u32::MAX,
+        });
+        tx.inputs[0].witness = Witness {
+            pubkey: a.pk.clone(),
+            signature: vec![0; SchemeId::MlDsa87.sig_len()],
+        };
+        let wrong = Satisfaction::All(vec![
+            Satisfaction::Key {
+                pubkey: a.pk.clone(),
+                signature: a.sign(&sighash(&tx, 1, NET, &e.output, &p, 0, &[])),
+            },
+            Satisfaction::Preimage([0xee; 32]),
+        ]);
+        tx.inputs[1].witness = witness(&p, &wrong);
+        assert_eq!(
+            check(&u, &tx, NET, BORN + 1),
+            pol(PolicyError::WrongPreimage)
+        );
+    }
+
+    /// The relay budget charges a policy input the keys on its path.
+    #[test]
+    fn relay_cost_counts_the_keys_of_the_path() {
+        let (a, b) = (Key::new(1), Key::new(2));
+        let p = Policy::All(vec![a.leaf(), b.leaf()]);
+        let (_, op, e) = fixture(&p);
+        let tx = spend(op, vec![a.output(VALUE - 20_000)]);
+        let s = Satisfaction::All(vec![
+            sign_leaf(&tx, &e, &p, 0, &a),
+            sign_leaf(&tx, &e, &p, 1, &b),
+        ]);
+        assert_eq!(verifications_claimed(&witness(&p, &s)), 2);
+        let plain = Witness {
+            pubkey: a.pk.clone(),
+            signature: vec![0; SchemeId::MlDsa87.sig_len()],
+        };
+        assert_eq!(verifications_claimed(&plain), 1);
+        assert_eq!(verifications_claimed(&Witness::default()), 1);
+    }
+
+    /// The defect of the review: a parent paying little creates an `Older(1)`
+    /// output and waits in the pool; one block later its child was accepted
+    /// (the age was counted from the parent's acceptance), and the template
+    /// put both in one block, invalid. The child now waits for its parent's
+    /// confirmation, and a block carrying both is named as invalid at the
+    /// child, which the miner drops.
+    #[test]
+    fn an_older_spend_of_an_unconfirmed_output_waits() {
+        let a = Key::new(1);
+        let mut r = Regtest::new(&a);
+        let p = Policy::All(vec![a.leaf(), Policy::Older(1)]);
+        let parent = {
+            let (coin, coin_out) = r.coin(206);
+            plain_spend(
+                coin,
+                &coin_out,
+                &a,
+                vec![p.output(units(coin_out.value.units() - FEE))],
+            )
+        };
+        let (op, o) = out(&parent, 0);
+        let mut child = spend(op, vec![a.output(o.value.units() - FEE)]);
+        let s = Satisfaction::All(vec![sign_out(&child, &o, &p, 0, &a), Satisfaction::Older]);
+        child.inputs[0].witness = witness(&p, &s);
+
+        let mut m = Mempool::new();
+        m.accept(&parent, &r.c.utxo, NET, r.height())
+            .expect("parent");
+        let early = |m: &mut Mempool, r: &Regtest| {
+            matches!(
+                m.accept(&child, &r.c.utxo, NET, r.height()),
+                Err(MempoolError::Validation(ValidationError::Policy(
+                    PolicyError::TooEarly { .. }
+                )))
+            )
+        };
+        assert!(early(&mut m, &r), "parent unconfirmed");
+        // One block without the parent: still unconfirmed, still refused.
+        r.mine(&[]).unwrap();
+        m.revalidate(&r.c.utxo, NET, r.height());
+        assert!(
+            early(&mut m, &r),
+            "one block later, parent still unconfirmed"
+        );
+        assert!(!m
+            .select_for_block(u64::MAX)
+            .iter()
+            .any(|t| t.txid() == child.txid()));
+
+        // A block that carries both is invalid at the child.
+        let (b, _) = r.candidate(&[parent.clone(), child.clone()]);
+        let (i, why) =
+            crate::validate::first_invalid_transaction(&b, &r.c.utxo, NET, r.height() + 1)
+                .expect("the child is invalid where it stands");
+        assert_eq!(b.transactions[i].txid(), child.txid());
+        assert!(matches!(
+            why,
+            ValidationError::Policy(PolicyError::TooEarly { .. })
+        ));
+
+        // Once the parent is in a block, the child enters the pool.
+        r.mine(from_ref(&parent)).unwrap();
+        m.on_block_connected(r.blocks.last().unwrap());
+        assert_eq!(
+            m.accept(&child, &r.c.utxo, NET, r.height()),
+            Ok(child.txid())
         );
     }
 

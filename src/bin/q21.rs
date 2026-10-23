@@ -5780,14 +5780,37 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 // a side block. The network announcement stays outside the
                 // lock.
                 let ok = node.with_chain_and_mempool(|c, m| {
-                    if c.connect(&b, unix_now()).is_ok() {
-                        // The write goes through the journal, as for any
-                        // accepted block: a single path to the disk.
-                        q21_core::chain::Journal::record(archive.as_ref(), &b);
-                        m.on_block_connected(&b);
-                        true
-                    } else {
-                        false
+                    match c.connect(&b, unix_now()) {
+                        Ok(_) => {
+                            // The write goes through the journal, as for any
+                            // accepted block: a single path to the disk.
+                            q21_core::chain::Journal::record(archive.as_ref(), &b);
+                            m.on_block_connected(&b);
+                            true
+                        }
+                        Err(e) => {
+                            // Our own block refused: a transaction of the
+                            // template is invalid where it stands. Built
+                            // again from the same pool, the next round
+                            // would be refused the same way, forever. Say
+                            // it loudly, and drop that transaction (with
+                            // its descendants) from the pool.
+                            eprintln!(
+                                "error: this node's own block at height {} was refused: {e:?}",
+                                b.header.height
+                            );
+                            if let Some((i, why)) = q21_core::validate::first_invalid_transaction(
+                                &b,
+                                &c.utxo,
+                                c.network,
+                                b.header.height,
+                            ) {
+                                let id = b.transactions[i].txid();
+                                eprintln!("error: transaction {id} dropped from the pool: {why:?}");
+                                m.remove(&id);
+                            }
+                            false
+                        }
                     }
                 });
                 if ok {

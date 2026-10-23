@@ -365,6 +365,20 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
 
     let mut total_inputs: u64 = 0;
 
+    // --- Rule: every policy input passes its cheap checks — lock,
+    //     decoding, branches, preimages, time locks, keys — before any
+    //     signature of the transaction is verified. Otherwise a malformed
+    //     last input made a node verify every signature before it.
+    for input in &tx.inputs {
+        if let Some(e) = utxo.lookup(&input.prev_out) {
+            if e.output.scheme == SchemeId::Policy
+                && policy::scheme_allowed(e.output.scheme, network, height)
+            {
+                policy::precheck_spend(network, &e, height, &input.witness)?;
+            }
+        }
+    }
+
     for (i, input) in tx.inputs.iter().enumerate() {
         // --- Rule: never the same output twice, neither in this block nor
         //     elsewhere.
@@ -478,6 +492,33 @@ impl UtxoView for BlockView<'_> {
             .copied()
             .or_else(|| self.confirmed.lookup(o))
     }
+}
+
+/// The first transaction of `block` (index in the block, never the
+/// coinbase) that is invalid where it stands, against `utxo` and the outputs
+/// of the transactions before it, as [`check_block`] sees them.
+///
+/// For a miner whose own block was refused: it names the transaction to drop
+/// from the pool, instead of building the same invalid block again.
+pub fn first_invalid_transaction(
+    block: &Block,
+    utxo: &UtxoSet,
+    network: Network,
+    height: u64,
+) -> Option<(usize, ValidationError)> {
+    let mut already_seen: HashSet<OutPoint> = HashSet::new();
+    let mut view = BlockView {
+        confirmed: utxo,
+        created: HashMap::new(),
+        spent: HashSet::new(),
+    };
+    for (i, tx) in block.transactions.iter().enumerate().skip(1) {
+        if let Err(e) = check_transaction(tx, &view, network, height, &mut already_seen) {
+            return Some((i, e));
+        }
+        view.apply(tx, height);
+    }
+    None
 }
 
 /// Validates a full block.
