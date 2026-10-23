@@ -66,6 +66,9 @@ pub enum Record {
     RevocationSent { state: u64 },
     /// We hold the counterparty's revocation secret for `state`.
     RevocationRecv { state: u64, secret: [u8; 32] },
+    /// The counterparty announced its revocation point for `state`. Persisted
+    /// so a resend after a crash can rebuild the counterparty's commitment.
+    TheirPoint { state: u64, point: Hash256 },
     /// The funding is buried to the agreed depth; the channel is open.
     Ready,
     /// A cooperative close was agreed at `fee`.
@@ -89,6 +92,7 @@ const R_CLOSING_COOP: u8 = 8;
 const R_FORCING: u8 = 9;
 const R_PENALISED: u8 = 10;
 const R_CLOSED: u8 = 11;
+const R_THEIR_POINT: u8 = 12;
 
 impl Record {
     fn encode(&self) -> Vec<u8> {
@@ -134,6 +138,9 @@ impl Record {
             }
             Record::RevocationRecv { state, secret } => {
                 w.u8(R_REVOCATION_RECV).u64(*state).bytes(secret);
+            }
+            Record::TheirPoint { state, point } => {
+                w.u8(R_THEIR_POINT).u64(*state).bytes(point.as_bytes());
             }
             Record::Ready => {
                 w.u8(R_READY);
@@ -203,6 +210,10 @@ impl Record {
             R_REVOCATION_RECV => Record::RevocationRecv {
                 state: r.u64()?,
                 secret: r.array32()?,
+            },
+            R_THEIR_POINT => Record::TheirPoint {
+                state: r.u64()?,
+                point: Hash256(r.array32()?),
             },
             R_READY => Record::Ready,
             R_CLOSING_COOP => Record::ClosingCoop { fee: r.u64()? },

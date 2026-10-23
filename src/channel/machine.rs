@@ -101,6 +101,15 @@ pub fn channel_id(funding: &[Hash256; 2]) -> Hash256 {
     )
 }
 
+/// The message a reestablish proof signs: the channel, the sender's nonce, and
+/// the sender's direction.
+fn reestablish_message(channel_id: Hash256, nonce: [u8; 32], direction: u8) -> Hash256 {
+    tagged_hash_parts(
+        TAG_REESTABLISH,
+        &[channel_id.as_bytes(), &nonce, &[direction]],
+    )
+}
+
 /// One running channel.
 pub struct Machine {
     params: ChannelParams,
@@ -240,7 +249,7 @@ impl Machine {
             *funding_depth,
             base_fee_rate,
         )?;
-        m.record_their_points(first_hashes);
+        m.record_their_points(first_hashes)?;
         let accept = Message::Accept {
             acceptor_pubkey: our_pubkey,
             first_hashes: vec![m.our_point(0), m.our_point(1)],
@@ -320,10 +329,15 @@ impl Machine {
         Hash256(sha256(&self.our_secret(n)))
     }
 
-    fn record_their_points(&mut self, hashes: &[Hash256]) {
+    fn record_their_points(&mut self, hashes: &[Hash256]) -> Result<(), ChannelError> {
         for (i, h) in hashes.iter().enumerate() {
+            self.journal.append(&Record::TheirPoint {
+                state: i as u64,
+                point: *h,
+            })?;
             self.their_points.insert(i as u64, *h);
         }
+        Ok(())
     }
 
     // --- Fees ----------------------------------------------------------------
@@ -446,7 +460,7 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         }
         self.their_pubkey = acceptor_pubkey.clone();
-        self.record_their_points(first_hashes);
+        self.record_their_points(first_hashes)?;
         Ok(())
     }
 
@@ -690,6 +704,12 @@ impl Machine {
         self.store
             .insert(rev.secret, shachain::MAX_INDEX - m)
             .map_err(|_| ChannelError::BadRevocation)?;
+        // Persist the newly announced point before recording the revocation,
+        // so a crash never loses a point a resend would need.
+        self.journal.append(&Record::TheirPoint {
+            state: m + 2,
+            point: rev.next_hash,
+        })?;
         self.their_points.remove(&m);
         self.their_points.insert(m + 2, rev.next_hash);
         self.persist_revocation_recv(m, rev.secret)?;
@@ -980,6 +1000,10 @@ impl Machine {
                 Record::RevocationRecv { state, secret } => {
                     self.revocations_recv = Some(*state);
                     let _ = self.store.insert(*secret, shachain::MAX_INDEX - *state);
+                    self.their_points.remove(state);
+                }
+                Record::TheirPoint { state, point } => {
+                    self.their_points.insert(*state, *point);
                 }
                 Record::Ready => self.phase = Phase::Open,
                 Record::ClosingCoop { .. } => self.phase = Phase::Closing,
@@ -994,23 +1018,21 @@ impl Machine {
         if self.phase == Phase::Opening && self.local_commit_number == Some(0) {
             self.phase = Phase::Funded;
         }
-        // Rebuild the counterparty's announced points for the states still in
-        // play: the next unrevealed state and the one after.
-        let next_recv = self.revocations_recv.map_or(0, |m| m + 1);
-        // Points for states >= next_recv are not reconstructable from secrets;
-        // they were announced over the wire. Reestablish re-announces via the
-        // peer's resent revocation, so we seed only what we can: nothing here,
-        // and rely on the peer's resend. For states already revoked, the store
-        // holds the secrets. This is sufficient for the resync the tests
-        // exercise (reconnect between complete states).
-        let _ = next_recv;
+        // The counterparty's announced points were persisted as TheirPoint
+        // records and are already back in `their_points`; the revoked ones were
+        // removed above. Nothing more to rebuild.
     }
 
-    /// Builds our [`Message::Reestablish`], proving the funding key over the
-    /// peer's nonce.
-    pub fn reestablish(&self, peer_nonce: [u8; 32]) -> Result<Message, ChannelError> {
+    /// Builds our [`Message::Reestablish`] on reconnection. It carries a fresh
+    /// nonce and a proof of our funding key over `(channel_id, nonce,
+    /// direction)`. From the peer's side the nonce is the peer's nonce, which
+    /// is what its proof commits to; the peer rejects a nonce it has seen
+    /// before, so a captured message cannot be replayed.
+    pub fn reestablish(&self) -> Result<Message, ChannelError> {
         let nonce = crate::rng::bytes::<32>().map_err(|_| ChannelError::NoRandomness)?;
-        let proof = self.sign_reestablish(peer_nonce);
+        let proof = self
+            .signer
+            .sign(&reestablish_message(self.channel_id, nonce, self.our_index as u8));
         Ok(Message::Reestablish {
             channel_id: self.channel_id,
             local_commit_number: self.local_commit_number.map_or(0, |n| n + 1),
@@ -1023,29 +1045,10 @@ impl Machine {
         })
     }
 
-    fn reestablish_message(&self, peer_nonce: [u8; 32]) -> Hash256 {
-        tagged_hash_parts(
-            TAG_REESTABLISH,
-            &[
-                self.channel_id.as_bytes(),
-                &peer_nonce,
-                &[self.our_index as u8],
-            ],
-        )
-    }
-
-    fn sign_reestablish(&self, peer_nonce: [u8; 32]) -> Vec<u8> {
-        self.signer.sign(&self.reestablish_message(peer_nonce))
-    }
-
-    /// Verifies a peer's [`Message::Reestablish`] against the nonce we sent it,
-    /// then returns the messages we must resend to resynchronize. The peer runs
-    /// the mirror of this and the two resend sets together restore both sides.
-    pub fn on_reestablish(
-        &mut self,
-        msg: &Message,
-        our_sent_nonce: [u8; 32],
-    ) -> Result<Vec<Message>, ChannelError> {
+    /// Verifies a peer's [`Message::Reestablish`] and returns the messages we
+    /// must resend to resynchronize. The peer runs the mirror of this; the two
+    /// resend sets together restore both sides.
+    pub fn on_reestablish(&mut self, msg: &Message) -> Result<Vec<Message>, ChannelError> {
         let Message::Reestablish {
             channel_id: cid,
             local_commit_number: their_next_local,
@@ -1064,19 +1067,14 @@ impl Machine {
         if !self.seen_nonces.insert(*nonce) {
             return Err(ChannelError::BadReestablish);
         }
-        // The peer proved its funding key over the nonce WE sent, under its own
-        // direction.
-        let their_leaf = (1 - self.our_index) as u8;
-        let expected = tagged_hash_parts(
-            TAG_REESTABLISH,
-            &[self.channel_id.as_bytes(), &our_sent_nonce, &[*direction]],
-        );
+        // The peer proved its funding key over its own fresh nonce and its
+        // direction; the freshness check above stops a replay.
         if usize::from(*direction) != 1 - self.our_index {
             return Err(ChannelError::BadReestablish);
         }
+        let expected = reestablish_message(self.channel_id, *nonce, *direction);
         crate::sig::verify(CHANNEL_SCHEME, &self.their_pubkey, &expected, proof)
             .map_err(|_| ChannelError::BadReestablish)?;
-        let _ = their_leaf;
 
         // --- Resync. The protocol is strictly sequential: at most one state
         // is in flight. Decide, from the two sides' counters, which single
