@@ -47,6 +47,7 @@ pub mod blake2b;
 pub mod block;
 pub mod bootstrap;
 pub mod chain;
+pub mod channel;
 pub mod compact;
 pub mod consensus;
 pub mod dialog;
