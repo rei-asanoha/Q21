@@ -106,3 +106,38 @@ fn two_capable_nodes_exchange_a_channel_frame() {
     );
     assert_eq!(*b_sink.last.lock().unwrap(), payload, "bytes match");
 }
+
+#[test]
+fn getpeers_lists_a_channel_capable_peer_with_a_usable_id() {
+    let a = node();
+    let b = node();
+    a.set_channel_sink(Arc::new(Recorder {
+        count: AtomicU64::new(0),
+        last: Default::default(),
+    }));
+    b.set_channel_sink(Arc::new(Recorder {
+        count: AtomicU64::new(0),
+        last: Default::default(),
+    }));
+
+    let addr = a.listen("127.0.0.1:0").expect("listen");
+    b.connect(addr).expect("connect");
+    wait_established(&a, &b);
+
+    // `a`'s peer view names `b` with a stable id, the handshake done, the
+    // channel capability advertised, and a height.
+    let listed = a.peer_list();
+    assert_eq!(listed.len(), 1, "exactly one peer listed");
+    let b_entry = &listed[0];
+    assert!(b_entry.handshake_complete, "handshake reported complete");
+    assert!(b_entry.supports_channels, "channel capability reported");
+
+    // The id getpeers reports is exactly the one send_channel (and thus
+    // channelopen) takes, and it reaches the capable peer.
+    assert!(
+        a.send_channel(b_entry.id, vec![0x11u8; 8]),
+        "the listed id is the one channelopen would use"
+    );
+    // It matches what channel_peers reports, too.
+    assert_eq!(a.channel_peers(), vec![b_entry.id]);
+}

@@ -1606,9 +1606,30 @@ impl RpcContext {
     }
 
     fn getpeers(&self) -> Json {
+        let peers = self.node.peer_list();
         Json::obj()
             .set("peer_count", Json::u64(self.node.peer_count() as u64))
             .set("maximum", Json::u64(crate::net::MAX_PEERS as u64))
+            .set(
+                "peers",
+                Json::array(
+                    peers
+                        .into_iter()
+                        .map(|p| {
+                            // `id` is the stable value channelopen expects; it
+                            // reaches send_channel unchanged.
+                            Json::obj()
+                                .set("id", Json::u64(p.id))
+                                .set("address", Json::str(p.address))
+                                .set("outbound", Json::Bool(p.outbound))
+                                .set("handshake_complete", Json::Bool(p.handshake_complete))
+                                .set("supports_channels", Json::Bool(p.supports_channels))
+                                .set("height", Json::u64(p.height))
+                                .build()
+                        })
+                        .collect(),
+                ),
+            )
             .build()
     }
 
