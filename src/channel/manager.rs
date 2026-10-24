@@ -751,12 +751,19 @@ impl ChannelManager {
         // carries a reestablish whose proof verifies against the peer's
         // funding key, below. Anything else is not acted on, and not
         // penalised: an honest peer's frame can trail a reconnect.
+        //
+        // Moving between two live links of the same peer loses nothing, so the
+        // channel stays synchronized; a new link was already marked at its
+        // handshake, which sends our reestablish on it. Marking it here left
+        // the channel waiting for a reestablish nobody would send: two
+        // wallets that dial each other hold two links, and a reestablish
+        // reply arriving on the other one refused every payment and close
+        // until the next reconnection (D14).
         if chan.peer != peer {
             let same_identity = !peer_identity.is_empty() && chan.peer_identity == peer_identity;
             if same_identity {
                 chan.peer = peer;
                 chan.reest_sent = false;
-                chan.synced = false;
             } else if !matches!(msg, ChMsg::Reestablish { .. }) {
                 return Ok(Vec::new());
             }

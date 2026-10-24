@@ -990,3 +990,46 @@ fn crossed_payments_are_not_misconduct() {
     net.a.shutdown();
     net.b.shutdown();
 }
+
+/// D14: two wallets that dial each other hold two links to the same peer. A
+/// payment arriving on the link the channel is not bound to moves the binding
+/// there; the channel must stay usable, not wait for a reestablish that no
+/// one sends while both links stay up.
+#[test]
+fn a_payment_on_the_second_link_leaves_the_channel_usable() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let net = setup("d14second", [0xd1u8; 32], [0xd2u8; 32]);
+    let cid = net.open(4_000_000);
+
+    let b_peer = *net.b.channel_peers().first().expect("B sees A");
+    let identity = net.b.peer_identity(b_peer);
+    let a_identity = net.a.peer_identity(net.bid);
+    // The second link: another live connection announcing the same peer.
+    let second = b_peer + 1000;
+
+    // The funder's payment reaches the acceptor on the second link; the rest
+    // of the exchange follows the same path.
+    let update = net.fmgr.pay(cid, 1_000_000).unwrap();
+    let ack = net.amgr.deliver(second, &identity, &update);
+    assert_eq!(ack.penalize, 0);
+    for frame in ack.frames {
+        let revoke = net.fmgr.deliver(net.bid, &a_identity, &frame);
+        assert_eq!(revoke.penalize, 0);
+        for frame in revoke.frames {
+            assert_eq!(net.amgr.deliver(second, &identity, &frame).penalize, 0);
+        }
+    }
+    assert_eq!(
+        net.amgr.info(cid).map(|i| i.local_balance),
+        Some(1_000_000),
+        "the payment did not settle"
+    );
+
+    // The acceptor can pay back at once.
+    net.amgr
+        .pay(cid, 1_000)
+        .expect("the channel waits for a reestablish after a payment on the second link");
+
+    net.a.shutdown();
+    net.b.shutdown();
+}
