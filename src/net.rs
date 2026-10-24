@@ -84,6 +84,12 @@ pub const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cost of a body requested and never delivered. Two are enough to disconnect.
 pub const MISCONDUCT_BODY_WITHHELD: u32 = 50;
 
+/// Maintenance rounds in a row in which a peer let a body go overdue without
+/// delivering a single one, on time or late, before it is charged with
+/// withholding even though it answers our transaction requests. See
+/// `Peer::body_overdue_rounds`.
+pub const MAX_BODY_OVERDUE_ROUNDS: u8 = 3;
+
 /// Block bodies we accept having requested from one peer without having
 /// received them yet.
 ///
@@ -747,6 +753,18 @@ struct Peer {
     /// that has delivered nothing at all within that window. See
     /// [`Node::maintain_peers`].
     last_delivered: Instant,
+    /// Maintenance rounds in a row in which a body requested from this peer
+    /// went overdue, with no body delivered since. A peer that serves every
+    /// transaction we ask for but never a block body kept `last_delivered`
+    /// fresh, was never charged, and delayed each block by [`BODY_TIMEOUT`]
+    /// for as long as it liked. A body, even one that arrives after it was
+    /// asked elsewhere, resets it: a slow link delivers late, a withholder
+    /// never. Charged at [`MAX_BODY_OVERDUE_ROUNDS`].
+    body_overdue_rounds: u8,
+    /// Bodies that went overdue from this peer, most recent last: one of them
+    /// arriving late still shows the peer delivers. Bounded by
+    /// [`MAX_BODIES_IN_FLIGHT`].
+    late_bodies: VecDeque<Hash256>,
     /// Instant of the last `Ping` sent that has gone unanswered.
     pending_ping: Option<Instant>,
     /// Transactions we asked this peer for and that have not arrived yet.
@@ -783,6 +801,19 @@ struct Peer {
 }
 
 impl Peer {
+    /// A block body arrived from this peer: if we had asked it for that body,
+    /// on time or past its deadline, it is answering, and owes us no body.
+    fn note_body_delivered(&mut self, bid: &Hash256) {
+        let late = self.late_bodies.iter().position(|h| h == bid);
+        if let Some(i) = late {
+            self.late_bodies.remove(i);
+        }
+        if late.is_some() || self.requested_bodies.contains_key(bid) {
+            self.last_delivered = Instant::now();
+            self.body_overdue_rounds = 0;
+        }
+    }
+
     /// How many more transactions can be requested from this peer now: its
     /// budget, less what is already asked and not received. Forgets the
     /// requests older than [`TX_REQUEST_MEMORY`].
@@ -1973,6 +2004,7 @@ impl Node {
             let mut holders: Vec<(u64, bool)> = Vec::new();
             for (id, p) in peers.iter_mut() {
                 let mut overdue = 0u32;
+                let late = &mut p.late_bodies;
                 p.requested_bodies.retain(|h, since| {
                     if chain.has_block(h) {
                         return false;
@@ -1980,12 +2012,24 @@ impl Node {
                     if now.duration_since(*since) >= BODY_TIMEOUT {
                         overdue += 1;
                         withheld.push(*h);
+                        if late.len() >= MAX_BODIES_IN_FLIGHT {
+                            late.pop_front();
+                        }
+                        late.push_back(*h);
                         return false;
                     }
                     true
                 });
                 if overdue > 0 {
-                    let delivered_nothing = now.duration_since(p.last_delivered) >= BODY_TIMEOUT;
+                    // Nothing we asked for within the window, or not one body
+                    // for several rounds while answering only transactions.
+                    p.body_overdue_rounds = p.body_overdue_rounds.saturating_add(1);
+                    let no_body = p.body_overdue_rounds >= MAX_BODY_OVERDUE_ROUNDS;
+                    if no_body {
+                        p.body_overdue_rounds = 0;
+                    }
+                    let delivered_nothing =
+                        now.duration_since(p.last_delivered) >= BODY_TIMEOUT || no_body;
                     holders.push((*id, delivered_nothing));
                 }
             }
@@ -2277,6 +2321,8 @@ impl Node {
                     remote_nonce: None,
                     last_received: Instant::now(),
                     last_delivered: Instant::now(),
+                    body_overdue_rounds: 0,
+                    late_bodies: VecDeque::new(),
                     pending_ping: None,
                     requested_txs: HashMap::new(),
                     announced_waiting: VecDeque::new(),
@@ -2991,9 +3037,7 @@ impl Node {
                         // is not a withholder even if another body of its lags.
                         let bid = b.header.block_id();
                         if let Some(p) = g.peers.get_mut(&id) {
-                            if p.requested_bodies.contains_key(&bid) {
-                                p.last_delivered = Instant::now();
-                            }
+                            p.note_body_delivered(&bid);
                         }
                         drop_peer = !Self::integrate(&mut g, &b, &self.stats, &mut outgoing, id);
                     }
@@ -3004,9 +3048,7 @@ impl Node {
                     let bid = c.header.block_id();
                     // A body we asked for marks this peer as answering us.
                     if let Some(p) = g.peers.get_mut(&id) {
-                        if p.requested_bodies.contains_key(&bid) {
-                            p.last_delivered = Instant::now();
-                        }
+                        p.note_body_delivered(&bid);
                     }
                     if g.chain.has_block(&bid) {
                         // Already known: nothing to reconstruct. But if it was a
@@ -5164,6 +5206,8 @@ mod tests {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 last_delivered: Instant::now(),
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -5568,6 +5612,8 @@ mod tests_hardening {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 last_delivered: Instant::now(),
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -6556,6 +6602,66 @@ mod tests_hardening {
         );
     }
 
+    /// Finding 12: a peer that answers every transaction we ask for but never
+    /// a block body is charged with withholding after a few rounds. Before,
+    /// each answered transaction counted as a delivery, and the peer delayed
+    /// every block by `BODY_TIMEOUT` for as long as it liked.
+    #[test]
+    fn a_peer_that_serves_transactions_but_no_body_is_charged() {
+        let (_a, b) = node_pair();
+        let _w = established_peer(&b, 7);
+        let _other = established_peer(&b, 8);
+        for round in 0..MAX_BODY_OVERDUE_ROUNDS {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.requested_bodies.insert(
+                Hash256([10 + round; 32]),
+                Instant::now() - BODY_TIMEOUT - Duration::from_secs(1),
+            );
+            // It answered a transaction request a moment ago.
+            p.last_delivered = Instant::now();
+            drop(g);
+            b.maintain_peers();
+        }
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].ban_score,
+            MISCONDUCT_BODY_WITHHELD,
+            "a peer that never delivers a body is charged, transactions or not"
+        );
+    }
+
+    /// What finding 12 must not undo (the L1-B partition): a peer whose bodies
+    /// arrive late, on a saturated link, is never charged — each late body
+    /// shows it delivers.
+    #[test]
+    fn a_peer_whose_bodies_arrive_late_is_never_charged() {
+        let (a, b) = node_pair();
+        let _slow = established_peer(&b, 7);
+        let _other = established_peer(&b, 8);
+        let rounds = 2 * MAX_BODY_OVERDUE_ROUNDS as u64;
+        crate::net::tests_util::mine_locally(&a, rounds as usize);
+        for h in 1..=rounds {
+            let body = a.with_chain(|c| c.block_at(h).unwrap());
+            {
+                let mut g = b.shared.lock().unwrap();
+                let p = g.peers.get_mut(&7).unwrap();
+                p.requested_bodies.insert(
+                    body.header.block_id(),
+                    Instant::now() - BODY_TIMEOUT - Duration::from_secs(1),
+                );
+                p.last_delivered = Instant::now();
+            }
+            b.maintain_peers();
+            // The overdue body arrives after all, late.
+            assert!(b.handle(7, Message::Block(Box::new(body))));
+        }
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].ban_score,
+            0,
+            "a peer that delivers its bodies late is not a withholder"
+        );
+    }
+
     /// A peer that delivered nothing we asked for within the window is charged
     /// with withholding — a genuine withholder is still removed.
     #[test]
@@ -6871,6 +6977,8 @@ mod tests_handler_fuzz {
                 remote_nonce: None,
                 last_received: now,
                 last_delivered: now,
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -7704,6 +7812,8 @@ mod tests_handler_review {
                 remote_nonce: None,
                 last_received: now,
                 last_delivered: now,
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
