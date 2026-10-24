@@ -1664,12 +1664,19 @@ impl Machine {
     /// before, so a captured message cannot be replayed.
     pub fn reestablish(&self) -> Result<Message, ChannelError> {
         let nonce = crate::rng::bytes::<32>().map_err(|_| ChannelError::NoRandomness)?;
+        Ok(self.reestablish_for(nonce))
+    }
+
+    /// Our [`Message::Reestablish`] answering the peer's challenge `nonce`:
+    /// the proof of our funding key signs the peer's own fresh nonce, so the
+    /// answer is good for that challenge — that connection — only.
+    pub fn reestablish_for(&self, nonce: [u8; 32]) -> Message {
         let proof = self.signer.sign(&reestablish_message(
             self.channel_id,
             nonce,
             self.our_index as u8,
         ));
-        Ok(Message::Reestablish {
+        Message::Reestablish {
             channel_id: self.channel_id,
             local_commit_number: self.local_commit_number.map_or(0, |n| n + 1),
             remote_commit_number: self.remote_commit_number.map_or(0, |n| n + 1),
@@ -1678,7 +1685,7 @@ impl Machine {
             nonce,
             direction: self.our_index as u8,
             proof,
-        })
+        }
     }
 
     /// Verifies a peer's [`Message::Reestablish`] and returns the messages we

@@ -1876,3 +1876,67 @@ fn a_channel_opens_only_on_its_real_funding_output() {
         .on_connected_block(&[], 900, &|_| Some((50, funding_output)));
     assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
 }
+
+/// A connection that merely announces the counterparty's identity gets
+/// nothing acted on — not even an unsigned Close — and a reestablish captured
+/// from an earlier exchange, replayed on another connection or after a
+/// restart, binds nothing: only the answer to a challenge we issued on that
+/// connection does.
+#[test]
+fn only_an_answered_challenge_authenticates_a_connection() {
+    let funder_seed = [0xedu8; 32];
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, [0xeeu8; 32], "auth-challenge");
+    const IMPOSTOR: u64 = 66;
+    // The impostor claims the acceptor's identity. Its Close is ignored.
+    // The funder challenges it; it cannot answer.
+    assert!(!p
+        .funder
+        .on_peer_connected(IMPOSTOR, "acceptor-node")
+        .is_empty());
+    let close = [
+        cid.as_bytes().as_slice(),
+        &[0u8],
+        &q21_core::channel::Message::Close { fee: 20_000 }.encode(),
+    ]
+    .concat();
+    let r = p.funder.deliver(IMPOSTOR, "acceptor-node", &close);
+    assert_eq!(r.penalize, 0);
+    assert!(r.frames.is_empty());
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Open);
+    assert_eq!(p.funder.peer_of(cid), Some(A_PEER));
+
+    // A real reconnect: capture the acceptor's answer to the funder's
+    // challenge, and let the exchange complete.
+    let mut captured = None;
+    let mut queue: VecDeque<(u64, Vec<u8>)> = p
+        .funder
+        .on_peer_connected(A_PEER, "")
+        .into_iter()
+        .map(|f| (1, f))
+        .collect();
+    while let Some((to, frame)) = queue.pop_front() {
+        let r = if to == 1 {
+            p.acceptor.deliver(F_PEER, "", &frame)
+        } else {
+            if frame[32] == 0 && captured.is_none() && frame.len() > 1000 {
+                captured = Some(frame.clone());
+            }
+            p.funder.deliver(A_PEER, "", &frame)
+        };
+        assert_eq!(r.penalize, 0);
+        queue.extend(r.frames.into_iter().map(|f| (1 - to, f)));
+    }
+    let captured = captured.expect("the acceptor's reestablish");
+    // Replayed on another connection: ignored, nothing rebound.
+    let r = p.funder.deliver(IMPOSTOR, "acceptor-node", &captured);
+    assert!(r.frames.is_empty());
+    assert_eq!(p.funder.peer_of(cid), Some(A_PEER));
+    // Replayed to the funder after its restart, even on the same id: the
+    // funder never issued that challenge, so it binds nothing.
+    p.reload_funder(funder_seed, wallet, chain, &dir);
+    let r = p.funder.deliver(A_PEER, "", &captured);
+    assert!(r.frames.is_empty());
+    assert_ne!(p.funder.peer_of(cid), Some(A_PEER));
+    assert!(p.funder.pay(cid, 1).is_err(), "unauthenticated");
+}

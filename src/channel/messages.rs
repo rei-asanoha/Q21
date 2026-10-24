@@ -27,6 +27,7 @@ const T_REESTABLISH: u8 = 9;
 const T_CLOSE: u8 = 10;
 const T_CLOSE_SIGNED: u8 = 11;
 const T_ERROR: u8 = 12;
+const T_CHALLENGE: u8 = 13;
 
 /// Most announced revocation hashes a message may carry. A channel announces
 /// the next one or two points ahead; a larger count is a malformed frame.
@@ -109,8 +110,9 @@ pub enum Message {
     },
     /// Initiator → responder: the initiator's revocation of the previous state.
     Revoke { state: u64, revocation: Revocation },
-    /// On reconnection: where this side stands, a fresh nonce, and a proof of
-    /// the funding key over `(channel_id, nonce, direction)`.
+    /// On reconnection, answering a [`Message::Challenge`]: where this side
+    /// stands, the challenge's nonce, and a proof of the funding key over
+    /// `(channel_id, nonce, direction)`.
     Reestablish {
         channel_id: Hash256,
         local_commit_number: u64,
@@ -132,6 +134,14 @@ pub enum Message {
     CloseSigned { fee: u64, signature: Vec<u8> },
     /// An abort, with a short reason. The channel moves to force-close.
     Error { reason: String },
+    /// On a new connection: a fresh nonce the receiver must sign, with its
+    /// funding key, in the [`Message::Reestablish`] it answers with. Issued by
+    /// the side that wants the connection authenticated, so a captured
+    /// reestablish never answers a later challenge.
+    Challenge {
+        channel_id: Hash256,
+        nonce: [u8; 32],
+    },
 }
 
 /// The deterministic tie-break for simultaneous updates: the party whose
@@ -306,6 +316,9 @@ impl Message {
                 w.u8(T_CLOSE_SIGNED).u64(*fee);
                 write_crypto(&mut w, signature);
             }
+            Message::Challenge { channel_id, nonce } => {
+                w.u8(T_CHALLENGE).bytes(channel_id.as_bytes()).bytes(nonce);
+            }
             Message::Error { reason } => {
                 let bytes = reason.as_bytes();
                 let bytes = &bytes[..bytes.len().min(MAX_ERROR_LEN)];
@@ -405,6 +418,10 @@ impl Message {
                 let signature = read_sig(&mut r)?;
                 Message::CloseSigned { fee, signature }
             }
+            T_CHALLENGE => Message::Challenge {
+                channel_id: Hash256(r.array32()?),
+                nonce: r.array32()?,
+            },
             T_ERROR => {
                 let bytes = read_bounded(&mut r, MAX_ERROR_LEN)?;
                 Message::Error {

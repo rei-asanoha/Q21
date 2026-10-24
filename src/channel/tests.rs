@@ -162,6 +162,10 @@ fn every_message_round_trips() {
             fee: 20_000,
             signature: sample_sig(),
         },
+        Message::Challenge {
+            channel_id: Hash256([8u8; 32]),
+            nonce: [9u8; 32],
+        },
         Message::Error {
             reason: "bye".to_string(),
         },

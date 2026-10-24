@@ -123,6 +123,33 @@ pub struct ChannelSummary {
     pub funding: Option<OutPoint>,
 }
 
+/// Authenticated connections remembered per channel, and challenges awaiting
+/// an answer: a handful, enough for two links per peer and a reconnect.
+const MAX_AUTHED: usize = 4;
+const MAX_CHALLENGES: usize = 8;
+
+impl Chan {
+    /// A fresh challenge for connection `conn`: the frame to send it.
+    fn challenge(&mut self, conn: u64) -> Option<Vec<u8>> {
+        let nonce = crate::rng::bytes::<32>().ok()?;
+        let cid = self.machine.channel_id();
+        self.challenges.retain(|(c, _)| *c != conn);
+        if self.challenges.len() >= MAX_CHALLENGES {
+            self.challenges.remove(0);
+        }
+        self.challenges.push((conn, nonce));
+        Some(write_frame(
+            cid,
+            KIND_ENGINE,
+            &ChMsg::Challenge {
+                channel_id: cid,
+                nonce,
+            }
+            .encode(),
+        ))
+    }
+}
+
 struct Chan {
     machine: Machine,
     /// The live network connection id of the peer. Transient: it changes on
@@ -132,10 +159,13 @@ struct Chan {
     /// restart or reconnect can map the new connection id back to this channel.
     peer_identity: String,
     capacity: u64,
-    /// Whether we have already sent a reestablish on the current connection, so
-    /// receiving the peer's reestablish reciprocates exactly once (no loop).
-    /// Reset whenever the channel is re-bound to a new connection id.
-    reest_sent: bool,
+    /// Connections on which the counterparty proved itself: the one that ran
+    /// the opening handshake, and each that answered our challenge with a
+    /// reestablish signed by its funding key. Only frames from these are acted
+    /// on. Most recent last.
+    authed: Vec<u64>,
+    /// Challenges we issued and not yet seen answered, per connection.
+    challenges: Vec<(u64, [u8; 32])>,
     /// Whether the peer's reestablish has been received and answered on the
     /// current connection. Until it has, a message one side lost may still be
     /// owed, and a new update or close stacked on top of it would be refused
@@ -363,7 +393,8 @@ impl ChannelManager {
                                 peer: u64::MAX,
                                 peer_identity,
                                 capacity,
-                                reest_sent: false,
+                                authed: Vec::new(),
+                                challenges: Vec::new(),
                                 synced: false,
                                 close: None,
                                 spend: None,
@@ -544,54 +575,40 @@ impl ChannelManager {
     }
 
     /// Called when a channel-capable peer completes the handshake, with the
-    /// peer's live connection id and its durable identity. It re-binds every
-    /// channel held with that durable identity to the live id — recovering the
-    /// binding a reconnect or restart broke — and returns the reestablish frames
-    /// to send. The engine then resends exactly the one in-flight message, if any.
+    /// peer's live connection id and the identity it announced. Every channel
+    /// held with that identity — a hint only: anyone can announce it — or
+    /// bound to that connection id is challenged on the new connection: the
+    /// peer must answer with a reestablish signed by the channel's funding key
+    /// over our fresh nonce before anything it sends there is acted on.
     pub fn on_peer_connected(&self, peer: u64, peer_identity: &str) -> Vec<Vec<u8>> {
         let mut g = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for c in g.channels.values_mut() {
-            // Re-bind by durable identity (a reconnect gives a fresh id), then
-            // send our reestablish for every channel now on this connection.
-            if !peer_identity.is_empty() && c.peer_identity == peer_identity && c.peer != peer {
-                c.peer = peer;
-                c.reest_sent = false;
-            }
-            if c.peer == peer {
-                // A new connection: whatever was in flight on the old one is
-                // settled by the reestablish exchange before anything else.
-                c.synced = false;
-                if let Ok(m) = c.machine.reestablish() {
-                    out.push(write_frame(
-                        c.machine.channel_id(),
-                        KIND_ENGINE,
-                        &m.encode(),
-                    ));
-                    c.reest_sent = true;
+            let same_link = c.peer == peer;
+            let same_identity = !peer_identity.is_empty() && c.peer_identity == peer_identity;
+            if same_link || same_identity {
+                // A new connection under this id proves nothing yet; one that
+                // merely claims the identity leaves the current link alone.
+                c.authed.retain(|x| *x != peer);
+                if same_link {
+                    c.synced = false;
                 }
+                out.extend(c.challenge(peer));
             }
         }
         out
     }
 
-    /// The reestablish frames for every channel with `peer`, to send on
-    /// reconnection. Marks each as reestablished so a reciprocal reestablish
-    /// from the peer is not echoed back into a loop.
+    /// The challenges for every channel bound to `peer`, to send on
+    /// reconnection: the channel resynchronizes once the peer answers.
     pub fn reestablish(&self, peer: u64) -> Vec<Vec<u8>> {
         let mut g = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for c in g.channels.values_mut() {
             if c.peer == peer {
+                c.authed.retain(|x| *x != peer);
                 c.synced = false;
-                if let Ok(m) = c.machine.reestablish() {
-                    out.push(write_frame(
-                        c.machine.channel_id(),
-                        KIND_ENGINE,
-                        &m.encode(),
-                    ));
-                    c.reest_sent = true;
-                }
+                out.extend(c.challenge(peer));
             }
         }
         out
@@ -735,7 +752,8 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
-                reest_sent: false,
+                authed: vec![peer],
+                challenges: Vec::new(),
                 synced: true,
                 close: None,
                 spend: None,
@@ -762,33 +780,51 @@ impl ChannelManager {
             // (closed on our side, still closing on theirs) offers its
             // reestablish at every connection. Penalising it dropped the link
             // at every reconnect; there is simply nothing to resynchronize.
-            if matches!(msg, ChMsg::Reestablish { .. }) {
+            if matches!(msg, ChMsg::Reestablish { .. } | ChMsg::Challenge { .. }) {
                 return Ok(Vec::new());
             }
             return Err("unknown channel".into());
         };
-        // A frame for this channel from a connection it is not bound to. The
-        // binding moves to it when the connection announces the channel's
-        // durable peer identity (a second link to the same peer), or when it
-        // carries a reestablish whose proof verifies against the peer's
-        // funding key, below. Anything else is not acted on, and not
-        // penalised: an honest peer's frame can trail a reconnect.
-        //
-        // Moving between two live links of the same peer loses nothing, so the
-        // channel stays synchronized; a new link was already marked at its
-        // handshake, which sends our reestablish on it. Marking it here left
-        // the channel waiting for a reestablish nobody would send: two
-        // wallets that dial each other hold two links, and a reestablish
-        // reply arriving on the other one refused every payment and close
-        // until the next reconnection (D14).
-        if chan.peer != peer {
-            let same_identity = !peer_identity.is_empty() && chan.peer_identity == peer_identity;
-            if same_identity {
-                chan.peer = peer;
-                chan.reest_sent = false;
-            } else if !matches!(msg, ChMsg::Reestablish { .. }) {
-                return Ok(Vec::new());
+        // Authentication. A challenge is answered on any connection: the
+        // answer proves our key over the asker's own nonce, good for nothing
+        // else. A reestablish is taken only as the answer to a challenge we
+        // issued on that very connection, and its proof must verify: then the
+        // connection speaks for the counterparty. Every other frame is acted
+        // on only from an authenticated connection; from any other it is
+        // ignored, not penalised — an honest frame can trail a reconnect.
+        // A self-declared identity, or a reestablish captured earlier and
+        // replayed (after our restart, or on another connection), proves
+        // nothing.
+        match &msg {
+            ChMsg::Challenge { nonce, .. } => {
+                // Our own challenge first, if this connection has not been
+                // asked yet: the peer then answers it before it handles our
+                // reestablish, so what it resends after that reaches us on a
+                // connection we already trust.
+                let mut out = Vec::new();
+                let challenged = chan.challenges.iter().any(|(c, _)| *c == peer);
+                if !chan.authed.contains(&peer) && !challenged {
+                    out.extend(chan.challenge(peer));
+                }
+                out.push(write_frame(
+                    cid,
+                    KIND_ENGINE,
+                    &chan.machine.reestablish_for(*nonce).encode(),
+                ));
+                return Ok(out);
             }
+            ChMsg::Reestablish { nonce, .. } => {
+                let Some(at) = chan
+                    .challenges
+                    .iter()
+                    .position(|(c, n)| *c == peer && n == nonce)
+                else {
+                    return Ok(Vec::new());
+                };
+                chan.challenges.remove(at);
+            }
+            _ if !chan.authed.contains(&peer) => return Ok(Vec::new()),
+            _ => {}
         }
         let mut out = Vec::new();
         match msg {
@@ -887,31 +923,26 @@ impl ChannelManager {
             }
             ChMsg::Reestablish { .. } => {
                 let frames = chan.machine.on_reestablish(&msg).map_err(err)?;
-                // The proof verified: this connection speaks for the channel's
-                // counterparty. Bind to it, and remember the identity it
-                // announced so a later reconnect re-binds at the handshake.
-                if chan.peer != peer {
-                    chan.peer = peer;
-                    chan.reest_sent = false;
+                // The proof verified over our challenge on this connection: it
+                // speaks for the channel's counterparty. Bind to it, and
+                // remember the identity it announced, so a later reconnect
+                // knows whom to challenge.
+                chan.authed.retain(|c| *c != peer);
+                if chan.authed.len() >= MAX_AUTHED {
+                    chan.authed.remove(0);
                 }
+                chan.authed.push(peer);
+                chan.peer = peer;
                 if !peer_identity.is_empty() && chan.peer_identity != peer_identity {
                     chan.peer_identity = peer_identity.to_string();
                     self.write_peer_identity(cid, peer_identity);
-                }
-                // Reciprocate exactly once, so both sides exchange reestablish
-                // and each learns what it must resend. (The peer that dialed
-                // sent first; this covers the other side.)
-                if !chan.reest_sent {
-                    if let Ok(m) = chan.machine.reestablish() {
-                        out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
-                        chan.reest_sent = true;
-                    }
                 }
                 for f in frames {
                     out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
                 }
                 chan.synced = true;
             }
+            ChMsg::Challenge { .. } => {}
             ChMsg::Error { .. } | ChMsg::Open { .. } => {}
         }
         Ok(out)
@@ -969,7 +1000,8 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
-                reest_sent: false,
+                authed: vec![peer],
+                challenges: Vec::new(),
                 synced: true,
                 close: None,
                 spend: None,

@@ -985,10 +985,12 @@ fn crossed_payments_are_not_misconduct() {
     net.b.shutdown();
 }
 
-/// D14: two wallets that dial each other hold two links to the same peer. A
-/// payment arriving on the link the channel is not bound to moves the binding
-/// there; the channel must stay usable, not wait for a reestablish that no
-/// one sends while both links stay up.
+/// D14: two wallets that dial each other hold two links to the same peer.
+/// Once the second link has answered the challenge sent at its handshake, a
+/// payment arriving on it settles and the channel stays usable, not waiting
+/// for a reestablish that no one sends while both links stay up. Before it
+/// has, a frame there — from a connection merely claiming the peer's
+/// identity — is not acted on.
 #[test]
 fn a_payment_on_the_second_link_leaves_the_channel_usable() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -1000,6 +1002,40 @@ fn a_payment_on_the_second_link_leaves_the_channel_usable() {
     let a_identity = net.a.peer_identity(net.bid);
     // The second link: another live connection announcing the same peer.
     let second = b_peer + 1000;
+
+    // Not yet authenticated: a Close there is ignored.
+    let close = net.amgr.deliver(
+        second,
+        &identity,
+        &[
+            cid.as_bytes().as_slice(),
+            &[0u8],
+            &q21_core::channel::Message::Close { fee: 20_000 }.encode(),
+        ]
+        .concat(),
+    );
+    assert_eq!(close.penalize, 0);
+    assert!(close.frames.is_empty());
+    assert_eq!(
+        net.amgr.info(cid).map(|i| i.phase),
+        Some(q21_core::channel::Phase::Open)
+    );
+
+    // Its handshake: the acceptor challenges it, the funder answers there.
+    let mut to_f: Vec<Vec<u8>> = net.amgr.on_peer_connected(second, &identity);
+    for _ in 0..4 {
+        let mut to_a = Vec::new();
+        for f in to_f.drain(..) {
+            let r = net.fmgr.deliver(net.bid, &a_identity, &f);
+            assert_eq!(r.penalize, 0);
+            to_a.extend(r.frames);
+        }
+        for f in to_a {
+            let r = net.amgr.deliver(second, &identity, &f);
+            assert_eq!(r.penalize, 0);
+            to_f.extend(r.frames);
+        }
+    }
 
     // The funder's payment reaches the acceptor on the second link; the rest
     // of the exchange follows the same path.
