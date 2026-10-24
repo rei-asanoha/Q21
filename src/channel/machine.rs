@@ -638,6 +638,11 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         };
         let n = *state;
+        // State 0 is the funding commitment, never the subject of an update;
+        // its predecessor `n - 1` does not exist.
+        if n == 0 {
+            return Err(ChannelError::Unexpected);
+        }
         // Idempotent resend: we already processed this update. Answered even
         // once a cooperative close is agreed, so an update that was in flight
         // when the close began still completes.
@@ -702,6 +707,11 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         }
         let n = *state;
+        // State 0 is the funding commitment, never the subject of an update;
+        // its predecessor `n - 1` does not exist.
+        if n == 0 {
+            return Err(ChannelError::Unexpected);
+        }
         // Idempotent resend path.
         if self.local_commit_number >= Some(n) && self.revocations_recv >= Some(n - 1) {
             return self.resend_revoke(n);
@@ -733,6 +743,11 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         };
         let n = *state;
+        // State 0 is the funding commitment, never the subject of an update;
+        // its predecessor `n - 1` does not exist.
+        if n == 0 {
+            return Err(ChannelError::Unexpected);
+        }
         if self.revocations_recv >= Some(n - 1) {
             return Ok(()); // idempotent resend
         }

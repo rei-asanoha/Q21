@@ -1690,3 +1690,42 @@ fn a_lost_close_is_resent_on_reestablish() {
     other.outputs[0].value = crate::amount::Amount::from_units(other.outputs[0].value.units() - 1);
     assert!(!a.is_cooperative_close(&other));
 }
+
+/// An update, an Ack or a Revoke naming state 0 is refused. An Ack or a
+/// Revoke computed the state below it, `0 - 1`: with overflow checks on and
+/// `panic = "abort"`, a single message from the peer stopped the node.
+#[test]
+fn an_update_message_for_state_zero_is_refused_not_a_crash() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    let Message::Update {
+        balances,
+        tier_sigs,
+        ..
+    } = f.propose([CAP - 2_000_000, 2_000_000]).unwrap()
+    else {
+        unreachable!()
+    };
+    let rev = Revocation {
+        secret: [0u8; 32],
+        next_hash: Hash256::ZERO,
+    };
+    let update = Message::Update {
+        state: 0,
+        balances,
+        tier_sigs: tier_sigs.clone(),
+    };
+    let ack = Message::Ack {
+        state: 0,
+        tier_sigs,
+        revocation: rev.clone(),
+    };
+    let revoke = Message::Revoke {
+        state: 0,
+        revocation: rev,
+    };
+    assert_eq!(a.on_update(&update), Err(ChannelError::Unexpected));
+    assert_eq!(f.on_ack(&ack), Err(ChannelError::Unexpected));
+    assert_eq!(a.on_revoke(&revoke), Err(ChannelError::Unexpected));
+}
