@@ -7,7 +7,7 @@
 
 use super::journal::{self, Record};
 use super::keys::{ChannelKey, Signer};
-use super::machine::{Machine, Phase};
+use super::machine::{ChannelError, Machine, Phase};
 use super::messages::{initiative, Message, Revocation, WireError};
 use super::txbuild::{self, ChannelParams, FeeTier, ACCEPTOR, FUNDER};
 use super::watcher::{classify, Watch, WatchContext};
@@ -1228,4 +1228,163 @@ fn the_revocation_root_depends_on_private_material() {
     );
     // Stable for the same inputs.
     assert_eq!(a.revocation_root(&cid), a.revocation_root(&cid));
+}
+
+// --- Security regression tests -----------------------------------------------
+
+/// C1 (critical): a received update may only keep or raise our own balance. A
+/// counterparty that proposes an update draining us is refused before we
+/// persist anything or reveal a secret, and the channel keeps working.
+#[test]
+fn an_update_that_drains_us_is_rejected() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    // A legitimate payment from the funder to the acceptor completes normally.
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    assert_eq!(f.balances(), [CAP - 1_000_000, 1_000_000]);
+
+    // Now the acceptor crafts an update that moves most of the funder's balance
+    // to itself and signs the funder's commitment at that drained split — a
+    // valid signature over our own commitment, the single-message theft C1
+    // describes. The funder must refuse before persisting or revealing anything.
+    let evil = a.propose([CAP / 4, CAP - CAP / 4]).unwrap();
+    let before_state = f.local_commit_number();
+    let before_bal = f.balances();
+    assert_eq!(
+        f.on_update(&evil),
+        Err(ChannelError::WrongDirection),
+        "an update lowering our balance must be refused"
+    );
+    assert_eq!(
+        f.local_commit_number(),
+        before_state,
+        "no commitment was persisted"
+    );
+    assert_eq!(
+        f.balances(),
+        before_bal,
+        "our balance is unchanged by the rejected drain"
+    );
+}
+
+/// H2: the sweep fee is capped so a penalty (or sweep/claim) output never falls
+/// below the dust floor, and a to_local below dust+fee is never created — so a
+/// cheater cannot pick a revoked balance that makes the victim's penalty
+/// dust-invalid and unconfirmable.
+#[test]
+fn a_small_to_local_still_yields_a_valid_penalty() {
+    // The fee cap: the swept output stays at or above the dust floor.
+    assert_eq!(txbuild::capped_fee(30_000, 20_000), 20_000); // output 10_000
+    assert_eq!(txbuild::capped_fee(15_000, 20_000), 5_000); // output 10_000
+    assert_eq!(txbuild::capped_fee(10_000, 20_000), 0); // output 10_000
+    assert_eq!(txbuild::capped_fee(1_000_000, 20_000), 20_000); // unchanged
+
+    // A penalty built on a small (revoked-shape) to_local produces a valid,
+    // non-dust output instead of a zero/negative one.
+    let dir = tmpdir();
+    let (f, _a) = open_pair(&dir);
+    let policy = f.params().to_local_policy(FUNDER, Hash256([3u8; 32]));
+    let out = policy.output(crate::amount::Amount::from_units(15_000));
+    let op = OutPoint {
+        txid: Hash256([7u8; 32]),
+        index: 0,
+    };
+    let penalty = txbuild::penalty_tx(
+        op,
+        &out,
+        &policy,
+        [0u8; 32],
+        Hash256([0x5e; 32]),
+        20_000,
+        NET,
+        f.signer(),
+    );
+    assert!(
+        penalty.outputs[0].value.units() >= MIN_OUTPUT_VALUE,
+        "the penalty output must clear the dust floor, got {}",
+        penalty.outputs[0].value.units()
+    );
+
+    // And a to_local below dust+fee is dropped into the miner fee, never
+    // created as an unsweepable output.
+    let c = f
+        .params()
+        .commitment(FUNDER, 1, [20_000, CAP - 20_000], 0, Hash256([1u8; 32]));
+    assert_eq!(c.trimmed_outputs, 1, "a 20000-unit to_local is trimmed");
+    assert_eq!(c.trimmed_units, 20_000);
+}
+
+/// H3: an acceptor refuses an open whose parameters would leave its funds
+/// unprotected or frozen — a too-short or too-long delay, too shallow a funding
+/// depth, or a dust capacity.
+#[test]
+fn accept_rejects_dangerous_open_parameters() {
+    let payout = Hash256([0xf0u8; 32]);
+    let dangerous: &[(u64, u16, u16)] = &[
+        (CAP, 0, DEPTH),        // delay 0: revoked holder's own sweep has no head-start
+        (CAP, 3, DEPTH),        // delay below the minimum
+        (CAP, 5_000, DEPTH),    // delay far above the maximum: funds frozen
+        (CAP, DELAY, 0),        // depth 0: funding treated as final unconfirmed
+        (CAP, DELAY, 1),        // depth below the minimum
+        (10_000, DELAY, DEPTH), // capacity below the floor
+    ];
+    for &(capacity, delay, depth) in dangerous {
+        let dir = tmpdir();
+        let a_signer = akey();
+        let a_pub = a_signer.pubkey().to_vec();
+        let (_f, open) = Machine::new_funder(
+            dir.join("f.jrnl"),
+            NET,
+            fkey(),
+            a_pub,
+            capacity,
+            delay,
+            depth,
+            RATE,
+            payout,
+            payout,
+        )
+        .unwrap();
+        let r = Machine::accept(
+            dir.join("a.jrnl"),
+            NET,
+            a_signer,
+            RATE,
+            &open,
+            payout,
+            payout,
+        );
+        assert_eq!(
+            r.err(),
+            Some(ChannelError::BadParameters),
+            "open must be refused: capacity={capacity} delay={delay} depth={depth}"
+        );
+    }
+    // A sane open is still accepted.
+    let dir = tmpdir();
+    let a_signer = akey();
+    let a_pub = a_signer.pubkey().to_vec();
+    let (_f, open) = Machine::new_funder(
+        dir.join("f.jrnl"),
+        NET,
+        fkey(),
+        a_pub,
+        CAP,
+        DELAY,
+        DEPTH,
+        RATE,
+        payout,
+        payout,
+    )
+    .unwrap();
+    assert!(Machine::accept(
+        dir.join("a.jrnl"),
+        NET,
+        a_signer,
+        RATE,
+        &open,
+        payout,
+        payout
+    )
+    .is_ok());
 }

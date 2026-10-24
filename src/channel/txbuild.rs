@@ -56,6 +56,27 @@ impl FeeTier {
 /// market.
 pub const MAX_COMMIT_FEE_RATE: u64 = 10_000;
 
+/// The fee reserved to sweep a `to_local`, penalty, or `to_remote` output. A
+/// sweep's output is `value - fee`, but the fee is capped so that output never
+/// falls below the dust floor (see [`capped_fee`]); otherwise a cheater could
+/// pick a revoked balance that made the victim's penalty dust-invalid.
+pub const SWEEP_FEE: u64 = 20_000;
+
+/// A `to_local` output is created only when it clears the dust floor *plus* the
+/// sweep fee, so any to_local that exists can always be swept to an output at or
+/// above dust. A smaller holder balance is dropped into the miner fee — which
+/// still denies a cheating counterparty, and costs an honest holder only a dust
+/// amount on a tiny channel.
+pub const TO_LOCAL_DUST: u64 = MIN_OUTPUT_VALUE + SWEEP_FEE;
+
+/// The fee to charge a sweep of `value`, capped so the swept output stays at or
+/// above the dust floor. With `TO_LOCAL_DUST` trimming, a created to_local pays
+/// the full `SWEEP_FEE`; a smaller *revoked* output (shape chosen by a cheater)
+/// pays less rather than producing a dust-invalid, unconfirmable sweep.
+pub fn capped_fee(value: u64, fee: u64) -> u64 {
+    fee.min(value.saturating_sub(MIN_OUTPUT_VALUE))
+}
+
 /// The fee rate of `tier`, from a base rate (itself at least the relay
 /// minimum), multiplied and then capped.
 pub fn tier_rate(base_rate: u64, tier: FeeTier) -> u64 {
@@ -183,7 +204,10 @@ impl ChannelParams {
         let mut trimmed_units = 0u64;
         let mut trimmed_outputs = 0u32;
 
-        if side[holder] >= MIN_OUTPUT_VALUE {
+        // The holder's own output is delayed/revocable and must later be swept,
+        // so it is created only when it clears dust *and* the sweep fee; a
+        // smaller balance goes to the miner fee (see [`TO_LOCAL_DUST`]).
+        if side[holder] >= TO_LOCAL_DUST {
             outs.push(to_local.output(Amount::from_units(side[holder])));
         } else if side[holder] > 0 {
             trimmed_units += side[holder];
@@ -346,6 +370,7 @@ pub fn penalty_tx(
     network: crate::address::Network,
     signer: &dyn Signer,
 ) -> Transaction {
+    let fee = capped_fee(to_local_output.value.units(), fee);
     let value = to_local_output.value.units().saturating_sub(fee);
     let mut tx = one_input(to_local_outpoint, vec![key_output(sweep_to, value)], 0);
     // Revocation path: choice 0 of the to_local `Any`, leaf 0 (the key),
@@ -379,6 +404,7 @@ pub fn local_sweep_tx(
     network: crate::address::Network,
     signer: &dyn Signer,
 ) -> Transaction {
+    let fee = capped_fee(to_local_output.value.units(), fee);
     let value = to_local_output.value.units().saturating_sub(fee);
     let mut tx = one_input(to_local_outpoint, vec![key_output(sweep_to, value)], 0);
     // Delayed path: choice 1 of the `Any`, leaf is the holder's key (leaf 2
@@ -417,6 +443,7 @@ pub fn to_remote_claim_tx(
     network: crate::address::Network,
     signer: &dyn Signer,
 ) -> Transaction {
+    let fee = capped_fee(to_remote_output.value.units(), fee);
     let value = to_remote_output.value.units().saturating_sub(fee);
     let mut tx = one_input(to_remote_outpoint, vec![key_output(sweep_to, value)], 0);
     let m = tx.sighash(0, network, to_remote_output);

@@ -39,8 +39,10 @@ const KIND_ENGINE: u8 = 0;
 const KIND_HELLO: u8 = 1;
 const KIND_HELLO_BACK: u8 = 2;
 
-/// Fee reserved for a cooperative close, a penalty, or a sweep, in units.
-pub const CLOSE_FEE: u64 = 20_000;
+/// Fee reserved for a cooperative close, a penalty, or a sweep, in units. The
+/// sweep builders cap it so a swept output never falls below the dust floor
+/// (see [`crate::channel::txbuild::capped_fee`]).
+pub const CLOSE_FEE: u64 = crate::channel::txbuild::SWEEP_FEE;
 
 /// Builds, signs, reserves and broadcasts the funding transaction paying the
 /// given output; returns its outpoint. Takes the chain and wallet locks itself.
@@ -755,7 +757,7 @@ impl ChannelManager {
                     txid: penalty.txid(),
                     penalty: true,
                 });
-                let _ = (self.hooks.broadcast)(&penalty);
+                self.broadcast_or_warn(&penalty, "penalty");
                 Some(penalty)
             }
             Watch::PeerLatest {
@@ -770,7 +772,7 @@ impl ChannelManager {
                     txid: claim.txid(),
                     penalty: false,
                 });
-                let _ = (self.hooks.broadcast)(&claim);
+                self.broadcast_or_warn(&claim, "to_remote claim");
                 Some(claim)
             }
             _ => None,
@@ -834,7 +836,7 @@ impl ChannelManager {
                         txid: penalty.txid(),
                         penalty: true,
                     });
-                    let _ = (self.hooks.broadcast)(&penalty);
+                    self.broadcast_or_warn(&penalty, "penalty");
                 }
             }
             Watch::PeerLatest { to_remote, .. } => {
@@ -848,7 +850,7 @@ impl ChannelManager {
                             txid: claim.txid(),
                             penalty: false,
                         });
-                        let _ = (self.hooks.broadcast)(&claim);
+                        self.broadcast_or_warn(&claim, "to_remote claim");
                     }
                     // Our funds were trimmed to dust: nothing to claim, settled.
                     None => {
@@ -948,7 +950,7 @@ impl ChannelManager {
                                 txid,
                                 penalty: false,
                             });
-                            let _ = (self.hooks.broadcast)(&sweep);
+                            self.broadcast_or_warn(&sweep, "delayed sweep");
                         }
                     }
                 }
@@ -1047,6 +1049,18 @@ impl ChannelManager {
 /// commitment shape (see [`Machine::identify_spend`]).
 fn classify_spend(chan: &Chan, _funding: OutPoint, tx: &Transaction) -> Watch {
     chan.machine.identify_spend(tx)
+}
+
+impl ChannelManager {
+    /// Broadcasts an on-chain protection transaction (penalty, claim, sweep),
+    /// warning loudly on failure. A swallowed error here can mean lost funds —
+    /// a penalty that never confirms lets a cheater's delayed sweep win — so it
+    /// must never pass silently.
+    fn broadcast_or_warn(&self, tx: &Transaction, what: &str) {
+        if let Err(e) = (self.hooks.broadcast)(tx) {
+            eprintln!("ALERT: channel {what} transaction could not be broadcast: {e}");
+        }
+    }
 }
 
 fn summary(c: &Chan) -> ChannelSummary {
