@@ -451,6 +451,29 @@ impl Mempool {
         Some(fees.saturating_mul(1000) / weight.max(1))
     }
 
+    /// Does every input of `tx` carry a key and a signature of exactly the
+    /// sizes its spent output's scheme fixes? Read from the UTXO set and the
+    /// pool, without verifying anything.
+    ///
+    /// The `txid` leaves the witness out, so anyone can relay a copy of a
+    /// transaction with its signature padded: a heavier copy, of a lower
+    /// apparent rate, under the same id. Every valid copy has the sizes its
+    /// schemes fix, hence the same weight and the same rate; a refusal decided
+    /// on a copy of those sizes holds for all of them, and only such a refusal
+    /// may be remembered by id. A policy input has no fixed size: never
+    /// canonical.
+    pub fn witness_is_canonical(&self, tx: &Transaction, confirmed: &UtxoSet) -> bool {
+        let view = self.view(confirmed);
+        tx.inputs.iter().all(|i| {
+            view.lookup(&i.prev_out).is_some_and(|u| {
+                let s = u.output.scheme;
+                crate::sig::SchemeId::ALL.contains(&s)
+                    && i.witness.pubkey.len() == s.pubkey_len()
+                    && i.witness.signature.len() == s.sig_len()
+            })
+        })
+    }
+
     /// Could a transaction paying `rate` and occupying `size` bytes get into
     /// the pool right now — either because there is free space, or because it
     /// pays clearly more than cheap enough entries it could evict?

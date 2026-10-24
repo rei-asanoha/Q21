@@ -450,6 +450,11 @@ pub const MAX_REQUESTED_TXS: usize = TX_BUCKET_MAX as usize;
 /// `Shared::rejected`.
 pub const MAX_RECENT_REJECTS: usize = 20_000;
 
+/// Blocks a full-pool refusal is remembered for. Past them the transaction is
+/// worth one more download: a refusal that held only for a stale copy, or for
+/// a pool that has since changed, does not keep it out for good.
+pub const FULL_POOL_REFUSAL_BLOCKS: u64 = 6;
+
 /// Announced transactions waiting, per peer, for its budget to refill before
 /// they are requested. Sized to hold a re-offer of a full pool
 /// ([`MEMPOOL_REOFFER_MAX_TXS`]), so that a node catching up never has to
@@ -966,8 +971,14 @@ struct Shared {
     /// below its rate. Without it, every peer re-offered its whole pool after
     /// each block and the node re-downloaded everything it had just refused
     /// (measured at 8.7 transactions received per accepted payment, against
-    /// 1.7 before). Bounded by [`MAX_RECENT_REJECTS`].
-    full_pool_rejected: HashMap<Hash256, (u64, usize)>,
+    /// 1.7 before). Bounded by [`MAX_RECENT_REJECTS`]; each entry, with the
+    /// height it was refused at, lasts [`FULL_POOL_REFUSAL_BLOCKS`].
+    ///
+    /// Keyed by `txid`, which announcements carry and which leaves the witness
+    /// out: only a refusal of a copy whose witness has the sizes its schemes
+    /// fix is recorded ([`Mempool::witness_is_canonical`]), so that a copy
+    /// padded to a lower rate cannot get the honest one ignored.
+    full_pool_rejected: HashMap<Hash256, (u64, usize, u64)>,
     /// Transactions that arrived before their parent. See
     /// [`crate::mempool::OrphanPool`].
     orphans: crate::mempool::OrphanPool,
@@ -3355,6 +3366,20 @@ impl Node {
                                 // side can lift, so it is not downloaded again
                                 // at every offer (0.4.9 offered every two
                                 // minutes).
+                                //
+                                // A rate refusal is decided before any
+                                // signature, on this copy's weight: it is
+                                // remembered by id only if the witness has
+                                // the sizes every valid copy has. A padded
+                                // copy refused here, then remembered, kept the
+                                // honest one from ever being fetched while the
+                                // pool stayed full — a penalty included.
+                                let rememberable =
+                                    !matches!(
+                                        e,
+                                        crate::mempool::MempoolError::FullAndUnderpaid
+                                            | crate::mempool::MempoolError::FeeRateTooLow { .. }
+                                    ) || g.mempool.witness_is_canonical(&t, &g.chain.utxo);
                                 match &e {
                                     // A full pool is lifted not by a mere block
                                     // but by room: this refusal is remembered
@@ -3363,12 +3388,22 @@ impl Node {
                                     // asked for again only once the pool could
                                     // take it. See `full_pool_rejected` and
                                     // `should_request_tx`.
-                                    crate::mempool::MempoolError::FullAndUnderpaid => {
+                                    crate::mempool::MempoolError::FullAndUnderpaid
+                                        if rememberable =>
+                                    {
                                         let size = t.encode().len();
                                         let rate = g
                                             .mempool
                                             .apparent_fee_rate(&t, &g.chain.utxo)
                                             .unwrap_or(0);
+                                        if g.full_pool_rejected.len() >= MAX_RECENT_REJECTS
+                                            && !g.full_pool_rejected.contains_key(&txid)
+                                        {
+                                            g.full_pool_rejected.retain(|_, r| {
+                                                height.saturating_sub(r.2)
+                                                    < FULL_POOL_REFUSAL_BLOCKS
+                                            });
+                                        }
                                         if g.full_pool_rejected.len() >= MAX_RECENT_REJECTS
                                             && !g.full_pool_rejected.contains_key(&txid)
                                         {
@@ -3378,13 +3413,15 @@ impl Node {
                                                 g.full_pool_rejected.remove(&evict);
                                             }
                                         }
-                                        g.full_pool_rejected.insert(txid, (rate, size));
+                                        g.full_pool_rejected.insert(txid, (rate, size, height));
                                     }
                                     // A conflict or a fee below the floor can be
                                     // cleared by the next block; remembered only
                                     // until the tip moves.
                                     crate::mempool::MempoolError::SpendConflict(_)
-                                    | crate::mempool::MempoolError::FeeRateTooLow { .. } => {
+                                    | crate::mempool::MempoolError::FeeRateTooLow { .. }
+                                        if rememberable =>
+                                    {
                                         let tip = g.chain.tip_id();
                                         if g.rejected_at != tip
                                             || g.rejected.len() >= MAX_RECENT_REJECTS
@@ -3796,8 +3833,9 @@ impl Node {
         if g.rejected_at == g.chain.tip_id() && g.rejected.contains(hash) {
             return false;
         }
-        if let Some((rate, size)) = g.full_pool_rejected.get(hash) {
-            if !g.mempool.would_admit(*rate, *size) {
+        if let Some((rate, size, at)) = g.full_pool_rejected.get(hash) {
+            let fresh = g.chain.height().saturating_sub(*at) < FULL_POOL_REFUSAL_BLOCKS;
+            if fresh && !g.mempool.would_admit(*rate, *size) {
                 return false;
             }
         }
@@ -5323,7 +5361,7 @@ mod tests {
         let too_big = 1usize << 40;
         {
             let mut g = n.shared.lock().unwrap();
-            g.full_pool_rejected.insert(h, (1_000, too_big));
+            g.full_pool_rejected.insert(h, (1_000, too_big, 0));
             // A stale tip-scoped set: a block has moved the tip since, so this
             // would no longer block on its own.
             g.rejected_at = Hash256([9u8; 32]);
@@ -5340,7 +5378,7 @@ mod tests {
             .lock()
             .unwrap()
             .full_pool_rejected
-            .insert(h, (1_000, 500));
+            .insert(h, (1_000, 500, 0));
         assert!(
             Node::should_request_tx(&n.shared.lock().unwrap(), &h),
             "once the pool has room, the transaction is requested again"
@@ -5546,6 +5584,120 @@ mod tests_hardening {
             c.mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
         })
         .expect("regtest mining")
+    }
+
+    /// Mines and connects one block on `n`; returns it.
+    fn connect_block(n: &Node) -> Block {
+        let b = next_block(n);
+        n.with_chain(|c| c.connect(&b, b.header.time + 1))
+            .expect("connect");
+        b
+    }
+
+    /// A spend of `b`'s coinbase whose key and signature have the sizes the
+    /// scheme fixes (their content does not matter: a rate refusal comes before
+    /// any signature), paying `fee`.
+    fn canonical_spend(b: &Block, fee: u64) -> Transaction {
+        let cb = &b.transactions[0];
+        let s = SchemeId::LamportOts;
+        Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn {
+                prev_out: crate::tx::OutPoint {
+                    txid: cb.txid(),
+                    index: 0,
+                },
+                witness: crate::tx::Witness {
+                    pubkey: vec![1u8; s.pubkey_len()],
+                    signature: vec![2u8; s.sig_len()],
+                },
+                sequence: 0,
+            }],
+            outputs: vec![crate::tx::TxOut {
+                value: crate::amount::Amount::from_units(cb.outputs[0].value.units() - fee),
+                scheme: s,
+                pubkey_hash: Hash256([5u8; 32]),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// The same transaction, its signature padded: same `txid`, heavier.
+    fn padded(tx: &Transaction, extra: usize) -> Transaction {
+        let mut p = tx.clone();
+        p.inputs[0].witness.signature.extend(vec![0u8; extra]);
+        assert_eq!(p.txid(), tx.txid());
+        p
+    }
+
+    /// Finding 9: a copy of a transaction padded to a lower rate, refused by a
+    /// full pool, must not get the honest copy ignored. The `txid` leaves the
+    /// witness out, so the refusal was remembered for every copy, and the
+    /// honest one was never requested again while the pool stayed full.
+    #[test]
+    fn a_padded_copy_refused_by_a_full_pool_does_not_shut_out_the_honest_one() {
+        let (_a, b) = node_pair();
+        let _p = established_peer(&b, 7);
+        let block = connect_block(&b);
+        let honest = canonical_spend(&block, block.transactions[0].outputs[0].value.units() / 2);
+        let bloated = padded(&honest, 50_000);
+        let txid = honest.txid();
+
+        // A pool with no room at all: refused before any signature.
+        b.shared.lock().unwrap().mempool = Mempool::with_capacity(1);
+        let _ = b.handle(7, Message::Tx(Box::new(bloated)));
+
+        // Now room for the honest copy, not for the padded one.
+        b.shared.lock().unwrap().mempool = Mempool::with_capacity(honest.encode().len() + 100);
+        assert!(
+            Node::should_request_tx(&b.shared.lock().unwrap(), &txid),
+            "a padded copy's refusal shut the honest transaction out"
+        );
+    }
+
+    /// The same for a fee-floor refusal: a copy padded below the minimum rate
+    /// must not keep the honest one away until the next block.
+    #[test]
+    fn a_padded_copy_under_the_fee_floor_does_not_shut_out_the_honest_one() {
+        let (_a, b) = node_pair();
+        let _p = established_peer(&b, 7);
+        let block = connect_block(&b);
+        // Just above the floor as it is; far below it once padded.
+        let probe = canonical_spend(&block, 0);
+        let weight = probe.weight(crate::consensus::WITNESS_DISCOUNT);
+        let fee = crate::mempool::MIN_FEE_RATE * weight / 1000 + 10;
+        let honest = canonical_spend(&block, fee);
+        let bloated = padded(&honest, 200_000);
+        let _ = b.handle(7, Message::Tx(Box::new(bloated)));
+        assert!(
+            Node::should_request_tx(&b.shared.lock().unwrap(), &honest.txid()),
+            "a padded copy's fee refusal shut the honest transaction out"
+        );
+    }
+
+    /// What finding 9 must not undo: the refusal of a copy of the right sizes
+    /// is still remembered, so a full pool does not download it again at every
+    /// offer — but only for a few blocks.
+    #[test]
+    fn a_full_pool_refusal_of_a_canonical_copy_is_kept_for_a_few_blocks() {
+        let (_a, b) = node_pair();
+        let _p = established_peer(&b, 7);
+        let block = connect_block(&b);
+        let honest = canonical_spend(&block, block.transactions[0].outputs[0].value.units() / 2);
+        let txid = honest.txid();
+        b.shared.lock().unwrap().mempool = Mempool::with_capacity(1);
+        let _ = b.handle(7, Message::Tx(Box::new(honest)));
+        assert!(
+            !Node::should_request_tx(&b.shared.lock().unwrap(), &txid),
+            "a refusal that holds for every copy is remembered"
+        );
+        for _ in 0..FULL_POOL_REFUSAL_BLOCKS {
+            connect_block(&b);
+        }
+        assert!(
+            Node::should_request_tx(&b.shared.lock().unwrap(), &txid),
+            "the refusal expired after a few blocks"
+        );
     }
 
     /// A sink that records the blocks and transactions handed to its watcher.
