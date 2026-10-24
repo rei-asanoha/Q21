@@ -76,6 +76,13 @@ pub enum ChannelError {
     BadReestablish,
     /// The balances of an update do not conserve the capacity, or underflow.
     BadBalances,
+    /// A received update would move funds the wrong way — it lowers our own
+    /// balance. A payment to us may only keep or raise our side; a proposer
+    /// never drains the receiver.
+    WrongDirection,
+    /// An opening parameter (to-self delay, funding depth, or capacity) is out
+    /// of the range this node will accept.
+    BadParameters,
     /// We lack randomness for a nonce.
     NoRandomness,
     /// A guard caught an attempt to break a safety invariant. Should never
@@ -239,6 +246,19 @@ impl Machine {
         else {
             return Err(ChannelError::Unexpected);
         };
+        // H3: the funder chooses these; an acceptor must refuse an open that
+        // would leave its funds unprotected or frozen. A too-short to-self delay
+        // gives a revoked cheater's own sweep no head-start over our penalty; a
+        // huge one freezes funds for years; depth 0 would treat an unconfirmed
+        // funding as final; a dust capacity cannot carry two outputs and a fee.
+        if *delay < crate::channel::MIN_DELAY_REGTEST
+            || *delay > crate::channel::MAX_DELAY
+            || *funding_depth < crate::channel::DEFAULT_FUNDING_DEPTH
+            || *capacity < crate::channel::MIN_CAPACITY
+            || *capacity > crate::channel::MAX_CAPACITY
+        {
+            return Err(ChannelError::BadParameters);
+        }
         let our_pubkey = signer.pubkey().to_vec();
         let funding = [
             crate::sig::pubkey_hash(CHANNEL_SCHEME, funder_pubkey),
@@ -618,6 +638,15 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         }
         self.check_balances(*balances)?;
+        // C1: a received update is a payment the proposer makes TO us, so our
+        // own balance may only stay the same or rise. A peer that lowers our
+        // side is trying to drain us — reject it before we persist the drained
+        // commitment or reveal any revocation secret. (We countersign and
+        // reveal only after this guard; nothing is journaled above.)
+        let us = self.our_index;
+        if balances[us] < self.current_balances()[us] {
+            return Err(ChannelError::WrongDirection);
+        }
         // INV2: persist the counterparty's signature over our commitment `n`
         // before acknowledging.
         self.verify_our_commitment(n, *balances, tier_sigs)?;

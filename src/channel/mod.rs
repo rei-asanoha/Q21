@@ -37,8 +37,17 @@ pub use watcher::{classify, Watch, WatchContext};
 pub const DEFAULT_DELAY_REGTEST: u16 = 12;
 /// Smallest to-self delay a party should accept on regtest.
 pub const MIN_DELAY_REGTEST: u16 = 6;
+/// Largest to-self delay a party should accept: beyond about two weeks of
+/// blocks a channel's funds would be frozen for an unreasonable time.
+pub const MAX_DELAY: u16 = 2016;
 /// Confirmations before a funding output is considered final.
 pub const DEFAULT_FUNDING_DEPTH: u16 = 2;
+/// Smallest channel capacity an acceptor will take: enough for two outputs and
+/// the commitment fee, so a close can always pay both sides above dust.
+pub const MIN_CAPACITY: u64 = 4 * crate::consensus::MIN_OUTPUT_VALUE;
+/// Largest channel capacity an acceptor will take, a sanity bound well under
+/// the money supply.
+pub const MAX_CAPACITY: u64 = 21_000_000_000_000;
 
 #[cfg(all(test, feature = "mldsa"))]
 mod tests;
