@@ -937,3 +937,56 @@ fn a_channel_survives_repeated_link_flaps() {
     net.a.shutdown();
     net.b.shutdown();
 }
+
+/// D14: both ends pay at the same instant, so each receives the other's
+/// proposal for the state it proposed itself. That is a race on the wire, not
+/// misconduct: the proposal is not acted on, and costs its sender nothing.
+/// Charged as misconduct, it cost the link, then again at every reestablish,
+/// which resends the same crossed proposals.
+#[test]
+fn crossed_payments_are_not_misconduct() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let net = setup("d14cross", [0xc1u8; 32], [0xc2u8; 32]);
+    let cap = 4_000_000u64;
+    let cid = net.open(cap);
+
+    // Give the acceptor a balance to pay with.
+    let first = net.fmgr.pay(cid, 1_000_000).unwrap();
+    assert!(net.a.send_channel(net.bid, first));
+    assert!(
+        wait(
+            || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 1_000_000,
+            10
+        ),
+        "the first payment did not land"
+    );
+
+    // Each side proposes the next state before hearing from the other.
+    // The acceptor waits out the funder's revocation of the first state.
+    let start = Instant::now();
+    let from_acceptor = loop {
+        if let Ok(frame) = net.amgr.pay(cid, 5_000) {
+            break frame;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the acceptor could not propose"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let from_funder = net.fmgr.pay(cid, 10_000).unwrap();
+
+    // Each proposal reaches the other side.
+    let b_peer = *net.b.channel_peers().first().expect("B sees A");
+    let at_acceptor = net
+        .amgr
+        .deliver(b_peer, &net.b.peer_identity(b_peer), &from_funder);
+    let at_funder = net
+        .fmgr
+        .deliver(net.bid, &net.a.peer_identity(net.bid), &from_acceptor);
+    assert_eq!(at_acceptor.penalize, 0, "the acceptor charged the race");
+    assert_eq!(at_funder.penalize, 0, "the funder charged the race");
+
+    net.a.shutdown();
+    net.b.shutdown();
+}

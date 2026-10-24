@@ -786,6 +786,12 @@ impl ChannelManager {
                 chan.machine.on_ready(&msg).map_err(err)?;
             }
             ChMsg::Update { .. } => {
+                // Both ends proposed the same state at once, or the peer
+                // resends such a proposal at a reestablish. Refused as
+                // misconduct, it cost the link at every reconnection (D14).
+                if chan.machine.crosses_our_proposal(&msg) {
+                    return Ok(out);
+                }
                 let m = chan.machine.on_update(&msg).map_err(err)?;
                 out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
             }

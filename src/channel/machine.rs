@@ -1538,6 +1538,20 @@ impl Machine {
         l >= 1 && (self.revocations_sent < Some(l - 1) || self.revocations_recv < Some(l - 1))
     }
 
+    /// Whether `msg` is the peer's [`Message::Update`] for the very state we
+    /// proposed and it has not acknowledged: both ends paid at the same
+    /// moment. An honest race on the wire, not misconduct. Neither proposal is
+    /// taken over the other here: each side has already signed its own.
+    pub fn crosses_our_proposal(&self, msg: &Message) -> bool {
+        let Message::Update { state, .. } = msg else {
+            return false;
+        };
+        matches!(self.phase, Phase::Open | Phase::Closing)
+            && self.remote_commit_number == Some(*state)
+            && self.local_commit_number < Some(*state)
+            && self.initiated.get(state) == Some(&true)
+    }
+
     /// Whether `tx` is the cooperative close of this channel at its current
     /// balances and the agreed fee: the transaction that settles it when the
     /// counterparty broadcast it.
