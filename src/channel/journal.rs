@@ -75,8 +75,12 @@ pub enum Record {
     TheirPoint { state: u64, point: Hash256 },
     /// The funding is buried to the agreed depth; the channel is open.
     Ready,
-    /// A cooperative close was agreed at `fee`.
+    /// A cooperative close was agreed at `fee`, charged to the funder (the
+    /// record of journals written before the payer was recorded).
     ClosingCoop { fee: u64 },
+    /// A cooperative close was agreed at `fee`, charged to `payer` — the
+    /// party that proposed it.
+    ClosingCoopBy { fee: u64, payer: u8 },
     /// We moved to force-close (we or the peer will broadcast a commitment).
     Forcing,
     /// We punished a revoked broadcast.
@@ -121,6 +125,7 @@ const R_REVOCATIONS: u8 = 13;
 const R_CONFIRMED: u8 = 14;
 const R_CLOSE_SIGNED: u8 = 15;
 const R_CROSSED: u8 = 16;
+const R_CLOSING_COOP_BY: u8 = 17;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -214,6 +219,9 @@ impl Record {
             Record::Crossed { state } => {
                 w.u8(R_CROSSED).u64(*state);
             }
+            Record::ClosingCoopBy { fee, payer } => {
+                w.u8(R_CLOSING_COOP_BY).u64(*fee).u8(*payer);
+            }
         }
         w.finish()
     }
@@ -293,6 +301,10 @@ impl Record {
             }
             R_CONFIRMED => Record::Confirmed { height: r.u64()? },
             R_CROSSED => Record::Crossed { state: r.u64()? },
+            R_CLOSING_COOP_BY => Record::ClosingCoopBy {
+                fee: r.u64()?,
+                payer: r.u8()?,
+            },
             R_CLOSE_SIGNED => Record::CloseSigned {
                 fee: r.u64()?,
                 signature: r.var_bytes()?.to_vec(),

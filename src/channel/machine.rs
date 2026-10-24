@@ -202,6 +202,8 @@ pub struct Machine {
     /// The fee of the cooperative close we agreed to, once closing, so the
     /// `Close` can be sent again after a crash or a reconnect.
     close_fee: Option<u64>,
+    /// Who pays the agreed close's fee: the party that proposed it.
+    close_payer: Option<usize>,
     /// Whether we may have signed the cooperative close. Until we have, a
     /// payment to us that crossed our `Close` on the wire is still accepted;
     /// once we have, the peer holds a close over the old balances and no update
@@ -413,6 +415,7 @@ impl Machine {
             remote_balances: BTreeMap::new(),
             initiated: BTreeMap::new(),
             close_fee: None,
+            close_payer: None,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,
@@ -1034,7 +1037,10 @@ impl Machine {
             out.push(Record::Confirmed { height });
         }
         if let Some(fee) = self.close_fee {
-            out.push(Record::ClosingCoop { fee });
+            out.push(Record::ClosingCoopBy {
+                fee,
+                payer: self.close_payer.unwrap_or(FUNDER) as u8,
+            });
             if let Some(signature) = &self.close_peer_sig {
                 out.push(Record::CloseSigned {
                     fee,
@@ -1196,16 +1202,20 @@ impl Machine {
     // --- Cooperative close ---------------------------------------------------
 
     /// Proposes a cooperative close at the current balance, returning
-    /// [`Message::Close`].
+    /// [`Message::Close`]. The proposer pays the fee, from its own side.
     ///
-    /// On a channel already closing cooperatively, it returns the agreed
-    /// `Close` again, unchanged: a close whose message was lost to a crash or a
-    /// dropped link can be completed instead of stranding the channel.
+    /// On a channel already closing cooperatively on our proposal, it returns
+    /// the agreed `Close` again, unchanged: a close whose message was lost to a
+    /// crash or a dropped link can be completed instead of stranding the
+    /// channel.
     pub fn propose_close(&mut self, fee: u64) -> Result<Message, ChannelError> {
         if self.phase == Phase::Closing {
-            if let Some(agreed) = self.close_fee {
-                return Ok(Message::Close { fee: agreed });
-            }
+            return match (self.close_fee, self.close_payer) {
+                (Some(agreed), Some(p)) if p == self.our_index => {
+                    Ok(Message::Close { fee: agreed })
+                }
+                _ => Err(ChannelError::Unexpected),
+            };
         }
         if self.phase != Phase::Open {
             return Err(ChannelError::Unexpected);
@@ -1215,30 +1225,73 @@ impl Machine {
         if self.update_in_flight() {
             return Err(ChannelError::Unexpected);
         }
-        self.journal.append(&Record::ClosingCoop { fee })?;
-        self.phase = Phase::Closing;
-        self.close_fee = Some(fee);
+        self.check_close_fee(fee, self.our_index)?;
+        self.journal_close(fee, self.our_index)?;
         Ok(Message::Close { fee })
     }
 
     /// Agrees to a cooperative close at `fee` while an update is still in
-    /// flight: the channel moves to [`Phase::Closing`] at once, so no new
-    /// update starts, and the `Close` is sent once the update settles (see
-    /// [`Machine::propose_close`], which then returns it). Idempotent.
-    pub fn agree_close(&mut self, fee: u64) -> Result<(), ChannelError> {
+    /// flight — our own (`ours`) or the peer's — moving to
+    /// [`Phase::Closing`] at once, so no new update starts. Once the update
+    /// settles, our `Close` follows, or our signature of the peer's (see
+    /// [`Machine::close_after_update`]). Idempotent.
+    pub fn agree_close(&mut self, fee: u64, ours: bool) -> Result<(), ChannelError> {
+        let payer = if ours {
+            self.our_index
+        } else {
+            1 - self.our_index
+        };
         match self.phase {
             Phase::Open => {
-                self.journal.append(&Record::ClosingCoop { fee })?;
-                self.phase = Phase::Closing;
-                self.close_fee = Some(fee);
-                Ok(())
+                self.check_close_fee(fee, payer)?;
+                self.journal_close(fee, payer)
             }
             Phase::Closing => Ok(()),
             _ => Err(ChannelError::Unexpected),
         }
     }
 
+    /// The message an agreed close owes once no update is in flight: our
+    /// `Close` if we proposed it, our `CloseSigned` if the peer did.
+    pub fn close_after_update(&mut self) -> Result<Option<Message>, ChannelError> {
+        if self.phase != Phase::Closing || self.update_in_flight() {
+            return Ok(None);
+        }
+        match (self.close_fee, self.close_payer) {
+            (Some(fee), Some(p)) if p == self.our_index => Ok(Some(Message::Close { fee })),
+            (Some(fee), Some(_)) => self.on_close(&Message::Close { fee }).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// A close fee `payer` may be charged: within [`txbuild::close_fee_bounds`]
+    /// and within the payer's own balance. Bounded, because a fee is burned:
+    /// unbounded, a peer proposing a close could make the other side pay away
+    /// its whole balance.
+    fn check_close_fee(&self, fee: u64, payer: usize) -> Result<(), ChannelError> {
+        let (min, max) = txbuild::close_fee_bounds(&self.params);
+        if fee < min || fee > max || fee > self.current_balances()[payer] {
+            return Err(ChannelError::BadParameters);
+        }
+        Ok(())
+    }
+
+    fn journal_close(&mut self, fee: u64, payer: usize) -> Result<(), ChannelError> {
+        self.journal.append(&Record::ClosingCoopBy {
+            fee,
+            payer: payer as u8,
+        })?;
+        self.phase = Phase::Closing;
+        self.close_fee = Some(fee);
+        self.close_payer = Some(payer);
+        Ok(())
+    }
+
     /// Handles a peer's [`Message::Close`], returning our [`Message::CloseSigned`].
+    ///
+    /// The close is the peer's proposal: its fee is charged to the peer alone,
+    /// so our side is paid in full, and the fee must lie within the bounds we
+    /// accept and within the peer's balance.
     pub fn on_close(&mut self, msg: &Message) -> Result<Message, ChannelError> {
         let Message::Close { fee } = msg else {
             return Err(ChannelError::Unexpected);
@@ -1251,18 +1304,15 @@ impl Machine {
         if self.update_in_flight() {
             return Err(ChannelError::Unexpected);
         }
-        if self.phase == Phase::Closed && self.close_fee != Some(*fee) {
-            return Err(ChannelError::Unexpected);
-        }
+        let peer = 1 - self.our_index;
+        self.check_close_fee(*fee, peer)?;
         if self.phase == Phase::Open {
-            self.journal.append(&Record::ClosingCoop { fee: *fee })?;
-            self.phase = Phase::Closing;
-            self.close_fee = Some(*fee);
+            self.journal_close(*fee, peer)?;
         }
         let bal = self.current_balances();
         let close = self
             .params
-            .cooperative_close(self.funding()?, bal, *fee, self.payout);
+            .cooperative_close(self.funding()?, bal, *fee, self.payout, peer);
         let m = self
             .params
             .funding_sighash(&close.tx, self.network, self.our_index);
@@ -1287,7 +1337,8 @@ impl Machine {
         if !matches!(self.phase, Phase::Closing | Phase::Closed) {
             return Err(ChannelError::Unexpected);
         }
-        if self.close_fee.is_some_and(|agreed| agreed != *fee) {
+        // The peer's signature of OUR proposal: same fee, charged to us.
+        if self.close_fee != Some(*fee) || self.close_payer != Some(self.our_index) {
             return Err(ChannelError::Unexpected);
         }
         let tx = self.assemble_close(*fee, signature)?;
@@ -1310,6 +1361,11 @@ impl Machine {
         self.assemble_close(self.close_fee?, sig).ok()
     }
 
+    /// Whether the agreed cooperative close is our own proposal.
+    pub fn closing_on_our_proposal(&self) -> bool {
+        self.close_payer == Some(self.our_index)
+    }
+
     /// Whether we hold the peer's signature over the cooperative close.
     pub fn has_signed_close(&self) -> bool {
         self.close_peer_sig.is_some()
@@ -1319,9 +1375,9 @@ impl Machine {
     /// returns the close signed by both.
     fn assemble_close(&self, fee: u64, signature: &[u8]) -> Result<Transaction, ChannelError> {
         let bal = self.current_balances();
-        let close = self
-            .params
-            .cooperative_close(self.funding()?, bal, fee, self.payout);
+        let close =
+            self.params
+                .cooperative_close(self.funding()?, bal, fee, self.payout, self.our_index);
         let their_leaf = (1 - self.our_index) as u8;
         crate::policy::check_signature(
             &close.tx,
@@ -1423,6 +1479,7 @@ impl Machine {
             remote_balances: BTreeMap::new(),
             initiated: BTreeMap::new(),
             close_fee: None,
+            close_payer: None,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,
@@ -1486,6 +1543,12 @@ impl Machine {
                 Record::ClosingCoop { fee } => {
                     self.phase = Phase::Closing;
                     self.close_fee = Some(*fee);
+                    self.close_payer = Some(FUNDER);
+                }
+                Record::ClosingCoopBy { fee, payer } => {
+                    self.phase = Phase::Closing;
+                    self.close_fee = Some(*fee);
+                    self.close_payer = Some(usize::from(*payer).min(1));
                 }
                 Record::Forcing => self.phase = Phase::Forcing,
                 Record::Penalised => self.phase = Phase::Penalised,
@@ -1494,6 +1557,7 @@ impl Machine {
                 Record::Crossed { state } => self.crossed = Some(*state),
                 Record::CloseSigned { fee, signature } => {
                     self.close_fee = Some(*fee);
+                    self.close_payer = Some(self.our_index);
                     self.close_peer_sig = Some(signature.clone());
                     if self.phase != Phase::Closed {
                         self.phase = Phase::Closing;
@@ -1646,8 +1710,12 @@ impl Machine {
         // an update still settles: both sides must sign the same balances, so
         // the Close then follows the update's completion.
         if self.phase == Phase::Closing && !self.update_in_flight() {
-            if let Some(fee) = self.close_fee {
-                out.push(Message::Close { fee });
+            // Only our own proposal: the peer resends its own, and a Close of
+            // ours over the peer's proposal would charge us its fee.
+            if let (Some(fee), Some(p)) = (self.close_fee, self.close_payer) {
+                if p == self.our_index {
+                    out.push(Message::Close { fee });
+                }
             }
         }
         Ok(out)
@@ -1821,20 +1889,23 @@ impl Machine {
         }))
     }
 
-    /// Whether `tx` is the cooperative close of this channel at its current
-    /// balances and the agreed fee: the transaction that settles it when the
-    /// counterparty broadcast it.
+    /// Whether `tx` is a cooperative close of this channel: it spends the
+    /// funding output and pays only the two parties' payout addresses, neither
+    /// more than its current balance. A spend of the 2-of-2 funding output
+    /// needs our signature, and we sign no other such shape, so this matches
+    /// either party's proposal, whoever pays its fee.
     pub fn is_cooperative_close(&self, tx: &Transaction) -> bool {
-        let (Some(fee), Some(funding)) = (self.close_fee, self.funding_outpoint) else {
+        let Some(funding) = self.funding_outpoint else {
             return false;
         };
-        if tx.inputs.first().map(|i| i.prev_out) != Some(funding) {
+        if tx.inputs.len() != 1 || tx.inputs[0].prev_out != funding || tx.outputs.is_empty() {
             return false;
         }
-        let close =
-            self.params
-                .cooperative_close(funding, self.current_balances(), fee, self.payout);
-        close.tx.outputs == tx.outputs
+        let bal = self.current_balances();
+        tx.outputs.iter().all(|o| {
+            o.scheme == CHANNEL_SCHEME
+                && (0..2).any(|i| o.pubkey_hash == self.payout[i] && o.value.units() <= bal[i])
+        })
     }
 
     // --- Force close and accessors ------------------------------------------

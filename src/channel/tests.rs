@@ -278,6 +278,7 @@ fn channel_transaction_weights() {
         [CAP - 2_000_000, 2_000_000],
         20_000,
         [Hash256([0xf0u8; 32]), Hash256([0xa0u8; 32])],
+        FUNDER,
     );
     let mut closetx = close.tx;
     closetx.inputs[0].witness = txbuild::dummy_funding_witness(&params.funding_policy());
@@ -1745,8 +1746,9 @@ fn a_lost_close_is_resent_on_reestablish() {
     assert_eq!(f.phase(), Phase::Closing);
     assert_eq!(a.phase(), Phase::Closing);
     assert!(a.is_cooperative_close(&tx), "the peer recognises the close");
+    // A spend paying anyone but the two payout addresses is not a close.
     let mut other = tx.clone();
-    other.outputs[0].value = crate::amount::Amount::from_units(other.outputs[0].value.units() - 1);
+    other.outputs[0].pubkey_hash = Hash256([0x66u8; 32]);
     assert!(!a.is_cooperative_close(&other));
 }
 
@@ -2282,4 +2284,71 @@ fn a_crossed_proposal_draining_us_is_refused() {
     let records = f.journal_records();
     assert_eq!(f.on_peer_update(&bad), Err(ChannelError::WrongDirection));
     assert_eq!(f.journal_records(), records);
+}
+
+// --- Cooperative-close fees -------------------------------------------------
+
+/// A peer proposing a close cannot make us pay for it: an unbounded fee, or
+/// one larger than the proposer's own balance, is refused before anything is
+/// journaled or signed, and a fee within bounds is charged to the proposer
+/// alone, our side paid in full.
+#[test]
+fn a_peer_proposed_close_fee_is_bounded_and_charged_to_the_proposer() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    let (_, max) = txbuild::close_fee_bounds(f.params());
+    // The acceptor asks the funder to burn its balance as fee.
+    let records = f.journal_records();
+    for fee in [CAP - 1_000_000, max + 1, 0] {
+        assert_eq!(
+            f.on_close(&Message::Close { fee }),
+            Err(ChannelError::BadParameters),
+            "fee {fee}"
+        );
+    }
+    assert_eq!(f.journal_records(), records, "nothing journaled");
+    assert_eq!(f.phase(), Phase::Open);
+    // Within bounds but above what the proposer holds.
+    pay(&mut a, &mut f, [CAP - 5_000, 5_000]);
+    assert_eq!(
+        f.on_close(&Message::Close { fee: 20_000 }),
+        Err(ChannelError::BadParameters)
+    );
+    // A sane proposal by the acceptor: the acceptor pays.
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    let close = a.propose_close(20_000).unwrap();
+    let signed = f.on_close(&close).unwrap();
+    let tx = a.on_close_signed(&signed).unwrap();
+    let paid = |h: Hash256| -> u64 {
+        tx.outputs
+            .iter()
+            .filter(|o| o.pubkey_hash == h)
+            .map(|o| o.value.units())
+            .sum()
+    };
+    assert_eq!(
+        paid(Hash256([0xf0u8; 32])),
+        CAP - 1_000_000,
+        "the funder is paid in full"
+    );
+    assert_eq!(
+        paid(Hash256([0xa0u8; 32])),
+        1_000_000 - 20_000,
+        "the proposer pays"
+    );
+    assert!(f.is_cooperative_close(&tx));
+}
+
+/// We never propose a close fee out of bounds, nor one beyond our balance.
+#[test]
+fn our_own_close_fee_is_bounded_too() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 10_000, 10_000]);
+    let (_, max) = txbuild::close_fee_bounds(f.params());
+    assert_eq!(f.propose_close(max + 1), Err(ChannelError::BadParameters));
+    assert_eq!(a.propose_close(20_000), Err(ChannelError::BadParameters));
+    assert_eq!(f.phase(), Phase::Open);
+    assert!(f.propose_close(20_000).is_ok());
 }

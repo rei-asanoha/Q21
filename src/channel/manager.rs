@@ -516,7 +516,11 @@ impl ChannelManager {
             return Err("channel is not yet resynchronized with its peer".into());
         }
         if chan.machine.update_in_flight() {
-            chan.machine.agree_close(CLOSE_FEE).map_err(err)?;
+            chan.machine.agree_close(CLOSE_FEE, true).map_err(err)?;
+            return Ok(None);
+        }
+        // Closing already on the peer's proposal: nothing of ours to send.
+        if chan.machine.phase() == Phase::Closing && !chan.machine.closing_on_our_proposal() {
             return Ok(None);
         }
         let msg = chan.machine.propose_close(CLOSE_FEE).map_err(err)?;
@@ -830,7 +834,7 @@ impl ChannelManager {
                     // The peer's Close crossed an update still settling here:
                     // agree now, and send our own Close once the update
                     // completes; the peer signs that one.
-                    chan.machine.agree_close(fee).map_err(err)?;
+                    chan.machine.agree_close(fee, false).map_err(err)?;
                 } else {
                     let m = chan.machine.on_close(&msg).map_err(err)?;
                     out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
@@ -1536,10 +1540,7 @@ impl ChannelManager {
 /// flight, once that update has settled: the close could not be signed over
 /// balances the two sides did not yet share, so it follows the update.
 fn pending_close(chan: &mut Chan, cid: Hash256) -> Option<Vec<u8>> {
-    if chan.machine.phase() != Phase::Closing || chan.machine.update_in_flight() {
-        return None;
-    }
-    let msg = chan.machine.propose_close(CLOSE_FEE).ok()?;
+    let msg = chan.machine.close_after_update().ok()??;
     Some(write_frame(cid, KIND_ENGINE, &msg.encode()))
 }
 

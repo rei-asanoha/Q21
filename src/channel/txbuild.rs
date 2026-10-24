@@ -278,8 +278,9 @@ impl ChannelParams {
         tx.inputs[0].witness = policy::witness(&self.funding_policy(), &s);
     }
 
-    /// A cooperative close paying each party its final balance, the funder's
-    /// side less the close fee, dropping dust into the fee.
+    /// A cooperative close paying each party its final balance, the side of
+    /// `payer` (the party that proposed the close) less the close fee, dropping
+    /// dust into the fee.
     ///
     /// Each output pays the party's **wallet** payout address (`payout[i]`),
     /// not its channel key: a channel key is not in any wallet's address space,
@@ -292,9 +293,10 @@ impl ChannelParams {
         bal: [u64; 2],
         fee: u64,
         payout: [Hash256; 2],
+        payer: usize,
     ) -> Commitment {
         let mut side = bal;
-        side[FUNDER] = side[FUNDER].saturating_sub(fee);
+        side[payer] = side[payer].saturating_sub(fee);
         let mut outs = Vec::new();
         let mut trimmed_units = 0u64;
         let mut trimmed_outputs = 0u32;
@@ -346,6 +348,34 @@ pub fn standard_commitment_weight(params: &ChannelParams) -> u64 {
     let mut tx = c.tx;
     tx.inputs[0].witness = dummy_funding_witness(&params.funding_policy());
     tx.weight(WITNESS_DISCOUNT)
+}
+
+/// The weight of a two-output cooperative close once fully witnessed.
+pub fn standard_close_weight(params: &ChannelParams) -> u64 {
+    let half = params.capacity.units() / 2;
+    let c = params.cooperative_close(
+        OutPoint {
+            txid: Hash256::ZERO,
+            index: 0,
+        },
+        [half, params.capacity.units() - half],
+        0,
+        [Hash256::ZERO, Hash256([1u8; 32])],
+        FUNDER,
+    );
+    let mut tx = c.tx;
+    tx.inputs[0].witness = dummy_funding_witness(&params.funding_policy());
+    tx.weight(WITNESS_DISCOUNT)
+}
+
+/// The range of cooperative-close fees a party accepts, in units: from the
+/// relay minimum rate to [`MAX_COMMIT_FEE_RATE`] over the close's weight, and
+/// never less than the sweep fee at the top, which every node proposes.
+pub fn close_fee_bounds(params: &ChannelParams) -> (u64, u64) {
+    let w = standard_close_weight(params);
+    let min = (crate::mempool::MIN_FEE_RATE.saturating_mul(w)).div_ceil(1000);
+    let max = (MAX_COMMIT_FEE_RATE.saturating_mul(w) / 1000).max(SWEEP_FEE);
+    (min, max)
 }
 
 /// The commitment fee, in units, at fee rate `rate` (per thousand weight
