@@ -65,6 +65,39 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.9 to 0.4.10
+
+0.4.10 is a drop-in replacement: same protocol (4), same chain, same data
+directory, same wallet file. A 0.4.9 node and a 0.4.10 node talk to each
+other, and nothing a 0.4.10 node accepts on testnet is refused by a 0.4.9
+node, or the reverse: the blocks a 0.4.10 miner builds are accepted by 0.4.9.
+It fixes five faults of the transaction pool, the miner and block relay that
+were already present in 0.4.9, found under load with a full pool, crashes and
+chain splits. It also carries payment channels, complete and tested but
+**active on regtest only**.
+
+## What changes
+
+| | 0.4.9 | 0.4.10 |
+|---|---|---|
+| Payments of blocks abandoned in a reorganization, when the pool is full | Refused by the full pool: confirmed payments could disappear | Taken back even into a full pool, ahead of newcomers |
+| A miner's coinbase when a block holds a payment and the payment that spends it | The fee of the second payment was left out: the miner lost it | Counted. The block is the same one 0.4.9 accepts |
+| The miner's own block refused | Silently thrown away, and the same block built again, forever | Logged; the offending transaction is dropped from the pool; an identical template is not hashed again; the miner waits when the chain's clock runs ahead |
+| A newcomer seated in a full pool | Could push out the very payments it builds on | Its ancestors are never pushed out to seat it |
+| A transaction a full pool refused | Downloaded again from every peer at every block | Remembered across blocks |
+| A peer slow to deliver a block body on a busy link | Banned: honest peers were cut and chain splits did not heal | Not banned; a block whose parent we lack makes us ask for the headers |
+| A node paused and resumed (a debugger, a laptop lid, `SIGSTOP`) | Every link dropped on resume | Links kept |
+| Payment channels | Pay-to-policy building blocks only, regtest | Complete channels on regtest: `channelopen`, `channelpay`, `channelclose`, `channellist`, `channelinfo`; payments in a few milliseconds; penalties for a revoked state, with a rising fee; recovery after a crash, a lost link or a reorganization. **On testnet and mainnet nothing changes**: no channel message is sent or accepted, and a policy output is treated exactly as 0.4.9 treats it |
+
+## Who needs it
+
+Everyone, the entry points first. The order does not matter for safety: a
+0.4.9 node and a 0.4.10 node agree on every block. Turning channels on for
+testnet is a separate, later decision: it changes the consensus rules, so it
+needs every node on 0.4.10 or later first.
+
+---
+
 # Upgrading from 0.4.8 to 0.4.9
 
 0.4.9 is a drop-in replacement: same protocol (4), same chain, same data

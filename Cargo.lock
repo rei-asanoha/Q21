@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "q21-core"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "libc",
  "ml-dsa",
