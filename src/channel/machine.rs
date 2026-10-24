@@ -156,10 +156,20 @@ pub struct Machine {
     local_commits: BTreeMap<u64, (Balances, [Vec<u8>; 3])>,
     /// Balances we signed the counterparty's commitment at, by state.
     remote_balances: BTreeMap<u64, Balances>,
-    /// Whether, for the current top state, we were the initiator. Set during
-    /// replay from the order of the LocalCommit/RemoteCommit records, and
-    /// during live operation as updates run.
-    initiated_top: Option<bool>,
+    /// Whether we initiated each recent state. The initiator persists its
+    /// `RemoteCommit` before its `LocalCommit`, the responder the reverse, so
+    /// replay recovers this from the order of the records. Reestablish needs it
+    /// to resend the right message: a `Revoke` from the initiator, an `Ack`
+    /// from the responder.
+    initiated: BTreeMap<u64, bool>,
+    /// The fee of the cooperative close we agreed to, once closing, so the
+    /// `Close` can be sent again after a crash or a reconnect.
+    close_fee: Option<u64>,
+    /// Whether we may have signed the cooperative close. Until we have, a
+    /// payment to us that crossed our `Close` on the wire is still accepted;
+    /// once we have, the peer holds a close over the old balances and no update
+    /// may follow. Conservatively true for a channel reloaded while closing.
+    close_signed: bool,
 
     /// The counterparty's announced revocation points, by state.
     their_points: BTreeMap<u64, Hash256>,
@@ -341,7 +351,9 @@ impl Machine {
             revocations_recv: None,
             local_commits: BTreeMap::new(),
             remote_balances: BTreeMap::new(),
-            initiated_top: None,
+            initiated: BTreeMap::new(),
+            close_fee: None,
+            close_signed: false,
             their_points: BTreeMap::new(),
             store: shachain::Store::new(),
             base_fee_rate,
@@ -608,7 +620,6 @@ impl Machine {
         // Persist that we are committed to the counterparty's new state before
         // the signature leaves us.
         self.persist_remote_commit(n, balances)?;
-        self.initiated_top = Some(true);
         Ok(Message::Update {
             state: n,
             balances,
@@ -626,13 +637,19 @@ impl Machine {
         else {
             return Err(ChannelError::Unexpected);
         };
-        if self.phase != Phase::Open {
-            return Err(ChannelError::Unexpected);
-        }
         let n = *state;
-        // Idempotent resend: we already fully processed this update.
-        if self.local_commit_number >= Some(n) {
+        // Idempotent resend: we already processed this update. Answered even
+        // once a cooperative close is agreed, so an update that was in flight
+        // when the close began still completes.
+        if matches!(self.phase, Phase::Open | Phase::Closing) && self.local_commit_number >= Some(n)
+        {
             return self.resend_ack(n);
+        }
+        // A payment to us may still cross our own `Close`; it settles before
+        // the close does. Never once we may have signed the close.
+        let closing_open = self.phase == Phase::Closing && !self.close_signed;
+        if self.phase != Phase::Open && !closing_open {
+            return Err(ChannelError::Unexpected);
         }
         if n != self.next_state() {
             return Err(ChannelError::Unexpected);
@@ -679,7 +696,9 @@ impl Machine {
         else {
             return Err(ChannelError::Unexpected);
         };
-        if self.phase != Phase::Open {
+        // Our own proposal may complete after a cooperative close was agreed:
+        // the Ack only settles the state we already committed to.
+        if !matches!(self.phase, Phase::Open | Phase::Closing) {
             return Err(ChannelError::Unexpected);
         }
         let n = *state;
@@ -785,8 +804,17 @@ impl Machine {
             let oldest = *self.local_commits.keys().next().unwrap();
             self.local_commits.remove(&oldest);
         }
-        self.initiated_top = Some(we_initiated);
+        self.note_initiator(n, we_initiated);
         Ok(())
+    }
+
+    /// Records who initiated state `n`, the first time it is seen.
+    fn note_initiator(&mut self, n: u64, we_initiated: bool) {
+        self.initiated.entry(n).or_insert(we_initiated);
+        while self.initiated.len() > 3 {
+            let oldest = *self.initiated.keys().next().unwrap();
+            self.initiated.remove(&oldest);
+        }
     }
 
     fn persist_remote_commit(&mut self, n: u64, bal: Balances) -> Result<(), ChannelError> {
@@ -796,10 +824,17 @@ impl Machine {
         })?;
         self.remote_commit_number = Some(n);
         self.remote_balances.insert(n, bal);
+        // A RemoteCommit journaled before its LocalCommit marks the initiator.
+        self.note_initiator(n, true);
         Ok(())
     }
 
     fn persist_revocation_sent(&mut self, m: u64) -> Result<(), ChannelError> {
+        // A resend after a crash reveals the same secret again; journal the
+        // fact only once, and never move the counter backwards.
+        if self.revocations_sent >= Some(m) {
+            return Ok(());
+        }
         self.journal.append(&Record::RevocationSent { state: m })?;
         self.revocations_sent = Some(m);
         Ok(())
@@ -814,12 +849,34 @@ impl Machine {
 
     // --- Idempotent resends for reestablish ----------------------------------
 
-    fn resend_ack(&self, n: u64) -> Result<Message, ChannelError> {
-        let bal = *self.remote_balances.get(&n).ok_or(ChannelError::Invariant(
-            "missing remote balances for resend",
-        ))?;
+    /// Our `Ack` of state `n`, as responder. A crash inside
+    /// [`Machine::on_update`] can leave the counterparty's signature over our
+    /// commitment `n` persisted but our own over theirs not yet: the
+    /// acknowledgement is then completed here, each write `fsync`ed before the
+    /// message is built, exactly as the first pass would have done.
+    fn resend_ack(&mut self, n: u64) -> Result<Message, ChannelError> {
+        let bal = match self.remote_balances.get(&n) {
+            Some(b) => *b,
+            None if self.local_commit_number == Some(n) && self.remote_commit_number < Some(n) => {
+                let bal = self
+                    .local_commits
+                    .get(&n)
+                    .map(|(b, _)| *b)
+                    .ok_or(ChannelError::Invariant("missing local commitment"))?;
+                self.persist_remote_commit(n, bal)?;
+                // We answered this state; we did not initiate it.
+                self.initiated.insert(n, false);
+                bal
+            }
+            None => {
+                return Err(ChannelError::Invariant(
+                    "missing remote balances for resend",
+                ))
+            }
+        };
         let tier_sigs = self.sign_their_commitment(n, bal)?;
         let revocation = self.make_revocation(n - 1)?;
+        self.persist_revocation_sent(n - 1)?;
         Ok(Message::Ack {
             state: n,
             tier_sigs,
@@ -827,10 +884,12 @@ impl Machine {
         })
     }
 
-    fn resend_revoke(&self, n: u64) -> Result<Message, ChannelError> {
+    fn resend_revoke(&mut self, n: u64) -> Result<Message, ChannelError> {
+        let revocation = self.make_revocation(n - 1)?;
+        self.persist_revocation_sent(n - 1)?;
         Ok(Message::Revoke {
             state: n,
-            revocation: self.make_revocation(n - 1)?,
+            revocation,
         })
     }
 
@@ -850,13 +909,45 @@ impl Machine {
 
     /// Proposes a cooperative close at the current balance, returning
     /// [`Message::Close`].
+    ///
+    /// On a channel already closing cooperatively, it returns the agreed
+    /// `Close` again, unchanged: a close whose message was lost to a crash or a
+    /// dropped link can be completed instead of stranding the channel.
     pub fn propose_close(&mut self, fee: u64) -> Result<Message, ChannelError> {
+        if self.phase == Phase::Closing {
+            if let Some(agreed) = self.close_fee {
+                return Ok(Message::Close { fee: agreed });
+            }
+        }
         if self.phase != Phase::Open {
+            return Err(ChannelError::Unexpected);
+        }
+        // Both sides must sign the same balances: never while an update is
+        // still settling.
+        if self.update_in_flight() {
             return Err(ChannelError::Unexpected);
         }
         self.journal.append(&Record::ClosingCoop { fee })?;
         self.phase = Phase::Closing;
+        self.close_fee = Some(fee);
         Ok(Message::Close { fee })
+    }
+
+    /// Agrees to a cooperative close at `fee` while an update is still in
+    /// flight: the channel moves to [`Phase::Closing`] at once, so no new
+    /// update starts, and the `Close` is sent once the update settles (see
+    /// [`Machine::propose_close`], which then returns it). Idempotent.
+    pub fn agree_close(&mut self, fee: u64) -> Result<(), ChannelError> {
+        match self.phase {
+            Phase::Open => {
+                self.journal.append(&Record::ClosingCoop { fee })?;
+                self.phase = Phase::Closing;
+                self.close_fee = Some(fee);
+                Ok(())
+            }
+            Phase::Closing => Ok(()),
+            _ => Err(ChannelError::Unexpected),
+        }
     }
 
     /// Handles a peer's [`Message::Close`], returning our [`Message::CloseSigned`].
@@ -864,12 +955,21 @@ impl Machine {
         let Message::Close { fee } = msg else {
             return Err(ChannelError::Unexpected);
         };
-        if !matches!(self.phase, Phase::Open | Phase::Closing) {
+        // A peer still waiting on a close we already completed asks again:
+        // sign the same transaction again so it can settle too.
+        if !matches!(self.phase, Phase::Open | Phase::Closing | Phase::Closed) {
+            return Err(ChannelError::Unexpected);
+        }
+        if self.update_in_flight() {
+            return Err(ChannelError::Unexpected);
+        }
+        if self.phase == Phase::Closed && self.close_fee != Some(*fee) {
             return Err(ChannelError::Unexpected);
         }
         if self.phase == Phase::Open {
             self.journal.append(&Record::ClosingCoop { fee: *fee })?;
             self.phase = Phase::Closing;
+            self.close_fee = Some(*fee);
         }
         let bal = self.current_balances();
         let close = self
@@ -878,6 +978,7 @@ impl Machine {
         let m = self
             .params
             .funding_sighash(&close.tx, self.network, self.our_index);
+        self.close_signed = true;
         Ok(Message::CloseSigned {
             fee: *fee,
             signature: self.signer.sign(&m),
@@ -911,6 +1012,7 @@ impl Machine {
         let m = self
             .params
             .funding_sighash(&tx, self.network, self.our_index);
+        self.close_signed = true;
         let our_sig = self.signer.sign(&m);
         let (mut sigs_ours, mut sigs_theirs): (Vec<u8>, Vec<u8>) = (our_sig, signature.clone());
         let mut sigs: [&[u8]; 2] = [&[], &[]];
@@ -928,8 +1030,7 @@ impl Machine {
         }
         self.params.complete_funding_spend(&mut tx, sigs, pks);
         let _ = (&mut sigs_ours, &mut sigs_theirs);
-        self.journal.append(&Record::Closed)?;
-        self.phase = Phase::Closed;
+        self.mark_closed()?;
         Ok(tx)
     }
 
@@ -989,7 +1090,9 @@ impl Machine {
             revocations_recv: None,
             local_commits: BTreeMap::new(),
             remote_balances: BTreeMap::new(),
-            initiated_top: None,
+            initiated: BTreeMap::new(),
+            close_fee: None,
+            close_signed: false,
             their_points: BTreeMap::new(),
             store: shachain::Store::new(),
             base_fee_rate,
@@ -1000,8 +1103,6 @@ impl Machine {
     }
 
     fn replay(&mut self, records: &[Record]) {
-        let mut top_state: Option<u64> = None;
-        let mut top_first_local: Option<bool> = None;
         for rec in records {
             match rec {
                 Record::Opened { .. } => {}
@@ -1026,22 +1127,14 @@ impl Machine {
                         let oldest = *self.local_commits.keys().next().unwrap();
                         self.local_commits.remove(&oldest);
                     }
-                    if Some(*state) > top_state {
-                        top_state = Some(*state);
-                        top_first_local = Some(true);
-                    } else if top_state == Some(*state) && top_first_local.is_none() {
-                        top_first_local = Some(true);
-                    }
+                    // LocalCommit first: we answered this state.
+                    self.note_initiator(*state, false);
                 }
                 Record::RemoteCommit { state, balances } => {
                     self.remote_commit_number = Some(*state);
                     self.remote_balances.insert(*state, *balances);
-                    if Some(*state) > top_state {
-                        top_state = Some(*state);
-                        top_first_local = Some(false);
-                    } else if top_state == Some(*state) && top_first_local.is_none() {
-                        top_first_local = Some(false);
-                    }
+                    // RemoteCommit first: we proposed this state.
+                    self.note_initiator(*state, true);
                 }
                 Record::RevocationSent { state } => self.revocations_sent = Some(*state),
                 Record::RevocationRecv { state, secret } => {
@@ -1053,18 +1146,19 @@ impl Machine {
                     self.their_points.insert(*state, *point);
                 }
                 Record::Ready => self.phase = Phase::Open,
-                Record::ClosingCoop { .. } => self.phase = Phase::Closing,
+                Record::ClosingCoop { fee } => {
+                    self.phase = Phase::Closing;
+                    self.close_fee = Some(*fee);
+                }
                 Record::Forcing => self.phase = Phase::Forcing,
                 Record::Penalised => self.phase = Phase::Penalised,
                 Record::Closed => self.phase = Phase::Closed,
             }
         }
-        // top_first_local true => we journaled LocalCommit first => responder.
-        // false => RemoteCommit first => initiator.
-        self.initiated_top = top_first_local.map(|first_local| !first_local);
         if self.phase == Phase::Opening && self.local_commit_number == Some(0) {
             self.phase = Phase::Funded;
         }
+        self.close_signed = matches!(self.phase, Phase::Closing | Phase::Closed);
         // The counterparty's announced points were persisted as TheirPoint
         // records and are already back in `their_points`; the revoked ones were
         // removed above. Nothing more to rebuild.
@@ -1113,57 +1207,114 @@ impl Machine {
         if *cid != self.channel_id {
             return Err(ChannelError::BadReestablish);
         }
-        if !self.seen_nonces.insert(*nonce) {
+        if self.seen_nonces.contains(nonce) {
             return Err(ChannelError::BadReestablish);
         }
         // The peer proved its funding key over its own fresh nonce and its
-        // direction; the freshness check above stops a replay.
+        // direction; the freshness check above stops a replay. The nonce is
+        // remembered only once the proof verifies, so a forged message cannot
+        // fill the set.
         if usize::from(*direction) != 1 - self.our_index {
             return Err(ChannelError::BadReestablish);
         }
         let expected = reestablish_message(self.channel_id, *nonce, *direction);
         crate::sig::verify(CHANNEL_SCHEME, &self.their_pubkey, &expected, proof)
             .map_err(|_| ChannelError::BadReestablish)?;
+        self.seen_nonces.insert(*nonce);
+        // A channel settling on chain has nothing left to resynchronize.
+        if matches!(
+            self.phase,
+            Phase::Forcing | Phase::Penalised | Phase::Closed
+        ) {
+            return Ok(Vec::new());
+        }
 
         // --- Resync. The protocol is strictly sequential: at most one state
-        // is in flight. Decide, from the two sides' counters, which single
-        // message we owe the peer.
-        let mut out = Vec::new();
-        // Their highest state they can enforce (local to them) is
-        // their_next_local - 1; the highest they have signed for us equals our
-        // local_commit's state when complete.
+        // is in flight. Decide, from our persisted counters and the peer's,
+        // what we owe it, in the order it must be processed.
         let their_local = their_next_local.checked_sub(1);
         let their_recv = their_next_recv.checked_sub(1);
+        let mut out = Vec::new();
+        // The state whose Ack we have queued, so it is not sent twice.
+        let mut acked: Option<u64> = None;
 
-        // Case A: we signed the peer's commitment at `r` but they have not
-        // persisted it (their enforceable top is below `r`): resend the
-        // commitment signature as Update (if we initiated) or Ack (responder).
+        if let Some(l) = self.local_commit_number {
+            // A crash inside `on_update` after persisting the peer's signature
+            // over our commitment `l`, before signing theirs: the Ack was never
+            // built. Finish it now; it also carries our revocation of `l-1`.
+            if l >= 1 && self.remote_commit_number < Some(l) {
+                out.push(self.resend_ack(l)?);
+                acked = Some(l);
+            } else if l >= 1 && their_recv.map_or(true, |tr| tr < l - 1) {
+                // We hold commitment `l`, so the secret of `l-1` is ours to
+                // reveal (INV1), and the peer does not have it: the message
+                // that carried it was lost, or a crash came between persisting
+                // its receipt and journaling ours. The initiator of `l` reveals
+                // it in a Revoke, the responder in an Ack.
+                if self.initiated.get(&l) == Some(&true) {
+                    out.push(self.resend_revoke(l)?);
+                } else {
+                    out.push(self.resend_ack(l)?);
+                    acked = Some(l);
+                }
+            }
+        }
+
+        // We signed the peer's commitment at `r` but the peer has not persisted
+        // it: resend our signature, as the Update we proposed or as the Ack we
+        // answered with. After any revocation above, so the peer holds the
+        // point it needs to sign our side of `r`.
         if let Some(r) = self.remote_commit_number {
-            if their_local.map_or(true, |tl| tl < r) {
-                if self.initiated_top == Some(true) {
+            if r >= 1 && their_local.map_or(true, |tl| tl < r) && acked != Some(r) {
+                if self.initiated.get(&r) == Some(&true) {
                     out.push(self.resend_update(r)?);
                 } else {
                     out.push(self.resend_ack(r)?);
                 }
-                return Ok(out);
             }
         }
 
-        // Case B: we owe a revocation the peer has not received. We have
-        // revealed up to `revocations_sent`; if the peer's next_recv is below
-        // or equal, resend that revocation.
-        if let Some(s) = self.revocations_sent {
-            if their_recv.map_or(true, |tr| tr < s) {
-                // Resend as Ack (responder also owes its commitment sig, but
-                // that was covered by Case A) or Revoke (initiator).
-                if self.initiated_top == Some(true) {
-                    out.push(self.resend_revoke(s + 1)?);
-                } else {
-                    out.push(self.resend_ack(s + 1)?);
-                }
+        // A cooperative close we agreed to is sent again: its Close may have
+        // been lost, and the handlers are idempotent if it was not. Not while
+        // an update still settles: both sides must sign the same balances, so
+        // the Close then follows the update's completion.
+        if self.phase == Phase::Closing && !self.update_in_flight() {
+            if let Some(fee) = self.close_fee {
+                out.push(Message::Close { fee });
             }
         }
         Ok(out)
+    }
+
+    /// Whether an update is still settling: we proposed a state the peer has not
+    /// acknowledged, we hold a state we have not finished acknowledging, or a
+    /// revocation of the previous state is still owed in either direction.
+    /// While it is, no new update or close may start; a reestablish completes
+    /// it.
+    pub fn update_in_flight(&self) -> bool {
+        let Some(l) = self.local_commit_number else {
+            return false;
+        };
+        if self.remote_commit_number != Some(l) {
+            return true;
+        }
+        l >= 1 && (self.revocations_sent < Some(l - 1) || self.revocations_recv < Some(l - 1))
+    }
+
+    /// Whether `tx` is the cooperative close of this channel at its current
+    /// balances and the agreed fee: the transaction that settles it when the
+    /// counterparty broadcast it.
+    pub fn is_cooperative_close(&self, tx: &Transaction) -> bool {
+        let (Some(fee), Some(funding)) = (self.close_fee, self.funding_outpoint) else {
+            return false;
+        };
+        if tx.inputs.first().map(|i| i.prev_out) != Some(funding) {
+            return false;
+        }
+        let close =
+            self.params
+                .cooperative_close(funding, self.current_balances(), fee, self.payout);
+        close.tx.outputs == tx.outputs
     }
 
     // --- Force close and accessors ------------------------------------------

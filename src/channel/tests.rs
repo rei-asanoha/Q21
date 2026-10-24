@@ -1388,3 +1388,305 @@ fn accept_rejects_dangerous_open_parameters() {
     )
     .is_ok());
 }
+
+// --- D11: a crash at every journal write of an update, on either side --------
+
+/// Keeps only the first `keep` record frames of a journal, as a crash right
+/// after the `keep`-th `fsync` would leave it.
+fn keep_records(path: &std::path::Path, keep: usize) {
+    let bytes = read_journal(path);
+    let mut offset = 0usize;
+    for _ in 0..keep {
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 8 + len;
+    }
+    std::fs::write(path, &bytes[..offset]).unwrap();
+}
+
+fn record_count(path: &std::path::Path) -> usize {
+    journal::replay(&read_journal(path)).len()
+}
+
+/// Which side a message is for, in [`deliver_all`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum To {
+    F,
+    A,
+}
+
+/// A message's kind and state, for a readable failure.
+fn kind(m: &Message) -> String {
+    match m {
+        Message::Update { state, .. } => format!("Update({state})"),
+        Message::Ack { state, .. } => format!("Ack({state})"),
+        Message::Revoke { state, .. } => format!("Revoke({state})"),
+        Message::Close { fee } => format!("Close({fee})"),
+        Message::CloseSigned { .. } => "CloseSigned".into(),
+        Message::Reestablish { .. } => "Reestablish".into(),
+        _ => "other".into(),
+    }
+}
+
+/// Delivers messages in order, queueing every reply for the other side, until
+/// nothing is left. Any handler error is a failure: after a reestablish an
+/// honest peer never sends a message the other side must refuse.
+fn deliver_all(
+    f: &mut Machine,
+    a: &mut Machine,
+    mut queue: std::collections::VecDeque<(To, Message)>,
+) -> Result<(), String> {
+    let mut steps = 0;
+    while let Some((to, m)) = queue.pop_front() {
+        steps += 1;
+        if steps > 64 {
+            return Err("did not settle".into());
+        }
+        let (me, back) = match to {
+            To::F => (&mut *f, To::A),
+            To::A => (&mut *a, To::F),
+        };
+        let reply = match &m {
+            Message::Update { .. } => Some(me.on_update(&m)),
+            Message::Ack { .. } => Some(me.on_ack(&m)),
+            Message::Revoke { .. } => me.on_revoke(&m).map(|_| None).transpose(),
+            Message::Close { .. } => Some(me.on_close(&m)),
+            Message::CloseSigned { .. } => me.on_close_signed(&m).map(|_| None).transpose(),
+            other => return Err(format!("unexpected resend {}", kind(other))),
+        };
+        match reply {
+            Some(Ok(r)) => queue.push_back((back, r)),
+            Some(Err(e)) => return Err(format!("{to:?} refused {}: {e:?}", kind(&m))),
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Reconnects two machines: each verifies the other's reestablish, and what
+/// each owes is delivered until both are quiescent.
+fn reconnect(f: &mut Machine, a: &mut Machine) -> Result<(), String> {
+    let rf = f.reestablish().unwrap();
+    let ra = a.reestablish().unwrap();
+    let mut q = std::collections::VecDeque::new();
+    for m in a.on_reestablish(&rf).map_err(|e| format!("{e:?}"))? {
+        q.push_back((To::F, m));
+    }
+    for m in f.on_reestablish(&ra).map_err(|e| format!("{e:?}"))? {
+        q.push_back((To::A, m));
+    }
+    deliver_all(f, a, q)
+}
+
+/// One crash scenario: an update to state 3 paid by the funder or by the
+/// acceptor, cut at write `keep` of protocol step `step` (1 propose, 2 Ack
+/// built, 3 Revoke built, 4 Revoke taken) on the side running that step, its
+/// outgoing message lost. The crashed side reopens from its truncated journal,
+/// and so does the other side when `reopen_both` (a restart of both nodes).
+fn crash_scenario(
+    funder_pays: bool,
+    step: usize,
+    keep: Option<usize>,
+    reopen_both: bool,
+) -> Result<usize, String> {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]); // state 1
+    pay(&mut a, &mut f, [CAP - 1_500_000, 1_500_000]); // state 2
+    let old = [CAP - 1_500_000, 1_500_000];
+    let target = if funder_pays {
+        [CAP - 2_500_000, 2_500_000]
+    } else {
+        [CAP - 1_000_000, 1_000_000]
+    };
+    let paths = [dir.join("f.jrnl"), dir.join("a.jrnl")];
+    // Index 0 is the funder, 1 the acceptor; the payer runs steps 1 and 3.
+    let payer = if funder_pays { 0 } else { 1 };
+    let runner = if step % 2 == 1 { payer } else { 1 - payer };
+    let mut before = 0;
+    {
+        let (p, r) = if funder_pays {
+            (&mut f, &mut a)
+        } else {
+            (&mut a, &mut f)
+        };
+        // Each step runs only if the previous one delivered its message; the
+        // runner's record count is taken just before its step.
+        let mut count = |at: usize| {
+            if at == step {
+                before = record_count(&paths[runner]);
+            }
+        };
+        count(1);
+        let upd = p.propose(target).unwrap();
+        if step >= 2 {
+            count(2);
+            let ack = r.on_update(&upd).unwrap();
+            if step >= 3 {
+                count(3);
+                let rev = p.on_ack(&ack).unwrap();
+                if step >= 4 {
+                    count(4);
+                    r.on_revoke(&rev).unwrap();
+                }
+            }
+        }
+    }
+    let written = record_count(&paths[runner]) - before;
+    let keep = keep.unwrap_or(written);
+    if keep > written {
+        return Ok(written);
+    }
+    keep_records(&paths[runner], before + keep);
+    // The crashed side reopens from its truncated journal. The other keeps
+    // running in memory, or restarts too and replays its complete journal.
+    let reopen_f = runner == 0 || reopen_both;
+    let reopen_a = runner == 1 || reopen_both;
+    let mut f = if reopen_f {
+        drop(f);
+        Machine::reopen(&paths[0], NET, fkey(), RATE).unwrap()
+    } else {
+        f
+    };
+    let mut a = if reopen_a {
+        drop(a);
+        Machine::reopen(&paths[1], NET, akey(), RATE).unwrap()
+    } else {
+        a
+    };
+
+    let ctx = format!("funder_pays={funder_pays} step={step} keep={keep}");
+    reconnect(&mut f, &mut a).map_err(|e| format!("{ctx}: {e}"))?;
+    if f.balances() != a.balances() || f.local_commit_number() != a.local_commit_number() {
+        return Err(format!(
+            "{ctx}: diverged {:?}@{:?} vs {:?}@{:?}",
+            f.balances(),
+            f.local_commit_number(),
+            a.balances(),
+            a.local_commit_number()
+        ));
+    }
+    let b = f.balances();
+    if b != old && b != target {
+        return Err(format!("{ctx}: unexpected balance {b:?}"));
+    }
+    if f.update_in_flight() || a.update_in_flight() {
+        return Err(format!("{ctx}: an update is still in flight"));
+    }
+    // A second reconnection resends nothing.
+    let rf = f.reestablish().unwrap();
+    let ra = a.reestablish().unwrap();
+    let r1 = a.on_reestablish(&rf).unwrap();
+    let r2 = f.on_reestablish(&ra).unwrap();
+    if !r1.is_empty() || !r2.is_empty() {
+        let k: Vec<String> = r1.iter().chain(r2.iter()).map(kind).collect();
+        return Err(format!("{ctx}: not quiescent: {k:?}"));
+    }
+    // Payments resume both ways, then a cooperative close is signed by both.
+    let n = f.local_commit_number().unwrap();
+    let mut next = b;
+    next[FUNDER] -= 100_000;
+    next[ACCEPTOR] += 100_000;
+    let upd = f
+        .propose(next)
+        .map_err(|e| format!("{ctx}: propose {e:?}"))?;
+    let mut q = std::collections::VecDeque::new();
+    q.push_back((To::A, upd));
+    deliver_all(&mut f, &mut a, q).map_err(|e| format!("{ctx}: {e}"))?;
+    let mut back = next;
+    back[FUNDER] += 50_000;
+    back[ACCEPTOR] -= 50_000;
+    let upd = a
+        .propose(back)
+        .map_err(|e| format!("{ctx}: propose {e:?}"))?;
+    let mut q = std::collections::VecDeque::new();
+    q.push_back((To::F, upd));
+    deliver_all(&mut f, &mut a, q).map_err(|e| format!("{ctx}: {e}"))?;
+    if f.balances() != back || a.balances() != back || f.local_commit_number() != Some(n + 2) {
+        return Err(format!("{ctx}: payments after recovery did not settle"));
+    }
+    let close = f.propose_close(20_000).unwrap();
+    let signed = a.on_close(&close).map_err(|e| format!("{ctx}: {e:?}"))?;
+    f.on_close_signed(&signed)
+        .map_err(|e| format!("{ctx}: close {e:?}"))?;
+    Ok(written)
+}
+
+#[test]
+fn a_crash_at_any_journal_write_of_an_update_recovers_on_either_side() {
+    let mut failures = Vec::new();
+    let mut scenarios = 0;
+    for funder_pays in [true, false] {
+        for step in 1..=4 {
+            let written = crash_scenario(funder_pays, step, Some(usize::MAX), false).unwrap();
+            for keep in 0..=written {
+                for reopen_both in [false, true] {
+                    scenarios += 1;
+                    if let Err(e) = crash_scenario(funder_pays, step, Some(keep), reopen_both) {
+                        failures.push(format!("reopen_both={reopen_both} {e}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(scenarios >= 40, "only {scenarios} scenarios ran");
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A reloaded proposal counts as in flight until the reestablish settles it,
+/// so no second update can be stacked on an unacknowledged one.
+#[test]
+fn a_reloaded_proposal_is_in_flight_until_reestablish() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    assert!(!f.update_in_flight() && !a.update_in_flight());
+    let _lost = f.propose([CAP - 2_000_000, 2_000_000]).unwrap();
+    assert!(f.update_in_flight());
+    drop(f);
+    let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+    assert!(
+        f.update_in_flight(),
+        "the journaled proposal is still in flight"
+    );
+    assert_eq!(f.propose_close(20_000), Err(ChannelError::Unexpected));
+    reconnect(&mut f, &mut a).unwrap();
+    assert!(!f.update_in_flight() && !a.update_in_flight());
+    assert_eq!(f.balances(), [CAP - 2_000_000, 2_000_000]);
+    assert_eq!(a.balances(), f.balances());
+}
+
+/// A cooperative close whose `Close` was lost to a crash is sent again on
+/// reestablish and completes; the peer recognises the close on chain.
+#[test]
+fn a_lost_close_is_resent_on_reestablish() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 3_000_000, 3_000_000]);
+    let _lost = f.propose_close(20_000).unwrap();
+    drop(f);
+    let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+    assert_eq!(f.phase(), Phase::Closing);
+    // Asking again yields the same Close rather than an error.
+    assert_eq!(
+        f.propose_close(99_999).unwrap(),
+        Message::Close { fee: 20_000 }
+    );
+    let rf = f.reestablish().unwrap();
+    let ra = a.reestablish().unwrap();
+    let to_a = f.on_reestablish(&ra).unwrap();
+    assert!(a.on_reestablish(&rf).unwrap().is_empty());
+    assert_eq!(to_a, vec![Message::Close { fee: 20_000 }]);
+    let signed = a.on_close(&to_a[0]).unwrap();
+    let tx = f.on_close_signed(&signed).unwrap();
+    assert_eq!(f.phase(), Phase::Closed);
+    assert_eq!(a.phase(), Phase::Closing);
+    assert!(a.is_cooperative_close(&tx), "the peer recognises the close");
+    let mut other = tx.clone();
+    other.outputs[0].value = crate::amount::Amount::from_units(other.outputs[0].value.units() - 1);
+    assert!(!a.is_cooperative_close(&other));
+}
