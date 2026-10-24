@@ -46,7 +46,7 @@ use crate::hash::{tagged_hash_parts, Hash256};
 use crate::sha256::sha256;
 use crate::shachain;
 use crate::tx::{OutPoint, Transaction, TxOut};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
 /// The channel's lifecycle phase.
@@ -106,6 +106,14 @@ pub fn channel_id(funding: &[Hash256; 2]) -> Hash256 {
         "Q21/channel/id",
         &[funding[0].as_bytes(), funding[1].as_bytes()],
     )
+}
+
+/// Keeps only the `keep` highest states of a per-state map.
+fn prune_to_latest<V>(map: &mut BTreeMap<u64, V>, keep: usize) {
+    while map.len() > keep {
+        let oldest = *map.keys().next().expect("non-empty");
+        map.remove(&oldest);
+    }
 }
 
 /// The message a reestablish proof signs: the channel, the sender's nonce, and
@@ -179,9 +187,20 @@ pub struct Machine {
     /// Base fee rate (per thousand weight units); the tiers multiply it.
     base_fee_rate: u64,
 
-    /// Reestablish nonces already accepted from the peer, for freshness.
-    seen_nonces: HashSet<[u8; 32]>,
+    /// Reestablish nonces already accepted from the peer, for freshness: the
+    /// most recent [`MAX_SEEN_NONCES`], oldest first.
+    seen_nonces: VecDeque<[u8; 32]>,
 }
+
+/// Reestablish nonces remembered per channel. One is accepted per reconnection;
+/// the window covers far more reconnections than a captured message could
+/// usefully be replayed across, and bounds what a long-lived channel keeps.
+pub const MAX_SEEN_NONCES: usize = 64;
+
+/// Records a journal may hold before it is compacted into the few that
+/// rebuild the same state. An update appends five or six, each commitment
+/// record carrying three ML-DSA-87 signatures (about 14 KB).
+pub const COMPACT_AFTER: usize = 64;
 
 impl Machine {
     // --- Construction --------------------------------------------------------
@@ -357,7 +376,7 @@ impl Machine {
             their_points: BTreeMap::new(),
             store: shachain::Store::new(),
             base_fee_rate,
-            seen_nonces: HashSet::new(),
+            seen_nonces: VecDeque::new(),
         })
     }
 
@@ -731,6 +750,7 @@ impl Machine {
         // INV1: our commitment `n` is persisted, so reveal our secret `n-1`.
         let our_rev = self.make_revocation(n - 1)?;
         self.persist_revocation_sent(n - 1)?;
+        self.compact_if_long()?;
         Ok(Message::Revoke {
             state: n,
             revocation: our_rev,
@@ -752,6 +772,7 @@ impl Machine {
             return Ok(()); // idempotent resend
         }
         self.take_revocation(n - 1, revocation)?;
+        self.compact_if_long()?;
         Ok(())
     }
 
@@ -839,6 +860,7 @@ impl Machine {
         })?;
         self.remote_commit_number = Some(n);
         self.remote_balances.insert(n, bal);
+        prune_to_latest(&mut self.remote_balances, 2);
         // A RemoteCommit journaled before its LocalCommit marks the initiator.
         self.note_initiator(n, true);
         Ok(())
@@ -860,6 +882,176 @@ impl Machine {
             .append(&Record::RevocationRecv { state: m, secret })?;
         self.revocations_recv = Some(m);
         Ok(())
+    }
+
+    // --- Compaction ------------------------------------------------------------
+
+    /// The fewest records that replay to this machine's exact state: the
+    /// opening, the funding, the commitments and signed balances still
+    /// retained (each state's pair in the order that marks its initiator), the
+    /// revocation counters with the counterparty's secrets in compact shachain
+    /// form, the points announced and not yet revoked, and the phase.
+    fn snapshot_records(&self) -> Vec<Record> {
+        let mut out = vec![Record::Opened {
+            channel_id: self.channel_id,
+            our_index: self.our_index as u8,
+            funding: self.params.funding,
+            capacity: self.params.capacity.units(),
+            delay: self.params.delay,
+            funding_depth: self.funding_depth,
+            our_pubkey: self.our_pubkey.clone(),
+            their_pubkey: self.their_pubkey.clone(),
+            payout: self.payout,
+        }];
+        if let Some(op) = self.funding_outpoint {
+            out.push(Record::Funded {
+                funding_txid: op.txid,
+                funding_index: op.index,
+            });
+        }
+        let mut states: Vec<u64> = self
+            .local_commits
+            .keys()
+            .chain(self.remote_balances.keys())
+            .copied()
+            .collect();
+        states.sort_unstable();
+        states.dedup();
+        for n in states {
+            let local = self
+                .local_commits
+                .get(&n)
+                .map(|(b, sigs)| Record::LocalCommit {
+                    state: n,
+                    balances: *b,
+                    their_tier_sigs: sigs.clone(),
+                });
+            // Both sides sign the same balances for a state, so a signed
+            // balance pruned from memory is the commitment's own: writing it
+            // keeps the record order that tells who initiated the state.
+            let remote = self
+                .remote_balances
+                .get(&n)
+                .copied()
+                .or_else(|| {
+                    (self.remote_commit_number >= Some(n))
+                        .then(|| self.local_commits.get(&n).map(|(b, _)| *b))
+                        .flatten()
+                })
+                .map(|b| Record::RemoteCommit {
+                    state: n,
+                    balances: b,
+                });
+            let (first, second) = if self.initiated.get(&n) == Some(&true) {
+                (remote, local)
+            } else {
+                (local, remote)
+            };
+            out.extend(first);
+            out.extend(second);
+        }
+        if let Some(m) = self.revocations_sent {
+            out.push(Record::RevocationSent { state: m });
+        }
+        if let Some(m) = self.revocations_recv {
+            out.push(Record::Revocations {
+                state: m,
+                entries: self.store.entries(),
+            });
+        }
+        for (state, point) in &self.their_points {
+            out.push(Record::TheirPoint {
+                state: *state,
+                point: *point,
+            });
+        }
+        if !matches!(self.phase, Phase::Opening | Phase::Funded) {
+            out.push(Record::Ready);
+        }
+        if let Some(fee) = self.close_fee {
+            out.push(Record::ClosingCoop { fee });
+        }
+        match self.phase {
+            Phase::Forcing => out.push(Record::Forcing),
+            Phase::Penalised => out.push(Record::Penalised),
+            Phase::Closed => out.push(Record::Closed),
+            _ => {}
+        }
+        out
+    }
+
+    /// Rewrites the journal as [`Machine::snapshot_records`], atomically. The
+    /// journal otherwise grows by an update's records, signatures included, for
+    /// the life of the channel.
+    pub fn compact(&mut self) -> Result<(), ChannelError> {
+        let records = self.snapshot_records();
+        self.journal.rewrite(&records)?;
+        Ok(())
+    }
+
+    /// Compacts once the journal holds more than [`COMPACT_AFTER`] records.
+    fn compact_if_long(&mut self) -> Result<(), ChannelError> {
+        if self.journal.records() > COMPACT_AFTER {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Records in the journal file.
+    pub fn journal_records(&self) -> usize {
+        self.journal.records()
+    }
+
+    /// Entries held in each per-state map and the reestablish nonce window,
+    /// for the memory bounds: `(commitments, signed balances, initiators,
+    /// announced points, nonces, shachain entries)`.
+    pub fn retained(&self) -> [usize; 6] {
+        [
+            self.local_commits.len(),
+            self.remote_balances.len(),
+            self.initiated.len(),
+            self.their_points.len(),
+            self.seen_nonces.len(),
+            self.store.len(),
+        ]
+    }
+
+    /// Everything replay must rebuild, as text, so a test can compare a
+    /// machine with its reopened journal.
+    #[cfg(all(test, feature = "mldsa"))]
+    pub(crate) fn digest(&self) -> String {
+        // Who initiated a state matters only while that state is retained.
+        let initiated: BTreeMap<u64, bool> = self
+            .initiated
+            .iter()
+            .filter(|(n, _)| {
+                self.local_commits.contains_key(n) || self.remote_balances.contains_key(n)
+            })
+            .map(|(n, b)| (*n, *b))
+            .collect();
+        let text = format!(
+            "{:?} {:?} L{:?} R{:?} S{:?} V{:?} lc{:?} rb{:?} in{:?} tp{:?} st{:?} cf{:?} cs{}",
+            self.phase,
+            self.funding_outpoint,
+            self.local_commit_number,
+            self.remote_commit_number,
+            self.revocations_sent,
+            self.revocations_recv,
+            self.local_commits,
+            self.remote_balances,
+            initiated,
+            self.their_points,
+            self.store.entries(),
+            self.close_fee,
+            self.close_signed,
+        );
+        format!(
+            "{:?} L{:?} R{:?} {}",
+            self.phase,
+            self.local_commit_number,
+            self.remote_commit_number,
+            Hash256(sha256(text.as_bytes())).to_hex()
+        )
     }
 
     // --- Idempotent resends for reestablish ----------------------------------
@@ -1111,9 +1303,10 @@ impl Machine {
             their_points: BTreeMap::new(),
             store: shachain::Store::new(),
             base_fee_rate,
-            seen_nonces: HashSet::new(),
+            seen_nonces: VecDeque::new(),
         };
         m.replay(&records);
+        m.compact_if_long()?;
         Ok(m)
     }
 
@@ -1148,6 +1341,7 @@ impl Machine {
                 Record::RemoteCommit { state, balances } => {
                     self.remote_commit_number = Some(*state);
                     self.remote_balances.insert(*state, *balances);
+                    prune_to_latest(&mut self.remote_balances, 2);
                     // RemoteCommit first: we proposed this state.
                     self.note_initiator(*state, true);
                 }
@@ -1168,6 +1362,12 @@ impl Machine {
                 Record::Forcing => self.phase = Phase::Forcing,
                 Record::Penalised => self.phase = Phase::Penalised,
                 Record::Closed => self.phase = Phase::Closed,
+                Record::Revocations { state, entries } => {
+                    self.revocations_recv = Some(*state);
+                    if let Ok(store) = shachain::Store::restore(entries) {
+                        self.store = store;
+                    }
+                }
             }
         }
         if self.phase == Phase::Opening && self.local_commit_number == Some(0) {
@@ -1235,7 +1435,10 @@ impl Machine {
         let expected = reestablish_message(self.channel_id, *nonce, *direction);
         crate::sig::verify(CHANNEL_SCHEME, &self.their_pubkey, &expected, proof)
             .map_err(|_| ChannelError::BadReestablish)?;
-        self.seen_nonces.insert(*nonce);
+        if self.seen_nonces.len() >= MAX_SEEN_NONCES {
+            self.seen_nonces.pop_front();
+        }
+        self.seen_nonces.push_back(*nonce);
         // A channel settling on chain has nothing left to resynchronize.
         if matches!(
             self.phase,

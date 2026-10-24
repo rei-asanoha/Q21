@@ -129,6 +129,50 @@ impl Store {
     pub fn bytes(&self) -> usize {
         self.len() * (32 + 8)
     }
+
+    /// The entries held, `(secret, index)`, highest index first: everything
+    /// needed to rebuild the store with [`Store::restore`], so a journal can
+    /// keep these few entries instead of every secret ever revealed.
+    pub fn entries(&self) -> Vec<([u8; 32], u64)> {
+        let mut v: Vec<([u8; 32], u64)> = self.known.iter().flatten().copied().collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
+        v
+    }
+
+    /// Rebuilds a store from its [`Store::entries`]. Each entry goes back in
+    /// its bucket and must derive the entries below it, exactly as when it was
+    /// first inserted; the next expected index follows the lowest one.
+    pub fn restore(entries: &[([u8; 32], u64)]) -> Result<Store, ShachainError> {
+        let mut store = Store::new();
+        let mut lowest: Option<u64> = None;
+        for &(secret, index) in entries {
+            if index > MAX_INDEX {
+                return Err(ShachainError::IndexOutOfRange(index));
+            }
+            let at = bucket(index);
+            if store.known[at].is_some() {
+                return Err(ShachainError::Inconsistent { index });
+            }
+            store.known[at] = Some((secret, index));
+            lowest = Some(lowest.map_or(index, |l: u64| l.min(index)));
+        }
+        // Every entry must derive the lower-bucket entries that were already
+        // there when it was inserted — those of higher index — as on insertion.
+        for (at, entry) in store.known.iter().enumerate() {
+            if let Some((secret, index)) = entry {
+                for (older_secret, older) in store.known[..at].iter().flatten() {
+                    if *older > *index && derive_from(secret, at as u32, *older) != *older_secret {
+                        return Err(ShachainError::Inconsistent { index: *index });
+                    }
+                }
+            }
+        }
+        store.next = match lowest {
+            Some(l) => l.checked_sub(1),
+            None => Some(MAX_INDEX),
+        };
+        Ok(store)
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +210,43 @@ mod tests {
 
     /// A thousand and more states: the store stays at a few entries, and
     /// every secret revealed so far can be rebuilt.
+    #[test]
+    fn a_store_restores_from_its_entries() {
+        let seed = [0x42u8; 32];
+        let mut full = Store::new();
+        for i in 0..1000u64 {
+            full.insert(derive(&seed, MAX_INDEX - i), MAX_INDEX - i)
+                .unwrap();
+            let mut back = Store::restore(&full.entries()).unwrap();
+            assert_eq!(back.len(), full.len());
+            // Every revealed secret is still derivable, and the next insert
+            // is accepted exactly as by the original store.
+            for j in [0, i / 2, i] {
+                assert_eq!(back.get(MAX_INDEX - j), Some(derive(&seed, MAX_INDEX - j)));
+            }
+            assert_eq!(back.get(MAX_INDEX - i - 1), None);
+            let next = MAX_INDEX - i - 1;
+            back.insert(derive(&seed, next), next).unwrap();
+        }
+        assert!(full.len() <= MAX_ENTRIES);
+        // An entry that does not derive the older entry below it is refused.
+        let mut two = Store::new();
+        two.insert(derive(&seed, MAX_INDEX), MAX_INDEX).unwrap();
+        two.insert(derive(&seed, MAX_INDEX - 1), MAX_INDEX - 1)
+            .unwrap();
+        let mut forged = two.entries();
+        assert_eq!(forged.len(), 2);
+        forged[1].0[0] ^= 1;
+        assert!(Store::restore(&two.entries()).is_ok());
+        assert!(Store::restore(&forged).is_err());
+        let entries = full.entries();
+        // Two entries in one bucket are refused.
+        let mut doubled = entries.clone();
+        doubled.push(entries[0]);
+        assert!(Store::restore(&doubled).is_err());
+        assert_eq!(Store::restore(&[]).unwrap().len(), 0);
+    }
+
     #[test]
     fn a_long_channel_fits_in_a_few_entries() {
         let seed = [0x5a; 32];

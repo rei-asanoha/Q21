@@ -1488,10 +1488,26 @@ fn crash_scenario(
     keep: Option<usize>,
     reopen_both: bool,
 ) -> Result<usize, String> {
+    crash_scenario_after(0, funder_pays, step, keep, reopen_both)
+}
+
+/// [`crash_scenario`] after `history` round trips of payments, enough of them
+/// for the journals to have been compacted before the update that is cut.
+fn crash_scenario_after(
+    history: u64,
+    funder_pays: bool,
+    step: usize,
+    keep: Option<usize>,
+    reopen_both: bool,
+) -> Result<usize, String> {
     let dir = tmpdir();
     let (mut f, mut a) = open_pair(&dir);
-    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]); // state 1
-    pay(&mut a, &mut f, [CAP - 1_500_000, 1_500_000]); // state 2
+    for i in 0..history {
+        pay(&mut f, &mut a, [CAP - 1_000 - i, 1_000 + i]);
+        pay(&mut a, &mut f, [CAP, 0]);
+    }
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    pay(&mut a, &mut f, [CAP - 1_500_000, 1_500_000]);
     let old = [CAP - 1_500_000, 1_500_000];
     let target = if funder_pays {
         [CAP - 2_500_000, 2_500_000]
@@ -1728,4 +1744,151 @@ fn an_update_message_for_state_zero_is_refused_not_a_crash() {
     assert_eq!(a.on_update(&update), Err(ChannelError::Unexpected));
     assert_eq!(f.on_ack(&ack), Err(ChannelError::Unexpected));
     assert_eq!(a.on_revoke(&revoke), Err(ChannelError::Unexpected));
+}
+
+// --- L6: memory and journal bounds -------------------------------------------
+
+/// A long-lived channel keeps bounded per-state maps and a bounded journal,
+/// and the compacted journal replays to the exact same state — including the
+/// counterparty's oldest revoked state, still punishable.
+#[test]
+fn a_long_channel_keeps_its_maps_and_journal_bounded() {
+    use super::machine::COMPACT_AFTER;
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    // The funder's state 1, revoked by now: kept aside to cheat with later.
+    let old = f.signed_commitment_at(1, FeeTier::Low).unwrap();
+    let mut bal = f.balances();
+    let mut biggest = 0u64;
+    for i in 0..150u64 {
+        let step = 10_000 + i;
+        if i % 3 == 2 {
+            bal[FUNDER] += step;
+            bal[ACCEPTOR] -= step;
+            pay(&mut a, &mut f, bal);
+        } else {
+            bal[FUNDER] -= step;
+            bal[ACCEPTOR] += step;
+            pay(&mut f, &mut a, bal);
+        }
+        for m in [&f, &a] {
+            assert!(
+                m.journal_records() <= COMPACT_AFTER + 6,
+                "journal unbounded"
+            );
+            let [lc, rb, ini, tp, _, st] = m.retained();
+            assert!(
+                lc <= 2 && rb <= 2 && ini <= 3 && tp <= 4,
+                "{:?}",
+                m.retained()
+            );
+            assert!(st <= crate::shachain::MAX_ENTRIES);
+        }
+        biggest = biggest.max(std::fs::metadata(dir.join("f.jrnl")).unwrap().len());
+        if i % 25 == 24 {
+            // The journal, compacted or not, replays to the same state.
+            for (m, name, key) in [(&f, "f", fkey()), (&a, "a", akey())] {
+                let copy = dir.join(format!("{name}-copy.jrnl"));
+                std::fs::copy(dir.join(format!("{name}.jrnl")), &copy).unwrap();
+                let back = Machine::reopen(&copy, NET, key, RATE).unwrap();
+                assert_eq!(back.digest(), m.digest(), "{name} after {i} payments");
+                std::fs::remove_file(&copy).unwrap();
+            }
+        }
+    }
+    // Without compaction the funder's journal would hold some 150 commitments
+    // of three ML-DSA-87 signatures each, about 2 MB.
+    assert!(biggest < 1_200_000, "journal reached {biggest} bytes");
+    // The oldest revoked state is still recognised and punishable after the
+    // journal was compacted many times and reopened.
+    drop(a);
+    let a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    match a.identify_spend(&old) {
+        w @ Watch::RevokedByPeer { state: 1, .. } => {
+            assert!(a.build_penalty(&w, Hash256([5u8; 32]), 20_000).is_ok());
+        }
+        other => panic!("the old state is not recognised as revoked: {other:?}"),
+    }
+}
+
+/// Compaction in the middle of an update keeps every half-done write: the
+/// update still completes after a reopen, and the channel closes.
+#[test]
+fn a_journal_compacted_mid_update_still_completes_it() {
+    for step in 1..=3usize {
+        let dir = tmpdir();
+        let (mut f, mut a) = open_pair(&dir);
+        pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+        pay(&mut a, &mut f, [CAP - 500_000, 500_000]);
+        let upd = f.propose([CAP - 900_000, 900_000]).unwrap();
+        if step >= 2 {
+            let ack = a.on_update(&upd).unwrap();
+            if step >= 3 {
+                let _rev_lost = f.on_ack(&ack).unwrap();
+            }
+        }
+        let (df, da) = (f.digest(), a.digest());
+        f.compact().unwrap();
+        a.compact().unwrap();
+        drop(f);
+        drop(a);
+        let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+        let mut a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+        assert_eq!(f.digest(), df, "step {step}");
+        assert_eq!(a.digest(), da, "step {step}");
+        reconnect(&mut f, &mut a).unwrap();
+        assert_eq!(f.balances(), [CAP - 900_000, 900_000], "step {step}");
+        assert_eq!(a.balances(), f.balances());
+        let close = f.propose_close(20_000).unwrap();
+        let signed = a.on_close(&close).unwrap();
+        f.on_close_signed(&signed).unwrap();
+    }
+}
+
+/// The reestablish nonces a channel remembers are a bounded window, and the
+/// latest is still refused if replayed.
+#[test]
+fn reestablish_nonces_are_a_bounded_window() {
+    use super::machine::MAX_SEEN_NONCES;
+    let dir = tmpdir();
+    let (f, mut a) = open_pair(&dir);
+    let mut last = None;
+    for _ in 0..(MAX_SEEN_NONCES + 40) {
+        let r = f.reestablish().unwrap();
+        a.on_reestablish(&r).unwrap();
+        last = Some(r);
+    }
+    assert_eq!(a.retained()[4], MAX_SEEN_NONCES);
+    assert_eq!(
+        a.on_reestablish(&last.unwrap()),
+        Err(ChannelError::BadReestablish)
+    );
+}
+
+/// The same crash points once the journals have been compacted: the snapshot
+/// a compaction writes resynchronizes exactly as the full history would.
+#[test]
+fn a_crash_after_compaction_recovers_at_every_journal_write() {
+    use super::machine::COMPACT_AFTER;
+    let history = (COMPACT_AFTER as u64) / 10 + 2;
+    let mut failures = Vec::new();
+    for funder_pays in [true, false] {
+        for step in 1..=4 {
+            let written =
+                crash_scenario_after(history, funder_pays, step, Some(usize::MAX), true).unwrap();
+            for keep in 0..=written {
+                if let Err(e) = crash_scenario_after(history, funder_pays, step, Some(keep), true) {
+                    failures.push(e);
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

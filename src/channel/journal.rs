@@ -83,6 +83,14 @@ pub enum Record {
     Penalised,
     /// The channel is settled on chain.
     Closed,
+    /// The counterparty's revealed secrets in compact form, written by a
+    /// compaction in place of every [`Record::RevocationRecv`]: the highest
+    /// revoked state and the few shachain entries that derive every secret
+    /// revealed so far (see [`crate::shachain::Store::entries`]).
+    Revocations {
+        state: u64,
+        entries: Vec<([u8; 32], u64)>,
+    },
 }
 
 const R_OPENED: u8 = 1;
@@ -97,6 +105,10 @@ const R_FORCING: u8 = 9;
 const R_PENALISED: u8 = 10;
 const R_CLOSED: u8 = 11;
 const R_THEIR_POINT: u8 = 12;
+const R_REVOCATIONS: u8 = 13;
+
+/// Most shachain entries a [`Record::Revocations`] may carry.
+const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
 
 impl Record {
     fn encode(&self) -> Vec<u8> {
@@ -172,6 +184,12 @@ impl Record {
             Record::Closed => {
                 w.u8(R_CLOSED);
             }
+            Record::Revocations { state, entries } => {
+                w.u8(R_REVOCATIONS).u64(*state).u8(entries.len() as u8);
+                for (secret, index) in entries {
+                    w.bytes(secret).u64(*index);
+                }
+            }
         }
         w.finish()
     }
@@ -237,6 +255,18 @@ impl Record {
             R_FORCING => Record::Forcing,
             R_PENALISED => Record::Penalised,
             R_CLOSED => Record::Closed,
+            R_REVOCATIONS => {
+                let state = r.u64()?;
+                let n = r.u8()? as usize;
+                if n > MAX_STORE_ENTRIES {
+                    return Err(ReadError::InvalidValue);
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    entries.push((r.array32()?, r.u64()?));
+                }
+                Record::Revocations { state, entries }
+            }
             _ => return Err(ReadError::InvalidValue),
         };
         r.expect_end()?;
@@ -295,6 +325,18 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 pub struct Journal {
     file: File,
     path: PathBuf,
+    /// Records in the file: replayed at open, then appended or rewritten.
+    records: usize,
+}
+
+/// One record, framed: its length, its checksum, its body.
+fn frame(record: &Record) -> Vec<u8> {
+    let body = record.encode();
+    let mut frame = Vec::with_capacity(body.len() + 8);
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&checksum(&body));
+    frame.extend_from_slice(&body);
+    frame
 }
 
 impl Journal {
@@ -309,21 +351,41 @@ impl Journal {
         File::open(&path)?.read_to_end(&mut raw)?;
         let records = replay(&raw);
         let file = OpenOptions::new().append(true).open(&path)?;
-        Ok((Journal { file, path }, records))
+        let count = records.len();
+        Ok((
+            Journal {
+                file,
+                path,
+                records: count,
+            },
+            records,
+        ))
     }
 
     /// Appends one record and `fsync`s before returning: on return, the record
     /// is durable.
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
-        let body = record.encode();
-        let mut frame = Vec::with_capacity(body.len() + 8);
-        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&checksum(&body));
-        frame.extend_from_slice(&body);
-        self.file.write_all(&frame)?;
+        self.file.write_all(&frame(record))?;
         self.file.flush()?;
         self.file.sync_all()?;
+        self.records += 1;
         Ok(())
+    }
+
+    /// Replaces the whole journal with `records`, atomically: a crash leaves
+    /// either the old file or the new one, complete ([`atomic_write`]). Used to
+    /// compact a long journal into the few records that rebuild the same state.
+    pub fn rewrite(&mut self, records: &[Record]) -> io::Result<()> {
+        let bytes: Vec<u8> = records.iter().flat_map(frame).collect();
+        atomic_write(&self.path, &bytes)?;
+        self.file = OpenOptions::new().append(true).open(&self.path)?;
+        self.records = records.len();
+        Ok(())
+    }
+
+    /// Records in the journal file.
+    pub fn records(&self) -> usize {
+        self.records
     }
 
     pub fn path(&self) -> &Path {
