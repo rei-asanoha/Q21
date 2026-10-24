@@ -366,7 +366,7 @@ fn two_nodes_open_pay_and_cooperatively_close() {
     // Cooperative close: the funder proposes; the pump completes it and the
     // hook mines the close transaction.
     let before_h = chain.lock().unwrap().height();
-    let close = p.funder.close(cid).unwrap();
+    let close = p.funder.close(cid).unwrap().expect("a close frame");
     p.queue.push_back((1, close));
     p.pump();
     let after_h = chain.lock().unwrap().height();
@@ -880,6 +880,218 @@ fn a_reloaded_channel_reconciles_an_incomplete_update() {
         before + 100_000,
         "the reloaded channel keeps working after reconciliation"
     );
+    assert_eq!(
+        p.funder.info(cid).unwrap().state_number,
+        p.acceptor.info(cid).unwrap().state_number
+    );
+}
+
+/// An open channel: the pair, the funder's wallet, the chain, the journal
+/// directory, the channel id and its capacity.
+type Opened = (
+    Pair,
+    Arc<Mutex<Wallet>>,
+    Arc<Mutex<SharedChain>>,
+    std::path::PathBuf,
+    Hash256,
+    u64,
+);
+
+/// Opens a channel between two fresh managers and buries its funding, so it is
+/// `open` on both sides. Returns the pair, the chain, the channel id and its
+/// capacity.
+fn open_channel(funder_seed: [u8; 32], acceptor_seed: [u8; 32], tag: &str) -> Opened {
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir(tag);
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    (p, wallet, chain, dir, cid, capacity)
+}
+
+/// Both sides exchange reestablish over a fresh connection, as the node's
+/// handshake hook does, and the pump settles what each owes.
+fn reconnect(p: &mut Pair) {
+    for f in p.funder.on_peer_connected(A_PEER, "") {
+        p.queue.push_back((1, f));
+    }
+    for f in p.acceptor.on_peer_connected(F_PEER, "") {
+        p.queue.push_back((0, f));
+    }
+    p.pump();
+}
+
+/// What a payout address holds on chain.
+fn held(chain: &Arc<Mutex<SharedChain>>, hash: Hash256) -> u64 {
+    let c = chain.lock().unwrap();
+    c.chain
+        .utxo
+        .iter()
+        .filter(|(_, e)| e.output.scheme == SchemeId::MlDsa87 && e.output.pubkey_hash == hash)
+        .map(|(_, e)| e.output.value.units())
+        .sum()
+}
+
+/// D11: a payment journaled but never delivered before a crash is in flight
+/// in the reloaded channel. A second payment is refused until the reestablish
+/// has run — stacking it on the unacknowledged one made the peer refuse it as
+/// misconduct and drop the link — and both then settle.
+#[test]
+fn a_reloaded_unsent_payment_blocks_a_second_until_reestablish() {
+    let funder_seed = [0xe1u8; 32];
+    let acceptor_seed = [0xe2u8; 32];
+    let (mut p, wallet, chain, dir, cid, capacity) =
+        open_channel(funder_seed, acceptor_seed, "d11-unsent");
+    let m = p.funder.pay(cid, 500_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    let _never_delivered = p.funder.pay(cid, 300_000).unwrap();
+    p.reload_funder(funder_seed, wallet, chain, &dir);
+
+    assert!(
+        p.funder.pay(cid, 100_000).is_err(),
+        "a payment stacked on the reloaded, unacknowledged one"
+    );
+    reconnect(&mut p);
+    assert_eq!(
+        p.acceptor.info(cid).unwrap().local_balance,
+        800_000,
+        "the journaled payment completed on reestablish"
+    );
+    let m = p.funder.pay(cid, 100_000).expect("payments resume");
+    p.queue.push_back((1, m));
+    p.pump();
+    let fi = p.funder.info(cid).unwrap();
+    let ai = p.acceptor.info(cid).unwrap();
+    assert_eq!(ai.local_balance, 900_000);
+    assert_eq!(fi.local_balance, capacity - 900_000);
+    assert_eq!(fi.state_number, ai.state_number);
+}
+
+/// D11: a cooperative close asked for while a payment is still settling is
+/// agreed at once and sent when the payment completes; the close pays both
+/// sides the final balances, and the peer that did not broadcast it settles
+/// when it confirms.
+#[test]
+fn a_close_asked_during_a_payment_follows_it_and_both_sides_settle() {
+    let (mut p, _wallet, chain, _dir, cid, capacity) =
+        open_channel([0xe3u8; 32], [0xe4u8; 32], "d11-close-follows");
+    let m = p.funder.pay(cid, 600_000).unwrap();
+    assert!(
+        p.funder.close(cid).unwrap().is_none(),
+        "the Close waits for the payment to settle"
+    );
+    assert!(p.funder.pay(cid, 1).is_err(), "no payment after the close");
+    p.queue.push_back((1, m));
+    p.pump();
+    assert_eq!(held(&chain, ACCEPTOR_PAYOUT), 600_000);
+    assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 600_000 - CLOSE_FEE);
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
+    // The acceptor learns of the close from the block that confirms it.
+    drive(&p.acceptor, &chain);
+    assert_eq!(
+        p.acceptor.info(cid).unwrap().phase,
+        Phase::Closed,
+        "the closer's peer settles when the close confirms"
+    );
+}
+
+/// D11: a cooperative close whose `Close` was lost to a crash completes after
+/// the restart, through the reestablish, with no force-close.
+#[test]
+fn a_close_lost_to_a_crash_completes_after_restart() {
+    let funder_seed = [0xe5u8; 32];
+    let (mut p, wallet, chain, dir, cid, capacity) =
+        open_channel(funder_seed, [0xe6u8; 32], "d11-close-lost");
+    let m = p.funder.pay(cid, 250_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    let _lost = p.funder.close(cid).unwrap().expect("a close frame");
+    p.reload_funder(funder_seed, wallet, chain.clone(), &dir);
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closing);
+    reconnect(&mut p);
+    assert_eq!(held(&chain, ACCEPTOR_PAYOUT), 250_000);
+    assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 250_000 - CLOSE_FEE);
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
+}
+
+/// D11: a peer that still tracks a channel we settled and forgot offers its
+/// reestablish at every connection; that is not misconduct, or the link would
+/// drop at every reconnect.
+#[test]
+fn a_reestablish_for_a_forgotten_channel_is_not_misconduct() {
+    let (p, wallet, chain, _dir, _cid, _capacity) =
+        open_channel([0xe7u8; 32], [0xe8u8; 32], "d11-forgotten");
+    let stranger = one_manager([0xe9u8; 32], wallet, chain, &tmpdir("d11-stranger"));
+    let frames = p.funder.on_peer_connected(A_PEER, "");
+    assert!(!frames.is_empty());
+    for f in frames {
+        let r = stranger.deliver(F_PEER, "", &f);
+        assert_eq!(r.penalize, 0, "a reestablish for an unknown channel");
+        assert!(r.frames.is_empty());
+    }
+}
+
+/// D11: a channel frame arriving on a connection the channel is not bound to,
+/// with no identity tying it to the counterparty, is not acted on; a
+/// reestablish whose proof verifies moves the binding to that connection.
+#[test]
+fn only_a_verified_reestablish_rebinds_a_channel_to_another_connection() {
+    let (p, _wallet, _chain, _dir, cid, _capacity) =
+        open_channel([0xeau8; 32], [0xebu8; 32], "d11-rebind");
+    const OTHER: u64 = 77;
+    let m = p.funder.pay(cid, 400_000).unwrap();
+    let r = p.acceptor.deliver(OTHER, "", &m);
+    assert_eq!(r.penalize, 0);
+    assert!(r.frames.is_empty(), "a frame from an unbound connection");
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 0);
+    assert_eq!(p.acceptor.peer_of(cid), Some(F_PEER));
+
+    // The funder reconnects on the other connection: its reestablish proves
+    // its funding key, the acceptor re-binds there, and the dropped payment
+    // completes.
+    let mut queue: VecDeque<(u64, Vec<u8>)> = p
+        .funder
+        .reestablish(A_PEER)
+        .into_iter()
+        .map(|f| (1, f))
+        .collect();
+    let mut steps = 0;
+    while let Some((to, frame)) = queue.pop_front() {
+        steps += 1;
+        assert!(steps < 100, "did not settle");
+        let r = if to == 1 {
+            p.acceptor.deliver(OTHER, "", &frame)
+        } else {
+            p.funder.deliver(A_PEER, "", &frame)
+        };
+        assert_eq!(r.penalize, 0);
+        queue.extend(r.frames.into_iter().map(|f| (1 - to, f)));
+    }
+    assert_eq!(p.acceptor.peer_of(cid), Some(OTHER));
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 400_000);
     assert_eq!(
         p.funder.info(cid).unwrap().state_number,
         p.acceptor.info(cid).unwrap().state_number

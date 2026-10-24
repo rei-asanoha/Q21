@@ -95,12 +95,16 @@ struct Chan {
     /// restart or reconnect can map the new connection id back to this channel.
     peer_identity: String,
     capacity: u64,
-    /// True while an update we proposed is still in flight.
-    in_flight: bool,
     /// Whether we have already sent a reestablish on the current connection, so
     /// receiving the peer's reestablish reciprocates exactly once (no loop).
     /// Reset whenever the channel is re-bound to a new connection id.
     reest_sent: bool,
+    /// Whether the peer's reestablish has been received and answered on the
+    /// current connection. Until it has, a message one side lost may still be
+    /// owed, and a new update or close stacked on top of it would be refused
+    /// by the peer; so neither starts before. A channel opened on the current
+    /// connection starts synchronized.
+    synced: bool,
     /// What the channel is waiting for on chain, once a commitment has been
     /// broadcast. `None` while the channel is still off-chain or settled.
     close: Option<CloseTracker>,
@@ -262,8 +266,8 @@ impl ChannelManager {
                                 peer: u64::MAX,
                                 peer_identity,
                                 capacity,
-                                in_flight: false,
                                 reest_sent: false,
+                                synced: false,
                                 close: None,
                             },
                         );
@@ -370,7 +374,12 @@ impl ChannelManager {
         if chan.machine.phase() != Phase::Open {
             return Err("channel not open".into());
         }
-        if chan.in_flight {
+        if !chan.synced {
+            return Err("channel is not yet resynchronized with its peer".into());
+        }
+        // Derived from the persisted counters, so a proposal reloaded from the
+        // journal after a crash still counts until the reestablish settles it.
+        if chan.machine.update_in_flight() {
             return Err("a payment is already in flight".into());
         }
         let us = chan.machine.our_index();
@@ -381,16 +390,27 @@ impl ChannelManager {
         bal[us] -= amount;
         bal[1 - us] += amount;
         let msg = chan.machine.propose(bal).map_err(err)?;
-        chan.in_flight = true;
         Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
     }
 
-    /// Proposes a cooperative close of `cid`.
-    pub fn close(&self, cid: Hash256) -> Result<Vec<u8>, String> {
+    /// Proposes a cooperative close of `cid`, returning the `Close` frame to
+    /// send. While a payment is still settling the close is agreed at once
+    /// (no new payment starts) and its frame goes out when the payment
+    /// completes, so this returns `None`. On a channel already closing
+    /// cooperatively it returns the agreed `Close` again, so a close
+    /// interrupted by a crash or a dropped link can be completed.
+    pub fn close(&self, cid: Hash256) -> Result<Option<Vec<u8>>, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        if !chan.synced {
+            return Err("channel is not yet resynchronized with its peer".into());
+        }
+        if chan.machine.update_in_flight() {
+            chan.machine.agree_close(CLOSE_FEE).map_err(err)?;
+            return Ok(None);
+        }
         let msg = chan.machine.propose_close(CLOSE_FEE).map_err(err)?;
-        Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
+        Ok(Some(write_frame(cid, KIND_ENGINE, &msg.encode())))
     }
 
     /// Signals that `cid`'s funding is buried to the agreed depth, returning
@@ -418,6 +438,9 @@ impl ChannelManager {
                 c.reest_sent = false;
             }
             if c.peer == peer {
+                // A new connection: whatever was in flight on the old one is
+                // settled by the reestablish exchange before anything else.
+                c.synced = false;
                 if let Ok(m) = c.machine.reestablish() {
                     out.push(write_frame(
                         c.machine.channel_id(),
@@ -439,6 +462,7 @@ impl ChannelManager {
         let mut out = Vec::new();
         for c in g.channels.values_mut() {
             if c.peer == peer {
+                c.synced = false;
                 if let Ok(m) = c.machine.reestablish() {
                     out.push(write_frame(
                         c.machine.channel_id(),
@@ -578,8 +602,8 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
-                in_flight: false,
                 reest_sent: false,
+                synced: true,
                 close: None,
             },
         );
@@ -599,13 +623,31 @@ impl ChannelManager {
             return self.accept_open(peer, peer_identity, cid, msg);
         }
         let mut g = self.inner.lock().unwrap();
-        let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
-        // A frame for this channel came from `peer`: that is the live network
-        // id to reach the counterparty on, which a reconnect may have changed.
-        // A changed id means a new connection, so a reestablish is owed again.
+        let Some(chan) = g.channels.get_mut(&cid) else {
+            // A peer that still tracks a channel we have settled and forgotten
+            // (closed on our side, still closing on theirs) offers its
+            // reestablish at every connection. Penalising it dropped the link
+            // at every reconnect; there is simply nothing to resynchronize.
+            if matches!(msg, ChMsg::Reestablish { .. }) {
+                return Ok(Vec::new());
+            }
+            return Err("unknown channel".into());
+        };
+        // A frame for this channel from a connection it is not bound to. The
+        // binding moves to it when the connection announces the channel's
+        // durable peer identity (a second link to the same peer), or when it
+        // carries a reestablish whose proof verifies against the peer's
+        // funding key, below. Anything else is not acted on, and not
+        // penalised: an honest peer's frame can trail a reconnect.
         if chan.peer != peer {
-            chan.peer = peer;
-            chan.reest_sent = false;
+            let same_identity = !peer_identity.is_empty() && chan.peer_identity == peer_identity;
+            if same_identity {
+                chan.peer = peer;
+                chan.reest_sent = false;
+                chan.synced = false;
+            } else if !matches!(msg, ChMsg::Reestablish { .. }) {
+                return Ok(Vec::new());
+            }
         }
         let mut out = Vec::new();
         match msg {
@@ -637,35 +679,60 @@ impl ChannelManager {
             }
             ChMsg::Ack { .. } => {
                 let m = chan.machine.on_ack(&msg).map_err(err)?;
-                chan.in_flight = false;
                 out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+                out.extend(pending_close(chan, cid));
             }
             ChMsg::Revoke { .. } => {
                 chan.machine.on_revoke(&msg).map_err(err)?;
+                out.extend(pending_close(chan, cid));
             }
-            ChMsg::Close { .. } => {
-                let m = chan.machine.on_close(&msg).map_err(err)?;
-                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+            ChMsg::Close { fee } => {
+                if chan.machine.update_in_flight() {
+                    // The peer's Close crossed an update still settling here:
+                    // agree now, and send our own Close once the update
+                    // completes; the peer signs that one.
+                    chan.machine.agree_close(fee).map_err(err)?;
+                } else {
+                    let m = chan.machine.on_close(&msg).map_err(err)?;
+                    out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+                }
             }
             ChMsg::CloseSigned { .. } => {
+                let already = chan.machine.phase() == Phase::Closed;
                 let tx = chan.machine.on_close_signed(&msg).map_err(err)?;
                 drop(g);
-                (self.hooks.broadcast)(&tx)?;
+                // Both sides may complete the same close after a reconnect; a
+                // copy already in the mempool is no fault of the peer's.
+                if !already {
+                    self.broadcast_or_warn(&tx, "cooperative close");
+                }
             }
             ChMsg::Reestablish { .. } => {
                 let frames = chan.machine.on_reestablish(&msg).map_err(err)?;
-                for f in frames {
-                    out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
+                // The proof verified: this connection speaks for the channel's
+                // counterparty. Bind to it, and remember the identity it
+                // announced so a later reconnect re-binds at the handshake.
+                if chan.peer != peer {
+                    chan.peer = peer;
+                    chan.reest_sent = false;
+                }
+                if !peer_identity.is_empty() && chan.peer_identity != peer_identity {
+                    chan.peer_identity = peer_identity.to_string();
+                    self.write_peer_identity(cid, peer_identity);
                 }
                 // Reciprocate exactly once, so both sides exchange reestablish
-                // and each learns the single in-flight message it must resend.
-                // (The peer that dialed sent first; this covers the other side.)
+                // and each learns what it must resend. (The peer that dialed
+                // sent first; this covers the other side.)
                 if !chan.reest_sent {
                     if let Ok(m) = chan.machine.reestablish() {
                         out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
                         chan.reest_sent = true;
                     }
                 }
+                for f in frames {
+                    out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
+                }
+                chan.synced = true;
             }
             ChMsg::Error { .. } | ChMsg::Open { .. } => {}
         }
@@ -724,8 +791,8 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
-                in_flight: false,
                 reest_sent: false,
+                synced: true,
                 close: None,
             },
         );
@@ -826,6 +893,11 @@ impl ChannelManager {
         let Some(funding) = chan.machine.funding_outpoint() else {
             return;
         };
+        // The cooperative close we agreed to, broadcast by the peer: settled.
+        if chan.machine.is_cooperative_close(tx) {
+            let _ = chan.machine.mark_closed();
+            return;
+        }
         let decision = classify_spend(chan, funding, tx);
         let sweep_to = (self.hooks.sweep_address)();
         match decision {
@@ -1043,6 +1115,17 @@ impl ChannelManager {
         }
         found
     }
+}
+
+/// The `Close` of a cooperative close agreed while an update was still in
+/// flight, once that update has settled: the close could not be signed over
+/// balances the two sides did not yet share, so it follows the update.
+fn pending_close(chan: &mut Chan, cid: Hash256) -> Option<Vec<u8>> {
+    if chan.machine.phase() != Phase::Closing || chan.machine.update_in_flight() {
+        return None;
+    }
+    let msg = chan.machine.propose_close(CLOSE_FEE).ok()?;
+    Some(write_frame(cid, KIND_ENGINE, &msg.encode()))
 }
 
 /// Classifies a funding-output spend for `chan`, robust to the single-output

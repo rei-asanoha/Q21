@@ -395,8 +395,10 @@ fn cooperative_close_credits_both_wallets() {
     let b_before = net.b_balance();
 
     // Cooperative close, proposed by the funder.
-    let close = net.fmgr.close(cid).unwrap();
-    assert!(net.a.send_channel(net.bid, close));
+    // `None`: a payment still settling; the Close follows it on its own.
+    if let Some(close) = net.fmgr.close(cid).unwrap() {
+        assert!(net.a.send_channel(net.bid, close));
+    }
     assert!(
         wait(|| net.pending_len() >= 1, 10),
         "cooperative close was not signed and broadcast"
@@ -644,7 +646,10 @@ fn channelpay_survives_a_restart_and_reconnect() {
         .fmgr
         .close(cid)
         .expect("a reloaded channel can be cooperatively closed");
-    assert!(net.a.send_channel(net.bid, close));
+    // `None`: the payment is still settling; the Close follows it on its own.
+    if let Some(close) = close {
+        assert!(net.a.send_channel(net.bid, close));
+    }
     assert!(
         wait(|| net.pending_len() >= 1, 10),
         "cooperative close after restart was not signed and broadcast"
@@ -909,8 +914,10 @@ fn a_channel_survives_repeated_link_flaps() {
 
     // And a cooperative close still settles both wallets after the flaps.
     let b_before = net.b_balance();
-    let close = net.fmgr.close(cid).unwrap();
-    assert!(net.a.send_channel(net.bid, close));
+    // `None`: a payment still settling; the Close follows it on its own.
+    if let Some(close) = net.fmgr.close(cid).unwrap() {
+        assert!(net.a.send_channel(net.bid, close));
+    }
     assert!(wait(|| net.pending_len() >= 1, 10), "close not broadcast");
     net.mine();
     assert_eq!(

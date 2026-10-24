@@ -1211,11 +1211,19 @@ impl RpcContext {
         let peer = mgr
             .peer_of(cid)
             .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))?;
+        // Refuse before the engine commits to a new state: a payment journaled
+        // for a peer that cannot hear it would sit in flight until a reconnect.
+        if !self.node.channel_peers().contains(&peer) {
+            return Err(rpc_error(ERR_REQUEST, "peer is not connected"));
+        }
         let frame = mgr
             .pay(cid, amount)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
         if !self.node.send_channel(peer, frame) {
-            return Err(rpc_error(ERR_REQUEST, "peer is not connected"));
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "peer disconnected; the payment completes when the channel reconnects",
+            ));
         }
         Ok(Json::obj()
             .set("status", Json::str("sent"))
@@ -1241,9 +1249,18 @@ impl RpcContext {
         let peer = mgr
             .peer_of(cid)
             .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))?;
-        let frame = mgr.close(cid).map_err(|e| rpc_error(ERR_REQUEST, &e))?;
-        if !self.node.send_channel(peer, frame) {
+        if !self.node.channel_peers().contains(&peer) {
             return Err(rpc_error(ERR_REQUEST, "peer is not connected"));
+        }
+        // `None`: a payment is still settling; the close is agreed and its
+        // message leaves as soon as the payment completes.
+        if let Some(frame) = mgr.close(cid).map_err(|e| rpc_error(ERR_REQUEST, &e))? {
+            if !self.node.send_channel(peer, frame) {
+                return Err(rpc_error(
+                    ERR_REQUEST,
+                    "peer disconnected; the close completes when the channel reconnects",
+                ));
+            }
         }
         Ok(Json::obj()
             .set("status", Json::str("closing"))
