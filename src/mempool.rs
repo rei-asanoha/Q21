@@ -38,7 +38,7 @@ use crate::hash::Hash256;
 use crate::tx::{OutPoint, Transaction, TxOut};
 use crate::utxo::{UtxoEntry, UtxoSet, UtxoView};
 use crate::validate::{self, ValidationError};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Maximum size of the mempool, in serialized bytes.
 ///
@@ -78,6 +78,12 @@ pub const PACKAGE_MAX: usize = 64;
 /// that would bring them back. Far beyond what six blocks can hold.
 pub const LOCAL_CONFIRMED_MAX: usize = 4096;
 
+/// Blocks during which a transaction put back by a reorganization is
+/// protected from eviction. Past them it is an ordinary entry: a miner that
+/// orphans its own blocks of minimum-fee transactions could otherwise pin pool
+/// space for good. See [`MempoolEntry::returned`].
+pub const RETURNED_PROTECTION_BLOCKS: u64 = 6;
+
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
     pub tx: Transaction,
@@ -92,9 +98,10 @@ pub struct MempoolEntry {
     /// [`Mempool::accept_local`].
     pub local: bool,
     /// Put back by a reorganization from a block that had already confirmed
-    /// it. Never evicted here: it was confirmed once and the wallet that sent
-    /// it counts on it, so a full pool makes room for it rather than refusing
-    /// it. See [`Mempool::return_abandoned`].
+    /// it. Not evicted here for [`RETURNED_PROTECTION_BLOCKS`]: it was
+    /// confirmed once and the wallet that sent it counts on it, so a full pool
+    /// makes room for it rather than refusing it. See
+    /// [`Mempool::return_abandoned`].
     pub returned: bool,
 }
 
@@ -303,6 +310,14 @@ pub struct Mempool {
     counter: u64,
     /// Bound in bytes; zero means [`MEMPOOL_MAX_BYTES`]. Only tests lower it.
     max_bytes: usize,
+    /// Blocks connected so far, to date the protection of returned entries.
+    blocks_seen: u64,
+    /// Returned entries, oldest first, with the block count they came back
+    /// at: their protection ends [`RETURNED_PROTECTION_BLOCKS`] later.
+    returned_since: VecDeque<(u64, Hash256)>,
+    /// The latest such count per returned entry: a transaction returned
+    /// twice keeps the later date, and its older record is stale.
+    returned_at: HashMap<Hash256, u64>,
 }
 
 impl Mempool {
@@ -766,6 +781,10 @@ impl Mempool {
             self.children.entry(txid).or_default().extend(adopted);
         }
         self.entries.insert(txid, entry);
+        if returned {
+            self.returned_since.push_back((self.blocks_seen, txid));
+            self.returned_at.insert(txid, self.blocks_seen);
+        }
         Ok(txid)
     }
 
@@ -1071,6 +1090,35 @@ impl Mempool {
                 if let Some(conflict) = self.committed.get(&input.prev_out).copied() {
                     self.remove(&conflict);
                 }
+            }
+        }
+        self.blocks_seen += 1;
+        self.end_expired_protection();
+    }
+
+    /// Returned entries whose protection has run out become ordinary ones:
+    /// evictable like any other, alone as a leaf or with their package.
+    fn end_expired_protection(&mut self) {
+        while let Some(&(since, txid)) = self.returned_since.front() {
+            if self.blocks_seen.saturating_sub(since) < RETURNED_PROTECTION_BLOCKS {
+                break;
+            }
+            self.returned_since.pop_front();
+            if self.returned_at.get(&txid) != Some(&since) {
+                continue;
+            }
+            self.returned_at.remove(&txid);
+            let Some(e) = self.entries.get_mut(&txid) else {
+                continue;
+            };
+            if !e.returned {
+                continue;
+            }
+            e.returned = false;
+            let leaf = self.children.get(&txid).map_or(true, |v| v.is_empty());
+            if !e.local && leaf {
+                let key = Self::eviction_key(&txid, e);
+                self.evictable.insert(key);
             }
         }
     }
@@ -2751,6 +2799,61 @@ mod tests_chains {
                 "the rich newcomer could not push a returned payment out"
             );
         }
+        assert!(m.bytes() <= m.capacity());
+    }
+
+    /// Finding 13: the protection of a returned transaction lasts a few blocks.
+    /// Past them, a newcomer that pays more evicts it like any other entry —
+    /// otherwise a miner orphaning its own blocks of minimum-fee transactions
+    /// pinned pool space for good.
+    #[test]
+    fn a_returned_payment_is_protected_only_for_a_few_blocks() {
+        let mut w = Wallet::from_seed([0x62; 32], NETWORK);
+        let c = funded_chain(&mut w, crate::consensus::COINBASE_MATURITY + 9);
+        let mut built = Mempool::new();
+        let payment = spend_with_pending(&mut w, &c, &built, 1_000);
+        built
+            .accept(&payment, &c.utxo, NETWORK, c.height())
+            .unwrap();
+        let s = payment.encode().len();
+
+        // A pool that holds two entries, filled with cheap ordinary ones.
+        let mut m = Mempool::with_capacity(2 * s + s / 2);
+        for _ in 0..2 {
+            let f = spend_with_pending(&mut w, &c, &m, 1_000);
+            m.accept(&f, &c.utxo, NETWORK, c.height()).unwrap();
+        }
+        let block = |txs: Vec<Transaction>| crate::block::Block {
+            header: c.tip(),
+            transactions: txs,
+            uncles: Vec::new(),
+        };
+        // Index 0 is the coinbase slot, skipped by `return_abandoned`.
+        let abandoned = block(vec![payment.clone(), payment.clone()]);
+        assert_eq!(
+            m.return_abandoned(&[abandoned], &c.utxo, NETWORK, c.height()),
+            1
+        );
+
+        // Within its protection: a rich newcomer cannot push it out.
+        let rich = spend_with_pending(&mut w, &c, &m, 200_000);
+        let _ = m.accept(&rich, &c.utxo, NETWORK, c.height());
+        assert!(
+            m.contains(&payment.txid()),
+            "protected right after the reorg"
+        );
+
+        // Some blocks later, it is an ordinary cheap entry.
+        for _ in 0..RETURNED_PROTECTION_BLOCKS {
+            m.on_block_connected(&block(Vec::new()));
+        }
+        let richer = spend_with_pending(&mut w, &c, &m, 300_000);
+        let _ = m.accept(&richer, &c.utxo, NETWORK, c.height());
+        assert!(m.contains(&richer.txid()), "the newcomer got in");
+        assert!(
+            !m.contains(&payment.txid()),
+            "the protection of a returned transaction never ended"
+        );
         assert!(m.bytes() <= m.capacity());
     }
 
