@@ -204,6 +204,8 @@ pub struct Machine {
     close_fee: Option<u64>,
     /// Who pays the agreed close's fee: the party that proposed it.
     close_payer: Option<usize>,
+    /// The funder's signed funding transaction, until the channel opens.
+    funding_tx: Option<Transaction>,
     /// Whether we may have signed the cooperative close. Until we have, a
     /// payment to us that crossed our `Close` on the wire is still accepted;
     /// once we have, the peer holds a close over the old balances and no update
@@ -416,6 +418,7 @@ impl Machine {
             initiated: BTreeMap::new(),
             close_fee: None,
             close_payer: None,
+            funding_tx: None,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,
@@ -571,6 +574,11 @@ impl Machine {
         if self.our_index != FUNDER || self.phase != Phase::Opening {
             return Err(ChannelError::Unexpected);
         }
+        // Already accepted: a replayed Accept must not fund the channel a
+        // second time (see [`Machine::accepted`]).
+        if self.accepted() {
+            return Err(ChannelError::Unexpected);
+        }
         // The acceptor's key was already folded into the funding policy at
         // construction; re-check it matches what we accepted.
         if crate::sig::pubkey_hash(CHANNEL_SCHEME, acceptor_pubkey) != self.params.funding[ACCEPTOR]
@@ -582,10 +590,59 @@ impl Machine {
         Ok(())
     }
 
+    /// Funder: whether the acceptor's `Accept` has been taken. Explicit in the
+    /// state: the acceptor's announced points are recorded at that moment.
+    pub fn accepted(&self) -> bool {
+        self.our_index == FUNDER && !self.their_points.is_empty()
+    }
+
+    /// Funder: records the signed funding transaction — not broadcast: that
+    /// waits for the acceptor's signature over our first commitment
+    /// ([`Machine::on_funding_signed`]) — and returns [`Message::Funding`].
+    pub fn funding_built(
+        &mut self,
+        outpoint: OutPoint,
+        tx: &Transaction,
+    ) -> Result<Message, ChannelError> {
+        if self.our_index != FUNDER || self.phase != Phase::Opening || !self.accepted() {
+            return Err(ChannelError::Unexpected);
+        }
+        if tx.txid() != outpoint.txid
+            || tx.outputs.get(outpoint.index as usize) != Some(&self.params.funding_output())
+        {
+            return Err(ChannelError::Invariant(
+                "funding transaction does not fund the channel",
+            ));
+        }
+        self.journal
+            .append(&Record::FundingTx { tx: tx.encode() })?;
+        self.funding_tx = Some(tx.clone());
+        self.funding_created(outpoint)
+    }
+
+    /// The funder's signed funding transaction, kept until the channel opens.
+    pub fn funding_tx(&self) -> Option<&Transaction> {
+        self.funding_tx.as_ref()
+    }
+
+    /// Funder: the `Funding` message again, for an acceptor that asks twice.
+    pub fn funding_message(&self) -> Result<Message, ChannelError> {
+        let outpoint = self.funding()?;
+        let bal = [self.params.capacity.units(), 0];
+        Ok(Message::Funding {
+            funding_txid: outpoint.txid,
+            funding_index: outpoint.index,
+            tier_sigs: self.sign_their_commitment(0, bal)?,
+        })
+    }
+
     /// Funder: records the funding outpoint and returns [`Message::Funding`]
     /// with our signatures of the acceptor's first commitment.
     pub fn funding_created(&mut self, outpoint: OutPoint) -> Result<Message, ChannelError> {
         if self.our_index != FUNDER || self.phase != Phase::Opening {
+            return Err(ChannelError::Unexpected);
+        }
+        if self.funding_outpoint.is_some() {
             return Err(ChannelError::Unexpected);
         }
         self.set_funding(outpoint)?;
@@ -1036,6 +1093,9 @@ impl Machine {
         if let Some(height) = self.funding_height {
             out.push(Record::Confirmed { height });
         }
+        if let (Some(tx), Phase::Opening | Phase::Funded) = (&self.funding_tx, self.phase) {
+            out.push(Record::FundingTx { tx: tx.encode() });
+        }
         if let Some(fee) = self.close_fee {
             out.push(Record::ClosingCoopBy {
                 fee,
@@ -1480,6 +1540,7 @@ impl Machine {
             initiated: BTreeMap::new(),
             close_fee: None,
             close_payer: None,
+            funding_tx: None,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,
@@ -1554,6 +1615,9 @@ impl Machine {
                 Record::Penalised => self.phase = Phase::Penalised,
                 Record::Closed => self.phase = Phase::Closed,
                 Record::Confirmed { height } => self.funding_height = Some(*height),
+                Record::FundingTx { tx } => {
+                    self.funding_tx = Transaction::decode(tx).ok();
+                }
                 Record::Crossed { state } => self.crossed = Some(*state),
                 Record::CloseSigned { fee, signature } => {
                     self.close_fee = Some(*fee);

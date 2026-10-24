@@ -155,9 +155,9 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
     let w1 = wallet.clone();
     let c1 = chain.clone();
     let fund = Box::new(
-        move |_cid: Hash256, funding_output: TxOut| -> Result<OutPoint, String> {
+        move |_cid: Hash256, funding_output: TxOut| -> Result<Transaction, String> {
             let mut w = w1.lock().unwrap();
-            let mut c = c1.lock().unwrap();
+            let c = c1.lock().unwrap();
             let prepared = w
                 .prepare_funding(
                     &c.chain.utxo,
@@ -168,12 +168,8 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
                     &[],
                 )
                 .map_err(|e| format!("{e:?}"))?;
-            let tx = w
-                .sign_spend(&c.chain.utxo, prepared)
-                .map_err(|e| format!("{e:?}"))?;
-            let txid = tx.txid();
-            c.mine(std::slice::from_ref(&tx));
-            Ok(OutPoint { txid, index: 0 })
+            w.sign_spend(&c.chain.utxo, prepared)
+                .map_err(|e| format!("{e:?}"))
         },
     );
     let c2 = chain.clone();
@@ -1727,4 +1723,96 @@ fn a_to_local_taken_by_a_penalty_settles_our_side() {
     back.rescan(tip, &txs_at, &move |op: &OutPoint| chain_depth(&c2, op));
     assert!(sent.lock().unwrap().is_empty());
     assert_eq!(back.info(cid).unwrap().phase, Phase::Closed);
+}
+
+// --- Funding: broadcast only once the funder can get its capacity back -------
+
+/// The funder signs the funding transaction when the acceptor accepts, but
+/// broadcasts it only once it holds the acceptor's signature over its first
+/// commitment; a replayed Accept funds nothing a second time.
+#[test]
+fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
+    let funder_seed = [0xc5u8; 32];
+    let acceptor_seed = [0xc6u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("funding-order");
+    std::fs::create_dir_all(dir.join("f")).unwrap();
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    let built = Arc::new(Mutex::new(0usize));
+    let sent: Arc<Mutex<Vec<Transaction>>> = Arc::new(Mutex::new(Vec::new()));
+    let real = funder_hooks(wallet, chain.clone());
+    let (b1, s1) = (built.clone(), sent.clone());
+    let fund = real.fund;
+    let funder = ChannelManager::new(
+        NET,
+        RATE,
+        funder_seed,
+        dir.join("f"),
+        DELAY,
+        DEPTH,
+        Hooks {
+            fund: Box::new(move |cid, out| {
+                *b1.lock().unwrap() += 1;
+                fund(cid, out)
+            }),
+            broadcast: Box::new(move |tx| {
+                s1.lock().unwrap().push(tx.clone());
+                Ok(())
+            }),
+            sweep_address: real.sweep_address,
+            payout_address: real.payout_address,
+            replace: real.replace,
+        },
+    );
+    let acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("a"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain, Hash256([0x5e; 32])),
+    );
+    let one = |r: q21_core::channel::manager::Reaction| -> Vec<u8> {
+        assert_eq!(r.penalize, 0);
+        assert_eq!(r.frames.len(), 1);
+        r.frames.into_iter().next().unwrap()
+    };
+    let hello = funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    let hello_back = one(acceptor.deliver(F_PEER, "", &hello));
+    let open = one(funder.deliver(A_PEER, "", &hello_back));
+    let accept = one(acceptor.deliver(F_PEER, "", &open));
+    let funding = one(funder.deliver(A_PEER, "", &accept));
+    assert_eq!(*built.lock().unwrap(), 1);
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "funding broadcast before FundingSigned"
+    );
+    // The same Accept again: the same Funding, nothing built or sent.
+    let again = one(funder.deliver(A_PEER, "", &accept));
+    assert_eq!(again, funding);
+    assert_eq!(*built.lock().unwrap(), 1, "a replayed Accept funded again");
+    assert!(sent.lock().unwrap().is_empty());
+    let signed = one(acceptor.deliver(F_PEER, "", &funding));
+    let r = funder.deliver(A_PEER, "", &signed);
+    assert_eq!(r.penalize, 0);
+    let first = {
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "the funding goes out after FundingSigned");
+        sent[0].clone()
+    };
+    let cid = funder.list()[0].channel_id;
+    assert_eq!(
+        Some(first.txid()),
+        funder.info(cid).and_then(|i| i.funding).map(|o| o.txid)
+    );
+    // Killed before the funding confirmed, its mempool lost: the restarted
+    // funder broadcasts it again from its journal.
+    drop(funder);
+    let (back, again) = relaying_manager(funder_seed, &dir.join("f"), Hash256([4; 32]));
+    back.rescan(500, &|_| None, &|_| None);
+    assert_eq!(again.lock().unwrap().len(), 1);
+    assert_eq!(again.lock().unwrap()[0].1, first);
 }

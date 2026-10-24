@@ -16,7 +16,7 @@ use q21_core::consensus::{COINBASE_MATURITY, TARGET_BLOCK_SECS};
 use q21_core::hash::Hash256;
 use q21_core::net::{Node, PeerInfo};
 use q21_core::sig::SchemeId;
-use q21_core::tx::{OutPoint, Transaction, TxOut};
+use q21_core::tx::{Transaction, TxOut};
 use q21_core::wallet::Wallet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,14 +58,13 @@ fn sync_mine(a: &Node, b: &Node, pending: &Pending, miner: Hash256) {
 fn hooks(wallet: Arc<Mutex<Wallet>>, node: Node, pending: Pending, can_fund: bool) -> Hooks {
     let w_fund = wallet.clone();
     let n_fund = node.clone();
-    let p_fund = pending.clone();
     let fund = Box::new(
-        move |_cid: Hash256, funding_output: TxOut| -> Result<OutPoint, String> {
+        move |_cid: Hash256, funding_output: TxOut| -> Result<Transaction, String> {
             if !can_fund {
                 return Err("this side does not fund".into());
             }
             let mut w = w_fund.lock().unwrap();
-            let (tx, txid) = n_fund.with_chain(|c| {
+            n_fund.with_chain(|c| {
                 let prepared = w
                     .prepare_funding(
                         &c.utxo,
@@ -76,14 +75,9 @@ fn hooks(wallet: Arc<Mutex<Wallet>>, node: Node, pending: Pending, can_fund: boo
                         &[],
                     )
                     .map_err(|e| format!("{e:?}"))?;
-                let tx = w
-                    .sign_spend(&c.utxo, prepared)
-                    .map_err(|e| format!("{e:?}"))?;
-                let txid = tx.txid();
-                Ok::<_, String>((tx, txid))
-            })?;
-            p_fund.lock().unwrap().push(tx);
-            Ok(OutPoint { txid, index: 0 })
+                w.sign_spend(&c.utxo, prepared)
+                    .map_err(|e| format!("{e:?}"))
+            })
         },
     );
     let p_b = pending.clone();

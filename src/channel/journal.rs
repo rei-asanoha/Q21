@@ -81,6 +81,10 @@ pub enum Record {
     /// A cooperative close was agreed at `fee`, charged to `payer` — the
     /// party that proposed it.
     ClosingCoopBy { fee: u64, payer: u8 },
+    /// The funder's signed funding transaction, kept until it confirms: it is
+    /// broadcast only once the acceptor's signature over our first commitment
+    /// is held, and again after a crash that lost it from the mempool.
+    FundingTx { tx: Vec<u8> },
     /// We moved to force-close (we or the peer will broadcast a commitment).
     Forcing,
     /// We punished a revoked broadcast.
@@ -126,6 +130,7 @@ const R_CONFIRMED: u8 = 14;
 const R_CLOSE_SIGNED: u8 = 15;
 const R_CROSSED: u8 = 16;
 const R_CLOSING_COOP_BY: u8 = 17;
+const R_FUNDING_TX: u8 = 18;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -222,6 +227,9 @@ impl Record {
             Record::ClosingCoopBy { fee, payer } => {
                 w.u8(R_CLOSING_COOP_BY).u64(*fee).u8(*payer);
             }
+            Record::FundingTx { tx } => {
+                w.u8(R_FUNDING_TX).var_bytes(tx);
+            }
         }
         w.finish()
     }
@@ -301,6 +309,9 @@ impl Record {
             }
             R_CONFIRMED => Record::Confirmed { height: r.u64()? },
             R_CROSSED => Record::Crossed { state: r.u64()? },
+            R_FUNDING_TX => Record::FundingTx {
+                tx: r.var_bytes()?.to_vec(),
+            },
             R_CLOSING_COOP_BY => Record::ClosingCoopBy {
                 fee: r.u64()?,
                 payer: r.u8()?,

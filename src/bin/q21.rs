@@ -4694,7 +4694,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             use q21_core::amount::Amount;
             use q21_core::channel::manager::{ChannelManager, Hooks};
             use q21_core::channel::{DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH};
-            use q21_core::tx::{OutPoint, Transaction, TxOut};
+            use q21_core::tx::{Transaction, TxOut};
             const CHANNEL_FUND_FEE: u64 = 50_000;
 
             let folder = datadir.to_path_buf();
@@ -4708,9 +4708,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             let fund = Box::new(
                 move |_cid: q21_core::hash::Hash256,
                       funding_output: TxOut|
-                      -> Result<OutPoint, String> {
+                      -> Result<Transaction, String> {
+                    // Built and signed only: the manager broadcasts it once the
+                    // acceptor has signed our first commitment.
                     let mut w = w_fund.lock().map_err(|_| "wallet locked".to_string())?;
-                    let (tx, txid) = n_fund.with_chain_and_mempool(|c, m| {
+                    let tx = n_fund.with_chain_and_mempool(|c, m| {
                         let prepared = w
                             .prepare_funding(
                                 &c.utxo,
@@ -4721,20 +4723,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                                 &[],
                             )
                             .map_err(|e| format!("{e:?}"))?;
-                        let tx = w
-                            .sign_spend(&m.view(&c.utxo), prepared)
-                            .map_err(|e| format!("{e:?}"))?;
-                        let txid = m
-                            .accept_local(&tx, &c.utxo, network, c.height())
-                            .map_err(|e| format!("{e:?}"))?;
-                        Ok::<_, String>((tx, txid))
+                        w.sign_spend(&m.view(&c.utxo), prepared)
+                            .map_err(|e| format!("{e:?}"))
                     })?;
                     let _ = write_wallet(&folder_fund, &w);
-                    n_fund.announce_tx(txid);
-                    Ok(OutPoint {
-                        txid: tx.txid(),
-                        index: 0,
-                    })
+                    Ok(tx)
                 },
             );
 

@@ -46,9 +46,11 @@ const KIND_HELLO_BACK: u8 = 2;
 /// (see [`crate::channel::txbuild::capped_fee`]).
 pub const CLOSE_FEE: u64 = crate::channel::txbuild::SWEEP_FEE;
 
-/// Builds, signs, reserves and broadcasts the funding transaction paying the
-/// given output; returns its outpoint. Takes the chain and wallet locks itself.
-pub type FundFn = dyn Fn(Hash256, TxOut) -> Result<OutPoint, String> + Send + Sync;
+/// Builds and signs the funding transaction paying the given output, and
+/// returns it — not broadcast: the manager broadcasts it only once the
+/// acceptor has signed our first commitment. Takes the chain and wallet locks
+/// itself.
+pub type FundFn = dyn Fn(Hash256, TxOut) -> Result<Transaction, String> + Send + Sync;
 /// Broadcasts a transaction (cooperative close, penalty, sweep) through the
 /// normal mempool and relay.
 pub type BroadcastFn = dyn Fn(&Transaction) -> Result<(), String> + Send + Sync;
@@ -786,15 +788,36 @@ impl ChannelManager {
         let mut out = Vec::new();
         match msg {
             ChMsg::Accept { .. } => {
+                // A replayed Accept funds nothing again: the Funding already
+                // built is sent again, if any.
+                if chan.machine.accepted() {
+                    if chan.machine.funding_outpoint().is_some() {
+                        let m = chan.machine.funding_message().map_err(err)?;
+                        out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+                    }
+                    return Ok(out);
+                }
                 chan.machine.on_accept(&msg).map_err(err)?;
-                // Funder builds and broadcasts the funding transaction, then
-                // tells the acceptor the outpoint.
+                // The funder builds and signs the funding transaction and tells
+                // the acceptor its outpoint. It is broadcast only once the
+                // acceptor's FundingSigned is in: broadcast earlier, the
+                // capacity would sit in the 2-of-2 output with no commitment
+                // the funder could enforce to get it back.
                 let funding_output = chan.machine.funding_output();
                 drop(g); // the fund hook takes the chain lock
-                let outpoint = (self.hooks.fund)(cid, funding_output)?;
+                let tx = (self.hooks.fund)(cid, funding_output)?;
+                let index = tx
+                    .outputs
+                    .iter()
+                    .position(|o| *o == funding_output)
+                    .ok_or("the funding transaction does not pay the channel")?;
+                let outpoint = OutPoint {
+                    txid: tx.txid(),
+                    index: index as u32,
+                };
                 let mut g = self.inner.lock().unwrap();
                 let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
-                let m = chan.machine.funding_created(outpoint).map_err(err)?;
+                let m = chan.machine.funding_built(outpoint, &tx).map_err(err)?;
                 out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
             }
             ChMsg::Funding { .. } => {
@@ -803,6 +826,13 @@ impl ChannelManager {
             }
             ChMsg::FundingSigned { .. } => {
                 chan.machine.on_funding_signed(&msg).map_err(err)?;
+                // We hold the acceptor's signature over our commitment 0: the
+                // capacity can always come back. Now the funding goes out.
+                let tx = chan.machine.funding_tx().cloned();
+                drop(g);
+                if let Some(tx) = tx {
+                    self.broadcast_or_warn(&tx, "funding");
+                }
             }
             ChMsg::Ready => {
                 chan.machine.on_ready(&msg).map_err(err)?;
@@ -1064,6 +1094,17 @@ impl ChannelManager {
         {
             let g = self.inner.lock().unwrap();
             for c in g.channels.values() {
+                // Our funding, signed for by the acceptor, not yet on chain: a
+                // crash may have come before its broadcast, or lost it.
+                if c.machine.phase() == Phase::Funded {
+                    let unconfirmed = c
+                        .machine
+                        .funding_outpoint()
+                        .is_some_and(|op| depth_of(&op).is_none());
+                    if let (true, Some(tx)) = (unconfirmed, c.machine.funding_tx()) {
+                        pending.push((tx.clone(), "funding"));
+                    }
+                }
                 match &c.close {
                     Some(CloseTracker::Penalty { current, .. }) => {
                         pending.push((current.clone(), "penalty"));
@@ -1081,6 +1122,7 @@ impl ChannelManager {
                             continue;
                         }
                         match c.machine.phase() {
+                            Phase::Funded => {}
                             Phase::Closing => {
                                 if let Some(tx) = c.machine.signed_cooperative_close() {
                                     pending.push((tx, "cooperative close"));
