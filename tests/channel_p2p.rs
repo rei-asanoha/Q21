@@ -18,7 +18,7 @@ struct Recorder {
 }
 
 impl ChannelSink for Recorder {
-    fn deliver(&self, _peer: u64, bytes: &[u8]) -> ChannelOutcome {
+    fn deliver(&self, _peer: u64, _peer_identity: &str, bytes: &[u8]) -> ChannelOutcome {
         self.count.fetch_add(1, Ordering::SeqCst);
         *self.last.lock().unwrap() = bytes.to_vec();
         ChannelOutcome::default()

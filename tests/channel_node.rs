@@ -184,9 +184,15 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
     Hooks {
         fund,
         broadcast,
-        sweep_address: Box::new(|| Hash256([0x5e; 32])),
+        sweep_address: Box::new(|| FUNDER_PAYOUT),
+        payout_address: Box::new(|| FUNDER_PAYOUT),
     }
 }
+
+/// The funder's cooperative-close / sweep payout address in these tests.
+const FUNDER_PAYOUT: Hash256 = Hash256([0xf0; 32]);
+/// The acceptor's cooperative-close payout address in these tests.
+const ACCEPTOR_PAYOUT: Hash256 = Hash256([0xa0; 32]);
 
 /// The acceptor's hooks: it never funds; it broadcasts penalties/claims.
 fn acceptor_hooks(chain: Arc<Mutex<SharedChain>>, sweep: Hash256) -> Hooks {
@@ -198,6 +204,7 @@ fn acceptor_hooks(chain: Arc<Mutex<SharedChain>>, sweep: Hash256) -> Hooks {
             Ok(())
         }),
         sweep_address: Box::new(move || sweep),
+        payout_address: Box::new(|| ACCEPTOR_PAYOUT),
     }
 }
 
@@ -215,9 +222,9 @@ impl Pair {
             steps += 1;
             assert!(steps < 1000, "protocol did not settle");
             let r = if to == 1 {
-                self.acceptor.deliver(F_PEER, &frame)
+                self.acceptor.deliver(F_PEER, "", &frame)
             } else {
-                self.funder.deliver(A_PEER, &frame)
+                self.funder.deliver(A_PEER, "", &frame)
             };
             assert_eq!(r.penalize, 0, "a frame was treated as misconduct");
             let reply_to = if to == 1 { 0 } else { 1 };
@@ -296,7 +303,7 @@ fn two_nodes_open_pay_and_cooperatively_close() {
 
     // Open: funder sends Hello; the pump drives key exchange, Open/Accept,
     // funding (built, signed and mined by the hook), funding_signed.
-    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
 
@@ -345,10 +352,8 @@ fn two_nodes_open_pay_and_cooperatively_close() {
     let after_h = chain.lock().unwrap().height();
     assert!(after_h > before_h, "close mined");
 
-    // On-chain outcomes: the funder's channel-key output less the close fee,
-    // the acceptor's channel-key output, exact to the unit.
-    let f_hash = chan_hash(&funder_seed, 0);
-    let a_hash = chan_hash(&acceptor_seed, 0);
+    // On-chain outcomes: each side's **payout** (wallet) output, not its
+    // channel key — the funder's less the close fee — exact to the unit.
     let got = |hash: Hash256| -> u64 {
         let c = chain.lock().unwrap();
         c.chain
@@ -358,10 +363,14 @@ fn two_nodes_open_pay_and_cooperatively_close() {
             .map(|(_, e)| e.output.value.units())
             .sum()
     };
-    let gf = got(f_hash);
-    let ga = got(a_hash);
-    assert_eq!(gf, capacity - 1_100_000 - CLOSE_FEE, "funder on chain");
-    assert_eq!(ga, 1_100_000, "acceptor on chain");
+    let gf = got(FUNDER_PAYOUT);
+    let ga = got(ACCEPTOR_PAYOUT);
+    assert_eq!(
+        gf,
+        capacity - 1_100_000 - CLOSE_FEE,
+        "funder payout on chain"
+    );
+    assert_eq!(ga, 1_100_000, "acceptor payout on chain");
     assert_eq!(gf + ga + CLOSE_FEE, capacity, "conserved to the unit");
 }
 
@@ -387,7 +396,7 @@ fn a_revoked_broadcast_is_punished_before_the_delay() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
@@ -468,7 +477,7 @@ fn reestablish_after_a_clean_reconnect_resends_nothing() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
@@ -533,7 +542,7 @@ fn two_nodes_reach_open_through_the_block_hook() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
@@ -574,7 +583,8 @@ fn a_unilateral_close_is_swept_after_the_delay() {
     let funder_seed = [0x3cu8; 32];
     let acceptor_seed = [0x4du8; 32];
     let (wallet, chain) = setup(funder_seed);
-    let sweep = Hash256([0x5e; 32]);
+    // The funder force-closes and sweeps to its own payout address.
+    let sweep = FUNDER_PAYOUT;
     let dir = tmpdir("d2-sweep");
     let mut p = managers(
         funder_seed,
@@ -589,7 +599,7 @@ fn a_unilateral_close_is_swept_after_the_delay() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
@@ -661,7 +671,7 @@ fn a_manager_reloads_its_channels_on_restart() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
@@ -732,7 +742,7 @@ fn reestablish_recovers_a_dropped_update() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
@@ -752,16 +762,16 @@ fn reestablish_recovers_a_dropped_update() {
     // A second payment, but the acceptor's acknowledgement is dropped on the
     // wire: the two sides are now out of step.
     let upd = p.funder.pay(cid, 300_000).unwrap();
-    let dropped = p.acceptor.deliver(F_PEER, &upd);
+    let dropped = p.acceptor.deliver(F_PEER, "", &upd);
     assert_eq!(dropped.penalize, 0, "the update was well formed");
     assert!(!dropped.frames.is_empty(), "the acceptor produced an ack");
     // ... and we deliberately do not deliver it.
 
     // Reconnect: the node's handshake hook asks each side to resync.
-    for f in p.funder.on_peer_connected(A_PEER) {
+    for f in p.funder.on_peer_connected(A_PEER, "") {
         p.queue.push_back((1, f));
     }
-    for f in p.acceptor.on_peer_connected(F_PEER) {
+    for f in p.acceptor.on_peer_connected(F_PEER, "") {
         p.queue.push_back((0, f));
     }
     p.pump();
