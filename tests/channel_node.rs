@@ -13,7 +13,7 @@ use q21_core::address::Network;
 use q21_core::amount::Amount;
 use q21_core::chain::{genesis_block, Chain, GENESIS_TIME};
 use q21_core::channel::keys::{funding_key_seed, ChannelKey, Signer};
-use q21_core::channel::machine::channel_id;
+use q21_core::channel::machine::{channel_id, Phase};
 use q21_core::channel::manager::{ChannelManager, Hooks, CLOSE_FEE};
 use q21_core::consensus::{COINBASE_MATURITY, MIN_OUTPUT_VALUE, TARGET_BLOCK_SECS};
 use q21_core::hash::Hash256;
@@ -42,6 +42,9 @@ fn timestamp(height: u64) -> u64 {
 struct SharedChain {
     chain: Chain,
     miner: Hash256,
+    /// The transactions of the most recently connected block, as the node's
+    /// block hook would see them.
+    last_txs: Vec<Transaction>,
 }
 
 impl SharedChain {
@@ -53,9 +56,19 @@ impl SharedChain {
             .mine_block(self.miner, SchemeId::MlDsa87, txs, t, ATTEMPTS)
             .expect("mining");
         self.chain.connect(&b, t + 1).expect("connect");
+        self.last_txs = b.transactions.clone();
     }
     fn height(&self) -> u64 {
         self.chain.height()
+    }
+    /// The confirmation depth of an unspent outpoint (`1` in the tip), as the
+    /// node's depth oracle computes it.
+    fn depth_of(&self, op: &OutPoint) -> Option<u64> {
+        let h = self.chain.height();
+        self.chain
+            .utxo
+            .get(op)
+            .map(|e| h.saturating_sub(e.height).saturating_add(1))
     }
 }
 
@@ -78,7 +91,61 @@ fn setup(funder_seed: [u8; 32]) -> (Arc<Mutex<Wallet>>, Arc<Mutex<SharedChain>>)
     }
     (
         Arc::new(Mutex::new(w)),
-        Arc::new(Mutex::new(SharedChain { chain, miner })),
+        Arc::new(Mutex::new(SharedChain {
+            chain,
+            miner,
+            last_txs: Vec::new(),
+        })),
+    )
+}
+
+/// Drives one manager the way the node's block hook does: it hands the current
+/// tip's transactions, the chain height and a depth oracle to the manager, and
+/// returns the frames (peer, bytes) it wants sent. It settles the tip fully,
+/// looping while the manager's own broadcasts (a sweep, a penalty) grow the
+/// chain, so a transaction broadcast now is reacted to on the next pass.
+fn drive(mgr: &ChannelManager, chain: &Arc<Mutex<SharedChain>>) -> Vec<(u64, Vec<u8>)> {
+    let mut all = Vec::new();
+    loop {
+        let (txs, height) = {
+            let c = chain.lock().unwrap();
+            (c.last_txs.clone(), c.height())
+        };
+        let frames = {
+            let c = chain.clone();
+            let depth_of = move |op: &OutPoint| chain_depth(&c, op);
+            mgr.on_connected_block(&txs, height, &depth_of)
+        };
+        all.extend(frames);
+        // If the manager broadcast a transaction, the hook mined it and the tip
+        // moved; run again so the new tip is reacted to. Otherwise we are done.
+        if chain.lock().unwrap().height() == height {
+            break;
+        }
+    }
+    all
+}
+
+fn chain_depth(chain: &Arc<Mutex<SharedChain>>, op: &OutPoint) -> Option<u64> {
+    chain.lock().unwrap().depth_of(op)
+}
+
+/// Builds one manager (a funder's hooks) on `dir`, as a node would at startup.
+fn one_manager(
+    seed: [u8; 32],
+    wallet: Arc<Mutex<Wallet>>,
+    chain: Arc<Mutex<SharedChain>>,
+    dir: &std::path::Path,
+) -> ChannelManager {
+    std::fs::create_dir_all(dir).unwrap();
+    ChannelManager::new(
+        NET,
+        RATE,
+        seed,
+        dir.to_path_buf(),
+        DELAY,
+        DEPTH,
+        funder_hooks(wallet, chain),
     )
 }
 
@@ -431,4 +498,282 @@ fn reestablish_after_a_clean_reconnect_resends_nothing() {
     assert_eq!(fi.local_balance, ai.remote_balance);
     assert_eq!(fi.remote_balance, ai.local_balance);
     assert_eq!(fi.state_number, ai.state_number);
+}
+
+/// Sums the value of every ML-DSA-87 output paying `hash` in the UTXO set.
+fn paid_to(chain: &Arc<Mutex<SharedChain>>, hash: Hash256) -> u64 {
+    let c = chain.lock().unwrap();
+    c.chain
+        .utxo
+        .iter()
+        .filter(|(_, e)| e.output.scheme == SchemeId::MlDsa87 && e.output.pubkey_hash == hash)
+        .map(|(_, e)| e.output.value.units())
+        .sum()
+}
+
+/// D1: two real managers reach `open` purely because the node's block hook
+/// detected the funding buried to the agreed depth. No test code calls
+/// `funding_confirmed`; both sides detect their own depth independently.
+#[test]
+fn two_nodes_reach_open_through_the_block_hook() {
+    let funder_seed = [0x1au8; 32];
+    let acceptor_seed = [0x2bu8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("d1-open");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    // The funder sits in `Funded`, the acceptor in `Opening`; neither is open
+    // until the block hook confirms the funding.
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Funded);
+    assert_ne!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
+    assert!(p.acceptor.info(cid).unwrap().funding.is_some());
+
+    // Mine blocks over the funding; after each, the block hook drives both
+    // managers, which confirm their own funding and exchange `ready`.
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+        for (_, f) in drive(&p.funder, &chain) {
+            p.queue.push_back((1, f));
+        }
+        for (_, f) in drive(&p.acceptor, &chain) {
+            p.queue.push_back((0, f));
+        }
+        p.pump();
+    }
+    assert_eq!(
+        p.funder.info(cid).unwrap().phase,
+        Phase::Open,
+        "funder opened by the block hook"
+    );
+    assert_eq!(
+        p.acceptor.info(cid).unwrap().phase,
+        Phase::Open,
+        "acceptor opened by the block hook"
+    );
+}
+
+/// D2: a unilateral (force) close is swept through the node block hook, and the
+/// sweep is broadcast only after the to-self delay, then settles the channel.
+#[test]
+fn a_unilateral_close_is_swept_after_the_delay() {
+    let funder_seed = [0x3cu8; 32];
+    let acceptor_seed = [0x4du8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let sweep = Hash256([0x5e; 32]);
+    let dir = tmpdir("d2-sweep");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        sweep,
+        &dir,
+    );
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+
+    // The funder force-closes: its commitment is broadcast (mined) by the hook.
+    p.funder.force_close(cid).unwrap();
+    let hc = chain.lock().unwrap().height();
+    drive(&p.funder, &chain);
+    assert_eq!(
+        p.funder.info(cid).unwrap().phase,
+        Phase::Forcing,
+        "force close recorded"
+    );
+    assert_eq!(paid_to(&chain, sweep), 0, "nothing swept before the delay");
+
+    for _ in 0..DELAY {
+        assert!(
+            chain.lock().unwrap().height() < hc + DELAY as u64,
+            "still inside the delay window"
+        );
+        assert_eq!(
+            paid_to(&chain, sweep),
+            0,
+            "the sweep must wait out the delay"
+        );
+        chain.lock().unwrap().mine(&[]);
+        drive(&p.funder, &chain);
+    }
+    assert_eq!(
+        p.funder.info(cid).unwrap().phase,
+        Phase::Closed,
+        "the channel closed once the sweep confirmed"
+    );
+    assert!(
+        paid_to(&chain, sweep) >= MIN_OUTPUT_VALUE,
+        "the delayed sweep recovered the to_local output"
+    );
+}
+
+/// D7: a manager rebuilt on the same journal directory reloads its channels,
+/// with the same state and the watcher armed, instead of forgetting them.
+#[test]
+fn a_manager_reloads_its_channels_on_restart() {
+    let funder_seed = [0x5eu8; 32];
+    let acceptor_seed = [0x6fu8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("d7-reload");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    let pay = p.funder.pay(cid, 700_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+
+    let before = p.funder.info(cid).expect("channel is live");
+    let funding = before.funding.expect("funding known");
+
+    // Drop the funder's manager and build a fresh one on the same directory, as
+    // a restart would. The channel must come back with the same state.
+    drop(p);
+    let reloaded = one_manager(
+        funder_seed,
+        wallet.clone(),
+        chain.clone(),
+        &dir.join("funder"),
+    );
+    let after = reloaded.info(cid).expect("channel reloaded");
+    assert_eq!(after.phase, before.phase, "phase survived the restart");
+    assert_eq!(
+        after.local_balance, before.local_balance,
+        "balance survived"
+    );
+    assert_eq!(after.remote_balance, before.remote_balance);
+    assert_eq!(
+        after.state_number, before.state_number,
+        "state number survived"
+    );
+    assert_eq!(after.capacity, before.capacity);
+    assert!(
+        reloaded
+            .watched_funding()
+            .iter()
+            .any(|(_, o)| *o == funding),
+        "the watcher is armed on the reloaded channel"
+    );
+}
+
+/// D3: after a message is dropped mid-update, a reconnect (the node's
+/// handshake hook calling `on_peer_connected`) resyncs both sides to the same
+/// state through the engine's reestablish.
+#[test]
+fn reestablish_recovers_a_dropped_update() {
+    let funder_seed = [0x7au8; 32];
+    let acceptor_seed = [0x8bu8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("d3-reest");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    // One completed payment so there is a settled state to build on.
+    let m = p.funder.pay(cid, 500_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+
+    // A second payment, but the acceptor's acknowledgement is dropped on the
+    // wire: the two sides are now out of step.
+    let upd = p.funder.pay(cid, 300_000).unwrap();
+    let dropped = p.acceptor.deliver(F_PEER, &upd);
+    assert_eq!(dropped.penalize, 0, "the update was well formed");
+    assert!(!dropped.frames.is_empty(), "the acceptor produced an ack");
+    // ... and we deliberately do not deliver it.
+
+    // Reconnect: the node's handshake hook asks each side to resync.
+    for f in p.funder.on_peer_connected(A_PEER) {
+        p.queue.push_back((1, f));
+    }
+    for f in p.acceptor.on_peer_connected(F_PEER) {
+        p.queue.push_back((0, f));
+    }
+    p.pump();
+
+    let fi = p.funder.info(cid).unwrap();
+    let ai = p.acceptor.info(cid).unwrap();
+    assert_eq!(fi.state_number, ai.state_number, "both at the same state");
+    assert_eq!(fi.local_balance, ai.remote_balance, "balances agree");
+    assert_eq!(fi.remote_balance, ai.local_balance);
+    assert_eq!(
+        fi.local_balance,
+        capacity - 800_000,
+        "the dropped payment completed after reestablish"
+    );
 }

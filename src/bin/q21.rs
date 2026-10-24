@@ -5367,6 +5367,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 },
             ));
             node.set_channel_sink(mgr.clone());
+            // Channels reloaded from the journal may already be funded to depth
+            // (the funding confirmed while this node was down): confirm them now
+            // so they open without waiting for the next block.
+            node.rescan_channels();
             Some(mgr)
         } else {
             None
@@ -5934,6 +5938,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                         }
                     }
                     node.announce_block(&b);
+                    // This block connected on the mining path, not through
+                    // `integrate`: hand its transactions to the channel
+                    // component so a channel funded or closing here advances.
+                    node.note_local_block_for_channels(&b);
+                    node.scan_connected_blocks_for_channels();
                 }
             }
         } else {

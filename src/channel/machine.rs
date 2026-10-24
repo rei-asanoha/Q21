@@ -1146,6 +1146,36 @@ impl Machine {
         Ok(tx)
     }
 
+    /// Records that a commitment is on chain and the channel is force-closing.
+    /// Idempotent: a channel already in [`Phase::Forcing`] stays put. Used by
+    /// the manager when it first sees a commitment spend the funding output.
+    pub fn mark_forcing(&mut self) -> Result<(), ChannelError> {
+        if self.phase != Phase::Forcing {
+            self.journal.append(&Record::Forcing)?;
+            self.phase = Phase::Forcing;
+        }
+        Ok(())
+    }
+
+    /// Records that we punished a revoked broadcast; moves to
+    /// [`Phase::Penalised`].
+    pub fn mark_penalised(&mut self) -> Result<(), ChannelError> {
+        if self.phase != Phase::Penalised {
+            self.journal.append(&Record::Penalised)?;
+            self.phase = Phase::Penalised;
+        }
+        Ok(())
+    }
+
+    /// Records that the channel is settled on chain; moves to [`Phase::Closed`].
+    pub fn mark_closed(&mut self) -> Result<(), ChannelError> {
+        if self.phase != Phase::Closed {
+            self.journal.append(&Record::Closed)?;
+            self.phase = Phase::Closed;
+        }
+        Ok(())
+    }
+
     /// Builds (and keeps private) a commitment at `n` for `tier` at the
     /// balances we signed it at, for use in tests of a revoked broadcast.
     pub fn signed_commitment_at(&self, n: u64, tier: FeeTier) -> Result<Transaction, ChannelError> {

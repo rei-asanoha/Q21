@@ -1039,10 +1039,28 @@ struct Outgoing {
 pub trait ChannelSink: Send + Sync {
     fn deliver(&self, peer: u64, bytes: &[u8]) -> ChannelOutcome;
 
-    /// Called with a connected block's transactions, off the chain lock, so the
-    /// channel watcher can detect a spend of a funding output and react. The
-    /// default does nothing.
-    fn on_block(&self, _txs: &[crate::tx::Transaction]) {}
+    /// Called after each connected block, off the chain lock, with the block's
+    /// transactions, the new chain `height`, and a `depth_of` oracle giving the
+    /// confirmation depth (`1` in the tip) of an unspent outpoint or `None` once
+    /// it is spent or absent. The component detects funding spends, confirms a
+    /// buried funding, schedules delayed sweeps and settles closes, and returns
+    /// the frames to send, each paired with its destination peer. The default
+    /// does nothing.
+    fn on_connected_block(
+        &self,
+        _txs: &[crate::tx::Transaction],
+        _height: u64,
+        _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        Vec::new()
+    }
+
+    /// Called when a channel-capable peer completes the handshake, off the chain
+    /// lock. Returns the frames to send it — the reestablish of every channel we
+    /// hold with it. The default does nothing.
+    fn on_peer_connected(&self, _peer: u64) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
 
 /// The result of handing a channel message to the [`ChannelSink`].
@@ -1052,6 +1070,23 @@ pub struct ChannelOutcome {
     pub replies: Vec<Vec<u8>>,
     /// Misconduct points for a malformed or unsolicited message; zero is none.
     pub penalize: u32,
+}
+
+/// A connected peer, as the RPC `getpeers` reports it.
+#[derive(Clone, Debug)]
+pub struct PeerInfo {
+    /// The stable connection id, the one `channelopen`/`send_channel` take.
+    pub id: u64,
+    /// The peer's address (or, behind a proxy, the label it is filed under).
+    pub address: String,
+    /// True if this node dialed the peer.
+    pub outbound: bool,
+    /// True once `Version` then `VerAck` have both been exchanged.
+    pub handshake_complete: bool,
+    /// True if the peer advertised the payment-channel capability.
+    pub supports_channels: bool,
+    /// The height the peer announced at the handshake.
+    pub height: u64,
 }
 
 #[derive(Clone)]
@@ -1246,8 +1281,72 @@ impl Node {
             std::mem::take(&mut g.channel_scan)
         };
         if !txs.is_empty() {
-            sink.on_block(&txs);
+            self.drive_channels(&sink, &txs);
         }
+    }
+
+    /// Queues a locally connected block's transactions for the channel scan.
+    /// A block received from a peer is queued inside `integrate`; one this node
+    /// mines connects on another path, so the miner announces it here too, or
+    /// its own channels would never see their funding confirm.
+    pub fn note_local_block_for_channels(&self, b: &Block) {
+        let mut g = self.shared.lock().unwrap();
+        if g.channels_active {
+            g.channel_scan.extend(b.transactions.iter().cloned());
+        }
+    }
+
+    /// Drives the channel component once against the current chain state with no
+    /// newly connected block — used at startup, so a funding that was already
+    /// buried while the node was down is confirmed and its channel opens.
+    pub fn rescan_channels(&self) {
+        let sink = self
+            .channel_sink
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned());
+        if let Some(sink) = sink {
+            self.drive_channels(&sink, &[]);
+        }
+    }
+
+    /// Hands a connected block (or nothing, at startup) to the channel
+    /// component with the chain height and a depth oracle, then sends the frames
+    /// it returns. Off the chain lock, so the component may sign and broadcast.
+    fn drive_channels(&self, sink: &Arc<dyn ChannelSink>, txs: &[crate::tx::Transaction]) {
+        let height = self.shared.lock().unwrap().chain.height();
+        let depth_of = |op: &crate::tx::OutPoint| -> Option<u64> {
+            let g = self.shared.lock().unwrap();
+            g.chain
+                .utxo
+                .get(op)
+                .map(|e| height.saturating_sub(e.height).saturating_add(1))
+        };
+        let frames = sink.on_connected_block(txs, height, &depth_of);
+        for (peer, frame) in frames {
+            self.send_channel(peer, frame);
+        }
+    }
+
+    /// A stable, sorted view of every connected peer, for the RPC. The `id` is
+    /// the one [`Node::send_channel`] and `channelopen` take: it is fixed for
+    /// the life of the connection, so an agent can read it here and name it.
+    pub fn peer_list(&self) -> Vec<PeerInfo> {
+        let g = self.shared.lock().unwrap();
+        let mut v: Vec<PeerInfo> = g
+            .peers
+            .iter()
+            .map(|(id, p)| PeerInfo {
+                id: *id,
+                address: p.addr.to_string(),
+                outbound: p.outbound,
+                handshake_complete: p.handshaked,
+                supports_channels: p.channels,
+                height: p.start_height,
+            })
+            .collect();
+        v.sort_by_key(|p| p.id);
+        v
     }
 
     /// The peers that advertised the channel capability, by id.
@@ -2216,6 +2315,10 @@ impl Node {
         // cryptography), and a misconduct score for an unsolicited one.
         let mut channel_in: Option<Vec<u8>> = None;
         let mut channel_penalty: u32 = 0;
+        // Set when this message completes the handshake with a channel-capable
+        // peer: once the lock is released, the channel component is asked to
+        // resync (reestablish) every channel it holds with that peer.
+        let mut channel_peer_ready = false;
 
         // The work of a block or of an announcement is checked before the lock.
         match &msg {
@@ -2349,6 +2452,7 @@ impl Node {
                             // (connection to oneself) is not bypassed.
                             Some(p) if p.version_received => {
                                 p.handshaked = true;
+                                channel_peer_ready = p.channels;
                                 (p.start_height > height, g.chain.locator())
                             }
                             _ => (false, Vec::new()),
@@ -3386,6 +3490,20 @@ impl Node {
                         peer: id,
                         message: Message::Channel(payload),
                     });
+                }
+            }
+        }
+        // A channel-capable peer that just finished the handshake is resynced:
+        // we send it the reestablish of every channel we hold with it.
+        if channel_peer_ready {
+            let sink = self
+                .channel_sink
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().cloned());
+            if let Some(sink) = sink {
+                for frame in sink.on_peer_connected(id) {
+                    self.send_channel(id, frame);
                 }
             }
         }
@@ -5081,9 +5199,15 @@ mod tests_hardening {
         fn deliver(&self, _peer: u64, _bytes: &[u8]) -> ChannelOutcome {
             ChannelOutcome::default()
         }
-        fn on_block(&self, txs: &[crate::tx::Transaction]) {
+        fn on_connected_block(
+            &self,
+            txs: &[crate::tx::Transaction],
+            _height: u64,
+            _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+        ) -> Vec<(u64, Vec<u8>)> {
             self.blocks.fetch_add(1, Ordering::SeqCst);
             self.txs.fetch_add(txs.len() as u64, Ordering::SeqCst);
+            Vec::new()
         }
     }
 
