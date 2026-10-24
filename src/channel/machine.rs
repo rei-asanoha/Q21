@@ -41,7 +41,7 @@ use crate::channel::journal::{Balances, Journal, Record};
 use crate::channel::keys::{Signer, CHANNEL_SCHEME};
 use crate::channel::messages::{Message, Revocation, TierSigs};
 use crate::channel::txbuild::{self, ChannelParams, Commitment, FeeTier, ACCEPTOR, FUNDER};
-use crate::channel::watcher::Watch;
+use crate::channel::watcher::{OutputRef, Watch};
 use crate::hash::{tagged_hash_parts, Hash256};
 use crate::sha256::sha256;
 use crate::shachain;
@@ -1285,6 +1285,98 @@ impl Machine {
 /// Broadcast-time transaction builders driven by a [`Watch`] decision. These
 /// hold a key, so they live on the machine rather than in the watcher.
 impl Machine {
+    /// Classifies a spend of the funding output robustly, including a commitment
+    /// with a single `to_local` output and no `to_remote` — the shape that
+    /// defeats the output-count heuristic and let a revoked single-output
+    /// broadcast go unpunished.
+    ///
+    /// The `to_local` output pays a *policy*, whose lock hash is independent of
+    /// its value, so we rebuild the policy for each hypothesis (the peer's
+    /// revoked state, our own state, the peer's announced latest) and match it
+    /// against the output. Only the trimmed-`to_local` shapes (the holder's own
+    /// balance was dust, leaving a lone `to_remote`) fall through to the
+    /// output-count heuristic [`crate::channel::watcher::classify`].
+    pub fn identify_spend(&self, tx: &Transaction) -> Watch {
+        let Some(funding) = self.funding_outpoint else {
+            return Watch::NotOurChannel;
+        };
+        if tx.inputs.first().map(|i| i.prev_out) != Some(funding) {
+            return Watch::NotOurChannel;
+        }
+        let n = self.params.state_of(tx);
+        let txid = tx.txid();
+        let our = self.our_index;
+        let peer = 1 - our;
+        let policy_out = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, o)| o.scheme == crate::sig::SchemeId::Policy)
+            .map(|(i, o)| (i as u32, *o));
+
+        if let Some((idx, out)) = policy_out {
+            let matches = |holder: usize, point: Hash256| {
+                out.pubkey_hash == self.params.to_local_policy(holder, point).lock_hash()
+            };
+            let as_ref = OutputRef {
+                outpoint: OutPoint { txid, index: idx },
+                output: out,
+            };
+            // The peer's revoked commitment: we hold its secret for state `n`,
+            // so the to_local point is the hash of that secret.
+            if let Some(secret) = self.store.get(shachain::MAX_INDEX - n) {
+                if matches(peer, Hash256(sha256(&secret))) {
+                    return Watch::RevokedByPeer {
+                        state: n,
+                        to_local: as_ref,
+                        revocation_secret: secret,
+                    };
+                }
+            }
+            // Our own commitment at state `n`.
+            if matches(our, self.our_point(n)) {
+                return Watch::OurCommitment {
+                    state: n,
+                    to_local: Some(as_ref),
+                    delay: self.params.delay,
+                };
+            }
+            // The peer's latest commitment (point announced, not revealed).
+            if let Some(pt) = self.their_points.get(&n).copied() {
+                if matches(peer, pt) {
+                    let to_remote = self.find_our_output(tx, txid);
+                    return Watch::PeerLatest {
+                        state: n,
+                        to_remote,
+                    };
+                }
+            }
+        }
+        // No matchable to_local (trimmed to dust): the remaining shapes carry a
+        // to_remote key output, which the output-count heuristic reads.
+        let ctx = crate::channel::watcher::WatchContext {
+            params: &self.params,
+            our_index: our,
+            store: &self.store,
+            latest_state: self.local_commit_number.unwrap_or(0),
+        };
+        crate::channel::watcher::classify(&ctx, funding, tx)
+    }
+
+    /// A key output paying our own funding key (a `to_remote` that is ours).
+    fn find_our_output(&self, tx: &Transaction, txid: Hash256) -> Option<OutputRef> {
+        let ours = self.params.funding[self.our_index];
+        tx.outputs.iter().enumerate().find_map(|(i, o)| {
+            (o.scheme == CHANNEL_SCHEME && o.pubkey_hash == ours).then_some(OutputRef {
+                outpoint: OutPoint {
+                    txid,
+                    index: i as u32,
+                },
+                output: *o,
+            })
+        })
+    }
+
     /// Builds the signed penalty transaction that sweeps the counterparty's
     /// revoked `to_local` output to `sweep_to`, paying `fee`.
     pub fn build_penalty(

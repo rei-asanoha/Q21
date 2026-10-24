@@ -26,7 +26,7 @@ use crate::address::Network;
 use crate::channel::keys::{funding_key_seed, ChannelKey, Signer, CHANNEL_SCHEME};
 use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
 use crate::channel::messages::Message as ChMsg;
-use crate::channel::watcher::{classify, OutputRef, Watch, WatchContext};
+use crate::channel::watcher::{OutputRef, Watch};
 use crate::hash::Hash256;
 use crate::ser::{Reader, Writer};
 use crate::sig;
@@ -993,15 +993,10 @@ impl ChannelManager {
     }
 }
 
-/// Classifies a funding-output spend for `chan`.
-fn classify_spend(chan: &Chan, funding: OutPoint, tx: &Transaction) -> Watch {
-    let ctx = WatchContext {
-        params: chan.machine.params(),
-        our_index: chan.machine.our_index(),
-        store: chan.machine.revocation_store(),
-        latest_state: chan.machine.local_commit_number().unwrap_or(0),
-    };
-    classify(&ctx, funding, tx)
+/// Classifies a funding-output spend for `chan`, robust to the single-output
+/// commitment shape (see [`Machine::identify_spend`]).
+fn classify_spend(chan: &Chan, _funding: OutPoint, tx: &Transaction) -> Watch {
+    chan.machine.identify_spend(tx)
 }
 
 fn summary(c: &Chan) -> ChannelSummary {
