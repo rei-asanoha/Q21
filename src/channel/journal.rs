@@ -99,6 +99,10 @@ pub enum Record {
     /// it the close can be rebuilt and broadcast again until it confirms, after
     /// a crash that lost it from the mempool.
     CloseSigned { fee: u64, signature: Vec<u8> },
+    /// Both sides proposed `state` at once. The peer's proposal follows as our
+    /// LocalCommit at that state; neither becomes the channel's state: both
+    /// are merged into the next one (see [`crate::channel::machine`]).
+    Crossed { state: u64 },
 }
 
 const R_OPENED: u8 = 1;
@@ -116,6 +120,7 @@ const R_THEIR_POINT: u8 = 12;
 const R_REVOCATIONS: u8 = 13;
 const R_CONFIRMED: u8 = 14;
 const R_CLOSE_SIGNED: u8 = 15;
+const R_CROSSED: u8 = 16;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -206,6 +211,9 @@ impl Record {
             Record::CloseSigned { fee, signature } => {
                 w.u8(R_CLOSE_SIGNED).u64(*fee).var_bytes(signature);
             }
+            Record::Crossed { state } => {
+                w.u8(R_CROSSED).u64(*state);
+            }
         }
         w.finish()
     }
@@ -284,6 +292,7 @@ impl Record {
                 Record::Revocations { state, entries }
             }
             R_CONFIRMED => Record::Confirmed { height: r.u64()? },
+            R_CROSSED => Record::Crossed { state: r.u64()? },
             R_CLOSE_SIGNED => Record::CloseSigned {
                 fee: r.u64()?,
                 signature: r.var_bytes()?.to_vec(),

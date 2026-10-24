@@ -35,6 +35,18 @@
 //! sides' persisted counters and resends exactly the one in-flight message
 //! that did not land. The handlers are idempotent, so a resend that did land
 //! changes nothing.
+//!
+//! # Crossed proposals
+//!
+//! When both sides propose the same state `n` at once, each has signed the
+//! other's commitment `n` at its own proposal. Neither proposal may become
+//! state `n`: the other side would keep a signature over a different, for it
+//! better, commitment at the same index, enforceable until the index is
+//! revoked. Instead both are merged into `n + 1` ([`Machine::on_crossed_update`]):
+//! each side takes the peer's proposal as its commitment `n` and reveals the
+//! secret of `n - 1`; the side holding the initiative then proposes `n + 1`
+//! with both payments, and completing it reveals both secrets of `n`, which
+//! revokes every commitment at that index whatever its balances.
 
 use crate::address::Network;
 use crate::channel::journal::{Balances, Journal, Record};
@@ -114,6 +126,15 @@ impl Drop for Machine {
     fn drop(&mut self) {
         crate::kdf::wipe(&mut self.revocation_seed);
     }
+}
+
+/// `base` plus the payments of both proposals over it, or `None` on overflow.
+fn merge(base: Balances, ours: Balances, theirs: Balances) -> Option<Balances> {
+    let mut out = [0u64; 2];
+    for i in 0..2 {
+        out[i] = ours[i].checked_add(theirs[i])?.checked_sub(base[i])?;
+    }
+    Some(out)
 }
 
 /// Keeps only the `keep` highest states of a per-state map.
@@ -207,6 +228,9 @@ pub struct Machine {
     /// was lost with the old link and comes again; until it lands, a proposal
     /// of ours would cross it. Not journaled: every reestablish sets it anew.
     peer_proposal: Option<u64>,
+    /// A state both sides proposed at once (see "Crossed proposals" in the
+    /// module documentation). Set until the merged state above it settles.
+    crossed: Option<u64>,
 }
 
 /// Reestablish nonces remembered per channel. One is accepted per reconnection;
@@ -397,6 +421,7 @@ impl Machine {
             base_fee_rate,
             seen_nonces: VecDeque::new(),
             peer_proposal: None,
+            crossed: None,
         })
     }
 
@@ -708,8 +733,16 @@ impl Machine {
         // side is trying to drain us — reject it before we persist the drained
         // commitment or reveal any revocation secret. (We countersign and
         // reveal only after this guard; nothing is journaled above.)
+        //
+        // After crossed proposals at `n - 1`, the state above them is the merge
+        // of both, and nothing else: the side holding the initiative proposes
+        // it, the other accepts exactly that.
         let us = self.our_index;
-        if balances[us] < self.current_balances()[us] {
+        if self.crossed.is_some() && self.crossed == self.local_commit_number {
+            if Some(*balances) != self.merged_balances() {
+                return Err(ChannelError::BadBalances);
+            }
+        } else if balances[us] < self.current_balances()[us] {
             return Err(ChannelError::WrongDirection);
         }
         // INV2: persist the counterparty's signature over our commitment `n`
@@ -974,6 +1007,11 @@ impl Machine {
             out.extend(first);
             out.extend(second);
         }
+        if let Some(c) = self.crossed {
+            if Some(c) >= self.local_commit_number {
+                out.push(Record::Crossed { state: c });
+            }
+        }
         if let Some(m) = self.revocations_sent {
             out.push(Record::RevocationSent { state: m });
         }
@@ -1070,7 +1108,7 @@ impl Machine {
             .map(|(n, b)| (*n, *b))
             .collect();
         let text = format!(
-            "{:?} {:?} L{:?} R{:?} S{:?} V{:?} lc{:?} rb{:?} in{:?} tp{:?} st{:?} cf{:?} cs{} ps{:?} fh{:?}",
+            "{:?} {:?} L{:?} R{:?} S{:?} V{:?} lc{:?} rb{:?} in{:?} tp{:?} st{:?} cf{:?} cs{} ps{:?} fh{:?} cr{:?}",
             self.phase,
             self.funding_outpoint,
             self.local_commit_number,
@@ -1086,6 +1124,7 @@ impl Machine {
             self.close_signed,
             self.close_peer_sig,
             self.funding_height,
+            self.crossed,
         );
         format!(
             "{:?} L{:?} R{:?} {}",
@@ -1392,6 +1431,7 @@ impl Machine {
             base_fee_rate,
             seen_nonces: VecDeque::new(),
             peer_proposal: None,
+            crossed: None,
         };
         m.replay(&records);
         m.compact_if_long()?;
@@ -1451,6 +1491,7 @@ impl Machine {
                 Record::Penalised => self.phase = Phase::Penalised,
                 Record::Closed => self.phase = Phase::Closed,
                 Record::Confirmed { height } => self.funding_height = Some(*height),
+                Record::Crossed { state } => self.crossed = Some(*state),
                 Record::CloseSigned { fee, signature } => {
                     self.close_fee = Some(*fee);
                     self.close_peer_sig = Some(signature.clone());
@@ -1596,6 +1637,10 @@ impl Machine {
             }
         }
 
+        // Crossed proposals whose revocations are both in: the merge above
+        // them, if ours to propose and not proposed yet.
+        out.extend(self.merge_if_ready()?);
+
         // A cooperative close we agreed to is sent again: its Close may have
         // been lost, and the handlers are idempotent if it was not. Not while
         // an update still settles: both sides must sign the same balances, so
@@ -1623,6 +1668,10 @@ impl Machine {
         if self.peer_proposal.is_some_and(|p| l < p) {
             return true;
         }
+        // Crossed proposals at `l`: in flight until their merge above settles.
+        if self.crossed == Some(l) {
+            return true;
+        }
         if self.remote_commit_number != Some(l) {
             return true;
         }
@@ -1631,16 +1680,145 @@ impl Machine {
 
     /// Whether `msg` is the peer's [`Message::Update`] for the very state we
     /// proposed and it has not acknowledged: both ends paid at the same
-    /// moment. An honest race on the wire, not misconduct. Neither proposal is
-    /// taken over the other here: each side has already signed its own.
+    /// moment. An honest race on the wire, not misconduct.
     pub fn crosses_our_proposal(&self, msg: &Message) -> bool {
         let Message::Update { state, .. } = msg else {
             return false;
         };
         matches!(self.phase, Phase::Open | Phase::Closing)
+            && *state >= 1
             && self.remote_commit_number == Some(*state)
-            && self.local_commit_number < Some(*state)
+            && self.local_commit_number == Some(*state - 1)
             && self.initiated.get(state) == Some(&true)
+    }
+
+    /// Handles a peer's [`Message::Update`], whatever its relation to our own
+    /// proposals: an ordinary update is acknowledged ([`Machine::on_update`]),
+    /// one that crosses ours starts their merge ([`Machine::on_crossed_update`]),
+    /// and a crossed proposal already taken is a resend with nothing to answer.
+    pub fn on_peer_update(&mut self, msg: &Message) -> Result<Vec<Message>, ChannelError> {
+        let Message::Update { state, .. } = msg else {
+            return Err(ChannelError::Unexpected);
+        };
+        if self.crossed == Some(*state) && self.local_commit_number >= Some(*state) {
+            return Ok(Vec::new());
+        }
+        if self.crosses_our_proposal(msg) {
+            return self.on_crossed_update(msg);
+        }
+        Ok(vec![self.on_update(msg)?])
+    }
+
+    /// Both sides proposed state `n` at once: each signed the other's
+    /// commitment `n` at its own proposal. Taking either proposal as state `n`
+    /// would be unsafe: the other side keeps a signature over a different,
+    /// for it better, commitment at the same index, enforceable until that
+    /// index is revoked, so a payment both believe settled could be undone.
+    ///
+    /// So neither is taken. Each side journals the peer's proposal as its
+    /// commitment `n` (it can enforce it: that is the peer's own payment to
+    /// it), which lets it reveal the secret of `n - 1` now (INV1) and so
+    /// announce the point of `n + 1`; it sends that revocation as a `Revoke`
+    /// for `n`. Once both revocations are in, the side holding the initiative
+    /// proposes `n + 1` at the merge of both proposals — both payments — and
+    /// the ordinary update completes it, each side revealing the secret of
+    /// `n`. That revokes every commitment either side holds at index `n`,
+    /// whatever its balances, since a per-commitment point belongs to an
+    /// index. Until then the channel is in flight, as for any update, and the
+    /// most either side can enforce is the peer's own payment to it.
+    pub fn on_crossed_update(&mut self, msg: &Message) -> Result<Vec<Message>, ChannelError> {
+        let Message::Update {
+            state,
+            balances,
+            tier_sigs,
+        } = msg
+        else {
+            return Err(ChannelError::Unexpected);
+        };
+        if !self.crosses_our_proposal(msg) {
+            return Err(ChannelError::Unexpected);
+        }
+        let n = *state;
+        self.check_balances(*balances)?;
+        // C1, against the last settled state: the peer's proposal is a payment
+        // to us.
+        let base = self.settled_balances(n - 1)?;
+        let us = self.our_index;
+        if balances[us] < base[us] {
+            return Err(ChannelError::WrongDirection);
+        }
+        // The merge must be a valid state too.
+        let ours = *self
+            .remote_balances
+            .get(&n)
+            .ok_or(ChannelError::Invariant("missing our proposal"))?;
+        merge(base, ours, *balances)
+            .filter(|m| self.check_balances(*m).is_ok())
+            .ok_or(ChannelError::BadBalances)?;
+        self.verify_our_commitment(n, *balances, tier_sigs)?;
+        if self.crossed != Some(n) {
+            self.journal.append(&Record::Crossed { state: n })?;
+            self.crossed = Some(n);
+        }
+        // INV2, then INV1: the peer's signature is persisted before we reveal
+        // the secret of `n - 1`.
+        self.persist_local_commit(n, *balances, tier_sigs.clone(), true)?;
+        let revocation = self.make_revocation(n - 1)?;
+        self.persist_revocation_sent(n - 1)?;
+        let mut out = vec![Message::Revoke {
+            state: n,
+            revocation,
+        }];
+        out.extend(self.merge_if_ready()?);
+        Ok(out)
+    }
+
+    /// The balances of a settled state `m`, as our commitment holds them.
+    fn settled_balances(&self, m: u64) -> Result<Balances, ChannelError> {
+        self.local_commits
+            .get(&m)
+            .map(|(b, _)| *b)
+            .ok_or(ChannelError::Invariant("missing settled commitment"))
+    }
+
+    /// The merge of the two proposals crossed at the current state: the
+    /// settled state below plus both payments.
+    fn merged_balances(&self) -> Option<Balances> {
+        let n = self.crossed?;
+        let base = self.settled_balances(n.checked_sub(1)?).ok()?;
+        let ours = *self.remote_balances.get(&n)?;
+        let theirs = self.local_commits.get(&n)?.0;
+        merge(base, ours, theirs)
+    }
+
+    /// After crossed proposals at `n`, once both sides have revealed the
+    /// secret of `n - 1`, the side holding the initiative proposes their merge
+    /// as `n + 1`. Returns that `Update`, or nothing if it is not yet time or
+    /// not ours to send.
+    pub fn merge_if_ready(&mut self) -> Result<Option<Message>, ChannelError> {
+        let Some(n) = self.crossed else {
+            return Ok(None);
+        };
+        let ready = self.local_commit_number == Some(n)
+            && self.remote_commit_number == Some(n)
+            && self.revocations_sent >= Some(n - 1)
+            && self.revocations_recv >= Some(n - 1)
+            && self.has_initiative()
+            && matches!(self.phase, Phase::Open | Phase::Closing);
+        if !ready {
+            return Ok(None);
+        }
+        let merged = self
+            .merged_balances()
+            .ok_or(ChannelError::Invariant("crossed proposals do not merge"))?;
+        self.check_balances(merged)?;
+        let tier_sigs = self.sign_their_commitment(n + 1, merged)?;
+        self.persist_remote_commit(n + 1, merged)?;
+        Ok(Some(Message::Update {
+            state: n + 1,
+            balances: merged,
+            tier_sigs,
+        }))
     }
 
     /// Whether `tx` is the cooperative close of this channel at its current

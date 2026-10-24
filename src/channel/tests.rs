@@ -1480,21 +1480,29 @@ fn deliver_all(
             To::F => (&mut *f, To::A),
             To::A => (&mut *a, To::F),
         };
-        let reply = match &m {
-            Message::Update { .. } => Some(me.on_update(&m)),
-            Message::Ack { .. } => Some(me.on_ack(&m)),
-            Message::Revoke { .. } => me.on_revoke(&m).map(|_| None).transpose(),
-            Message::Close { .. } => Some(me.on_close(&m)),
-            Message::CloseSigned { .. } => me.on_close_signed(&m).map(|_| None).transpose(),
-            other => return Err(format!("unexpected resend {}", kind(other))),
-        };
-        match reply {
-            Some(Ok(r)) => queue.push_back((back, r)),
-            Some(Err(e)) => return Err(format!("{to:?} refused {}: {e:?}", kind(&m))),
-            None => {}
+        match handle(me, &m) {
+            Ok(replies) => queue.extend(replies.into_iter().map(|r| (back, r))),
+            Err(e) => return Err(format!("{to:?} refused {}: {e}", kind(&m))),
         }
     }
     Ok(())
+}
+
+/// What a node does with one channel message, as the manager dispatches it:
+/// the replies to send back.
+fn handle(me: &mut Machine, m: &Message) -> Result<Vec<Message>, String> {
+    let e = |e: ChannelError| format!("{e:?}");
+    match m {
+        Message::Update { .. } => me.on_peer_update(m).map_err(e),
+        Message::Ack { .. } => me.on_ack(m).map(|r| vec![r]).map_err(e),
+        Message::Revoke { .. } => {
+            me.on_revoke(m).map_err(e)?;
+            Ok(me.merge_if_ready().map_err(e)?.into_iter().collect())
+        }
+        Message::Close { .. } => me.on_close(m).map(|r| vec![r]).map_err(e),
+        Message::CloseSigned { .. } => me.on_close_signed(m).map(|_| Vec::new()).map_err(e),
+        other => Err(format!("unexpected message {}", kind(other))),
+    }
 }
 
 /// Reconnects two machines: each verifies the other's reestablish, and what
@@ -1980,4 +1988,298 @@ fn a_signed_close_survives_a_restart() {
     let f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
     assert_eq!(f.phase(), Phase::Closing);
     assert_eq!(f.signed_cooperative_close(), Some(tx));
+}
+
+// --- Crossed proposals: both sides pay at the same moment ---------------------
+
+/// The settled state the crossing tests start from (state 2).
+const X_BASE: [u64; 2] = [CAP - 1_500_000, 1_500_000];
+const X_F_PAYS: u64 = 300_000;
+const X_A_PAYS: u64 = 100_000;
+/// Both payments, merged into state 4.
+const X_MERGED: [u64; 2] = [
+    CAP - 1_500_000 - X_F_PAYS + X_A_PAYS,
+    1_500_000 + X_F_PAYS - X_A_PAYS,
+];
+
+type Queue = std::collections::VecDeque<Message>;
+
+/// A channel at state 2 where both sides have just proposed state 3, each
+/// proposal on its way to the other.
+fn crossed_pair() -> (PathBuf, Machine, Machine, Queue, Queue) {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    pay(&mut a, &mut f, X_BASE);
+    let uf = f
+        .propose([X_BASE[0] - X_F_PAYS, X_BASE[1] + X_F_PAYS])
+        .unwrap();
+    let ua = a
+        .propose([X_BASE[0] + X_A_PAYS, X_BASE[1] - X_A_PAYS])
+        .unwrap();
+    (dir, f, a, Queue::from(vec![ua]), Queue::from(vec![uf]))
+}
+
+/// Delivers the next message queued for `who` and queues its replies for the
+/// other side.
+fn deliver_one(
+    who: To,
+    f: &mut Machine,
+    a: &mut Machine,
+    to_f: &mut Queue,
+    to_a: &mut Queue,
+) -> Result<(), String> {
+    let (me, inbox, outbox) = match who {
+        To::F => (f, to_f, to_a),
+        To::A => (a, to_a, to_f),
+    };
+    let m = inbox.pop_front().expect("a queued message");
+    let replies = handle(me, &m).map_err(|e| format!("{who:?} refused {}: {e}", kind(&m)))?;
+    outbox.extend(replies);
+    Ok(())
+}
+
+/// Runs one schedule of the crossing: at each step where both sides have a
+/// message waiting, `choices` (then `false`) picks who receives first (`true`:
+/// the acceptor). With `crash = Some((k, side))`, `side` is killed before step
+/// `k`: it reopens from its journal, both links' messages in flight are lost,
+/// and the two reconnect. Returns every choice made, then checks the outcome:
+/// both payments merged, state 4 on both sides, every commitment either holds
+/// at the crossed state 3 revoked, payments both ways and a cooperative close
+/// still working.
+fn run_crossing(choices: &[bool], crash: Option<(usize, To)>) -> Result<Vec<bool>, String> {
+    let (dir, mut f, mut a, mut to_f, mut to_a) = crossed_pair();
+    let mut decisions = Vec::new();
+    let mut step = 0usize;
+    loop {
+        if let Some((k, side)) = crash {
+            if k == step {
+                to_f.clear();
+                to_a.clear();
+                match side {
+                    To::F => {
+                        drop(f);
+                        f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+                    }
+                    To::A => {
+                        drop(a);
+                        a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+                    }
+                }
+                let rf = f.reestablish().unwrap();
+                let ra = a.reestablish().unwrap();
+                to_f.extend(a.on_reestablish(&rf).map_err(|e| format!("{e:?}"))?);
+                to_a.extend(f.on_reestablish(&ra).map_err(|e| format!("{e:?}"))?);
+            }
+        }
+        let who = match (to_f.is_empty(), to_a.is_empty()) {
+            (true, true) => break,
+            (false, true) => To::F,
+            (true, false) => To::A,
+            (false, false) => {
+                let d = choices.get(decisions.len()).copied().unwrap_or(false);
+                decisions.push(d);
+                if d {
+                    To::A
+                } else {
+                    To::F
+                }
+            }
+        };
+        deliver_one(who, &mut f, &mut a, &mut to_f, &mut to_a)?;
+        step += 1;
+        if step > 64 {
+            return Err("did not settle".into());
+        }
+    }
+    let ctx = format!("choices={decisions:?} crash={crash:?}");
+    if crash.is_some_and(|(k, _)| k >= step) {
+        // The crash point lies past the end: nothing more to check here.
+        return Ok(decisions);
+    }
+    if f.balances() != X_MERGED || a.balances() != X_MERGED {
+        return Err(format!(
+            "{ctx}: {:?} / {:?}, not the merge",
+            f.balances(),
+            a.balances()
+        ));
+    }
+    if f.local_commit_number() != Some(4) || a.local_commit_number() != Some(4) {
+        return Err(format!("{ctx}: not at state 4"));
+    }
+    if f.update_in_flight() || a.update_in_flight() {
+        return Err(format!("{ctx}: still in flight"));
+    }
+    // Every variant at index 3 is revoked: each side's own commitment there
+    // (the peer's payment to it) is punishable by the other.
+    for (holder, watcher) in [(&f, &a), (&a, &f)] {
+        let variant = holder.signed_commitment_at(3, FeeTier::Low).unwrap();
+        match watcher.identify_spend(&variant) {
+            Watch::RevokedByPeer { state: 3, .. } => {}
+            other => {
+                return Err(format!(
+                    "{ctx}: a state-3 variant is not revoked: {other:?}"
+                ))
+            }
+        }
+    }
+    let rf = f.reestablish().unwrap();
+    let ra = a.reestablish().unwrap();
+    if !a.on_reestablish(&rf).unwrap().is_empty() || !f.on_reestablish(&ra).unwrap().is_empty() {
+        return Err(format!("{ctx}: not quiescent"));
+    }
+    let mut b = X_MERGED;
+    b[FUNDER] -= 50_000;
+    b[ACCEPTOR] += 50_000;
+    pay(&mut f, &mut a, b);
+    b[FUNDER] += 20_000;
+    b[ACCEPTOR] -= 20_000;
+    pay(&mut a, &mut f, b);
+    let close = f.propose_close(20_000).unwrap();
+    let signed = a.on_close(&close).unwrap();
+    f.on_close_signed(&signed)
+        .map_err(|e| format!("{ctx}: {e:?}"))?;
+    Ok(decisions)
+}
+
+/// Every order in which the crossed messages can arrive, each explored
+/// once: the two proposals, the two revocations, and the merged update.
+fn every_crossing_schedule(crash: Option<(usize, To)>) -> (usize, Vec<String>) {
+    let mut stack: Vec<Vec<bool>> = vec![Vec::new()];
+    let (mut runs, mut failures) = (0, Vec::new());
+    while let Some(prefix) = stack.pop() {
+        runs += 1;
+        match run_crossing(&prefix, crash) {
+            Ok(decisions) => {
+                for i in prefix.len()..decisions.len() {
+                    let mut p = decisions[..i].to_vec();
+                    p.push(true);
+                    stack.push(p);
+                }
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+    (runs, failures)
+}
+
+/// Both sides propose the same state at once, at every interleaving of what
+/// follows: the two proposals merge into the next state, no commitment either
+/// side holds at the crossed index survives unrevoked, and the channel keeps
+/// paying and closes.
+#[test]
+fn crossed_proposals_merge_at_every_interleaving() {
+    let (runs, failures) = every_crossing_schedule(None);
+    assert!(runs >= 4, "only {runs} interleavings");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The same with either side killed and restarted before any step of the
+/// crossing, its messages in flight lost: the reestablish resumes the merge.
+#[test]
+fn crossed_proposals_merge_across_a_restart_at_any_step() {
+    let mut failures = Vec::new();
+    for side in [To::F, To::A] {
+        for k in 0..8 {
+            for schedule in [vec![], vec![true; 8], vec![true, false, true, false]] {
+                if let Err(e) = run_crossing(&schedule, Some((k, side))) {
+                    failures.push(e);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A crash inside the crossing handler, the merge proposal or its update, at
+/// every journal write of every message the crashed side handles: it reopens
+/// from its truncated journal and the two still converge on the merge.
+#[test]
+fn crossed_proposals_survive_a_crash_at_every_journal_write() {
+    let mut failures = Vec::new();
+    let mut cuts = 0;
+    for side in [To::F, To::A] {
+        for a_first in [false, true] {
+            // The `nth` message the crashed side handles is cut after `keep`
+            // of its writes.
+            for nth in 0..4usize {
+                for keep in 0..4usize {
+                    let (dir, mut f, mut a, mut to_f, mut to_a) = crossed_pair();
+                    let path = match side {
+                        To::F => dir.join("f.jrnl"),
+                        To::A => dir.join("a.jrnl"),
+                    };
+                    let mut handled = 0;
+                    let mut cut = false;
+                    for _ in 0..32 {
+                        let who = match (to_f.is_empty(), to_a.is_empty()) {
+                            (true, true) => break,
+                            (false, true) => To::F,
+                            (true, false) => To::A,
+                            (false, false) if a_first => To::A,
+                            (false, false) => To::F,
+                        };
+                        let before = record_count(&path);
+                        deliver_one(who, &mut f, &mut a, &mut to_f, &mut to_a).unwrap();
+                        if who == side {
+                            if handled == nth {
+                                let written = record_count(&path) - before;
+                                if keep < written {
+                                    keep_records(&path, before + keep);
+                                    cut = true;
+                                }
+                                break;
+                            }
+                            handled += 1;
+                        }
+                    }
+                    if !cut {
+                        continue;
+                    }
+                    cuts += 1;
+                    to_f.clear();
+                    to_a.clear();
+                    match side {
+                        To::F => {
+                            drop(f);
+                            f = Machine::reopen(&path, NET, fkey(), RATE).unwrap();
+                        }
+                        To::A => {
+                            drop(a);
+                            a = Machine::reopen(&path, NET, akey(), RATE).unwrap();
+                        }
+                    }
+                    let ctx = format!("side={side:?} a_first={a_first} nth={nth} keep={keep}");
+                    if let Err(e) = reconnect(&mut f, &mut a) {
+                        failures.push(format!("{ctx}: {e}"));
+                        continue;
+                    }
+                    if f.balances() != X_MERGED || a.balances() != X_MERGED {
+                        failures.push(format!("{ctx}: {:?} / {:?}", f.balances(), a.balances()));
+                        continue;
+                    }
+                    if f.update_in_flight() || a.update_in_flight() {
+                        failures.push(format!("{ctx}: in flight"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(cuts >= 20, "only {cuts} cut points");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A crossed proposal that would not merge into a valid state, or that pays
+/// the wrong way, is refused before anything is journaled or revealed.
+#[test]
+fn a_crossed_proposal_draining_us_is_refused() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    let _uf = f.propose([CAP - 2_100_000, 2_100_000]).unwrap();
+    // The acceptor "pays" by lowering the funder's balance.
+    let bad = a.propose([CAP - 2_500_000, 2_500_000]).unwrap();
+    let records = f.journal_records();
+    assert_eq!(f.on_peer_update(&bad), Err(ChannelError::WrongDirection));
+    assert_eq!(f.journal_records(), records);
 }
