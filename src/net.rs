@@ -2300,6 +2300,12 @@ impl Node {
                 Ok(0) => return,
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                // A read cut short by a signal, not by the peer. On Linux a
+                // socket with a receive timeout fails every blocked read with
+                // EINTR once the process resumes from a stop (SIGSTOP or
+                // Ctrl-Z, then SIGCONT), handler or not: treated as fatal, a
+                // pause of a few seconds dropped every live link at once.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => return,
             };
             buffer.extend_from_slice(&chunk[..n]);
