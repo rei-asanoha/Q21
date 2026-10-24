@@ -382,9 +382,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// The append-only journal of one channel.
+/// The append-only journal of one channel. It holds no open file between
+/// writes: a node may track many idle channels, and each would otherwise
+/// keep a file handle for its whole life.
 pub struct Journal {
-    file: File,
     path: PathBuf,
     /// Records in the file: replayed at open, then appended or rewritten.
     records: usize,
@@ -420,11 +421,9 @@ impl Journal {
             f.set_len(good as u64)?;
             f.sync_all()?;
         }
-        let file = OpenOptions::new().append(true).open(&path)?;
         let count = records.len();
         Ok((
             Journal {
-                file,
                 path,
                 records: count,
             },
@@ -435,9 +434,10 @@ impl Journal {
     /// Appends one record and `fsync`s before returning: on return, the record
     /// is durable.
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
-        self.file.write_all(&frame(record))?;
-        self.file.flush()?;
-        self.file.sync_all()?;
+        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        file.write_all(&frame(record))?;
+        file.flush()?;
+        file.sync_all()?;
         self.records += 1;
         Ok(())
     }
@@ -448,7 +448,6 @@ impl Journal {
     pub fn rewrite(&mut self, records: &[Record]) -> io::Result<()> {
         let bytes: Vec<u8> = records.iter().flat_map(frame).collect();
         atomic_write(&self.path, &bytes)?;
-        self.file = OpenOptions::new().append(true).open(&self.path)?;
         self.records = records.len();
         Ok(())
     }
@@ -506,6 +505,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("j.jrnl")
+    }
+
+    /// A journal holds no open file between writes: a node tracking many idle
+    /// channels must not hold a file handle for each.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_idle_journal_holds_no_file_open() {
+        let path = tmp("idle");
+        let (mut j, _) = Journal::open(&path).unwrap();
+        j.append(&Record::Ready).unwrap();
+        let held = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .any(|target| target == path);
+        assert!(!held, "the journal file is still open");
+        drop(j);
     }
 
     /// A crash cut the last append in the middle of its frame. Reopening must
