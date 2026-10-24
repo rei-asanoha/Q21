@@ -186,6 +186,10 @@ pub struct Machine {
     /// once we have, the peer holds a close over the old balances and no update
     /// may follow. Conservatively true for a channel reloaded while closing.
     close_signed: bool,
+    /// The peer's signature over the cooperative close, once received.
+    close_peer_sig: Option<Vec<u8>>,
+    /// The height at which the funding confirmed, once known.
+    funding_height: Option<u64>,
 
     /// The counterparty's announced revocation points, by state.
     their_points: BTreeMap<u64, Hash256>,
@@ -386,6 +390,8 @@ impl Machine {
             initiated: BTreeMap::new(),
             close_fee: None,
             close_signed: false,
+            close_peer_sig: None,
+            funding_height: None,
             their_points: BTreeMap::new(),
             store: shachain::Store::new(),
             base_fee_rate,
@@ -986,8 +992,17 @@ impl Machine {
         if !matches!(self.phase, Phase::Opening | Phase::Funded) {
             out.push(Record::Ready);
         }
+        if let Some(height) = self.funding_height {
+            out.push(Record::Confirmed { height });
+        }
         if let Some(fee) = self.close_fee {
             out.push(Record::ClosingCoop { fee });
+            if let Some(signature) = &self.close_peer_sig {
+                out.push(Record::CloseSigned {
+                    fee,
+                    signature: signature.clone(),
+                });
+            }
         }
         match self.phase {
             Phase::Forcing => out.push(Record::Forcing),
@@ -1055,7 +1070,7 @@ impl Machine {
             .map(|(n, b)| (*n, *b))
             .collect();
         let text = format!(
-            "{:?} {:?} L{:?} R{:?} S{:?} V{:?} lc{:?} rb{:?} in{:?} tp{:?} st{:?} cf{:?} cs{}",
+            "{:?} {:?} L{:?} R{:?} S{:?} V{:?} lc{:?} rb{:?} in{:?} tp{:?} st{:?} cf{:?} cs{} ps{:?} fh{:?}",
             self.phase,
             self.funding_outpoint,
             self.local_commit_number,
@@ -1069,6 +1084,8 @@ impl Machine {
             self.store.entries(),
             self.close_fee,
             self.close_signed,
+            self.close_peer_sig,
+            self.funding_height,
         );
         format!(
             "{:?} L{:?} R{:?} {}",
@@ -1219,14 +1236,53 @@ impl Machine {
 
     /// Verifies the peer's [`Message::CloseSigned`] and returns the fully
     /// signed cooperative close transaction, ready to broadcast.
+    ///
+    /// The channel stays [`Phase::Closing`] until the close confirms on chain;
+    /// the peer's signature is journaled first, so the close can be rebuilt
+    /// and broadcast again after a crash that lost it from the mempool (see
+    /// [`Machine::signed_cooperative_close`]). Idempotent.
     pub fn on_close_signed(&mut self, msg: &Message) -> Result<Transaction, ChannelError> {
         let Message::CloseSigned { fee, signature } = msg else {
             return Err(ChannelError::Unexpected);
         };
+        if !matches!(self.phase, Phase::Closing | Phase::Closed) {
+            return Err(ChannelError::Unexpected);
+        }
+        if self.close_fee.is_some_and(|agreed| agreed != *fee) {
+            return Err(ChannelError::Unexpected);
+        }
+        let tx = self.assemble_close(*fee, signature)?;
+        if self.close_peer_sig.is_none() {
+            self.journal.append(&Record::CloseSigned {
+                fee: *fee,
+                signature: signature.clone(),
+            })?;
+            self.close_peer_sig = Some(signature.clone());
+            self.close_fee = Some(*fee);
+        }
+        self.close_signed = true;
+        Ok(tx)
+    }
+
+    /// The fully signed cooperative close, rebuilt from the peer's journaled
+    /// signature, if we hold it.
+    pub fn signed_cooperative_close(&self) -> Option<Transaction> {
+        let sig = self.close_peer_sig.as_ref()?;
+        self.assemble_close(self.close_fee?, sig).ok()
+    }
+
+    /// Whether we hold the peer's signature over the cooperative close.
+    pub fn has_signed_close(&self) -> bool {
+        self.close_peer_sig.is_some()
+    }
+
+    /// Verifies the peer's signature over the cooperative close at `fee` and
+    /// returns the close signed by both.
+    fn assemble_close(&self, fee: u64, signature: &[u8]) -> Result<Transaction, ChannelError> {
         let bal = self.current_balances();
         let close = self
             .params
-            .cooperative_close(self.funding()?, bal, *fee, self.payout);
+            .cooperative_close(self.funding()?, bal, fee, self.payout);
         let their_leaf = (1 - self.our_index) as u8;
         crate::policy::check_signature(
             &close.tx,
@@ -1244,26 +1300,30 @@ impl Machine {
         let m = self
             .params
             .funding_sighash(&tx, self.network, self.our_index);
-        self.close_signed = true;
         let our_sig = self.signer.sign(&m);
-        let (mut sigs_ours, mut sigs_theirs): (Vec<u8>, Vec<u8>) = (our_sig, signature.clone());
         let mut sigs: [&[u8]; 2] = [&[], &[]];
         let mut pks: [&[u8]; 2] = [&[], &[]];
-        if self.our_index == FUNDER {
-            sigs[FUNDER] = &sigs_ours;
-            sigs[ACCEPTOR] = &sigs_theirs;
-            pks[FUNDER] = &self.our_pubkey;
-            pks[ACCEPTOR] = &self.their_pubkey;
-        } else {
-            sigs[ACCEPTOR] = &sigs_ours;
-            sigs[FUNDER] = &sigs_theirs;
-            pks[ACCEPTOR] = &self.our_pubkey;
-            pks[FUNDER] = &self.their_pubkey;
-        }
+        sigs[self.our_index] = &our_sig;
+        sigs[1 - self.our_index] = signature;
+        pks[self.our_index] = &self.our_pubkey;
+        pks[1 - self.our_index] = &self.their_pubkey;
         self.params.complete_funding_spend(&mut tx, sigs, pks);
-        let _ = (&mut sigs_ours, &mut sigs_theirs);
-        self.mark_closed()?;
         Ok(tx)
+    }
+
+    /// Records the height at which the funding confirmed, once (again after a
+    /// reorganization moved it).
+    pub fn note_funding_height(&mut self, height: u64) -> Result<(), ChannelError> {
+        if self.funding_height != Some(height) {
+            self.journal.append(&Record::Confirmed { height })?;
+            self.funding_height = Some(height);
+        }
+        Ok(())
+    }
+
+    /// The height at which the funding confirmed, if recorded.
+    pub fn funding_height(&self) -> Option<u64> {
+        self.funding_height
     }
 
     // --- Reestablish ---------------------------------------------------------
@@ -1325,6 +1385,8 @@ impl Machine {
             initiated: BTreeMap::new(),
             close_fee: None,
             close_signed: false,
+            close_peer_sig: None,
+            funding_height: None,
             their_points: BTreeMap::new(),
             store: shachain::Store::new(),
             base_fee_rate,
@@ -1388,6 +1450,14 @@ impl Machine {
                 Record::Forcing => self.phase = Phase::Forcing,
                 Record::Penalised => self.phase = Phase::Penalised,
                 Record::Closed => self.phase = Phase::Closed,
+                Record::Confirmed { height } => self.funding_height = Some(*height),
+                Record::CloseSigned { fee, signature } => {
+                    self.close_fee = Some(*fee);
+                    self.close_peer_sig = Some(signature.clone());
+                    if self.phase != Phase::Closed {
+                        self.phase = Phase::Closing;
+                    }
+                }
                 Record::Revocations { state, entries } => {
                     self.revocations_recv = Some(*state);
                     if let Ok(store) = shachain::Store::restore(entries) {

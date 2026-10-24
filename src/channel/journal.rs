@@ -91,6 +91,14 @@ pub enum Record {
         state: u64,
         entries: Vec<([u8; 32], u64)>,
     },
+    /// The block height at which the funding transaction confirmed: where a
+    /// restarted node starts looking for a spend of the funding output it may
+    /// have missed while it was down.
+    Confirmed { height: u64 },
+    /// The counterparty's signature over the cooperative close at `fee`. With
+    /// it the close can be rebuilt and broadcast again until it confirms, after
+    /// a crash that lost it from the mempool.
+    CloseSigned { fee: u64, signature: Vec<u8> },
 }
 
 const R_OPENED: u8 = 1;
@@ -106,6 +114,8 @@ const R_PENALISED: u8 = 10;
 const R_CLOSED: u8 = 11;
 const R_THEIR_POINT: u8 = 12;
 const R_REVOCATIONS: u8 = 13;
+const R_CONFIRMED: u8 = 14;
+const R_CLOSE_SIGNED: u8 = 15;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -190,6 +200,12 @@ impl Record {
                     w.bytes(secret).u64(*index);
                 }
             }
+            Record::Confirmed { height } => {
+                w.u8(R_CONFIRMED).u64(*height);
+            }
+            Record::CloseSigned { fee, signature } => {
+                w.u8(R_CLOSE_SIGNED).u64(*fee).var_bytes(signature);
+            }
         }
         w.finish()
     }
@@ -267,6 +283,11 @@ impl Record {
                 }
                 Record::Revocations { state, entries }
             }
+            R_CONFIRMED => Record::Confirmed { height: r.u64()? },
+            R_CLOSE_SIGNED => Record::CloseSigned {
+                fee: r.u64()?,
+                signature: r.var_bytes()?.to_vec(),
+            },
             _ => return Err(ReadError::InvalidValue),
         };
         r.expect_end()?;

@@ -1019,8 +1019,11 @@ fn a_close_asked_during_a_payment_follows_it_and_both_sides_settle() {
     p.pump();
     assert_eq!(held(&chain, ACCEPTOR_PAYOUT), 600_000);
     assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 600_000 - CLOSE_FEE);
+    // Both learn of the close from the block that confirms it: the closer
+    // stays closing until then, holding the close to broadcast again.
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closing);
+    drive(&p.funder, &chain);
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
-    // The acceptor learns of the close from the block that confirms it.
     drive(&p.acceptor, &chain);
     assert_eq!(
         p.acceptor.info(cid).unwrap().phase,
@@ -1045,6 +1048,7 @@ fn a_close_lost_to_a_crash_completes_after_restart() {
     reconnect(&mut p);
     assert_eq!(held(&chain, ACCEPTOR_PAYOUT), 250_000);
     assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 250_000 - CLOSE_FEE);
+    drive(&p.funder, &chain);
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
 }
 
@@ -1394,3 +1398,4 @@ fn channels_per_peer_are_bounded() {
         .frames
         .is_empty());
 }
+

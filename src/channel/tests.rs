@@ -712,7 +712,10 @@ fn a_cooperative_close_is_signed_by_both() {
     let close = f.propose_close(20_000).unwrap();
     let signed_by_a = a.on_close(&close).unwrap();
     let close_tx = f.on_close_signed(&signed_by_a).unwrap();
-    assert_eq!(f.phase(), Phase::Closed);
+    // Closing until the close confirms; it can be rebuilt meanwhile.
+    assert_eq!(f.phase(), Phase::Closing);
+    assert_eq!(f.signed_cooperative_close(), Some(close_tx.clone()));
+    assert!(f.is_cooperative_close(&close_tx));
     assert_eq!(close_tx.inputs.len(), 1);
     assert_eq!(close_tx.outputs.len(), 2);
     // Outputs pay the final balance less the close fee from the funder.
@@ -1731,7 +1734,7 @@ fn a_lost_close_is_resent_on_reestablish() {
     assert_eq!(to_a, vec![Message::Close { fee: 20_000 }]);
     let signed = a.on_close(&to_a[0]).unwrap();
     let tx = f.on_close_signed(&signed).unwrap();
-    assert_eq!(f.phase(), Phase::Closed);
+    assert_eq!(f.phase(), Phase::Closing);
     assert_eq!(a.phase(), Phase::Closing);
     assert!(a.is_cooperative_close(&tx), "the peer recognises the close");
     let mut other = tx.clone();
@@ -1958,4 +1961,23 @@ fn a_machine_revocation_root_is_wiped_on_drop() {
         bytes_after_drop(f, |m| m.revocation_root_location()),
         [0u8; 32]
     );
+}
+
+/// The closer journals the peer's close signature before it broadcasts: a
+/// close lost from the mempool by a crash is rebuilt, identical, from the
+/// reopened journal.
+#[test]
+fn a_signed_close_survives_a_restart() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 4_000_000, 4_000_000]);
+    let close = f.propose_close(20_000).unwrap();
+    let signed = a.on_close(&close).unwrap();
+    let tx = f.on_close_signed(&signed).unwrap();
+    // Again: idempotent.
+    assert_eq!(f.on_close_signed(&signed).unwrap(), tx);
+    drop(f);
+    let f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+    assert_eq!(f.phase(), Phase::Closing);
+    assert_eq!(f.signed_cooperative_close(), Some(tx));
 }
