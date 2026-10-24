@@ -121,6 +121,17 @@ fn drive(mgr: &ChannelManager, chain: &Arc<Mutex<SharedChain>>) -> Vec<(u64, Vec
     all
 }
 
+/// Buries the tip to the funding depth, driving each manager at every block:
+/// a channel's last transaction settles it only once that deep.
+fn bury(mgrs: &[&ChannelManager], chain: &Arc<Mutex<SharedChain>>) {
+    for _ in 1..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+        for m in mgrs {
+            drive(m, chain);
+        }
+    }
+}
+
 fn chain_depth(chain: &Arc<Mutex<SharedChain>>, op: &OutPoint) -> Option<(u64, TxOut)> {
     chain.lock().unwrap().depth_of(op)
 }
@@ -655,6 +666,7 @@ fn a_unilateral_close_is_swept_after_the_delay() {
         chain.lock().unwrap().mine(&[]);
         drive(&p.funder, &chain);
     }
+    bury(&[&p.funder], &chain);
     assert_eq!(
         p.funder.info(cid).unwrap().phase,
         Phase::Closed,
@@ -1008,8 +1020,10 @@ fn a_close_asked_during_a_payment_follows_it_and_both_sides_settle() {
     // stays closing until then, holding the close to broadcast again.
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closing);
     drive(&p.funder, &chain);
-    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
     drive(&p.acceptor, &chain);
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closing);
+    bury(&[&p.funder, &p.acceptor], &chain);
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
     assert_eq!(
         p.acceptor.info(cid).unwrap().phase,
         Phase::Closed,
@@ -1034,6 +1048,7 @@ fn a_close_lost_to_a_crash_completes_after_restart() {
     assert_eq!(held(&chain, ACCEPTOR_PAYOUT), 250_000);
     assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 250_000 - CLOSE_FEE);
     drive(&p.funder, &chain);
+    bury(&[&p.funder], &chain);
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
 }
 
@@ -1206,8 +1221,10 @@ fn an_unconfirmed_penalty_pays_the_top_fee_at_once_and_is_announced_again() {
     let rebuilt = other_sent.lock().unwrap()[0].clone();
     assert_ne!(rebuilt.txid(), penalty.txid());
     other.on_connected_block(std::slice::from_ref(&penalty), h + 1, &no_depth);
+    for k in 1..u64::from(DEPTH) {
+        other.on_connected_block(&[], h + 1 + k, &no_depth);
+    }
     assert_eq!(other.info(cid).unwrap().phase, Phase::Closed);
-    other.on_connected_block(&[], h + 2, &no_depth);
     assert_eq!(
         other_sent.lock().unwrap().len(),
         1,
@@ -1465,6 +1482,7 @@ fn an_offline_victim_punishes_a_revoked_commitment_on_restart() {
     );
     assert!(chain.lock().unwrap().height() < committed_at + u64::from(DELAY));
     drive(&victim, &chain);
+    bury(&[&victim], &chain);
     assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
 }
 
@@ -1509,6 +1527,7 @@ fn a_penalty_lost_in_a_crash_is_broadcast_again_on_restart() {
     let paid = spender_of(&chain, &to_local_of(&revoked), 2).expect("the penalty confirmed");
     assert_eq!(paid.pubkey_hash, sweep);
     drive(&victim, &chain);
+    bury(&[&victim], &chain);
     assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
 }
 
@@ -1605,6 +1624,7 @@ fn an_unconfirmed_close_is_broadcast_again_on_restart() {
     );
     assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 300_000 - CLOSE_FEE);
     drive(&back, &chain);
+    bury(&[&back], &chain);
     assert_eq!(back.info(cid).unwrap().phase, Phase::Closed);
 }
 
@@ -1637,6 +1657,7 @@ fn our_commitment_confirmed_while_down_is_swept_on_restart() {
         .units();
     assert_eq!(swept, to_local - CLOSE_FEE, "the delayed sweep confirmed");
     drive(&back, &chain);
+    bury(&[&back], &chain);
     assert_eq!(back.info(cid).unwrap().phase, Phase::Closed);
 }
 
@@ -2143,4 +2164,109 @@ fn unfunded_channels_are_bounded() {
     }
     assert_eq!(opened, MAX_UNFUNDED_CHANNELS);
     assert_eq!(acceptor.list().len(), MAX_UNFUNDED_CHANNELS);
+}
+
+/// A cooperative close is settled only once buried to the funding depth. One
+/// confirmation, then a reorganization: the channel was not forgotten, it
+/// reloads after a restart, and settles when the close confirms again and is
+/// buried.
+#[test]
+fn a_close_settles_only_once_buried_and_survives_a_reorganization() {
+    let funder_seed = [0xc5u8; 32];
+    let acceptor_seed = [0xc6u8; 32];
+    let (mut p, _wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "settle-depth");
+    let m = p.funder.pay(cid, 450_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    // Signed by both; the funder's hook mines it at once.
+    let close = p.funder.close(cid).unwrap().expect("a close frame");
+    p.queue.push_back((1, close));
+    p.pump();
+    let block = chain.lock().unwrap().last_txs.clone();
+    let close_tx = block
+        .iter()
+        .find(|t| !t.is_coinbase())
+        .expect("the close is mined")
+        .clone();
+
+    // One confirmation: not settled yet.
+    drive(&p.acceptor, &chain);
+    let phase = p.acceptor.info(cid).unwrap().phase;
+    assert_ne!(phase, Phase::Closed, "closed at one confirmation");
+
+    // A reorganization takes the close away, and the node restarts.
+    {
+        let mut c = chain.lock().unwrap();
+        assert!(c.chain.disconnect());
+    }
+    p.acceptor.on_disconnected_block(&block);
+    chain.lock().unwrap().mine(&[]);
+    drop(p);
+    let acceptor = restart_and_rescan(
+        acceptor_seed,
+        &dir.join("acceptor"),
+        acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+        &chain,
+    );
+    let info = acceptor
+        .info(cid)
+        .expect("a channel whose close left the chain is reloaded");
+    assert_ne!(info.phase, Phase::Closed);
+
+    // The close confirms again, and settles once buried.
+    chain.lock().unwrap().mine(std::slice::from_ref(&close_tx));
+    drive(&acceptor, &chain);
+    assert_ne!(acceptor.info(cid).unwrap().phase, Phase::Closed);
+    for _ in 1..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+        drive(&acceptor, &chain);
+    }
+    assert_eq!(acceptor.info(cid).unwrap().phase, Phase::Closed);
+}
+
+/// A penalty that confirmed, then left the chain in a reorganization, is
+/// announced again: the channel stays penalised, not closed, until a penalty
+/// is buried.
+#[test]
+#[cfg(feature = "audit")]
+fn a_reorganized_penalty_is_announced_again() {
+    let funder_seed = [0xc7u8; 32];
+    let acceptor_seed = [0xc8u8; 32];
+    let (mut p, _wallet, _chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "settle-penalty");
+    for amt in [700_000u64, 700_000] {
+        let m = p.funder.pay(cid, amt).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+    }
+    let state = p.funder.info(cid).unwrap().state_number;
+    let revoked = p.funder.signed_commitment(cid, state - 1).unwrap();
+    let (victim, sent) =
+        relaying_manager(acceptor_seed, &dir.join("acceptor"), Hash256([0x7d; 32]));
+    let no_depth = |_: &OutPoint| None;
+    let h = 1_000u64;
+    victim.on_connected_block(std::slice::from_ref(&revoked), h, &no_depth);
+    let penalty = sent.lock().unwrap()[0].clone();
+
+    // The penalty confirms: penalised, not yet closed.
+    victim.on_connected_block(std::slice::from_ref(&penalty), h + 1, &no_depth);
+    assert_eq!(victim.info(cid).unwrap().phase, Phase::Penalised);
+
+    // It leaves the chain: the next block announces it again.
+    victim.on_disconnected_block(std::slice::from_ref(&penalty));
+    let before = sent.lock().unwrap().len();
+    victim.on_connected_block(&[], h + 1, &no_depth);
+    assert_eq!(sent.lock().unwrap().len(), before + 1, "announced again");
+    assert_eq!(sent.lock().unwrap()[before].txid(), penalty.txid());
+
+    // Confirmed again and buried: closed, and announced no more.
+    victim.on_connected_block(std::slice::from_ref(&penalty), h + 2, &no_depth);
+    for k in 1..u64::from(DEPTH) {
+        victim.on_connected_block(&[], h + 2 + k, &no_depth);
+    }
+    assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
+    let n = sent.lock().unwrap().len();
+    victim.on_connected_block(&[], h + 10, &no_depth);
+    assert_eq!(sent.lock().unwrap().len(), n);
 }

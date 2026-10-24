@@ -533,6 +533,10 @@ fn force_close_sweeps_to_wallet_after_delay() {
         cap - paid
     );
     use q21_core::channel::machine::Phase;
+    // Settled once the sweep is buried to the funding depth.
+    for _ in 1..DEPTH {
+        net.mine();
+    }
     assert!(
         wait(
             || net
@@ -872,6 +876,10 @@ fn a_single_output_force_close_is_swept() {
         net.f_balance() - f_locked >= cap - 100_000,
         "the sweep recovered the whole channel balance"
     );
+    // Settled once the sweep is buried to the funding depth.
+    for _ in 1..DEPTH {
+        net.mine();
+    }
     assert!(
         wait(
             || net
@@ -1156,6 +1164,9 @@ fn an_offline_victim_node_punishes_on_restart() {
         gained + 16 * q21_core::channel::manager::CLOSE_FEE >= to_local,
         "the victim took the cheater's to_local ({gained} of {to_local})"
     );
+    for _ in 1..DEPTH {
+        net.mine();
+    }
     assert!(matches!(
         victim.info(cid).map(|i| i.phase),
         Some(Phase::Closed)

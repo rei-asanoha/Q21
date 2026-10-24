@@ -181,6 +181,15 @@ enum CloseTracker {
     /// once the revoked output is spent: by it, by a version built before a
     /// restart, or — too late — by the cheater.
     Penalty { watch: Watch, current: Transaction },
+    /// The transaction `by` that ends the channel confirmed at `height`. The
+    /// channel is marked closed — and no longer reloaded — only once that is
+    /// buried to the funding depth; until then a reorganization that takes
+    /// `by` off the chain brings back what was awaited before it.
+    Settling {
+        by: Hash256,
+        height: u64,
+        prior: Option<Box<CloseTracker>>,
+    },
 }
 
 /// Channels not yet funded on chain, across all peers. Each holds a journal
@@ -1231,12 +1240,12 @@ impl ChannelManager {
     /// For every reloaded channel whose funding output is spent at the tip,
     /// the blocks from the funding's confirmation height (journaled; without
     /// it, the last [`MAX_RESCAN_BLOCKS`]) up to the tip are replayed through
-    /// the same reactions as live blocks: a revoked commitment is punished
-    /// (its fee ladder climbs with the replayed heights), our own commitment's
-    /// delayed sweep is scheduled, a cooperative close settles the channel, and
-    /// a claim, sweep or penalty already confirmed settles it too. Nothing is
+    /// the same reactions as live blocks: a revoked commitment is punished, our
+    /// own commitment's delayed sweep is scheduled, and a cooperative close, or
+    /// a claim, sweep or penalty already confirmed, settles the channel once
+    /// buried to the funding depth. Nothing is
     /// broadcast during the replay; at the tip, every transaction still
-    /// awaited is broadcast once: a penalty at its current tier, a claim or
+    /// awaited is broadcast once: a penalty, a claim or
     /// sweep, a cooperative close we hold signed, or our commitment if we were
     /// force-closing and it never confirmed. `txs_at` yields the transactions
     /// of the active chain's block at a height.
@@ -1305,7 +1314,7 @@ impl ChannelManager {
                     Some(CloseTracker::Finalizing { tx, .. }) => {
                         pending.push((tx.clone(), "claim or sweep"));
                     }
-                    Some(CloseTracker::DelayedSweep { .. }) => {}
+                    Some(CloseTracker::DelayedSweep { .. } | CloseTracker::Settling { .. }) => {}
                     None => {
                         let unspent = c
                             .machine
@@ -1354,6 +1363,13 @@ impl ChannelManager {
         let gone: std::collections::HashSet<Hash256> = txs.iter().map(|t| t.txid()).collect();
         let mut g = self.inner.lock().unwrap();
         for chan in g.channels.values_mut() {
+            // The transaction that was settling the channel left the chain:
+            // wait again for what it ended.
+            if matches!(&chan.close, Some(CloseTracker::Settling { by, .. }) if gone.contains(by)) {
+                if let Some(CloseTracker::Settling { prior, .. }) = chan.close.take() {
+                    chan.close = prior.map(|p| *p);
+                }
+            }
             if chan.spend.is_some_and(|s| gone.contains(&s)) {
                 chan.spend = None;
                 chan.close = None;
@@ -1407,7 +1423,7 @@ impl ChannelManager {
         chan.spend = Some(txid);
         // The cooperative close we agreed to, broadcast by the peer: settled.
         if chan.machine.is_cooperative_close(tx) {
-            let _ = chan.machine.mark_closed();
+            settle(chan, txid, height);
             return;
         }
         let decision = classify_spend(chan, funding, tx);
@@ -1430,9 +1446,7 @@ impl ChannelManager {
                         self.broadcast_or_warn(&claim, "to_remote claim");
                     }
                     // Our funds were trimmed to dust: nothing to claim, settled.
-                    None => {
-                        let _ = chan.machine.mark_closed();
-                    }
+                    None => settle(chan, txid, height),
                 }
             }
             Watch::OurCommitment {
@@ -1451,9 +1465,7 @@ impl ChannelManager {
                         });
                     }
                     // Our own output was trimmed to dust: nothing to sweep.
-                    None => {
-                        let _ = chan.machine.mark_closed();
-                    }
+                    None => settle(chan, txid, height),
                 }
             }
             Watch::NotOurChannel | Watch::Unrecognized => {}
@@ -1541,17 +1553,14 @@ impl ChannelManager {
                     // for a sweep that can never confirm would hold the channel
                     // forever.
                     let outpoint = to_local.outpoint;
-                    if txs
-                        .iter()
-                        .any(|t| t.inputs.iter().any(|i| i.prev_out == outpoint))
-                    {
+                    if let Some(by) = spender(txs, outpoint) {
                         eprintln!(
                             "ALERT: channel {}: our to_local was taken by a penalty; the \
                              broadcast commitment had been revoked",
                             cid.to_hex()
                         );
-                        let _ = chan.machine.mark_closed();
-                        chan.close = None;
+                        settle(chan, by, height);
+                        finish_settling(chan, height);
                         continue;
                     }
                     // `Older(D)` is satisfied once the chain is `D` blocks past
@@ -1577,18 +1586,14 @@ impl ChannelManager {
                     }
                 }
                 Some(CloseTracker::Finalizing { spends, .. }) => {
-                    let spends = *spends;
-                    if txs
-                        .iter()
-                        .any(|t| t.inputs.iter().any(|i| i.prev_out == spends))
-                    {
-                        let _ = chan.machine.mark_closed();
-                        chan.close = None;
+                    if let Some(by) = spender(txs, *spends) {
+                        settle(chan, by, height);
                     }
                 }
-                Some(CloseTracker::Penalty { .. }) => self.advance_penalty(chan, txs),
-                None => {}
+                Some(CloseTracker::Penalty { .. }) => self.advance_penalty(chan, txs, height),
+                Some(CloseTracker::Settling { .. }) | None => {}
             }
+            finish_settling(chan, height);
         }
     }
 
@@ -1622,7 +1627,7 @@ impl ChannelManager {
     /// revoked output is spent, or else announce the penalty again. Past the
     /// cheater's delay it stays valid until the cheater sweeps, so it is
     /// still worth announcing.
-    fn advance_penalty(&self, chan: &mut Chan, txs: &[Transaction]) {
+    fn advance_penalty(&self, chan: &mut Chan, txs: &[Transaction], height: u64) {
         let Some(CloseTracker::Penalty { watch, current }) = &chan.close else {
             return;
         };
@@ -1635,11 +1640,12 @@ impl ChannelManager {
             return;
         };
         let revoked = to_local.outpoint;
-        if let Some(input) = txs
-            .iter()
-            .flat_map(|t| t.inputs.iter())
-            .find(|i| i.prev_out == revoked)
-        {
+        if let Some((tx, input)) = txs.iter().find_map(|t| {
+            t.inputs
+                .iter()
+                .find(|i| i.prev_out == revoked)
+                .map(|i| (t, i))
+        }) {
             // Any penalty, whichever sweep address it pays (one built before
             // a restart pays another), reveals the revocation secret; the
             // cheater's delayed sweep does not.
@@ -1652,8 +1658,7 @@ impl ChannelManager {
                 eprintln!("ALERT: a revoked channel output was swept before the penalty confirmed");
             }
             let _ = chan.machine.mark_penalised();
-            let _ = chan.machine.mark_closed();
-            chan.close = None;
+            settle(chan, tx.txid(), height);
             return;
         }
         // In the block holding the revoked commitment it has just gone out.
@@ -1781,6 +1786,33 @@ impl ChannelManager {
         }
         if let Err(e) = (self.hooks.broadcast)(tx) {
             eprintln!("ALERT: channel {what} transaction could not be broadcast: {e}");
+        }
+    }
+}
+
+/// The transaction in `txs` spending `op`, if any.
+fn spender(txs: &[Transaction], op: OutPoint) -> Option<Hash256> {
+    txs.iter()
+        .find(|t| t.inputs.iter().any(|i| i.prev_out == op))
+        .map(|t| t.txid())
+}
+
+/// The channel's last transaction, `by`, confirmed at `height`: wait for it
+/// to be buried before marking the channel closed, keeping what was awaited
+/// in case a reorganization takes it away.
+fn settle(chan: &mut Chan, by: Hash256, height: u64) {
+    let prior = chan.close.take().map(Box::new);
+    chan.close = Some(CloseTracker::Settling { by, height, prior });
+}
+
+/// Marks a settling channel closed once its last transaction is buried to
+/// the funding depth at chain height `height`, as a funding is to open it.
+fn finish_settling(chan: &mut Chan, height: u64) {
+    if let Some(CloseTracker::Settling { height: at, .. }) = &chan.close {
+        let depth = height.saturating_add(1).saturating_sub(*at);
+        if depth >= u64::from(chan.machine.funding_depth().max(1)) {
+            let _ = chan.machine.mark_closed();
+            chan.close = None;
         }
     }
 }
