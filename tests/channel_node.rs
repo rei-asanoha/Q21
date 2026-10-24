@@ -1109,6 +1109,43 @@ fn only_a_verified_reestablish_rebinds_a_channel_to_another_connection() {
     );
 }
 
+/// What a [`relaying_manager`] broadcast, in order: each transaction, with
+/// the one it replaced for a fee bump.
+type Sent = Arc<Mutex<Vec<(Option<Hash256>, Transaction)>>>;
+
+/// A manager reloaded from `dir` whose hooks relay without mining, so what it
+/// broadcasts stays unconfirmed until the test confirms it.
+fn relaying_manager(
+    seed: [u8; 32],
+    dir: &std::path::Path,
+    sweep: Hash256,
+) -> (ChannelManager, Sent) {
+    let sent: Sent = Arc::new(Mutex::new(Vec::new()));
+    let (s1, s2) = (sent.clone(), sent.clone());
+    let mgr = ChannelManager::new(
+        NET,
+        RATE,
+        seed,
+        dir.to_path_buf(),
+        DELAY,
+        DEPTH,
+        Hooks {
+            fund: Box::new(|_, _| Err("does not fund".into())),
+            broadcast: Box::new(move |tx: &Transaction| {
+                s1.lock().unwrap().push((None, tx.clone()));
+                Ok(())
+            }),
+            sweep_address: Box::new(move || sweep),
+            payout_address: Box::new(|| ACCEPTOR_PAYOUT),
+            replace: Box::new(move |old: &Transaction, new: &Transaction| {
+                s2.lock().unwrap().push((Some(old.txid()), new.clone()));
+                Ok(())
+            }),
+        },
+    );
+    (mgr, sent)
+}
+
 /// M4: a penalty that stays unconfirmed climbs its fee ladder. The mempool has
 /// no replacement by fee, so each tier replaces the previous one in the
 /// node's own pool and is relayed; every tier pays the victim, its output never
@@ -1132,31 +1169,8 @@ fn an_unconfirmed_penalty_is_replaced_by_a_higher_fee_tier() {
 
     // The victim's node, reloaded with hooks that relay without mining, as a
     // congested network would leave a penalty waiting.
-    type Sent = Arc<Mutex<Vec<(Option<Hash256>, Transaction)>>>;
-    let sent: Sent = Arc::new(Mutex::new(Vec::new()));
-    let (s1, s2) = (sent.clone(), sent.clone());
     let sweep = Hash256([0x7bu8; 32]);
-    let victim = ChannelManager::new(
-        NET,
-        RATE,
-        acceptor_seed,
-        dir.join("acceptor"),
-        DELAY,
-        DEPTH,
-        Hooks {
-            fund: Box::new(|_, _| Err("does not fund".into())),
-            broadcast: Box::new(move |tx: &Transaction| {
-                s1.lock().unwrap().push((None, tx.clone()));
-                Ok(())
-            }),
-            sweep_address: Box::new(move || sweep),
-            payout_address: Box::new(|| ACCEPTOR_PAYOUT),
-            replace: Box::new(move |old: &Transaction, new: &Transaction| {
-                s2.lock().unwrap().push((Some(old.txid()), new.clone()));
-                Ok(())
-            }),
-        },
-    );
+    let (victim, sent) = relaying_manager(acceptor_seed, &dir.join("acceptor"), sweep);
     let to_local = revoked
         .outputs
         .iter()
@@ -1223,4 +1237,69 @@ fn an_unconfirmed_penalty_is_replaced_by_a_higher_fee_tier() {
     // A lower tier confirming (still held by some other node) settles too.
     victim.on_connected_block(std::slice::from_ref(&tier0), h + 40, &no_depth);
     assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
+}
+
+/// M5: the block holding the counterparty's latest commitment is disconnected
+/// and a revoked commitment confirms in its place. The watcher, which had
+/// started claiming from the first, reclassifies the spend and punishes the
+/// second — whether or not it was told of the disconnection first.
+#[test]
+#[cfg(feature = "audit")]
+fn a_revoked_commitment_that_replaces_a_reorged_spend_is_punished() {
+    for told_of_disconnect in [true, false] {
+        let funder_seed = [0xf3u8; 32];
+        let acceptor_seed = [0xf4u8; 32];
+        let tag = format!("m5-reorg-{told_of_disconnect}");
+        let (mut p, _wallet, chain, dir, cid, _capacity) =
+            open_channel(funder_seed, acceptor_seed, &tag);
+        for amt in [700_000u64, 700_000, 700_000] {
+            let m = p.funder.pay(cid, amt).unwrap();
+            p.queue.push_back((1, m));
+            p.pump();
+        }
+        let state = p.funder.info(cid).unwrap().state_number;
+        let latest = p.funder.signed_commitment(cid, state).unwrap();
+        let revoked = p.funder.signed_commitment(cid, state - 1).unwrap();
+        assert_eq!(latest.inputs[0].prev_out, revoked.inputs[0].prev_out);
+
+        let sweep = Hash256([0x7cu8; 32]);
+        let (victim, sent) = relaying_manager(acceptor_seed, &dir.join("acceptor"), sweep);
+        let no_depth = |_: &OutPoint| None;
+
+        // The latest commitment confirms: the victim claims its to_remote.
+        victim.on_connected_block(std::slice::from_ref(&latest), 500, &no_depth);
+        assert_eq!(victim.info(cid).unwrap().phase, Phase::Forcing);
+        assert_eq!(sent.lock().unwrap().len(), 1, "the to_remote claim");
+
+        // A reorganization replaces it with the revoked one.
+        if told_of_disconnect {
+            victim.on_disconnected_block(std::slice::from_ref(&latest));
+        }
+        victim.on_connected_block(std::slice::from_ref(&revoked), 500, &no_depth);
+        assert_eq!(
+            victim.info(cid).unwrap().phase,
+            Phase::Penalised,
+            "the revoked replacement is punished (told_of_disconnect={told_of_disconnect})"
+        );
+        let penalty = sent.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(penalty.outputs[0].pubkey_hash, sweep);
+        assert!(revoked
+            .outputs
+            .iter()
+            .enumerate()
+            .any(|(i, _)| penalty.inputs[0].prev_out
+                == OutPoint {
+                    txid: revoked.txid(),
+                    index: i as u32
+                }));
+        // Seen again in a later block (another reorganization), the same spend
+        // is not punished twice.
+        victim.on_connected_block(std::slice::from_ref(&revoked), 501, &no_depth);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+
+        // The penalty is valid on chain against the revoked commitment.
+        let mut c = chain.lock().unwrap();
+        c.mine(std::slice::from_ref(&revoked));
+        c.mine(std::slice::from_ref(&penalty));
+    }
 }

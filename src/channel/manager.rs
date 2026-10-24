@@ -133,6 +133,12 @@ struct Chan {
     /// What the channel is waiting for on chain, once a commitment has been
     /// broadcast. `None` while the channel is still off-chain or settled.
     close: Option<CloseTracker>,
+    /// The confirmed spend of the funding output the channel last reacted to.
+    /// A funding output is spent once per chain: a different spend means the
+    /// first left the chain in a reorganization, and the new one is
+    /// classified afresh — a revoked commitment that replaced the latest one
+    /// is still punished.
+    spend: Option<Hash256>,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -308,6 +314,7 @@ impl ChannelManager {
                                 reest_sent: false,
                                 synced: false,
                                 close: None,
+                                spend: None,
                             },
                         );
                     }
@@ -644,6 +651,7 @@ impl ChannelManager {
                 reest_sent: false,
                 synced: true,
                 close: None,
+                spend: None,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
@@ -833,6 +841,7 @@ impl ChannelManager {
                 reest_sent: false,
                 synced: true,
                 close: None,
+                spend: None,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
@@ -850,6 +859,7 @@ impl ChannelManager {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid)?;
         let funding = chan.machine.funding_outpoint()?;
+        chan.spend = Some(tx.txid());
         let decision = classify_spend(chan, funding, tx);
         let sweep_to = (self.hooks.sweep_address)();
         match decision {
@@ -896,6 +906,22 @@ impl ChannelManager {
         frames
     }
 
+    /// Forgets, for every channel, a funding spend that a reorganization took
+    /// off the chain, with whatever the channel was waiting for after it. The
+    /// spend that replaces it, if any, is classified afresh when its block is
+    /// connected; if the same one comes back, it is re-armed from its new
+    /// height.
+    pub fn on_disconnected_block(&self, txs: &[Transaction]) {
+        let gone: std::collections::HashSet<Hash256> = txs.iter().map(|t| t.txid()).collect();
+        let mut g = self.inner.lock().unwrap();
+        for chan in g.channels.values_mut() {
+            if chan.spend.is_some_and(|s| gone.contains(&s)) {
+                chan.spend = None;
+                chan.close = None;
+            }
+        }
+    }
+
     /// Reacts to any funding-output spend in `txs`, recording the commitment and
     /// starting the right close path for each channel it concerns.
     fn react_to_spends(&self, txs: &[Transaction], height: u64) {
@@ -917,13 +943,34 @@ impl ChannelManager {
         let Some(chan) = g.channels.get_mut(&cid) else {
             return;
         };
-        // A channel already settling on chain ignores further spends.
-        if chan.close.is_some() {
-            return;
-        }
         let Some(funding) = chan.machine.funding_outpoint() else {
             return;
         };
+        let txid = tx.txid();
+        if chan.spend == Some(txid) {
+            // The same spend again: a reorganization put it in a later block.
+            // The clocks that count from its confirmation restart there.
+            let delay = u64::from(chan.machine.params().delay);
+            match &mut chan.close {
+                Some(CloseTracker::DelayedSweep { commit_height, .. }) => *commit_height = height,
+                Some(CloseTracker::Penalty { deadline, .. }) => {
+                    *deadline = height.saturating_add(delay)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if chan.spend.is_some() {
+            // A different spend of the funding output: the one we reacted to
+            // left the chain. Whatever we were waiting for went with it.
+            eprintln!(
+                "channel {}: the funding output is now spent by {}; reclassifying",
+                cid.to_hex(),
+                txid.to_hex()
+            );
+            chan.close = None;
+        }
+        chan.spend = Some(txid);
         // The cooperative close we agreed to, broadcast by the peer: settled.
         if chan.machine.is_cooperative_close(tx) {
             let _ = chan.machine.mark_closed();
@@ -1320,5 +1367,9 @@ impl crate::net::ChannelSink for ChannelManager {
 
     fn on_peer_connected(&self, peer: u64, peer_identity: &str) -> Vec<Vec<u8>> {
         ChannelManager::on_peer_connected(self, peer, peer_identity)
+    }
+
+    fn on_disconnected_block(&self, txs: &[Transaction]) {
+        ChannelManager::on_disconnected_block(self, txs)
     }
 }
