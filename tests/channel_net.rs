@@ -9,8 +9,6 @@
 use q21_core::address::Network;
 use q21_core::amount::Amount;
 use q21_core::chain::{genesis_block, Chain, GENESIS_TIME};
-use q21_core::channel::keys::{funding_key_seed, ChannelKey, Signer};
-use q21_core::channel::machine::channel_id;
 use q21_core::channel::manager::{ChannelManager, Hooks};
 use q21_core::consensus::{COINBASE_MATURITY, TARGET_BLOCK_SECS};
 use q21_core::hash::Hash256;
@@ -27,10 +25,6 @@ const DELAY: u16 = 6;
 const DEPTH: u16 = 2;
 const RATE: u64 = 10;
 const FUND_FEE: u64 = 50_000;
-
-fn chan_hash(seed: &[u8; 32], index: u32) -> Hash256 {
-    ChannelKey::from_seed(&funding_key_seed(seed, index)).pubkey_hash()
-}
 
 /// Transactions a manager hook wants on chain, mined by the next `sync_mine`.
 type Pending = Arc<Mutex<Vec<Transaction>>>;
@@ -271,12 +265,24 @@ impl Net {
     /// Opens a channel A→B over the wire and drives it to `open` on both sides.
     fn open(&self, capacity: u64) -> Hash256 {
         let identity = self.a.peer_identity(self.bid);
+        let known: Vec<Hash256> = self.fmgr.list().iter().map(|c| c.channel_id).collect();
         let hello = self
             .fmgr
             .open(self.bid, &identity, capacity, None, None)
             .unwrap();
         assert!(self.a.send_channel(self.bid, hello));
-        let cid = channel_id(&[chan_hash(&self.fseed, 0), chan_hash(&self.aseed, 0)]);
+        let fresh = || {
+            self.fmgr
+                .list()
+                .into_iter()
+                .map(|c| c.channel_id)
+                .find(|c| !known.contains(c))
+        };
+        assert!(
+            wait(|| fresh().is_some(), 10),
+            "the channel was not created"
+        );
+        let cid = fresh().unwrap();
         // Wait for funding to be built (pushed to pending by the fund hook) and
         // for both sides to have learned the funding outpoint (the handshake
         // reached the funding step), so the block hook can confirm it.

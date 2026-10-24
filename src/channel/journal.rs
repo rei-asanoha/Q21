@@ -85,6 +85,9 @@ pub enum Record {
     /// broadcast only once the acceptor's signature over our first commitment
     /// is held, and again after a crash that lost it from the mempool.
     FundingTx { tx: Vec<u8> },
+    /// The wallet key index our channel key derives from, so a restart finds
+    /// the key directly instead of searching for it.
+    KeyIndex { index: u32 },
     /// We moved to force-close (we or the peer will broadcast a commitment).
     Forcing,
     /// We punished a revoked broadcast.
@@ -131,6 +134,7 @@ const R_CLOSE_SIGNED: u8 = 15;
 const R_CROSSED: u8 = 16;
 const R_CLOSING_COOP_BY: u8 = 17;
 const R_FUNDING_TX: u8 = 18;
+const R_KEY_INDEX: u8 = 19;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -230,6 +234,9 @@ impl Record {
             Record::FundingTx { tx } => {
                 w.u8(R_FUNDING_TX).var_bytes(tx);
             }
+            Record::KeyIndex { index } => {
+                w.u8(R_KEY_INDEX).u32(*index);
+            }
         }
         w.finish()
     }
@@ -309,6 +316,7 @@ impl Record {
             }
             R_CONFIRMED => Record::Confirmed { height: r.u64()? },
             R_CROSSED => Record::Crossed { state: r.u64()? },
+            R_KEY_INDEX => Record::KeyIndex { index: r.u32()? },
             R_FUNDING_TX => Record::FundingTx {
                 tx: r.var_bytes()?.to_vec(),
             },

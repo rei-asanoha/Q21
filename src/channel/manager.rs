@@ -215,6 +215,14 @@ enum CloseTracker {
     },
 }
 
+/// Opens in progress from one announced identity, whatever its connections.
+pub const MAX_PENDING_PER_IDENTITY: usize = 2;
+
+/// Key indices from this one up are derived for the channels we accept (see
+/// [`ChannelManager::acceptor_index`]); below it they count the channels we
+/// open.
+const ACCEPTOR_INDEX_BASE: u32 = 0x8000_0000;
+
 /// Channels one peer may hold with this node at once, settled ones aside.
 pub const MAX_CHANNELS_PER_PEER: usize = 8;
 /// Channel opens waiting for the peer's next message, across all peers, on
@@ -254,6 +262,10 @@ struct Inner {
     next_index: u32,
     /// See [`PENDING_OPEN_TTL`]; shortened by tests.
     pending_ttl: std::time::Duration,
+    /// A wallet payout address offered in a Hello or HelloBack and not yet
+    /// used by a channel: offered again until one is, so opens that never
+    /// complete do not grow the wallet by an address each.
+    spare_payout: Option<Hash256>,
 }
 
 impl Inner {
@@ -323,6 +335,7 @@ impl ChannelManager {
                 pending_acceptor: HashMap::new(),
                 next_index: 0,
                 pending_ttl: PENDING_OPEN_TTL,
+                spare_payout: None,
             }),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
@@ -342,71 +355,102 @@ impl ChannelManager {
             Ok(e) => e,
             Err(_) => return,
         };
-        // (journal path, our funding pubkey) for every intact channel journal.
-        let mut pending: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        use crate::channel::journal::{Journal, Record};
+        // (journal path, our funding pubkey, journaled key index) for every
+        // intact channel journal.
+        let mut found: Vec<(PathBuf, Vec<u8>, Option<u32>)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("jrnl") {
                 continue;
             }
-            let Ok((_journal, records)) = crate::channel::journal::Journal::open(&path) else {
+            let Ok((_journal, records)) = Journal::open(&path) else {
+                eprintln!("ALERT: channel journal {} cannot be read", path.display());
                 continue;
             };
-            if let Some(crate::channel::journal::Record::Opened { our_pubkey, .. }) =
-                records.first()
-            {
-                pending.push((path, our_pubkey.clone()));
+            let Some(Record::Opened { our_pubkey, .. }) = records.first() else {
+                continue;
+            };
+            let index = records.iter().find_map(|r| match r {
+                Record::KeyIndex { index } => Some(*index),
+                _ => None,
+            });
+            found.push((path, our_pubkey.clone(), index));
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.next_index = self.read_next_index();
+        let mut legacy = Vec::new();
+        for (path, pubkey, index) in found {
+            // The journaled index, checked against the key it must give.
+            match index.filter(|&i| self.signer(i).pubkey() == pubkey.as_slice()) {
+                Some(i) => self.load_channel(&mut g, &path, i),
+                None => legacy.push((path, pubkey)),
             }
         }
-        if pending.is_empty() {
+        if legacy.is_empty() {
             return;
         }
-        // Match each journal to its channel index by deriving keys in order.
-        // The cap bounds the search should a foreign journal ever appear.
-        let cap = (pending.len() as u32)
+        // Journals written before the index was: find it by deriving keys in
+        // order. The cap bounds the search.
+        let cap = (legacy.len() as u32)
             .saturating_mul(64)
-            .saturating_add(1024);
-        let mut remaining = pending.len();
-        let mut g = self.inner.lock().unwrap();
+            .saturating_add(1024)
+            .max(g.next_index.saturating_add(64));
         let mut index = 0u32;
-        while remaining > 0 && index < cap {
+        while !legacy.is_empty() && index < cap {
             let pk = self.signer(index).pubkey().to_vec();
-            if let Some(pos) = pending
-                .iter()
-                .position(|(_, candidate)| !candidate.is_empty() && *candidate == pk)
-            {
-                let path = pending[pos].0.clone();
-                if let Ok(machine) =
-                    Machine::reopen(&path, self.network, self.signer(index), self.base_fee_rate)
-                {
-                    if !matches!(machine.phase(), Phase::Closed) {
-                        let cid = machine.channel_id();
-                        let capacity = machine.params().capacity.units();
-                        // The peer's network id is transient; its durable
-                        // identity, persisted in a sidecar, lets a reconnect
-                        // re-bind this channel to the new connection.
-                        let peer_identity = self.read_peer_identity(cid);
-                        g.channels.insert(
-                            cid,
-                            Chan {
-                                machine,
-                                peer: u64::MAX,
-                                peer_identity,
-                                capacity,
-                                authed: Vec::new(),
-                                challenges: Vec::new(),
-                                synced: false,
-                                close: None,
-                                spend: None,
-                            },
-                        );
-                    }
-                }
-                g.next_index = g.next_index.max(index + 1);
-                pending[pos].1.clear();
-                remaining -= 1;
+            if let Some(pos) = legacy.iter().position(|(_, candidate)| *candidate == pk) {
+                let (path, _) = legacy.remove(pos);
+                self.load_channel(&mut g, &path, index);
             }
             index += 1;
+        }
+        // A journal no key of this wallet opens: its channel cannot be
+        // operated, and its funds may need attention. Never silently.
+        for (path, _) in legacy {
+            eprintln!(
+                "ALERT: channel journal {} matches no key of this wallet; the channel is not loaded",
+                path.display()
+            );
+        }
+    }
+
+    /// Reopens one channel journal with the key at `index` and adds it, unless
+    /// settled.
+    fn load_channel(&self, g: &mut Inner, path: &std::path::Path, index: u32) {
+        if index < ACCEPTOR_INDEX_BASE {
+            g.next_index = g.next_index.max(index + 1);
+        }
+        match Machine::reopen(path, self.network, self.signer(index), self.base_fee_rate) {
+            Ok(mut machine) => {
+                let _ = machine.note_key_index(index);
+                if matches!(machine.phase(), Phase::Closed) {
+                    return;
+                }
+                let cid = machine.channel_id();
+                let capacity = machine.params().capacity.units();
+                // The peer's network id is transient; its durable identity,
+                // persisted in a sidecar, tells a reconnect whom to challenge.
+                let peer_identity = self.read_peer_identity(cid);
+                g.channels.insert(
+                    cid,
+                    Chan {
+                        machine,
+                        peer: u64::MAX,
+                        peer_identity,
+                        capacity,
+                        authed: Vec::new(),
+                        challenges: Vec::new(),
+                        synced: false,
+                        close: None,
+                        spend: None,
+                    },
+                );
+            }
+            Err(e) => eprintln!(
+                "ALERT: channel journal {} could not be reopened: {e:?}",
+                path.display()
+            ),
         }
     }
 
@@ -435,6 +479,49 @@ impl ChannelManager {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+
+    /// The payout address to offer in a Hello or HelloBack: the spare one if
+    /// any, else a fresh wallet address — drawn without the manager's lock
+    /// held, since drawing one writes the wallet.
+    fn spare_payout(&self) -> Hash256 {
+        if let Some(p) = self.inner.lock().unwrap().spare_payout {
+            return p;
+        }
+        let fresh = (self.hooks.payout_address)();
+        *self.inner.lock().unwrap().spare_payout.get_or_insert(fresh)
+    }
+
+    /// The key index of a channel we accept from a funder whose channel key
+    /// is `funder_pubkey`: derived, not counted, so a Hello that never leads
+    /// to a channel spends nothing. Keyed by our seed, so a funder cannot aim
+    /// at the index of another channel; the same funder key twice gives the
+    /// same channel id, which the journal refuses.
+    fn acceptor_index(&self, funder_pubkey: &[u8]) -> u32 {
+        let h = crate::hash::tagged_hash_parts(
+            "Q21/channel/acceptor-index",
+            &[&self.wallet_seed, funder_pubkey],
+        );
+        let v = u32::from_le_bytes(h.0[..4].try_into().expect("four bytes"));
+        ACCEPTOR_INDEX_BASE | v
+    }
+
+    fn next_index_path(&self) -> PathBuf {
+        self.journal_dir.join("next_index")
+    }
+
+    fn write_next_index(&self, next: u32) {
+        let _ = crate::channel::journal::atomic_write(&self.next_index_path(), &next.to_le_bytes());
+    }
+
+    fn read_next_index(&self) -> u32 {
+        std::fs::read(self.next_index_path())
+            .ok()
+            .and_then(|b| {
+                b.get(..4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            })
+            .unwrap_or(0)
     }
 
     fn signer(&self, index: u32) -> Box<dyn Signer> {
@@ -479,6 +566,7 @@ impl ChannelManager {
         delay: Option<u16>,
         depth: Option<u16>,
     ) -> Result<Vec<u8>, String> {
+        let our_payout = self.spare_payout();
         let mut g = self.inner.lock().unwrap();
         g.expire_pending();
         if g.pending_funder.len() >= MAX_PENDING_OPENS && !g.pending_funder.contains_key(&peer) {
@@ -488,11 +576,16 @@ impl ChannelManager {
             return Err("too many channels with this peer".into());
         }
         let index = g.next_index;
+        if index >= ACCEPTOR_INDEX_BASE {
+            return Err("channel key indices exhausted".into());
+        }
         g.next_index += 1;
+        // The counter survives a restart: an index once offered to a peer is
+        // never handed to another channel.
+        self.write_next_index(g.next_index);
         let delay = delay.unwrap_or(self.default_delay);
         let depth = depth.unwrap_or(self.default_depth);
         let our_pubkey = self.signer(index).pubkey().to_vec();
-        let our_payout = (self.hooks.payout_address)();
         g.pending_funder.insert(
             peer,
             PendingFunder {
@@ -670,21 +763,33 @@ impl ChannelManager {
         let delay = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
         let depth = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
         let funder_payout = Hash256(r.array32().map_err(|_| "payout")?);
+        // Bounded: opens in progress across all peers and per announced
+        // identity (one per connection, by construction), and channels per
+        // peer. Beyond any of them the Hello is not answered — the funder's
+        // open lapses. Nothing persistent is spent on a Hello: the key index
+        // derives from the funder's key, and the payout address offered is the
+        // spare one, until a channel actually uses it.
+        let admitted = |g: &mut Inner| {
+            g.expire_pending();
+            let full = g.pending_acceptor.len() >= MAX_PENDING_OPENS
+                && !g.pending_acceptor.contains_key(&peer);
+            let same_identity = !peer_identity.is_empty()
+                && g.pending_acceptor
+                    .iter()
+                    .filter(|(p, a)| **p != peer && a.peer_identity == peer_identity)
+                    .count()
+                    >= MAX_PENDING_PER_IDENTITY;
+            !full && !same_identity && g.channels_with(peer, peer_identity) < MAX_CHANNELS_PER_PEER
+        };
+        if !admitted(&mut self.inner.lock().unwrap()) {
+            return Ok(Vec::new());
+        }
+        let our_payout = self.spare_payout();
         let mut g = self.inner.lock().unwrap();
-        // Bounded: opens in progress across all peers, and channels per peer.
-        // Beyond either, the Hello is not answered — the funder's open lapses
-        // — and nothing is allocated for it: no key index, no wallet address.
-        g.expire_pending();
-        if g.pending_acceptor.len() >= MAX_PENDING_OPENS && !g.pending_acceptor.contains_key(&peer)
-        {
+        if !admitted(&mut g) {
             return Ok(Vec::new());
         }
-        if g.channels_with(peer, peer_identity) >= MAX_CHANNELS_PER_PEER {
-            return Ok(Vec::new());
-        }
-        let our_payout = (self.hooks.payout_address)();
-        let index = g.next_index;
-        g.next_index += 1;
+        let index = self.acceptor_index(&funder_pubkey);
         let our_pubkey = self.signer(index).pubkey().to_vec();
         g.pending_acceptor.insert(
             peer,
@@ -730,8 +835,11 @@ impl ChannelManager {
             signer.pubkey_hash(),
             sig::pubkey_hash(CHANNEL_SCHEME, &acceptor_pubkey),
         ];
+        if g.spare_payout == Some(pending.our_payout) {
+            g.spare_payout = None;
+        }
         let cid = channel_id(&funding);
-        let (machine, open) = Machine::new_funder(
+        let (mut machine, open) = Machine::new_funder(
             self.journal_path(cid),
             self.network,
             signer,
@@ -744,6 +852,7 @@ impl ChannelManager {
             acceptor_payout,
         )
         .map_err(err)?;
+        machine.note_key_index(pending.index).map_err(err)?;
         self.write_peer_identity(cid, &pending.peer_identity);
         g.channels.insert(
             cid,
@@ -979,7 +1088,7 @@ impl ChannelManager {
             }
         }
         let signer = self.signer(pending.index);
-        let (machine, accept) = Machine::accept(
+        let (mut machine, accept) = Machine::accept(
             self.journal_path(cid),
             self.network,
             signer,
@@ -991,6 +1100,10 @@ impl ChannelManager {
         .map_err(err)?;
         if machine.channel_id() != cid {
             return Err("channel id mismatch".into());
+        }
+        machine.note_key_index(pending.index).map_err(err)?;
+        if g.spare_payout == Some(pending.our_payout) {
+            g.spare_payout = None;
         }
         self.write_peer_identity(cid, &pending.peer_identity);
         g.channels.insert(

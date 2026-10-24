@@ -206,6 +206,8 @@ pub struct Machine {
     close_payer: Option<usize>,
     /// The funder's signed funding transaction, until the channel opens.
     funding_tx: Option<Transaction>,
+    /// The wallet key index of our channel key, once journaled.
+    key_index: Option<u32>,
     /// Whether we may have signed the cooperative close. Until we have, a
     /// payment to us that crossed our `Close` on the wire is still accepted;
     /// once we have, the peer holds a close over the old balances and no update
@@ -419,6 +421,7 @@ impl Machine {
             close_fee: None,
             close_payer: None,
             funding_tx: None,
+            key_index: None,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,
@@ -1103,6 +1106,9 @@ impl Machine {
         if !matches!(self.phase, Phase::Opening | Phase::Funded) {
             out.push(Record::Ready);
         }
+        if let Some(index) = self.key_index {
+            out.push(Record::KeyIndex { index });
+        }
         if let Some(height) = self.funding_height {
             out.push(Record::Confirmed { height });
         }
@@ -1479,6 +1485,15 @@ impl Machine {
         Ok(tx)
     }
 
+    /// Journals the wallet key index our channel key derives from.
+    pub fn note_key_index(&mut self, index: u32) -> Result<(), ChannelError> {
+        if self.key_index != Some(index) {
+            self.journal.append(&Record::KeyIndex { index })?;
+            self.key_index = Some(index);
+        }
+        Ok(())
+    }
+
     /// Records the height at which the funding confirmed, once (again after a
     /// reorganization moved it).
     pub fn note_funding_height(&mut self, height: u64) -> Result<(), ChannelError> {
@@ -1554,6 +1569,7 @@ impl Machine {
             close_fee: None,
             close_payer: None,
             funding_tx: None,
+            key_index: None,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,
@@ -1628,6 +1644,7 @@ impl Machine {
                 Record::Penalised => self.phase = Phase::Penalised,
                 Record::Closed => self.phase = Phase::Closed,
                 Record::Confirmed { height } => self.funding_height = Some(*height),
+                Record::KeyIndex { index } => self.key_index = Some(*index),
                 Record::FundingTx { tx } => {
                     self.funding_tx = Transaction::decode(tx).ok();
                 }

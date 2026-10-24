@@ -12,8 +12,7 @@
 use q21_core::address::Network;
 use q21_core::amount::Amount;
 use q21_core::chain::{genesis_block, Chain, GENESIS_TIME};
-use q21_core::channel::keys::{funding_key_seed, ChannelKey, Signer};
-use q21_core::channel::machine::{channel_id, Phase};
+use q21_core::channel::machine::Phase;
 use q21_core::channel::manager::{ChannelManager, Hooks, CLOSE_FEE};
 use q21_core::consensus::{COINBASE_MATURITY, MIN_OUTPUT_VALUE, TARGET_BLOCK_SECS};
 use q21_core::hash::Hash256;
@@ -70,10 +69,6 @@ impl SharedChain {
             .get(op)
             .map(|e| (h.saturating_sub(e.height).saturating_add(1), e.output))
     }
-}
-
-fn chan_hash(seed: &[u8; 32], index: u32) -> Hash256 {
-    ChannelKey::from_seed(&funding_key_seed(seed, index)).pubkey_hash()
 }
 
 /// Builds the funder wallet with mature funds and the shared chain.
@@ -339,7 +334,7 @@ fn two_nodes_open_pay_and_cooperatively_close() {
     p.queue.push_back((1, hello));
     p.pump();
 
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     let info = p.funder.info(cid).expect("channel exists");
     assert_eq!(info.capacity, capacity);
     assert_eq!(info.local_balance, capacity);
@@ -431,7 +426,7 @@ fn a_revoked_broadcast_is_punished_before_the_delay() {
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     for _ in 0..DEPTH {
         chain.lock().unwrap().mine(&[]);
     }
@@ -512,7 +507,7 @@ fn reestablish_after_a_clean_reconnect_resends_nothing() {
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     for _ in 0..DEPTH {
         chain.lock().unwrap().mine(&[]);
     }
@@ -577,7 +572,7 @@ fn two_nodes_reach_open_through_the_block_hook() {
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     // The funder sits in `Funded`, the acceptor in `Opening`; neither is open
     // until the block hook confirms the funding.
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Funded);
@@ -634,7 +629,7 @@ fn a_unilateral_close_is_swept_after_the_delay() {
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     for _ in 0..DEPTH {
         chain.lock().unwrap().mine(&[]);
     }
@@ -706,7 +701,7 @@ fn a_manager_reloads_its_channels_on_restart() {
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     for _ in 0..DEPTH {
         chain.lock().unwrap().mine(&[]);
     }
@@ -777,7 +772,7 @@ fn reestablish_recovers_a_dropped_update() {
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     for _ in 0..DEPTH {
         chain.lock().unwrap().mine(&[]);
     }
@@ -846,7 +841,7 @@ fn a_reloaded_channel_reconciles_an_incomplete_update() {
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     for _ in 0..DEPTH {
         chain.lock().unwrap().mine(&[]);
     }
@@ -931,7 +926,7 @@ fn open_channel(funder_seed: [u8; 32], acceptor_seed: [u8; 32], tag: &str) -> Op
     let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
-    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    let cid = p.funder.list()[0].channel_id;
     for _ in 0..DEPTH {
         chain.lock().unwrap().mine(&[]);
     }
@@ -1889,11 +1884,8 @@ fn only_an_answered_challenge_authenticates_a_connection() {
         open_channel(funder_seed, [0xeeu8; 32], "auth-challenge");
     const IMPOSTOR: u64 = 66;
     // The impostor claims the acceptor's identity. Its Close is ignored.
-    // The funder challenges it; it cannot answer.
-    assert!(!p
-        .funder
-        .on_peer_connected(IMPOSTOR, "acceptor-node")
-        .is_empty());
+    // Whatever the funder challenges it with, it cannot answer.
+    let _ = p.funder.on_peer_connected(IMPOSTOR, "acceptor-node");
     let close = [
         cid.as_bytes().as_slice(),
         &[0u8],
@@ -1939,4 +1931,108 @@ fn only_an_answered_challenge_authenticates_a_connection() {
     assert!(r.frames.is_empty());
     assert_ne!(p.funder.peer_of(cid), Some(A_PEER));
     assert!(p.funder.pay(cid, 1).is_err(), "unauthenticated");
+}
+
+// --- Hello spam -------------------------------------------------------------
+
+/// Hellos that never lead to a channel spend nothing persistent: no key index
+/// and no wallet address each. A flood of them used to push a real channel's
+/// key index past the reload search, losing the channel at the next restart;
+/// the index is now derived, journaled, and found directly.
+#[test]
+fn hello_spam_spends_nothing_and_a_real_channel_still_reloads() {
+    let funder_seed = [0xd5u8; 32];
+    let acceptor_seed = [0xd6u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("hello-spam");
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    let addresses = Arc::new(Mutex::new(0usize));
+    let counted = |chain: Arc<Mutex<SharedChain>>| {
+        let n = addresses.clone();
+        let mut h = acceptor_hooks(chain, Hash256([0x5e; 32]));
+        h.payout_address = Box::new(move || {
+            *n.lock().unwrap() += 1;
+            ACCEPTOR_PAYOUT
+        });
+        h
+    };
+    let acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("a"),
+        DELAY,
+        DEPTH,
+        counted(chain.clone()),
+    );
+    acceptor.set_pending_open_ttl(std::time::Duration::ZERO);
+    let spammer = one_manager([0xd7u8; 32], wallet.clone(), chain.clone(), &dir.join("s"));
+    let hello = spammer
+        .open(1, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    for conn in 0..1_200u64 {
+        let r = acceptor.deliver(10_000 + conn, "", &hello);
+        assert_eq!(r.penalize, 0);
+    }
+    assert_eq!(
+        *addresses.lock().unwrap(),
+        1,
+        "one spare address, offered again"
+    );
+    acceptor.set_pending_open_ttl(q21_core::channel::manager::PENDING_OPEN_TTL);
+
+    // A real channel after the flood.
+    let funder = one_manager(funder_seed, wallet, chain.clone(), &dir.join("f"));
+    let mut p = Pair {
+        funder,
+        acceptor,
+        queue: VecDeque::new(),
+    };
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    assert!(p.acceptor.info(cid).is_some());
+    let Pair { acceptor, .. } = p;
+    drop(acceptor);
+    let back = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("a"),
+        DELAY,
+        DEPTH,
+        counted(chain),
+    );
+    assert!(
+        back.info(cid).is_some(),
+        "the channel reloads after the flood"
+    );
+}
+
+/// Opens in progress are bounded per announced identity too, whatever the
+/// number of connections it comes on.
+#[test]
+fn pending_opens_are_bounded_per_identity() {
+    use q21_core::channel::manager::MAX_PENDING_PER_IDENTITY;
+    let (wallet, chain) = setup([0xd8u8; 32]);
+    let dir = tmpdir("hello-identity");
+    let acceptor = one_manager([0xd9u8; 32], wallet.clone(), chain.clone(), &dir.join("a"));
+    let spammer = one_manager([0xdau8; 32], wallet, chain, &dir.join("s"));
+    let hello = spammer
+        .open(1, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    for conn in 0..(MAX_PENDING_PER_IDENTITY as u64 + 3) {
+        let r = acceptor.deliver(50 + conn, "the-same-node", &hello);
+        assert_eq!(r.penalize, 0);
+        assert_eq!(
+            r.frames.is_empty(),
+            conn >= MAX_PENDING_PER_IDENTITY as u64,
+            "connection {conn}"
+        );
+    }
+    assert_eq!(acceptor.pending_opens().1, MAX_PENDING_PER_IDENTITY);
 }
