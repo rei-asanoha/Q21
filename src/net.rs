@@ -1391,10 +1391,10 @@ impl Node {
             .read()
             .ok()
             .and_then(|g| g.as_ref().cloned());
+        // No channel manager, nothing queued: the queues fill only once one is
+        // installed (`channels_active`). Called after every message handled,
+        // so the global lock is not taken for nothing.
         let Some(sink) = sink else {
-            let mut g = self.shared.lock().unwrap();
-            g.channel_scan.clear();
-            g.channel_unscan.clear();
             return;
         };
         let (untxs, txs) = {
@@ -3741,6 +3741,15 @@ impl Node {
                 // must stay within its per-peer rate. The decoded bytes are
                 // handed to the channel component after the lock is released,
                 // never under it.
+                // Channels exist on regtest only. Anywhere else this message
+                // gets what 0.4.9 gave it as an unknown command: malformed,
+                // and the link is cut.
+                Message::Channel(_) if network != Network::Regtest => {
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
+                    }
+                    drop_peer = true;
+                }
                 Message::Channel(bytes) => {
                     let (hs, cap) = g
                         .peers
@@ -5901,6 +5910,41 @@ mod tests_hardening {
             !a.handle(7, Message::Channel(vec![0u8; 40])),
             "a peer at the threshold is still disconnected"
         );
+    }
+
+    /// Finding 14: off regtest, where channels do not exist, a channel
+    /// message gets what 0.4.9 gave an unknown command — malformed, and the
+    /// link is cut — not a 20-point charge on a link that stays up.
+    #[test]
+    fn a_channel_message_off_regtest_is_malformed_and_cuts_the_link() {
+        let net = Network::Testnet;
+        let n = Node::new(net, Chain::new(net, crate::chain::genesis_block(net)));
+        let _e = established_peer(&n, 7);
+        assert!(
+            !n.handle(7, Message::Channel(vec![0u8; 40])),
+            "a channel message off regtest must cut the link"
+        );
+        assert_eq!(
+            n.shared.lock().unwrap().peers[&7].ban_score,
+            MISCONDUCT_MALFORMED
+        );
+    }
+
+    /// Finding 14: with no channel manager installed, the scan run after
+    /// every message handled does not take the global lock.
+    #[test]
+    fn the_channel_scan_takes_no_lock_without_a_channel_manager() {
+        let (a, _) = node_pair();
+        let held = a.shared.lock().unwrap();
+        let other = a.clone();
+        let (done, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            other.scan_connected_blocks_for_channels();
+            let _ = done.send(());
+        });
+        let returned = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(held);
+        assert!(returned, "the scan waited for the global lock");
     }
 
     /// A block connected through the node reaches the channel watcher, off the
