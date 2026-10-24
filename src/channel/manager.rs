@@ -26,7 +26,7 @@ use crate::address::Network;
 use crate::channel::keys::{ChannelKey, Signer, CHANNEL_SCHEME};
 use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
 use crate::channel::messages::Message as ChMsg;
-use crate::channel::txbuild::FeeTier;
+use crate::channel::txbuild;
 use crate::channel::watcher::{OutputRef, Watch};
 use crate::hash::Hash256;
 use crate::ser::{Reader, Writer};
@@ -56,31 +56,10 @@ pub type FundFn = dyn Fn(Hash256, TxOut) -> Result<Transaction, String> + Send +
 pub type BroadcastFn = dyn Fn(&Transaction) -> Result<(), String> + Send + Sync;
 /// Yields a fresh wallet address to receive swept or claimed funds.
 pub type SweepAddrFn = dyn Fn() -> Hash256 + Send + Sync;
-/// Replaces `old`, a transaction of ours, by `new`, a version of it paying a
-/// higher fee, in this node's mempool, and relays `new`.
-pub type ReplaceFn = dyn Fn(&Transaction, &Transaction) -> Result<(), String> + Send + Sync;
 
 /// How far back a startup rescan looks for a channel whose journal holds no
 /// funding height (one opened before it was journaled).
 pub const MAX_RESCAN_BLOCKS: u64 = 20_000;
-
-/// A penalty started off the block hook, before its height is known.
-const UNKNOWN_HEIGHT: u64 = u64::MAX;
-
-/// Blocks a penalty waits unconfirmed before the next fee tier replaces it,
-/// for a to-self delay of `delay` blocks: a quarter of the delay, so the whole
-/// ladder is climbed well before the cheater's own delayed sweep matures.
-pub fn penalty_bump_interval(delay: u16) -> u64 {
-    (u64::from(delay) / 4).max(1)
-}
-
-/// The fee requested for penalty tier `tier` (0, 1, 2): the sweep fee times
-/// the commitment tier multipliers (1, 4, 16). The penalty builder caps it so
-/// the swept output never falls below the dust floor.
-pub fn penalty_tier_fee(tier: usize) -> u64 {
-    let t = FeeTier::ALL[tier.min(FeeTier::ALL.len() - 1)];
-    CLOSE_FEE.saturating_mul(t.multiplier())
-}
 
 /// The chain oracle the block hook and the startup rescan receive: for an
 /// unspent outpoint, its confirmation depth (`1` in the tip) and the output
@@ -96,9 +75,6 @@ pub struct Hooks {
     /// payout — a real wallet address the wallet scans and can spend, never a
     /// channel key.
     pub payout_address: Box<SweepAddrFn>,
-    /// Moves an unconfirmed penalty up its fee ladder (see
-    /// [`ChannelManager::on_connected_block`]).
-    pub replace: Box<ReplaceFn>,
 }
 
 /// What handling one inbound frame produces.
@@ -199,20 +175,12 @@ enum CloseTracker {
     /// this transaction, or by an earlier version of it broadcast before a
     /// restart. Kept whole, to be broadcast again after a restart.
     Finalizing { spends: OutPoint, tx: Transaction },
-    /// A penalty has been broadcast at fee tier `tier`. While it stays
-    /// unconfirmed and the cheater's delay runs, the next tier replaces it
-    /// every [`penalty_bump_interval`] blocks. Any tier confirming settles the
-    /// channel: they all pay us, and one broadcast earlier may still sit in
-    /// another node's mempool.
-    Penalty {
-        watch: Watch,
-        sweep_to: Hash256,
-        tier: usize,
-        current: Transaction,
-        tiers: Vec<Hash256>,
-        broadcast_height: u64,
-        deadline: u64,
-    },
+    /// A penalty has been broadcast at [`txbuild::penalty_fee`]. While it stays
+    /// unconfirmed and the cheater's delay runs, it is announced again at
+    /// every block, for the nodes that dropped it or never had it. Settled
+    /// once the revoked output is spent: by it, by a version built before a
+    /// restart, or — too late — by the cheater.
+    Penalty { watch: Watch, current: Transaction },
 }
 
 /// Channels not yet funded on chain, across all peers. Each holds a journal
@@ -1164,11 +1132,7 @@ impl ChannelManager {
         let decision = classify_spend(chan, funding, tx);
         let sweep_to = (self.hooks.sweep_address)();
         match decision {
-            Watch::RevokedByPeer { .. } => {
-                // No block height on this path: the ladder's clock starts at
-                // the next block seen.
-                self.start_penalty(chan, decision, sweep_to, UNKNOWN_HEIGHT)
-            }
+            Watch::RevokedByPeer { .. } => self.start_penalty(chan, decision, sweep_to),
             Watch::PeerLatest {
                 to_remote: Some(to_remote),
                 ..
@@ -1425,13 +1389,8 @@ impl ChannelManager {
         if chan.spend == Some(txid) {
             // The same spend again: a reorganization put it in a later block.
             // The clocks that count from its confirmation restart there.
-            let delay = u64::from(chan.machine.params().delay);
-            match &mut chan.close {
-                Some(CloseTracker::DelayedSweep { commit_height, .. }) => *commit_height = height,
-                Some(CloseTracker::Penalty { deadline, .. }) => {
-                    *deadline = height.saturating_add(delay)
-                }
-                _ => {}
+            if let Some(CloseTracker::DelayedSweep { commit_height, .. }) = &mut chan.close {
+                *commit_height = height;
             }
             return;
         }
@@ -1455,7 +1414,7 @@ impl ChannelManager {
         let sweep_to = (self.hooks.sweep_address)();
         match decision {
             Watch::RevokedByPeer { .. } => {
-                let _ = self.start_penalty(chan, decision, sweep_to, height);
+                let _ = self.start_penalty(chan, decision, sweep_to);
             }
             Watch::PeerLatest { to_remote, .. } => {
                 let _ = chan.machine.mark_forcing();
@@ -1627,118 +1586,82 @@ impl ChannelManager {
                         chan.close = None;
                     }
                 }
-                Some(CloseTracker::Penalty { .. }) => self.advance_penalty(chan, txs, height),
+                Some(CloseTracker::Penalty { .. }) => self.advance_penalty(chan, txs),
                 None => {}
             }
         }
     }
 
-    /// Builds and broadcasts the first tier of a penalty against a revoked
-    /// commitment confirmed at `height` ([`UNKNOWN_HEIGHT`] when not known),
-    /// and arms its fee ladder.
+    /// Builds and broadcasts the penalty against a revoked commitment, at
+    /// [`txbuild::penalty_fee`], and keeps it to announce again until it settles.
     fn start_penalty(
         &self,
         chan: &mut Chan,
         watch: Watch,
         sweep_to: Hash256,
-        height: u64,
     ) -> Option<Transaction> {
+        // The weight does not depend on the fee: build once to weigh it.
+        let draft = chan
+            .machine
+            .build_penalty(&watch, sweep_to, CLOSE_FEE)
+            .ok()?;
         let penalty = chan
             .machine
-            .build_penalty(&watch, sweep_to, penalty_tier_fee(0))
+            .build_penalty(&watch, sweep_to, txbuild::penalty_fee(&draft))
             .ok()?;
         let _ = chan.machine.mark_penalised();
-        let delay = chan.machine.params().delay;
         chan.close = Some(CloseTracker::Penalty {
             watch,
-            sweep_to,
-            tier: 0,
             current: penalty.clone(),
-            tiers: vec![penalty.txid()],
-            broadcast_height: height,
-            deadline: height.saturating_add(u64::from(delay)),
         });
         self.broadcast_or_warn(&penalty, "penalty");
         Some(penalty)
     }
 
-    /// One block for a channel whose penalty is out: settle it if any tier of
-    /// the penalty confirmed, or else, while the cheater's delay still runs,
-    /// replace it with the next fee tier once it has waited its interval.
-    fn advance_penalty(&self, chan: &mut Chan, txs: &[Transaction], height: u64) {
-        let Some(CloseTracker::Penalty {
-            watch,
-            sweep_to,
-            tier,
-            current,
-            tiers,
-            broadcast_height,
-            deadline,
-        }) = &mut chan.close
+    /// One block for a channel whose penalty is out: settle it once the
+    /// revoked output is spent, or else announce the penalty again. Past the
+    /// cheater's delay it stays valid until the cheater sweeps, so it is
+    /// still worth announcing.
+    fn advance_penalty(&self, chan: &mut Chan, txs: &[Transaction]) {
+        let Some(CloseTracker::Penalty { watch, current }) = &chan.close else {
+            return;
+        };
+        let Watch::RevokedByPeer {
+            to_local,
+            revocation_secret,
+            ..
+        } = watch
         else {
             return;
         };
-        if txs.iter().any(|t| tiers.contains(&t.txid())) {
+        let revoked = to_local.outpoint;
+        if let Some(input) = txs
+            .iter()
+            .flat_map(|t| t.inputs.iter())
+            .find(|i| i.prev_out == revoked)
+        {
+            // Any penalty, whichever sweep address it pays (one built before
+            // a restart pays another), reveals the revocation secret; the
+            // cheater's delayed sweep does not.
+            let ours = input
+                .witness
+                .signature
+                .windows(revocation_secret.len())
+                .any(|w| w == revocation_secret.as_slice());
+            if !ours {
+                eprintln!("ALERT: a revoked channel output was swept before the penalty confirmed");
+            }
             let _ = chan.machine.mark_penalised();
             let _ = chan.machine.mark_closed();
             chan.close = None;
             return;
         }
-        let Watch::RevokedByPeer { to_local, .. } = watch else {
-            return;
-        };
-        // Someone else spent the revoked output: the cheater's delayed sweep
-        // beat every tier. Nothing is left to fight for.
-        if txs
-            .iter()
-            .any(|t| t.inputs.iter().any(|i| i.prev_out == to_local.outpoint))
-        {
-            eprintln!("ALERT: a revoked channel output was swept before the penalty confirmed");
-            let _ = chan.machine.mark_closed();
-            chan.close = None;
+        // In the block holding the revoked commitment it has just gone out.
+        if txs.iter().any(|t| Some(t.txid()) == chan.spend) {
             return;
         }
-        let delay = chan.machine.params().delay;
-        if *broadcast_height == UNKNOWN_HEIGHT {
-            *broadcast_height = height;
-            *deadline = height.saturating_add(u64::from(delay));
-            return;
-        }
-        let interval = penalty_bump_interval(delay);
-        if *tier + 1 >= FeeTier::ALL.len()
-            || height >= *deadline
-            || height < broadcast_height.saturating_add(interval)
-        {
-            return;
-        }
-        let next = *tier + 1;
-        let Ok(bumped) = chan
-            .machine
-            .build_penalty(watch, *sweep_to, penalty_tier_fee(next))
-        else {
-            return;
-        };
-        // The dust cap can flatten the top of the ladder: a tier paying no more
-        // than the current one would only conflict with it.
-        let value = |t: &Transaction| t.outputs.first().map_or(0, |o| o.value.units());
-        if value(&bumped) >= value(current) {
-            *tier = FeeTier::ALL.len();
-            return;
-        }
-        let replaced = if self.replaying.load(Ordering::SeqCst) {
-            Ok(())
-        } else {
-            (self.hooks.replace)(current, &bumped)
-        };
-        match replaced {
-            Ok(()) => {
-                tiers.push(bumped.txid());
-                *current = bumped;
-                *tier = next;
-                *broadcast_height = height;
-            }
-            Err(e) => eprintln!("ALERT: channel penalty fee bump could not be broadcast: {e}"),
-        }
+        let tx = current.clone();
+        self.broadcast_or_warn(&tx, "penalty");
     }
 
     /// The funding outpoints this manager is watching, with their channel ids.
@@ -1935,7 +1858,6 @@ mod tests {
             broadcast: Box::new(|_| Ok(())),
             sweep_address: Box::new(|| Hash256::ZERO),
             payout_address: Box::new(|| Hash256::ZERO),
-            replace: Box::new(|_, _| Ok(())),
         };
         let mgr = ChannelManager::new(Network::Regtest, 10, [0x77u8; 32], dir, 12, 2, hooks);
         let mut slot = std::mem::ManuallyDrop::new(mgr);

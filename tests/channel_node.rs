@@ -177,7 +177,6 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
         broadcast,
         sweep_address: Box::new(|| FUNDER_PAYOUT),
         payout_address: Box::new(|| FUNDER_PAYOUT),
-        replace: mining_replace(chain),
     }
 }
 
@@ -197,17 +196,7 @@ fn acceptor_hooks(chain: Arc<Mutex<SharedChain>>, sweep: Hash256) -> Hooks {
         }),
         sweep_address: Box::new(move || sweep),
         payout_address: Box::new(|| ACCEPTOR_PAYOUT),
-        replace: mining_replace(chain),
     }
-}
-
-/// A replacement hook that mines the new version at once, as the broadcast
-/// hooks here do.
-fn mining_replace(chain: Arc<Mutex<SharedChain>>) -> Box<q21_core::channel::manager::ReplaceFn> {
-    Box::new(move |_old: &Transaction, new: &Transaction| {
-        chain.lock().unwrap().mine(std::slice::from_ref(new));
-        Ok(())
-    })
 }
 
 struct Pair {
@@ -1109,9 +1098,8 @@ fn only_a_verified_reestablish_rebinds_a_channel_to_another_connection() {
     );
 }
 
-/// What a [`relaying_manager`] broadcast, in order: each transaction, with
-/// the one it replaced for a fee bump.
-type Sent = Arc<Mutex<Vec<(Option<Hash256>, Transaction)>>>;
+/// What a [`relaying_manager`] broadcast, in order.
+type Sent = Arc<Mutex<Vec<Transaction>>>;
 
 /// A manager reloaded from `dir` whose hooks relay without mining, so what it
 /// broadcasts stays unconfirmed until the test confirms it.
@@ -1121,7 +1109,7 @@ fn relaying_manager(
     sweep: Hash256,
 ) -> (ChannelManager, Sent) {
     let sent: Sent = Arc::new(Mutex::new(Vec::new()));
-    let (s1, s2) = (sent.clone(), sent.clone());
+    let s1 = sent.clone();
     let mgr = ChannelManager::new(
         NET,
         RATE,
@@ -1132,29 +1120,27 @@ fn relaying_manager(
         Hooks {
             fund: Box::new(|_, _| Err("does not fund".into())),
             broadcast: Box::new(move |tx: &Transaction| {
-                s1.lock().unwrap().push((None, tx.clone()));
+                s1.lock().unwrap().push(tx.clone());
                 Ok(())
             }),
             sweep_address: Box::new(move || sweep),
             payout_address: Box::new(|| ACCEPTOR_PAYOUT),
-            replace: Box::new(move |old: &Transaction, new: &Transaction| {
-                s2.lock().unwrap().push((Some(old.txid()), new.clone()));
-                Ok(())
-            }),
         },
     );
     (mgr, sent)
 }
 
-/// M4: a penalty that stays unconfirmed climbs its fee ladder. The mempool has
-/// no replacement by fee, so each tier replaces the previous one in the
-/// node's own pool and is relayed; every tier pays the victim, its output never
-/// falls below the dust floor, the ladder stops at the cheater's delay, and any
-/// tier confirming settles the channel.
+/// M4: the network relays no replacement by fee, so a penalty cannot climb a
+/// fee ladder outside the node that built it: the first version other pools
+/// hold keeps every later one out. It pays the top fee from its first
+/// broadcast instead, is announced again at every block while unconfirmed,
+/// and settles once the revoked output is spent — by it, or by a version built
+/// before a restart that pays another address.
 #[test]
 #[cfg(feature = "audit")]
-fn an_unconfirmed_penalty_is_replaced_by_a_higher_fee_tier() {
-    use q21_core::channel::manager::{penalty_bump_interval, penalty_tier_fee};
+fn an_unconfirmed_penalty_pays_the_top_fee_at_once_and_is_announced_again() {
+    use q21_core::channel::txbuild::{penalty_fee, MAX_COMMIT_FEE_RATE, SWEEP_FEE};
+    use q21_core::consensus::WITNESS_DISCOUNT;
     let funder_seed = [0xf1u8; 32];
     let acceptor_seed = [0xf2u8; 32];
     let (mut p, _wallet, chain, dir, cid, _capacity) =
@@ -1180,63 +1166,53 @@ fn an_unconfirmed_penalty_is_replaced_by_a_higher_fee_tier() {
     let fee_of = |t: &Transaction| to_local - t.outputs[0].value.units();
     let no_depth = |_: &OutPoint| None;
 
-    // The revoked commitment confirms at height h: tier 0 goes out.
+    // The revoked commitment confirms at height h: the penalty goes out at
+    // the top fee, not at a tier it could never climb from.
     let h = 1_000u64;
     victim.on_connected_block(std::slice::from_ref(&revoked), h, &no_depth);
     assert_eq!(sent.lock().unwrap().len(), 1);
-    let tier0 = sent.lock().unwrap()[0].1.clone();
-    assert_eq!(fee_of(&tier0), penalty_tier_fee(0));
+    let penalty = sent.lock().unwrap()[0].clone();
+    let fee = fee_of(&penalty);
+    assert!(fee > SWEEP_FEE, "more than a plain sweep");
+    assert_eq!(fee, penalty_fee(&penalty));
+    assert_eq!(
+        fee * 1000 / penalty.weight(WITNESS_DISCOUNT),
+        MAX_COMMIT_FEE_RATE,
+        "the highest rate any commitment may pay"
+    );
+    assert_eq!(penalty.outputs[0].pubkey_hash, sweep);
 
-    // Unconfirmed for less than the interval: nothing more.
-    let every = penalty_bump_interval(DELAY);
-    assert!(every >= 1 && 2 * every < u64::from(DELAY));
-    for k in 1..every {
+    // Unconfirmed: the same transaction is announced again at every block,
+    // past the cheater's delay too, never a conflicting version.
+    let blocks = u64::from(DELAY) + 3;
+    for k in 1..=blocks {
         victim.on_connected_block(&[], h + k, &no_depth);
     }
-    assert_eq!(sent.lock().unwrap().len(), 1, "bumped too early");
+    let all = sent.lock().unwrap().clone();
+    assert_eq!(all.len() as u64, 1 + blocks, "announced at every block");
+    assert!(all.iter().all(|t| t.txid() == penalty.txid()));
+    assert_eq!(victim.info(cid).unwrap().phase, Phase::Penalised);
 
-    // After the interval, the next tier replaces it, paying more.
-    victim.on_connected_block(&[], h + every, &no_depth);
-    let (replaced, tier1) = sent.lock().unwrap()[1].clone();
-    assert_eq!(replaced, Some(tier0.txid()), "tier 1 replaces tier 0");
-    assert_eq!(tier1.inputs[0].prev_out, tier0.inputs[0].prev_out);
-    assert!(fee_of(&tier1) > fee_of(&tier0), "a higher fee");
-    assert_eq!(tier1.outputs[0].pubkey_hash, sweep);
+    // It is a valid spend on chain.
+    chain.lock().unwrap().mine(std::slice::from_ref(&revoked));
+    chain.lock().unwrap().mine(std::slice::from_ref(&penalty));
 
-    // And again, up to the top tier, never below the dust floor.
-    victim.on_connected_block(&[], h + 2 * every, &no_depth);
-    let (replaced, tier2) = sent.lock().unwrap()[2].clone();
-    assert_eq!(replaced, Some(tier1.txid()));
-    assert!(fee_of(&tier2) > fee_of(&tier1));
-    assert!(tier2.outputs[0].value.units() >= MIN_OUTPUT_VALUE);
-    for k in (2 * every + 1)..(u64::from(DELAY) + 4) {
-        victim.on_connected_block(&[], h + k, &no_depth);
-    }
-    assert_eq!(sent.lock().unwrap().len(), 3, "the ladder has three tiers");
-
-    // Why replace in our own pool: without replacement by fee, a pool holding
-    // one tier refuses the next as a conflicting spend. Dropped first, the
-    // higher tier is admitted.
-    {
-        use q21_core::mempool::{Mempool, MempoolError};
-        let mut c = chain.lock().unwrap();
-        c.mine(std::slice::from_ref(&revoked));
-        let (utxo, height) = (&c.chain.utxo, c.chain.height());
-        let mut pool = Mempool::new();
-        pool.accept_local(&tier0, utxo, NET, height).unwrap();
-        assert!(matches!(
-            pool.accept_local(&tier1, utxo, NET, height),
-            Err(MempoolError::SpendConflict(_))
-        ));
-        pool.remove(&tier0.txid());
-        pool.accept_local(&tier1, utxo, NET, height)
-            .expect("the higher tier once the lower one is dropped");
-    }
-    // Every tier is a valid spend on chain: the top one confirms.
-    chain.lock().unwrap().mine(std::slice::from_ref(&tier2));
-    // A lower tier confirming (still held by some other node) settles too.
-    victim.on_connected_block(std::slice::from_ref(&tier0), h + 40, &no_depth);
-    assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
+    // A penalty built before a restart, paying another address, settles it
+    // just the same, without an alert.
+    drop(victim);
+    let (other, other_sent) =
+        relaying_manager(acceptor_seed, &dir.join("acceptor"), Hash256([0x7c; 32]));
+    other.on_connected_block(std::slice::from_ref(&revoked), h, &no_depth);
+    let rebuilt = other_sent.lock().unwrap()[0].clone();
+    assert_ne!(rebuilt.txid(), penalty.txid());
+    other.on_connected_block(std::slice::from_ref(&penalty), h + 1, &no_depth);
+    assert_eq!(other.info(cid).unwrap().phase, Phase::Closed);
+    other.on_connected_block(&[], h + 2, &no_depth);
+    assert_eq!(
+        other_sent.lock().unwrap().len(),
+        1,
+        "nothing more once settled"
+    );
 }
 
 /// M5: the block holding the counterparty's latest commitment is disconnected
@@ -1281,7 +1257,7 @@ fn a_revoked_commitment_that_replaces_a_reorged_spend_is_punished() {
             Phase::Penalised,
             "the revoked replacement is punished (told_of_disconnect={told_of_disconnect})"
         );
-        let penalty = sent.lock().unwrap().last().unwrap().1.clone();
+        let penalty = sent.lock().unwrap().last().unwrap().clone();
         assert_eq!(penalty.outputs[0].pubkey_hash, sweep);
         assert!(revoked
             .outputs
@@ -1761,7 +1737,6 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
             }),
             sweep_address: real.sweep_address,
             payout_address: real.payout_address,
-            replace: real.replace,
         },
     );
     let acceptor = ChannelManager::new(
@@ -1814,7 +1789,7 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
     let (back, again) = relaying_manager(funder_seed, &dir.join("f"), Hash256([4; 32]));
     back.rescan(500, &|_| None, &|_| None);
     assert_eq!(again.lock().unwrap().len(), 1);
-    assert_eq!(again.lock().unwrap()[0].1, first);
+    assert_eq!(again.lock().unwrap()[0], first);
 }
 
 /// The acceptor opens a channel only on the real funding output: when the

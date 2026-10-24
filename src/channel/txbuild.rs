@@ -368,6 +368,19 @@ pub fn standard_close_weight(params: &ChannelParams) -> u64 {
     tx.weight(WITNESS_DISCOUNT)
 }
 
+/// The fee a penalty pays: the highest fee rate a commitment may pay
+/// ([`MAX_COMMIT_FEE_RATE`]) over the penalty's own weight, and never less
+/// than the sweep fee. [`penalty_tx`] still caps it at the dust floor.
+///
+/// The highest rate from the first broadcast, because it cannot be raised
+/// later: the network relays no replacement by fee, so a cheaper first
+/// version, once in other nodes' pools, would keep any better-paying one out
+/// until it confirmed or was evicted. Whatever fee level gets the channel's
+/// commitments mined gets the penalty mined too.
+pub fn penalty_fee(penalty: &Transaction) -> u64 {
+    (MAX_COMMIT_FEE_RATE.saturating_mul(penalty.weight(WITNESS_DISCOUNT)) / 1000).max(SWEEP_FEE)
+}
+
 /// The range of cooperative-close fees a party accepts, in units: from the
 /// relay minimum rate to [`MAX_COMMIT_FEE_RATE`] over the close's weight, and
 /// never less than the sweep fee at the top, which every node proposes.

@@ -75,27 +75,32 @@ fn hooks(wallet: Arc<Mutex<Wallet>>, node: Node, pending: Pending, can_fund: boo
         },
     );
     let p_b = pending.clone();
+    // As a mempool would: one already held is not added twice, and one that
+    // spends what a held one spends is refused.
     let broadcast = Box::new(move |tx: &Transaction| -> Result<(), String> {
-        p_b.lock().unwrap().push(tx.clone());
+        let mut p = p_b.lock().unwrap();
+        if p.iter().any(|t| t.txid() == tx.txid()) {
+            return Ok(());
+        }
+        if p.iter().any(|t| {
+            t.inputs
+                .iter()
+                .any(|i| tx.inputs.iter().any(|j| j.prev_out == i.prev_out))
+        }) {
+            return Err("spend conflict".into());
+        }
+        p.push(tx.clone());
         Ok(())
     });
     let w_s = wallet.clone();
     let sweep_address = Box::new(move || w_s.lock().unwrap().new_address().hash);
     let w_p = wallet.clone();
     let payout_address = Box::new(move || w_p.lock().unwrap().new_address().hash);
-    let p_r = pending.clone();
-    let replace = Box::new(move |old: &Transaction, new: &Transaction| {
-        let mut p = p_r.lock().unwrap();
-        p.retain(|t| t.txid() != old.txid());
-        p.push(new.clone());
-        Ok(())
-    });
     Hooks {
         fund,
         broadcast,
         sweep_address,
         payout_address,
-        replace,
     }
 }
 
