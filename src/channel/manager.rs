@@ -82,6 +82,11 @@ pub fn penalty_tier_fee(tier: usize) -> u64 {
     CLOSE_FEE.saturating_mul(t.multiplier())
 }
 
+/// The chain oracle the block hook and the startup rescan receive: for an
+/// unspent outpoint, its confirmation depth (`1` in the tip) and the output
+/// itself; `None` once it is spent or absent.
+pub type DepthOf<'a> = dyn Fn(&OutPoint) -> Option<(u64, TxOut)> + 'a;
+
 /// What the node must do for the manager when the chain is involved.
 pub struct Hooks {
     pub fund: Box<FundFn>,
@@ -1024,7 +1029,7 @@ impl ChannelManager {
         &self,
         txs: &[Transaction],
         height: u64,
-        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
+        depth_of: &DepthOf,
     ) -> Vec<(u64, Vec<u8>)> {
         self.react_to_spends(txs, height);
         let frames = self.confirm_buried(height, depth_of);
@@ -1051,7 +1056,7 @@ impl ChannelManager {
         &self,
         tip: u64,
         txs_at: &dyn Fn(u64) -> Option<Vec<Transaction>>,
-        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
+        depth_of: &DepthOf,
     ) {
         let start = {
             let g = self.inner.lock().unwrap();
@@ -1089,7 +1094,7 @@ impl ChannelManager {
 
     /// Broadcasts, once, every transaction a channel still waits on (see
     /// [`ChannelManager::rescan`]).
-    fn resume_after_restart(&self, depth_of: &dyn Fn(&OutPoint) -> Option<u64>) {
+    fn resume_after_restart(&self, depth_of: &DepthOf) {
         let mut pending: Vec<(Transaction, &'static str)> = Vec::new();
         {
             let g = self.inner.lock().unwrap();
@@ -1274,18 +1279,14 @@ impl ChannelManager {
 
     /// Confirms the funding of every channel buried to its agreed depth, moving
     /// it to open and returning the `ready` frame to send its peer.
-    fn confirm_buried(
-        &self,
-        height: u64,
-        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
-    ) -> Vec<(u64, Vec<u8>)> {
+    fn confirm_buried(&self, height: u64, depth_of: &DepthOf) -> Vec<(u64, Vec<u8>)> {
         let mut g = self.inner.lock().unwrap();
         // Where each funding confirmed, journaled once: a restarted node scans
         // from there for a spend it missed while down. Recorded for any channel
         // whose funding is on chain, so one opened before this was journaled
         // gets it at the next block.
         for c in g.channels.values_mut() {
-            if let Some(depth) = c.machine.funding_outpoint().and_then(|op| depth_of(&op)) {
+            if let Some((depth, _)) = c.machine.funding_outpoint().and_then(|op| depth_of(&op)) {
                 let at = height.saturating_add(1).saturating_sub(depth);
                 if c.machine.funding_height() != Some(at) {
                     let _ = c.machine.note_funding_height(at);
@@ -1304,7 +1305,20 @@ impl ChannelManager {
             })
             .filter_map(|c| {
                 let op = c.machine.funding_outpoint()?;
-                let depth = depth_of(&op)?;
+                let (depth, output) = depth_of(&op)?;
+                // The outpoint the funder named must be the channel's funding
+                // output: the 2-of-2 policy, for the whole capacity. Any other
+                // output would open a channel that nothing on chain backs.
+                if output != c.machine.funding_output() {
+                    if depth == 1 {
+                        eprintln!(
+                            "ALERT: channel {}: the announced funding output is not the \
+                             channel's 2-of-2 output for its capacity; not opening",
+                            c.machine.channel_id().to_hex()
+                        );
+                    }
+                    return None;
+                }
                 (depth >= u64::from(c.machine.funding_depth()))
                     .then_some((c.machine.channel_id(), c.peer))
             })
@@ -1528,6 +1542,13 @@ impl ChannelManager {
         g.channels.get(&cid).map(summary)
     }
 
+    /// The funding output a channel expects on chain: the 2-of-2 policy for
+    /// its whole capacity.
+    pub fn funding_output_of(&self, cid: Hash256) -> Option<TxOut> {
+        let g = self.inner.lock().unwrap();
+        g.channels.get(&cid).map(|c| c.machine.funding_output())
+    }
+
     /// The peer a channel is with.
     pub fn peer_of(&self, cid: Hash256) -> Option<u64> {
         let g = self.inner.lock().unwrap();
@@ -1654,7 +1675,7 @@ impl crate::net::ChannelSink for ChannelManager {
         &self,
         txs: &[Transaction],
         height: u64,
-        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
+        depth_of: &DepthOf,
     ) -> Vec<(u64, Vec<u8>)> {
         ChannelManager::on_connected_block(self, txs, height, depth_of)
     }
@@ -1671,7 +1692,7 @@ impl crate::net::ChannelSink for ChannelManager {
         &self,
         tip: u64,
         txs_at: &dyn Fn(u64) -> Option<Vec<Transaction>>,
-        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
+        depth_of: &DepthOf,
     ) {
         ChannelManager::rescan(self, tip, txs_at, depth_of)
     }

@@ -63,12 +63,12 @@ impl SharedChain {
     }
     /// The confirmation depth of an unspent outpoint (`1` in the tip), as the
     /// node's depth oracle computes it.
-    fn depth_of(&self, op: &OutPoint) -> Option<u64> {
+    fn depth_of(&self, op: &OutPoint) -> Option<(u64, TxOut)> {
         let h = self.chain.height();
         self.chain
             .utxo
             .get(op)
-            .map(|e| h.saturating_sub(e.height).saturating_add(1))
+            .map(|e| (h.saturating_sub(e.height).saturating_add(1), e.output))
     }
 }
 
@@ -126,7 +126,7 @@ fn drive(mgr: &ChannelManager, chain: &Arc<Mutex<SharedChain>>) -> Vec<(u64, Vec
     all
 }
 
-fn chain_depth(chain: &Arc<Mutex<SharedChain>>, op: &OutPoint) -> Option<u64> {
+fn chain_depth(chain: &Arc<Mutex<SharedChain>>, op: &OutPoint) -> Option<(u64, TxOut)> {
     chain.lock().unwrap().depth_of(op)
 }
 
@@ -222,6 +222,11 @@ struct Pair {
 }
 
 impl Pair {
+    /// The funding output of `cid` as the funder's channel defines it.
+    fn funder_funding_output(&self, cid: Hash256) -> TxOut {
+        self.funder.funding_output_of(cid).expect("a channel")
+    }
+
     /// Rebuilds the funder's manager from its journal directory, as a crash and
     /// restart would — the reloaded manager replays its channels from disk.
     fn reload_funder(
@@ -1815,4 +1820,59 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
     back.rescan(500, &|_| None, &|_| None);
     assert_eq!(again.lock().unwrap().len(), 1);
     assert_eq!(again.lock().unwrap()[0].1, first);
+}
+
+/// The acceptor opens a channel only on the real funding output: when the
+/// outpoint the funder named holds anything but the 2-of-2 policy output for
+/// the whole capacity, the channel never opens, however deep it is buried.
+#[test]
+fn a_channel_opens_only_on_its_real_funding_output() {
+    let funder_seed = [0xc7u8; 32];
+    let acceptor_seed = [0xc8u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("fake-funding");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet,
+        chain,
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = 4 * MIN_OUTPUT_VALUE * 10;
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.acceptor.list()[0].channel_id;
+    let real = p.acceptor.list()[0].funding.is_some();
+    assert!(real, "the acceptor learned the funding outpoint");
+    let funding_output = TxOut {
+        value: Amount::from_units(capacity),
+        ..p.funder_funding_output(cid)
+    };
+    let wrong = [
+        // An ordinary key output of the right value.
+        TxOut {
+            scheme: SchemeId::MlDsa87,
+            ..funding_output
+        },
+        // The right policy, too little.
+        TxOut {
+            value: Amount::from_units(capacity - 1),
+            ..funding_output
+        },
+        // Another policy.
+        TxOut {
+            pubkey_hash: Hash256([0x42; 32]),
+            ..funding_output
+        },
+    ];
+    for out in wrong {
+        p.acceptor
+            .on_connected_block(&[], 900, &|_| Some((50, out)));
+        assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Opening);
+    }
+    p.acceptor
+        .on_connected_block(&[], 900, &|_| Some((50, funding_output)));
+    assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
 }

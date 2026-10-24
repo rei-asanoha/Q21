@@ -674,6 +674,19 @@ impl Machine {
             txid: *funding_txid,
             index: *funding_index,
         };
+        // One funding per channel. The same Funding again (its answer was
+        // lost) is answered again; another outpoint is refused rather than
+        // overwriting the first.
+        if let Some(known) = self.funding_outpoint {
+            if known != outpoint || self.local_commit_number != Some(0) {
+                return Err(ChannelError::Unexpected);
+            }
+            let bal = [self.params.capacity.units(), 0];
+            self.verify_our_commitment(0, bal, tier_sigs)?;
+            return Ok(Message::FundingSigned {
+                tier_sigs: self.sign_their_commitment(0, bal)?,
+            });
+        }
         self.set_funding(outpoint)?;
         let bal = [self.params.capacity.units(), 0];
         // INV2: persist their signature over our commitment 0 before we

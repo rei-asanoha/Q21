@@ -1087,7 +1087,7 @@ pub trait ChannelSink: Send + Sync {
         &self,
         _txs: &[crate::tx::Transaction],
         _height: u64,
-        _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+        _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<(u64, crate::tx::TxOut)>,
     ) -> Vec<(u64, Vec<u8>)> {
         Vec::new()
     }
@@ -1114,7 +1114,7 @@ pub trait ChannelSink: Send + Sync {
         &self,
         _tip: u64,
         _txs_at: &dyn Fn(u64) -> Option<Vec<crate::tx::Transaction>>,
-        _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+        _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<(u64, crate::tx::TxOut)>,
     ) {
     }
 }
@@ -1398,12 +1398,12 @@ impl Node {
                 let g = self.shared.lock().unwrap();
                 g.chain.block_at(h).map(|b| b.transactions)
             };
-            let depth_of = |op: &crate::tx::OutPoint| -> Option<u64> {
+            let depth_of = |op: &crate::tx::OutPoint| {
                 let g = self.shared.lock().unwrap();
                 g.chain
                     .utxo
                     .get(op)
-                    .map(|e| tip.saturating_sub(e.height).saturating_add(1))
+                    .map(|e| (tip.saturating_sub(e.height).saturating_add(1), e.output))
             };
             sink.rescan(tip, &txs_at, &depth_of);
             self.drive_channels(&sink, &[]);
@@ -1415,12 +1415,12 @@ impl Node {
     /// it returns. Off the chain lock, so the component may sign and broadcast.
     fn drive_channels(&self, sink: &Arc<dyn ChannelSink>, txs: &[crate::tx::Transaction]) {
         let height = self.shared.lock().unwrap().chain.height();
-        let depth_of = |op: &crate::tx::OutPoint| -> Option<u64> {
+        let depth_of = |op: &crate::tx::OutPoint| {
             let g = self.shared.lock().unwrap();
             g.chain
                 .utxo
                 .get(op)
-                .map(|e| height.saturating_sub(e.height).saturating_add(1))
+                .map(|e| (height.saturating_sub(e.height).saturating_add(1), e.output))
         };
         let frames = sink.on_connected_block(txs, height, &depth_of);
         for (peer, frame) in frames {
@@ -5562,7 +5562,7 @@ mod tests_hardening {
             &self,
             txs: &[crate::tx::Transaction],
             _height: u64,
-            _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+            _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<(u64, crate::tx::TxOut)>,
         ) -> Vec<(u64, Vec<u8>)> {
             self.blocks.fetch_add(1, Ordering::SeqCst);
             self.txs.fetch_add(txs.len() as u64, Ordering::SeqCst);
@@ -5586,7 +5586,7 @@ mod tests_hardening {
             &self,
             txs: &[crate::tx::Transaction],
             _height: u64,
-            _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+            _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<(u64, crate::tx::TxOut)>,
         ) -> Vec<(u64, Vec<u8>)> {
             let mut c = self.connected.lock().unwrap();
             c.extend(txs.iter().map(|t| t.txid()));

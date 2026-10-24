@@ -2352,3 +2352,58 @@ fn our_own_close_fee_is_bounded_too() {
     assert_eq!(f.phase(), Phase::Open);
     assert!(f.propose_close(20_000).is_ok());
 }
+
+/// One funding per channel: a second Funding naming another outpoint is
+/// refused instead of overwriting the first; the same Funding again is
+/// answered again.
+#[test]
+fn a_second_funding_is_refused() {
+    let dir = tmpdir();
+    let f_signer = fkey();
+    let a_signer = akey();
+    let a_pub = a_signer.pubkey().to_vec();
+    let payout = Hash256([0xf0u8; 32]);
+    let (mut f, open) = Machine::new_funder(
+        dir.join("f.jrnl"),
+        NET,
+        f_signer,
+        a_pub,
+        CAP,
+        DELAY,
+        DEPTH,
+        RATE,
+        payout,
+        payout,
+    )
+    .unwrap();
+    let (mut a, accept) = Machine::accept(
+        dir.join("a.jrnl"),
+        NET,
+        a_signer,
+        RATE,
+        &open,
+        payout,
+        payout,
+    )
+    .unwrap();
+    f.on_accept(&accept).unwrap();
+    // A replayed Accept is refused by the engine: it never funds twice.
+    assert_eq!(f.on_accept(&accept), Err(ChannelError::Unexpected));
+    let outpoint = OutPoint {
+        txid: Hash256([9u8; 32]),
+        index: 0,
+    };
+    let funding = f.funding_created(outpoint).unwrap();
+    let signed = a.on_funding(&funding).unwrap();
+    assert_eq!(
+        a.on_funding(&funding).unwrap(),
+        signed,
+        "the same Funding again"
+    );
+    let mut other = funding.clone();
+    if let Message::Funding { funding_txid, .. } = &mut other {
+        *funding_txid = Hash256([7u8; 32]);
+    }
+    assert_eq!(a.on_funding(&other), Err(ChannelError::Unexpected));
+    assert_eq!(a.funding_outpoint(), Some(outpoint), "not overwritten");
+}
