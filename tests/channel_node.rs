@@ -186,6 +186,7 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
         broadcast,
         sweep_address: Box::new(|| FUNDER_PAYOUT),
         payout_address: Box::new(|| FUNDER_PAYOUT),
+        replace: mining_replace(chain),
     }
 }
 
@@ -205,7 +206,17 @@ fn acceptor_hooks(chain: Arc<Mutex<SharedChain>>, sweep: Hash256) -> Hooks {
         }),
         sweep_address: Box::new(move || sweep),
         payout_address: Box::new(|| ACCEPTOR_PAYOUT),
+        replace: mining_replace(chain),
     }
+}
+
+/// A replacement hook that mines the new version at once, as the broadcast
+/// hooks here do.
+fn mining_replace(chain: Arc<Mutex<SharedChain>>) -> Box<q21_core::channel::manager::ReplaceFn> {
+    Box::new(move |_old: &Transaction, new: &Transaction| {
+        chain.lock().unwrap().mine(std::slice::from_ref(new));
+        Ok(())
+    })
 }
 
 struct Pair {
@@ -1096,4 +1107,120 @@ fn only_a_verified_reestablish_rebinds_a_channel_to_another_connection() {
         p.funder.info(cid).unwrap().state_number,
         p.acceptor.info(cid).unwrap().state_number
     );
+}
+
+/// M4: a penalty that stays unconfirmed climbs its fee ladder. The mempool has
+/// no replacement by fee, so each tier replaces the previous one in the
+/// node's own pool and is relayed; every tier pays the victim, its output never
+/// falls below the dust floor, the ladder stops at the cheater's delay, and any
+/// tier confirming settles the channel.
+#[test]
+#[cfg(feature = "audit")]
+fn an_unconfirmed_penalty_is_replaced_by_a_higher_fee_tier() {
+    use q21_core::channel::manager::{penalty_bump_interval, penalty_tier_fee};
+    let funder_seed = [0xf1u8; 32];
+    let acceptor_seed = [0xf2u8; 32];
+    let (mut p, _wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "m4-bump");
+    for amt in [700_000u64, 700_000] {
+        let m = p.funder.pay(cid, amt).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+    }
+    let state = p.funder.info(cid).unwrap().state_number;
+    let revoked = p.funder.signed_commitment(cid, state - 1).unwrap();
+
+    // The victim's node, reloaded with hooks that relay without mining, as a
+    // congested network would leave a penalty waiting.
+    type Sent = Arc<Mutex<Vec<(Option<Hash256>, Transaction)>>>;
+    let sent: Sent = Arc::new(Mutex::new(Vec::new()));
+    let (s1, s2) = (sent.clone(), sent.clone());
+    let sweep = Hash256([0x7bu8; 32]);
+    let victim = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("acceptor"),
+        DELAY,
+        DEPTH,
+        Hooks {
+            fund: Box::new(|_, _| Err("does not fund".into())),
+            broadcast: Box::new(move |tx: &Transaction| {
+                s1.lock().unwrap().push((None, tx.clone()));
+                Ok(())
+            }),
+            sweep_address: Box::new(move || sweep),
+            payout_address: Box::new(|| ACCEPTOR_PAYOUT),
+            replace: Box::new(move |old: &Transaction, new: &Transaction| {
+                s2.lock().unwrap().push((Some(old.txid()), new.clone()));
+                Ok(())
+            }),
+        },
+    );
+    let to_local = revoked
+        .outputs
+        .iter()
+        .find(|o| o.scheme == SchemeId::Policy)
+        .map(|o| o.value.units())
+        .expect("the revoked commitment has a to_local");
+    let fee_of = |t: &Transaction| to_local - t.outputs[0].value.units();
+    let no_depth = |_: &OutPoint| None;
+
+    // The revoked commitment confirms at height h: tier 0 goes out.
+    let h = 1_000u64;
+    victim.on_connected_block(std::slice::from_ref(&revoked), h, &no_depth);
+    assert_eq!(sent.lock().unwrap().len(), 1);
+    let tier0 = sent.lock().unwrap()[0].1.clone();
+    assert_eq!(fee_of(&tier0), penalty_tier_fee(0));
+
+    // Unconfirmed for less than the interval: nothing more.
+    let every = penalty_bump_interval(DELAY);
+    assert!(every >= 1 && 2 * every < u64::from(DELAY));
+    for k in 1..every {
+        victim.on_connected_block(&[], h + k, &no_depth);
+    }
+    assert_eq!(sent.lock().unwrap().len(), 1, "bumped too early");
+
+    // After the interval, the next tier replaces it, paying more.
+    victim.on_connected_block(&[], h + every, &no_depth);
+    let (replaced, tier1) = sent.lock().unwrap()[1].clone();
+    assert_eq!(replaced, Some(tier0.txid()), "tier 1 replaces tier 0");
+    assert_eq!(tier1.inputs[0].prev_out, tier0.inputs[0].prev_out);
+    assert!(fee_of(&tier1) > fee_of(&tier0), "a higher fee");
+    assert_eq!(tier1.outputs[0].pubkey_hash, sweep);
+
+    // And again, up to the top tier, never below the dust floor.
+    victim.on_connected_block(&[], h + 2 * every, &no_depth);
+    let (replaced, tier2) = sent.lock().unwrap()[2].clone();
+    assert_eq!(replaced, Some(tier1.txid()));
+    assert!(fee_of(&tier2) > fee_of(&tier1));
+    assert!(tier2.outputs[0].value.units() >= MIN_OUTPUT_VALUE);
+    for k in (2 * every + 1)..(u64::from(DELAY) + 4) {
+        victim.on_connected_block(&[], h + k, &no_depth);
+    }
+    assert_eq!(sent.lock().unwrap().len(), 3, "the ladder has three tiers");
+
+    // Why replace in our own pool: without replacement by fee, a pool holding
+    // one tier refuses the next as a conflicting spend. Dropped first, the
+    // higher tier is admitted.
+    {
+        use q21_core::mempool::{Mempool, MempoolError};
+        let mut c = chain.lock().unwrap();
+        c.mine(std::slice::from_ref(&revoked));
+        let (utxo, height) = (&c.chain.utxo, c.chain.height());
+        let mut pool = Mempool::new();
+        pool.accept_local(&tier0, utxo, NET, height).unwrap();
+        assert!(matches!(
+            pool.accept_local(&tier1, utxo, NET, height),
+            Err(MempoolError::SpendConflict(_))
+        ));
+        pool.remove(&tier0.txid());
+        pool.accept_local(&tier1, utxo, NET, height)
+            .expect("the higher tier once the lower one is dropped");
+    }
+    // Every tier is a valid spend on chain: the top one confirms.
+    chain.lock().unwrap().mine(std::slice::from_ref(&tier2));
+    // A lower tier confirming (still held by some other node) settles too.
+    victim.on_connected_block(std::slice::from_ref(&tier0), h + 40, &no_depth);
+    assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
 }

@@ -95,11 +95,19 @@ fn hooks(wallet: Arc<Mutex<Wallet>>, node: Node, pending: Pending, can_fund: boo
     let sweep_address = Box::new(move || w_s.lock().unwrap().new_address().hash);
     let w_p = wallet.clone();
     let payout_address = Box::new(move || w_p.lock().unwrap().new_address().hash);
+    let p_r = pending.clone();
+    let replace = Box::new(move |old: &Transaction, new: &Transaction| {
+        let mut p = p_r.lock().unwrap();
+        p.retain(|t| t.txid() != old.txid());
+        p.push(new.clone());
+        Ok(())
+    });
     Hooks {
         fund,
         broadcast,
         sweep_address,
         payout_address,
+        replace,
     }
 }
 

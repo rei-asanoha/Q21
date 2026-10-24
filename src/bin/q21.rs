@@ -4771,6 +4771,32 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 h
             });
 
+            // A penalty climbing its fee ladder. The mempool has no
+            // replacement by fee: our own pool would refuse the higher tier as
+            // a conflict with the lower one it keeps (a local transaction is
+            // never evicted here), so the lower tier is dropped from it first,
+            // then the higher one is admitted and relayed. Should admission
+            // fail, the lower tier goes back.
+            let n_r = node.clone();
+            let replace = Box::new(
+                move |old: &Transaction, new: &Transaction| -> Result<(), String> {
+                    let txid = n_r.with_chain_and_mempool(|c, m| {
+                        let removed = m.remove(&old.txid()).is_some();
+                        match m.accept_local(new, &c.utxo, network, c.height()) {
+                            Ok(id) => Ok(id),
+                            Err(e) => {
+                                if removed {
+                                    let _ = m.accept_local(old, &c.utxo, network, c.height());
+                                }
+                                Err(format!("{e:?}"))
+                            }
+                        }
+                    })?;
+                    n_r.announce_tx(txid);
+                    Ok(())
+                },
+            );
+
             let mgr = std::sync::Arc::new(ChannelManager::new(
                 network,
                 q21_core::mempool::MIN_FEE_RATE,
@@ -4783,6 +4809,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     broadcast,
                     sweep_address,
                     payout_address,
+                    replace,
                 },
             ));
             node.set_channel_sink(mgr.clone());
