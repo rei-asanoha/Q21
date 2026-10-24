@@ -4399,6 +4399,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mldsa")]
     /// A context whose wallet uses `scheme` and holds `coins` mature coins.
     fn context_with_coins(scheme: crate::sig::SchemeId, coins: u64) -> RpcContext {
         let c = context_with_funds();
@@ -4525,6 +4526,7 @@ mod tests {
         assert!(m.contains("insufficient"), "{m}");
     }
 
+    #[cfg(feature = "mldsa")]
     /// The inputs of a send, as `txid:index`.
     fn inputs_of(r: &Json) -> Vec<String> {
         r.get("transaction")
@@ -4542,6 +4544,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "mldsa")]
     /// Mines the pending transactions as a block template would, and connects
     /// the block. Returns how many went in.
     fn mine_pending(c: &RpcContext) -> usize {
