@@ -215,6 +215,14 @@ enum CloseTracker {
     },
 }
 
+/// Channels not yet funded on chain, across all peers. Each holds a journal
+/// and is reloaded at every start until it opens or expires.
+pub const MAX_UNFUNDED_CHANNELS: usize = 32;
+/// How long a channel may wait for its funding before it is forgotten, its
+/// journal deleted — only when nothing is at stake: our side accepted it and
+/// put nothing in, or we fund it and never broadcast the funding.
+pub const UNFUNDED_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// Opens in progress from one announced identity, whatever its connections.
 pub const MAX_PENDING_PER_IDENTITY: usize = 2;
 
@@ -262,6 +270,8 @@ struct Inner {
     next_index: u32,
     /// See [`PENDING_OPEN_TTL`]; shortened by tests.
     pending_ttl: std::time::Duration,
+    /// See [`UNFUNDED_TTL`]; shortened by tests.
+    unfunded_ttl: std::time::Duration,
     /// A wallet payout address offered in a Hello or HelloBack and not yet
     /// used by a channel: offered again until one is, so opens that never
     /// complete do not grow the wallet by an address each.
@@ -274,6 +284,14 @@ impl Inner {
         let ttl = self.pending_ttl;
         self.pending_funder.retain(|_, p| p.since.elapsed() < ttl);
         self.pending_acceptor.retain(|_, p| p.since.elapsed() < ttl);
+    }
+
+    /// Channels whose funding is not on chain yet.
+    fn unfunded(&self) -> usize {
+        self.channels
+            .values()
+            .filter(|c| matches!(c.machine.phase(), Phase::Opening | Phase::Funded))
+            .count()
     }
 
     /// Channels held with a peer, known by its connection id or its durable
@@ -336,6 +354,7 @@ impl ChannelManager {
                 next_index: 0,
                 pending_ttl: PENDING_OPEN_TTL,
                 spare_payout: None,
+                unfunded_ttl: UNFUNDED_TTL,
             }),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
@@ -575,6 +594,9 @@ impl ChannelManager {
         if g.channels_with(peer, peer_identity) >= MAX_CHANNELS_PER_PEER {
             return Err("too many channels with this peer".into());
         }
+        if g.unfunded() >= MAX_UNFUNDED_CHANNELS {
+            return Err("too many channels waiting for their funding".into());
+        }
         let index = g.next_index;
         if index >= ACCEPTOR_INDEX_BASE {
             return Err("channel key indices exhausted".into());
@@ -779,7 +801,10 @@ impl ChannelManager {
                     .filter(|(p, a)| **p != peer && a.peer_identity == peer_identity)
                     .count()
                     >= MAX_PENDING_PER_IDENTITY;
-            !full && !same_identity && g.channels_with(peer, peer_identity) < MAX_CHANNELS_PER_PEER
+            !full
+                && !same_identity
+                && g.channels_with(peer, peer_identity) < MAX_CHANNELS_PER_PEER
+                && g.unfunded() < MAX_UNFUNDED_CHANNELS
         };
         if !admitted(&mut self.inner.lock().unwrap()) {
             return Ok(Vec::new());
@@ -1179,7 +1204,61 @@ impl ChannelManager {
         self.react_to_spends(txs, height);
         let frames = self.confirm_buried(height, depth_of);
         self.advance_closes(txs, height);
+        self.expire_unfunded(depth_of);
         frames
+    }
+
+    /// Shortens how long a channel may wait for its funding (see
+    /// [`UNFUNDED_TTL`]), for tests.
+    #[doc(hidden)]
+    pub fn set_unfunded_ttl(&self, ttl: std::time::Duration) {
+        self.inner.lock().unwrap().unfunded_ttl = ttl;
+    }
+
+    /// Forgets the channels that waited longer than [`UNFUNDED_TTL`] for a
+    /// funding that is not on chain, deleting their journals — only those
+    /// where nothing of ours is at stake: a channel we accepted (the funder
+    /// alone puts funds in, and keeps our signature over its first commitment
+    /// to recover them), or one we fund whose funding was never broadcast
+    /// (we never received the acceptor's signature). A channel we funded and
+    /// broadcast is kept: should its funding confirm late, our commitment is
+    /// how the capacity comes back.
+    fn expire_unfunded(&self, depth_of: &DepthOf) {
+        let mut g = self.inner.lock().unwrap();
+        let ttl = g.unfunded_ttl;
+        let stale: Vec<Hash256> = g
+            .channels
+            .values()
+            .filter(|c| matches!(c.machine.phase(), Phase::Opening | Phase::Funded))
+            .filter(|c| {
+                c.machine.our_index() == crate::channel::txbuild::ACCEPTOR
+                    || c.machine.local_commit_number().is_none()
+            })
+            .filter(|c| {
+                c.machine
+                    .funding_outpoint()
+                    .map_or(true, |op| depth_of(&op).is_none())
+            })
+            .filter(|c| {
+                let path = self.journal_path(c.machine.channel_id());
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age >= ttl)
+            })
+            .map(|c| c.machine.channel_id())
+            .collect();
+        for cid in stale {
+            g.channels.remove(&cid);
+            let _ = std::fs::remove_file(self.journal_path(cid));
+            let _ = std::fs::remove_file(self.peer_identity_path(cid));
+            eprintln!(
+                "channel {}: never funded; forgotten after waiting {}s",
+                cid.to_hex(),
+                ttl.as_secs()
+            );
+        }
     }
 
     /// Catches up, at startup, with what happened on chain while the node was

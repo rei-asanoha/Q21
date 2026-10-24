@@ -2036,3 +2036,136 @@ fn pending_opens_are_bounded_per_identity() {
     }
     assert_eq!(acceptor.pending_opens().1, MAX_PENDING_PER_IDENTITY);
 }
+
+// --- Unfunded channels ------------------------------------------------------
+
+/// A channel whose funding never comes is forgotten after a while, its
+/// journal deleted, when nothing of ours is at stake: on the acceptor's side,
+/// and on the funder's before it ever broadcast the funding. A funder that
+/// did broadcast keeps it.
+#[test]
+fn unfunded_channels_expire_when_nothing_is_at_stake() {
+    let funder_seed = [0xdbu8; 32];
+    let acceptor_seed = [0xdcu8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("unfunded-expiry");
+    let p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet,
+        chain,
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let one = |r: q21_core::channel::manager::Reaction| -> Vec<u8> {
+        assert_eq!(r.penalize, 0);
+        r.frames.into_iter().next().expect("a frame")
+    };
+    // Opened as far as the acceptor's Accept; the funder never answers.
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    let hello_back = one(p.acceptor.deliver(F_PEER, "", &hello));
+    let open = one(p.funder.deliver(A_PEER, "", &hello_back));
+    let _accept = one(p.acceptor.deliver(F_PEER, "", &open));
+    let cid = p.acceptor.list()[0].channel_id;
+    let journals = |side: &str| {
+        std::fs::read_dir(dir.join(side))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jrnl"))
+            .count()
+    };
+    assert_eq!((journals("acceptor"), journals("funder")), (1, 1));
+    // Not yet expired.
+    p.acceptor.on_connected_block(&[], 900, &|_| None);
+    assert!(p.acceptor.info(cid).is_some());
+    // Expired: forgotten on both sides, journals gone.
+    p.acceptor.set_unfunded_ttl(std::time::Duration::ZERO);
+    p.funder.set_unfunded_ttl(std::time::Duration::ZERO);
+    p.acceptor.on_connected_block(&[], 901, &|_| None);
+    p.funder.on_connected_block(&[], 901, &|_| None);
+    assert!(p.acceptor.info(cid).is_none());
+    assert!(p.funder.info(cid).is_none());
+    assert_eq!((journals("acceptor"), journals("funder")), (0, 0));
+}
+
+/// A funder that broadcast its funding keeps the channel, however long the
+/// funding takes: its commitment is how the capacity comes back.
+#[test]
+fn a_broadcast_funding_is_never_forgotten() {
+    let funder_seed = [0xddu8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("unfunded-kept");
+    std::fs::create_dir_all(dir.join("funder")).unwrap();
+    std::fs::create_dir_all(dir.join("acceptor")).unwrap();
+    let acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        [0xdeu8; 32],
+        dir.join("acceptor"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+    );
+    // Broadcasts go nowhere: the funding never confirms.
+    let funder = ChannelManager::new(
+        NET,
+        RATE,
+        funder_seed,
+        dir.join("funder"),
+        DELAY,
+        DEPTH,
+        Hooks {
+            broadcast: Box::new(|_| Ok(())),
+            ..funder_hooks(wallet, chain)
+        },
+    );
+    let mut p = Pair {
+        funder,
+        acceptor,
+        queue: VecDeque::new(),
+    };
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Funded);
+    p.funder.set_unfunded_ttl(std::time::Duration::ZERO);
+    p.funder.on_connected_block(&[], 901, &|_| None);
+    assert!(
+        p.funder.info(cid).is_some(),
+        "a broadcast funding was forgotten"
+    );
+}
+
+/// The channels waiting for their funding are bounded across all peers.
+#[test]
+fn unfunded_channels_are_bounded() {
+    use q21_core::channel::manager::MAX_UNFUNDED_CHANNELS;
+    let (wallet, chain) = setup([0xdfu8; 32]);
+    let dir = tmpdir("unfunded-cap");
+    let acceptor = one_manager([0xe0u8; 32], wallet.clone(), chain.clone(), &dir.join("a"));
+    let spammer = one_manager([0xe3u8; 32], wallet, chain, &dir.join("s"));
+    let mut opened = 0;
+    for k in 0..(MAX_UNFUNDED_CHANNELS as u64 + 3) {
+        let hello = spammer.open(k, "", 4 * MIN_OUTPUT_VALUE * 10, None, None);
+        let Ok(hello) = hello else { break };
+        let r = acceptor.deliver(1_000 + k, "", &hello);
+        let Some(back) = r.frames.into_iter().next() else {
+            continue;
+        };
+        let r = spammer.deliver(k, "", &back);
+        if let Some(open) = r.frames.into_iter().next() {
+            if !acceptor.deliver(1_000 + k, "", &open).frames.is_empty() {
+                opened += 1;
+            }
+        }
+    }
+    assert_eq!(opened, MAX_UNFUNDED_CHANNELS);
+    assert_eq!(acceptor.list().len(), MAX_UNFUNDED_CHANNELS);
+}
