@@ -4677,6 +4677,124 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // of side branches — is written to disk at the moment it is accepted.
     node.set_journal(archive.clone());
 
+    // Payment channels run on regtest, on a node that serves its wallet over
+    // RPC: the manager owns the engines, the node routes channel messages to
+    // it, and these hooks move funding, closes and penalties through the
+    // ordinary mempool and relay. Off regtest, or without a wallet, no manager
+    // is installed and the channel RPC refuses cleanly.
+    //
+    // Installed before the node listens or dials anyone. The capability and
+    // the stable channel node id travel in our `Version`, and a peer that
+    // completed its handshake before the manager existed was never told we
+    // speak channels nor offered the reestablish of a reloaded channel: after
+    // a restart, every reloaded channel stayed unbound from its peer.
+    #[cfg(feature = "mldsa")]
+    let channel_manager: Option<std::sync::Arc<q21_core::channel::manager::ChannelManager>> =
+        if network == q21_core::address::Network::Regtest && rpc_wallet && rpc.is_some() {
+            use q21_core::amount::Amount;
+            use q21_core::channel::manager::{ChannelManager, Hooks};
+            use q21_core::channel::{DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH};
+            use q21_core::tx::{OutPoint, Transaction, TxOut};
+            const CHANNEL_FUND_FEE: u64 = 50_000;
+
+            let folder = datadir.to_path_buf();
+            let seed = wallet.lock().unwrap().channel_seed();
+            let jdir = datadir.join("channels");
+            let _ = std::fs::create_dir_all(&jdir);
+
+            let w_fund = wallet.clone();
+            let n_fund = node.clone();
+            let folder_fund = folder.clone();
+            let fund = Box::new(
+                move |_cid: q21_core::hash::Hash256,
+                      funding_output: TxOut|
+                      -> Result<OutPoint, String> {
+                    let mut w = w_fund.lock().map_err(|_| "wallet locked".to_string())?;
+                    let (tx, txid) = n_fund.with_chain_and_mempool(|c, m| {
+                        let prepared = w
+                            .prepare_funding(
+                                &c.utxo,
+                                c.height(),
+                                funding_output,
+                                Amount::from_units(CHANNEL_FUND_FEE),
+                                &|o| m.spends(o),
+                                &[],
+                            )
+                            .map_err(|e| format!("{e:?}"))?;
+                        let tx = w
+                            .sign_spend(&m.view(&c.utxo), prepared)
+                            .map_err(|e| format!("{e:?}"))?;
+                        let txid = m
+                            .accept_local(&tx, &c.utxo, network, c.height())
+                            .map_err(|e| format!("{e:?}"))?;
+                        Ok::<_, String>((tx, txid))
+                    })?;
+                    let _ = write_wallet(&folder_fund, &w);
+                    n_fund.announce_tx(txid);
+                    Ok(OutPoint {
+                        txid: tx.txid(),
+                        index: 0,
+                    })
+                },
+            );
+
+            let n_b = node.clone();
+            let broadcast = Box::new(move |tx: &Transaction| -> Result<(), String> {
+                let txid = n_b
+                    .with_chain_and_mempool(|c, m| m.accept_local(tx, &c.utxo, network, c.height()))
+                    .map_err(|e| format!("{e:?}"))?;
+                n_b.announce_tx(txid);
+                Ok(())
+            });
+
+            let w_sweep = wallet.clone();
+            let folder_sweep = folder.clone();
+            // A sweep, penalty or claim pays a fresh wallet address at broadcast
+            // time; persist it at once so a crash cannot leave the recovered
+            // funds paying an address the reloaded wallet has forgotten.
+            let sweep_address = Box::new(move || {
+                let mut w = w_sweep.lock().unwrap();
+                let h = w.new_address().hash;
+                let _ = write_wallet(&folder_sweep, &w);
+                h
+            });
+            // A cooperative close pays this address; it must be a real wallet
+            // address so the funds are scanned and spendable, not a channel key.
+            let w_payout = wallet.clone();
+            let folder_payout = folder.clone();
+            let payout_address = Box::new(move || {
+                let mut w = w_payout.lock().unwrap();
+                let h = w.new_address().hash;
+                // Persist at once: a fresh address must survive a crash, or the
+                // close output would pay an address the reloaded wallet forgot.
+                let _ = write_wallet(&folder_payout, &w);
+                h
+            });
+
+            let mgr = std::sync::Arc::new(ChannelManager::new(
+                network,
+                q21_core::mempool::MIN_FEE_RATE,
+                seed,
+                jdir,
+                DEFAULT_DELAY_REGTEST,
+                DEFAULT_FUNDING_DEPTH,
+                Hooks {
+                    fund,
+                    broadcast,
+                    sweep_address,
+                    payout_address,
+                },
+            ));
+            node.set_channel_sink(mgr.clone());
+            // Channels reloaded from the journal may already be funded to depth
+            // (the funding confirmed while this node was down): confirm them now
+            // so they open without waiting for the next block.
+            node.rescan_channels();
+            Some(mgr)
+        } else {
+            None
+        };
+
     // --- Tor: every outgoing connection through the proxy, or none.
     //
     // Set before the first connection. If Tor cannot be found or started,
@@ -5285,118 +5403,6 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // next shutdown — and on a one-time scheme, the corresponding key
         // would be used again.
         let folder = datadir.to_path_buf();
-
-        // Payment channels run on regtest, on a node that keeps a wallet: the
-        // manager owns the engines, the node routes channel messages to it, and
-        // these hooks move funding, closes and penalties through the ordinary
-        // mempool and relay. Off regtest, or without a wallet, no manager is
-        // installed and the channel RPC refuses cleanly.
-        #[cfg(feature = "mldsa")]
-        let channel_manager: Option<
-            std::sync::Arc<q21_core::channel::manager::ChannelManager>,
-        > = if network == q21_core::address::Network::Regtest && rpc_wallet {
-            use q21_core::amount::Amount;
-            use q21_core::channel::manager::{ChannelManager, Hooks};
-            use q21_core::channel::{DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH};
-            use q21_core::tx::{OutPoint, Transaction, TxOut};
-            const CHANNEL_FUND_FEE: u64 = 50_000;
-
-            let seed = wallet.lock().unwrap().channel_seed();
-            let jdir = datadir.join("channels");
-            let _ = std::fs::create_dir_all(&jdir);
-
-            let w_fund = wallet.clone();
-            let n_fund = node.clone();
-            let folder_fund = folder.clone();
-            let fund = Box::new(
-                move |_cid: q21_core::hash::Hash256,
-                      funding_output: TxOut|
-                      -> Result<OutPoint, String> {
-                    let mut w = w_fund.lock().map_err(|_| "wallet locked".to_string())?;
-                    let (tx, txid) = n_fund.with_chain_and_mempool(|c, m| {
-                        let prepared = w
-                            .prepare_funding(
-                                &c.utxo,
-                                c.height(),
-                                funding_output,
-                                Amount::from_units(CHANNEL_FUND_FEE),
-                                &|o| m.spends(o),
-                                &[],
-                            )
-                            .map_err(|e| format!("{e:?}"))?;
-                        let tx = w
-                            .sign_spend(&m.view(&c.utxo), prepared)
-                            .map_err(|e| format!("{e:?}"))?;
-                        let txid = m
-                            .accept_local(&tx, &c.utxo, network, c.height())
-                            .map_err(|e| format!("{e:?}"))?;
-                        Ok::<_, String>((tx, txid))
-                    })?;
-                    let _ = write_wallet(&folder_fund, &w);
-                    n_fund.announce_tx(txid);
-                    Ok(OutPoint {
-                        txid: tx.txid(),
-                        index: 0,
-                    })
-                },
-            );
-
-            let n_b = node.clone();
-            let broadcast = Box::new(move |tx: &Transaction| -> Result<(), String> {
-                let txid = n_b
-                    .with_chain_and_mempool(|c, m| m.accept_local(tx, &c.utxo, network, c.height()))
-                    .map_err(|e| format!("{e:?}"))?;
-                n_b.announce_tx(txid);
-                Ok(())
-            });
-
-            let w_sweep = wallet.clone();
-            let folder_sweep = folder.clone();
-            // A sweep, penalty or claim pays a fresh wallet address at broadcast
-            // time; persist it at once so a crash cannot leave the recovered
-            // funds paying an address the reloaded wallet has forgotten.
-            let sweep_address = Box::new(move || {
-                let mut w = w_sweep.lock().unwrap();
-                let h = w.new_address().hash;
-                let _ = write_wallet(&folder_sweep, &w);
-                h
-            });
-            // A cooperative close pays this address; it must be a real wallet
-            // address so the funds are scanned and spendable, not a channel key.
-            let w_payout = wallet.clone();
-            let folder_payout = folder.clone();
-            let payout_address = Box::new(move || {
-                let mut w = w_payout.lock().unwrap();
-                let h = w.new_address().hash;
-                // Persist at once: a fresh address must survive a crash, or the
-                // close output would pay an address the reloaded wallet forgot.
-                let _ = write_wallet(&folder_payout, &w);
-                h
-            });
-
-            let mgr = std::sync::Arc::new(ChannelManager::new(
-                network,
-                q21_core::mempool::MIN_FEE_RATE,
-                seed,
-                jdir,
-                DEFAULT_DELAY_REGTEST,
-                DEFAULT_FUNDING_DEPTH,
-                Hooks {
-                    fund,
-                    broadcast,
-                    sweep_address,
-                    payout_address,
-                },
-            ));
-            node.set_channel_sink(mgr.clone());
-            // Channels reloaded from the journal may already be funded to depth
-            // (the funding confirmed while this node was down): confirm them now
-            // so they open without waiting for the next block.
-            node.rescan_channels();
-            Some(mgr)
-        } else {
-            None
-        };
 
         let ctx = q21_core::rpc::RpcContext {
             node: node.clone(),
