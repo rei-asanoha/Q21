@@ -95,6 +95,10 @@ struct Chan {
     capacity: u64,
     /// True while an update we proposed is still in flight.
     in_flight: bool,
+    /// Whether we have already sent a reestablish on the current connection, so
+    /// receiving the peer's reestablish reciprocates exactly once (no loop).
+    /// Reset whenever the channel is re-bound to a new connection id.
+    reest_sent: bool,
     /// What the channel is waiting for on chain, once a commitment has been
     /// broadcast. `None` while the channel is still off-chain or settled.
     close: Option<CloseTracker>,
@@ -257,6 +261,7 @@ impl ChannelManager {
                                 peer_identity,
                                 capacity,
                                 in_flight: false,
+                                reest_sent: false,
                                 close: None,
                             },
                         );
@@ -388,31 +393,48 @@ impl ChannelManager {
     /// binding a reconnect or restart broke — and returns the reestablish frames
     /// to send. The engine then resends exactly the one in-flight message, if any.
     pub fn on_peer_connected(&self, peer: u64, peer_identity: &str) -> Vec<Vec<u8>> {
-        {
-            let mut g = self.inner.lock().unwrap();
-            for c in g.channels.values_mut() {
-                if !peer_identity.is_empty() && c.peer_identity == peer_identity {
-                    c.peer = peer;
+        let mut g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for c in g.channels.values_mut() {
+            // Re-bind by durable identity (a reconnect gives a fresh id), then
+            // send our reestablish for every channel now on this connection.
+            if !peer_identity.is_empty() && c.peer_identity == peer_identity && c.peer != peer {
+                c.peer = peer;
+                c.reest_sent = false;
+            }
+            if c.peer == peer {
+                if let Ok(m) = c.machine.reestablish() {
+                    out.push(write_frame(
+                        c.machine.channel_id(),
+                        KIND_ENGINE,
+                        &m.encode(),
+                    ));
+                    c.reest_sent = true;
                 }
             }
         }
-        self.reestablish(peer)
+        out
     }
 
     /// The reestablish frames for every channel with `peer`, to send on
-    /// reconnection.
+    /// reconnection. Marks each as reestablished so a reciprocal reestablish
+    /// from the peer is not echoed back into a loop.
     pub fn reestablish(&self, peer: u64) -> Vec<Vec<u8>> {
-        let g = self.inner.lock().unwrap();
-        g.channels
-            .values()
-            .filter(|c| c.peer == peer)
-            .filter_map(|c| {
-                c.machine
-                    .reestablish()
-                    .ok()
-                    .map(|m| write_frame(c.machine.channel_id(), KIND_ENGINE, &m.encode()))
-            })
-            .collect()
+        let mut g = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        for c in g.channels.values_mut() {
+            if c.peer == peer {
+                if let Ok(m) = c.machine.reestablish() {
+                    out.push(write_frame(
+                        c.machine.channel_id(),
+                        KIND_ENGINE,
+                        &m.encode(),
+                    ));
+                    c.reest_sent = true;
+                }
+            }
+        }
+        out
     }
 
     // --- Inbound ----------------------------------------------------------
@@ -542,6 +564,7 @@ impl ChannelManager {
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
                 in_flight: false,
+                reest_sent: false,
                 close: None,
             },
         );
@@ -564,7 +587,11 @@ impl ChannelManager {
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
         // A frame for this channel came from `peer`: that is the live network
         // id to reach the counterparty on, which a reconnect may have changed.
-        chan.peer = peer;
+        // A changed id means a new connection, so a reestablish is owed again.
+        if chan.peer != peer {
+            chan.peer = peer;
+            chan.reest_sent = false;
+        }
         let mut out = Vec::new();
         match msg {
             ChMsg::Accept { .. } => {
@@ -614,6 +641,15 @@ impl ChannelManager {
                 let frames = chan.machine.on_reestablish(&msg).map_err(err)?;
                 for f in frames {
                     out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
+                }
+                // Reciprocate exactly once, so both sides exchange reestablish
+                // and each learns the single in-flight message it must resend.
+                // (The peer that dialed sent first; this covers the other side.)
+                if !chan.reest_sent {
+                    if let Ok(m) = chan.machine.reestablish() {
+                        out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+                        chan.reest_sent = true;
+                    }
                 }
             }
             ChMsg::Error { .. } | ChMsg::Open { .. } => {}
@@ -674,6 +710,7 @@ impl ChannelManager {
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
                 in_flight: false,
+                reest_sent: false,
                 close: None,
             },
         );
