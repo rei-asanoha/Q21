@@ -670,6 +670,10 @@ struct Peer {
     /// True if the peer advertised the payment-channel capability in its
     /// `Version`. A peer that did not must never receive a channel message.
     channels: bool,
+    /// The peer's stable channel node id (hex), parsed from its `Version` user
+    /// agent. Empty if it advertised none. Used to re-bind channels to this
+    /// peer across reconnects, since the connection id and inbound port change.
+    channel_id: String,
     /// Per-peer budget for channel messages. See [`CHAN_BUCKET_MAX`].
     chan_bucket: TokenBucket,
     /// Height announced by the peer at the handshake.
@@ -1041,6 +1045,13 @@ pub trait ChannelSink: Send + Sync {
     /// (used to re-bind channels across a reconnect) is `peer_identity`.
     fn deliver(&self, peer: u64, peer_identity: &str, bytes: &[u8]) -> ChannelOutcome;
 
+    /// This node's stable channel identity (hex), advertised in the handshake so
+    /// peers can re-bind channels to it across reconnects. `None` means none is
+    /// advertised.
+    fn node_identity(&self) -> Option<String> {
+        None
+    }
+
     /// Called after each connected block, off the chain lock, with the block's
     /// transactions, the new chain `height`, and a `depth_of` oracle giving the
     /// confirmation depth (`1` in the tip) of an unspent outpoint or `None` once
@@ -1090,6 +1101,9 @@ pub struct PeerInfo {
     pub supports_channels: bool,
     /// The height the peer announced at the handshake.
     pub height: u64,
+    /// The peer's stable channel node id (hex), empty if none advertised. A
+    /// `channelopen` may name a peer by this, surviving reconnects.
+    pub channel_id: String,
 }
 
 #[derive(Clone)]
@@ -1114,6 +1128,9 @@ pub struct Node {
     /// accept channel messages; without it, channel frames are never sent and a
     /// received one is ignored.
     channel_sink: Arc<std::sync::RwLock<Option<Arc<dyn ChannelSink>>>>,
+    /// This node's stable channel identity (hex), advertised in the handshake
+    /// when channels are enabled. Set from the sink at [`Node::set_channel_sink`].
+    own_channel_id: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 #[derive(Default, Debug)]
@@ -1213,6 +1230,7 @@ impl Node {
             own_onion: Arc::new(std::sync::RwLock::new(None)),
             configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
             channel_sink: Arc::new(std::sync::RwLock::new(None)),
+            own_channel_id: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -1221,6 +1239,9 @@ impl Node {
     /// channel messages to `sink`. Meant for regtest, where channels are
     /// active; the caller gates on the network.
     pub fn set_channel_sink(&self, sink: Arc<dyn ChannelSink>) {
+        if let Ok(mut g) = self.own_channel_id.write() {
+            *g = sink.node_identity();
+        }
         if let Ok(mut g) = self.channel_sink.write() {
             *g = Some(sink);
         }
@@ -1238,7 +1259,16 @@ impl Node {
     /// Our user agent, carrying the channel capability token when enabled.
     fn user_agent(&self) -> String {
         if self.channels_enabled() {
-            format!("q21:0.4{}", crate::wire::CHANNELS_CAPABILITY)
+            // The channel capability, followed by this node's stable channel id
+            // so peers can re-bind channels to it across reconnects. The whole
+            // string stays within `MAX_USER_AGENT`: "q21:0.4" + "+chan" + 32 hex.
+            let id = self
+                .own_channel_id
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_default();
+            format!("q21:0.4{}{}", crate::wire::CHANNELS_CAPABILITY, id)
         } else {
             "q21:0.4".into()
         }
@@ -1346,21 +1376,29 @@ impl Node {
                 handshake_complete: p.handshaked,
                 supports_channels: p.channels,
                 height: p.start_height,
+                channel_id: p.channel_id.clone(),
             })
             .collect();
         v.sort_by_key(|p| p.id);
         v
     }
 
-    /// A durable identifier for a peer connection, used to re-bind channels to
-    /// a new connection id after a reconnect: the peer's address string. For an
-    /// outbound connection this is the stable dialed address; it is empty for an
-    /// unknown peer.
+    /// A durable identifier for a peer, used to re-bind channels to a new
+    /// connection id after a reconnect. It is the peer's advertised channel node
+    /// id — stable on both the dialing and accepting sides, unlike the
+    /// connection's ephemeral port — falling back to the address only for a peer
+    /// that advertised no id. Empty for an unknown peer.
     pub fn peer_identity(&self, id: u64) -> String {
         let g = self.shared.lock().unwrap();
         g.peers
             .get(&id)
-            .map(|p| p.addr.to_string())
+            .map(|p| {
+                if p.channel_id.is_empty() {
+                    p.addr.to_string()
+                } else {
+                    p.channel_id.clone()
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -2125,6 +2163,7 @@ impl Node {
                     ban_score: 0,
                     user_agent: String::new(),
                     channels: false,
+                    channel_id: String::new(),
                     chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                     start_height: 0,
                     pending: HashMap::new(),
@@ -2433,6 +2472,8 @@ impl Node {
                                 p.remote_nonce = Some(nonce);
                                 p.channels =
                                     crate::wire::user_agent_advertises_channels(user_agent);
+                                p.channel_id =
+                                    crate::wire::channel_node_id(user_agent).unwrap_or_default();
                                 p.user_agent = user_agent.clone();
                                 if !p.version_sent {
                                     p.version_sent = true;
@@ -4830,6 +4871,7 @@ mod tests {
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
                 user_agent: String::new(),
                 channels: false,
+                channel_id: String::new(),
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
@@ -5170,6 +5212,7 @@ mod tests_hardening {
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
                 user_agent: String::new(),
                 channels: false,
+                channel_id: String::new(),
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
@@ -6021,6 +6064,7 @@ mod tests_handler_fuzz {
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
                 user_agent: String::new(),
                 channels: false,
+                channel_id: String::new(),
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
@@ -6852,6 +6896,7 @@ mod tests_handler_review {
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
                 user_agent: String::new(),
                 channels: false,
+                channel_id: String::new(),
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),

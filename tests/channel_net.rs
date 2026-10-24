@@ -539,9 +539,25 @@ fn an_accepting_node_can_open_back_to_the_dialer() {
         "an inbound peer's announced height must be recorded, got {}",
         b_entry.height
     );
+    // The inbound peer advertised its stable channel node id, and it is the
+    // acceptor manager's id — the durable identity that re-binds across ports.
+    assert_eq!(
+        b_entry.channel_id,
+        net.amgr.node_id_hex(),
+        "an inbound peer's stable channel node id must be recorded"
+    );
 
-    // A (accepting side) opens a channel to the inbound dialer and it reaches open.
-    let cid = net.open(4_000_000);
+    // A (accepting side) opens a channel to the inbound dialer, naming it by its
+    // stable node id, and it reaches open.
+    let cid = {
+        let identity = net.a.peer_identity(net.bid);
+        assert_eq!(
+            identity,
+            net.amgr.node_id_hex(),
+            "peer identity is the node id"
+        );
+        net.open(4_000_000)
+    };
     assert!(phase_is_open(&net.fmgr, cid) && phase_is_open(&net.amgr, cid));
 
     net.a.shutdown();

@@ -275,6 +275,19 @@ impl ChannelManager {
         }
     }
 
+    /// This node's stable channel identity: the first 16 bytes of a tagged hash
+    /// of the wallet seed, as lowercase hex. It is advertised in the handshake
+    /// and persisted per channel, so a channel re-binds to its peer across a
+    /// reconnect no matter which ephemeral port the peer dials from. It reveals
+    /// nothing about the wallet: it is a one-way hash under a dedicated tag.
+    pub fn node_id_hex(&self) -> String {
+        let h = crate::hash::tagged_hash_parts("Q21/channel/node-id", &[&self.wallet_seed]).0;
+        h[..crate::wire::CHANNEL_NODE_ID_HEX / 2]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     fn signer(&self, index: u32) -> Box<dyn Signer> {
         Box::new(ChannelKey::from_seed(&funding_key_seed(
             &self.wallet_seed,
@@ -1063,6 +1076,10 @@ impl crate::net::ChannelSink for ChannelManager {
             replies: r.frames,
             penalize: r.penalize,
         }
+    }
+
+    fn node_identity(&self) -> Option<String> {
+        Some(self.node_id_hex())
     }
 
     fn on_connected_block(

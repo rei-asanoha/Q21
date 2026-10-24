@@ -1148,20 +1148,21 @@ impl RpcContext {
     fn channelopen(&self, params: &Json) -> Result<Json, Json> {
         let mgr = self.channels()?;
         // `peer` is either a numeric connection id (as getpeers reports) or a
-        // durable peer identity (an address string). Resolve a string to the
-        // live id of a connected, channel-capable peer at that address.
+        // durable peer identity — an address or the peer's stable channel node
+        // id. Resolve a string to the live id of a connected channel-capable
+        // peer; the node id survives reconnects, the connection id does not.
         let peer = match params.get("peer") {
             Some(v) if v.as_u64().is_some() => v.as_u64().unwrap(),
-            Some(Json::Str(addr)) => self
+            Some(Json::Str(key)) => self
                 .node
                 .peer_list()
                 .into_iter()
-                .find(|p| &p.address == addr && p.supports_channels)
+                .find(|p| p.supports_channels && (&p.address == key || &p.channel_id == key))
                 .map(|p| p.id)
                 .ok_or_else(|| {
                     rpc_error(
                         ERR_PARAMS,
-                        "no connected channel-capable peer at that address",
+                        "no connected channel-capable peer at that address or node id",
                     )
                 })?,
             _ => {
@@ -1646,6 +1647,7 @@ impl RpcContext {
                                 .set("handshake_complete", Json::Bool(p.handshake_complete))
                                 .set("supports_channels", Json::Bool(p.supports_channels))
                                 .set("height", Json::u64(p.height))
+                                .set("channel_id", Json::str(p.channel_id))
                                 .build()
                         })
                         .collect(),

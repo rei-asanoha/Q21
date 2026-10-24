@@ -277,6 +277,25 @@ pub fn user_agent_advertises_channels(user_agent: &str) -> bool {
     user_agent.contains(CHANNELS_CAPABILITY)
 }
 
+/// The hex characters a channel node advertises after [`CHANNELS_CAPABILITY`]:
+/// its stable channel node id (32 hex = 16 bytes), used to re-bind channels to
+/// a peer across reconnects regardless of the connection's ephemeral port.
+/// Empty when the peer advertises the capability without an id (an older
+/// channel build) or does not advertise it at all.
+pub fn channel_node_id(user_agent: &str) -> Option<String> {
+    let at = user_agent.find(CHANNELS_CAPABILITY)?;
+    let rest = &user_agent[at + CHANNELS_CAPABILITY.len()..];
+    let id: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .take(CHANNEL_NODE_ID_HEX)
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Length in hex characters of an advertised channel node id (16 bytes).
+pub const CHANNEL_NODE_ID_HEX: usize = 32;
+
 /// Largest channel message accepted on the wire. The heaviest is the funding
 /// message (its three tier signatures), well under this bound.
 pub const MAX_CHANNEL_MSG: usize = 16 * 1024;
