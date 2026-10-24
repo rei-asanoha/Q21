@@ -26,7 +26,7 @@ use crate::address::Network;
 use crate::channel::keys::{funding_key_seed, ChannelKey, Signer, CHANNEL_SCHEME};
 use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
 use crate::channel::messages::Message as ChMsg;
-use crate::channel::watcher::{classify, Watch, WatchContext};
+use crate::channel::watcher::{classify, OutputRef, Watch, WatchContext};
 use crate::hash::Hash256;
 use crate::ser::{Reader, Writer};
 use crate::sig;
@@ -86,6 +86,25 @@ struct Chan {
     capacity: u64,
     /// True while an update we proposed is still in flight.
     in_flight: bool,
+    /// What the channel is waiting for on chain, once a commitment has been
+    /// broadcast. `None` while the channel is still off-chain or settled.
+    close: Option<CloseTracker>,
+}
+
+/// What a closing channel is waiting for on chain, so the block hook can finish
+/// the close without any further message from the peer.
+enum CloseTracker {
+    /// Our own commitment is confirmed; its `to_local` output can be swept only
+    /// after `delay` blocks have passed since `commit_height`.
+    DelayedSweep {
+        to_local: OutputRef,
+        state: u64,
+        delay: u16,
+        commit_height: u64,
+    },
+    /// A finalizing transaction (penalty, claim, or delayed sweep) has been
+    /// broadcast; the channel is settled once it confirms.
+    Finalizing { txid: Hash256, penalty: bool },
 }
 
 struct PendingFunder {
@@ -140,7 +159,7 @@ impl ChannelManager {
         default_depth: u16,
         hooks: Hooks,
     ) -> ChannelManager {
-        ChannelManager {
+        let mgr = ChannelManager {
             network,
             base_fee_rate,
             wallet_seed,
@@ -154,6 +173,84 @@ impl ChannelManager {
                 pending_acceptor: HashMap::new(),
                 next_index: 0,
             }),
+        };
+        // Reload every channel persisted under `journal_dir`, so a restart —
+        // clean or after a crash — finds its channels again, with the watcher
+        // armed, instead of an empty map over funds it can no longer manage.
+        mgr.reload();
+        mgr
+    }
+
+    /// Enumerates the journal directory and replays each channel back into the
+    /// map. Each journal's signing key is the wallet key at some channel index;
+    /// the index is not stored, so we recover it by deriving keys in order and
+    /// matching the public key the opening record carries. On regtest a handful
+    /// of indices are in play, so the search is short and runs once at startup.
+    fn reload(&self) {
+        let entries = match std::fs::read_dir(&self.journal_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        // (journal path, our funding pubkey) for every intact channel journal.
+        let mut pending: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jrnl") {
+                continue;
+            }
+            let Ok((_journal, records)) = crate::channel::journal::Journal::open(&path) else {
+                continue;
+            };
+            if let Some(crate::channel::journal::Record::Opened { our_pubkey, .. }) =
+                records.first()
+            {
+                pending.push((path, our_pubkey.clone()));
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        // Match each journal to its channel index by deriving keys in order.
+        // The cap bounds the search should a foreign journal ever appear.
+        let cap = (pending.len() as u32)
+            .saturating_mul(64)
+            .saturating_add(1024);
+        let mut remaining = pending.len();
+        let mut g = self.inner.lock().unwrap();
+        let mut index = 0u32;
+        while remaining > 0 && index < cap {
+            let pk = self.signer(index).pubkey().to_vec();
+            if let Some(pos) = pending
+                .iter()
+                .position(|(_, candidate)| !candidate.is_empty() && *candidate == pk)
+            {
+                let path = pending[pos].0.clone();
+                if let Ok(machine) =
+                    Machine::reopen(&path, self.network, self.signer(index), self.base_fee_rate)
+                {
+                    if !matches!(machine.phase(), Phase::Closed) {
+                        let cid = machine.channel_id();
+                        let capacity = machine.params().capacity.units();
+                        g.channels.insert(
+                            cid,
+                            Chan {
+                                machine,
+                                // The peer's network id is transient and not
+                                // persisted; it is re-bound when the peer
+                                // reconnects and a frame arrives for the channel.
+                                peer: u64::MAX,
+                                capacity,
+                                in_flight: false,
+                                close: None,
+                            },
+                        );
+                    }
+                }
+                g.next_index = g.next_index.max(index + 1);
+                pending[pos].1.clear();
+                remaining -= 1;
+            }
+            index += 1;
         }
     }
 
@@ -371,6 +468,9 @@ impl ChannelManager {
         }
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        // A frame for this channel came from `peer`: that is the live network
+        // id to reach the counterparty on, which a reconnect may have changed.
+        chan.peer = peer;
         let mut out = Vec::new();
         match msg {
             ChMsg::Accept { .. } => {
@@ -470,6 +570,7 @@ impl ChannelManager {
                 peer,
                 capacity: pending.capacity,
                 in_flight: false,
+                close: None,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
