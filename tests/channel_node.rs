@@ -1399,3 +1399,271 @@ fn channels_per_peer_are_bounded() {
         .is_empty());
 }
 
+// --- Startup rescan: what confirmed while a node was down ---------------------
+
+/// Restarts a manager from `dir` with `hooks` and runs its startup rescan
+/// against the shared chain, as the node does before it connects to anyone.
+fn restart_and_rescan(
+    seed: [u8; 32],
+    dir: &std::path::Path,
+    hooks: Hooks,
+    chain: &Arc<Mutex<SharedChain>>,
+) -> ChannelManager {
+    let mgr = ChannelManager::new(NET, RATE, seed, dir.to_path_buf(), DELAY, DEPTH, hooks);
+    let tip = chain.lock().unwrap().height();
+    let c1 = chain.clone();
+    let txs_at = move |h: u64| c1.lock().unwrap().chain.block_at(h).map(|b| b.transactions);
+    let c2 = chain.clone();
+    let depth_of = move |op: &OutPoint| chain_depth(&c2, op);
+    mgr.rescan(tip, &txs_at, &depth_of);
+    mgr
+}
+
+/// The policy (to_local) output of a commitment.
+fn to_local_of(tx: &Transaction) -> OutPoint {
+    let i = tx
+        .outputs
+        .iter()
+        .position(|o| o.scheme == SchemeId::Policy)
+        .expect("a to_local output");
+    OutPoint {
+        txid: tx.txid(),
+        index: i as u32,
+    }
+}
+
+/// Whether some transaction in the chain's last `back` blocks spends `op`,
+/// and the output it pays first.
+fn spender_of(chain: &Arc<Mutex<SharedChain>>, op: &OutPoint, back: u64) -> Option<TxOut> {
+    let c = chain.lock().unwrap();
+    let tip = c.chain.height();
+    (tip.saturating_sub(back)..=tip).find_map(|h| {
+        c.chain.block_at(h).and_then(|b| {
+            b.transactions
+                .iter()
+                .find(|t| t.inputs.iter().any(|i| i.prev_out == *op))
+                .map(|t| t.outputs[0])
+        })
+    })
+}
+
+/// The victim's node is stopped when the cheater's revoked commitment
+/// confirms. It restarts before the to-self delay: the startup rescan finds
+/// the spend in the blocks it missed and the penalty confirms, the cheater
+/// keeping nothing of its to_local.
+#[test]
+#[cfg(feature = "audit")]
+fn an_offline_victim_punishes_a_revoked_commitment_on_restart() {
+    let funder_seed = [0xb1u8; 32];
+    let acceptor_seed = [0xb2u8; 32];
+    let (mut p, _wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "rescan-offline-victim");
+    for amt in [700_000u64, 700_000, 700_000] {
+        let m = p.funder.pay(cid, amt).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+    }
+    let state = p.funder.info(cid).unwrap().state_number;
+    let revoked = p.funder.signed_commitment(cid, state - 1).unwrap();
+    // The victim stops; the cheater's revoked commitment confirms, and a few
+    // blocks follow, fewer than the delay.
+    let Pair { acceptor, .. } = p;
+    drop(acceptor);
+    let committed_at = {
+        let mut c = chain.lock().unwrap();
+        c.mine(std::slice::from_ref(&revoked));
+        let h = c.height();
+        for _ in 0..4 {
+            c.mine(&[]);
+        }
+        h
+    };
+    let sweep = Hash256([0x7du8; 32]);
+    let victim = restart_and_rescan(
+        acceptor_seed,
+        &dir.join("acceptor"),
+        acceptor_hooks(chain.clone(), sweep),
+        &chain,
+    );
+    let to_local = to_local_of(&revoked);
+    let paid = spender_of(&chain, &to_local, 2).expect("the penalty confirmed");
+    assert_eq!(
+        paid.pubkey_hash, sweep,
+        "the cheater's to_local went to the victim"
+    );
+    assert!(chain.lock().unwrap().height() < committed_at + u64::from(DELAY));
+    drive(&victim, &chain);
+    assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
+}
+
+/// A node killed after broadcasting a penalty, before it confirmed, lost it
+/// with its mempool. On restart the rescan rebuilds and broadcasts it, and it
+/// confirms.
+#[test]
+#[cfg(feature = "audit")]
+fn a_penalty_lost_in_a_crash_is_broadcast_again_on_restart() {
+    let funder_seed = [0xb3u8; 32];
+    let acceptor_seed = [0xb4u8; 32];
+    let (mut p, _wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "rescan-lost-penalty");
+    for amt in [500_000u64, 500_000] {
+        let m = p.funder.pay(cid, amt).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+    }
+    let state = p.funder.info(cid).unwrap().state_number;
+    let revoked = p.funder.signed_commitment(cid, state - 1).unwrap();
+    let Pair { acceptor, .. } = p;
+    drop(acceptor);
+    // The victim sees the revoked commitment and broadcasts a penalty that
+    // never confirms, then is killed.
+    let (victim, sent) = relaying_manager(acceptor_seed, &dir.join("acceptor"), Hash256([1; 32]));
+    let h = {
+        let mut c = chain.lock().unwrap();
+        c.mine(std::slice::from_ref(&revoked));
+        c.height()
+    };
+    victim.on_connected_block(std::slice::from_ref(&revoked), h, &|_| None);
+    assert_eq!(sent.lock().unwrap().len(), 1, "the penalty went out");
+    drop(victim);
+    chain.lock().unwrap().mine(&[]);
+    let sweep = Hash256([0x7eu8; 32]);
+    let victim = restart_and_rescan(
+        acceptor_seed,
+        &dir.join("acceptor"),
+        acceptor_hooks(chain.clone(), sweep),
+        &chain,
+    );
+    let paid = spender_of(&chain, &to_local_of(&revoked), 2).expect("the penalty confirmed");
+    assert_eq!(paid.pubkey_hash, sweep);
+    drive(&victim, &chain);
+    assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
+}
+
+/// A cooperative close confirms while one side is down — the side that only
+/// signed it, or the closer, killed before it confirmed. On restart either
+/// ends closed, its payout credited on chain.
+#[test]
+fn a_close_confirmed_while_down_settles_on_restart() {
+    for closer_down in [false, true] {
+        let funder_seed = [0xb5u8; 32];
+        let acceptor_seed = [0xb6u8; 32];
+        let tag = format!("rescan-close-{closer_down}");
+        let (mut p, wallet, chain, dir, cid, capacity) =
+            open_channel(funder_seed, acceptor_seed, &tag);
+        let m = p.funder.pay(cid, 450_000).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+        // The close is signed by both; the funder's hook mines it at once.
+        let close = p.funder.close(cid).unwrap().expect("a close frame");
+        p.queue.push_back((1, close));
+        p.pump();
+        chain.lock().unwrap().mine(&[]);
+        assert_eq!(held(&chain, ACCEPTOR_PAYOUT), 450_000);
+        assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 450_000 - CLOSE_FEE);
+        // Neither manager saw the confirming block; the one that was down
+        // restarts.
+        let Pair {
+            funder, acceptor, ..
+        } = p;
+        drop(funder);
+        drop(acceptor);
+        let back = if closer_down {
+            restart_and_rescan(
+                funder_seed,
+                &dir.join("funder"),
+                funder_hooks(wallet, chain.clone()),
+                &chain,
+            )
+        } else {
+            restart_and_rescan(
+                acceptor_seed,
+                &dir.join("acceptor"),
+                acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+                &chain,
+            )
+        };
+        assert_eq!(
+            back.info(cid).unwrap().phase,
+            Phase::Closed,
+            "closer_down={closer_down}"
+        );
+    }
+}
+
+/// The closer killed after the close was signed by both, before it confirmed,
+/// with its mempool lost: on restart the close, rebuilt from the journal, is
+/// broadcast again and confirms.
+#[test]
+fn an_unconfirmed_close_is_broadcast_again_on_restart() {
+    let funder_seed = [0xb7u8; 32];
+    let (mut p, wallet, chain, dir, cid, capacity) =
+        open_channel(funder_seed, [0xb8u8; 32], "rescan-close-lost");
+    let m = p.funder.pay(cid, 300_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    // The funder restarts with broadcasts that go nowhere: its close never
+    // reaches a block.
+    let (lost, _sent) = relaying_manager(funder_seed, &dir.join("funder"), Hash256([2; 32]));
+    p.funder = lost;
+    reconnect(&mut p);
+    let close = p.funder.close(cid).unwrap().expect("a close frame");
+    let signed = p.acceptor.deliver(F_PEER, "", &close);
+    assert_eq!(signed.penalize, 0);
+    for f in signed.frames {
+        assert_eq!(p.funder.deliver(A_PEER, "", &f).penalize, 0);
+    }
+    assert_eq!(
+        held(&chain, ACCEPTOR_PAYOUT),
+        0,
+        "the close did not confirm"
+    );
+    let Pair { funder, .. } = p;
+    drop(funder);
+    let back = restart_and_rescan(
+        funder_seed,
+        &dir.join("funder"),
+        funder_hooks(wallet, chain.clone()),
+        &chain,
+    );
+    assert_eq!(
+        held(&chain, ACCEPTOR_PAYOUT),
+        300_000,
+        "the close confirmed"
+    );
+    assert_eq!(held(&chain, FUNDER_PAYOUT), capacity - 300_000 - CLOSE_FEE);
+    drive(&back, &chain);
+    assert_eq!(back.info(cid).unwrap().phase, Phase::Closed);
+}
+
+/// Our own commitment confirmed and the node went down: on restart past the
+/// delay, the rescan schedules the delayed sweep and it is broadcast at once.
+#[test]
+fn our_commitment_confirmed_while_down_is_swept_on_restart() {
+    let funder_seed = [0xb9u8; 32];
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, [0xbau8; 32], "rescan-own-commitment");
+    let m = p.funder.pay(cid, 800_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    let commitment = p.funder.force_close(cid).unwrap();
+    let Pair { funder, .. } = p;
+    drop(funder);
+    for _ in 0..DELAY {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let before = held(&chain, FUNDER_PAYOUT);
+    let back = restart_and_rescan(
+        funder_seed,
+        &dir.join("funder"),
+        funder_hooks(wallet, chain.clone()),
+        &chain,
+    );
+    let swept = held(&chain, FUNDER_PAYOUT) - before;
+    let to_local = commitment.outputs[to_local_of(&commitment).index as usize]
+        .value
+        .units();
+    assert_eq!(swept, to_local - CLOSE_FEE, "the delayed sweep confirmed");
+    drive(&back, &chain);
+    assert_eq!(back.info(cid).unwrap().phase, Phase::Closed);
+}

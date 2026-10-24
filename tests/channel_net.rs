@@ -1033,3 +1033,92 @@ fn a_payment_on_the_second_link_leaves_the_channel_usable() {
     net.a.shutdown();
     net.b.shutdown();
 }
+
+/// Startup rescan, through a real node: the victim's process is down when the
+/// cheater's revoked commitment confirms (its node holds the blocks but no
+/// channel manager saw them). Restarted before the delay, the node's startup
+/// rescan finds the spend and the penalty confirms, crediting the victim with
+/// the cheater's whole to_local.
+#[test]
+fn an_offline_victim_node_punishes_on_restart() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    use q21_core::channel::machine::Phase;
+    let mut net = setup("rescan-victim", [0xc1u8; 32], [0xc2u8; 32]);
+    let cid = net.open(4_000_000);
+    for (amount, total) in [(1_500_000u64, 1_500_000u64), (500_000, 2_000_000)] {
+        let pay = net.fmgr.pay(cid, amount).unwrap();
+        assert!(net.a.send_channel(net.bid, pay));
+        assert!(
+            wait(
+                || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == total,
+                10
+            ),
+            "payment did not land"
+        );
+    }
+    let revoked = net.fmgr.signed_commitment(cid, 1).expect("state 1");
+    let to_local = revoked
+        .outputs
+        .iter()
+        .find(|o| o.scheme == SchemeId::Policy)
+        .map(|o| o.value.units())
+        .expect("a to_local");
+
+    // The victim's process stops: its blocks arrive, nobody watches them.
+    net.amgr = Arc::new(ChannelManager::new(
+        NET,
+        RATE,
+        [0u8; 32],
+        net.dir.join("nobody"),
+        DELAY,
+        DEPTH,
+        hooks(
+            net.bwallet.clone(),
+            net.b.clone(),
+            net.pending.clone(),
+            false,
+        ),
+    ));
+    net.b.set_channel_sink(net.amgr.clone());
+    net.cheat_broadcast(&revoked);
+    net.mine();
+    let cheat_h = net.height();
+    net.mine();
+    net.mine();
+
+    // Restart: the reloaded manager is installed and the node rescans.
+    let b_before = net.b_balance();
+    let victim = Arc::new(ChannelManager::new(
+        NET,
+        RATE,
+        net.aseed,
+        net.dir.join("a"),
+        DELAY,
+        DEPTH,
+        hooks(
+            net.bwallet.clone(),
+            net.b.clone(),
+            net.pending.clone(),
+            false,
+        ),
+    ));
+    net.b.set_channel_sink(victim.clone());
+    net.b.rescan_channels();
+    assert!(net.pending_len() >= 1, "no penalty after the rescan");
+    net.mine();
+    assert!(
+        net.height() < cheat_h + u64::from(DELAY),
+        "before the delay"
+    );
+    let gained = net.b_balance() - b_before;
+    assert!(
+        gained + 16 * q21_core::channel::manager::CLOSE_FEE >= to_local,
+        "the victim took the cheater's to_local ({gained} of {to_local})"
+    );
+    assert!(matches!(
+        victim.info(cid).map(|i| i.phase),
+        Some(Phase::Closed)
+    ));
+    net.a.shutdown();
+    net.b.shutdown();
+}

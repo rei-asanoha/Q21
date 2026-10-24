@@ -34,6 +34,7 @@ use crate::sig;
 use crate::tx::{OutPoint, Transaction, TxOut};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 const KIND_ENGINE: u8 = 0;
@@ -56,6 +57,10 @@ pub type SweepAddrFn = dyn Fn() -> Hash256 + Send + Sync;
 /// Replaces `old`, a transaction of ours, by `new`, a version of it paying a
 /// higher fee, in this node's mempool, and relays `new`.
 pub type ReplaceFn = dyn Fn(&Transaction, &Transaction) -> Result<(), String> + Send + Sync;
+
+/// How far back a startup rescan looks for a channel whose journal holds no
+/// funding height (one opened before it was journaled).
+pub const MAX_RESCAN_BLOCKS: u64 = 20_000;
 
 /// A penalty started off the block hook, before its height is known.
 const UNKNOWN_HEIGHT: u64 = u64::MAX;
@@ -153,8 +158,10 @@ enum CloseTracker {
         commit_height: u64,
     },
     /// A finalizing transaction (claim, or delayed sweep) has been broadcast;
-    /// the channel is settled once it confirms.
-    Finalizing { txid: Hash256, penalty: bool },
+    /// the channel is settled once the output it spends is spent on chain — by
+    /// this transaction, or by an earlier version of it broadcast before a
+    /// restart. Kept whole, to be broadcast again after a restart.
+    Finalizing { spends: OutPoint, tx: Transaction },
     /// A penalty has been broadcast at fee tier `tier`. While it stays
     /// unconfirmed and the cheater's delay runs, the next tier replaces it
     /// every [`penalty_bump_interval`] blocks. Any tier confirming settles the
@@ -240,6 +247,9 @@ pub struct ChannelManager {
     default_depth: u16,
     hooks: Hooks,
     inner: Mutex<Inner>,
+    /// Set while [`ChannelManager::rescan`] replays past blocks: reactions are
+    /// computed but nothing is broadcast until the replay reaches the tip.
+    replaying: AtomicBool,
 }
 
 fn write_frame(cid: Hash256, kind: u8, body: &[u8]) -> Vec<u8> {
@@ -269,6 +279,7 @@ impl ChannelManager {
             default_delay,
             default_depth,
             hooks,
+            replaying: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 channels: HashMap::new(),
                 pending_funder: HashMap::new(),
@@ -823,7 +834,7 @@ impl ChannelManager {
                 }
             }
             ChMsg::CloseSigned { .. } => {
-                let already = chan.machine.phase() == Phase::Closed;
+                let already = chan.machine.has_signed_close();
                 let tx = chan.machine.on_close_signed(&msg).map_err(err)?;
                 drop(g);
                 // Both sides may complete the same close after a reconnect; a
@@ -955,8 +966,8 @@ impl ChannelManager {
                     .build_to_remote_claim(&to_remote, sweep_to, CLOSE_FEE);
                 let _ = chan.machine.mark_forcing();
                 chan.close = Some(CloseTracker::Finalizing {
-                    txid: claim.txid(),
-                    penalty: false,
+                    spends: to_remote.outpoint,
+                    tx: claim.clone(),
                 });
                 self.broadcast_or_warn(&claim, "to_remote claim");
                 Some(claim)
@@ -979,9 +990,117 @@ impl ChannelManager {
         depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
     ) -> Vec<(u64, Vec<u8>)> {
         self.react_to_spends(txs, height);
-        let frames = self.confirm_buried(depth_of);
+        let frames = self.confirm_buried(height, depth_of);
         self.advance_closes(txs, height);
         frames
+    }
+
+    /// Catches up, at startup, with what happened on chain while the node was
+    /// down or before a crash: the close and penalty tracking lives in memory.
+    ///
+    /// For every reloaded channel whose funding output is spent at the tip,
+    /// the blocks from the funding's confirmation height (journaled; without
+    /// it, the last [`MAX_RESCAN_BLOCKS`]) up to the tip are replayed through
+    /// the same reactions as live blocks: a revoked commitment is punished
+    /// (its fee ladder climbs with the replayed heights), our own commitment's
+    /// delayed sweep is scheduled, a cooperative close settles the channel, and
+    /// a claim, sweep or penalty already confirmed settles it too. Nothing is
+    /// broadcast during the replay; at the tip, every transaction still
+    /// awaited is broadcast once: a penalty at its current tier, a claim or
+    /// sweep, a cooperative close we hold signed, or our commitment if we were
+    /// force-closing and it never confirmed. `txs_at` yields the transactions
+    /// of the active chain's block at a height.
+    pub fn rescan(
+        &self,
+        tip: u64,
+        txs_at: &dyn Fn(u64) -> Option<Vec<Transaction>>,
+        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
+    ) {
+        let start = {
+            let g = self.inner.lock().unwrap();
+            g.channels
+                .values()
+                .filter(|c| {
+                    let Some(op) = c.machine.funding_outpoint() else {
+                        return false;
+                    };
+                    // Spent, or never seen confirmed: only a funding known to
+                    // have confirmed is looked for.
+                    depth_of(&op).is_none()
+                        && (c.machine.funding_height().is_some()
+                            || !matches!(c.machine.phase(), Phase::Opening | Phase::Funded))
+                })
+                .map(|c| {
+                    c.machine
+                        .funding_height()
+                        .unwrap_or_else(|| tip.saturating_sub(MAX_RESCAN_BLOCKS))
+                })
+                .min()
+        };
+        if let Some(start) = start {
+            self.replaying.store(true, Ordering::SeqCst);
+            for h in start..=tip {
+                if let Some(txs) = txs_at(h) {
+                    self.react_to_spends(&txs, h);
+                    self.advance_closes(&txs, h);
+                }
+            }
+            self.replaying.store(false, Ordering::SeqCst);
+        }
+        self.resume_after_restart(depth_of);
+    }
+
+    /// Broadcasts, once, every transaction a channel still waits on (see
+    /// [`ChannelManager::rescan`]).
+    fn resume_after_restart(&self, depth_of: &dyn Fn(&OutPoint) -> Option<u64>) {
+        let mut pending: Vec<(Transaction, &'static str)> = Vec::new();
+        {
+            let g = self.inner.lock().unwrap();
+            for c in g.channels.values() {
+                match &c.close {
+                    Some(CloseTracker::Penalty { current, .. }) => {
+                        pending.push((current.clone(), "penalty"));
+                    }
+                    Some(CloseTracker::Finalizing { tx, .. }) => {
+                        pending.push((tx.clone(), "claim or sweep"));
+                    }
+                    Some(CloseTracker::DelayedSweep { .. }) => {}
+                    None => {
+                        let unspent = c
+                            .machine
+                            .funding_outpoint()
+                            .is_some_and(|op| depth_of(&op).is_some());
+                        if !unspent {
+                            continue;
+                        }
+                        match c.machine.phase() {
+                            Phase::Closing => {
+                                if let Some(tx) = c.machine.signed_cooperative_close() {
+                                    pending.push((tx, "cooperative close"));
+                                }
+                            }
+                            Phase::Forcing => {
+                                let latest = c.machine.local_commit_number().and_then(|n| {
+                                    c.machine
+                                        .signed_commitment_at(
+                                            n,
+                                            crate::channel::txbuild::FeeTier::Medium,
+                                        )
+                                        .ok()
+                                });
+                                if let Some(tx) = latest {
+                                    pending.push((tx, "commitment"));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        for (tx, what) in pending {
+            self.broadcast_or_warn(&tx, what);
+        }
     }
 
     /// Forgets, for every channel, a funding spend that a reorganization took
@@ -1068,8 +1187,8 @@ impl ChannelManager {
                             .machine
                             .build_to_remote_claim(&to_remote, sweep_to, CLOSE_FEE);
                         chan.close = Some(CloseTracker::Finalizing {
-                            txid: claim.txid(),
-                            penalty: false,
+                            spends: to_remote.outpoint,
+                            tx: claim.clone(),
                         });
                         self.broadcast_or_warn(&claim, "to_remote claim");
                     }
@@ -1106,8 +1225,24 @@ impl ChannelManager {
 
     /// Confirms the funding of every channel buried to its agreed depth, moving
     /// it to open and returning the `ready` frame to send its peer.
-    fn confirm_buried(&self, depth_of: &dyn Fn(&OutPoint) -> Option<u64>) -> Vec<(u64, Vec<u8>)> {
+    fn confirm_buried(
+        &self,
+        height: u64,
+        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
+    ) -> Vec<(u64, Vec<u8>)> {
         let mut g = self.inner.lock().unwrap();
+        // Where each funding confirmed, journaled once: a restarted node scans
+        // from there for a spend it missed while down. Recorded for any channel
+        // whose funding is on chain, so one opened before this was journaled
+        // gets it at the next block.
+        for c in g.channels.values_mut() {
+            if let Some(depth) = c.machine.funding_outpoint().and_then(|op| depth_of(&op)) {
+                let at = height.saturating_add(1).saturating_sub(depth);
+                if c.machine.funding_height() != Some(at) {
+                    let _ = c.machine.note_funding_height(at);
+                }
+            }
+        }
         let ready: Vec<(Hash256, u64)> = g
             .channels
             .values()
@@ -1168,22 +1303,20 @@ impl ChannelManager {
                         if let Ok(sweep) =
                             chan.machine.build_local_sweep(&watch, sweep_to, CLOSE_FEE)
                         {
-                            let txid = sweep.txid();
                             chan.close = Some(CloseTracker::Finalizing {
-                                txid,
-                                penalty: false,
+                                spends: to_local.outpoint,
+                                tx: sweep.clone(),
                             });
                             self.broadcast_or_warn(&sweep, "delayed sweep");
                         }
                     }
                 }
-                Some(CloseTracker::Finalizing { txid, penalty }) => {
-                    let txid = *txid;
-                    let penalty = *penalty;
-                    if txs.iter().any(|t| t.txid() == txid) {
-                        if penalty {
-                            let _ = chan.machine.mark_penalised();
-                        }
+                Some(CloseTracker::Finalizing { spends, .. }) => {
+                    let spends = *spends;
+                    if txs
+                        .iter()
+                        .any(|t| t.inputs.iter().any(|i| i.prev_out == spends))
+                    {
                         let _ = chan.machine.mark_closed();
                         chan.close = None;
                     }
@@ -1286,7 +1419,12 @@ impl ChannelManager {
             *tier = FeeTier::ALL.len();
             return;
         }
-        match (self.hooks.replace)(current, &bumped) {
+        let replaced = if self.replaying.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            (self.hooks.replace)(current, &bumped)
+        };
+        match replaced {
             Ok(()) => {
                 tiers.push(bumped.txid());
                 *current = bumped;
@@ -1403,6 +1541,11 @@ impl ChannelManager {
     /// a penalty that never confirms lets a cheater's delayed sweep win — so it
     /// must never pass silently.
     fn broadcast_or_warn(&self, tx: &Transaction, what: &str) {
+        // Replaying blocks the node already holds at startup: what would have
+        // gone out then is broadcast once, at the tip, by `rescan`.
+        if self.replaying.load(Ordering::SeqCst) {
+            return;
+        }
         if let Err(e) = (self.hooks.broadcast)(tx) {
             eprintln!("ALERT: channel {what} transaction could not be broadcast: {e}");
         }
@@ -1457,6 +1600,15 @@ impl crate::net::ChannelSink for ChannelManager {
 
     fn on_disconnected_block(&self, txs: &[Transaction]) {
         ChannelManager::on_disconnected_block(self, txs)
+    }
+
+    fn rescan(
+        &self,
+        tip: u64,
+        txs_at: &dyn Fn(u64) -> Option<Vec<Transaction>>,
+        depth_of: &dyn Fn(&OutPoint) -> Option<u64>,
+    ) {
+        ChannelManager::rescan(self, tip, txs_at, depth_of)
     }
 }
 

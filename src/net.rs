@@ -1105,6 +1105,18 @@ pub trait ChannelSink: Send + Sync {
     /// spend the component reacted to and that left the chain can be forgotten
     /// and a different one classified afresh. The default does nothing.
     fn on_disconnected_block(&self, _txs: &[crate::tx::Transaction]) {}
+
+    /// Called once at startup, off the chain lock, with the chain height, the
+    /// transactions of the active chain's block at a height, and the depth
+    /// oracle, so the component can catch up with what confirmed while the
+    /// node was down. The default does nothing.
+    fn rescan(
+        &self,
+        _tip: u64,
+        _txs_at: &dyn Fn(u64) -> Option<Vec<crate::tx::Transaction>>,
+        _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+    ) {
+    }
 }
 
 /// The result of handing a channel message to the [`ChannelSink`].
@@ -1379,6 +1391,21 @@ impl Node {
             .ok()
             .and_then(|g| g.as_ref().cloned());
         if let Some(sink) = sink {
+            // First what confirmed while the node was down: a spend of a
+            // funding output it never saw is replayed block by block.
+            let tip = self.shared.lock().unwrap().chain.height();
+            let txs_at = |h: u64| {
+                let g = self.shared.lock().unwrap();
+                g.chain.block_at(h).map(|b| b.transactions)
+            };
+            let depth_of = |op: &crate::tx::OutPoint| -> Option<u64> {
+                let g = self.shared.lock().unwrap();
+                g.chain
+                    .utxo
+                    .get(op)
+                    .map(|e| tip.saturating_sub(e.height).saturating_add(1))
+            };
+            sink.rescan(tip, &txs_at, &depth_of);
             self.drive_channels(&sink, &[]);
         }
     }
