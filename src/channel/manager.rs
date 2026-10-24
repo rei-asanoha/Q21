@@ -1292,6 +1292,25 @@ impl ChannelManager {
                     delay,
                     commit_height,
                 }) => {
+                    // Our to_local spent before we swept it: only the
+                    // revocation branch can do that, so the commitment was a
+                    // revoked one — a journal restored from an old copy. Waiting
+                    // for a sweep that can never confirm would hold the channel
+                    // forever.
+                    let outpoint = to_local.outpoint;
+                    if txs
+                        .iter()
+                        .any(|t| t.inputs.iter().any(|i| i.prev_out == outpoint))
+                    {
+                        eprintln!(
+                            "ALERT: channel {}: our to_local was taken by a penalty; the \
+                             broadcast commitment had been revoked",
+                            cid.to_hex()
+                        );
+                        let _ = chan.machine.mark_closed();
+                        chan.close = None;
+                        continue;
+                    }
                     // `Older(D)` is satisfied once the chain is `D` blocks past
                     // the commitment: height >= commit_height + D.
                     if height >= commit_height.saturating_add(u64::from(*delay)) {

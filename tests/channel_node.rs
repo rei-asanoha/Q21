@@ -1667,3 +1667,64 @@ fn our_commitment_confirmed_while_down_is_swept_on_restart() {
     drive(&back, &chain);
     assert_eq!(back.info(cid).unwrap().phase, Phase::Closed);
 }
+
+/// Our own commitment confirms, but it was a revoked one (a journal restored
+/// from an old copy), and the counterparty's penalty takes its to_local before
+/// the delay. The channel settles instead of waiting forever for a sweep that
+/// can never confirm — and no sweep is attempted, live or in a startup rescan.
+#[test]
+#[cfg(feature = "audit")]
+fn a_to_local_taken_by_a_penalty_settles_our_side() {
+    let funder_seed = [0xbbu8; 32];
+    let (mut p, _wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, [0xbcu8; 32], "taken-to-local");
+    for amt in [600_000u64, 600_000] {
+        let m = p.funder.pay(cid, amt).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+    }
+    let state = p.funder.info(cid).unwrap().state_number;
+    let revoked = p.funder.signed_commitment(cid, state - 1).unwrap();
+    // The commitment confirms and the acceptor's penalty follows (its hook
+    // mines it at once).
+    let h = {
+        let mut c = chain.lock().unwrap();
+        c.mine(std::slice::from_ref(&revoked));
+        c.height()
+    };
+    p.acceptor
+        .on_funding_spend(cid, &revoked)
+        .expect("the acceptor punishes");
+    let penalty_block = chain.lock().unwrap().last_txs.clone();
+    for _ in 0..DELAY {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let Pair { funder, .. } = p;
+    drop(funder);
+    // A copy of the funder's journals for the rescan variant below.
+    let copy = dir.join("funder-copy");
+    std::fs::create_dir_all(&copy).unwrap();
+    for e in std::fs::read_dir(dir.join("funder")).unwrap().flatten() {
+        std::fs::copy(e.path(), copy.join(e.file_name())).unwrap();
+    }
+    // Live: the funder sees its commitment, then the penalty, then the delay.
+    let (live, sent) = relaying_manager(funder_seed, &dir.join("funder"), Hash256([3; 32]));
+    live.on_connected_block(std::slice::from_ref(&revoked), h, &|_| None);
+    live.on_connected_block(&penalty_block, h + 1, &|_| None);
+    for k in 2..=u64::from(DELAY) + 2 {
+        live.on_connected_block(&[], h + k, &|_| None);
+    }
+    assert_eq!(live.info(cid).unwrap().phase, Phase::Closed);
+    assert!(sent.lock().unwrap().is_empty(), "a sweep of a spent output");
+    drop(live);
+    // And through a startup rescan of the same blocks.
+    let (back, sent) = relaying_manager(funder_seed, &copy, Hash256([3; 32]));
+    assert_eq!(back.info(cid).unwrap().phase, Phase::Open);
+    let tip = chain.lock().unwrap().height();
+    let c1 = chain.clone();
+    let txs_at = move |h: u64| c1.lock().unwrap().chain.block_at(h).map(|b| b.transactions);
+    let c2 = chain.clone();
+    back.rescan(tip, &txs_at, &move |op: &OutPoint| chain_depth(&c2, op));
+    assert!(sent.lock().unwrap().is_empty());
+    assert_eq!(back.info(cid).unwrap().phase, Phase::Closed);
+}
