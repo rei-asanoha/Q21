@@ -2365,6 +2365,8 @@ impl Node {
         }
     }
 
+    /// Adds `points` to the peer's score. Returns whether the peer may stay:
+    /// `false` once its score reaches [`BAN_THRESHOLD`].
     fn penalize(&self, id: u64, points: u32) -> bool {
         let mut g = self.shared.lock().unwrap();
         if let Some(p) = g.peers.get_mut(&id) {
@@ -3668,7 +3670,14 @@ impl Node {
 
         // The channel component runs off the chain lock, so it is free to sign
         // and verify. An unsolicited message is penalized the same way.
-        if channel_penalty > 0 && self.penalize(id, channel_penalty) {
+        //
+        // `penalize` answers whether the peer may stay. Read the other way
+        // round, the first rejected channel message cut the link, while a peer
+        // already past the threshold was kept: a payment that crossed the
+        // peer's own was enough to drop the link, and the reestablish that
+        // followed each reconnection crossed again, so the link fell at every
+        // reconnection (D14).
+        if channel_penalty > 0 && !self.penalize(id, channel_penalty) {
             drop_peer = true;
         }
         if let Some(bytes) = channel_in {
@@ -3680,7 +3689,7 @@ impl Node {
             if let Some(sink) = sink {
                 let identity = self.peer_identity(id);
                 let outcome = sink.deliver(id, &identity, &bytes);
-                if outcome.penalize > 0 && self.penalize(id, outcome.penalize) {
+                if outcome.penalize > 0 && !self.penalize(id, outcome.penalize) {
                     drop_peer = true;
                 }
                 for payload in outcome.replies {
@@ -5610,6 +5619,62 @@ mod tests_hardening {
         assert_eq!(
             connected, expected,
             "every block of the winning branch is scanned, in order"
+        );
+    }
+
+    /// A sink that rejects every channel message as misconduct.
+    struct Rejecter;
+
+    impl ChannelSink for Rejecter {
+        fn deliver(&self, _peer: u64, _peer_identity: &str, _bytes: &[u8]) -> ChannelOutcome {
+            ChannelOutcome {
+                replies: Vec::new(),
+                penalize: MISCONDUCT_CHANNEL,
+            }
+        }
+    }
+
+    /// D14: a rejected channel message costs its sender points, like any other
+    /// misconduct, and the link falls when the score reaches the threshold —
+    /// not at the first one. A payment crossing the peer's own is rejected;
+    /// dropping the link for it, then again at each reestablish, kept two
+    /// honest wallets cut off from each other.
+    #[test]
+    fn a_rejected_channel_message_costs_points_not_the_link() {
+        let (a, _) = node_pair();
+        a.set_channel_sink(Arc::new(Rejecter));
+        let _e = established_peer(&a, 7);
+        a.shared.lock().unwrap().peers.get_mut(&7).unwrap().channels = true;
+        let tolerated = BAN_THRESHOLD.div_ceil(MISCONDUCT_CHANNEL) - 1;
+        for i in 1..=tolerated {
+            assert!(
+                a.handle(7, Message::Channel(vec![0u8; 40])),
+                "the link fell at rejected message {i}, below the threshold"
+            );
+        }
+        assert!(
+            !a.handle(7, Message::Channel(vec![0u8; 40])),
+            "a peer at the threshold is still disconnected"
+        );
+    }
+
+    /// The same rule for a channel message from a peer that never advertised
+    /// the capability: points first, the link at the threshold.
+    #[test]
+    fn an_unsolicited_channel_message_costs_points_up_to_the_threshold() {
+        let (a, _) = node_pair();
+        a.set_channel_sink(Arc::new(Rejecter));
+        let _e = established_peer(&a, 7);
+        let tolerated = BAN_THRESHOLD.div_ceil(MISCONDUCT_CHANNEL) - 1;
+        for i in 1..=tolerated {
+            assert!(
+                a.handle(7, Message::Channel(vec![0u8; 40])),
+                "the link fell at unsolicited message {i}, below the threshold"
+            );
+        }
+        assert!(
+            !a.handle(7, Message::Channel(vec![0u8; 40])),
+            "a peer at the threshold is still disconnected"
         );
     }
 
