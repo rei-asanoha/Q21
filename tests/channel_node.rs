@@ -215,6 +215,26 @@ struct Pair {
 }
 
 impl Pair {
+    /// Rebuilds the funder's manager from its journal directory, as a crash and
+    /// restart would — the reloaded manager replays its channels from disk.
+    fn reload_funder(
+        &mut self,
+        seed: [u8; 32],
+        wallet: Arc<Mutex<Wallet>>,
+        chain: Arc<Mutex<SharedChain>>,
+        dir: &std::path::Path,
+    ) {
+        self.funder = ChannelManager::new(
+            NET,
+            RATE,
+            seed,
+            dir.join("funder"),
+            DELAY,
+            DEPTH,
+            funder_hooks(wallet, chain),
+        );
+    }
+
     /// Drives every queued frame to quiescence, asserting no misconduct.
     fn pump(&mut self) {
         let mut steps = 0;
@@ -785,5 +805,83 @@ fn reestablish_recovers_a_dropped_update() {
         fi.local_balance,
         capacity - 800_000,
         "the dropped payment completed after reestablish"
+    );
+}
+
+/// D11-residual: a channel reloaded while an update was in flight (proposed but
+/// not acknowledged) reconciles on reconnect — both sides reach the same latest
+/// state and the channel keeps working — instead of jamming on "already in
+/// flight" / "not open".
+#[test]
+fn a_reloaded_channel_reconciles_an_incomplete_update() {
+    let funder_seed = [0xd1u8; 32];
+    let acceptor_seed = [0xd2u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("reload-midupdate");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = channel_id(&[chan_hash(&funder_seed, 0), chan_hash(&acceptor_seed, 0)]);
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    // One settled payment.
+    let m = p.funder.pay(cid, 500_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+
+    // The funder proposes another update but it is NOT delivered (the funder
+    // crashes right after persisting its side of it).
+    let _stuck = p.funder.pay(cid, 300_000).unwrap();
+    // Reload the funder from its journal: the in-flight proposal is on disk.
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+
+    // Reconnect: both sides exchange reestablish; the engine resends the one
+    // in-flight message and both converge.
+    for f in p.funder.on_peer_connected(A_PEER, "") {
+        p.queue.push_back((1, f));
+    }
+    for f in p.acceptor.on_peer_connected(F_PEER, "") {
+        p.queue.push_back((0, f));
+    }
+    p.pump();
+
+    let fi = p.funder.info(cid).unwrap();
+    let ai = p.acceptor.info(cid).unwrap();
+    assert_eq!(fi.state_number, ai.state_number, "both at the same state");
+    assert_eq!(fi.local_balance, ai.remote_balance, "balances agree");
+    assert_eq!(fi.remote_balance, ai.local_balance);
+
+    // The channel still works: a further payment settles on both sides.
+    let before = ai.local_balance;
+    let pay = p.funder.pay(cid, 100_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    assert_eq!(
+        p.acceptor.info(cid).unwrap().local_balance,
+        before + 100_000,
+        "the reloaded channel keeps working after reconciliation"
+    );
+    assert_eq!(
+        p.funder.info(cid).unwrap().state_number,
+        p.acceptor.info(cid).unwrap().state_number
     );
 }

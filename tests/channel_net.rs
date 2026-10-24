@@ -249,6 +249,11 @@ impl Net {
     fn pending_len(&self) -> usize {
         self.pending.lock().unwrap().len()
     }
+    /// Puts a raw transaction on chain at the next mine — a cheating funder
+    /// broadcasting a revoked commitment, for instance.
+    fn cheat_broadcast(&self, tx: &Transaction) {
+        self.pending.lock().unwrap().push(tx.clone());
+    }
     /// Spendable balance a wallet sees on its node's chain.
     fn balance(&self, wallet: &Arc<Mutex<Wallet>>, node: &Node) -> u64 {
         let w = wallet.lock().unwrap();
@@ -527,6 +532,13 @@ fn an_accepting_node_can_open_back_to_the_dialer() {
         b_entry.supports_channels,
         "an inbound peer's channel capability must be recorded"
     );
+    // The dialer completed the handshake after syncing, so its announced height
+    // is recorded too (not left at zero).
+    assert!(
+        b_entry.height > 0,
+        "an inbound peer's announced height must be recorded, got {}",
+        b_entry.height
+    );
 
     // A (accepting side) opens a channel to the inbound dialer and it reaches open.
     let cid = net.open(4_000_000);
@@ -585,6 +597,236 @@ fn channelpay_survives_a_restart_and_reconnect() {
             10
         ),
         "payment after restart did not land — the channel was frozen"
+    );
+
+    // And a cooperative close after the restart settles to both wallets — no
+    // force-close needed, proving the reloaded channel is fully usable.
+    let b_before = net.b_balance();
+    let f_before = net.f_balance();
+    let close = net
+        .fmgr
+        .close(cid)
+        .expect("a reloaded channel can be cooperatively closed");
+    assert!(net.a.send_channel(net.bid, close));
+    assert!(
+        wait(|| net.pending_len() >= 1, 10),
+        "cooperative close after restart was not signed and broadcast"
+    );
+    net.mine();
+    let close_fee = q21_core::channel::manager::CLOSE_FEE;
+    assert_eq!(
+        net.b_balance() - b_before,
+        800_000,
+        "acceptor wallet credited to the unit after a post-restart close"
+    );
+    assert_eq!(
+        net.f_balance() - f_before,
+        (cap - 800_000) - close_fee,
+        "funder wallet credited to the unit after a post-restart close"
+    );
+
+    net.a.shutdown();
+    net.b.shutdown();
+}
+
+/// D13 (SAFETY): a revoked commitment with a SINGLE to_local output (the
+/// counterparty's balance was zero, so there is no to_remote) must still be
+/// punished. The victim's watcher detects the spend, decodes the revoked state,
+/// builds the penalty against the to_local policy branch and broadcasts it well
+/// before the to-self delay, crediting the victim's wallet.
+#[test]
+fn a_revoked_single_output_commitment_is_punished() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    use q21_core::channel::machine::Phase;
+    let net = setup("d13single", [0x99u8; 32], [0x9au8; 32]);
+    let cap = 4_000_000u64;
+    let cid = net.open(cap); // state 0: funder=cap, acceptor=0 (single to_local on funder's commitment)
+
+    // Grab the funder's REVOKED state-0 commitment before advancing.
+    let revoked = net
+        .fmgr
+        .signed_commitment(cid, 0)
+        .expect("the funder retains its state-0 commitment");
+    assert_eq!(
+        revoked.outputs.len(),
+        1,
+        "state-0 commitment has a single to_local output (acceptor balance 0)"
+    );
+
+    // Pay the acceptor, revoking state 0.
+    let pay = net.fmgr.pay(cid, 1_000_000).unwrap();
+    assert!(net.a.send_channel(net.bid, pay));
+    assert!(
+        wait(
+            || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 1_000_000,
+            10
+        ),
+        "payment did not land"
+    );
+
+    let b_before = net.b_balance();
+    // The funder cheats: it broadcasts the revoked single-output commitment.
+    net.cheat_broadcast(&revoked);
+    net.mine();
+    let cheat_h = net.height();
+
+    // The victim's watcher must punish it within a few blocks — far inside D.
+    assert!(
+        wait(
+            || {
+                net.mine();
+                net.b_balance() > b_before
+            },
+            15
+        ),
+        "the revoked single-output broadcast was NOT punished — funds stolen"
+    );
+    assert!(
+        net.height() < cheat_h + DELAY as u64,
+        "the penalty confirmed before the to-self delay"
+    );
+    assert!(
+        net.b_balance() - b_before >= cap - 100_000,
+        "the victim swept the cheater's whole balance"
+    );
+    assert!(
+        wait(
+            || matches!(
+                net.amgr.info(cid).map(|i| i.phase),
+                Some(Phase::Penalised) | Some(Phase::Closed)
+            ),
+            5
+        ),
+        "the channel moves to penalised/closed"
+    );
+
+    net.a.shutdown();
+    net.b.shutdown();
+}
+
+/// D13, the two-output revoked case, for completeness: after a payment back and
+/// forth there are both outputs, and a revoked broadcast is still punished.
+#[test]
+fn a_revoked_two_output_commitment_is_punished() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    use q21_core::channel::machine::Phase;
+    let net = setup("d13two", [0x9bu8; 32], [0x9cu8; 32]);
+    let cap = 4_000_000u64;
+    let cid = net.open(cap);
+
+    // Pay to state 1 (both outputs present), keep state-1 as the revoked one.
+    let pay1 = net.fmgr.pay(cid, 1_500_000).unwrap();
+    assert!(net.a.send_channel(net.bid, pay1));
+    assert!(
+        wait(
+            || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 1_500_000,
+            10
+        ),
+        "first payment did not land"
+    );
+    let revoked = net
+        .fmgr
+        .signed_commitment(cid, 1)
+        .expect("state-1 commitment");
+    assert_eq!(
+        revoked.outputs.len(),
+        2,
+        "state-1 commitment has both outputs"
+    );
+
+    // Advance to state 2, revoking state 1.
+    let pay2 = net.fmgr.pay(cid, 500_000).unwrap();
+    assert!(net.a.send_channel(net.bid, pay2));
+    assert!(
+        wait(
+            || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 2_000_000,
+            10
+        ),
+        "second payment did not land"
+    );
+
+    let b_before = net.b_balance();
+    net.cheat_broadcast(&revoked);
+    net.mine();
+    let cheat_h = net.height();
+    assert!(
+        wait(
+            || {
+                net.mine();
+                net.b_balance() > b_before
+            },
+            15
+        ),
+        "the revoked two-output broadcast was not punished"
+    );
+    assert!(
+        net.height() < cheat_h + DELAY as u64,
+        "penalty before the delay"
+    );
+    assert!(
+        wait(
+            || matches!(
+                net.amgr.info(cid).map(|i| i.phase),
+                Some(Phase::Penalised) | Some(Phase::Closed)
+            ),
+            5
+        ),
+        "the channel moves to penalised/closed"
+    );
+
+    net.a.shutdown();
+    net.b.shutdown();
+}
+
+/// D12: an honest force-close of a channel whose counterparty balance is zero
+/// (single to_local output) must still sweep the to_local to our wallet after
+/// the delay, instead of freezing in `forcing`.
+#[test]
+fn a_single_output_force_close_is_swept() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    use q21_core::channel::machine::Phase;
+    let net = setup("d12", [0x9du8; 32], [0x9eu8; 32]);
+    let cap = 4_000_000u64;
+    let cid = net.open(cap); // acceptor balance 0 → funder's commitment is single-output
+
+    let f_locked = net.f_balance();
+    net.fmgr.force_close(cid).unwrap();
+    assert!(
+        wait(|| net.pending_len() >= 1, 5),
+        "commitment not broadcast"
+    );
+    net.mine();
+    let commit_h = net.height();
+
+    for _ in 0..(DELAY as u64 - 1) {
+        net.mine();
+        assert_eq!(net.f_balance(), f_locked, "nothing swept before the delay");
+        assert!(net.height() < commit_h + DELAY as u64);
+    }
+    assert!(
+        wait(
+            || {
+                net.mine();
+                net.f_balance() > f_locked
+            },
+            15
+        ),
+        "the single-output to_local was never swept — funds frozen"
+    );
+    assert!(
+        net.f_balance() - f_locked >= cap - 100_000,
+        "the sweep recovered the whole channel balance"
+    );
+    assert!(
+        wait(
+            || net
+                .fmgr
+                .info(cid)
+                .map(|i| i.phase == Phase::Closed)
+                .unwrap_or(false),
+            5
+        ),
+        "the channel settles to closed"
     );
 
     net.a.shutdown();
