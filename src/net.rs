@@ -733,6 +733,15 @@ struct Peer {
     /// On a public network, it is also an eclipse path: opening connections
     /// and then going quiet is enough to occupy every slot.
     last_received: Instant,
+    /// Instant this peer last delivered something we had **requested** — a
+    /// transaction or a block body. A peer that is answering our requests, if
+    /// slowly, is not withholding: on a saturated link a block body queues
+    /// behind the transactions we also asked for, and the body arrives late
+    /// through no fault of the peer. A requested body overdue past
+    /// [`BODY_TIMEOUT`] is therefore charged as withholding only to a peer
+    /// that has delivered nothing at all within that window. See
+    /// [`Node::maintain_peers`].
+    last_delivered: Instant,
     /// Instant of the last `Ping` sent that has gone unanswered.
     pending_ping: Option<Instant>,
     /// Transactions we asked this peer for and that have not arrived yet.
@@ -941,12 +950,24 @@ struct Shared {
     /// (same nonce, through Tor), with that nonce. Bounded: see the
     /// `Version` arm.
     aliases: HashMap<SocketAddr, u64>,
-    /// Transactions refused since the tip `rejected_at` for a reason only a
-    /// new block can change — full pool, conflict, fee too low — so that they
-    /// are not downloaded again at every offer. Bounded by
-    /// [`MAX_RECENT_REJECTS`]; emptied when the tip moves.
+    /// Transactions refused since the tip `rejected_at` for a reason a new
+    /// block can change on its own — a conflicting spend confirmed, a fee
+    /// floor that a block resets — so that they are not downloaded again at
+    /// every offer. Bounded by [`MAX_RECENT_REJECTS`]; emptied when the tip
+    /// moves. A **full pool** refusal does not go here: it survives blocks,
+    /// in `full_pool_rejected`.
     rejected: HashSet<Hash256>,
     rejected_at: Hash256,
+    /// Transactions refused for lack of room, with the fee rate and size they
+    /// were refused at. Unlike `rejected`, this survives block changes: a full
+    /// pool does not empty merely because the tip moved. Such a transaction is
+    /// requested again only once the pool could actually take it
+    /// ([`Mempool::would_admit`]) — free space, or an eviction floor that fell
+    /// below its rate. Without it, every peer re-offered its whole pool after
+    /// each block and the node re-downloaded everything it had just refused
+    /// (measured at 8.7 transactions received per accepted payment, against
+    /// 1.7 before). Bounded by [`MAX_RECENT_REJECTS`].
+    full_pool_rejected: HashMap<Hash256, (u64, usize)>,
     /// Transactions that arrived before their parent. See
     /// [`crate::mempool::OrphanPool`].
     orphans: crate::mempool::OrphanPool,
@@ -1212,6 +1233,7 @@ impl Node {
                 aliases: HashMap::new(),
                 rejected: HashSet::new(),
                 rejected_at: Hash256::ZERO,
+                full_pool_rejected: HashMap::new(),
                 orphans: crate::mempool::OrphanPool::new(),
                 peers: HashMap::new(),
                 network,
@@ -1880,8 +1902,19 @@ impl Node {
                 ..
             } = *g;
             // --- The requested bodies: delivered, pending, or withheld?
+            //
+            // A body overdue past the timeout is re-requested from another
+            // peer, and its holder is charged with withholding ONLY if it has
+            // delivered nothing we asked for within the same window. On a
+            // saturated link a 2 MB body queues behind the transactions we
+            // also requested; a peer that keeps answering, if slowly, is not
+            // withholding, and banning it split the network into halves that
+            // ignored each other until the stale-tip timer. `delivered_nothing`
+            // separates the honest-but-slow peer from the one that answers
+            // nothing.
             let mut withheld: Vec<Hash256> = Vec::new();
-            let mut withholders: Vec<u64> = Vec::new();
+            // (peer id, delivered nothing we asked for within the window).
+            let mut holders: Vec<(u64, bool)> = Vec::new();
             for (id, p) in peers.iter_mut() {
                 let mut overdue = 0u32;
                 p.requested_bodies.retain(|h, since| {
@@ -1896,16 +1929,13 @@ impl Node {
                     true
                 });
                 if overdue > 0 {
-                    withholders.push(*id);
-                    p.ban_score = p.ban_score.saturating_add(MISCONDUCT_BODY_WITHHELD);
-                    if p.ban_score >= BAN_THRESHOLD {
-                        self.stats.peers_banned.fetch_add(1, Ordering::Relaxed);
-                        dead.push(*id);
-                    }
+                    let delivered_nothing = now.duration_since(p.last_delivered) >= BODY_TIMEOUT;
+                    holders.push((*id, delivered_nothing));
                 }
             }
             if !withheld.is_empty() {
-                // To another peer — established, and not the one withholding.
+                let withholders: Vec<u64> = holders.iter().map(|(id, _)| *id).collect();
+                // To another peer — established, and not one of the holders.
                 let other = peers
                     .iter()
                     .filter(|(id, p)| {
@@ -1913,6 +1943,24 @@ impl Node {
                     })
                     .map(|(id, _)| *id)
                     .next();
+                // Charge withholding to a holder that delivered nothing at all
+                // in the window, or — when no other peer can serve the body —
+                // to the holder anyway, so a node cornered with a single
+                // non-delivering peer can still free the slot for a fresh one
+                // rather than stall forever. A holder that is still answering
+                // our other requests while another peer can fetch the body is
+                // left untouched.
+                for (hid, delivered_nothing) in &holders {
+                    if *delivered_nothing || other.is_none() {
+                        if let Some(p) = peers.get_mut(hid) {
+                            p.ban_score = p.ban_score.saturating_add(MISCONDUCT_BODY_WITHHELD);
+                            if p.ban_score >= BAN_THRESHOLD {
+                                self.stats.peers_banned.fetch_add(1, Ordering::Relaxed);
+                                dead.push(*hid);
+                            }
+                        }
+                    }
+                }
                 if let Some(id) = other {
                     // As a full block, and without noting it in flight: this
                     // peer announced none of these bodies, it must not be
@@ -2172,6 +2220,7 @@ impl Node {
                     version: 0,
                     remote_nonce: None,
                     last_received: Instant::now(),
+                    last_delivered: Instant::now(),
                     pending_ping: None,
                     requested_txs: HashMap::new(),
                     announced_waiting: VecDeque::new(),
@@ -2748,9 +2797,7 @@ impl Node {
                                 }
                             }
                             InvKind::Tx => {
-                                let refused = g.rejected_at == g.chain.tip_id()
-                                    && g.rejected.contains(&i.hash);
-                                if !g.mempool.contains(&i.hash) && !refused {
+                                if Self::should_request_tx(&g, &i.hash) {
                                     wanted.push(i);
                                 }
                             }
@@ -2876,6 +2923,14 @@ impl Node {
                     // a mere anonymous TCP connection. Same rule for all.
                     if handshaked {
                         self.stats.blocks_received.fetch_add(1, Ordering::Relaxed);
+                        // A body we asked for: this peer is answering us, so it
+                        // is not a withholder even if another body of its lags.
+                        let bid = b.header.block_id();
+                        if let Some(p) = g.peers.get_mut(&id) {
+                            if p.requested_bodies.contains_key(&bid) {
+                                p.last_delivered = Instant::now();
+                            }
+                        }
                         drop_peer = !Self::integrate(&mut g, &b, &self.stats, &mut outgoing, id);
                     }
                 }
@@ -2883,6 +2938,12 @@ impl Node {
                 Message::CmpctBlock(c) => {
                     self.stats.compacts_received.fetch_add(1, Ordering::Relaxed);
                     let bid = c.header.block_id();
+                    // A body we asked for marks this peer as answering us.
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        if p.requested_bodies.contains_key(&bid) {
+                            p.last_delivered = Instant::now();
+                        }
+                    }
                     if g.chain.has_block(&bid) {
                         // Already known: nothing to reconstruct. But if it was a
                         // body requested from this peer, its in-flight slot is
@@ -2910,6 +2971,27 @@ impl Node {
                         }
                         g.parked.push((id, c));
                         self.stats.compacts_parked.fetch_add(1, Ordering::Relaxed);
+                        // Its parent is one we have never seen: this peer is on
+                        // a branch we do not know. Ask it for headers — one
+                        // request outstanding at a time, charged to its budget
+                        // by `note_sent` — so two halves of a split re-sync
+                        // promptly instead of ignoring each other until the
+                        // stale-tip timer. The reply drives the normal sync
+                        // path (`Message::Headers` → `continue_sync`), which
+                        // fetches and connects the blocks we are missing, the
+                        // parent among them; the parked block is then resumed
+                        // (`resume_parked`). Without this, each half parked the
+                        // other's blocks waiting for a parent it never asked
+                        // for — a split that did not heal.
+                        if g.peers.get(&id).is_some_and(|p| p.expected_headers == 0) {
+                            outgoing.push(Outgoing {
+                                peer: id,
+                                message: Message::GetHeaders {
+                                    locator: g.chain.locator(),
+                                    stop: Hash256::ZERO,
+                                },
+                            });
+                        }
                     } else if !handshaked || !g.chain.has_block(&c.header.prev_block) {
                         // --- Defense: work imposed by a stranger.
                         //
@@ -3122,6 +3204,7 @@ impl Node {
                                     && p.requested_txs.remove(&t.txid()).is_some();
                                 if asked {
                                     p.tx_bucket.drain(now);
+                                    p.last_delivered = now;
                                 }
                                 asked
                             })
@@ -3159,7 +3242,12 @@ impl Node {
                     } else {
                         let txid = t.txid();
                         if let Some(p) = g.peers.get_mut(&id) {
-                            p.requested_txs.remove(&txid);
+                            if p.requested_txs.remove(&txid).is_some() {
+                                // It answered something we asked for: it is
+                                // not a withholder, however slow a block body
+                                // of its may be. See `Peer::last_delivered`.
+                                p.last_delivered = Instant::now();
+                            }
                         }
                         let is_new = !g.mempool.contains(&txid);
                         let height = g.chain.height();
@@ -3181,6 +3269,9 @@ impl Node {
                         };
                         match result {
                             Ok(txid) => {
+                                // It is in the pool now: forget any earlier
+                                // full-pool refusal of it.
+                                g.full_pool_rejected.remove(&txid);
                                 // To established peers only, like every
                                 // announcement: see `announce_tx`.
                                 let others: Vec<u64> = g
@@ -3207,24 +3298,50 @@ impl Node {
                                 g.orphans.add((*t).clone(), id, Instant::now());
                             }
                             Err(e) => {
-                                // Refused until the next block, whatever peer
-                                // offers it again: not downloaded again for
-                                // nothing at every offer (0.4.9, offers every
-                                // two minutes).
-                                if matches!(
-                                    e,
-                                    crate::mempool::MempoolError::FullAndUnderpaid
-                                        | crate::mempool::MempoolError::SpendConflict(_)
-                                        | crate::mempool::MempoolError::FeeRateTooLow { .. }
-                                ) {
-                                    let tip = g.chain.tip_id();
-                                    if g.rejected_at != tip
-                                        || g.rejected.len() >= MAX_RECENT_REJECTS
-                                    {
-                                        g.rejected.clear();
-                                        g.rejected_at = tip;
+                                // Refused for a reason only a change on our
+                                // side can lift, so it is not downloaded again
+                                // at every offer (0.4.9 offered every two
+                                // minutes).
+                                match &e {
+                                    // A full pool is lifted not by a mere block
+                                    // but by room: this refusal is remembered
+                                    // across blocks, with the rate and size it
+                                    // was refused at, and the transaction is
+                                    // asked for again only once the pool could
+                                    // take it. See `full_pool_rejected` and
+                                    // `should_request_tx`.
+                                    crate::mempool::MempoolError::FullAndUnderpaid => {
+                                        let size = t.encode().len();
+                                        let rate = g
+                                            .mempool
+                                            .apparent_fee_rate(&t, &g.chain.utxo)
+                                            .unwrap_or(0);
+                                        if g.full_pool_rejected.len() >= MAX_RECENT_REJECTS
+                                            && !g.full_pool_rejected.contains_key(&txid)
+                                        {
+                                            if let Some(evict) =
+                                                g.full_pool_rejected.keys().next().copied()
+                                            {
+                                                g.full_pool_rejected.remove(&evict);
+                                            }
+                                        }
+                                        g.full_pool_rejected.insert(txid, (rate, size));
                                     }
-                                    g.rejected.insert(txid);
+                                    // A conflict or a fee below the floor can be
+                                    // cleared by the next block; remembered only
+                                    // until the tip moves.
+                                    crate::mempool::MempoolError::SpendConflict(_)
+                                    | crate::mempool::MempoolError::FeeRateTooLow { .. } => {
+                                        let tip = g.chain.tip_id();
+                                        if g.rejected_at != tip
+                                            || g.rejected.len() >= MAX_RECENT_REJECTS
+                                        {
+                                            g.rejected.clear();
+                                            g.rejected_at = tip;
+                                        }
+                                        g.rejected.insert(txid);
+                                    }
+                                    _ => {}
                                 }
                                 // A rejected transaction is not necessarily an
                                 // aggression: it may already be known, or spend
@@ -3604,35 +3721,59 @@ impl Node {
         !drop_peer
     }
 
+    /// Whether an announced transaction is worth requesting from a peer.
+    ///
+    /// It is skipped when it is already in the pool, already held as an orphan
+    /// waiting for its parent (so a waiting orphan is not fetched again at
+    /// every offer), refused until the next block for a conflict or a fee
+    /// floor, or refused for lack of room and the pool still could not take it
+    /// ([`Mempool::would_admit`]). The last check is what stops a full pool
+    /// from re-downloading, after every block, everything it had just refused.
+    fn should_request_tx(g: &Shared, hash: &Hash256) -> bool {
+        if g.mempool.contains(hash) || g.orphans.contains(hash) {
+            return false;
+        }
+        if g.rejected_at == g.chain.tip_id() && g.rejected.contains(hash) {
+            return false;
+        }
+        if let Some((rate, size)) = g.full_pool_rejected.get(hash) {
+            if !g.mempool.would_admit(*rate, *size) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Requests, from peer `id`, the announced transactions that waited for
     /// its budget, as far as the budget now allows. Those that reached the
-    /// pool meanwhile, or were refused until the next block, are skipped.
+    /// pool meanwhile, or that it is not worth asking for (see
+    /// [`Self::should_request_tx`]), are skipped.
     fn request_waiting_txs(g: &mut Shared, id: u64, now: Instant) -> Option<Message> {
-        let tip = g.chain.tip_id();
-        let Shared {
-            ref mut peers,
-            ref mempool,
-            ref rejected,
-            ref rejected_at,
-            ..
-        } = *g;
-        let p = peers.get_mut(&id)?;
-        if p.announced_waiting.is_empty() || !p.handshaked {
-            return None;
+        match g.peers.get(&id) {
+            Some(p) if !p.announced_waiting.is_empty() && p.handshaked => {}
+            _ => return None,
         }
-        let room = p.tx_request_room(now);
+        let room = g
+            .peers
+            .get_mut(&id)
+            .map(|p| p.tx_request_room(now))
+            .unwrap_or(0);
         let mut items = Vec::new();
         while items.len() < room {
-            let Some(h) = p.announced_waiting.pop_front() else {
+            let Some(h) = g
+                .peers
+                .get_mut(&id)
+                .and_then(|p| p.announced_waiting.pop_front())
+            else {
                 break;
             };
-            if mempool.contains(&h)
-                || p.requested_txs.contains_key(&h)
-                || (*rejected_at == tip && rejected.contains(&h))
-            {
+            let p = g.peers.get(&id)?;
+            if p.requested_txs.contains_key(&h) || !Self::should_request_tx(g, &h) {
                 continue;
             }
-            p.requested_txs.insert(h, now);
+            if let Some(p) = g.peers.get_mut(&id) {
+                p.requested_txs.insert(h, now);
+            }
             items.push(InvItem {
                 kind: InvKind::Tx,
                 hash: h,
@@ -4890,6 +5031,7 @@ mod tests {
                 version: 0,
                 remote_nonce: None,
                 last_received: Instant::now(),
+                last_delivered: Instant::now(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -5071,6 +5213,68 @@ mod tests {
         a.shutdown();
         b.shutdown();
     }
+
+    /// A full-pool refusal is remembered across blocks, with the rate and size
+    /// it was refused at, and the transaction is not requested again while the
+    /// pool still has no room for it — only once it could take it.
+    ///
+    /// Before, the whole refusal set was emptied at every block, so each peer's
+    /// re-offer of its full pool after a block made the node re-download
+    /// everything it had just refused.
+    #[test]
+    fn a_full_pool_refusal_survives_a_block_and_waits_for_room() {
+        let n = node();
+        let h = Hash256([7u8; 32]);
+        // A size no pool can ever hold: the pool can never take it.
+        let too_big = 1usize << 40;
+        {
+            let mut g = n.shared.lock().unwrap();
+            g.full_pool_rejected.insert(h, (1_000, too_big));
+            // A stale tip-scoped set: a block has moved the tip since, so this
+            // would no longer block on its own.
+            g.rejected_at = Hash256([9u8; 32]);
+            g.rejected.insert(h);
+        }
+        assert!(
+            !Node::should_request_tx(&n.shared.lock().unwrap(), &h),
+            "a full-pool refusal is kept across the block and not fetched again \
+             while there is no room"
+        );
+        // Once the pool could take it (a size that fits), it is worth asking
+        // for again.
+        n.shared
+            .lock()
+            .unwrap()
+            .full_pool_rejected
+            .insert(h, (1_000, 500));
+        assert!(
+            Node::should_request_tx(&n.shared.lock().unwrap(), &h),
+            "once the pool has room, the transaction is requested again"
+        );
+    }
+
+    /// A transaction already held as an orphan, waiting for its parent, is not
+    /// requested again at every offer.
+    #[test]
+    fn an_orphan_already_held_is_not_requested_again() {
+        let n = node();
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn::coinbase(vec![3])],
+            outputs: Vec::new(),
+            lock_time: 0,
+        };
+        let h = tx.txid();
+        assert!(
+            Node::should_request_tx(&n.shared.lock().unwrap(), &h),
+            "unknown and not held: worth requesting"
+        );
+        n.shared.lock().unwrap().orphans.add(tx, 7, Instant::now());
+        assert!(
+            !Node::should_request_tx(&n.shared.lock().unwrap(), &h),
+            "an orphan already waiting is not fetched again"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5231,6 +5435,7 @@ mod tests_hardening {
                 version: 0,
                 remote_nonce: None,
                 last_received: Instant::now(),
+                last_delivered: Instant::now(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -5930,6 +6135,207 @@ mod tests_hardening {
         assert!(!a.penalize(7, MISCONDUCT_BAD_BLOCK));
         assert_eq!(a.shared.lock().unwrap().peers[&7].ban_score, u32::MAX);
     }
+
+    /// A body overdue on a saturated link is not misconduct as long as the
+    /// peer keeps answering our other requests: it is re-requested from
+    /// another peer, and the slow one is left alone.
+    ///
+    /// Banning such a peer — a 2 MB body queued behind the transactions we
+    /// also asked for — split the network into halves that then ignored each
+    /// other until the stale-tip timer.
+    #[test]
+    fn a_late_body_on_a_busy_link_is_not_misconduct() {
+        let (_a, b) = node_pair();
+        let _slow = established_peer(&b, 7); // answering, just slow on one body
+        let _other = established_peer(&b, 8); // able to serve the body instead
+        let overdue = Hash256([3u8; 32]);
+        {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.requested_bodies.insert(
+                overdue,
+                Instant::now() - BODY_TIMEOUT - Duration::from_secs(1),
+            );
+            // It delivered something we asked for a moment ago.
+            p.last_delivered = Instant::now();
+        }
+        b.maintain_peers();
+        let g = b.shared.lock().unwrap();
+        assert!(
+            g.peers.contains_key(&7),
+            "an honest but slow peer must not be dropped"
+        );
+        assert_eq!(
+            g.peers[&7].ban_score, 0,
+            "a peer that is answering keeps a clean score"
+        );
+        assert!(
+            !g.peers[&7].requested_bodies.contains_key(&overdue),
+            "the overdue body left its in-flight set, to be asked elsewhere"
+        );
+    }
+
+    /// A peer that delivered nothing we asked for within the window is charged
+    /// with withholding — a genuine withholder is still removed.
+    #[test]
+    fn a_peer_that_answers_nothing_is_charged_with_withholding() {
+        let (_a, b) = node_pair();
+        let _slow = established_peer(&b, 7);
+        let _other = established_peer(&b, 8);
+        let old = Instant::now() - BODY_TIMEOUT - Duration::from_secs(5);
+        {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.requested_bodies.insert(Hash256([3u8; 32]), old);
+            p.last_delivered = old; // nothing delivered within the window
+        }
+        b.maintain_peers();
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].ban_score,
+            MISCONDUCT_BODY_WITHHELD,
+            "a peer that answers nothing is charged with withholding"
+        );
+    }
+
+    /// Only what we asked for marks a peer as answering: an unrequested
+    /// transaction does not, a requested one does.
+    #[test]
+    fn only_what_we_asked_for_marks_a_peer_as_answering() {
+        let (_a, b) = node_pair();
+        let _s = established_peer(&b, 7);
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn::coinbase(vec![9])],
+            outputs: Vec::new(),
+            lock_time: 0,
+        };
+        let old = Instant::now() - Duration::from_secs(120);
+        b.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&7)
+            .unwrap()
+            .last_delivered = old;
+        // A transaction we never asked for.
+        let _ = b.handle(7, Message::Tx(Box::new(tx.clone())));
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].last_delivered,
+            old,
+            "a transaction we never requested is no sign the peer is answering"
+        );
+        // The same transaction, now requested.
+        b.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&7)
+            .unwrap()
+            .requested_txs
+            .insert(tx.txid(), Instant::now());
+        let _ = b.handle(7, Message::Tx(Box::new(tx)));
+        assert!(
+            b.shared.lock().unwrap().peers[&7].last_delivered > old,
+            "a transaction we requested marks the peer as answering"
+        );
+    }
+
+    /// A requested block whose parent we do not know makes us ask that peer
+    /// for headers (one outstanding), so a split branch is discovered instead
+    /// of being parked and forgotten.
+    #[test]
+    fn an_announcement_on_an_unknown_branch_triggers_a_headers_request() {
+        let (a, b) = node_pair();
+        let _s = established_peer(&b, 7);
+        crate::net::tests_util::mine_locally(&a, 2);
+        let b2 = a.with_chain(|c| c.block_at(2).unwrap());
+        b.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&7)
+            .unwrap()
+            .requested_bodies
+            .insert(b2.header.block_id(), Instant::now());
+        let _ = b.handle(
+            7,
+            Message::CmpctBlock(Box::new(CompactBlock::from_block(&b2, 1))),
+        );
+        let g = b.shared.lock().unwrap();
+        assert_eq!(
+            g.peers[&7].expected_headers, 1,
+            "an unknown-parent block makes us ask the peer for headers"
+        );
+        assert_eq!(b.stats.compacts_parked.load(Ordering::Relaxed), 1);
+    }
+
+    /// Two halves that diverged while split converge on one tip once
+    /// reconnected: the announcement of an unknown-branch tip drives a headers
+    /// request, which drives the normal sync, which fetches and connects the
+    /// missing blocks and reorganizes onto the heavier branch.
+    #[test]
+    fn two_partitioned_halves_converge_after_reconnecting() {
+        let (a, b) = node_pair();
+        // Each half mined its own branch, with a distinct miner so the branches
+        // really differ; A's is heavier by one block.
+        let mine_as = |n: &Node, count: usize, miner: u8| {
+            for _ in 0..count {
+                let blk = n
+                    .with_chain(|c| {
+                        let t = c.tip().time + TARGET_BLOCK_SECS;
+                        c.mine_block(
+                            Hash256([miner; 32]),
+                            SchemeId::LamportOts,
+                            &[],
+                            t,
+                            5_000_000,
+                        )
+                    })
+                    .expect("mining");
+                n.with_chain(|c| c.connect(&blk, blk.header.time + 1).expect("local"));
+            }
+        };
+        mine_as(&a, 4, 0xAA);
+        mine_as(&b, 3, 0xBB);
+        assert_ne!(a.tip_id(), b.tip_id(), "the halves diverged");
+
+        let _s = established_peer(&b, 7);
+        let a_blocks: Vec<Block> =
+            a.with_chain(|c| (1..=4).map(|h| c.block_at(h).unwrap()).collect());
+        let a_tip = a_blocks[3].clone();
+
+        // A announces its tip; B requests the body.
+        let _ = b.handle(
+            7,
+            Message::Inv(vec![InvItem {
+                kind: InvKind::CompactBlock,
+                hash: a_tip.header.block_id(),
+            }]),
+        );
+        // The body's parent is unknown: B parks it and asks A for headers.
+        let _ = b.handle(
+            7,
+            Message::CmpctBlock(Box::new(CompactBlock::from_block(&a_tip, 1))),
+        );
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].expected_headers,
+            1,
+            "B asked A for headers on the unknown branch"
+        );
+        // A replies with its branch's headers, then serves the bodies.
+        let headers: Vec<crate::block::BlockHeader> =
+            a_blocks.iter().map(|blk| blk.header).collect();
+        let _ = b.handle(7, Message::Headers(headers));
+        for blk in &a_blocks {
+            let _ = b.handle(7, Message::Block(Box::new(blk.clone())));
+        }
+        assert_eq!(b.height(), 4, "B followed the heavier branch");
+        assert_eq!(
+            b.tip_id(),
+            a.tip_id(),
+            "the two halves converged on one tip"
+        );
+    }
 }
 
 /// Handler fuzzing: `handle` fed structured, hostile messages, over several
@@ -6083,6 +6489,7 @@ mod tests_handler_fuzz {
                 version: 0,
                 remote_nonce: None,
                 last_received: now,
+                last_delivered: now,
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -6915,6 +7322,7 @@ mod tests_handler_review {
                 version: 0,
                 remote_nonce: None,
                 last_received: now,
+                last_delivered: now,
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),

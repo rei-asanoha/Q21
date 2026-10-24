@@ -2182,16 +2182,39 @@ impl Chain {
     ) -> Block {
         let height = self.height() + 1;
 
+        // Fees are valued in block order against the confirmed set **plus the
+        // outputs created earlier in this block**, exactly as validation does
+        // through its `BlockView` (see `validate::check_block`). Without the
+        // in-block outputs, a child spending its parent's change in the same
+        // block valued that input at zero and added nothing to the coinbase:
+        // the block under-claimed the fees it was owed. An input found in
+        // neither set still counts zero, so the coinbase can only ever claim
+        // less than consensus allows, never more.
         let mut fees: u64 = 0;
+        let mut created_here: HashMap<crate::tx::OutPoint, u64> = HashMap::new();
         for tx in mempool {
             let inputs: u64 = tx
                 .inputs
                 .iter()
-                .filter_map(|i| self.utxo.get(&i.prev_out))
-                .map(|e| e.output.value.units())
+                .filter_map(|i| {
+                    self.utxo
+                        .get(&i.prev_out)
+                        .map(|e| e.output.value.units())
+                        .or_else(|| created_here.get(&i.prev_out).copied())
+                })
                 .sum();
             let outputs = tx.total_output().map(|a| a.units()).unwrap_or(0);
             fees += inputs.saturating_sub(outputs);
+            let id = tx.txid();
+            for (i, o) in tx.outputs.iter().enumerate() {
+                created_here.insert(
+                    crate::tx::OutPoint {
+                        txid: id,
+                        index: i as u32,
+                    },
+                    o.value.units(),
+                );
+            }
         }
 
         let rewards = validate::uncle_rewards(height, uncles.len());
@@ -2755,6 +2778,84 @@ mod tests {
             c.connect(&b, t + 1),
             Err(ValidationError::ExcessiveSubsidy { .. })
         ));
+    }
+
+    /// A child spending its parent's change in the same block contributes its
+    /// fee to the coinbase, and the resulting fuller claim is accepted by the
+    /// existing validation.
+    ///
+    /// Before the fix, `assemble_candidate` valued the child's input only from
+    /// the confirmed UTXO set — where the parent's change does not yet exist —
+    /// so the child added zero to the coinbase and its fee was forfeited.
+    #[test]
+    fn coinbase_claims_the_fees_of_in_block_chained_transactions() {
+        use crate::mempool::Mempool;
+        use crate::wallet::Wallet;
+
+        fn spend_with_pending(w: &mut Wallet, c: &Chain, m: &Mempool, fee: u64) -> Transaction {
+            let mut dest = Wallet::from_seed([0x73; 32], NETWORK);
+            let a = dest.new_address();
+            let pending = m.unspent_created(&|o| w.owns_output(o));
+            let p = w
+                .prepare_spend_avoiding(
+                    &c.utxo,
+                    c.height(),
+                    &[(a, Amount::from_units(10_000))],
+                    Amount::from_units(fee),
+                    &|o| m.spends(o),
+                    &pending,
+                )
+                .expect("prepare");
+            w.sign_spend(&m.view(&c.utxo), p).expect("sign")
+        }
+
+        let mut w = Wallet::from_seed([0x71; 32], NETWORK);
+        let _ = w.new_address();
+        let mut c = new_chain();
+        for i in 1..=COINBASE_MATURITY + 1 {
+            let a = w.new_address();
+            let t = GENESIS_TIME + i * TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(a.hash, SchemeId::LamportOts, &[], t, TRIES)
+                .expect("mining");
+            c.connect(&b, t + 1).expect("connect");
+        }
+
+        let mut m = Mempool::new();
+        let parent_fee = 7_000u64;
+        let child_fee = 11_000u64;
+        let parent = spend_with_pending(&mut w, &c, &m, parent_fee);
+        m.accept(&parent, &c.utxo, NETWORK, c.height())
+            .expect("parent");
+        let child = spend_with_pending(&mut w, &c, &m, child_fee);
+        m.accept(&child, &c.utxo, NETWORK, c.height())
+            .expect("child");
+        assert_eq!(
+            child.inputs[0].prev_out.txid,
+            parent.txid(),
+            "the child spends the parent's change in the same block"
+        );
+
+        let selection = m.select_for_block(u64::MAX);
+        assert_eq!(selection.len(), 2);
+        assert_eq!(selection[0].txid(), parent.txid(), "parent first");
+        assert_eq!(selection[1].txid(), child.txid(), "child after its parent");
+
+        let t = c.tip().time + TARGET_BLOCK_SECS;
+        let a = w.new_address();
+        let block = c
+            .mine_block(a.hash, SchemeId::LamportOts, &selection, t, TRIES)
+            .expect("mining the candidate");
+
+        let subsidy = validate::uncle_rewards(c.height() + 1, 0).miner_share;
+        assert_eq!(
+            block.transactions[0].outputs[0].value.units(),
+            subsidy + parent_fee + child_fee,
+            "the coinbase claims the subsidy plus both fees"
+        );
+
+        c.connect(&block, t + 1)
+            .expect("the fuller claim is accepted by validation");
     }
 
     #[test]
