@@ -1457,11 +1457,14 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
                     .filter_map(|s| s.parse().ok())
                     .collect()
             }
+            // Key schemes only, as for an address: the policy value (5) names
+            // no key, and no wallet derives from it.
             "scheme" => {
                 scheme = value
                     .parse::<u8>()
                     .ok()
                     .and_then(SchemeId::from_u8)
+                    .filter(|s| SchemeId::ALL.contains(s))
                     .ok_or_else(|| format!("wallet unreadable: unknown scheme ({value})"))?
             }
             "network" => {
@@ -7718,6 +7721,50 @@ mod tests {
         assert!(wallet_path(&d_test).exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A wallet file naming the policy value (5) as its scheme is refused as
+    /// an unknown scheme, like an address naming it: it designates no key.
+    /// Before, it was read, then refused further on with a message blaming a
+    /// build without ML-DSA.
+    #[test]
+    fn a_wallet_naming_the_policy_scheme_is_unreadable() {
+        use q21_core::wallet::Wallet;
+
+        remember_passphrase(None);
+        let d = std::env::temp_dir().join(format!(
+            "q21_test_policy_scheme_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let w = Wallet::from_seed([0x5b; 32], Network::Regtest);
+        write_wallet(&d, &w).expect("a regtest wallet in plaintext");
+        let text = std::fs::read_to_string(wallet_path(&d)).unwrap();
+        let edited = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("scheme=") {
+                    "scheme=5"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(wallet_path(&d), edited).unwrap();
+        let refusal = match read_wallet(&d) {
+            Ok(_) => panic!("a wallet naming the policy scheme was read"),
+            Err(e) => e,
+        };
+        assert!(
+            refusal.contains("unknown scheme (5)"),
+            "unexpected message: {refusal}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
