@@ -67,6 +67,14 @@ pub struct Store {
     next: Option<u64>,
 }
 
+/// The revealed secrets are wiped when the store is dropped: they are what a
+/// penalty is built from, and no copy needs to survive in a reused heap.
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
 impl Store {
     pub fn new() -> Store {
         Store {
@@ -123,6 +131,13 @@ impl Store {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Zeroes every secret held, in place.
+    fn wipe(&mut self) {
+        for (secret, _) in self.known.iter_mut().flatten() {
+            crate::kdf::wipe(secret);
+        }
     }
 
     /// Bytes held: each entry is a secret and its index.
@@ -210,6 +225,22 @@ mod tests {
 
     /// A thousand and more states: the store stays at a few entries, and
     /// every secret revealed so far can be rebuilt.
+    #[test]
+    fn revealed_secrets_are_wiped() {
+        let seed = [0x24u8; 32];
+        let mut store = Store::new();
+        for i in 0..5 {
+            store
+                .insert(derive(&seed, MAX_INDEX - i), MAX_INDEX - i)
+                .unwrap();
+        }
+        assert!(store.entries().iter().all(|(s, _)| *s != [0u8; 32]));
+        // What `Drop` runs: every held secret is zeroed in place.
+        store.wipe();
+        assert!(!store.entries().is_empty());
+        assert!(store.entries().iter().all(|(s, _)| *s == [0u8; 32]));
+    }
+
     #[test]
     fn a_store_restores_from_its_entries() {
         let seed = [0x42u8; 32];

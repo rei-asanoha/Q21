@@ -58,6 +58,10 @@ pub trait Signer: Send + Sync {
 
 /// A concrete ML-DSA-87 channel key, holding the expanded signing key so a
 /// channel that signs thousands of states pays the key expansion only once.
+///
+/// Its seed, which also roots the channel's revocation shachain, is wiped
+/// when the key is dropped; the expanded signing key wipes itself (the
+/// signing backend is built with its `zeroize` feature).
 #[cfg(feature = "mldsa")]
 pub struct ChannelKey {
     seed: [u8; 32],
@@ -81,7 +85,23 @@ impl ChannelKey {
 
     /// Builds a channel's signing key from the wallet seed and the index.
     pub fn derive(wallet_seed: &[u8; 32], channel_index: u32) -> ChannelKey {
-        ChannelKey::from_seed(&funding_key_seed(wallet_seed, channel_index))
+        let mut seed = funding_key_seed(wallet_seed, channel_index);
+        let key = ChannelKey::from_seed(&seed);
+        crate::kdf::wipe(&mut seed);
+        key
+    }
+
+    /// Where the seed lives, so a test can check it is wiped on drop.
+    #[cfg(test)]
+    pub(crate) fn seed_location(&self) -> *const [u8; 32] {
+        &self.seed
+    }
+}
+
+#[cfg(feature = "mldsa")]
+impl Drop for ChannelKey {
+    fn drop(&mut self) {
+        crate::kdf::wipe(&mut self.seed);
     }
 }
 

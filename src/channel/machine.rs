@@ -108,6 +108,14 @@ pub fn channel_id(funding: &[Hash256; 2]) -> Hash256 {
     )
 }
 
+/// The root of our revocation shachain derives every revocation secret of the
+/// channel, past and future: it does not outlive the machine.
+impl Drop for Machine {
+    fn drop(&mut self) {
+        crate::kdf::wipe(&mut self.revocation_seed);
+    }
+}
+
 /// Keeps only the `keep` highest states of a per-state map.
 fn prune_to_latest<V>(map: &mut BTreeMap<u64, V>, keep: usize) {
     while map.len() > keep {
@@ -387,7 +395,11 @@ impl Machine {
     }
 
     fn our_point(&self, n: u64) -> Hash256 {
-        Hash256(sha256(&self.our_secret(n)))
+        // The secret of a state not yet revoked: no copy of it outlives this.
+        let mut secret = self.our_secret(n);
+        let point = Hash256(sha256(&secret));
+        crate::kdf::wipe(&mut secret);
+        point
     }
 
     fn record_their_points(&mut self, hashes: &[Hash256]) -> Result<(), ChannelError> {
@@ -1014,6 +1026,13 @@ impl Machine {
             self.seen_nonces.len(),
             self.store.len(),
         ]
+    }
+
+    /// Where the revocation root lives, so a test can check it is wiped on
+    /// drop.
+    #[cfg(all(test, feature = "mldsa"))]
+    pub(crate) fn revocation_root_location(&self) -> *const [u8; 32] {
+        &self.revocation_seed
     }
 
     /// Everything replay must rebuild, as text, so a test can compare a

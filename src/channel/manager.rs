@@ -23,7 +23,7 @@
 //! which take the chain lock themselves, after the cryptography is done.
 
 use crate::address::Network;
-use crate::channel::keys::{funding_key_seed, ChannelKey, Signer, CHANNEL_SCHEME};
+use crate::channel::keys::{ChannelKey, Signer, CHANNEL_SCHEME};
 use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
 use crate::channel::messages::Message as ChMsg;
 use crate::channel::txbuild::FeeTier;
@@ -389,10 +389,7 @@ impl ChannelManager {
     }
 
     fn signer(&self, index: u32) -> Box<dyn Signer> {
-        Box::new(ChannelKey::from_seed(&funding_key_seed(
-            &self.wallet_seed,
-            index,
-        )))
+        Box::new(ChannelKey::derive(&self.wallet_seed, index))
     }
 
     /// The sidecar file holding a channel's durable peer identity, beside its
@@ -1373,6 +1370,14 @@ fn pending_close(chan: &mut Chan, cid: Hash256) -> Option<Vec<u8>> {
     Some(write_frame(cid, KIND_ENGINE, &msg.encode()))
 }
 
+/// The channel seed derives every channel key and revocation root this node
+/// holds: it does not outlive the manager.
+impl Drop for ChannelManager {
+    fn drop(&mut self) {
+        crate::kdf::wipe(&mut self.wallet_seed);
+    }
+}
+
 /// Classifies a funding-output spend for `chan`, robust to the single-output
 /// commitment shape (see [`Machine::identify_spend`]).
 fn classify_spend(chan: &Chan, _funding: OutPoint, tx: &Transaction) -> Watch {
@@ -1439,5 +1444,33 @@ impl crate::net::ChannelSink for ChannelManager {
 
     fn on_disconnected_block(&self, txs: &[Transaction]) {
         ChannelManager::on_disconnected_block(self, txs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The channel seed a manager holds is wiped when it is dropped.
+    #[test]
+    fn the_channel_seed_is_wiped_on_drop() {
+        let dir = std::env::temp_dir().join(format!("q21-mgr-wipe-{}", std::process::id()));
+        let hooks = Hooks {
+            fund: Box::new(|_, _| Err("no".into())),
+            broadcast: Box::new(|_| Ok(())),
+            sweep_address: Box::new(|| Hash256::ZERO),
+            payout_address: Box::new(|| Hash256::ZERO),
+            replace: Box::new(|_, _| Ok(())),
+        };
+        let mgr = ChannelManager::new(Network::Regtest, 10, [0x77u8; 32], dir, 12, 2, hooks);
+        let mut slot = std::mem::ManuallyDrop::new(mgr);
+        let p: *const [u8; 32] = &slot.wallet_seed;
+        assert_eq!(unsafe { *p }, [0x77u8; 32]);
+        // Safe: dropped once, here; the bytes read stay in `slot`'s storage.
+        let after = unsafe {
+            std::mem::ManuallyDrop::drop(&mut slot);
+            std::ptr::read_volatile(p)
+        };
+        assert_eq!(after, [0u8; 32]);
     }
 }

@@ -1892,3 +1892,38 @@ fn a_crash_after_compaction_recovers_at_every_journal_write() {
         failures.join("\n")
     );
 }
+
+// --- L7: secrets do not outlive their holder ---------------------------------
+
+/// Drops `value` in place and returns the 32 bytes at `at` (a field of it)
+/// afterwards. The storage stays ours (it is a `ManuallyDrop`), so the bytes
+/// are what the drop left behind.
+fn bytes_after_drop<T>(value: T, at: impl Fn(&T) -> *const [u8; 32]) -> [u8; 32] {
+    let mut slot = std::mem::ManuallyDrop::new(value);
+    let p = at(&slot);
+    // Safe: `slot` is dropped exactly once, here, and never used again; the
+    // bytes read are plain integers in storage `slot` still owns.
+    unsafe {
+        std::mem::ManuallyDrop::drop(&mut slot);
+        std::ptr::read_volatile(p)
+    }
+}
+
+#[test]
+fn a_channel_key_seed_is_wiped_on_drop() {
+    let k = ChannelKey::from_seed(&[0x5au8; 32]);
+    assert_eq!(unsafe { *k.seed_location() }, [0x5au8; 32]);
+    assert_eq!(bytes_after_drop(k, |k| k.seed_location()), [0u8; 32]);
+}
+
+#[test]
+fn a_machine_revocation_root_is_wiped_on_drop() {
+    let dir = tmpdir();
+    let (f, a) = open_pair(&dir);
+    drop(a);
+    assert_ne!(unsafe { *f.revocation_root_location() }, [0u8; 32]);
+    assert_eq!(
+        bytes_after_drop(f, |m| m.revocation_root_location()),
+        [0u8; 32]
+    );
+}

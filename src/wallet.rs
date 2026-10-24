@@ -1888,10 +1888,10 @@ impl Wallet {
     /// The channel signing key for `channel_index`, derived from the wallet
     /// seed. Reconstructed identically on any reload of the same wallet.
     pub fn channel_key(&self, channel_index: u32) -> crate::channel::keys::ChannelKey {
-        crate::channel::keys::ChannelKey::from_seed(&crate::channel::keys::funding_key_seed(
-            &self.channel_seed(),
-            channel_index,
-        ))
+        let mut seed = self.channel_seed();
+        let key = crate::channel::keys::ChannelKey::derive(&seed, channel_index);
+        crate::kdf::wipe(&mut seed);
+        key
     }
 
     /// A seed dedicated to this wallet's payment channels, derived from the

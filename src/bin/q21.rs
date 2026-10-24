@@ -4698,7 +4698,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             const CHANNEL_FUND_FEE: u64 = 50_000;
 
             let folder = datadir.to_path_buf();
-            let seed = wallet.lock().unwrap().channel_seed();
+            let mut seed = wallet.lock().unwrap().channel_seed();
             let jdir = datadir.join("channels");
             let _ = std::fs::create_dir_all(&jdir);
 
@@ -4812,6 +4812,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     replace,
                 },
             ));
+            // The manager holds its own copy, wiped when it is dropped.
+            q21_core::kdf::wipe(&mut seed);
             node.set_channel_sink(mgr.clone());
             // Channels reloaded from the journal may already be funded to depth
             // (the funding confirmed while this node was down): confirm them now
