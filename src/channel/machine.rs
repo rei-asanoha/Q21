@@ -198,6 +198,11 @@ pub struct Machine {
     /// Reestablish nonces already accepted from the peer, for freshness: the
     /// most recent [`MAX_SEEN_NONCES`], oldest first.
     seen_nonces: VecDeque<[u8; 32]>,
+    /// A state the peer proposed and we have not received, as its last
+    /// reestablish showed: it signed our commitment at that state. Its update
+    /// was lost with the old link and comes again; until it lands, a proposal
+    /// of ours would cross it. Not journaled: every reestablish sets it anew.
+    peer_proposal: Option<u64>,
 }
 
 /// Reestablish nonces remembered per channel. One is accepted per reconnection;
@@ -385,6 +390,7 @@ impl Machine {
             store: shachain::Store::new(),
             base_fee_rate,
             seen_nonces: VecDeque::new(),
+            peer_proposal: None,
         })
     }
 
@@ -1323,6 +1329,7 @@ impl Machine {
             store: shachain::Store::new(),
             base_fee_rate,
             seen_nonces: VecDeque::new(),
+            peer_proposal: None,
         };
         m.replay(&records);
         m.compact_if_long()?;
@@ -1429,6 +1436,7 @@ impl Machine {
         let Message::Reestablish {
             channel_id: cid,
             local_commit_number: their_next_local,
+            remote_commit_number: their_next_remote,
             next_revocation_recv: their_next_recv,
             nonce,
             direction,
@@ -1471,6 +1479,13 @@ impl Machine {
         // what we owe it, in the order it must be processed.
         let their_local = their_next_local.checked_sub(1);
         let their_recv = their_next_recv.checked_sub(1);
+        // The peer signed our commitment at a state we neither hold nor
+        // proposed: its own update, lost with the old link, which it resends
+        // on this reestablish. Proposing that state meanwhile crossed it, and
+        // the channel deadlocked with both proposals in flight.
+        let their_remote = their_next_remote.checked_sub(1);
+        self.peer_proposal = their_remote
+            .filter(|&r| self.local_commit_number < Some(r) && self.remote_commit_number < Some(r));
         let mut out = Vec::new();
         // The state whose Ack we have queued, so it is not sent twice.
         let mut acked: Option<u64> = None;
@@ -1524,14 +1539,20 @@ impl Machine {
     }
 
     /// Whether an update is still settling: we proposed a state the peer has not
-    /// acknowledged, we hold a state we have not finished acknowledging, or a
-    /// revocation of the previous state is still owed in either direction.
+    /// acknowledged, we hold a state we have not finished acknowledging, a
+    /// revocation of the previous state is still owed in either direction, or
+    /// the peer's reestablish showed a proposal of its own not received yet.
     /// While it is, no new update or close may start; a reestablish completes
     /// it.
     pub fn update_in_flight(&self) -> bool {
         let Some(l) = self.local_commit_number else {
             return false;
         };
+        // The peer's own proposal, shown by its reestablish, is still on its
+        // way to us.
+        if self.peer_proposal.is_some_and(|p| l < p) {
+            return true;
+        }
         if self.remote_commit_number != Some(l) {
             return true;
         }

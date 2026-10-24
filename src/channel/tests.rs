@@ -670,6 +670,38 @@ fn reestablish_recovers_from_a_crash_mid_update() {
     assert_eq!(a.local_commit_number(), Some(2));
 }
 
+/// D14: a proposal lost with the old link is resent on reestablish. Until it
+/// lands, the side that never received it must not propose the same state:
+/// the two proposals would cross, and the channel deadlock with both in
+/// flight.
+#[test]
+fn reestablish_holds_our_proposal_until_the_peers_lost_one_lands() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    // The acceptor proposes state 2; the link drops before it arrives.
+    let _lost = a.propose([CAP - 900_000, 900_000]).unwrap();
+
+    // Reconnect. The acceptor's reestablish shows the funder a proposal on
+    // its way: the funder holds its own.
+    let (_f_resends, a_resends) = exchange_reestablish(&mut f, &mut a);
+    assert!(
+        f.update_in_flight(),
+        "the funder may propose over the acceptor's resent update"
+    );
+
+    // The resent update lands and settles; the funder may propose again.
+    let upd = a_resends
+        .into_iter()
+        .find(|m| matches!(m, Message::Update { state: 2, .. }))
+        .expect("the acceptor resends its update");
+    let ack = f.on_update(&upd).unwrap();
+    let rev = a.on_ack(&ack).unwrap();
+    f.on_revoke(&rev).unwrap();
+    assert!(!f.update_in_flight());
+    pay(&mut f, &mut a, [CAP - 1_500_000, 1_500_000]);
+}
+
 // --- Cooperative close ------------------------------------------------------
 
 #[test]
