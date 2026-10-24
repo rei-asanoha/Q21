@@ -306,6 +306,27 @@ impl Net {
         cid
     }
 
+    /// Drops the funder's live links and redials, as a transient network flap
+    /// would. The channel stays in memory; only the connection changes, so the
+    /// node-id rebind must recover it. Returns the new connection id.
+    fn flap_link(&mut self) -> u64 {
+        self.a.disconnect_all_peers();
+        assert!(
+            wait(|| self.a.peer_count() == 0, 10),
+            "the old link did not drop"
+        );
+        let bid2 = self
+            .a
+            .connect(self.b_listen)
+            .expect("redial after the flap");
+        assert!(
+            wait(|| self.a.channel_peers().contains(&bid2), 10),
+            "the link did not re-establish after the flap"
+        );
+        self.bid = bid2;
+        bid2
+    }
+
     /// Simulates a funder process restart: a fresh manager reloads the channels
     /// from the journal directory, is reinstalled on the node, and redials the
     /// acceptor's stable address. The handshake re-binds the reloaded channel to
@@ -843,6 +864,59 @@ fn a_single_output_force_close_is_swept() {
             5
         ),
         "the channel settles to closed"
+    );
+
+    net.a.shutdown();
+    net.b.shutdown();
+}
+
+/// D14 (symptom): a channel stays usable across repeated link flaps. The TCP
+/// connection is dropped and re-established several times; each reconnect
+/// re-binds the channel by the peer's stable node id (not the ephemeral port),
+/// so channelpay keeps working and the channel does not become unreachable.
+#[test]
+fn a_channel_survives_repeated_link_flaps() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let mut net = setup_as("d14flap", [0xa1u8; 32], [0xa2u8; 32], true);
+    let cap = 6_000_000u64;
+    let cid = net.open(cap);
+
+    let mut paid = 0u64;
+    for _ in 0..3 {
+        net.flap_link();
+        // After the flap the channel re-binds by node id on both sides, so a
+        // payment goes through without re-opening or forcing a close.
+        paid += 400_000;
+        assert!(
+            wait(
+                || net
+                    .fmgr
+                    .pay(cid, 400_000)
+                    .map(|f| net.a.send_channel(net.bid, f))
+                    .unwrap_or(false),
+                10
+            ),
+            "channelpay was refused after a link flap — the channel was isolated"
+        );
+        assert!(
+            wait(
+                || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == paid,
+                10
+            ),
+            "payment did not land after a link flap"
+        );
+    }
+
+    // And a cooperative close still settles both wallets after the flaps.
+    let b_before = net.b_balance();
+    let close = net.fmgr.close(cid).unwrap();
+    assert!(net.a.send_channel(net.bid, close));
+    assert!(wait(|| net.pending_len() >= 1, 10), "close not broadcast");
+    net.mine();
+    assert_eq!(
+        net.b_balance() - b_before,
+        paid,
+        "acceptor credited to the unit after flaps + close"
     );
 
     net.a.shutdown();
