@@ -1122,3 +1122,57 @@ fn an_offline_victim_node_punishes_on_restart() {
     net.a.shutdown();
     net.b.shutdown();
 }
+
+/// Both ends pay at the same instant, over the real link, several times in a
+/// row: each pair of crossed proposals merges into the next state with both
+/// payments, the balances stay conserved, and the channel keeps paying —
+/// where it used to stay "a payment is already in flight" forever.
+#[test]
+fn crossed_payments_merge_and_the_channel_keeps_paying() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let net = setup("crossmerge", [0xe1u8; 32], [0xe2u8; 32]);
+    let cap = 4_000_000u64;
+    let cid = net.open(cap);
+    let b_peer = *net.b.channel_peers().first().expect("B sees A");
+    let pay = |mgr: &ChannelManager, amount: u64| -> Vec<u8> {
+        let start = Instant::now();
+        loop {
+            if let Ok(frame) = mgr.pay(cid, amount) {
+                return frame;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "could not pay");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let first = pay(&net.fmgr, 1_000_000);
+    assert!(net.a.send_channel(net.bid, first));
+    let mut expect_b = 1_000_000u64;
+    for round in 0..5u64 {
+        // Both propose before either hears from the other.
+        let from_funder = pay(&net.fmgr, 10_000 + round);
+        let from_acceptor = pay(&net.amgr, 4_000 + round);
+        assert!(net.a.send_channel(net.bid, from_funder));
+        assert!(net.b.send_channel(b_peer, from_acceptor));
+        expect_b = expect_b + 10_000 + round - (4_000 + round);
+        let settled = || {
+            let (f, a) = (net.fmgr.info(cid), net.amgr.info(cid));
+            matches!((f, a), (Some(f), Some(a))
+                if a.local_balance == expect_b
+                    && f.local_balance == cap - expect_b
+                    && f.state_number == a.state_number)
+        };
+        assert!(
+            wait(settled, 15),
+            "round {round}: the crossed payments did not merge"
+        );
+    }
+    // And the channel keeps paying, one side at a time.
+    let last = pay(&net.amgr, 1_000);
+    assert!(net.b.send_channel(b_peer, last));
+    assert!(wait(
+        || net.fmgr.info(cid).map(|i| i.local_balance) == Some(cap - expect_b + 1_000),
+        10
+    ));
+    net.a.shutdown();
+    net.b.shutdown();
+}

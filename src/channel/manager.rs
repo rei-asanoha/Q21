@@ -804,14 +804,12 @@ impl ChannelManager {
                 chan.machine.on_ready(&msg).map_err(err)?;
             }
             ChMsg::Update { .. } => {
-                // Both ends proposed the same state at once, or the peer
-                // resends such a proposal at a reestablish. Refused as
-                // misconduct, it cost the link at every reconnection (D14).
-                if chan.machine.crosses_our_proposal(&msg) {
-                    return Ok(out);
+                // An ordinary update, one crossing our own proposal (both ends
+                // paid at once: the two are merged into the next state), or a
+                // crossed proposal resent at a reestablish.
+                for m in chan.machine.on_peer_update(&msg).map_err(err)? {
+                    out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
                 }
-                let m = chan.machine.on_update(&msg).map_err(err)?;
-                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
             }
             ChMsg::Ack { .. } => {
                 let m = chan.machine.on_ack(&msg).map_err(err)?;
@@ -820,6 +818,11 @@ impl ChannelManager {
             }
             ChMsg::Revoke { .. } => {
                 chan.machine.on_revoke(&msg).map_err(err)?;
+                // The peer's revocation of crossed proposals: the merge may be
+                // ours to propose now.
+                if let Some(m) = chan.machine.merge_if_ready().map_err(err)? {
+                    out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+                }
                 out.extend(pending_close(chan, cid));
             }
             ChMsg::Close { fee } => {
