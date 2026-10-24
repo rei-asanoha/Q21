@@ -220,15 +220,17 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Zeroes a sensitive buffer, in a way the optimizer cannot remove.
 ///
 /// An ordinary write whose result nobody reads is dead code in the eyes of
-/// the compiler, and it removes it. `write_volatile` makes it mandatory. This
-/// protects neither against a reader of RAM during execution, nor against a
-/// page swapped to disk; it prevents a secret from surviving in a reused
-/// heap, and then in a core dump.
+/// the compiler, and it removes it. `write_volatile` makes it mandatory, and
+/// the compiler fence keeps later code (the buffer's deallocation, say) from
+/// being reordered before the writes. This protects neither against a reader
+/// of RAM during execution, nor against a page swapped to disk; it prevents a
+/// secret from surviving in a reused heap, and then in a core dump.
 pub fn wipe(buf: &mut [u8]) {
     for o in buf.iter_mut() {
         // Safe: each pointer comes from a valid element of the buffer.
         unsafe { std::ptr::write_volatile(o, 0) };
     }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Two independent keys derived from a passphrase.
