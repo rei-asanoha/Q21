@@ -999,7 +999,7 @@ struct Shared {
     channels_active: bool,
     /// Transactions of blocks connected since the last drain, for the channel
     /// watcher to scan off the chain lock. Only filled when `channels_active`.
-    channel_scan: Vec<crate::tx::Transaction>,
+    channel_scan: Vec<(u64, Vec<crate::tx::Transaction>)>,
     /// Transactions of blocks a reorganization took off the active chain since
     /// the last drain, handed to the channel watcher before `channel_scan`.
     channel_unscan: Vec<crate::tx::Transaction>,
@@ -1365,8 +1365,10 @@ impl Node {
         if !untxs.is_empty() {
             sink.on_disconnected_block(&untxs);
         }
-        if !txs.is_empty() {
-            self.drive_channels(&sink, &txs);
+        // Block by block, each at its own height: a commitment's height
+        // starts its to-self delay and the penalty's deadline.
+        for (height, txs) in txs {
+            self.drive_channels(&sink, &txs, height);
         }
     }
 
@@ -1377,7 +1379,8 @@ impl Node {
     pub fn note_local_block_for_channels(&self, b: &Block) {
         let mut g = self.shared.lock().unwrap();
         if g.channels_active {
-            g.channel_scan.extend(b.transactions.iter().cloned());
+            let height = g.chain.height();
+            g.channel_scan.push((height, b.transactions.clone()));
         }
     }
 
@@ -1406,21 +1409,27 @@ impl Node {
                     .map(|e| (tip.saturating_sub(e.height).saturating_add(1), e.output))
             };
             sink.rescan(tip, &txs_at, &depth_of);
-            self.drive_channels(&sink, &[]);
+            self.drive_channels(&sink, &[], tip);
         }
     }
 
     /// Hands a connected block (or nothing, at startup) to the channel
     /// component with the chain height and a depth oracle, then sends the frames
     /// it returns. Off the chain lock, so the component may sign and broadcast.
-    fn drive_channels(&self, sink: &Arc<dyn ChannelSink>, txs: &[crate::tx::Transaction]) {
-        let height = self.shared.lock().unwrap().chain.height();
+    fn drive_channels(
+        &self,
+        sink: &Arc<dyn ChannelSink>,
+        txs: &[crate::tx::Transaction],
+        height: u64,
+    ) {
+        // Depths are read at the current tip, whatever block is being handed.
+        let tip = self.shared.lock().unwrap().chain.height();
         let depth_of = |op: &crate::tx::OutPoint| {
             let g = self.shared.lock().unwrap();
             g.chain
                 .utxo
                 .get(op)
-                .map(|e| (height.saturating_sub(e.height).saturating_add(1), e.output))
+                .map(|e| (tip.saturating_sub(e.height).saturating_add(1), e.output))
         };
         let frames = sink.on_connected_block(txs, height, &depth_of);
         for (peer, frame) in frames {
@@ -4048,34 +4057,21 @@ impl Node {
     }
 
     /// A reorganization, for the channel watcher: the abandoned blocks are
-    /// handed to it as disconnected, and every block of the winning branch is
-    /// scanned — up to now only the tip that triggered the switch was, and a
-    /// revoked commitment in an earlier block of the branch went unseen.
-    fn queue_reorg_for_channels(g: &mut Shared, abandoned: &[Block], tip: &Block) {
+    /// handed to it as disconnected, and every block of the winning branch,
+    /// from just above the real fork height to the tip, is scanned at its own
+    /// height. (Only the last [`crate::chain::RETURNED_BLOCKS`] abandoned
+    /// bodies are kept; the fork comes from the reorganization's depth, not
+    /// from them.)
+    fn queue_reorg_for_channels(g: &mut Shared, abandoned: &[Block], fork_height: u64) {
         for gone in abandoned {
             g.channel_unscan.extend(gone.transactions.iter().cloned());
         }
-        // The branch runs from the fork (the parent of the oldest abandoned
-        // block) to the tip, whose transactions are already queued.
-        let fork = abandoned[0].header.prev_block;
-        let mut branch = Vec::new();
-        let height = g.chain.height();
-        for h in (0..height)
-            .rev()
-            .take(abandoned.len() + crate::chain::RETURNED_BLOCKS)
-        {
-            match g.chain.block_at(h) {
-                Some(blk) if blk.header.block_id() != fork => branch.push(blk),
-                _ => break,
+        let tip = g.chain.height();
+        for h in fork_height.saturating_add(1)..=tip {
+            if let Some(blk) = g.chain.block_at(h) {
+                g.channel_scan.push((h, blk.transactions));
             }
         }
-        let at = g.channel_scan.len().saturating_sub(tip.transactions.len());
-        let earlier: Vec<crate::tx::Transaction> = branch
-            .into_iter()
-            .rev()
-            .flat_map(|blk| blk.transactions)
-            .collect();
-        g.channel_scan.splice(at..at, earlier);
     }
 
     fn integrate(
@@ -4090,8 +4086,9 @@ impl Node {
             Self::body_arrived(g, source, outgoing);
             return true;
         }
+        let before = g.chain.height();
         match g.chain.submit(b, unix_now()) {
-            Ok(Accept::Extended) | Ok(Accept::Reorganized { .. }) => {
+            Ok(accepted @ (Accept::Extended | Accept::Reorganized { .. })) => {
                 stats.blocks_accepted.fetch_add(1, Ordering::Relaxed);
                 // An accepted block is a stored block. Before, only the blocks
                 // this node mined itself reached the disk.
@@ -4102,17 +4099,21 @@ impl Node {
                 // A connected block: hand its transactions to the channel
                 // watcher, which scans them for a spend of a funding output
                 // after the lock is released.
-                if g.channels_active {
-                    g.channel_scan.extend(b.transactions.iter().cloned());
-                }
                 let height = g.chain.height();
+                let abandoned = g.chain.take_disconnected();
+                if g.channels_active {
+                    match accepted {
+                        Accept::Reorganized { depth } => Self::queue_reorg_for_channels(
+                            g,
+                            &abandoned,
+                            before.saturating_sub(depth),
+                        ),
+                        _ => g.channel_scan.push((height, b.transactions.clone())),
+                    }
+                }
                 // A reorganization: the transactions of the abandoned blocks
                 // go back to the pool, those the winning branch does not
                 // already carry. See `Chain::take_disconnected`.
-                let abandoned = g.chain.take_disconnected();
-                if g.channels_active && !abandoned.is_empty() {
-                    Self::queue_reorg_for_channels(g, &abandoned, b);
-                }
                 if !abandoned.is_empty() {
                     let shared = &mut *g;
                     shared.mempool.return_abandoned(
@@ -5576,6 +5577,8 @@ mod tests_hardening {
     struct ReorgRecorder {
         connected: Mutex<Vec<Hash256>>,
         disconnected: Mutex<Vec<Hash256>>,
+        /// Each call: the height handed and the transactions.
+        blocks: Mutex<Vec<(u64, Vec<Hash256>)>>,
     }
 
     impl ChannelSink for ReorgRecorder {
@@ -5585,11 +5588,15 @@ mod tests_hardening {
         fn on_connected_block(
             &self,
             txs: &[crate::tx::Transaction],
-            _height: u64,
+            height: u64,
             _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<(u64, crate::tx::TxOut)>,
         ) -> Vec<(u64, Vec<u8>)> {
             let mut c = self.connected.lock().unwrap();
             c.extend(txs.iter().map(|t| t.txid()));
+            self.blocks
+                .lock()
+                .unwrap()
+                .push((height, txs.iter().map(|t| t.txid()).collect()));
             Vec::new()
         }
         fn on_disconnected_block(&self, txs: &[crate::tx::Transaction]) {
@@ -5646,6 +5653,61 @@ mod tests_hardening {
         assert_eq!(
             connected, expected,
             "every block of the winning branch is scanned, in order"
+        );
+        // Each block at its own height.
+        let heights: Vec<u64> = rec.blocks.lock().unwrap().iter().map(|b| b.0).collect();
+        assert_eq!(heights, vec![1, 1, 2]);
+    }
+
+    /// A reorganization deeper than the abandoned bodies the chain keeps: the
+    /// winning branch is still scanned from the real fork, every block once at
+    /// its own height — not from a guess at the fork that over- or
+    /// under-scans.
+    #[test]
+    fn a_deep_reorganization_is_scanned_from_its_real_fork() {
+        let (a, b) = node_pair();
+        let (x, _) = node_pair();
+        let rec = Arc::new(ReorgRecorder::default());
+        b.set_channel_sink(rec.clone());
+        let _e = established_peer(&b, 7);
+        let mine_on = |n: &Node, who: u8| {
+            let blk = n
+                .with_chain(|c| {
+                    let t = c.tip().time + TARGET_BLOCK_SECS;
+                    c.mine_block(Hash256([who; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
+                })
+                .expect("regtest mining");
+            n.with_chain(|c| c.connect(&blk, blk.header.time + 1).expect("connect"));
+            blk
+        };
+        let deep = crate::chain::RETURNED_BLOCKS as u64 + 3;
+        for _ in 0..deep {
+            let blk = mine_on(&a, 2);
+            assert!(b.handle(7, Message::Block(Box::new(blk))));
+        }
+        let mut branch = Vec::new();
+        for _ in 0..(2 * deep) {
+            branch.push(mine_on(&x, 3));
+        }
+        rec.blocks.lock().unwrap().clear();
+        for blk in &branch {
+            assert!(b.handle(7, Message::Block(Box::new(blk.clone()))));
+        }
+        assert_eq!(b.height(), 2 * deep, "the heavier branch won");
+        let seen = rec.blocks.lock().unwrap().clone();
+        let expected: Vec<(u64, Vec<Hash256>)> = branch
+            .iter()
+            .enumerate()
+            .map(|(i, blk)| {
+                (
+                    i as u64 + 1,
+                    blk.transactions.iter().map(|t| t.txid()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "the new branch, block by block, from the fork"
         );
     }
 
