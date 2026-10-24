@@ -171,7 +171,18 @@ enum CloseTracker {
     },
 }
 
+/// Channels one peer may hold with this node at once, settled ones aside.
+pub const MAX_CHANNELS_PER_PEER: usize = 8;
+/// Channel opens waiting for the peer's next message, across all peers, on
+/// each side of the handshake.
+pub const MAX_PENDING_OPENS: usize = 16;
+/// How long an open may wait for the peer's next message before it is
+/// forgotten: an honest handshake answers within seconds, and a peer that
+/// sent a `Hello` and vanished must not hold a slot forever.
+pub const PENDING_OPEN_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 struct PendingFunder {
+    since: std::time::Instant,
     index: u32,
     capacity: u64,
     delay: u16,
@@ -181,6 +192,7 @@ struct PendingFunder {
 }
 
 struct PendingAcceptor {
+    since: std::time::Instant,
     index: u32,
     funder_pubkey: Vec<u8>,
     capacity: u64,
@@ -196,6 +208,27 @@ struct Inner {
     pending_funder: HashMap<u64, PendingFunder>,
     pending_acceptor: HashMap<u64, PendingAcceptor>,
     next_index: u32,
+    /// See [`PENDING_OPEN_TTL`]; shortened by tests.
+    pending_ttl: std::time::Duration,
+}
+
+impl Inner {
+    /// Forgets the opens that waited too long for the peer.
+    fn expire_pending(&mut self) {
+        let ttl = self.pending_ttl;
+        self.pending_funder.retain(|_, p| p.since.elapsed() < ttl);
+        self.pending_acceptor.retain(|_, p| p.since.elapsed() < ttl);
+    }
+
+    /// Channels held with a peer, known by its connection id or its durable
+    /// identity, settled ones aside.
+    fn channels_with(&self, peer: u64, identity: &str) -> usize {
+        self.channels
+            .values()
+            .filter(|c| c.machine.phase() != Phase::Closed)
+            .filter(|c| c.peer == peer || (!identity.is_empty() && c.peer_identity == identity))
+            .count()
+    }
 }
 
 pub struct ChannelManager {
@@ -241,6 +274,7 @@ impl ChannelManager {
                 pending_funder: HashMap::new(),
                 pending_acceptor: HashMap::new(),
                 next_index: 0,
+                pending_ttl: PENDING_OPEN_TTL,
             }),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
@@ -327,6 +361,20 @@ impl ChannelManager {
         }
     }
 
+    /// Shortens how long an open may wait for the peer (see
+    /// [`PENDING_OPEN_TTL`]), for tests.
+    #[doc(hidden)]
+    pub fn set_pending_open_ttl(&self, ttl: std::time::Duration) {
+        self.inner.lock().unwrap().pending_ttl = ttl;
+    }
+
+    /// Opens waiting for the peer: `(as funder, as acceptor)`.
+    pub fn pending_opens(&self) -> (usize, usize) {
+        let mut g = self.inner.lock().unwrap();
+        g.expire_pending();
+        (g.pending_funder.len(), g.pending_acceptor.len())
+    }
+
     /// This node's stable channel identity: the first 16 bytes of a tagged hash
     /// of the wallet seed, as lowercase hex. It is advertised in the handshake
     /// and persisted per channel, so a channel re-binds to its peer across a
@@ -386,6 +434,13 @@ impl ChannelManager {
         depth: Option<u16>,
     ) -> Result<Vec<u8>, String> {
         let mut g = self.inner.lock().unwrap();
+        g.expire_pending();
+        if g.pending_funder.len() >= MAX_PENDING_OPENS && !g.pending_funder.contains_key(&peer) {
+            return Err("too many channel opens in progress".into());
+        }
+        if g.channels_with(peer, peer_identity) >= MAX_CHANNELS_PER_PEER {
+            return Err("too many channels with this peer".into());
+        }
         let index = g.next_index;
         g.next_index += 1;
         let delay = delay.unwrap_or(self.default_delay);
@@ -395,6 +450,7 @@ impl ChannelManager {
         g.pending_funder.insert(
             peer,
             PendingFunder {
+                since: std::time::Instant::now(),
                 index,
                 capacity,
                 delay,
@@ -578,14 +634,26 @@ impl ChannelManager {
         let delay = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
         let depth = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
         let funder_payout = Hash256(r.array32().map_err(|_| "payout")?);
-        let our_payout = (self.hooks.payout_address)();
         let mut g = self.inner.lock().unwrap();
+        // Bounded: opens in progress across all peers, and channels per peer.
+        // Beyond either, the Hello is not answered — the funder's open lapses
+        // — and nothing is allocated for it: no key index, no wallet address.
+        g.expire_pending();
+        if g.pending_acceptor.len() >= MAX_PENDING_OPENS && !g.pending_acceptor.contains_key(&peer)
+        {
+            return Ok(Vec::new());
+        }
+        if g.channels_with(peer, peer_identity) >= MAX_CHANNELS_PER_PEER {
+            return Ok(Vec::new());
+        }
+        let our_payout = (self.hooks.payout_address)();
         let index = g.next_index;
         g.next_index += 1;
         let our_pubkey = self.signer(index).pubkey().to_vec();
         g.pending_acceptor.insert(
             peer,
             PendingAcceptor {
+                since: std::time::Instant::now(),
                 index,
                 funder_pubkey,
                 capacity,

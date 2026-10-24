@@ -1303,3 +1303,94 @@ fn a_revoked_commitment_that_replaces_a_reorged_spend_is_punished() {
         c.mine(std::slice::from_ref(&penalty));
     }
 }
+
+/// L6: opens waiting for the peer are bounded across peers and expire; a
+/// Hello beyond the bound is left unanswered, without misconduct and without
+/// allocating anything for it.
+#[test]
+fn pending_opens_are_bounded_and_expire() {
+    use q21_core::channel::manager::MAX_PENDING_OPENS;
+    let funder_seed = [0xa1u8; 32];
+    let acceptor_seed = [0xa2u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("l6-pending");
+    let p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet,
+        chain,
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = 4 * MIN_OUTPUT_VALUE;
+    // The funder side: its own opens in progress are bounded too.
+    let mut hello = None;
+    for peer in 0..MAX_PENDING_OPENS as u64 {
+        hello = Some(p.funder.open(100 + peer, "", capacity, None, None).unwrap());
+    }
+    assert!(p.funder.open(999, "", capacity, None, None).is_err());
+    assert_eq!(p.funder.pending_opens().0, MAX_PENDING_OPENS);
+    // The acceptor side: Hellos from as many connections as it takes.
+    let hello = hello.unwrap();
+    for peer in 0..(MAX_PENDING_OPENS as u64 + 5) {
+        let r = p.acceptor.deliver(200 + peer, "", &hello);
+        assert_eq!(r.penalize, 0);
+        assert_eq!(
+            r.frames.is_empty(),
+            peer >= MAX_PENDING_OPENS as u64,
+            "Hello {peer} answered beyond the bound, or refused within it"
+        );
+    }
+    assert_eq!(p.acceptor.pending_opens().1, MAX_PENDING_OPENS);
+    // A Hello whose peer vanished does not hold its slot forever.
+    p.acceptor.set_pending_open_ttl(std::time::Duration::ZERO);
+    p.funder.set_pending_open_ttl(std::time::Duration::ZERO);
+    assert_eq!(p.acceptor.pending_opens(), (0, 0));
+    assert_eq!(p.funder.pending_opens(), (0, 0));
+    p.acceptor
+        .set_pending_open_ttl(q21_core::channel::manager::PENDING_OPEN_TTL);
+    assert!(!p.acceptor.deliver(300, "", &hello).frames.is_empty());
+}
+
+/// L6: the channels one peer holds with a node are bounded, on both sides.
+#[test]
+fn channels_per_peer_are_bounded() {
+    use q21_core::channel::manager::MAX_CHANNELS_PER_PEER;
+    let funder_seed = [0xa3u8; 32];
+    let acceptor_seed = [0xa4u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("l6-per-peer");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = 4 * MIN_OUTPUT_VALUE;
+    for _ in 0..MAX_CHANNELS_PER_PEER {
+        let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+        p.queue.push_back((1, hello));
+        p.pump();
+    }
+    assert_eq!(p.funder.list().len(), MAX_CHANNELS_PER_PEER);
+    assert_eq!(p.acceptor.list().len(), MAX_CHANNELS_PER_PEER);
+    assert!(
+        p.funder.open(A_PEER, "", capacity, None, None).is_err(),
+        "one channel too many with this peer"
+    );
+    // A Hello arriving from that same peer is not answered by the acceptor.
+    let elsewhere = one_manager([0xa5u8; 32], wallet, chain, &dir.join("elsewhere"));
+    let hello = elsewhere.open(A_PEER, "", capacity, None, None).unwrap();
+    let r = p.acceptor.deliver(F_PEER, "", &hello);
+    assert_eq!(r.penalize, 0);
+    assert!(r.frames.is_empty(), "a ninth channel with the same peer");
+    assert_eq!(p.acceptor.pending_opens().1, 0);
+    // Another peer is still served.
+    assert!(!p
+        .acceptor
+        .deliver(F_PEER + 50, "", &hello)
+        .frames
+        .is_empty());
+}
