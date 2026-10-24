@@ -1000,6 +1000,9 @@ struct Shared {
     /// Transactions of blocks connected since the last drain, for the channel
     /// watcher to scan off the chain lock. Only filled when `channels_active`.
     channel_scan: Vec<crate::tx::Transaction>,
+    /// Transactions of blocks a reorganization took off the active chain since
+    /// the last drain, handed to the channel watcher before `channel_scan`.
+    channel_unscan: Vec<crate::tx::Transaction>,
 }
 
 /// How many requested compact blocks may wait for their parent. Two batches
@@ -1096,6 +1099,12 @@ pub trait ChannelSink: Send + Sync {
     fn on_peer_connected(&self, _peer: u64, _peer_identity: &str) -> Vec<Vec<u8>> {
         Vec::new()
     }
+
+    /// Called, off the chain lock and before the blocks that replace them,
+    /// with the transactions of blocks a reorganization disconnected, so a
+    /// spend the component reacted to and that left the chain can be forgotten
+    /// and a different one classified afresh. The default does nothing.
+    fn on_disconnected_block(&self, _txs: &[crate::tx::Transaction]) {}
 }
 
 /// The result of handing a channel message to the [`ChannelSink`].
@@ -1243,6 +1252,7 @@ impl Node {
                 parked: Vec::new(),
                 channels_active: false,
                 channel_scan: Vec::new(),
+                channel_unscan: Vec::new(),
             })),
             magic: magic_for(network),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -1328,13 +1338,21 @@ impl Node {
             .ok()
             .and_then(|g| g.as_ref().cloned());
         let Some(sink) = sink else {
-            self.shared.lock().unwrap().channel_scan.clear();
+            let mut g = self.shared.lock().unwrap();
+            g.channel_scan.clear();
+            g.channel_unscan.clear();
             return;
         };
-        let txs = {
+        let (untxs, txs) = {
             let mut g = self.shared.lock().unwrap();
-            std::mem::take(&mut g.channel_scan)
+            (
+                std::mem::take(&mut g.channel_unscan),
+                std::mem::take(&mut g.channel_scan),
+            )
         };
+        if !untxs.is_empty() {
+            sink.on_disconnected_block(&untxs);
+        }
         if !txs.is_empty() {
             self.drive_channels(&sink, &txs);
         }
@@ -3987,6 +4005,37 @@ impl Node {
         !drop_peer
     }
 
+    /// A reorganization, for the channel watcher: the abandoned blocks are
+    /// handed to it as disconnected, and every block of the winning branch is
+    /// scanned — up to now only the tip that triggered the switch was, and a
+    /// revoked commitment in an earlier block of the branch went unseen.
+    fn queue_reorg_for_channels(g: &mut Shared, abandoned: &[Block], tip: &Block) {
+        for gone in abandoned {
+            g.channel_unscan.extend(gone.transactions.iter().cloned());
+        }
+        // The branch runs from the fork (the parent of the oldest abandoned
+        // block) to the tip, whose transactions are already queued.
+        let fork = abandoned[0].header.prev_block;
+        let mut branch = Vec::new();
+        let height = g.chain.height();
+        for h in (0..height)
+            .rev()
+            .take(abandoned.len() + crate::chain::RETURNED_BLOCKS)
+        {
+            match g.chain.block_at(h) {
+                Some(blk) if blk.header.block_id() != fork => branch.push(blk),
+                _ => break,
+            }
+        }
+        let at = g.channel_scan.len().saturating_sub(tip.transactions.len());
+        let earlier: Vec<crate::tx::Transaction> = branch
+            .into_iter()
+            .rev()
+            .flat_map(|blk| blk.transactions)
+            .collect();
+        g.channel_scan.splice(at..at, earlier);
+    }
+
     fn integrate(
         g: &mut Shared,
         b: &Block,
@@ -4019,6 +4068,9 @@ impl Node {
                 // go back to the pool, those the winning branch does not
                 // already carry. See `Chain::take_disconnected`.
                 let abandoned = g.chain.take_disconnected();
+                if g.channels_active && !abandoned.is_empty() {
+                    Self::queue_reorg_for_channels(g, &abandoned, b);
+                }
                 if !abandoned.is_empty() {
                     let shared = &mut *g;
                     shared.mempool.return_abandoned(
@@ -5474,6 +5526,85 @@ mod tests_hardening {
             self.txs.fetch_add(txs.len() as u64, Ordering::SeqCst);
             Vec::new()
         }
+    }
+
+    /// A sink that records the transaction ids handed to it, connected and
+    /// disconnected, in order.
+    #[derive(Default)]
+    struct ReorgRecorder {
+        connected: Mutex<Vec<Hash256>>,
+        disconnected: Mutex<Vec<Hash256>>,
+    }
+
+    impl ChannelSink for ReorgRecorder {
+        fn deliver(&self, _peer: u64, _peer_identity: &str, _bytes: &[u8]) -> ChannelOutcome {
+            ChannelOutcome::default()
+        }
+        fn on_connected_block(
+            &self,
+            txs: &[crate::tx::Transaction],
+            _height: u64,
+            _depth_of: &dyn Fn(&crate::tx::OutPoint) -> Option<u64>,
+        ) -> Vec<(u64, Vec<u8>)> {
+            let mut c = self.connected.lock().unwrap();
+            c.extend(txs.iter().map(|t| t.txid()));
+            Vec::new()
+        }
+        fn on_disconnected_block(&self, txs: &[crate::tx::Transaction]) {
+            let mut d = self.disconnected.lock().unwrap();
+            d.extend(txs.iter().map(|t| t.txid()));
+        }
+    }
+
+    /// M5: a reorganization hands the channel watcher the abandoned blocks as
+    /// disconnected, and every block of the winning branch as connected — not
+    /// only the tip that triggered the switch.
+    #[test]
+    fn a_reorganization_reaches_the_channel_watcher_whole() {
+        let (a, b) = node_pair();
+        let (x, _) = node_pair();
+        let rec = Arc::new(ReorgRecorder::default());
+        b.set_channel_sink(rec.clone());
+        let _e = established_peer(&b, 7);
+        let mine_on = |n: &Node, who: u8| {
+            let blk = n
+                .with_chain(|c| {
+                    let t = c.tip().time + TARGET_BLOCK_SECS;
+                    c.mine_block(Hash256([who; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
+                })
+                .expect("regtest mining");
+            n.with_chain(|c| c.connect(&blk, blk.header.time + 1).expect("connect"));
+            blk
+        };
+        let a1 = mine_on(&a, 2);
+        assert!(b.handle(7, Message::Block(Box::new(a1.clone()))));
+        // A heavier branch from the same genesis: the first block stays on a
+        // side branch, the second switches the chain.
+        let x1 = mine_on(&x, 3);
+        let x2 = mine_on(&x, 3);
+        assert!(b.handle(7, Message::Block(Box::new(x1.clone()))));
+        assert!(b.handle(7, Message::Block(Box::new(x2.clone()))));
+        assert_eq!(b.height(), 2, "the heavier branch won");
+        let ids = |blk: &Block| {
+            blk.transactions
+                .iter()
+                .map(|t| t.txid())
+                .collect::<Vec<_>>()
+        };
+        let connected = rec.connected.lock().unwrap().clone();
+        let disconnected = rec.disconnected.lock().unwrap().clone();
+        assert_eq!(
+            disconnected,
+            ids(&a1),
+            "the abandoned block is disconnected"
+        );
+        let mut expected = ids(&a1);
+        expected.extend(ids(&x1));
+        expected.extend(ids(&x2));
+        assert_eq!(
+            connected, expected,
+            "every block of the winning branch is scanned, in order"
+        );
     }
 
     /// A block connected through the node reaches the channel watcher, off the
