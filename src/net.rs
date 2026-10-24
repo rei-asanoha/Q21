@@ -1037,7 +1037,9 @@ struct Outgoing {
 /// [`Message::Channel`]) and a misconduct score for a malformed one. The node
 /// calls it off the chain lock, so the component may do cryptography freely.
 pub trait ChannelSink: Send + Sync {
-    fn deliver(&self, peer: u64, bytes: &[u8]) -> ChannelOutcome;
+    /// Handles one inbound channel frame from `peer`, whose durable identity
+    /// (used to re-bind channels across a reconnect) is `peer_identity`.
+    fn deliver(&self, peer: u64, peer_identity: &str, bytes: &[u8]) -> ChannelOutcome;
 
     /// Called after each connected block, off the chain lock, with the block's
     /// transactions, the new chain `height`, and a `depth_of` oracle giving the
@@ -1056,9 +1058,10 @@ pub trait ChannelSink: Send + Sync {
     }
 
     /// Called when a channel-capable peer completes the handshake, off the chain
-    /// lock. Returns the frames to send it — the reestablish of every channel we
-    /// hold with it. The default does nothing.
-    fn on_peer_connected(&self, _peer: u64) -> Vec<Vec<u8>> {
+    /// lock, with its live connection id and its durable identity. Returns the
+    /// frames to send it — the reestablish of every channel we hold with it,
+    /// re-bound to the live id. The default does nothing.
+    fn on_peer_connected(&self, _peer: u64, _peer_identity: &str) -> Vec<Vec<u8>> {
         Vec::new()
     }
 }
@@ -1347,6 +1350,18 @@ impl Node {
             .collect();
         v.sort_by_key(|p| p.id);
         v
+    }
+
+    /// A durable identifier for a peer connection, used to re-bind channels to
+    /// a new connection id after a reconnect: the peer's address string. For an
+    /// outbound connection this is the stable dialed address; it is empty for an
+    /// unknown peer.
+    pub fn peer_identity(&self, id: u64) -> String {
+        let g = self.shared.lock().unwrap();
+        g.peers
+            .get(&id)
+            .map(|p| p.addr.to_string())
+            .unwrap_or_default()
     }
 
     /// The peers that advertised the channel capability, by id.
@@ -3481,7 +3496,8 @@ impl Node {
                 .ok()
                 .and_then(|g| g.as_ref().cloned());
             if let Some(sink) = sink {
-                let outcome = sink.deliver(id, &bytes);
+                let identity = self.peer_identity(id);
+                let outcome = sink.deliver(id, &identity, &bytes);
                 if outcome.penalize > 0 && self.penalize(id, outcome.penalize) {
                     drop_peer = true;
                 }
@@ -3502,7 +3518,8 @@ impl Node {
                 .ok()
                 .and_then(|g| g.as_ref().cloned());
             if let Some(sink) = sink {
-                for frame in sink.on_peer_connected(id) {
+                let identity = self.peer_identity(id);
+                for frame in sink.on_peer_connected(id, &identity) {
                     self.send_channel(id, frame);
                 }
             }
@@ -5196,7 +5213,7 @@ mod tests_hardening {
     }
 
     impl ChannelSink for BlockRecorder {
-        fn deliver(&self, _peer: u64, _bytes: &[u8]) -> ChannelOutcome {
+        fn deliver(&self, _peer: u64, _peer_identity: &str, _bytes: &[u8]) -> ChannelOutcome {
             ChannelOutcome::default()
         }
         fn on_connected_block(

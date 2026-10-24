@@ -56,6 +56,10 @@ pub struct Hooks {
     pub fund: Box<FundFn>,
     pub broadcast: Box<BroadcastFn>,
     pub sweep_address: Box<SweepAddrFn>,
+    /// Yields a fresh wallet address to receive this party's cooperative-close
+    /// payout — a real wallet address the wallet scans and can spend, never a
+    /// channel key.
+    pub payout_address: Box<SweepAddrFn>,
 }
 
 /// What handling one inbound frame produces.
@@ -82,7 +86,12 @@ pub struct ChannelSummary {
 
 struct Chan {
     machine: Machine,
+    /// The live network connection id of the peer. Transient: it changes on
+    /// every reconnect and is re-bound from `peer_identity` at handshake time.
     peer: u64,
+    /// A durable identifier of the counterparty (its address), persisted so a
+    /// restart or reconnect can map the new connection id back to this channel.
+    peer_identity: String,
     capacity: u64,
     /// True while an update we proposed is still in flight.
     in_flight: bool,
@@ -112,6 +121,8 @@ struct PendingFunder {
     capacity: u64,
     delay: u16,
     depth: u16,
+    our_payout: Hash256,
+    peer_identity: String,
 }
 
 struct PendingAcceptor {
@@ -120,6 +131,9 @@ struct PendingAcceptor {
     capacity: u64,
     delay: u16,
     depth: u16,
+    funder_payout: Hash256,
+    our_payout: Hash256,
+    peer_identity: String,
 }
 
 struct Inner {
@@ -231,14 +245,16 @@ impl ChannelManager {
                     if !matches!(machine.phase(), Phase::Closed) {
                         let cid = machine.channel_id();
                         let capacity = machine.params().capacity.units();
+                        // The peer's network id is transient; its durable
+                        // identity, persisted in a sidecar, lets a reconnect
+                        // re-bind this channel to the new connection.
+                        let peer_identity = self.read_peer_identity(cid);
                         g.channels.insert(
                             cid,
                             Chan {
                                 machine,
-                                // The peer's network id is transient and not
-                                // persisted; it is re-bound when the peer
-                                // reconnects and a frame arrives for the channel.
                                 peer: u64::MAX,
+                                peer_identity,
                                 capacity,
                                 in_flight: false,
                                 close: None,
@@ -261,6 +277,27 @@ impl ChannelManager {
         )))
     }
 
+    /// The sidecar file holding a channel's durable peer identity, beside its
+    /// journal. Kept out of the journal so the engine's crash-safe record
+    /// format is untouched; it carries no money-safety invariant.
+    fn peer_identity_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.peer", cid.to_hex()))
+    }
+
+    fn write_peer_identity(&self, cid: Hash256, identity: &str) {
+        let _ = crate::channel::journal::atomic_write(
+            &self.peer_identity_path(cid),
+            identity.as_bytes(),
+        );
+    }
+
+    fn read_peer_identity(&self, cid: Hash256) -> String {
+        std::fs::read(self.peer_identity_path(cid))
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default()
+    }
+
     fn journal_path(&self, cid: Hash256) -> PathBuf {
         self.journal_dir.join(format!("{}.jrnl", cid.to_hex()))
     }
@@ -273,6 +310,7 @@ impl ChannelManager {
     pub fn open(
         &self,
         peer: u64,
+        peer_identity: &str,
         capacity: u64,
         delay: Option<u16>,
         depth: Option<u16>,
@@ -283,6 +321,7 @@ impl ChannelManager {
         let delay = delay.unwrap_or(self.default_delay);
         let depth = depth.unwrap_or(self.default_depth);
         let our_pubkey = self.signer(index).pubkey().to_vec();
+        let our_payout = (self.hooks.payout_address)();
         g.pending_funder.insert(
             peer,
             PendingFunder {
@@ -290,14 +329,17 @@ impl ChannelManager {
                 capacity,
                 delay,
                 depth,
+                our_payout,
+                peer_identity: peer_identity.to_string(),
             },
         );
-        // Hello body: our funding pubkey, capacity, delay, depth.
+        // Hello body: our funding pubkey, capacity, delay, depth, payout.
         let mut w = Writer::new();
         w.var_bytes(&our_pubkey);
         w.u64(capacity);
         w.bytes(&delay.to_le_bytes());
         w.bytes(&depth.to_le_bytes());
+        w.bytes(our_payout.as_bytes());
         Ok(write_frame(Hash256::ZERO, KIND_HELLO, &w.finish()))
     }
 
@@ -340,10 +382,20 @@ impl ChannelManager {
         Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
     }
 
-    /// Called when a channel-capable peer completes the handshake: the frames to
-    /// send it to resync every channel we hold with it. The node routes these;
-    /// the engine resends exactly the one in-flight message, if any.
-    pub fn on_peer_connected(&self, peer: u64) -> Vec<Vec<u8>> {
+    /// Called when a channel-capable peer completes the handshake, with the
+    /// peer's live connection id and its durable identity. It re-binds every
+    /// channel held with that durable identity to the live id — recovering the
+    /// binding a reconnect or restart broke — and returns the reestablish frames
+    /// to send. The engine then resends exactly the one in-flight message, if any.
+    pub fn on_peer_connected(&self, peer: u64, peer_identity: &str) -> Vec<Vec<u8>> {
+        {
+            let mut g = self.inner.lock().unwrap();
+            for c in g.channels.values_mut() {
+                if !peer_identity.is_empty() && c.peer_identity == peer_identity {
+                    c.peer = peer;
+                }
+            }
+        }
         self.reestablish(peer)
     }
 
@@ -365,9 +417,10 @@ impl ChannelManager {
 
     // --- Inbound ----------------------------------------------------------
 
-    /// Handles one inbound frame from `peer`.
-    pub fn deliver(&self, peer: u64, bytes: &[u8]) -> Reaction {
-        match self.deliver_inner(peer, bytes) {
+    /// Handles one inbound frame from `peer`, whose durable identity (for
+    /// re-binding on a later reconnect) is `peer_identity`.
+    pub fn deliver(&self, peer: u64, peer_identity: &str, bytes: &[u8]) -> Reaction {
+        match self.deliver_inner(peer, peer_identity, bytes) {
             Ok(frames) => Reaction {
                 frames,
                 penalize: 0,
@@ -379,7 +432,12 @@ impl ChannelManager {
         }
     }
 
-    fn deliver_inner(&self, peer: u64, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    fn deliver_inner(
+        &self,
+        peer: u64,
+        peer_identity: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<Vec<u8>>, String> {
         if bytes.len() < 33 {
             return Err("short frame".into());
         }
@@ -388,17 +446,22 @@ impl ChannelManager {
         let kind = r.u8().map_err(|_| "kind")?;
         let body = &bytes[33..];
         match kind {
-            KIND_HELLO => self.on_hello(peer, body),
-            KIND_HELLO_BACK => self.on_hello_back(peer, body),
+            KIND_HELLO => self.on_hello(peer, peer_identity, body),
+            KIND_HELLO_BACK => self.on_hello_back(peer, peer_identity, body),
             KIND_ENGINE => {
                 let msg = ChMsg::decode(body).map_err(|_| "bad engine message")?;
-                self.on_engine(peer, cid, msg)
+                self.on_engine(peer, peer_identity, cid, msg)
             }
             _ => Err("unknown frame kind".into()),
         }
     }
 
-    fn on_hello(&self, peer: u64, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    fn on_hello(
+        &self,
+        peer: u64,
+        peer_identity: &str,
+        body: &[u8],
+    ) -> Result<Vec<Vec<u8>>, String> {
         let mut r = Reader::new(body);
         let funder_pubkey = r.var_bytes().map_err(|_| "pubkey")?.to_vec();
         if funder_pubkey.len() != CHANNEL_SCHEME.pubkey_len() {
@@ -407,6 +470,8 @@ impl ChannelManager {
         let capacity = r.u64().map_err(|_| "capacity")?;
         let delay = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
         let depth = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
+        let funder_payout = Hash256(r.array32().map_err(|_| "payout")?);
+        let our_payout = (self.hooks.payout_address)();
         let mut g = self.inner.lock().unwrap();
         let index = g.next_index;
         g.next_index += 1;
@@ -419,10 +484,15 @@ impl ChannelManager {
                 capacity,
                 delay,
                 depth,
+                funder_payout,
+                our_payout,
+                peer_identity: peer_identity.to_string(),
             },
         );
+        // HelloBack body: our funding pubkey and our payout.
         let mut w = Writer::new();
         w.var_bytes(&our_pubkey);
+        w.bytes(our_payout.as_bytes());
         Ok(vec![write_frame(
             Hash256::ZERO,
             KIND_HELLO_BACK,
@@ -430,12 +500,18 @@ impl ChannelManager {
         )])
     }
 
-    fn on_hello_back(&self, peer: u64, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    fn on_hello_back(
+        &self,
+        peer: u64,
+        _peer_identity: &str,
+        body: &[u8],
+    ) -> Result<Vec<Vec<u8>>, String> {
         let mut r = Reader::new(body);
         let acceptor_pubkey = r.var_bytes().map_err(|_| "pubkey")?.to_vec();
         if acceptor_pubkey.len() != CHANNEL_SCHEME.pubkey_len() {
             return Err("pubkey length".into());
         }
+        let acceptor_payout = Hash256(r.array32().map_err(|_| "payout")?);
         let mut g = self.inner.lock().unwrap();
         let pending = g.pending_funder.remove(&peer).ok_or("no pending open")?;
         let signer = self.signer(pending.index);
@@ -453,13 +529,17 @@ impl ChannelManager {
             pending.delay,
             pending.depth,
             self.base_fee_rate,
+            pending.our_payout,
+            acceptor_payout,
         )
         .map_err(err)?;
+        self.write_peer_identity(cid, &pending.peer_identity);
         g.channels.insert(
             cid,
             Chan {
                 machine,
                 peer,
+                peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
                 in_flight: false,
                 close: None,
@@ -468,11 +548,17 @@ impl ChannelManager {
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
     }
 
-    fn on_engine(&self, peer: u64, cid: Hash256, msg: ChMsg) -> Result<Vec<Vec<u8>>, String> {
+    fn on_engine(
+        &self,
+        peer: u64,
+        peer_identity: &str,
+        cid: Hash256,
+        msg: ChMsg,
+    ) -> Result<Vec<Vec<u8>>, String> {
         // The acceptor's first engine message is the funder's Open: build the
         // channel from the pending acceptor state.
         if matches!(msg, ChMsg::Open { .. }) {
-            return self.accept_open(peer, cid, msg);
+            return self.accept_open(peer, peer_identity, cid, msg);
         }
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
@@ -535,7 +621,13 @@ impl ChannelManager {
         Ok(out)
     }
 
-    fn accept_open(&self, peer: u64, cid: Hash256, open: ChMsg) -> Result<Vec<Vec<u8>>, String> {
+    fn accept_open(
+        &self,
+        peer: u64,
+        _peer_identity: &str,
+        cid: Hash256,
+        open: ChMsg,
+    ) -> Result<Vec<Vec<u8>>, String> {
         let mut g = self.inner.lock().unwrap();
         let pending = g
             .pending_acceptor
@@ -566,16 +658,20 @@ impl ChannelManager {
             signer,
             self.base_fee_rate,
             &open,
+            pending.our_payout,
+            pending.funder_payout,
         )
         .map_err(err)?;
         if machine.channel_id() != cid {
             return Err("channel id mismatch".into());
         }
+        self.write_peer_identity(cid, &pending.peer_identity);
         g.channels.insert(
             cid,
             Chan {
                 machine,
                 peer,
+                peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
                 in_flight: false,
                 close: None,
@@ -929,8 +1025,8 @@ fn err(e: ChannelError) -> String {
 
 /// Adapter so the node's [`crate::net::ChannelSink`] can drive the manager.
 impl crate::net::ChannelSink for ChannelManager {
-    fn deliver(&self, peer: u64, bytes: &[u8]) -> crate::net::ChannelOutcome {
-        let r = ChannelManager::deliver(self, peer, bytes);
+    fn deliver(&self, peer: u64, peer_identity: &str, bytes: &[u8]) -> crate::net::ChannelOutcome {
+        let r = ChannelManager::deliver(self, peer, peer_identity, bytes);
         crate::net::ChannelOutcome {
             replies: r.frames,
             penalize: r.penalize,
@@ -946,7 +1042,7 @@ impl crate::net::ChannelSink for ChannelManager {
         ChannelManager::on_connected_block(self, txs, height, depth_of)
     }
 
-    fn on_peer_connected(&self, peer: u64) -> Vec<Vec<u8>> {
-        ChannelManager::on_peer_connected(self, peer)
+    fn on_peer_connected(&self, peer: u64, peer_identity: &str) -> Vec<Vec<u8>> {
+        ChannelManager::on_peer_connected(self, peer, peer_identity)
     }
 }

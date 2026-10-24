@@ -5351,7 +5351,28 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             });
 
             let w_sweep = wallet.clone();
-            let sweep_address = Box::new(move || w_sweep.lock().unwrap().new_address().hash);
+            let folder_sweep = folder.clone();
+            // A sweep, penalty or claim pays a fresh wallet address at broadcast
+            // time; persist it at once so a crash cannot leave the recovered
+            // funds paying an address the reloaded wallet has forgotten.
+            let sweep_address = Box::new(move || {
+                let mut w = w_sweep.lock().unwrap();
+                let h = w.new_address().hash;
+                let _ = write_wallet(&folder_sweep, &w);
+                h
+            });
+            // A cooperative close pays this address; it must be a real wallet
+            // address so the funds are scanned and spendable, not a channel key.
+            let w_payout = wallet.clone();
+            let folder_payout = folder.clone();
+            let payout_address = Box::new(move || {
+                let mut w = w_payout.lock().unwrap();
+                let h = w.new_address().hash;
+                // Persist at once: a fresh address must survive a crash, or the
+                // close output would pay an address the reloaded wallet forgot.
+                let _ = write_wallet(&folder_payout, &w);
+                h
+            });
 
             let mgr = std::sync::Arc::new(ChannelManager::new(
                 network,
@@ -5364,6 +5385,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     fund,
                     broadcast,
                     sweep_address,
+                    payout_address,
                 },
             ));
             node.set_channel_sink(mgr.clone());

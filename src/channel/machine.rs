@@ -120,6 +120,10 @@ pub struct Machine {
     signer: Box<dyn Signer>,
     our_pubkey: Vec<u8>,
     their_pubkey: Vec<u8>,
+    /// Each party's wallet payout address, `[funder, acceptor]`, used to build a
+    /// cooperative close that pays spendable wallet outputs rather than channel
+    /// keys no wallet scans.
+    payout: [Hash256; 2],
     /// The root of our revocation shachain.
     revocation_seed: [u8; 32],
     funding_depth: u16,
@@ -177,6 +181,8 @@ impl Machine {
         delay: u16,
         funding_depth: u16,
         base_fee_rate: u64,
+        our_payout: Hash256,
+        their_payout: Hash256,
     ) -> Result<(Machine, Message), ChannelError> {
         let our_pubkey = signer.pubkey().to_vec();
         let funding = [
@@ -188,6 +194,8 @@ impl Machine {
             capacity: crate::amount::Amount::from_units(capacity),
             delay,
         };
+        // Funder is index 0, acceptor index 1.
+        let payout = [our_payout, their_payout];
         let m = Machine::bootstrap(
             journal_path,
             network,
@@ -198,6 +206,7 @@ impl Machine {
             params,
             funding_depth,
             base_fee_rate,
+            payout,
         )?;
         let open = Message::Open {
             capacity,
@@ -217,6 +226,8 @@ impl Machine {
         signer: Box<dyn Signer>,
         base_fee_rate: u64,
         open: &Message,
+        our_payout: Hash256,
+        their_payout: Hash256,
     ) -> Result<(Machine, Message), ChannelError> {
         let Message::Open {
             capacity,
@@ -238,6 +249,8 @@ impl Machine {
             capacity: crate::amount::Amount::from_units(*capacity),
             delay: *delay,
         };
+        // Acceptor is index 1; the funder's payout is index 0.
+        let payout = [their_payout, our_payout];
         let mut m = Machine::bootstrap(
             journal_path,
             network,
@@ -248,6 +261,7 @@ impl Machine {
             params,
             *funding_depth,
             base_fee_rate,
+            payout,
         )?;
         m.record_their_points(first_hashes)?;
         let accept = Message::Accept {
@@ -268,6 +282,7 @@ impl Machine {
         params: ChannelParams,
         funding_depth: u16,
         base_fee_rate: u64,
+        payout: [Hash256; 2],
     ) -> Result<Machine, ChannelError> {
         let cid = channel_id(&params.funding);
         let revocation_seed = signer.revocation_root(&cid);
@@ -284,6 +299,7 @@ impl Machine {
             funding_depth,
             our_pubkey: our_pubkey.clone(),
             their_pubkey: their_pubkey.clone(),
+            payout,
         })?;
         Ok(Machine {
             params,
@@ -293,6 +309,7 @@ impl Machine {
             signer,
             our_pubkey,
             their_pubkey,
+            payout,
             revocation_seed,
             funding_depth,
             journal,
@@ -826,7 +843,9 @@ impl Machine {
             self.phase = Phase::Closing;
         }
         let bal = self.current_balances();
-        let close = self.params.cooperative_close(self.funding()?, bal, *fee);
+        let close = self
+            .params
+            .cooperative_close(self.funding()?, bal, *fee, self.payout);
         let m = self
             .params
             .funding_sighash(&close.tx, self.network, self.our_index);
@@ -843,7 +862,9 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         };
         let bal = self.current_balances();
-        let close = self.params.cooperative_close(self.funding()?, bal, *fee);
+        let close = self
+            .params
+            .cooperative_close(self.funding()?, bal, *fee, self.payout);
         let their_leaf = (1 - self.our_index) as u8;
         crate::policy::check_signature(
             &close.tx,
@@ -907,6 +928,7 @@ impl Machine {
             delay,
             funding_depth,
             their_pubkey,
+            payout,
             ..
         } = opened
         else {
@@ -926,6 +948,7 @@ impl Machine {
             our_pubkey: signer.pubkey().to_vec(),
             signer,
             their_pubkey,
+            payout,
             revocation_seed,
             funding_depth,
             journal,

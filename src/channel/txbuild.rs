@@ -256,7 +256,19 @@ impl ChannelParams {
 
     /// A cooperative close paying each party its final balance, the funder's
     /// side less the close fee, dropping dust into the fee.
-    pub fn cooperative_close(&self, funding: OutPoint, bal: [u64; 2], fee: u64) -> Commitment {
+    ///
+    /// Each output pays the party's **wallet** payout address (`payout[i]`),
+    /// not its channel key: a channel key is not in any wallet's address space,
+    /// so a close that paid it would leave the funds unspendable. Both sides
+    /// build this transaction identically from the payout addresses they
+    /// exchanged at open, so their signatures match.
+    pub fn cooperative_close(
+        &self,
+        funding: OutPoint,
+        bal: [u64; 2],
+        fee: u64,
+        payout: [Hash256; 2],
+    ) -> Commitment {
         let mut side = bal;
         side[FUNDER] = side[FUNDER].saturating_sub(fee);
         let mut outs = Vec::new();
@@ -264,7 +276,7 @@ impl ChannelParams {
         let mut trimmed_outputs = 0u32;
         for (i, &v) in side.iter().enumerate() {
             if v >= MIN_OUTPUT_VALUE {
-                outs.push(key_output(self.funding[i], v));
+                outs.push(key_output(payout[i], v));
             } else if v > 0 {
                 trimmed_units += v;
                 trimmed_outputs += 1;

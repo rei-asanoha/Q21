@@ -78,6 +78,8 @@ mod sim {
     fn open_pair(d: &std::path::Path) -> (Machine, Machine, usize) {
         let a_signer = ChannelKey::from_seed(&[2u8; 32]);
         let a_pub = a_signer.pubkey().to_vec();
+        let f_payout = q21_core::hash::Hash256([0xf0u8; 32]);
+        let a_payout = q21_core::hash::Hash256([0xa0u8; 32]);
         let (mut f, open) = Machine::new_funder(
             d.join("f.jrnl"),
             NET,
@@ -87,10 +89,20 @@ mod sim {
             DELAY,
             DEPTH,
             RATE,
+            f_payout,
+            a_payout,
         )
         .unwrap();
-        let (mut a, accept) =
-            Machine::accept(d.join("a.jrnl"), NET, Box::new(a_signer), RATE, &open).unwrap();
+        let (mut a, accept) = Machine::accept(
+            d.join("a.jrnl"),
+            NET,
+            Box::new(a_signer),
+            RATE,
+            &open,
+            a_payout,
+            f_payout,
+        )
+        .unwrap();
         let mut handshake_bytes = open.encode().len();
         f.on_accept(&accept).unwrap();
         handshake_bytes += accept.encode().len();

@@ -46,6 +46,8 @@ fn open_pair(dir: &std::path::Path) -> (Machine, Machine) {
     let f_signer = fkey();
     let a_signer = akey();
     let a_pub = a_signer.pubkey().to_vec();
+    let f_payout = Hash256([0xf0u8; 32]);
+    let a_payout = Hash256([0xa0u8; 32]);
     let (mut f, open) = Machine::new_funder(
         dir.join("f.jrnl"),
         NET,
@@ -55,9 +57,20 @@ fn open_pair(dir: &std::path::Path) -> (Machine, Machine) {
         DELAY,
         DEPTH,
         RATE,
+        f_payout,
+        a_payout,
     )
     .unwrap();
-    let (mut a, accept) = Machine::accept(dir.join("a.jrnl"), NET, a_signer, RATE, &open).unwrap();
+    let (mut a, accept) = Machine::accept(
+        dir.join("a.jrnl"),
+        NET,
+        a_signer,
+        RATE,
+        &open,
+        a_payout,
+        f_payout,
+    )
+    .unwrap();
     f.on_accept(&accept).unwrap();
     let outpoint = OutPoint {
         txid: Hash256([9u8; 32]),
@@ -264,6 +277,7 @@ fn channel_transaction_weights() {
         },
         [CAP - 2_000_000, 2_000_000],
         20_000,
+        [Hash256([0xf0u8; 32]), Hash256([0xa0u8; 32])],
     );
     let mut closetx = close.tx;
     closetx.inputs[0].witness = txbuild::dummy_funding_witness(&params.funding_policy());

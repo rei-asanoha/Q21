@@ -1147,9 +1147,30 @@ impl RpcContext {
     #[cfg(feature = "mldsa")]
     fn channelopen(&self, params: &Json) -> Result<Json, Json> {
         let mgr = self.channels()?;
-        let peer = params.get("peer").and_then(|v| v.as_u64()).ok_or_else(|| {
-            rpc_error(ERR_PARAMS, "peer must be a numeric peer id (see getpeers)")
-        })?;
+        // `peer` is either a numeric connection id (as getpeers reports) or a
+        // durable peer identity (an address string). Resolve a string to the
+        // live id of a connected, channel-capable peer at that address.
+        let peer = match params.get("peer") {
+            Some(v) if v.as_u64().is_some() => v.as_u64().unwrap(),
+            Some(Json::Str(addr)) => self
+                .node
+                .peer_list()
+                .into_iter()
+                .find(|p| &p.address == addr && p.supports_channels)
+                .map(|p| p.id)
+                .ok_or_else(|| {
+                    rpc_error(
+                        ERR_PARAMS,
+                        "no connected channel-capable peer at that address",
+                    )
+                })?,
+            _ => {
+                return Err(rpc_error(
+                    ERR_PARAMS,
+                    "peer must be a numeric peer id (see getpeers) or a peer address",
+                ))
+            }
+        };
         let capacity = params
             .get("capacity")
             .and_then(|v| v.as_u64())
@@ -1163,7 +1184,7 @@ impl RpcContext {
             .and_then(|v| v.as_u64())
             .map(|d| d as u16);
         let frame = mgr
-            .open(peer, capacity, delay, depth)
+            .open(peer, &self.node.peer_identity(peer), capacity, delay, depth)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
         if !self.node.send_channel(peer, frame) {
             return Err(rpc_error(

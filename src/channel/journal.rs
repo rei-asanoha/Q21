@@ -47,6 +47,10 @@ pub enum Record {
         funding_depth: u16,
         our_pubkey: Vec<u8>,
         their_pubkey: Vec<u8>,
+        /// Each party's wallet payout address, `[funder, acceptor]`, exchanged
+        /// at open and used to build a cooperative close that pays spendable
+        /// wallet outputs.
+        payout: [Hash256; 2],
     },
     /// The funding outpoint is known (funding transaction built).
     Funded {
@@ -107,6 +111,7 @@ impl Record {
                 funding_depth,
                 our_pubkey,
                 their_pubkey,
+                payout,
             } => {
                 w.u8(R_OPENED).bytes(channel_id.as_bytes()).u8(*our_index);
                 w.bytes(funding[0].as_bytes()).bytes(funding[1].as_bytes());
@@ -114,6 +119,7 @@ impl Record {
                 w.bytes(&delay.to_le_bytes())
                     .bytes(&funding_depth.to_le_bytes());
                 w.var_bytes(our_pubkey).var_bytes(their_pubkey);
+                w.bytes(payout[0].as_bytes()).bytes(payout[1].as_bytes());
             }
             Record::Funded {
                 funding_txid,
@@ -182,6 +188,7 @@ impl Record {
                 let funding_depth = u16::from_le_bytes([r.u8()?, r.u8()?]);
                 let our_pubkey = r.var_bytes()?.to_vec();
                 let their_pubkey = r.var_bytes()?.to_vec();
+                let payout = [Hash256(r.array32()?), Hash256(r.array32()?)];
                 Record::Opened {
                     channel_id,
                     our_index,
@@ -191,6 +198,7 @@ impl Record {
                     funding_depth,
                     our_pubkey,
                     their_pubkey,
+                    payout,
                 }
             }
             R_FUNDED => Record::Funded {
