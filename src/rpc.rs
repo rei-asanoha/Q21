@@ -642,6 +642,33 @@ impl RpcContext {
     }
 }
 
+/// The optional `delay` and `min_depth` of a `channelopen`, checked against the
+/// range a peer accepts. A value was cut to 16 bits with `as u16`: 65548 became
+/// a delay of 12, and the channel opened on terms nobody asked for.
+#[cfg(feature = "mldsa")]
+fn channel_open_terms(params: &Json) -> Result<(Option<u16>, Option<u16>), Json> {
+    use crate::channel::{DEFAULT_FUNDING_DEPTH, MAX_DELAY, MIN_DELAY_REGTEST};
+    let term = |name: &str, min: u16, max: u16| -> Result<Option<u16>, Json> {
+        match params.get(name) {
+            None | Some(Json::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .filter(|&x| x >= u64::from(min) && x <= u64::from(max))
+                .map(|x| Some(x as u16))
+                .ok_or_else(|| {
+                    rpc_error(
+                        ERR_PARAMS,
+                        &format!("{name} must be an integer from {min} to {max}"),
+                    )
+                }),
+        }
+    };
+    Ok((
+        term("delay", MIN_DELAY_REGTEST, MAX_DELAY)?,
+        term("min_depth", DEFAULT_FUNDING_DEPTH, MAX_DELAY)?,
+    ))
+}
+
 /// One channel as a small JSON object, for `channellist` and `channelinfo`.
 #[cfg(feature = "mldsa")]
 fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
@@ -1176,14 +1203,7 @@ impl RpcContext {
             .get("capacity")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| rpc_error(ERR_PARAMS, "capacity (in units) is required"))?;
-        let delay = params
-            .get("delay")
-            .and_then(|v| v.as_u64())
-            .map(|d| d as u16);
-        let depth = params
-            .get("min_depth")
-            .and_then(|v| v.as_u64())
-            .map(|d| d as u16);
+        let (delay, depth) = channel_open_terms(params)?;
         let frame = mgr
             .open(peer, &self.node.peer_identity(peer), capacity, delay, depth)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
@@ -4000,6 +4020,29 @@ mod tests {
     fn call(c: &RpcContext, method: &str, params: &str) -> Json {
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
         jparse(&c.handle(&body)).expect("valid JSON response")
+    }
+
+    /// `channelopen` rejects a delay or depth out of range instead of cutting it
+    /// to 16 bits.
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn channel_open_terms_are_checked_not_truncated() {
+        let terms = |p: &str| super::channel_open_terms(&jparse(p).unwrap());
+        assert_eq!(terms("{}").unwrap(), (None, None));
+        assert_eq!(
+            terms(r#"{"delay":144,"min_depth":3}"#).unwrap(),
+            (Some(144), Some(3))
+        );
+        for bad in [
+            r#"{"delay":65548}"#,
+            r#"{"delay":3}"#,
+            r#"{"delay":-1}"#,
+            r#"{"delay":"12"}"#,
+            r#"{"min_depth":65538}"#,
+            r#"{"min_depth":0}"#,
+        ] {
+            assert!(terms(bad).is_err(), "{bad} accepted");
+        }
     }
 
     /// The channel methods are listed and refuse cleanly when the node runs no
