@@ -379,7 +379,16 @@ impl Journal {
         }
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
-        let records = replay(&raw);
+        let (records, good) = replay_prefix(&raw);
+        // A torn tail — the half-written frame of an interrupted append — is
+        // cut off before anything is appended after it. Left in place, every
+        // record appended later would sit behind it, invisible to the next
+        // replay: lost at the next restart.
+        if good < raw.len() {
+            let f = OpenOptions::new().write(true).open(&path)?;
+            f.set_len(good as u64)?;
+            f.sync_all()?;
+        }
         let file = OpenOptions::new().append(true).open(&path)?;
         let count = records.len();
         Ok((
@@ -426,6 +435,11 @@ impl Journal {
 /// Reads every intact record from the raw journal bytes, stopping at the first
 /// torn or corrupt frame.
 pub fn replay(raw: &[u8]) -> Vec<Record> {
+    replay_prefix(raw).0
+}
+
+/// [`replay`], with the length of the intact prefix those records occupy.
+fn replay_prefix(raw: &[u8]) -> (Vec<Record>, usize) {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + 8 <= raw.len() {
@@ -449,5 +463,41 @@ pub fn replay(raw: &[u8]) -> Vec<Record> {
         }
         pos = body_end;
     }
-    out
+    (out, pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("q21-journal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("j.jrnl")
+    }
+
+    /// A crash cut the last append in the middle of its frame. Reopening must
+    /// drop that torn tail, so records appended afterwards are replayed at the
+    /// next restart instead of hiding behind it.
+    #[test]
+    fn records_appended_after_a_torn_tail_survive_the_next_restart() {
+        let path = tmp("torn");
+        {
+            let (mut j, _) = Journal::open(&path).unwrap();
+            j.append(&Record::Ready).unwrap();
+            j.append(&Record::ClosingCoop { fee: 7 }).unwrap();
+        }
+        // Tear the second frame in its middle.
+        let full = std::fs::read(&path).unwrap();
+        let cut = full.len() - 5;
+        std::fs::write(&path, &full[..cut]).unwrap();
+        {
+            let (mut j, recs) = Journal::open(&path).unwrap();
+            assert_eq!(recs, vec![Record::Ready]);
+            j.append(&Record::Forcing).unwrap();
+        }
+        let (_, recs) = Journal::open(&path).unwrap();
+        assert_eq!(recs, vec![Record::Ready, Record::Forcing]);
+    }
 }
