@@ -1307,6 +1307,7 @@ impl ChannelManager {
         let frames = self.confirm_buried(height, depth_of);
         self.advance_closes(txs, height);
         self.expire_unfunded(height, depth_of);
+        self.tend_fundings(depth_of);
         frames
     }
 
@@ -1331,6 +1332,44 @@ impl ChannelManager {
             {
                 c.conflict = Some((t.txid(), height));
             }
+        }
+    }
+
+    /// Each block: our funding, signed for by the acceptor and still in no
+    /// block, is announced again — a pool may have dropped it — and the coins
+    /// of a channel past its opening are released.
+    fn tend_fundings(&self, depth_of: &DepthOf) {
+        let mut again = Vec::new();
+        let mut release = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap();
+            for c in g.channels.values_mut() {
+                let Some(tx) = c.machine.funding_tx().cloned() else {
+                    continue;
+                };
+                let opening = matches!(c.machine.phase(), Phase::Opening | Phase::Funded);
+                if c.reserved && (!opening || c.spend.is_some()) {
+                    c.reserved = false;
+                    release.push(tx.clone());
+                }
+                // Unconfirmed and unconflicted: every coin it spends is still
+                // unspent on chain.
+                let pending = c.machine.phase() == Phase::Funded
+                    && c.spend.is_none()
+                    && c.machine
+                        .funding_outpoint()
+                        .is_some_and(|op| depth_of(&op).is_none())
+                    && tx.inputs.iter().all(|i| depth_of(&i.prev_out).is_some());
+                if pending {
+                    again.push(tx);
+                }
+            }
+        }
+        for tx in release {
+            (self.hooks.reserve)(&tx, false);
+        }
+        for tx in again {
+            self.broadcast_or_warn(&tx, "funding");
         }
     }
 

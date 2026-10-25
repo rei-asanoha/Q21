@@ -2841,3 +2841,39 @@ fn a_funding_confirmed_while_we_were_down_is_claimed_not_given_up() {
         "the funder's capacity was not claimed ({claimed} of {capacity})"
     );
 }
+
+/// M2: our funding, signed for by the acceptor, may drop out of every pool
+/// before it confirms. It is announced again at every block while it waits,
+/// and its coins are released as soon as the channel leaves its opening —
+/// here by a force-close — rather than held until a restart.
+#[test]
+fn an_unconfirmed_funding_is_announced_again_and_released_when_the_channel_ends() {
+    let (mut p, wallet, chain, _dir, sent) =
+        unconfirmed_funding_pair([0xb7u8; 32], [0xb8u8; 32], "m2-rebroadcast");
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    let funding = sent.lock().unwrap()[0].clone();
+    for k in 1..=3 {
+        chain.lock().unwrap().mine(&[]);
+        drive(&p.funder, &chain);
+        let all = sent.lock().unwrap().clone();
+        assert_eq!(all.len(), 1 + k, "announced again at block {k}");
+        assert!(all.iter().all(|t| t.txid() == funding.txid()));
+    }
+    let locked = |w: &Wallet| funding.inputs.iter().all(|i| w.is_locked(&i.prev_out));
+    assert!(locked(&wallet.lock().unwrap()));
+    // The channel ends before its funding confirmed.
+    p.funder.force_close(cid).unwrap();
+    chain.lock().unwrap().mine(&[]);
+    drive(&p.funder, &chain);
+    let w = wallet.lock().unwrap();
+    assert!(
+        funding.inputs.iter().all(|i| !w.is_locked(&i.prev_out)),
+        "coins held after the channel ended"
+    );
+}
