@@ -396,7 +396,9 @@ impl Machine {
             our_pubkey: our_pubkey.clone(),
             their_pubkey: their_pubkey.clone(),
             payout,
+            key_index: signer.key_index(),
         })?;
+        let key_index = signer.key_index();
         Ok(Machine {
             params,
             network,
@@ -421,7 +423,7 @@ impl Machine {
             close_fee: None,
             close_payer: None,
             funding_tx: None,
-            key_index: None,
+            key_index,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,
@@ -1035,6 +1037,7 @@ impl Machine {
             our_pubkey: self.our_pubkey.clone(),
             their_pubkey: self.their_pubkey.clone(),
             payout: self.payout,
+            key_index: self.key_index,
         }];
         if let Some(op) = self.funding_outpoint {
             out.push(Record::Funded {
@@ -1105,9 +1108,6 @@ impl Machine {
         }
         if !matches!(self.phase, Phase::Opening | Phase::Funded) {
             out.push(Record::Ready);
-        }
-        if let Some(index) = self.key_index {
-            out.push(Record::KeyIndex { index });
         }
         if let Some(height) = self.funding_height {
             out.push(Record::Confirmed { height });
@@ -1534,6 +1534,7 @@ impl Machine {
             funding_depth,
             their_pubkey,
             payout,
+            key_index: opened_index,
             ..
         } = opened
         else {
@@ -1569,7 +1570,7 @@ impl Machine {
             close_fee: None,
             close_payer: None,
             funding_tx: None,
-            key_index: None,
+            key_index: opened_index,
             close_signed: false,
             close_peer_sig: None,
             funding_height: None,

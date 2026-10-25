@@ -54,6 +54,12 @@ pub trait Signer: Send + Sync {
     /// could derive every revocation secret and so every penalty preimage. A
     /// public-key-only derivation here would hand the channel away.
     fn revocation_root(&self, channel_id: &Hash256) -> [u8; 32];
+
+    /// The wallet key index this key derives from, when it does: journaled
+    /// in the channel's opening record, so a restart finds the key at once.
+    fn key_index(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// A concrete ML-DSA-87 channel key, holding the expanded signing key so a
@@ -67,6 +73,7 @@ pub struct ChannelKey {
     seed: [u8; 32],
     sk: ml_dsa::SigningKey<ml_dsa::MlDsa87>,
     pubkey: Vec<u8>,
+    index: Option<u32>,
 }
 
 #[cfg(feature = "mldsa")]
@@ -80,14 +87,16 @@ impl ChannelKey {
             seed: *seed,
             sk,
             pubkey,
+            index: None,
         }
     }
 
     /// Builds a channel's signing key from the wallet seed and the index.
     pub fn derive(wallet_seed: &[u8; 32], channel_index: u32) -> ChannelKey {
         let mut seed = funding_key_seed(wallet_seed, channel_index);
-        let key = ChannelKey::from_seed(&seed);
+        let mut key = ChannelKey::from_seed(&seed);
         crate::kdf::wipe(&mut seed);
+        key.index = Some(channel_index);
         key
     }
 
@@ -123,5 +132,9 @@ impl Signer for ChannelKey {
     fn revocation_root(&self, channel_id: &Hash256) -> [u8; 32] {
         // From the private seed, never the public key.
         tagged_hash_parts(TAG_REVOKE, &[&self.seed, channel_id.as_bytes()]).0
+    }
+
+    fn key_index(&self) -> Option<u32> {
+        self.index
     }
 }

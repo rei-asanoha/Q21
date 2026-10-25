@@ -55,6 +55,10 @@ pub enum Record {
         /// at open and used to build a cooperative close that pays spendable
         /// wallet outputs.
         payout: [Hash256; 2],
+        /// The wallet key index our channel key derives from, written with
+        /// the rest so no crash can leave a journal without it. `None` in
+        /// journals written before it was (see [`Record::KeyIndex`]).
+        key_index: Option<u32>,
     },
     /// The funding outpoint is known (funding transaction built).
     Funded {
@@ -90,7 +94,9 @@ pub enum Record {
     /// is held, and again after a crash that lost it from the mempool.
     FundingTx { tx: Vec<u8> },
     /// The wallet key index our channel key derives from, so a restart finds
-    /// the key directly instead of searching for it.
+    /// the key directly instead of searching for it. Written by 0.4.10
+    /// candidates after the opening record, and still for a journal found by
+    /// search; the opening record now carries the index itself.
     KeyIndex { index: u32 },
     /// We moved to force-close (we or the peer will broadcast a commitment).
     Forcing,
@@ -139,6 +145,8 @@ const R_CROSSED: u8 = 16;
 const R_CLOSING_COOP_BY: u8 = 17;
 const R_FUNDING_TX: u8 = 18;
 const R_KEY_INDEX: u8 = 19;
+/// [`Record::Opened`] with its key index.
+const R_OPENED_INDEXED: u8 = 20;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -157,14 +165,23 @@ impl Record {
                 our_pubkey,
                 their_pubkey,
                 payout,
+                key_index,
             } => {
-                w.u8(R_OPENED).bytes(channel_id.as_bytes()).u8(*our_index);
+                let tag = if key_index.is_some() {
+                    R_OPENED_INDEXED
+                } else {
+                    R_OPENED
+                };
+                w.u8(tag).bytes(channel_id.as_bytes()).u8(*our_index);
                 w.bytes(funding[0].as_bytes()).bytes(funding[1].as_bytes());
                 w.u64(*capacity);
                 w.bytes(&delay.to_le_bytes())
                     .bytes(&funding_depth.to_le_bytes());
                 w.var_bytes(our_pubkey).var_bytes(their_pubkey);
                 w.bytes(payout[0].as_bytes()).bytes(payout[1].as_bytes());
+                if let Some(index) = key_index {
+                    w.u32(*index);
+                }
             }
             Record::Funded {
                 funding_txid,
@@ -247,8 +264,9 @@ impl Record {
 
     fn decode(data: &[u8]) -> Result<Record, ReadError> {
         let mut r = Reader::new(data);
-        let rec = match r.u8()? {
-            R_OPENED => {
+        let tag = r.u8()?;
+        let rec = match tag {
+            R_OPENED | R_OPENED_INDEXED => {
                 let channel_id = Hash256(r.array32()?);
                 let our_index = r.u8()?;
                 let funding = [Hash256(r.array32()?), Hash256(r.array32()?)];
@@ -258,6 +276,11 @@ impl Record {
                 let our_pubkey = r.var_bytes()?.to_vec();
                 let their_pubkey = r.var_bytes()?.to_vec();
                 let payout = [Hash256(r.array32()?), Hash256(r.array32()?)];
+                let key_index = if tag == R_OPENED_INDEXED {
+                    Some(r.u32()?)
+                } else {
+                    None
+                };
                 Record::Opened {
                     channel_id,
                     our_index,
@@ -268,6 +291,7 @@ impl Record {
                     our_pubkey,
                     their_pubkey,
                     payout,
+                    key_index,
                 }
             }
             R_FUNDED => Record::Funded {

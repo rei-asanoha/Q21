@@ -2270,3 +2270,40 @@ fn a_reorganized_penalty_is_announced_again() {
     victim.on_connected_block(&[], h + 10, &no_depth);
     assert_eq!(sent.lock().unwrap().len(), n);
 }
+
+/// N6: a crash between creating a channel's journal and journaling its key
+/// index left a journal no reload could match to its key — for an accepted
+/// channel, whose index derives from the funder's key, never. The opening
+/// record carries the index itself.
+#[test]
+fn a_journal_without_a_key_index_record_still_reloads() {
+    use q21_core::channel::journal::{Journal, Record};
+    let funder_seed = [0xd5u8; 32];
+    let acceptor_seed = [0xd6u8; 32];
+    let (p, _wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "n6-index");
+    drop(p);
+    for side in ["funder", "acceptor"] {
+        let path = dir.join(side).join(format!("{}.jrnl", cid.to_hex()));
+        let (mut j, records) = Journal::open(&path).unwrap();
+        let kept: Vec<Record> = records
+            .into_iter()
+            .filter(|r| !matches!(r, Record::KeyIndex { .. }))
+            .collect();
+        j.rewrite(&kept).unwrap();
+    }
+    let acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("acceptor"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+    );
+    assert_eq!(
+        acceptor.info(cid).map(|i| i.phase),
+        Some(Phase::Open),
+        "the accepted channel reloads"
+    );
+}

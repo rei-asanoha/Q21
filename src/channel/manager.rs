@@ -369,12 +369,21 @@ impl ChannelManager {
                     continue;
                 }
             };
-            let Some(Record::Opened { our_pubkey, .. }) = records.first() else {
+            let Some(Record::Opened {
+                our_pubkey,
+                key_index,
+                ..
+            }) = records.first()
+            else {
                 continue;
             };
-            let index = records.iter().find_map(|r| match r {
-                Record::KeyIndex { index } => Some(*index),
-                _ => None,
+            // In the opening record; in journals written before it was, in a
+            // record of its own.
+            let index = key_index.or_else(|| {
+                records.iter().find_map(|r| match r {
+                    Record::KeyIndex { index } => Some(*index),
+                    _ => None,
+                })
             });
             found.push((path, our_pubkey.clone(), index));
         }
@@ -859,7 +868,6 @@ impl ChannelManager {
             acceptor_payout,
         )
         .map_err(err)?;
-        machine.note_key_index(pending.index).map_err(err)?;
         self.write_peer_identity(cid, &pending.peer_identity);
         g.channels.insert(
             cid,
@@ -1108,7 +1116,6 @@ impl ChannelManager {
         if machine.channel_id() != cid {
             return Err("channel id mismatch".into());
         }
-        machine.note_key_index(pending.index).map_err(err)?;
         if g.spare_payout == Some(pending.our_payout) {
             g.spare_payout = None;
         }
