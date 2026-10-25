@@ -4901,6 +4901,38 @@ mod tests {
         a.shutdown();
     }
 
+    /// A 0.4.10 node speaks protocol 4: it predates the policy activation but
+    /// is still a peer, as it must be until the activation height.
+    #[test]
+    fn a_0_4_10_peer_completes_the_handshake() {
+        use std::io::Write;
+        let a = node();
+        let addr = a.listen("127.0.0.1:0").expect("listen");
+        let magic = magic_for(NETWORK);
+        let mut s = std::net::TcpStream::connect(addr).expect("connection");
+        let v4 = Message::Version {
+            version: 4,
+            timestamp: unix_now(),
+            nonce: 0x0410,
+            user_agent: "q21:0.4".into(),
+            start_height: 0,
+        };
+        s.write_all(&v4.frame(magic)).unwrap();
+        s.write_all(&Message::VerAck.frame(magic)).unwrap();
+        s.flush().unwrap();
+        assert!(
+            wait_until(
+                || {
+                    let g = a.shared.lock().unwrap();
+                    g.peers.values().any(|p| p.handshaked && p.version == 4)
+                },
+                5
+            ),
+            "a version-4 peer must stay welcome"
+        );
+        a.shutdown();
+    }
+
     #[test]
     fn the_handshake_announces_the_height() {
         let (a, b) = node_pair();

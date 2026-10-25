@@ -41,10 +41,21 @@ use crate::tx::Transaction;
 /// peers that announced version 4: a version-3 node treats an unknown command
 /// as a malformed frame. Everything else is unchanged, and version-3 peers
 /// stay welcome.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// 5: follows the activation of policy outputs on a network that schedules
+/// it (0.4.11). No new message: a version-4 peer reads a version-5 one as
+/// before, and a version-5 node stays a peer of it. What changes is what the
+/// version-5 node sends it: never a transaction that creates or spends a
+/// policy output, which a version-4 node reads as malformed.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// First version that understands `onionaddr`.
 pub const ONION_ADDR_VERSION: u32 = 4;
+
+/// First version that follows the activation of policy outputs: it validates
+/// them from the activation height of its network, and does not take a
+/// policy output received from a peer that is ahead of it for a malformed
+/// message. See [`crate::policy::has_transition`].
+pub const POLICY_ACTIVATION_VERSION: u32 = 5;
 
 /// Length of a Tor v3 onion name, without `.onion`: 56 base32 characters.
 pub const ONION_NAME_LEN: usize = 56;
@@ -829,6 +840,16 @@ impl Message {
 mod tests {
     use super::*;
     use crate::consensus::NETWORK_MAGIC_TESTNET as MAGIC;
+
+    /// 0.4.11 announces the version that follows the policy activation, and
+    /// still accepts the 0.4.10 nodes (version 4) it must keep talking to
+    /// before the activation height.
+    #[test]
+    fn this_version_follows_the_policy_activation_and_accepts_0_4_10() {
+        assert_eq!(PROTOCOL_VERSION, POLICY_ACTIVATION_VERSION);
+        assert!(MIN_PROTOCOL_VERSION <= 4);
+        assert!(ONION_ADDR_VERSION < POLICY_ACTIVATION_VERSION);
+    }
 
     fn round_trip(m: Message) {
         let frame = m.frame(MAGIC);
