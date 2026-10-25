@@ -357,6 +357,55 @@ pub fn policy_output_is_malformed(
     !crate::policy::is_active(network, mined_at)
 }
 
+/// Does a peer that announced protocol `version` follow the policy
+/// activation of `network`? Always, where the network has no transition
+/// ([`crate::policy::has_transition`]): there, every version reads policies
+/// as this node does.
+pub fn follows_activation(network: Network, version: u32) -> bool {
+    !crate::policy::has_transition(network) || version >= crate::wire::POLICY_ACTIVATION_VERSION
+}
+
+/// `m` as peer `peer` may receive it.
+///
+/// A peer that does not follow the policy activation reads a policy output
+/// as a malformed message and drops the link: it is never offered, nor
+/// sent, a transaction that creates or spends one. `None` when nothing of
+/// `m` is left for it.
+fn for_peer<'a>(g: &Shared, peer: u64, m: &'a Message) -> Option<std::borrow::Cow<'a, Message>> {
+    use std::borrow::Cow;
+    let follows = g
+        .peers
+        .get(&peer)
+        .is_some_and(|p| follows_activation(g.network, p.version));
+    if follows {
+        return Some(Cow::Borrowed(m));
+    }
+    let withheld = |hash: &Hash256| g.mempool.touches_policy(hash);
+    match m {
+        Message::Tx(t) => {
+            let policy = t
+                .outputs
+                .iter()
+                .any(|o| o.scheme == crate::sig::SchemeId::Policy)
+                || withheld(&t.txid());
+            (!policy).then_some(Cow::Borrowed(m))
+        }
+        Message::Inv(items)
+            if items
+                .iter()
+                .any(|i| i.kind == InvKind::Tx && withheld(&i.hash)) =>
+        {
+            let kept: Vec<InvItem> = items
+                .iter()
+                .filter(|i| i.kind != InvKind::Tx || !withheld(&i.hash))
+                .copied()
+                .collect();
+            (!kept.is_empty()).then_some(Cow::Owned(Message::Inv(kept)))
+        }
+        _ => Some(Cow::Borrowed(m)),
+    }
+}
+
 /// See [`crate::validate::ValidationError::locally_unverifiable_scheme`].
 pub fn locally_unverifiable_scheme(
     e: &crate::validate::ValidationError,
@@ -3901,17 +3950,28 @@ impl Node {
         self.scan_connected_blocks_for_channels();
 
         for e in outgoing {
-            let writer = {
+            let sent = {
                 let mut g = self.shared.lock().unwrap();
-                // A requested body is noted, so we know whether it arrives —
-                // within the limit of in-flight slots, as everywhere. A header
-                // request too: only an expected reply will be read.
-                g.peers.get_mut(&e.peer).map(|p| {
-                    p.note_sent(&e.message, Instant::now());
-                    p.writer.clone()
-                })
+                match for_peer(&g, e.peer, &e.message) {
+                    Some(m) => {
+                        let m = m.into_owned();
+                        // A requested body is noted, so we know whether it
+                        // arrives — within the limit of in-flight slots, as
+                        // everywhere. A header request too: only an expected
+                        // reply will be read.
+                        g.peers.get_mut(&e.peer).map(|p| {
+                            p.note_sent(&m, Instant::now());
+                            (p.writer.clone(), m)
+                        })
+                    }
+                    None => None,
+                }
             };
-            if let Some(s) = writer {
+            if let Some((s, message)) = sent {
+                let e = Outgoing {
+                    peer: e.peer,
+                    message,
+                };
                 let frame = frame_of(&e.message, self.magic);
                 if must_deliver(&e.message) {
                     // Recorded as sent just above: it must not be dropped.
@@ -4439,14 +4499,18 @@ impl Node {
     /// Sends a message to a peer, outside the lock, noting the requested
     /// bodies as `handle` does.
     fn send_to(&self, id: u64, m: &Message) {
-        let writer = {
+        let sent = {
             let mut g = self.shared.lock().unwrap();
-            g.peers.get_mut(&id).map(|p| {
-                p.note_sent(m, Instant::now());
-                p.writer.clone()
-            })
+            match for_peer(&g, id, m).map(|m| m.into_owned()) {
+                Some(m) => g.peers.get_mut(&id).map(|p| {
+                    p.note_sent(&m, Instant::now());
+                    (p.writer.clone(), m)
+                }),
+                None => None,
+            }
         };
-        if let Some(s) = writer {
+        if let Some((s, m)) = sent {
+            let m = &m;
             let frame = frame_of(m, self.magic);
             if must_deliver(m) {
                 let _ = s.push_force(frame);
@@ -4479,42 +4543,63 @@ impl Node {
     }
 
     pub fn announce_mempool(&self) -> usize {
-        let (targets, pending): (Vec<Arc<Outbox>>, Vec<Hash256>) = {
+        let (targets, pending, older, without_policies) = {
             let g = self.shared.lock().unwrap();
             // The whole pool, not just its top: a peer behind by thousands
             // reconciles the rest here, bounding its own intake. See
             // `Mempool::announcement_window`.
             let pending = g.mempool.announcement_window(MEMPOOL_REOFFER_MAX_TXS);
-            let targets = g
+            let (follow, older): (Vec<&Peer>, Vec<&Peer>) = g
                 .peers
                 .values()
                 .filter(|p| p.handshaked)
-                .map(|p| p.writer.clone())
-                .collect();
-            (targets, pending)
+                .partition(|p| follows_activation(g.network, p.version));
+            // The peers that predate the policy activation get the pool
+            // without its policy transactions: see `for_peer`.
+            let without_policies: Vec<Hash256> = if older.is_empty() {
+                Vec::new()
+            } else {
+                pending
+                    .iter()
+                    .filter(|h| !g.mempool.touches_policy(h))
+                    .copied()
+                    .collect()
+            };
+            (
+                follow.iter().map(|p| p.writer.clone()).collect::<Vec<_>>(),
+                pending,
+                older.iter().map(|p| p.writer.clone()).collect::<Vec<_>>(),
+                without_policies,
+            )
         };
         if pending.is_empty() {
             return 0;
         }
-        let m = Message::Inv(
-            pending
-                .iter()
-                .map(|hash| InvItem {
-                    kind: InvKind::Tx,
-                    hash: *hash,
-                })
-                .collect(),
-        );
-        self.broadcast(&targets, &m);
+        let inv = |hashes: &[Hash256]| {
+            Message::Inv(
+                hashes
+                    .iter()
+                    .map(|hash| InvItem {
+                        kind: InvKind::Tx,
+                        hash: *hash,
+                    })
+                    .collect(),
+            )
+        };
+        self.broadcast(&targets, &inv(&pending));
+        if !without_policies.is_empty() {
+            self.broadcast(&older, &inv(&without_policies));
+        }
         pending.len()
     }
 
     pub fn announce_tx(&self, txid: Hash256) {
         let targets: Vec<Arc<Outbox>> = {
             let g = self.shared.lock().unwrap();
+            let policy = g.mempool.touches_policy(&txid);
             g.peers
                 .values()
-                .filter(|p| p.handshaked)
+                .filter(|p| p.handshaked && (!policy || follows_activation(g.network, p.version)))
                 .map(|p| p.writer.clone())
                 .collect()
         };
@@ -4955,6 +5040,19 @@ mod tests {
             "and never marked handshaked"
         );
         a.shutdown();
+    }
+
+    /// Regtest opens policies at its first block and mainnet never does:
+    /// neither has a transition, so every peer is offered everything, as in
+    /// 0.4.10.
+    #[test]
+    fn without_a_transition_every_version_follows() {
+        for network in [Network::Regtest, Network::Mainnet] {
+            assert!(!crate::policy::has_transition(network));
+            for version in [MIN_PROTOCOL_VERSION, 4, PROTOCOL_VERSION] {
+                assert!(follows_activation(network, version));
+            }
+        }
     }
 
     /// A 0.4.10 node speaks protocol 4: it predates the policy activation but

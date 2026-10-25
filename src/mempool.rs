@@ -105,7 +105,8 @@ pub struct MempoolEntry {
     /// [`Mempool::return_abandoned`].
     pub returned: bool,
     /// Creates or spends a policy output ([`SchemeId::Policy`]). Such a
-    /// transaction can enter a block only from the activation height on.
+    /// transaction can enter a block only from the activation height on, and
+    /// is offered only to the peers that follow the activation.
     pub policy: bool,
 }
 
@@ -451,6 +452,12 @@ impl Mempool {
             overlay: &self.created,
             spent: &self.committed,
         }
+    }
+
+    /// Does this pooled transaction create or spend a policy output? See
+    /// [`MempoolEntry::policy`].
+    pub fn touches_policy(&self, txid: &Hash256) -> bool {
+        self.entries.get(txid).is_some_and(|e| e.policy)
     }
 
     pub fn contains(&self, txid: &Hash256) -> bool {

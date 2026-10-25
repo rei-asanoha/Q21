@@ -192,6 +192,19 @@ pub const fn scheduled_activation(network: Network) -> u64 {
     }
 }
 
+/// Does `network` go through a transition, a height before which the rule is
+/// closed and after which it is open?
+///
+/// True on testnet. False on mainnet, where it never opens, and on regtest,
+/// where it opens at block 1, the first block that can carry a transaction
+/// at all: a regtest chain has the rule from its start, and 0.4.10 already
+/// had it there. Only where there is a transition must the peers be told
+/// apart: a node that predates it cannot follow the chain past it.
+pub fn has_transition(network: Network) -> bool {
+    let h = activation_height(network);
+    h > 1 && h != u64::MAX
+}
+
 /// Moves the activation height of `network` for this process.
 ///
 /// Audit builds only, for the tests and the lab that must cross a real

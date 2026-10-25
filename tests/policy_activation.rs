@@ -158,6 +158,7 @@ fn has_policy_output(c: &Chain) -> bool {
 fn the_process_moved_only_testnet() {
     activate();
     assert_eq!(policy::activation_height(NET), H);
+    assert!(policy::has_transition(NET));
     assert!(!policy::may_appear_on(Network::Mainnet));
     assert_eq!(
         policy::activation_height(Network::Regtest),
@@ -637,5 +638,150 @@ mod wire {
             assert_eq!(node.peer_count(), 1);
             node.shutdown();
         }
+    }
+}
+
+/// A peer that predates the activation reads a policy output as malformed
+/// and cuts the link: it is never offered, nor sent, a policy transaction.
+mod relay {
+    use super::*;
+    use q21_core::net::{magic_for, Node};
+    use q21_core::wire::{InvItem, InvKind, Message, WireError, POLICY_ACTIVATION_VERSION};
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    fn peer(node: &Node, addr: std::net::SocketAddr, version: u32) -> std::net::TcpStream {
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        let magic = magic_for(NET);
+        let before = node
+            .peer_list()
+            .iter()
+            .filter(|p| p.handshake_complete)
+            .count();
+        let hello = Message::Version {
+            version,
+            timestamp: 0,
+            nonce: 0x5eed_0000 + u64::from(version),
+            user_agent: "q21:0.4".into(),
+            start_height: H - 1,
+        };
+        s.write_all(&hello.frame(magic)).unwrap();
+        s.write_all(&Message::VerAck.frame(magic)).unwrap();
+        let t = Instant::now();
+        while node
+            .peer_list()
+            .iter()
+            .filter(|p| p.handshake_complete)
+            .count()
+            == before
+        {
+            assert!(t.elapsed() < Duration::from_secs(10), "handshake");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s
+    }
+
+    /// Every message the node sends `s` within `secs`.
+    fn received(s: &mut std::net::TcpStream, secs: u64) -> Vec<Message> {
+        let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+        let magic = magic_for(NET);
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(secs) {
+            match s.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        loop {
+            match Message::parse(&buf, magic) {
+                Ok((m, used)) => {
+                    buf.drain(..used);
+                    out.push(m);
+                }
+                Err(WireError::Incomplete) => break,
+                Err(e) => panic!("unreadable frame: {e:?}"),
+            }
+        }
+        out
+    }
+
+    fn offers(msgs: &[Message], txid: &Hash256) -> bool {
+        msgs.iter().any(|m| match m {
+            Message::Inv(items) => items
+                .iter()
+                .any(|i| i.kind == InvKind::Tx && i.hash == *txid),
+            _ => false,
+        })
+    }
+
+    fn sends(msgs: &[Message], txid: &Hash256) -> bool {
+        msgs.iter()
+            .any(|m| matches!(m, Message::Tx(t) if t.txid() == *txid))
+    }
+
+    #[test]
+    fn a_policy_transaction_reaches_only_the_peers_that_follow_the_activation() {
+        let (mut c, mut w) = at_h_minus_2();
+        let b = mine(&c, &[], Hash256([0x22; 32]));
+        connect(&mut c, &b).unwrap();
+        let policy_tx = funding(&c, &mut w, 1_000_000);
+        let plain = {
+            let mut other =
+                Wallet::from_seed_scheme([0x78; 32], NET, SchemeId::LamportOts).unwrap();
+            let to = other.new_address();
+            w.create_transaction(
+                &c.utxo,
+                c.height(),
+                &to,
+                Amount::from_units(10_000),
+                Amount::from_units(FEE),
+            )
+            .unwrap()
+        };
+        let node = Node::new(NET, c);
+        let addr = node.listen("127.0.0.1:0").expect("listen");
+        let mut old = peer(&node, addr, 4);
+        let mut new = peer(&node, addr, POLICY_ACTIVATION_VERSION);
+        // What the handshake offered: nothing yet, the pool is empty.
+        let _ = received(&mut old, 1);
+        let _ = received(&mut new, 1);
+
+        for tx in [&policy_tx, &plain] {
+            node.with_chain_and_mempool(|c, m| m.accept_local(tx, &c.utxo, NET, c.height()))
+                .expect("accepted at H - 1");
+            node.announce_tx(tx.txid());
+        }
+        node.announce_mempool();
+        let to_old = received(&mut old, 2);
+        let to_new = received(&mut new, 2);
+        assert!(offers(&to_new, &policy_tx.txid()));
+        assert!(offers(&to_new, &plain.txid()));
+        assert!(!offers(&to_old, &policy_tx.txid()), "{to_old:?}");
+        assert!(offers(&to_old, &plain.txid()), "the rest still flows");
+
+        // Asked for it by id anyway: served to the one, not to the other.
+        let ask = Message::GetData(vec![
+            InvItem {
+                kind: InvKind::Tx,
+                hash: policy_tx.txid(),
+            },
+            InvItem {
+                kind: InvKind::Tx,
+                hash: plain.txid(),
+            },
+        ]);
+        old.write_all(&ask.frame(magic_for(NET))).unwrap();
+        new.write_all(&ask.frame(magic_for(NET))).unwrap();
+        let to_old = received(&mut old, 2);
+        let to_new = received(&mut new, 2);
+        assert!(sends(&to_new, &policy_tx.txid()));
+        assert!(!sends(&to_old, &policy_tx.txid()));
+        assert!(sends(&to_old, &plain.txid()));
+        assert_eq!(node.peer_count(), 2);
+        node.shutdown();
     }
 }
