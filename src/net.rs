@@ -1299,6 +1299,12 @@ pub struct PeerInfo {
     /// The peer's stable channel node id (hex), empty if none advertised. A
     /// `channelopen` may name a peer by this, surviving reconnects.
     pub channel_id: String,
+    /// The protocol version the peer announced (0 before its `Version`).
+    pub version: u32,
+    /// Whether that version follows the policy activation of this network
+    /// ([`follows_activation`]): a peer that does not stops at the first
+    /// block carrying a policy.
+    pub follows_activation: bool,
 }
 
 #[derive(Clone)]
@@ -1619,6 +1625,8 @@ impl Node {
                 supports_channels: p.channels,
                 height: p.start_height,
                 channel_id: p.channel_id.clone(),
+                version: p.version,
+                follows_activation: follows_activation(g.network, p.version),
             })
             .collect();
         v.sort_by_key(|p| p.id);
@@ -6273,6 +6281,18 @@ mod tests_hardening {
             !a.handle(7, Message::Channel(vec![0u8; 40])),
             "a peer at the threshold is still disconnected"
         );
+    }
+
+    /// `getpeers` shows each peer's protocol version, and whether it follows
+    /// the policy activation.
+    #[test]
+    fn the_peer_list_shows_the_protocol_version() {
+        let (a, _) = node_pair();
+        let _e = established_peer(&a, 7);
+        a.shared.lock().unwrap().peers.get_mut(&7).unwrap().version = 4;
+        let p = a.peer_list().into_iter().find(|p| p.id == 7).unwrap();
+        assert_eq!(p.version, 4);
+        assert!(p.follows_activation, "regtest has no transition");
     }
 
     /// Without a transition there is nothing to warn about, whatever the

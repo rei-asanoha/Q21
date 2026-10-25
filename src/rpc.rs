@@ -1808,6 +1808,8 @@ impl RpcContext {
                                 .set("supports_channels", Json::Bool(p.supports_channels))
                                 .set("height", Json::u64(p.height))
                                 .set("channel_id", Json::str(p.channel_id))
+                                .set("protocol_version", Json::u64(u64::from(p.version)))
+                                .set("follows_activation", Json::Bool(p.follows_activation))
                                 .build()
                         })
                         .collect(),
