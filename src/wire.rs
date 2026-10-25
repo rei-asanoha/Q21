@@ -46,6 +46,14 @@ use crate::tx::Transaction;
 /// before, and a version-5 node stays a peer of it. What changes is what the
 /// version-5 node sends it: never a transaction that creates or spends a
 /// policy output, which a version-4 node reads as malformed.
+///
+/// The payment-channel protocol has versions of its own, carried inside
+/// [`Message::Channel`] and announced in the user agent rather than here:
+/// [`CHANNELS_CAPABILITY`] (`+chanv3`) for its version 3, where every frame
+/// travels in an authenticated session ([`crate::channel::transport::VERSION`],
+/// [`crate::channel::messages::WIRE_VERSION`]). 0.4.11 ships both: protocol
+/// 5 and channels 3. A peer counts as a channel peer only if it announces
+/// both where the network has a transition ([`crate::net::channel_capable`]).
 pub const PROTOCOL_VERSION: u32 = 5;
 
 /// First version that understands `onionaddr`.

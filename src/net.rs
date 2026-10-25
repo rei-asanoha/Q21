@@ -382,6 +382,16 @@ pub fn channel_message_is_malformed(
         )
 }
 
+/// Is a peer a channel peer: does it advertise the channel capability
+/// ([`crate::wire::CHANNELS_CAPABILITY`], channel protocol 3) and, where the
+/// network has a transition, follow the policy activation (protocol 5)?
+/// Channels are built from policy outputs: a peer that would read their
+/// funding as malformed cannot be one, whatever its user agent says. Every
+/// build that speaks the channel protocol 3 announces protocol 5.
+pub fn channel_capable(network: Network, version: u32, user_agent: &str) -> bool {
+    crate::wire::user_agent_advertises_channels(user_agent) && follows_activation(network, version)
+}
+
 /// Does a peer that announced protocol `version` follow the policy
 /// activation of `network`? Always, where the network has no transition
 /// ([`crate::policy::has_transition`]): there, every version reads policies
@@ -2938,8 +2948,7 @@ impl Node {
                                 p.start_height = start_height;
                                 p.version = version;
                                 p.remote_nonce = Some(nonce);
-                                p.channels =
-                                    crate::wire::user_agent_advertises_channels(user_agent);
+                                p.channels = channel_capable(network, version, user_agent);
                                 p.channel_id =
                                     crate::wire::channel_node_id(user_agent).unwrap_or_default();
                                 p.user_agent = user_agent.clone();
@@ -5249,6 +5258,19 @@ mod tests {
             "and never marked handshaked"
         );
         a.shutdown();
+    }
+
+    /// A channel peer advertises the channel protocol 3 and, on testnet,
+    /// follows the policy activation: a user agent alone does not make one.
+    #[test]
+    fn a_channel_peer_also_follows_the_activation() {
+        let ua = format!("q21:0.4{}", crate::wire::CHANNELS_CAPABILITY);
+        let v = crate::wire::POLICY_ACTIVATION_VERSION;
+        assert!(channel_capable(Network::Testnet, v, &ua));
+        assert!(!channel_capable(Network::Testnet, 4, &ua));
+        assert!(!channel_capable(Network::Testnet, v, "q21:0.4+chan"));
+        // Regtest has no transition: the capability is enough, as in 0.4.10.
+        assert!(channel_capable(Network::Regtest, 4, &ua));
     }
 
     /// Regtest opens policies at its first block and mainnet never does:
