@@ -442,6 +442,8 @@ struct DiskState {
     /// block this node will no longer be able to serve to its peers.
     archive: std::sync::Arc<BlockArchive>,
     datadir: PathBuf,
+    /// The tip that was active when the node stopped, as it recorded it.
+    last_tip: Option<q21_core::hash::Hash256>,
 }
 
 fn wallet_path(d: &Path) -> PathBuf {
@@ -866,6 +868,27 @@ fn write_anchor(d: &Path, a: &Anchor) {
 /// refused, with a message that says what to do.
 fn mempool_path(d: &Path) -> PathBuf {
     d.join("mempool.dat")
+}
+
+/// The tip this node was on when it last wrote it: kept at the next start over
+/// any other tip of equal work, and the start of what a tip change gives back
+/// to the pool. See `Chain::block_tree_preferring`.
+fn active_tip_path(d: &Path) -> PathBuf {
+    d.join("tip.dat")
+}
+
+fn read_active_tip(d: &Path) -> Option<q21_core::hash::Hash256> {
+    let text = std::fs::read_to_string(active_tip_path(d)).ok()?;
+    q21_core::hash::Hash256::from_hex(text.trim())
+}
+
+/// Written whole or not at all: a torn file reads as no record, and the start
+/// falls back to the deterministic rule.
+fn write_active_tip(d: &Path, tip: &q21_core::hash::Hash256) {
+    let tmp = d.join("tip.dat.tmp");
+    if std::fs::write(&tmp, tip.to_hex()).is_ok() {
+        let _ = std::fs::rename(&tmp, active_tip_path(d));
+    }
 }
 
 fn serial_path(d: &Path) -> PathBuf {
@@ -2188,8 +2211,17 @@ fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<Di
     let key = q21_core::state::datadir_key(datadir).map_err(|e| e.to_string())?;
     let state = StateStore::new_sealed(state_path(datadir), key);
     let store = q21_core::store::HeaderStore::new(headers_path(datadir));
-    let mut chain =
-        q21_core::pruning::resume_chain(network, &archive, headers_only, &store, &state)?;
+    // The tip this node stopped on wins a tie of equal work: see
+    // `Chain::block_tree_preferring`.
+    let last_tip = read_active_tip(datadir);
+    let mut chain = q21_core::pruning::resume_chain_preferring(
+        network,
+        &archive,
+        headers_only,
+        &store,
+        &state,
+        last_tip,
+    )?;
 
     if timing {
         eprintln!("[timing] chain ready {:.2} s", t0.elapsed().as_secs_f64());
@@ -2331,6 +2363,7 @@ fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<Di
         archive,
         datadir: datadir.to_path_buf(),
         wallet_less,
+        last_tip,
     })
 }
 
@@ -4701,6 +4734,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let start_height = state.chain.height();
     state.chain.set_mining_threads(threads);
     let effective_threads = state.chain.mining_threads();
+    let last_tip = state.last_tip;
     let node = std::sync::Arc::new(Node::new(network, state.chain));
     let wallet = std::sync::Arc::new(std::sync::Mutex::new(state.wallet));
     let archive = state.archive.clone();
@@ -5138,51 +5172,71 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // against the chain as it is **now**. The chain may have moved on during
     // the shutdown: some are already confirmed, others have become
     // impossible. A mempool read back is never taken on trust.
-    if let Ok(key) = q21_core::state::datadir_key(datadir) {
-        let store = q21_core::state::MempoolStore::new(mempool_path(datadir), key);
-        if store.exists() {
-            match store.load() {
-                Ok(pending) => {
-                    let mut restored = 0usize;
-                    let total = pending.len();
-                    // The wallet's own payments are its own again: a full pool
-                    // never pushes them out of this node (see
-                    // `Mempool::accept_local`). The flag is not written with the
-                    // pool; the wallet recognizes its keys in the inputs.
-                    let own = |tx: &q21_core::tx::Transaction| -> bool {
-                        if wallet_less {
-                            return false;
-                        }
-                        let Ok(w) = wallet.lock() else {
-                            return false;
-                        };
-                        let scheme = w.scheme();
-                        tx.inputs.iter().any(|i| {
-                            !i.witness.pubkey.is_empty()
-                                && w.owns(&q21_core::sig::pubkey_hash(scheme, &i.witness.pubkey))
-                        })
-                    };
-                    for tx in &pending {
-                        let local = own(tx);
-                        let ok = node.with_chain_and_mempool(|c, m| {
-                            if local {
-                                m.accept_local(tx, &c.utxo, network, c.height()).is_ok()
-                            } else {
-                                m.accept(tx, &c.utxo, network, c.height()).is_ok()
-                            }
-                        });
-                        if ok {
-                            restored += 1;
-                        }
-                    }
-                    if total > 0 {
-                        println!("  mempool: {restored} transaction(s) restored out of {total}");
-                    }
-                }
-                Err(e) => eprintln!("warning: mempool ignored ({e})"),
+    //
+    // --- A tip change at startup is a reorganization.
+    //
+    // The node may come back on another tip than the one it stopped on: an
+    // equal-work tie decided without a record, a damaged tail cut, a better
+    // branch found on disk. No live reorganization happens then, and the
+    // transactions of the blocks it left went back nowhere: every saved
+    // payment chained on them was dropped below, and the wallet took their
+    // coins for spendable again. They go back first, through the door of a
+    // live reorganization (see `Mempool::return_abandoned`), and the saved pool
+    // after them.
+    let abandoned = match last_tip {
+        Some(t) if t != node.with_chain(|c| c.tip_id()) => {
+            node.with_chain(|c| c.abandoned_since(&t, &|id| archive.read(id)))
+        }
+        _ => Vec::new(),
+    };
+    let saved = q21_core::state::datadir_key(datadir)
+        .ok()
+        .map(|key| q21_core::state::MempoolStore::new(mempool_path(datadir), key))
+        .filter(|store| store.exists())
+        .and_then(|store| match store.load() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("warning: mempool ignored ({e})");
+                None
             }
+        })
+        .unwrap_or_default();
+    if !abandoned.is_empty() || !saved.is_empty() {
+        // The wallet's own payments are its own again: a full pool never
+        // pushes them out of this node (see `Mempool::accept_local`). The flag
+        // is not written with the pool; the wallet recognizes its keys in the
+        // inputs.
+        let own = |tx: &q21_core::tx::Transaction| -> bool {
+            if wallet_less {
+                return false;
+            }
+            let Ok(w) = wallet.lock() else {
+                return false;
+            };
+            let scheme = w.scheme();
+            tx.inputs.iter().any(|i| {
+                !i.witness.pubkey.is_empty()
+                    && w.owns(&q21_core::sig::pubkey_hash(scheme, &i.witness.pubkey))
+            })
+        };
+        let (returned, restored) = node.with_chain_and_mempool(|c, m| {
+            m.restore_at_startup(&abandoned, &saved, &own, &c.utxo, network, c.height())
+        });
+        if !abandoned.is_empty() {
+            println!(
+                "  tip changed while stopped: {} block(s) left, {returned} transaction(s) \
+                 back in the pool",
+                abandoned.len()
+            );
+        }
+        if !saved.is_empty() {
+            println!(
+                "  mempool: {restored} transaction(s) restored out of {}",
+                saved.len()
+            );
         }
     }
+    write_active_tip(datadir, &node.with_chain(|c| c.tip_id()));
 
     if !quiet {
         println!("Q21 node — network {network:?}, height {start_height}");
@@ -5720,9 +5774,17 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // with a chain premined into the future, so the message is printed once.
     let mut waiting_for_clock = false;
 
+    let mut recorded_tip = node.with_chain(|c| c.tip_id());
     loop {
         if duration > 0 && start.elapsed().as_secs() >= duration {
             break;
+        }
+        // The tip, recorded as soon as it moves: the one a restart keeps on a
+        // tie of equal work, even after a power cut.
+        let tip_now = node.with_chain(|c| c.tip_id());
+        if tip_now != recorded_tip {
+            write_active_tip(datadir, &tip_now);
+            recorded_tip = tip_now;
         }
         if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
             // Holes first: a body of the active chain that never reached the
@@ -6363,6 +6425,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             println!("  {} pending transaction(s) kept", pending.len());
         }
     }
+    // The tip the pool above was saved against: kept at the next start.
+    write_active_tip(datadir, &node.with_chain(|c| c.tip_id()));
     if !wallet_less {
         if let Ok(w) = wallet.lock() {
             let _ = write_wallet(datadir, &w);

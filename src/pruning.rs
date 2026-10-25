@@ -46,6 +46,7 @@ use crate::address::Network;
 use crate::block::BlockHeader;
 use crate::chain::Chain;
 use crate::consensus::{BODY_WINDOW, MAX_FUTURE_TIME};
+use crate::hash::Hash256;
 use crate::state::StateStore;
 use crate::store::{BlockArchive, HeaderStore, PruneSummary};
 use std::sync::Arc;
@@ -339,9 +340,30 @@ fn damaged_path(header_store: &HeaderStore) -> std::path::PathBuf {
 pub fn resume_chain(
     network: Network,
     archive: &Arc<BlockArchive>,
+    bare_headers: Vec<BlockHeader>,
+    header_store: &HeaderStore,
+    state_store: &StateStore,
+) -> Result<Chain, String> {
+    resume_chain_preferring(
+        network,
+        archive,
+        bare_headers,
+        header_store,
+        state_store,
+        None,
+    )
+}
+
+/// [`resume_chain`], keeping `last_tip` — the tip that was active when the
+/// node stopped — over any other tip of equal work. See
+/// [`Chain::block_tree_preferring`].
+pub fn resume_chain_preferring(
+    network: Network,
+    archive: &Arc<BlockArchive>,
     mut bare_headers: Vec<BlockHeader>,
     header_store: &HeaderStore,
     state_store: &StateStore,
+    last_tip: Option<Hash256>,
 ) -> Result<Chain, String> {
     // --- 1. Adopted directory: the header chain comes from the store, not
     // from the bodies. A node that started from a snapshot does not have the
@@ -399,10 +421,10 @@ pub fn resume_chain(
     let resumed = match state_store.load(network) {
         Ok(i) => {
             let snapshot_height = i.height;
-            match Chain::from_snapshot(network, i, &bare_headers) {
+            match Chain::from_snapshot_preferring(network, i, &bare_headers, last_tip) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    let best = Chain::block_tree(&bare_headers)
+                    let best = Chain::block_tree_preferring(&bare_headers, last_tip)
                         .map(|t| t.active.len().saturating_sub(1) as u64)
                         .unwrap_or(0);
                     if matches!(e, crate::chain::ResumeError::SnapshotOffChain)
@@ -501,8 +523,8 @@ pub fn resume_chain(
     // There is then not a single reorg left to accept: each block extends the
     // previous one, by construction. The side branches stay in the file and in
     // the index — a later reorg will find their bodies.
-    let tree =
-        Chain::block_tree(&bare_headers).map_err(|e| format!("unreadable block index: {e:?}"))?;
+    let tree = Chain::block_tree_preferring(&bare_headers, last_tip)
+        .map_err(|e| format!("unreadable block index: {e:?}"))?;
     let genesis_id = tree.active[0];
     let genesis_body = archive.read(&genesis_id).ok_or(
         "the body of the genesis block cannot be read back from the block file: it is the only \
