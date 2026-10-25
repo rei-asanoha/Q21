@@ -124,6 +124,12 @@ pub enum Record {
     /// LocalCommit at that state; neither becomes the channel's state: both
     /// are merged into the next one (see [`crate::channel::machine`]).
     Crossed { state: u64 },
+    /// The sequence number of the last signed control message we sent: never
+    /// signed again (see [`crate::channel::messages::control_message`]).
+    ControlSent { seq: u64 },
+    /// The sequence number of the last signed control message accepted from
+    /// the peer: one at or below it is a replay.
+    ControlRecv { seq: u64 },
 }
 
 const R_OPENED: u8 = 1;
@@ -147,6 +153,8 @@ const R_FUNDING_TX: u8 = 18;
 const R_KEY_INDEX: u8 = 19;
 /// [`Record::Opened`] with its key index.
 const R_OPENED_INDEXED: u8 = 20;
+const R_CONTROL_SENT: u8 = 21;
+const R_CONTROL_RECV: u8 = 22;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -258,6 +266,12 @@ impl Record {
             Record::KeyIndex { index } => {
                 w.u8(R_KEY_INDEX).u32(*index);
             }
+            Record::ControlSent { seq } => {
+                w.u8(R_CONTROL_SENT).u64(*seq);
+            }
+            Record::ControlRecv { seq } => {
+                w.u8(R_CONTROL_RECV).u64(*seq);
+            }
         }
         w.finish()
     }
@@ -345,6 +359,8 @@ impl Record {
             R_CONFIRMED => Record::Confirmed { height: r.u64()? },
             R_CROSSED => Record::Crossed { state: r.u64()? },
             R_KEY_INDEX => Record::KeyIndex { index: r.u32()? },
+            R_CONTROL_SENT => Record::ControlSent { seq: r.u64()? },
+            R_CONTROL_RECV => Record::ControlRecv { seq: r.u64()? },
             R_FUNDING_TX => Record::FundingTx {
                 tx: r.var_bytes()?.to_vec(),
             },

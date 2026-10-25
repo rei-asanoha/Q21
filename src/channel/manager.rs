@@ -121,11 +121,13 @@ impl Chan {
             self.challenges.remove(0);
         }
         self.challenges.push((conn, nonce));
+        // The connection has proved nothing yet: the channel id stays out of
+        // the frame, named only by a locator its counterparty can match.
         Some(write_frame(
-            cid,
+            Hash256::ZERO,
             KIND_ENGINE,
             &ChMsg::Challenge {
-                channel_id: cid,
+                locator: crate::channel::messages::challenge_locator(cid, &nonce),
                 nonce,
             }
             .encode(),
@@ -964,6 +966,20 @@ impl ChannelManager {
             return self.accept_open(peer, peer_identity, cid, msg);
         }
         let mut g = self.inner.lock().unwrap();
+        // A challenge names its channel by a locator only.
+        let cid = match &msg {
+            ChMsg::Challenge { locator, nonce } => {
+                let found =
+                    g.channels.keys().copied().find(|c| {
+                        crate::channel::messages::challenge_locator(*c, nonce) == *locator
+                    });
+                match found {
+                    Some(c) => c,
+                    None => return Ok(Vec::new()),
+                }
+            }
+            _ => cid,
+        };
         let Some(chan) = g.channels.get_mut(&cid) else {
             // A peer that still tracks a channel we have settled and forgotten
             // (closed on our side, still closing on theirs) offers its
@@ -984,6 +1000,18 @@ impl ChannelManager {
         // A self-declared identity, or a reestablish captured earlier and
         // replayed (after our restart, or on another connection), proves
         // nothing.
+        //
+        // What this cannot stop: a relay connected to both ends, passing each
+        // side's challenge to the other and the answers back, gets both of its
+        // connections authenticated. Binding the answer to the connection
+        // needs a transport whose handshake both ends authenticate with static
+        // keys; nonces exchanged in the clear can be passed along like the
+        // rest. So no frame acted on here relies on the connection alone:
+        // commitments and the close carry signatures over what they commit
+        // to, revocations reveal secrets checked against their points, and
+        // the control messages without either (Ready, Close) are signed with
+        // a sequence number that only grows. A relay can drop or delay
+        // frames, as any hop on the path can; it cannot forge or replay one.
         match &msg {
             ChMsg::Challenge { nonce, .. } => {
                 // Our own challenge first, if this connection has not been
@@ -1078,8 +1106,8 @@ impl ChannelManager {
                     self.broadcast_or_warn(&tx, "funding");
                 }
             }
-            ChMsg::Ready => {
-                chan.machine.on_ready(&msg).map_err(err)?;
+            ChMsg::Ready { .. } => {
+                fresh(chan.machine.on_ready(&msg))?;
             }
             ChMsg::Update { .. } => {
                 // An ordinary update, one crossing our own proposal (both ends
@@ -1103,14 +1131,16 @@ impl ChannelManager {
                 }
                 out.extend(pending_close(chan, cid));
             }
-            ChMsg::Close { fee } => {
+            ChMsg::Close { .. } => {
+                // Signed by the counterparty's funding key: from a connection
+                // that merely relays both sides, an unsigned or replayed Close
+                // moves nothing.
                 if chan.machine.update_in_flight() {
                     // The peer's Close crossed an update still settling here:
                     // agree now, and send our own Close once the update
                     // completes; the peer signs that one.
-                    chan.machine.agree_close(fee, false).map_err(err)?;
-                } else {
-                    let m = chan.machine.on_close(&msg).map_err(err)?;
+                    fresh(chan.machine.on_close_crossing(&msg))?;
+                } else if let Some(m) = fresh(chan.machine.on_close(&msg))? {
                     out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
                 }
             }
@@ -2056,6 +2086,16 @@ fn summary(c: &Chan) -> ChannelSummary {
 
 fn err(e: ChannelError) -> String {
     format!("{e:?}")
+}
+
+/// A signed control message's outcome: a stale one (a replay, or one
+/// overtaken on another connection) is ignored rather than misconduct.
+fn fresh<T>(r: Result<T, ChannelError>) -> Result<Option<T>, String> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(ChannelError::Stale) => Ok(None),
+        Err(e) => Err(err(e)),
+    }
 }
 
 /// Adapter so the node's [`crate::net::ChannelSink`] can drive the manager.

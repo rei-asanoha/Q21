@@ -132,7 +132,10 @@ fn every_message_round_trips() {
         Message::FundingSigned {
             tier_sigs: tiers.clone(),
         },
-        Message::Ready,
+        Message::Ready {
+            seq: 7,
+            signature: sample_sig(),
+        },
         Message::Update {
             state: 5,
             balances: [10_000, 20_000],
@@ -157,13 +160,17 @@ fn every_message_round_trips() {
             direction: 1,
             proof: sample_sig(),
         },
-        Message::Close { fee: 20_000 },
+        Message::Close {
+            fee: 20_000,
+            seq: 3,
+            signature: sample_sig(),
+        },
         Message::CloseSigned {
             fee: 20_000,
             signature: sample_sig(),
         },
         Message::Challenge {
-            channel_id: Hash256([8u8; 32]),
+            locator: Hash256([8u8; 32]),
             nonce: [9u8; 32],
         },
         Message::Error {
@@ -185,7 +192,7 @@ fn every_message_round_trips() {
 
 #[test]
 fn a_bad_version_and_type_are_refused() {
-    let m = Message::Ready.encode();
+    let m = Message::Error { reason: "x".into() }.encode();
     let mut wrong_ver = m.clone();
     wrong_ver[0] = 9;
     assert_eq!(
@@ -1460,7 +1467,7 @@ fn kind(m: &Message) -> String {
         Message::Update { state, .. } => format!("Update({state})"),
         Message::Ack { state, .. } => format!("Ack({state})"),
         Message::Revoke { state, .. } => format!("Revoke({state})"),
-        Message::Close { fee } => format!("Close({fee})"),
+        Message::Close { fee, .. } => format!("Close({fee})"),
         Message::CloseSigned { .. } => "CloseSigned".into(),
         Message::Reestablish { .. } => "Reestablish".into(),
         _ => "other".into(),
@@ -1736,15 +1743,15 @@ fn a_lost_close_is_resent_on_reestablish() {
     let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
     assert_eq!(f.phase(), Phase::Closing);
     // Asking again yields the same Close rather than an error.
-    assert_eq!(
+    assert!(matches!(
         f.propose_close(99_999).unwrap(),
-        Message::Close { fee: 20_000 }
-    );
+        Message::Close { fee: 20_000, .. }
+    ));
     let rf = f.reestablish().unwrap();
     let ra = a.reestablish().unwrap();
     let to_a = f.on_reestablish(&ra).unwrap();
     assert!(a.on_reestablish(&rf).unwrap().is_empty());
-    assert_eq!(to_a, vec![Message::Close { fee: 20_000 }]);
+    assert!(matches!(to_a[..], [Message::Close { fee: 20_000, .. }]));
     let signed = a.on_close(&to_a[0]).unwrap();
     let tx = f.on_close_signed(&signed).unwrap();
     assert_eq!(f.phase(), Phase::Closing);
@@ -2305,8 +2312,9 @@ fn a_peer_proposed_close_fee_is_bounded_and_charged_to_the_proposer() {
     // The acceptor asks the funder to burn its balance as fee.
     let records = f.journal_records();
     for fee in [CAP - 1_000_000, max + 1, 0] {
+        let close = a.close_message(fee).unwrap();
         assert_eq!(
-            f.on_close(&Message::Close { fee }),
+            f.on_close(&close),
             Err(ChannelError::BadParameters),
             "fee {fee}"
         );
@@ -2315,10 +2323,8 @@ fn a_peer_proposed_close_fee_is_bounded_and_charged_to_the_proposer() {
     assert_eq!(f.phase(), Phase::Open);
     // Within bounds but above what the proposer holds.
     pay(&mut a, &mut f, [CAP - 5_000, 5_000]);
-    assert_eq!(
-        f.on_close(&Message::Close { fee: 20_000 }),
-        Err(ChannelError::BadParameters)
-    );
+    let close = a.close_message(20_000).unwrap();
+    assert_eq!(f.on_close(&close), Err(ChannelError::BadParameters));
     // A sane proposal by the acceptor: the acceptor pays.
     pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
     let close = a.propose_close(20_000).unwrap();
@@ -2410,4 +2416,143 @@ fn a_second_funding_is_refused() {
     }
     assert_eq!(a.on_funding(&other), Err(ChannelError::Unexpected));
     assert_eq!(a.funding_outpoint(), Some(outpoint), "not overwritten");
+}
+
+// --- Signed control messages ------------------------------------------------
+
+/// N1: a Close moves a channel to closing, so it is signed by the sender's
+/// funding key over the channel, its side, its fee and a sequence number. One
+/// made up, signed by another key, for another fee, or sent back as if from
+/// the other side, is refused before anything is journaled; the genuine one,
+/// replayed — even after a restart — is stale and ignored.
+#[test]
+fn a_close_is_taken_only_signed_and_only_once() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    let records = f.journal_records();
+    let close = a.propose_close(20_000).unwrap();
+    let Message::Close {
+        fee,
+        seq,
+        signature,
+    } = close.clone()
+    else {
+        unreachable!()
+    };
+    let other = ChannelKey::from_seed(&[0x5a; 32]);
+    let forged = [
+        Message::Close {
+            fee,
+            seq,
+            signature: vec![0; signature.len()],
+        },
+        Message::Close {
+            fee,
+            seq,
+            signature: other.sign(&super::messages::control_message(
+                f.channel_id(),
+                ACCEPTOR as u8,
+                seq,
+                super::messages::CONTROL_CLOSE,
+                &fee.to_le_bytes(),
+            )),
+        },
+        Message::Close {
+            fee: fee + 1,
+            seq,
+            signature: signature.clone(),
+        },
+        Message::Close {
+            fee,
+            seq: seq + 1,
+            signature: signature.clone(),
+        },
+    ];
+    for m in &forged {
+        assert_eq!(f.on_close(m), Err(ChannelError::BadSignature), "{m:?}");
+        assert_eq!(f.on_close_crossing(m), Err(ChannelError::BadSignature));
+    }
+    // Our own side's signature, sent back to us, is not the peer's.
+    let mine = f.close_message(20_000).unwrap();
+    assert_eq!(a.on_close(&close), Err(ChannelError::BadSignature));
+    assert_eq!(f.on_close(&mine), Err(ChannelError::BadSignature));
+    assert_eq!(f.phase(), Phase::Open);
+    // One record: the sequence number our own Close above used.
+    assert_eq!(f.journal_records(), records + 1);
+
+    let signed = f.on_close(&close).unwrap();
+    assert!(matches!(signed, Message::CloseSigned { .. }));
+    assert_eq!(f.on_close(&close), Err(ChannelError::Stale));
+    drop(f);
+    let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+    assert_eq!(
+        f.on_close(&close),
+        Err(ChannelError::Stale),
+        "after a restart"
+    );
+}
+
+/// N1: Ready is signed too; a forged one is refused and a replayed one is
+/// stale.
+#[test]
+fn a_ready_is_taken_only_signed_and_only_once() {
+    let dir = tmpdir();
+    let (mut f, _a) = open_pair(&dir);
+    let m = super::messages::control_message(
+        f.channel_id(),
+        ACCEPTOR as u8,
+        99,
+        super::messages::CONTROL_READY,
+        &[],
+    );
+    let forged = Message::Ready {
+        seq: 99,
+        signature: ChannelKey::from_seed(&[0x5b; 32]).sign(&m),
+    };
+    assert_eq!(f.on_ready(&forged), Err(ChannelError::BadSignature));
+    let genuine = Message::Ready {
+        seq: 99,
+        signature: akey().sign(&m),
+    };
+    assert_eq!(f.on_ready(&genuine), Ok(()));
+    assert_eq!(f.on_ready(&genuine), Err(ChannelError::Stale));
+}
+
+/// N1: the reestablish proof covers every counter the sender reports: a
+/// relay that alters where a side says it stands breaks the proof.
+#[test]
+fn a_tampered_reestablish_is_refused() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    let honest = a.reestablish_for([0x42; 32]);
+    let Message::Reestablish {
+        channel_id,
+        local_commit_number,
+        remote_commit_number,
+        next_revocation_sent,
+        next_revocation_recv,
+        nonce,
+        direction,
+        proof,
+    } = honest.clone()
+    else {
+        unreachable!()
+    };
+    let tampered = Message::Reestablish {
+        channel_id,
+        local_commit_number: local_commit_number + 1,
+        remote_commit_number,
+        next_revocation_sent,
+        next_revocation_recv,
+        nonce,
+        direction,
+        proof,
+    };
+    assert_eq!(
+        f.on_reestablish(&tampered),
+        Err(ChannelError::BadReestablish)
+    );
+    assert!(f.on_reestablish(&honest).is_ok());
 }

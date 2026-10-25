@@ -1040,7 +1040,12 @@ fn a_payment_on_the_second_link_leaves_the_channel_usable() {
         &[
             cid.as_bytes().as_slice(),
             &[0u8],
-            &q21_core::channel::Message::Close { fee: 20_000 }.encode(),
+            &q21_core::channel::Message::Close {
+                fee: 20_000,
+                seq: 1,
+                signature: vec![0; q21_core::channel::keys::CHANNEL_SCHEME.sig_len()],
+            }
+            .encode(),
         ]
         .concat(),
     );

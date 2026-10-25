@@ -51,7 +51,7 @@
 use crate::address::Network;
 use crate::channel::journal::{Balances, Journal, Record};
 use crate::channel::keys::{Signer, CHANNEL_SCHEME};
-use crate::channel::messages::{Message, Revocation, TierSigs};
+use crate::channel::messages::{self, Message, Revocation, TierSigs};
 use crate::channel::txbuild::{self, ChannelParams, Commitment, FeeTier, ACCEPTOR, FUNDER};
 use crate::channel::watcher::{OutputRef, Watch};
 use crate::hash::{tagged_hash_parts, Hash256};
@@ -97,6 +97,10 @@ pub enum ChannelError {
     BadParameters,
     /// We lack randomness for a nonce.
     NoRandomness,
+    /// A signed control message whose sequence number is not above the last
+    /// one accepted: a replay, or one overtaken on another connection.
+    /// Ignored, not misconduct.
+    Stale,
     /// A guard caught an attempt to break a safety invariant. Should never
     /// fire; it means a caller sequenced the protocol wrongly.
     Invariant(&'static str),
@@ -145,12 +149,22 @@ fn prune_to_latest<V>(map: &mut BTreeMap<u64, V>, keep: usize) {
     }
 }
 
-/// The message a reestablish proof signs: the channel, the sender's nonce, and
-/// the sender's direction.
-fn reestablish_message(channel_id: Hash256, nonce: [u8; 32], direction: u8) -> Hash256 {
+/// The message a reestablish proof signs: the channel, the challenge's nonce,
+/// the sender's direction, and the four counters it reports — so a relay
+/// cannot alter where the sender says it stands.
+fn reestablish_message(
+    channel_id: Hash256,
+    nonce: [u8; 32],
+    direction: u8,
+    counters: [u64; 4],
+) -> Hash256 {
+    let mut c = [0u8; 32];
+    for (i, v) in counters.iter().enumerate() {
+        c[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
     tagged_hash_parts(
         TAG_REESTABLISH,
-        &[channel_id.as_bytes(), &nonce, &[direction]],
+        &[channel_id.as_bytes(), &nonce, &[direction], &c],
     )
 }
 
@@ -217,6 +231,11 @@ pub struct Machine {
     close_peer_sig: Option<Vec<u8>>,
     /// The height at which the funding confirmed, once known.
     funding_height: Option<u64>,
+    /// The sequence number of the last control message we signed, and of the
+    /// last one accepted from the peer (see
+    /// [`crate::channel::messages::control_message`]).
+    control_sent: u64,
+    control_recv: u64,
 
     /// The counterparty's announced revocation points, by state.
     their_points: BTreeMap<u64, Hash256>,
@@ -431,6 +450,8 @@ impl Machine {
             store: shachain::Store::new(),
             base_fee_rate,
             seen_nonces: VecDeque::new(),
+            control_sent: 0,
+            control_recv: 0,
             peer_proposal: None,
             crossed: None,
         })
@@ -740,15 +761,84 @@ impl Machine {
         // LocalCommit(0) by now.
         self.journal.append(&Record::Ready)?;
         self.phase = Phase::Open;
-        Ok(Message::Ready)
+        let (seq, signature) = self.sign_control(messages::CONTROL_READY, &[])?;
+        Ok(Message::Ready { seq, signature })
     }
 
-    /// Either side: the peer signalled readiness.
+    /// Either side: the peer signalled readiness. Its signature is checked
+    /// like any control message's; nothing else follows from it.
     pub fn on_ready(&mut self, msg: &Message) -> Result<(), ChannelError> {
-        if !matches!(msg, Message::Ready) {
+        let Message::Ready { seq, signature } = msg else {
             return Err(ChannelError::Unexpected);
+        };
+        self.check_control(messages::CONTROL_READY, &[], *seq, signature)?;
+        self.note_control(*seq)
+    }
+
+    // --- Signed control messages ---------------------------------------------
+
+    /// Signs a control message of `kind` over `fields` with the next sequence
+    /// number, journaled first so a number is never signed twice.
+    fn sign_control(&mut self, kind: u8, fields: &[u8]) -> Result<(u64, Vec<u8>), ChannelError> {
+        let seq = self.control_sent + 1;
+        self.journal.append(&Record::ControlSent { seq })?;
+        self.control_sent = seq;
+        let m = messages::control_message(self.channel_id, self.our_index as u8, seq, kind, fields);
+        Ok((seq, self.signer.sign(&m)))
+    }
+
+    /// Verifies a control message from the peer: its funding key over the
+    /// fields, with a sequence number above the last one accepted. A number
+    /// already used is [`ChannelError::Stale`]. Nothing is journaled: once
+    /// the message has been acted on, [`Machine::note_control`] records it.
+    fn check_control(
+        &mut self,
+        kind: u8,
+        fields: &[u8],
+        seq: u64,
+        signature: &[u8],
+    ) -> Result<(), ChannelError> {
+        if seq <= self.control_recv {
+            return Err(ChannelError::Stale);
         }
+        let peer = (1 - self.our_index) as u8;
+        let m = messages::control_message(self.channel_id, peer, seq, kind, fields);
+        crate::sig::verify(CHANNEL_SCHEME, &self.their_pubkey, &m, signature)
+            .map_err(|_| ChannelError::BadSignature)
+    }
+
+    /// Journals that the peer's control message `seq` was acted on: at or
+    /// below it, any other is a replay.
+    fn note_control(&mut self, seq: u64) -> Result<(), ChannelError> {
+        self.journal.append(&Record::ControlRecv { seq })?;
+        self.control_recv = seq;
         Ok(())
+    }
+
+    /// Our signed [`Message::Close`] at `fee`. Checks nothing else: the
+    /// callers have.
+    pub(crate) fn close_message(&mut self, fee: u64) -> Result<Message, ChannelError> {
+        let (seq, signature) = self.sign_control(messages::CONTROL_CLOSE, &fee.to_le_bytes())?;
+        Ok(Message::Close {
+            fee,
+            seq,
+            signature,
+        })
+    }
+
+    /// Verifies the peer's [`Message::Close`] and returns its fee and
+    /// sequence number.
+    fn check_close(&mut self, msg: &Message) -> Result<(u64, u64), ChannelError> {
+        let Message::Close {
+            fee,
+            seq,
+            signature,
+        } = msg
+        else {
+            return Err(ChannelError::Unexpected);
+        };
+        self.check_control(messages::CONTROL_CLOSE, &fee.to_le_bytes(), *seq, signature)?;
+        Ok((*fee, *seq))
     }
 
     // --- Payment update flow -------------------------------------------------
@@ -1112,6 +1202,16 @@ impl Machine {
         if let Some(height) = self.funding_height {
             out.push(Record::Confirmed { height });
         }
+        if self.control_sent > 0 {
+            out.push(Record::ControlSent {
+                seq: self.control_sent,
+            });
+        }
+        if self.control_recv > 0 {
+            out.push(Record::ControlRecv {
+                seq: self.control_recv,
+            });
+        }
         if let (Some(tx), Phase::Opening | Phase::Funded) = (&self.funding_tx, self.phase) {
             out.push(Record::FundingTx { tx: tx.encode() });
         }
@@ -1290,9 +1390,7 @@ impl Machine {
     pub fn propose_close(&mut self, fee: u64) -> Result<Message, ChannelError> {
         if self.phase == Phase::Closing {
             return match (self.close_fee, self.close_payer) {
-                (Some(agreed), Some(p)) if p == self.our_index => {
-                    Ok(Message::Close { fee: agreed })
-                }
+                (Some(agreed), Some(p)) if p == self.our_index => self.close_message(agreed),
                 _ => Err(ChannelError::Unexpected),
             };
         }
@@ -1306,7 +1404,7 @@ impl Machine {
         }
         self.check_close_fee(fee, self.our_index)?;
         self.journal_close(fee, self.our_index)?;
-        Ok(Message::Close { fee })
+        self.close_message(fee)
     }
 
     /// Agrees to a cooperative close at `fee` while an update is still in
@@ -1337,8 +1435,8 @@ impl Machine {
             return Ok(None);
         }
         match (self.close_fee, self.close_payer) {
-            (Some(fee), Some(p)) if p == self.our_index => Ok(Some(Message::Close { fee })),
-            (Some(fee), Some(_)) => self.on_close(&Message::Close { fee }).map(Some),
+            (Some(fee), Some(p)) if p == self.our_index => self.close_message(fee).map(Some),
+            (Some(fee), Some(_)) => self.sign_peer_close(fee).map(Some),
             _ => Ok(None),
         }
     }
@@ -1372,9 +1470,31 @@ impl Machine {
     /// so our side is paid in full, and the fee must lie within the bounds we
     /// accept and within the peer's balance.
     pub fn on_close(&mut self, msg: &Message) -> Result<Message, ChannelError> {
-        let Message::Close { fee } = msg else {
+        if !matches!(msg, Message::Close { .. }) {
             return Err(ChannelError::Unexpected);
-        };
+        }
+        if !matches!(self.phase, Phase::Open | Phase::Closing | Phase::Closed)
+            || self.update_in_flight()
+        {
+            return Err(ChannelError::Unexpected);
+        }
+        let (fee, seq) = self.check_close(msg)?;
+        let signed = self.sign_peer_close(fee)?;
+        self.note_control(seq)?;
+        Ok(signed)
+    }
+
+    /// A peer's [`Message::Close`] that crossed an update still settling
+    /// here: verified, and agreed to at once (see [`Machine::agree_close`]);
+    /// our signature follows once the update completes.
+    pub fn on_close_crossing(&mut self, msg: &Message) -> Result<(), ChannelError> {
+        let (fee, seq) = self.check_close(msg)?;
+        self.agree_close(fee, false)?;
+        self.note_control(seq)
+    }
+
+    /// Our [`Message::CloseSigned`] over the peer's close proposal at `fee`.
+    fn sign_peer_close(&mut self, fee: u64) -> Result<Message, ChannelError> {
         // A peer still waiting on a close we already completed asks again:
         // sign the same transaction again so it can settle too.
         if !matches!(self.phase, Phase::Open | Phase::Closing | Phase::Closed) {
@@ -1384,20 +1504,20 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         }
         let peer = 1 - self.our_index;
-        self.check_close_fee(*fee, peer)?;
+        self.check_close_fee(fee, peer)?;
         if self.phase == Phase::Open {
-            self.journal_close(*fee, peer)?;
+            self.journal_close(fee, peer)?;
         }
         let bal = self.current_balances();
         let close = self
             .params
-            .cooperative_close(self.funding()?, bal, *fee, self.payout, peer);
+            .cooperative_close(self.funding()?, bal, fee, self.payout, peer);
         let m = self
             .params
             .funding_sighash(&close.tx, self.network, self.our_index);
         self.close_signed = true;
         Ok(Message::CloseSigned {
-            fee: *fee,
+            fee,
             signature: self.signer.sign(&m),
         })
     }
@@ -1578,6 +1698,8 @@ impl Machine {
             store: shachain::Store::new(),
             base_fee_rate,
             seen_nonces: VecDeque::new(),
+            control_sent: 0,
+            control_recv: 0,
             peer_proposal: None,
             crossed: None,
         };
@@ -1650,6 +1772,8 @@ impl Machine {
                     self.funding_tx = Transaction::decode(tx).ok();
                 }
                 Record::Crossed { state } => self.crossed = Some(*state),
+                Record::ControlSent { seq } => self.control_sent = self.control_sent.max(*seq),
+                Record::ControlRecv { seq } => self.control_recv = self.control_recv.max(*seq),
                 Record::CloseSigned { fee, signature } => {
                     self.close_fee = Some(*fee);
                     self.close_payer = Some(self.our_index);
@@ -1689,17 +1813,24 @@ impl Machine {
     /// the proof of our funding key signs the peer's own fresh nonce, so the
     /// answer is good for that challenge — that connection — only.
     pub fn reestablish_for(&self, nonce: [u8; 32]) -> Message {
+        let counters = [
+            self.local_commit_number.map_or(0, |n| n + 1),
+            self.remote_commit_number.map_or(0, |n| n + 1),
+            self.revocations_sent.map_or(0, |m| m + 1),
+            self.revocations_recv.map_or(0, |m| m + 1),
+        ];
         let proof = self.signer.sign(&reestablish_message(
             self.channel_id,
             nonce,
             self.our_index as u8,
+            counters,
         ));
         Message::Reestablish {
             channel_id: self.channel_id,
-            local_commit_number: self.local_commit_number.map_or(0, |n| n + 1),
-            remote_commit_number: self.remote_commit_number.map_or(0, |n| n + 1),
-            next_revocation_sent: self.revocations_sent.map_or(0, |m| m + 1),
-            next_revocation_recv: self.revocations_recv.map_or(0, |m| m + 1),
+            local_commit_number: counters[0],
+            remote_commit_number: counters[1],
+            next_revocation_sent: counters[2],
+            next_revocation_recv: counters[3],
             nonce,
             direction: self.our_index as u8,
             proof,
@@ -1714,11 +1845,11 @@ impl Machine {
             channel_id: cid,
             local_commit_number: their_next_local,
             remote_commit_number: their_next_remote,
+            next_revocation_sent: their_next_sent,
             next_revocation_recv: their_next_recv,
             nonce,
             direction,
             proof,
-            ..
         } = msg
         else {
             return Err(ChannelError::Unexpected);
@@ -1736,7 +1867,17 @@ impl Machine {
         if usize::from(*direction) != 1 - self.our_index {
             return Err(ChannelError::BadReestablish);
         }
-        let expected = reestablish_message(self.channel_id, *nonce, *direction);
+        let expected = reestablish_message(
+            self.channel_id,
+            *nonce,
+            *direction,
+            [
+                *their_next_local,
+                *their_next_remote,
+                *their_next_sent,
+                *their_next_recv,
+            ],
+        );
         crate::sig::verify(CHANNEL_SCHEME, &self.their_pubkey, &expected, proof)
             .map_err(|_| ChannelError::BadReestablish)?;
         if self.seen_nonces.len() >= MAX_SEEN_NONCES {
@@ -1816,7 +1957,7 @@ impl Machine {
             // ours over the peer's proposal would charge us its fee.
             if let (Some(fee), Some(p)) = (self.close_fee, self.close_payer) {
                 if p == self.our_index {
-                    out.push(Message::Close { fee });
+                    out.push(self.close_message(fee)?);
                 }
             }
         }

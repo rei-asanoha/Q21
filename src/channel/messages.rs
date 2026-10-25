@@ -13,7 +13,11 @@ use crate::ser::{ReadError, Reader, Writer};
 
 /// The codec version. A future change bumps it; a decoder refuses a version it
 /// does not know rather than guess.
-pub const WIRE_VERSION: u8 = 1;
+///
+/// 2: `Ready` and `Close` carry a sequence number and the sender's funding
+/// signature, a `Challenge` names its channel only through a locator, and a
+/// reestablish proof covers every field.
+pub const WIRE_VERSION: u8 = 2;
 
 const T_OPEN: u8 = 1;
 const T_ACCEPT: u8 = 2;
@@ -92,8 +96,10 @@ pub enum Message {
     /// Acceptor → funder: the acceptor's signatures of the funder's first
     /// commitment (all tiers). The funder may now broadcast the funding.
     FundingSigned { tier_sigs: TierSigs },
-    /// Either side, once the funding is buried to the agreed depth.
-    Ready,
+    /// Either side, once the funding is buried to the agreed depth. Signed
+    /// like every control message that carries no signature of its own (see
+    /// [`control_message`]).
+    Ready { seq: u64, signature: Vec<u8> },
     /// Initiator → responder: a new state, with the initiator's signatures of
     /// the responder's commitment at that state (all tiers).
     Update {
@@ -112,7 +118,7 @@ pub enum Message {
     Revoke { state: u64, revocation: Revocation },
     /// On reconnection, answering a [`Message::Challenge`]: where this side
     /// stands, the challenge's nonce, and a proof of the funding key over
-    /// `(channel_id, nonce, direction)`.
+    /// every other field.
     Reestablish {
         channel_id: Hash256,
         local_commit_number: u64,
@@ -128,20 +134,62 @@ pub enum Message {
         proof: Vec<u8>,
     },
     /// A request to close cooperatively at the current balance, with the fee
-    /// the sender proposes.
-    Close { fee: u64 },
+    /// the sender proposes. Signed (see [`control_message`]): it moves the
+    /// channel to closing, and an unsigned one could be injected by anyone
+    /// relaying the connection.
+    Close {
+        fee: u64,
+        seq: u64,
+        signature: Vec<u8>,
+    },
     /// The sender's signature of the agreed cooperative close.
     CloseSigned { fee: u64, signature: Vec<u8> },
-    /// An abort, with a short reason. The channel moves to force-close.
+    /// An abort, with a short reason. Informational: nothing acts on it.
     Error { reason: String },
     /// On a new connection: a fresh nonce the receiver must sign, with its
     /// funding key, in the [`Message::Reestablish`] it answers with. Issued by
     /// the side that wants the connection authenticated, so a captured
-    /// reestablish never answers a later challenge.
-    Challenge {
-        channel_id: Hash256,
-        nonce: [u8; 32],
-    },
+    /// reestablish never answers a later challenge. The connection is not
+    /// authenticated yet: the channel is named by [`challenge_locator`], which
+    /// only a party that already knows the channel id can match.
+    Challenge { locator: Hash256, nonce: [u8; 32] },
+}
+
+/// The control message kinds a [`control_message`] signature covers.
+pub const CONTROL_READY: u8 = T_READY;
+pub const CONTROL_CLOSE: u8 = T_CLOSE;
+
+/// What the funding key signs for a control message that carries no other
+/// signature: the channel, the sender's side, a sequence number that only
+/// grows (per channel and sender, journaled on both ends, so a captured
+/// message is never accepted twice), the kind, and its fields. Without it a
+/// relay that passed both sides' challenges along, and so got both of its
+/// connections authenticated, could inject a `Close` on each side.
+pub fn control_message(
+    channel_id: Hash256,
+    sender: u8,
+    seq: u64,
+    kind: u8,
+    fields: &[u8],
+) -> Hash256 {
+    crate::hash::tagged_hash_parts(
+        "Q21/channel/control",
+        &[
+            channel_id.as_bytes(),
+            &[sender],
+            &seq.to_le_bytes(),
+            &[kind],
+            fields,
+        ],
+    )
+}
+
+/// How a [`Message::Challenge`] names its channel: a hash of the channel id
+/// and the challenge's own nonce. The id is never sent in clear to a
+/// connection that has not proved itself; a stranger learns nothing from the
+/// locator, while the real counterparty finds its channel by recomputing it.
+pub fn challenge_locator(channel_id: Hash256, nonce: &[u8; 32]) -> Hash256 {
+    crate::hash::tagged_hash_parts("Q21/channel/challenge", &[channel_id.as_bytes(), nonce])
 }
 
 /// The deterministic tie-break for simultaneous updates: the party whose
@@ -267,8 +315,9 @@ impl Message {
                 w.u8(T_FUNDING_SIGNED);
                 write_tier_sigs(&mut w, tier_sigs);
             }
-            Message::Ready => {
-                w.u8(T_READY);
+            Message::Ready { seq, signature } => {
+                w.u8(T_READY).u64(*seq);
+                write_crypto(&mut w, signature);
             }
             Message::Update {
                 state,
@@ -309,15 +358,20 @@ impl Message {
                 w.bytes(nonce).u8(*direction);
                 write_crypto(&mut w, proof);
             }
-            Message::Close { fee } => {
-                w.u8(T_CLOSE).u64(*fee);
+            Message::Close {
+                fee,
+                seq,
+                signature,
+            } => {
+                w.u8(T_CLOSE).u64(*fee).u64(*seq);
+                write_crypto(&mut w, signature);
             }
             Message::CloseSigned { fee, signature } => {
                 w.u8(T_CLOSE_SIGNED).u64(*fee);
                 write_crypto(&mut w, signature);
             }
-            Message::Challenge { channel_id, nonce } => {
-                w.u8(T_CHALLENGE).bytes(channel_id.as_bytes()).bytes(nonce);
+            Message::Challenge { locator, nonce } => {
+                w.u8(T_CHALLENGE).bytes(locator.as_bytes()).bytes(nonce);
             }
             Message::Error { reason } => {
                 let bytes = reason.as_bytes();
@@ -367,7 +421,11 @@ impl Message {
             T_FUNDING_SIGNED => Message::FundingSigned {
                 tier_sigs: read_tier_sigs(&mut r)?,
             },
-            T_READY => Message::Ready,
+            T_READY => {
+                let seq = r.u64()?;
+                let signature = read_sig(&mut r)?;
+                Message::Ready { seq, signature }
+            }
             T_UPDATE => {
                 let state = r.u64()?;
                 let balances = [r.u64()?, r.u64()?];
@@ -412,14 +470,23 @@ impl Message {
                     proof,
                 }
             }
-            T_CLOSE => Message::Close { fee: r.u64()? },
+            T_CLOSE => {
+                let fee = r.u64()?;
+                let seq = r.u64()?;
+                let signature = read_sig(&mut r)?;
+                Message::Close {
+                    fee,
+                    seq,
+                    signature,
+                }
+            }
             T_CLOSE_SIGNED => {
                 let fee = r.u64()?;
                 let signature = read_sig(&mut r)?;
                 Message::CloseSigned { fee, signature }
             }
             T_CHALLENGE => Message::Challenge {
-                channel_id: Hash256(r.array32()?),
+                locator: Hash256(r.array32()?),
                 nonce: r.array32()?,
             },
             T_ERROR => {

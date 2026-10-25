@@ -1938,7 +1938,12 @@ fn only_an_answered_challenge_authenticates_a_connection() {
     let close = [
         cid.as_bytes().as_slice(),
         &[0u8],
-        &q21_core::channel::Message::Close { fee: 20_000 }.encode(),
+        &q21_core::channel::Message::Close {
+            fee: 20_000,
+            seq: 1,
+            signature: vec![0; q21_core::channel::keys::CHANNEL_SCHEME.sig_len()],
+        }
+        .encode(),
     ]
     .concat();
     let r = p.funder.deliver(IMPOSTOR, "acceptor-node", &close);
@@ -2481,19 +2486,23 @@ fn a_close_settles_past_the_deepest_reorganization_off_regtest() {
     }
 }
 
+/// [`unconfirmed_funding_pair`]: the pair, the funder's wallet, the chain,
+/// the journal directory and what the funder broadcast.
+type UnconfirmedPair = (
+    Pair,
+    Arc<Mutex<Wallet>>,
+    Arc<Mutex<SharedChain>>,
+    std::path::PathBuf,
+    Arc<Mutex<Vec<Transaction>>>,
+);
+
 /// A funder whose broadcasts go nowhere, so its funding stays unconfirmed
 /// until the test mines it, and an acceptor; both driven by hand.
 fn unconfirmed_funding_pair(
     funder_seed: [u8; 32],
     acceptor_seed: [u8; 32],
     tag: &str,
-) -> (
-    Pair,
-    Arc<Mutex<Wallet>>,
-    Arc<Mutex<SharedChain>>,
-    std::path::PathBuf,
-    Arc<Mutex<Vec<Transaction>>>,
-) {
+) -> UnconfirmedPair {
     let (wallet, chain) = setup(funder_seed);
     let dir = tmpdir(tag);
     std::fs::create_dir_all(dir.join("funder")).unwrap();
@@ -2647,4 +2656,111 @@ fn a_funding_whose_coin_is_spent_elsewhere_is_given_up() {
     }
     assert!(p.funder.info(cid).is_none(), "given up");
     assert!(!journal.exists());
+}
+
+/// An engine frame as the manager writes it: the channel id, the kind, the
+/// message.
+fn engine_frame(cid: Hash256, msg: &q21_core::channel::messages::Message) -> Vec<u8> {
+    let mut f = cid.0.to_vec();
+    f.push(0);
+    f.extend(msg.encode());
+    f
+}
+
+/// N1: a relay between the two ends of a channel — connected to each,
+/// passing every frame on — gets both of its connections authenticated: each
+/// side's challenge is answered by the real other side. Before control
+/// messages were signed, it could then inject a Close on each side: both
+/// went to closing, each believing the other proposed, and only a unilateral
+/// close was left. Now a frame it makes up is refused on both sides, and a
+/// signed one replayed is ignored.
+#[test]
+fn a_relay_cannot_close_a_channel_it_sits_in() {
+    use q21_core::channel::messages::Message;
+    let (mut p, _wallet, _chain, _dir, cid, _capacity) =
+        open_channel([0xa7u8; 32], [0xa8u8; 32], "n1-relay");
+    let m = p.funder.pay(cid, 300_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    // The relay's connections: 77 on the funder, 88 on the acceptor.
+    const ON_F: u64 = 77;
+    const ON_A: u64 = 88;
+    // It challenges the funder itself, then only passes frames along until
+    // both sides fall quiet.
+    let mut to_f: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut to_a: VecDeque<Vec<u8>> = VecDeque::new();
+    // It knows the channel id: it saw the earlier traffic.
+    to_f.push_back(engine_frame(
+        Hash256::ZERO,
+        &Message::Challenge {
+            locator: q21_core::channel::messages::challenge_locator(cid, &[0x11; 32]),
+            nonce: [0x11; 32],
+        },
+    ));
+    let mut steps = 0;
+    while !(to_f.is_empty() && to_a.is_empty()) {
+        steps += 1;
+        assert!(steps < 100);
+        if let Some(f) = to_f.pop_front() {
+            to_a.extend(p.funder.deliver(ON_F, "", &f).frames);
+        }
+        if let Some(f) = to_a.pop_front() {
+            to_f.extend(p.acceptor.deliver(ON_A, "", &f).frames);
+        }
+    }
+    // Both connections now speak for the channel: its frames are acted on.
+    // A Close it makes up — unsigned, or signed by a key of its own — is
+    // injected on both sides.
+    use q21_core::channel::keys::{ChannelKey, Signer, CHANNEL_SCHEME};
+    let own = ChannelKey::from_seed(&[0x66; 32]);
+    for sender in [0u8, 1] {
+        let m = q21_core::channel::messages::control_message(
+            cid,
+            sender,
+            1,
+            q21_core::channel::messages::CONTROL_CLOSE,
+            &CLOSE_FEE.to_le_bytes(),
+        );
+        for signature in [vec![0u8; CHANNEL_SCHEME.sig_len()], own.sign(&m)] {
+            let forged = engine_frame(
+                cid,
+                &Message::Close {
+                    fee: CLOSE_FEE,
+                    seq: 1,
+                    signature,
+                },
+            );
+            let to = if sender == 1 { &p.funder } else { &p.acceptor };
+            let conn = if sender == 1 { ON_F } else { ON_A };
+            let r = to.deliver(conn, "", &forged);
+            assert!(r.frames.is_empty());
+        }
+    }
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Open, "funder");
+    assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open, "acceptor");
+    // The channel still pays.
+    let m = p.funder.pay(cid, 1_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 301_000);
+}
+
+/// N1: a challenge goes to a connection that has proved nothing yet, so it
+/// does not name its channel in clear: a stranger announcing the
+/// counterparty's identity learns no channel id from it.
+#[test]
+fn a_challenge_does_not_name_its_channel_in_clear() {
+    let (p, _wallet, _chain, _dir, cid, _capacity) =
+        open_channel([0xa9u8; 32], [0xaau8; 32], "n1-locator");
+    // A new connection under the counterparty's id: challenged.
+    let frames = p.funder.on_peer_connected(A_PEER, "");
+    assert_eq!(frames.len(), 1, "challenged");
+    assert!(
+        !frames[0].windows(32).any(|w| w == cid.as_bytes()),
+        "the channel id travels in clear"
+    );
+    // The real counterparty still finds its channel and answers.
+    let r = p.acceptor.deliver(F_PEER, "", &frames[0]);
+    assert_eq!(r.penalize, 0);
+    assert!(!r.frames.is_empty());
 }
