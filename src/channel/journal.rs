@@ -12,11 +12,15 @@
 //!
 //! # Surviving a torn write
 //!
-//! A crash can stop a write anywhere. Replay reads records in order and stops
-//! at the first whose frame is short or whose checksum does not match: that is
-//! the half-written tail of the interrupted append, and everything before it
-//! is intact. The truncation tests cut the file at every byte offset and check
-//! that replay always yields a clean prefix of the records.
+//! A crash can stop a write anywhere, but only in the last frame. Opening reads
+//! records in order; a frame that runs past the end of the file, or a bad
+//! checksum on the very last frame, is the half-written tail of the
+//! interrupted append, cut off before anything is appended after it. Anything
+//! else — a bad checksum with frames after it, or a record that passes its
+//! checksum but does not decode — is corruption or a newer version's record:
+//! the journal is refused and left untouched (see [`scan`]). The truncation
+//! tests cut the file at every byte offset and check that replay always yields
+//! a clean prefix of the records.
 //!
 //! The initial creation of the file uses the atomic tmp+fsync+rename+dir-fsync
 //! dance ([`atomic_write`]), so a crash during creation leaves either no file
@@ -411,7 +415,17 @@ impl Journal {
         }
         let mut raw = Vec::new();
         File::open(&path)?.read_to_end(&mut raw)?;
-        let (records, good) = replay_prefix(&raw);
+        // Corruption anywhere but the tail, or a record this version cannot
+        // read, refuses the journal and writes nothing: cutting there would
+        // destroy every record after it, the secrets that enforce the channel
+        // among them. The file stays as it is, for a newer version or a
+        // backup to recover.
+        let (records, good) = scan(&raw).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("channel journal {}: {e}; left untouched", path.display()),
+            )
+        })?;
         // A torn tail — the half-written frame of an interrupted append — is
         // cut off before anything is appended after it. Left in place, every
         // record appended later would sit behind it, invisible to the next
@@ -463,9 +477,68 @@ impl Journal {
 }
 
 /// Reads every intact record from the raw journal bytes, stopping at the first
-/// torn or corrupt frame.
+/// torn or corrupt frame. A diagnostic reading: [`Journal::open`] tells a
+/// torn tail from corruption and refuses the latter.
 pub fn replay(raw: &[u8]) -> Vec<Record> {
     replay_prefix(raw).0
+}
+
+/// Why a journal is refused rather than repaired.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Corruption {
+    /// A frame before the last fails its checksum: not a torn append.
+    BadChecksum { offset: usize },
+    /// A frame passes its checksum but holds no record this version reads:
+    /// written by a newer version, or corrupt in a way a checksum missed.
+    Undecodable { offset: usize },
+}
+
+impl std::fmt::Display for Corruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Corruption::BadChecksum { offset } => {
+                write!(
+                    f,
+                    "a record at byte {offset} is corrupt, with records after it"
+                )
+            }
+            Corruption::Undecodable { offset } => write!(
+                f,
+                "the record at byte {offset} cannot be read (written by a newer version?)"
+            ),
+        }
+    }
+}
+
+/// The records of a journal and the length of the bytes they occupy; what
+/// follows is a torn tail. Only an append cut short can tear: a frame running
+/// past the end of the file, or a bad checksum on the very last frame. Any
+/// other fault is [`Corruption`].
+pub fn scan(raw: &[u8]) -> Result<(Vec<Record>, usize), Corruption> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 8 <= raw.len() {
+        let len = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
+        let crc: [u8; 4] = raw[pos + 4..pos + 8].try_into().unwrap();
+        let body_start = pos + 8;
+        let body_end = match body_start.checked_add(len) {
+            Some(e) if e <= raw.len() => e,
+            _ => break,
+        };
+        let body = &raw[body_start..body_end];
+        if checksum(body) != crc {
+            if body_end == raw.len() {
+                break;
+            }
+            return Err(Corruption::BadChecksum { offset: pos });
+        }
+        match Record::decode(body) {
+            Ok(rec) => out.push(rec),
+            Err(_) => return Err(Corruption::Undecodable { offset: pos }),
+        }
+        pos = body_end;
+    }
+    Ok((out, pos))
 }
 
 /// [`replay`], with the length of the intact prefix those records occupy.
@@ -546,5 +619,81 @@ mod tests {
         }
         let (_, recs) = Journal::open(&path).unwrap();
         assert_eq!(recs, vec![Record::Ready, Record::Forcing]);
+    }
+
+    /// A raw frame around `body`, with a valid checksum.
+    fn raw_frame(body: &[u8]) -> Vec<u8> {
+        let mut f = (body.len() as u32).to_le_bytes().to_vec();
+        f.extend_from_slice(&checksum(body));
+        f.extend_from_slice(body);
+        f
+    }
+
+    /// A record this version cannot read — one a newer version wrote, before
+    /// a downgrade — sits in the middle of the journal. The journal is refused
+    /// and left byte for byte as it was: cutting it there would destroy every
+    /// record after it.
+    #[test]
+    fn an_unreadable_record_refuses_the_journal_and_writes_nothing() {
+        let path = tmp("unknown");
+        {
+            let (mut j, _) = Journal::open(&path).unwrap();
+            j.append(&Record::Ready).unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend(raw_frame(&[0xee, 1, 2, 3]));
+        bytes.extend(frame(&Record::RevocationRecv {
+            state: 3,
+            secret: [7; 32],
+        }));
+        std::fs::write(&path, &bytes).unwrap();
+        let e = Journal::open(&path).err().expect("refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing written");
+        // Even when the unreadable record is the last one.
+        let mut last = bytes.clone();
+        let tail = frame(&Record::RevocationRecv {
+            state: 3,
+            secret: [7; 32],
+        });
+        last.truncate(last.len() - tail.len());
+        std::fs::write(&path, &last).unwrap();
+        assert!(Journal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), last);
+    }
+
+    /// A bad checksum in the middle of the file is not a torn append: bit rot
+    /// is refused, not cut away with the records behind it. On the final
+    /// frame it is a torn tail, and is cut.
+    #[test]
+    fn a_bad_checksum_is_cut_only_on_the_final_frame() {
+        let path = tmp("rot");
+        {
+            let (mut j, _) = Journal::open(&path).unwrap();
+            j.append(&Record::Ready).unwrap();
+            j.append(&Record::RevocationRecv {
+                state: 1,
+                secret: [9; 32],
+            })
+            .unwrap();
+            j.append(&Record::Forcing).unwrap();
+        }
+        let good = std::fs::read(&path).unwrap();
+        let mut rot = good.clone();
+        rot[8] ^= 0x01; // the first frame's body
+        std::fs::write(&path, &rot).unwrap();
+        assert!(Journal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), rot, "nothing written");
+
+        let mut torn = good.clone();
+        let n = torn.len();
+        torn[n - 1] ^= 0x01; // the last frame's body
+        std::fs::write(&path, &torn).unwrap();
+        let (_, recs) = Journal::open(&path).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(
+            std::fs::read(&path).unwrap().len(),
+            n - frame(&Record::Forcing).len()
+        );
     }
 }

@@ -360,9 +360,14 @@ impl ChannelManager {
             if path.extension().and_then(|s| s.to_str()) != Some("jrnl") {
                 continue;
             }
-            let Ok((_journal, records)) = Journal::open(&path) else {
-                eprintln!("ALERT: channel journal {} cannot be read", path.display());
-                continue;
+            let (_journal, records) = match Journal::open(&path) {
+                Ok(j) => j,
+                Err(e) => {
+                    // Left as it is: the channel is not managed until the
+                    // journal is recovered, but nothing in it is destroyed.
+                    eprintln!("ALERT: {e}; this channel is not loaded");
+                    continue;
+                }
             };
             let Some(Record::Opened { our_pubkey, .. }) = records.first() else {
                 continue;
