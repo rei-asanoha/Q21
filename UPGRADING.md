@@ -87,7 +87,7 @@ chain splits. It also carries payment channels, complete and tested but
 | A transaction a full pool refused | Downloaded again from every peer at every block | Remembered across blocks |
 | A peer slow to deliver a block body on a busy link | Banned: honest peers were cut and chain splits did not heal | Not banned; a block whose parent we lack makes us ask for the headers |
 | A node paused and resumed (a debugger, a laptop lid, `SIGSTOP`) | Every link dropped on resume | Links kept |
-| Payment channels | Pay-to-policy building blocks only, regtest | Complete channels on regtest: `channelopen`, `channelpay`, `channelclose`, `channellist`, `channelinfo`; payments in a few milliseconds; penalties for a revoked state, with a rising fee; recovery after a crash, a lost link or a reorganization. **On testnet and mainnet nothing changes**: no channel message is sent or accepted, and a policy output is treated exactly as 0.4.9 treats it |
+| Payment channels | — | Complete channels on regtest: `channelopen`, `channelpay`, `channelclose`, `channellist`, `channelinfo`; payments in a few milliseconds; penalties for a revoked state; recovery after a crash, a lost link, a reorganization or a revoked state confirmed while the node was off. **On testnet and mainnet nothing changes**: no channel message is sent or accepted, and a policy output is treated exactly as 0.4.9 treats it |
 
 ## Who needs it
 
