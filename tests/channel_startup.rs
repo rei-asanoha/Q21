@@ -285,7 +285,7 @@ fn a_testnet_wallet_node_runs_channels_and_waits_for_the_activation() {
     );
     let open = rpc(port, "channelopen").unwrap();
     assert!(
-        open.contains("payment channels open on this network at block"),
+        open.contains("payment channels are not active on this network yet: they open at block"),
         "channelopen before the activation: {open}"
     );
 }

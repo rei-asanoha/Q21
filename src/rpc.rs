@@ -1236,9 +1236,9 @@ impl RpcContext {
         Err(rpc_error(
             ERR_REQUEST,
             &format!(
-                "payment channels open on this network at block {h}, when policy outputs \
-                 activate; the tip is at {}: {left} blocks to go (about {minutes} minutes). \
-                 See channelstatus",
+                "payment channels are not active on this network yet: they open at block {h}, \
+                 when policy outputs activate; the tip is at {}: {left} blocks to go (about \
+                 {minutes} minutes). See channelstatus",
                 st.tip
             ),
         ))

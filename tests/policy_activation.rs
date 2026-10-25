@@ -1072,7 +1072,10 @@ mod channels {
             let r = call(m, p);
             let text = message(&r);
             assert!(
-                text.contains(&format!("at block {H}")) && text.contains("1 blocks to go"),
+                text.contains(&format!("at block {H}"))
+                    && text.contains("1 blocks to go")
+                    // What the wallet's Channels tab reads as "not active yet".
+                    && text.contains("not active"),
                 "{m} at H - 1: {r:?}"
             );
         }
