@@ -1301,6 +1301,9 @@ pub struct Node {
     /// This node's stable channel identity (hex), advertised in the handshake
     /// when channels are enabled. Set from the sink at [`Node::set_channel_sink`].
     own_channel_id: Arc<std::sync::RwLock<Option<String>>>,
+    /// The links already warned about as predating the policy activation:
+    /// see [`Node::warn_peers_predating_activation`].
+    activation_warned: Arc<Mutex<HashSet<u64>>>,
 }
 
 #[derive(Default, Debug)]
@@ -1356,6 +1359,9 @@ pub struct Stats {
     pub tx_requests_deferred: AtomicU64,
     /// Transactions that arrived before their parent and went in once it did.
     pub orphans_adopted: AtomicU64,
+    /// Warnings logged about a connected peer that predates the policy
+    /// activation. See [`Node::warn_peers_predating_activation`].
+    pub peers_predating_activation_warned: AtomicU64,
 }
 
 impl Node {
@@ -1403,6 +1409,7 @@ impl Node {
             configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
             channel_sink: Arc::new(std::sync::RwLock::new(None)),
             own_channel_id: Arc::new(std::sync::RwLock::new(None)),
+            activation_warned: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -2265,7 +2272,67 @@ impl Node {
             // loop, which was waiting, exits with an error and its thread dies.
             self.disconnect(id);
         }
+        self.warn_peers_predating_activation();
         dropped
+    }
+
+    /// The established peers that do not follow the policy activation of
+    /// this network ([`follows_activation`]): zero where it has no
+    /// transition.
+    pub fn peers_predating_activation(&self) -> usize {
+        let g = self.shared.lock().unwrap();
+        g.peers
+            .values()
+            .filter(|p| p.handshaked && !follows_activation(g.network, p.version))
+            .count()
+    }
+
+    /// Logs a warning, once per link, for each established peer that predates
+    /// the policy activation, from [`crate::consensus::POLICY_ACTIVATION_NOTICE`]
+    /// blocks before the activation height on. Such a node stops at the first
+    /// block carrying a policy: its operator must upgrade it before then, and
+    /// ours should know that this link will not last. Called at every
+    /// maintenance round; returns how many peers were warned about now.
+    pub fn warn_peers_predating_activation(&self) -> usize {
+        let (network, tip, peers, older) = {
+            let g = self.shared.lock().unwrap();
+            let older: Vec<(u64, SocketAddr, u32, String)> = g
+                .peers
+                .iter()
+                .filter(|(_, p)| p.handshaked && !follows_activation(g.network, p.version))
+                .map(|(id, p)| (*id, p.addr, p.version, p.user_agent.clone()))
+                .collect();
+            let peers: HashSet<u64> = g.peers.keys().copied().collect();
+            (g.network, g.chain.height(), peers, older)
+        };
+        let mut warned = self.activation_warned.lock().unwrap();
+        warned.retain(|id| peers.contains(id));
+        if !crate::policy::has_transition(network) {
+            return 0;
+        }
+        let h = crate::policy::activation_height(network);
+        if tip.saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE) < h {
+            return 0;
+        }
+        let mut count = 0;
+        for (id, addr, version, agent) in older {
+            if !warned.insert(id) {
+                continue;
+            }
+            let when = if tip < h {
+                format!("at block {h}, {} blocks from now", h - tip)
+            } else {
+                format!("since block {h}")
+            };
+            eprintln!(
+                "warning: peer {addr} ({agent}, protocol {version}) predates the activation                  of policy outputs {when}: it stops at the first block carrying one.                  Its operator must upgrade it to 0.4.11 or later."
+            );
+            count += 1;
+        }
+        self.stats
+            .peers_predating_activation_warned
+            .fetch_add(count as u64, Ordering::Relaxed);
+        count
     }
 
     pub fn mempool_len(&self) -> usize {
@@ -6169,6 +6236,17 @@ mod tests_hardening {
             !a.handle(7, Message::Channel(vec![0u8; 40])),
             "a peer at the threshold is still disconnected"
         );
+    }
+
+    /// Without a transition there is nothing to warn about, whatever the
+    /// versions connected.
+    #[test]
+    fn no_warning_about_old_peers_without_a_transition() {
+        let (a, _) = node_pair();
+        let _e = established_peer(&a, 7);
+        a.shared.lock().unwrap().peers.get_mut(&7).unwrap().version = 4;
+        assert_eq!(a.peers_predating_activation(), 0);
+        assert_eq!(a.warn_peers_predating_activation(), 0);
     }
 
     /// Finding 14: off regtest, where channels do not exist, a channel

@@ -785,3 +785,66 @@ mod relay {
         node.shutdown();
     }
 }
+
+/// Within the notice before `H` — here from the genesis, `H` being closer
+/// than the notice — each established peer that predates the activation is
+/// warned about once per link; a peer that follows it never is.
+mod warnings {
+    use super::*;
+    use q21_core::net::{magic_for, Node};
+    use q21_core::wire::{Message, POLICY_ACTIVATION_VERSION};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    fn hello(
+        node: &Node,
+        addr: std::net::SocketAddr,
+        version: u32,
+        n: usize,
+    ) -> std::net::TcpStream {
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        let magic = magic_for(NET);
+        let v = Message::Version {
+            version,
+            timestamp: 0,
+            nonce: 0x7a00 + n as u64,
+            user_agent: "q21:0.4".into(),
+            start_height: 0,
+        };
+        s.write_all(&v.frame(magic)).unwrap();
+        s.write_all(&Message::VerAck.frame(magic)).unwrap();
+        let t = Instant::now();
+        while node
+            .peer_list()
+            .iter()
+            .filter(|p| p.handshake_complete)
+            .count()
+            < n
+        {
+            assert!(t.elapsed() < Duration::from_secs(10), "handshake");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s
+    }
+
+    #[test]
+    fn each_old_peer_is_warned_about_once() {
+        activate();
+        let node = Node::new(NET, new_chain());
+        let addr = node.listen("127.0.0.1:0").expect("listen");
+        let _new = hello(&node, addr, POLICY_ACTIVATION_VERSION, 1);
+        assert_eq!(node.warn_peers_predating_activation(), 0);
+        let _old = hello(&node, addr, 4, 2);
+        assert_eq!(node.peers_predating_activation(), 1);
+        assert_eq!(node.warn_peers_predating_activation(), 1);
+        assert_eq!(node.warn_peers_predating_activation(), 0, "once per link");
+        node.maintain_peers();
+        assert_eq!(
+            node.stats
+                .peers_predating_activation_warned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        node.shutdown();
+    }
+}
