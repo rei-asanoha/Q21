@@ -69,16 +69,24 @@ file you do not install.
 
 > **Draft.** The activation height below is provisional: it is fixed at
 > release, about two weeks of blocks after the day 0.4.11 is published.
-> `q21 channelstatus` (or `getinfo`, under `policy_activation`) gives the
-> height the binary you run was built with.
+> `channelstatus` (or `getinfo`, under `policy_activation`) gives the height
+> the binary you run was built with.
 
-0.4.11 turns on, **on testnet**, the pay-to-policy outputs that payment
-channels are built from, at a height announced in advance: **block 17,000**
-(provisional). It is a **hard fork**: from that block on, a 0.4.10 node no
-longer follows the testnet chain. Same chain until then, same data
-directory, same wallet file. Mainnet does not exist yet, and nothing in this
-release would open the rule there; regtest keeps the rule it had in 0.4.10,
-open from its first block.
+0.4.11 brings payment channels to **testnet**. Four things come together:
+
+- the pay-to-policy outputs channels are built from become valid on testnet
+  at a height announced in advance, **block 17,000** (provisional): a
+  **hard fork**, after which a 0.4.10 node no longer follows testnet;
+- channel peers talk through an **encrypted, authenticated transport**
+  (ML-KEM-1024 and ML-DSA-87), not in clear;
+- the wallet gets a **Channels** tab;
+- channels on testnet use **terms fit for a public network**: days, not
+  minutes, to answer a cheat.
+
+Same chain until block 17,000, same data directory, same wallet file.
+Mainnet does not exist yet, and nothing in this release would open
+policies or channels there. Regtest keeps the rule it had in 0.4.10, open
+from its first block, and its short channel terms.
 
 ## What changes
 
@@ -86,8 +94,11 @@ open from its first block.
 |---|---|---|
 | A testnet block carrying a policy output, or spending one | Malformed: refused, and the peer that sent it cut | Below block 17,000, the same. From block 17,000 on, valid when its policies are satisfied |
 | A testnet payment creating or spending a policy output | Malformed | Refused by the pool until the next block is 17,000; from then on, accepted like any other |
-| Payment channels on testnet | None: no channel message sent or accepted | The channel manager runs on a node started with `--rpc-wallet` from its first minute. `channellist` and `channelinfo` answer at once; `channelopen`, `channelpay` and `channelclose` refuse, saying how many blocks remain, until the tip reaches 17,000, so that every funding confirms at block 17,000 or later. No channel message is sent before then |
-| The protocol version announced to peers | 4 | 5, meaning "follows the activation". A 0.4.10 node keeps a version-5 peer, and a 0.4.11 node keeps version-4 peers |
+| Payment channels on testnet | None: no channel message sent or accepted | The channel manager runs on a node started with `--rpc-wallet` (the wallet included) from its start. `channellist` and `channelinfo` answer at once; `channelopen`, `channelpay` and `channelclose` refuse, saying how many blocks remain, until the tip reaches 17,000, so that every funding confirms at block 17,000 or later. No channel message, session handshake included, leaves before then |
+| How channel peers talk | Frames in clear over the P2P link, the peer named by an id it declared itself | Every frame inside a session: each side proves its ML-DSA-87 node identity over a transcript holding both ends' fresh ML-KEM-1024 keys, then records are encrypted and authenticated, with forward secrecy and rekeying. A party relaying the connection can delay or drop frames, nothing else. `channelopen` names a peer by address or by the node id its session authenticated; `getpeers` shows each peer's `channel_session` |
+| Versions announced | Protocol 4; channel capability `+chan` | Protocol 5, meaning "follows the activation", and channel capability `+chanv3`, channel protocol 3 (session frames). A 0.4.10 node keeps a 0.4.11 peer and the reverse; on testnet a peer is a channel peer only if it announces both. A 0.4.10 channel node (`+chan`) is not one: its frames are refused without blame |
+| Channel terms | 12-block to-self delay, 2 confirmations, everywhere | Per network. Testnet: 1,440 blocks (about two days) proposed, 720 to 2,016 accepted from a peer, 6 confirmations before a channel opens. Regtest keeps 12 blocks (6 to 2,016 accepted) and 2 confirmations. `getinfo` reports them under `channel_terms` |
+| The wallet | — | A Channels tab: until channels are active it says at which block, in how many blocks and about how long; then it lists channels with the balances in plain words, opens one with a connected peer that runs channels, pays, and closes, cooperatively or without the peer. Each step is confirmed with what moves, the fees and the delay of a forced close |
 | A peer still on 0.4.10 | — | Is never offered a policy transaction, which it would read as malformed. From two days (1,440 blocks) before the activation, each such peer is named in the log once per connection, and counted in `getinfo` (`policy_activation.peers_predating_activation`); `getpeers` shows every peer's `protocol_version` and `follows_activation` |
 | A policy transaction from a 0.4.11 peer that is a few blocks ahead | — | Refused without any penalty, and the link stays |
 | Where the activation stands | — | `channelstatus`: `network`, `activation_height`, `tip`, `active`, `blocks_remaining`, `eta_seconds` |
@@ -127,6 +138,12 @@ output — in practice the first channel funding. Then:
    wallet is untouched.
 
 Upgrade before block 17,000 and none of this happens.
+
+## Channels opened on regtest with 0.4.10
+
+They spoke the clear protocol, which 0.4.11 no longer speaks: a 0.4.10 and
+a 0.4.11 regtest node do not hold a channel together. Close such channels
+cooperatively before upgrading either end.
 
 ---
 
