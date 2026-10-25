@@ -65,6 +65,71 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.4.10 to 0.4.11
+
+> **Draft.** The activation height below is provisional: it is fixed at
+> release, about two weeks of blocks after the day 0.4.11 is published.
+> `q21 channelstatus` (or `getinfo`, under `policy_activation`) gives the
+> height the binary you run was built with.
+
+0.4.11 turns on, **on testnet**, the pay-to-policy outputs that payment
+channels are built from, at a height announced in advance: **block 17,000**
+(provisional). It is a **hard fork**: from that block on, a 0.4.10 node no
+longer follows the testnet chain. Same chain until then, same data
+directory, same wallet file. Mainnet does not exist yet, and nothing in this
+release would open the rule there; regtest keeps the rule it had in 0.4.10,
+open from its first block.
+
+## What changes
+
+| | 0.4.10 | 0.4.11 |
+|---|---|---|
+| A testnet block carrying a policy output, or spending one | Malformed: refused, and the peer that sent it cut | Below block 17,000, the same. From block 17,000 on, valid when its policies are satisfied |
+| A testnet payment creating or spending a policy output | Malformed | Refused by the pool until the next block is 17,000; from then on, accepted like any other |
+| Payment channels on testnet | None: no channel message sent or accepted | The channel manager runs on a node started with `--rpc-wallet` from its first minute. `channellist` and `channelinfo` answer at once; `channelopen`, `channelpay` and `channelclose` refuse, saying how many blocks remain, until the tip reaches 17,000, so that every funding confirms at block 17,000 or later. No channel message is sent before then |
+| The protocol version announced to peers | 4 | 5, meaning "follows the activation". A 0.4.10 node keeps a version-5 peer, and a 0.4.11 node keeps version-4 peers |
+| A peer still on 0.4.10 | — | Is never offered a policy transaction, which it would read as malformed. From two days (1,440 blocks) before the activation, each such peer is named in the log once per connection, and counted in `getinfo` (`policy_activation.peers_predating_activation`); `getpeers` shows every peer's `protocol_version` and `follows_activation` |
+| A policy transaction from a 0.4.11 peer that is a few blocks ahead | — | Refused without any penalty, and the link stays |
+| Where the activation stands | — | `channelstatus`: `network`, `activation_height`, `tip`, `active`, `blocks_remaining`, `eta_seconds` |
+
+## Who must upgrade, and when
+
+**Every testnet node, before block 17,000** — entry points, miners, wallets,
+explorers. At two-minute blocks, 17,000 is about two weeks after the release.
+The order does not matter before the activation: until block 17,000 a 0.4.10
+node and a 0.4.11 node agree on every block, relay each other's payments, and
+stay connected.
+
+Miners first among them: a block of 17,000 or above that carries a policy is
+only built by a 0.4.11 miner, and only 0.4.11 nodes build on it.
+
+## What happens to a node left on 0.4.10
+
+Nothing, until the first block at or above 17,000 that carries a policy
+output — in practice the first channel funding. Then:
+
+1. It refuses that block as malformed and disconnects the peer that sent it;
+   every upgraded peer sends it the same block, so it disconnects them all,
+   one after the other. It stays at the height before that block, its peer
+   count falls to zero, and its log shows nothing but reconnections. The
+   pages and the wallet show a height that no longer moves.
+2. If it mines, it mines on that old tip, a branch of its own. Its blocks
+   are valid for upgraded nodes too, but stay on a side branch as long as the
+   upgraded miners have more work. That is why miners upgrade first: should
+   the miners left on 0.4.10 hold most of the work, their branch would win,
+   and upgraded nodes would follow it, putting the policy transactions back
+   in their pools until an upgraded miner confirms them again. Payments sent
+   from a 0.4.10 wallet after the activation reach only the other 0.4.10
+   nodes.
+3. Nothing on disk is lost or damaged. Installed over the same folder, 0.4.11
+   resumes from the height where 0.4.10 stopped and catches up within
+   seconds to minutes; nothing is re-downloaded from the start and the
+   wallet is untouched.
+
+Upgrade before block 17,000 and none of this happens.
+
+---
+
 # Upgrading from 0.4.9 to 0.4.10
 
 0.4.10 is a drop-in replacement: same protocol (4), same chain, same data

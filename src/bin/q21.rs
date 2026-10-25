@@ -4464,6 +4464,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut address_index = false;
     let mut prune = false;
     let mut forced_network: Option<Network> = None;
+    // Audit builds only: the lab's activation height of policy outputs.
+    #[cfg(feature = "audit")]
+    let mut audit_activation: Option<u64> = None;
     let mut no_bootstrap = false;
     let mut upnp = false;
     // Tor (0.4.7): `--tor` finds the local Tor, `--proxy` names any SOCKS5
@@ -4585,11 +4588,37 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 forced_network = Some(network_from_name(&args[i + 1])?);
                 i += 2;
             }
+            // A lab that must cross a real activation height of policy
+            // outputs, on regtest or testnet. Not in a release build: there,
+            // this option does not exist.
+            #[cfg(feature = "audit")]
+            "--audit-policy-activation" if i + 1 < args.len() => {
+                audit_activation = Some(
+                    args[i + 1]
+                        .parse()
+                        .ok()
+                        .filter(|h| *h >= 1)
+                        .ok_or("--audit-policy-activation: a height of 1 or more")?,
+                );
+                i += 2;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
 
     check_rpc_token(rpc_wallet, rpc_token.as_deref())?;
+    // Before anything is loaded: replaying the chain already validates.
+    #[cfg(feature = "audit")]
+    if let Some(h) = audit_activation {
+        let network = forced_network
+            .filter(|n| *n != Network::Mainnet)
+            .ok_or("--audit-policy-activation requires --network regtest or testnet")?;
+        q21_core::policy::audit_set_activation_height(network, h);
+        eprintln!(
+            "warning: audit build: policy outputs activate at block {h} on {network:?} \
+             in this process, not at the height this release schedules"
+        );
+    }
     if rpc_wallet && std::env::args().any(|a| a == "--rpc-token") && cfg!(unix) {
         eprintln!(
             "warning: --rpc-token on the command line is readable by any\n\
@@ -4680,11 +4709,15 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // of side branches — is written to disk at the moment it is accepted.
     node.set_journal(archive.clone());
 
-    // Payment channels run on regtest, on a node that serves its wallet over
-    // RPC: the manager owns the engines, the node routes channel messages to
-    // it, and these hooks move funding, closes and penalties through the
-    // ordinary mempool and relay. Off regtest, or without a wallet, no manager
-    // is installed and the channel RPC refuses cleanly.
+    // Payment channels run where policy outputs can appear — regtest, and
+    // testnet — on a node that serves its wallet over RPC: the manager owns
+    // the engines, the node routes channel messages to it, and these hooks
+    // move funding, closes and penalties through the ordinary mempool and
+    // relay. On testnet it is installed at once, before the activation height:
+    // until the tip reaches it the channel RPC that opens, pays or closes
+    // refuses, and no channel message is sent (see `policy::reached`). On
+    // mainnet, or without a wallet, no manager is installed and the channel
+    // RPC refuses cleanly.
     //
     // Installed before the node listens or dials anyone. The capability and
     // the stable channel node id travel in our `Version`, and a peer that
@@ -4693,7 +4726,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // a restart, every reloaded channel stayed unbound from its peer.
     #[cfg(feature = "mldsa")]
     let channel_manager: Option<std::sync::Arc<q21_core::channel::manager::ChannelManager>> =
-        if network == q21_core::address::Network::Regtest && rpc_wallet && rpc.is_some() {
+        if q21_core::policy::may_appear_on(network) && rpc_wallet && rpc.is_some() {
             use q21_core::amount::Amount;
             use q21_core::channel::manager::{ChannelManager, Hooks};
             use q21_core::channel::{DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH};
@@ -4818,6 +4851,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // (the funding confirmed while this node was down): confirm them now
             // so they open without waiting for the next block.
             node.rescan_channels();
+            let st = q21_core::policy::status(network, node.height());
+            if !st.active {
+                println!(
+                    "  channels: open at block {} ({} blocks to go)",
+                    st.activation_height.unwrap_or(u64::MAX),
+                    st.blocks_remaining.unwrap_or(u64::MAX)
+                );
+            }
             Some(mgr)
         } else {
             None

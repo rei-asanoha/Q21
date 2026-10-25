@@ -597,20 +597,38 @@ pub const NETWORK_MAGIC_TESTNET: [u8; 4] = [0x51, 0x32, 0x31, 0x75];
 // ---------------------------------------------------------------------------
 
 /// First height at which a block may create or spend a policy output, per
-/// network.
+/// network: a block at `height - 1` refuses one, a block at `height` accepts
+/// it. Below it, a policy output is invalid exactly as an unknown lock was
+/// before 0.4.10.
 ///
-/// Mainnet and testnet: `u64::MAX`, that is never. The rule is a prototype:
-/// until it has been reviewed and scheduled, nothing changes for the live
-/// networks, and a policy output there is invalid exactly as an unknown lock
-/// was before.
+/// Mainnet: `u64::MAX`, that is never. Nothing changes there until the rule
+/// has run on testnet and its own activation is scheduled.
 ///
 /// Regtest: height 1, the first block that can carry a transaction at all
 /// (height 0 is the genesis, a lone coinbase). The rule is therefore open from
-/// the start of any regtest chain, while the gate itself stays exercised by
-/// the tests on the one network where it opens.
+/// the start of any regtest chain, as it was in 0.4.10.
 pub const POLICY_ACTIVATION_MAINNET: u64 = u64::MAX;
-pub const POLICY_ACTIVATION_TESTNET: u64 = u64::MAX;
 pub const POLICY_ACTIVATION_REGTEST: u64 = 1;
+
+/// Testnet activation height of policy outputs, and so of payment channels.
+///
+/// **Provisional: the value is set at release**, about two weeks of blocks
+/// after the day the release is published, so that every testnet node has
+/// time to upgrade. 17,000 assumes a tip near 4,440 (25 October 2026) and a
+/// release within a few days, at the two-minute target spacing. It is a hard
+/// fork: a 0.4.10 node refuses the first block that carries a policy and
+/// stops there. The one place to change it; nothing else repeats it.
+pub const POLICY_ACTIVATION_TESTNET: u64 = 17_000;
+
+/// How long before the activation height a node prepares its peers for it,
+/// in blocks: two days at the target spacing.
+///
+/// From `activation - POLICY_ACTIVATION_NOTICE` on, a node logs a warning for
+/// every connected peer that predates the activation: past the activation
+/// height that peer stops at the first block carrying a policy. And a peer
+/// that follows the activation may relay a policy transaction without
+/// penalty: it may be ahead of us, or we behind it.
+pub const POLICY_ACTIVATION_NOTICE: u64 = 1_440;
 
 /// Deepest nesting of a policy, the root counting as level one and a leaf
 /// as a level of its own.
@@ -677,7 +695,12 @@ const _: () = {
     assert!(MAX_POLICY_LEAVES * 34 + (MAX_POLICY_LEAVES - 1) * 2 <= MAX_POLICY_SIZE);
     // `Older` is encoded on two bytes: the bound is the encoding.
     assert!(MAX_POLICY_OLDER == u16::MAX as u64);
-    // The live networks never open the prototype rule.
+    // Mainnet never opens the rule.
     assert!(POLICY_ACTIVATION_MAINNET == u64::MAX);
-    assert!(POLICY_ACTIVATION_TESTNET == u64::MAX);
+    // Testnet opens it at a real height, past its tip when it was scheduled
+    // and far enough beyond the notice for every node to be warned in time.
+    assert!(POLICY_ACTIVATION_TESTNET != u64::MAX);
+    assert!(POLICY_ACTIVATION_TESTNET > 4_440 + POLICY_ACTIVATION_NOTICE);
+    // Regtest opens it at its first block, as 0.4.10 did.
+    assert!(POLICY_ACTIVATION_REGTEST == 1);
 };

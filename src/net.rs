@@ -310,14 +310,137 @@ pub const MISCONDUCT_BAD_TX: u32 = 20;
 
 /// Is `msg` unreadable on `network` for carrying a policy output?
 ///
-/// Policies are dormant on testnet and mainnet (activation height
-/// `u64::MAX`). There, a message carrying a policy output gets exactly what
-/// 0.4.9 gave it — it did not decode: [`MISCONDUCT_MALFORMED`] and the
-/// connection dropped — rather than the milder penalty of an invalid
-/// transaction, so that a dormant rule changes nothing in how peers are
-/// treated.
-pub fn policy_output_is_malformed(network: Network, msg: &Message) -> bool {
-    !crate::policy::may_appear_on(network) && msg.carries_policy_output()
+/// Where the rule is not in force, a message carrying a policy output gets
+/// exactly what 0.4.9 gave it — it did not decode: [`MISCONDUCT_MALFORMED`]
+/// and the connection dropped — rather than the milder penalty of an invalid
+/// transaction, so that a rule not yet open changes nothing in how peers are
+/// treated. That is always the case on mainnet, where it never opens.
+///
+/// Elsewhere it depends on the height the content could be mined at:
+///
+/// - a block, or a compact block, carries its height: below the activation
+///   height a policy output in it is malformed, from the activation height
+///   on it is validated like anything else;
+/// - a transaction (or the transactions of a compact block) is judged against
+///   our tip, `tip`. A peer that predates the activation
+///   ([`crate::wire::POLICY_ACTIVATION_VERSION`]) sending one before our next
+///   block is at the activation height gets the 0.4.9 treatment. A peer that
+///   follows it relays one only once its own next block is there, and it may
+///   be ahead of us — we may even be syncing from far behind: its
+///   transaction is refused without penalty (see `Node::tx_invalid_in_itself`)
+///   unless it comes earlier than [`crate::consensus::POLICY_ACTIVATION_NOTICE`]
+///   blocks before the activation height, counted from our tip or from the
+///   height the peer announced at the handshake (`peer_height`), whichever is
+///   higher.
+pub fn policy_output_is_malformed(
+    network: Network,
+    tip: u64,
+    peer_version: u32,
+    peer_height: u64,
+    msg: &Message,
+) -> bool {
+    if !msg.carries_policy_output() {
+        return false;
+    }
+    if !crate::policy::may_appear_on(network) {
+        return true;
+    }
+    let mined_at = match msg {
+        Message::Block(b) => b.header.height,
+        Message::CmpctBlock(c) => c.header.height,
+        _ if peer_version >= crate::wire::POLICY_ACTIVATION_VERSION => tip
+            .max(peer_height)
+            .saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE)
+            .saturating_add(1),
+        _ => tip.saturating_add(1),
+    };
+    !crate::policy::is_active(network, mined_at)
+}
+
+/// Is a channel message, received while channels are not open yet at our
+/// tip `tip` ([`crate::policy::reached`]), malformed?
+///
+/// Yes, as 0.4.9 read an unknown command, where channels never open
+/// (mainnet), from a peer that predates the activation, and from one that
+/// follows it but sends it earlier than
+/// [`crate::consensus::POLICY_ACTIVATION_NOTICE`] blocks before the
+/// activation height, counted from our tip or the height it announced. A
+/// peer closer than that may just be ahead of us: its message is ignored.
+pub fn channel_message_is_malformed(
+    network: Network,
+    tip: u64,
+    peer_version: u32,
+    peer_height: u64,
+) -> bool {
+    !crate::policy::may_appear_on(network)
+        || peer_version < crate::wire::POLICY_ACTIVATION_VERSION
+        || !crate::policy::is_active(
+            network,
+            tip.max(peer_height)
+                .saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE)
+                .saturating_add(1),
+        )
+}
+
+/// Does a peer that announced protocol `version` follow the policy
+/// activation of `network`? Always, where the network has no transition
+/// ([`crate::policy::has_transition`]): there, every version reads policies
+/// as this node does.
+pub fn follows_activation(network: Network, version: u32) -> bool {
+    !crate::policy::has_transition(network) || version >= crate::wire::POLICY_ACTIVATION_VERSION
+}
+
+/// What of a message a peer may receive: see [`for_peer`].
+enum ForPeer {
+    /// All of it, as it is: the common case, which copies nothing.
+    Unchanged,
+    /// Only this part of it.
+    Part(Message),
+    /// Nothing.
+    Withheld,
+}
+
+/// `m` as peer `peer` may receive it.
+///
+/// A peer that does not follow the policy activation reads a policy output
+/// as a malformed message and drops the link: it is never offered, nor
+/// sent, a transaction that creates or spends one.
+fn for_peer(g: &Shared, peer: u64, m: &Message) -> ForPeer {
+    let follows = g
+        .peers
+        .get(&peer)
+        .is_some_and(|p| follows_activation(g.network, p.version));
+    if follows {
+        return ForPeer::Unchanged;
+    }
+    let withheld = |hash: &Hash256| g.mempool.touches_policy(hash);
+    match m {
+        Message::Tx(t)
+            if t.outputs
+                .iter()
+                .any(|o| o.scheme == crate::sig::SchemeId::Policy)
+                || withheld(&t.txid()) =>
+        {
+            ForPeer::Withheld
+        }
+        Message::Inv(items)
+            if items
+                .iter()
+                .any(|i| i.kind == InvKind::Tx && withheld(&i.hash)) =>
+        {
+            let kept: Vec<InvItem> = items
+                .iter()
+                .filter(|i| i.kind != InvKind::Tx || !withheld(&i.hash))
+                .copied()
+                .collect();
+            if kept.is_empty() {
+                ForPeer::Withheld
+            } else {
+                ForPeer::Part(Message::Inv(kept))
+            }
+        }
+        _ => ForPeer::Unchanged,
+    }
 }
 
 /// See [`crate::validate::ValidationError::locally_unverifiable_scheme`].
@@ -1188,6 +1311,12 @@ pub struct PeerInfo {
     /// The peer's stable channel node id (hex), empty if none advertised. A
     /// `channelopen` may name a peer by this, surviving reconnects.
     pub channel_id: String,
+    /// The protocol version the peer announced (0 before its `Version`).
+    pub version: u32,
+    /// Whether that version follows the policy activation of this network
+    /// ([`follows_activation`]): a peer that does not stops at the first
+    /// block carrying a policy.
+    pub follows_activation: bool,
 }
 
 #[derive(Clone)]
@@ -1207,7 +1336,8 @@ pub struct Node {
     /// link to one of them can make a later link to the same node redundant:
     /// see the `Version` arm.
     configured: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
-    /// The payment-channel component, when this node runs channels (regtest).
+    /// The payment-channel component, when this node runs channels (regtest,
+    /// testnet).
     /// Its presence is what makes the node advertise the channel capability and
     /// accept channel messages; without it, channel frames are never sent and a
     /// received one is ignored.
@@ -1215,6 +1345,9 @@ pub struct Node {
     /// This node's stable channel identity (hex), advertised in the handshake
     /// when channels are enabled. Set from the sink at [`Node::set_channel_sink`].
     own_channel_id: Arc<std::sync::RwLock<Option<String>>>,
+    /// The links already warned about as predating the policy activation:
+    /// see [`Node::warn_peers_predating_activation`].
+    activation_warned: Arc<Mutex<HashSet<u64>>>,
 }
 
 #[derive(Default, Debug)]
@@ -1270,6 +1403,9 @@ pub struct Stats {
     pub tx_requests_deferred: AtomicU64,
     /// Transactions that arrived before their parent and went in once it did.
     pub orphans_adopted: AtomicU64,
+    /// Warnings logged about a connected peer that predates the policy
+    /// activation. See [`Node::warn_peers_predating_activation`].
+    pub peers_predating_activation_warned: AtomicU64,
 }
 
 impl Node {
@@ -1317,6 +1453,7 @@ impl Node {
             configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
             channel_sink: Arc::new(std::sync::RwLock::new(None)),
             own_channel_id: Arc::new(std::sync::RwLock::new(None)),
+            activation_warned: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -1364,11 +1501,16 @@ impl Node {
     /// channel capability. Returns false if the peer is unknown or did not
     /// advertise it — so a node that does not speak the protocol is never sent
     /// one.
+    ///
+    /// Nor is one sent before channels open on this network
+    /// ([`crate::policy::reached`]): a peer that predates them reads it as
+    /// malformed.
     pub fn send_channel(&self, peer: u64, payload: Vec<u8>) -> bool {
         let writer = {
             let g = self.shared.lock().unwrap();
+            let open = crate::policy::reached(g.network, g.chain.height());
             match g.peers.get(&peer) {
-                Some(p) if p.handshaked && p.channels => Some(p.writer.clone()),
+                Some(p) if open && p.handshaked && p.channels => Some(p.writer.clone()),
                 _ => None,
             }
         };
@@ -1495,6 +1637,8 @@ impl Node {
                 supports_channels: p.channels,
                 height: p.start_height,
                 channel_id: p.channel_id.clone(),
+                version: p.version,
+                follows_activation: follows_activation(g.network, p.version),
             })
             .collect();
         v.sort_by_key(|p| p.id);
@@ -2179,7 +2323,69 @@ impl Node {
             // loop, which was waiting, exits with an error and its thread dies.
             self.disconnect(id);
         }
+        self.warn_peers_predating_activation();
         dropped
+    }
+
+    /// The established peers that do not follow the policy activation of
+    /// this network ([`follows_activation`]): zero where it has no
+    /// transition.
+    pub fn peers_predating_activation(&self) -> usize {
+        let g = self.shared.lock().unwrap();
+        g.peers
+            .values()
+            .filter(|p| p.handshaked && !follows_activation(g.network, p.version))
+            .count()
+    }
+
+    /// Logs a warning, once per link, for each established peer that predates
+    /// the policy activation, from [`crate::consensus::POLICY_ACTIVATION_NOTICE`]
+    /// blocks before the activation height on. Such a node stops at the first
+    /// block carrying a policy: its operator must upgrade it before then, and
+    /// ours should know that this link will not last. Called at every
+    /// maintenance round; returns how many peers were warned about now.
+    pub fn warn_peers_predating_activation(&self) -> usize {
+        let (network, tip, peers, older) = {
+            let g = self.shared.lock().unwrap();
+            let older: Vec<(u64, SocketAddr, u32, String)> = g
+                .peers
+                .iter()
+                .filter(|(_, p)| p.handshaked && !follows_activation(g.network, p.version))
+                .map(|(id, p)| (*id, p.addr, p.version, p.user_agent.clone()))
+                .collect();
+            let peers: HashSet<u64> = g.peers.keys().copied().collect();
+            (g.network, g.chain.height(), peers, older)
+        };
+        let mut warned = self.activation_warned.lock().unwrap();
+        warned.retain(|id| peers.contains(id));
+        if !crate::policy::has_transition(network) {
+            return 0;
+        }
+        let h = crate::policy::activation_height(network);
+        if tip.saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE) < h {
+            return 0;
+        }
+        let mut count = 0;
+        for (id, addr, version, agent) in older {
+            if !warned.insert(id) {
+                continue;
+            }
+            let when = if tip < h {
+                format!("at block {h}, {} blocks from now", h - tip)
+            } else {
+                format!("since block {h}")
+            };
+            eprintln!(
+                "warning: peer {addr} ({agent}, protocol {version}) predates the activation \
+                 of policy outputs {when}: it stops at the first block carrying one. \
+                 Its operator must upgrade it to 0.4.11 or later."
+            );
+            count += 1;
+        }
+        self.stats
+            .peers_predating_activation_warned
+            .fetch_add(count as u64, Ordering::Relaxed);
+        count
     }
 
     pub fn mempool_len(&self) -> usize {
@@ -2383,7 +2589,6 @@ impl Node {
     fn read_loop(&self, id: u64, mut stream: TcpStream) {
         let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut chunk = [0u8; 32 * 1024];
-        let network = self.shared.lock().unwrap().network;
 
         loop {
             if self.is_stopped() {
@@ -2412,7 +2617,7 @@ impl Node {
                 match Message::parse(&buffer, self.magic) {
                     Ok((msg, consumed)) => {
                         buffer.drain(..consumed);
-                        if policy_output_is_malformed(network, &msg) {
+                        if msg.carries_policy_output() && self.policy_is_malformed_from(id, &msg) {
                             self.penalize(id, MISCONDUCT_MALFORMED);
                             return;
                         }
@@ -2431,6 +2636,21 @@ impl Node {
         }
     }
 
+    /// [`policy_output_is_malformed`] for a message of peer `id`, against
+    /// our tip and what the peer announced at the handshake.
+    fn policy_is_malformed_from(&self, id: u64, msg: &Message) -> bool {
+        let (network, tip, version, height) = {
+            let g = self.shared.lock().unwrap();
+            let (version, height) = g
+                .peers
+                .get(&id)
+                .map(|p| (p.version, p.start_height))
+                .unwrap_or((0, 0));
+            (g.network, g.chain.height(), version, height)
+        };
+        policy_output_is_malformed(network, tip, version, height, msg)
+    }
+
     /// A transaction that only its author could have made invalid.
     fn tx_invalid_in_itself(e: &crate::mempool::MempoolError) -> bool {
         use crate::mempool::MempoolError as M;
@@ -2439,6 +2659,11 @@ impl Node {
             // "I cannot verify" is not "you are lying": see
             // `locally_unverifiable_scheme`.
             M::Validation(v) if locally_unverifiable_scheme(v).is_some() => false,
+            // A policy output our next block cannot carry yet, from a peer
+            // ahead of us: the height, not its author, makes it invalid. Where
+            // the peer could not honestly be ahead, the message never got
+            // this far (`policy_output_is_malformed`).
+            M::Validation(V::SchemeForbiddenOnNetwork(crate::sig::SchemeId::Policy)) => false,
             M::Validation(
                 V::Signature(_)
                 | V::KeyDoesNotMatchLock
@@ -3750,14 +3975,20 @@ impl Node {
                 // must stay within its per-peer rate. The decoded bytes are
                 // handed to the channel component after the lock is released,
                 // never under it.
-                // Channels exist on regtest only. Anywhere else this message
-                // gets what 0.4.9 gave it as an unknown command: malformed,
-                // and the link is cut.
-                Message::Channel(_) if network != Network::Regtest => {
+                // Channels open with policies: on regtest from the start, on
+                // testnet once the tip has reached the activation height,
+                // never on mainnet. Before that this message gets what 0.4.9
+                // gave it as an unknown command — malformed, and the link is
+                // cut — unless a peer that follows the activation may just
+                // be ahead of us: then it is ignored.
+                Message::Channel(_) if !crate::policy::reached(network, g.chain.height()) => {
+                    let tip = g.chain.height();
                     if let Some(p) = g.peers.get_mut(&id) {
-                        p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
+                        if channel_message_is_malformed(network, tip, p.version, p.start_height) {
+                            p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
+                            drop_peer = true;
+                        }
                     }
-                    drop_peer = true;
                 }
                 Message::Channel(bytes) => {
                     let (hs, cap) = g
@@ -3844,9 +4075,14 @@ impl Node {
         // and broadcast without holding it.
         self.scan_connected_blocks_for_channels();
 
-        for e in outgoing {
+        for mut e in outgoing {
             let writer = {
                 let mut g = self.shared.lock().unwrap();
+                match for_peer(&g, e.peer, &e.message) {
+                    ForPeer::Unchanged => {}
+                    ForPeer::Part(m) => e.message = m,
+                    ForPeer::Withheld => continue,
+                }
                 // A requested body is noted, so we know whether it arrives —
                 // within the limit of in-flight slots, as everywhere. A header
                 // request too: only an expected reply will be read.
@@ -4383,14 +4619,22 @@ impl Node {
     /// Sends a message to a peer, outside the lock, noting the requested
     /// bodies as `handle` does.
     fn send_to(&self, id: u64, m: &Message) {
+        let mut part = None;
         let writer = {
             let mut g = self.shared.lock().unwrap();
+            match for_peer(&g, id, m) {
+                ForPeer::Unchanged => {}
+                ForPeer::Part(p) => part = Some(p),
+                ForPeer::Withheld => return,
+            }
+            let m = part.as_ref().unwrap_or(m);
             g.peers.get_mut(&id).map(|p| {
                 p.note_sent(m, Instant::now());
                 p.writer.clone()
             })
         };
         if let Some(s) = writer {
+            let m = part.as_ref().unwrap_or(m);
             let frame = frame_of(m, self.magic);
             if must_deliver(m) {
                 let _ = s.push_force(frame);
@@ -4423,42 +4667,63 @@ impl Node {
     }
 
     pub fn announce_mempool(&self) -> usize {
-        let (targets, pending): (Vec<Arc<Outbox>>, Vec<Hash256>) = {
+        let (targets, pending, older, without_policies) = {
             let g = self.shared.lock().unwrap();
             // The whole pool, not just its top: a peer behind by thousands
             // reconciles the rest here, bounding its own intake. See
             // `Mempool::announcement_window`.
             let pending = g.mempool.announcement_window(MEMPOOL_REOFFER_MAX_TXS);
-            let targets = g
+            let (follow, older): (Vec<&Peer>, Vec<&Peer>) = g
                 .peers
                 .values()
                 .filter(|p| p.handshaked)
-                .map(|p| p.writer.clone())
-                .collect();
-            (targets, pending)
+                .partition(|p| follows_activation(g.network, p.version));
+            // The peers that predate the policy activation get the pool
+            // without its policy transactions: see `for_peer`.
+            let without_policies: Vec<Hash256> = if older.is_empty() {
+                Vec::new()
+            } else {
+                pending
+                    .iter()
+                    .filter(|h| !g.mempool.touches_policy(h))
+                    .copied()
+                    .collect()
+            };
+            (
+                follow.iter().map(|p| p.writer.clone()).collect::<Vec<_>>(),
+                pending,
+                older.iter().map(|p| p.writer.clone()).collect::<Vec<_>>(),
+                without_policies,
+            )
         };
         if pending.is_empty() {
             return 0;
         }
-        let m = Message::Inv(
-            pending
-                .iter()
-                .map(|hash| InvItem {
-                    kind: InvKind::Tx,
-                    hash: *hash,
-                })
-                .collect(),
-        );
-        self.broadcast(&targets, &m);
+        let inv = |hashes: &[Hash256]| {
+            Message::Inv(
+                hashes
+                    .iter()
+                    .map(|hash| InvItem {
+                        kind: InvKind::Tx,
+                        hash: *hash,
+                    })
+                    .collect(),
+            )
+        };
+        self.broadcast(&targets, &inv(&pending));
+        if !without_policies.is_empty() {
+            self.broadcast(&older, &inv(&without_policies));
+        }
         pending.len()
     }
 
     pub fn announce_tx(&self, txid: Hash256) {
         let targets: Vec<Arc<Outbox>> = {
             let g = self.shared.lock().unwrap();
+            let policy = g.mempool.touches_policy(&txid);
             g.peers
                 .values()
-                .filter(|p| p.handshaked)
+                .filter(|p| p.handshaked && (!policy || follows_activation(g.network, p.version)))
                 .map(|p| p.writer.clone())
                 .collect()
         };
@@ -4897,6 +5162,51 @@ mod tests {
                 g.peers.values().any(|p| p.handshaked)
             },
             "and never marked handshaked"
+        );
+        a.shutdown();
+    }
+
+    /// Regtest opens policies at its first block and mainnet never does:
+    /// neither has a transition, so every peer is offered everything, as in
+    /// 0.4.10.
+    #[test]
+    fn without_a_transition_every_version_follows() {
+        for network in [Network::Regtest, Network::Mainnet] {
+            assert!(!crate::policy::has_transition(network));
+            for version in [MIN_PROTOCOL_VERSION, 4, PROTOCOL_VERSION] {
+                assert!(follows_activation(network, version));
+            }
+        }
+    }
+
+    /// A 0.4.10 node speaks protocol 4: it predates the policy activation but
+    /// is still a peer, as it must be until the activation height.
+    #[test]
+    fn a_0_4_10_peer_completes_the_handshake() {
+        use std::io::Write;
+        let a = node();
+        let addr = a.listen("127.0.0.1:0").expect("listen");
+        let magic = magic_for(NETWORK);
+        let mut s = std::net::TcpStream::connect(addr).expect("connection");
+        let v4 = Message::Version {
+            version: 4,
+            timestamp: unix_now(),
+            nonce: 0x0410,
+            user_agent: "q21:0.4".into(),
+            start_height: 0,
+        };
+        s.write_all(&v4.frame(magic)).unwrap();
+        s.write_all(&Message::VerAck.frame(magic)).unwrap();
+        s.flush().unwrap();
+        assert!(
+            wait_until(
+                || {
+                    let g = a.shared.lock().unwrap();
+                    g.peers.values().any(|p| p.handshaked && p.version == 4)
+                },
+                5
+            ),
+            "a version-4 peer must stay welcome"
         );
         a.shutdown();
     }
@@ -5983,6 +6293,48 @@ mod tests_hardening {
             !a.handle(7, Message::Channel(vec![0u8; 40])),
             "a peer at the threshold is still disconnected"
         );
+    }
+
+    /// `getpeers` shows each peer's protocol version, and whether it follows
+    /// the policy activation.
+    #[test]
+    fn the_peer_list_shows_the_protocol_version() {
+        let (a, _) = node_pair();
+        let _e = established_peer(&a, 7);
+        a.shared.lock().unwrap().peers.get_mut(&7).unwrap().version = 4;
+        let p = a.peer_list().into_iter().find(|p| p.id == 7).unwrap();
+        assert_eq!(p.version, 4);
+        assert!(p.follows_activation, "regtest has no transition");
+    }
+
+    /// Without a transition there is nothing to warn about, whatever the
+    /// versions connected.
+    #[test]
+    fn no_warning_about_old_peers_without_a_transition() {
+        let (a, _) = node_pair();
+        let _e = established_peer(&a, 7);
+        a.shared.lock().unwrap().peers.get_mut(&7).unwrap().version = 4;
+        assert_eq!(a.peers_predating_activation(), 0);
+        assert_eq!(a.warn_peers_predating_activation(), 0);
+    }
+
+    /// A channel message before channels open: malformed where they never
+    /// open and from a peer that predates them; from one that follows them,
+    /// only when it is earlier than the notice before the activation.
+    #[test]
+    fn a_channel_message_before_activation_is_malformed_unless_the_peer_may_be_ahead() {
+        let new = crate::wire::POLICY_ACTIVATION_VERSION;
+        for v in [0, 4, new] {
+            assert!(channel_message_is_malformed(Network::Mainnet, 0, v, 0));
+            assert!(channel_message_is_malformed(
+                Network::Mainnet,
+                1 << 40,
+                v,
+                1 << 40
+            ));
+        }
+        assert!(channel_message_is_malformed(Network::Regtest, 0, 4, 0));
+        assert!(!channel_message_is_malformed(Network::Regtest, 0, new, 0));
     }
 
     /// Finding 14: off regtest, where channels do not exist, a channel

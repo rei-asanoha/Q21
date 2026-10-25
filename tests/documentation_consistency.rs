@@ -464,3 +464,50 @@ fn the_release_publishes_archives_and_signed_sums_only() {
         "the release publishes the unsigned per-file hashes again"
     );
 }
+
+/// The audit feature carries the hooks the tests and the lab use to make
+/// inconsistent or early state — among them a policy activation height other
+/// than the scheduled one. A released binary must not have them: it is built
+/// with `mldsa` alone, and every `cargo build --release` of the workflow says
+/// so.
+#[test]
+fn the_released_binary_is_built_without_the_audit_hooks() {
+    let workflow = read(".github/workflows/release.yml");
+    let builds: Vec<&str> = workflow
+        .lines()
+        .filter(|l| l.contains("cargo build") && l.contains("--release"))
+        .collect();
+    assert!(!builds.is_empty(), "no release build in the workflow");
+    for b in builds {
+        assert!(
+            b.contains("--features mldsa") && !b.contains("audit") && !b.contains("--all-features"),
+            "a release build that may carry the audit hooks: {b}"
+        );
+    }
+}
+
+/// The upgrade notes announce the testnet activation height. The height is
+/// set at release: the notes must follow it, or operators would upgrade by
+/// the wrong date.
+#[test]
+fn upgrading_md_announces_the_compiled_testnet_activation() {
+    let h = q21_core::consensus::POLICY_ACTIVATION_TESTNET;
+    let digits = h.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    let text = read("UPGRADING.md");
+    let start = text
+        .find("# Upgrading from 0.4.10 to 0.4.11")
+        .expect("UPGRADING.md has no 0.4.10 to 0.4.11 section");
+    let section = &text[start..];
+    let section = &section[..section[1..].find("\n# ").map_or(section.len(), |e| e + 1)];
+    assert!(
+        section.contains(&format!("block {grouped}")),
+        "the 0.4.11 notes do not announce block {grouped}, the compiled testnet activation"
+    );
+}
