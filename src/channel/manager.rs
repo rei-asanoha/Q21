@@ -56,6 +56,10 @@ pub type FundFn = dyn Fn(Hash256, TxOut) -> Result<Transaction, String> + Send +
 pub type BroadcastFn = dyn Fn(&Transaction) -> Result<(), String> + Send + Sync;
 /// Yields a fresh wallet address to receive swept or claimed funds.
 pub type SweepAddrFn = dyn Fn() -> Hash256 + Send + Sync;
+/// Holds back (`true`) or releases (`false`) the wallet coins a funding
+/// transaction spends, so no other spend selects them while the funding is
+/// signed but not yet confirmed. Idempotent; takes the wallet lock itself.
+pub type ReserveFn = dyn Fn(&Transaction, bool) + Send + Sync;
 
 /// How far back a startup rescan looks for a channel whose journal holds no
 /// funding height (one opened before it was journaled).
@@ -71,6 +75,9 @@ pub struct Hooks {
     pub fund: Box<FundFn>,
     pub broadcast: Box<BroadcastFn>,
     pub sweep_address: Box<SweepAddrFn>,
+    /// See [`ReserveFn`]: from the funding's signature at Accept until it
+    /// confirms, or until the channel is given up.
+    pub reserve: Box<ReserveFn>,
     /// Yields a fresh wallet address to receive this party's cooperative-close
     /// payout — a real wallet address the wallet scans and can spend, never a
     /// channel key.
@@ -157,6 +164,13 @@ struct Chan {
     /// classified afresh — a revoked commitment that replaced the latest one
     /// is still punished.
     spend: Option<Hash256>,
+    /// Whether the coins of our funding transaction are held back in the
+    /// wallet (see [`ReserveFn`]).
+    reserved: bool,
+    /// Blocks in a row in which a coin our unconfirmed funding spends was
+    /// seen spent on chain by something else: once that is buried, the
+    /// funding can never confirm and the channel is given up.
+    conflicted: u64,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -278,6 +292,18 @@ impl Inner {
     /// (`inbound`), or those we open.
     fn unfunded(&self, inbound: bool) -> usize {
         self.unfunded_iter(inbound).count()
+    }
+
+    fn unfunded_iter_mut(&mut self, inbound: bool) -> impl Iterator<Item = &mut Chan> {
+        let side = if inbound {
+            crate::channel::txbuild::ACCEPTOR
+        } else {
+            crate::channel::txbuild::FUNDER
+        };
+        self.channels.values_mut().filter(move |c| {
+            matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
+                && c.machine.our_index() == side
+        })
     }
 
     fn unfunded_iter(&self, inbound: bool) -> impl Iterator<Item = &Chan> {
@@ -489,6 +515,8 @@ impl ChannelManager {
                         synced: false,
                         close: None,
                         spend: None,
+                        reserved: false,
+                        conflicted: 0,
                     },
                 );
             }
@@ -916,6 +944,8 @@ impl ChannelManager {
                 synced: true,
                 close: None,
                 spend: None,
+                reserved: false,
+                conflicted: 0,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
@@ -1006,19 +1036,33 @@ impl ChannelManager {
                 let funding_output = chan.machine.funding_output();
                 drop(g); // the fund hook takes the chain lock
                 let tx = (self.hooks.fund)(cid, funding_output)?;
-                let index = tx
-                    .outputs
-                    .iter()
-                    .position(|o| *o == funding_output)
-                    .ok_or("the funding transaction does not pay the channel")?;
-                let outpoint = OutPoint {
-                    txid: tx.txid(),
-                    index: index as u32,
-                };
-                let mut g = self.inner.lock().unwrap();
-                let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
-                let m = chan.machine.funding_built(outpoint, &tx).map_err(err)?;
-                out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+                // Its coins are held back at once: until it is broadcast, a
+                // round trip from now, they are in no mempool, and any other
+                // spend would choose them again.
+                (self.hooks.reserve)(&tx, true);
+                let built = (|| {
+                    let index = tx
+                        .outputs
+                        .iter()
+                        .position(|o| *o == funding_output)
+                        .ok_or("the funding transaction does not pay the channel")?;
+                    let outpoint = OutPoint {
+                        txid: tx.txid(),
+                        index: index as u32,
+                    };
+                    let mut g = self.inner.lock().unwrap();
+                    let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+                    let m = chan.machine.funding_built(outpoint, &tx).map_err(err)?;
+                    chan.reserved = true;
+                    Ok::<_, String>(m)
+                })();
+                match built {
+                    Ok(m) => out.push(write_frame(cid, KIND_ENGINE, &m.encode())),
+                    Err(e) => {
+                        (self.hooks.reserve)(&tx, false);
+                        return Err(e);
+                    }
+                }
             }
             ChMsg::Funding { .. } => {
                 let m = chan.machine.on_funding(&msg).map_err(err)?;
@@ -1172,6 +1216,8 @@ impl ChannelManager {
                 synced: true,
                 close: None,
                 spend: None,
+                reserved: false,
+                conflicted: 0,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
@@ -1288,21 +1334,57 @@ impl ChannelManager {
             })
             .map(|c| (c.machine.channel_id(), ttl_of(c)))
             .collect();
+        let mut release = Vec::new();
         for (cid, ttl) in stale {
-            self.forget(&mut g, cid);
+            release.extend(self.forget(&mut g, cid));
             eprintln!(
                 "channel {}: never funded; forgotten after waiting {}s",
                 cid.to_hex(),
                 ttl.as_secs()
             );
         }
+        // Our funding, unconfirmed, whose coins something else spent on chain:
+        // it can never confirm. Given up once that spend is buried — nothing
+        // of ours went into a channel that never existed.
+        let network = self.network;
+        let mut given_up = Vec::new();
+        for c in g.unfunded_iter_mut(false) {
+            let lost = c.spend.is_none()
+                && c.machine.funding_tx().is_some_and(|tx| {
+                    c.machine
+                        .funding_outpoint()
+                        .is_some_and(|op| depth_of(&op).is_none())
+                        && tx.inputs.iter().any(|i| depth_of(&i.prev_out).is_none())
+                });
+            c.conflicted = if lost { c.conflicted + 1 } else { 0 };
+            if c.conflicted >= settle_depth(network, c.machine.funding_depth()) {
+                given_up.push(c.machine.channel_id());
+            }
+        }
+        for cid in given_up {
+            release.extend(self.forget(&mut g, cid));
+            eprintln!(
+                "channel {}: a coin its funding spends was spent elsewhere; the funding \
+                 can never confirm, channel given up",
+                cid.to_hex()
+            );
+        }
+        drop(g);
+        for tx in release {
+            (self.hooks.reserve)(&tx, false);
+        }
     }
 
     /// Drops a channel with nothing at stake, its journal and sidecar too.
-    fn forget(&self, g: &mut Inner, cid: Hash256) {
-        g.channels.remove(&cid);
+    /// Returns its funding transaction if its coins were held back: the
+    /// caller releases them (see [`ReserveFn`]) once the lock is dropped.
+    fn forget(&self, g: &mut Inner, cid: Hash256) -> Option<Transaction> {
+        let chan = g.channels.remove(&cid)?;
         let _ = std::fs::remove_file(self.journal_path(cid));
         let _ = std::fs::remove_file(self.peer_identity_path(cid));
+        chan.reserved
+            .then(|| chan.machine.funding_tx().cloned())
+            .flatten()
     }
 
     /// Catches up, at startup, with what happened on chain while the node was
@@ -1364,9 +1446,22 @@ impl ChannelManager {
     /// [`ChannelManager::rescan`]).
     fn resume_after_restart(&self, depth_of: &DepthOf) {
         let mut pending: Vec<(Transaction, &'static str)> = Vec::new();
+        let mut hold = Vec::new();
         {
-            let g = self.inner.lock().unwrap();
-            for c in g.channels.values() {
+            let mut g = self.inner.lock().unwrap();
+            for c in g.channels.values_mut() {
+                // Our funding, signed and not yet on chain: its coins are held
+                // back again (the wallet keeps that in memory only).
+                if matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
+                    && c.machine
+                        .funding_outpoint()
+                        .is_some_and(|op| depth_of(&op).is_none())
+                {
+                    if let Some(tx) = c.machine.funding_tx() {
+                        hold.push(tx.clone());
+                        c.reserved = true;
+                    }
+                }
                 // Our funding, signed for by the acceptor, not yet on chain: a
                 // crash may have come before its broadcast, or lost it.
                 if c.machine.phase() == Phase::Funded {
@@ -1419,6 +1514,9 @@ impl ChannelManager {
                     }
                 }
             }
+        }
+        for tx in hold {
+            (self.hooks.reserve)(&tx, true);
         }
         for (tx, what) in pending {
             self.broadcast_or_warn(&tx, what);
@@ -1557,11 +1655,18 @@ impl ChannelManager {
         // from there for a spend it missed while down. Recorded for any channel
         // whose funding is on chain, so one opened before this was journaled
         // gets it at the next block.
+        let mut confirmed = Vec::new();
         for c in g.channels.values_mut() {
             if let Some((depth, _)) = c.machine.funding_outpoint().and_then(|op| depth_of(&op)) {
                 let at = height.saturating_add(1).saturating_sub(depth);
                 if c.machine.funding_height() != Some(at) {
                     let _ = c.machine.note_funding_height(at);
+                }
+                // Our funding is on chain: its coins are spent, nothing left
+                // to hold back.
+                if c.reserved {
+                    c.reserved = false;
+                    confirmed.extend(c.machine.funding_tx().cloned());
                 }
             }
         }
@@ -1587,7 +1692,7 @@ impl ChannelManager {
                  output for its capacity; forgotten",
                 cid.to_hex()
             );
-            self.forget(&mut g, cid);
+            let _ = self.forget(&mut g, cid);
         }
         let ready: Vec<(Hash256, u64)> = g
             .channels
@@ -1624,6 +1729,10 @@ impl ChannelManager {
                     frames.push((peer, write_frame(cid, KIND_ENGINE, &msg.encode())));
                 }
             }
+        }
+        drop(g);
+        for tx in confirmed {
+            (self.hooks.reserve)(&tx, false);
         }
         frames
     }
@@ -2003,6 +2112,7 @@ mod tests {
             broadcast: Box::new(|_| Ok(())),
             sweep_address: Box::new(|| Hash256::ZERO),
             payout_address: Box::new(|| Hash256::ZERO),
+            reserve: Box::new(|_, _| {}),
         };
         let mgr = ChannelManager::new(Network::Regtest, 10, [0x77u8; 32], dir, 12, 2, hooks);
         let mut slot = std::mem::ManuallyDrop::new(mgr);

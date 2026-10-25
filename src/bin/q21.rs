@@ -4729,6 +4729,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                         w.sign_spend(&m.view(&c.utxo), prepared)
                             .map_err(|e| format!("{e:?}"))
                     })?;
+                    // Held back under the same wallet lock that chose them:
+                    // the funding goes out only after the peer's FundingSigned.
+                    let coins: Vec<_> = tx.inputs.iter().map(|i| i.prev_out).collect();
+                    w.lock_coins(&coins);
                     let _ = write_wallet(&folder_fund, &w);
                     Ok(tx)
                 },
@@ -4774,6 +4778,20 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 h
             });
 
+            // The coins of a funding signed and not yet confirmed, held back
+            // from every other spend of the wallet.
+            let w_reserve = wallet.clone();
+            let reserve = Box::new(move |tx: &Transaction, hold: bool| {
+                let coins: Vec<_> = tx.inputs.iter().map(|i| i.prev_out).collect();
+                if let Ok(mut w) = w_reserve.lock() {
+                    if hold {
+                        w.lock_coins(&coins);
+                    } else {
+                        w.unlock_coins(&coins);
+                    }
+                }
+            });
+
             let mgr = std::sync::Arc::new(ChannelManager::new(
                 network,
                 q21_core::mempool::MIN_FEE_RATE,
@@ -4786,6 +4804,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     broadcast,
                     sweep_address,
                     payout_address,
+                    reserve,
                 },
             ));
             // The manager holds its own copy, wiped when it is dropped.

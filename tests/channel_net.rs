@@ -96,11 +96,22 @@ fn hooks(wallet: Arc<Mutex<Wallet>>, node: Node, pending: Pending, can_fund: boo
     let sweep_address = Box::new(move || w_s.lock().unwrap().new_address().hash);
     let w_p = wallet.clone();
     let payout_address = Box::new(move || w_p.lock().unwrap().new_address().hash);
+    let w_r = wallet.clone();
+    let reserve = Box::new(move |tx: &Transaction, hold: bool| {
+        let coins: Vec<_> = tx.inputs.iter().map(|i| i.prev_out).collect();
+        let mut w = w_r.lock().unwrap();
+        if hold {
+            w.lock_coins(&coins);
+        } else {
+            w.unlock_coins(&coins);
+        }
+    });
     Hooks {
         fund,
         broadcast,
         sweep_address,
         payout_address,
+        reserve,
     }
 }
 

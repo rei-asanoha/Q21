@@ -188,7 +188,22 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
         broadcast,
         sweep_address: Box::new(|| FUNDER_PAYOUT),
         payout_address: Box::new(|| FUNDER_PAYOUT),
+        reserve: wallet_reserve(wallet),
     }
+}
+
+/// The reserve hook a node installs: the funding's coins locked in the
+/// wallet, or released.
+fn wallet_reserve(wallet: Arc<Mutex<Wallet>>) -> Box<q21_core::channel::manager::ReserveFn> {
+    Box::new(move |tx: &Transaction, hold: bool| {
+        let coins: Vec<OutPoint> = tx.inputs.iter().map(|i| i.prev_out).collect();
+        let mut w = wallet.lock().unwrap();
+        if hold {
+            w.lock_coins(&coins);
+        } else {
+            w.unlock_coins(&coins);
+        }
+    })
 }
 
 /// The funder's cooperative-close / sweep payout address in these tests.
@@ -207,6 +222,7 @@ fn acceptor_hooks(chain: Arc<Mutex<SharedChain>>, sweep: Hash256) -> Hooks {
         }),
         sweep_address: Box::new(move || sweep),
         payout_address: Box::new(|| ACCEPTOR_PAYOUT),
+        reserve: Box::new(|_, _| {}),
     }
 }
 
@@ -1140,6 +1156,7 @@ fn relaying_manager(
             }),
             sweep_address: Box::new(move || sweep),
             payout_address: Box::new(|| ACCEPTOR_PAYOUT),
+            reserve: Box::new(|_, _| {}),
         },
     );
     (mgr, sent)
@@ -1769,6 +1786,7 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
             }),
             sweep_address: real.sweep_address,
             payout_address: real.payout_address,
+            reserve: real.reserve,
         },
     );
     let acceptor = ChannelManager::new(
@@ -2461,4 +2479,172 @@ fn a_close_settles_past_the_deepest_reorganization_off_regtest() {
         assert!(settle_depth(net, DEPTH) > MAX_REORG_DEPTH);
         assert!(settle_depth(net, 2016) >= 2016);
     }
+}
+
+/// A funder whose broadcasts go nowhere, so its funding stays unconfirmed
+/// until the test mines it, and an acceptor; both driven by hand.
+fn unconfirmed_funding_pair(
+    funder_seed: [u8; 32],
+    acceptor_seed: [u8; 32],
+    tag: &str,
+) -> (
+    Pair,
+    Arc<Mutex<Wallet>>,
+    Arc<Mutex<SharedChain>>,
+    std::path::PathBuf,
+    Arc<Mutex<Vec<Transaction>>>,
+) {
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir(tag);
+    std::fs::create_dir_all(dir.join("funder")).unwrap();
+    std::fs::create_dir_all(dir.join("acceptor")).unwrap();
+    let sent: Arc<Mutex<Vec<Transaction>>> = Arc::new(Mutex::new(Vec::new()));
+    let s1 = sent.clone();
+    let funder = ChannelManager::new(
+        NET,
+        RATE,
+        funder_seed,
+        dir.join("funder"),
+        DELAY,
+        DEPTH,
+        Hooks {
+            broadcast: Box::new(move |tx| {
+                s1.lock().unwrap().push(tx.clone());
+                Ok(())
+            }),
+            ..funder_hooks(wallet.clone(), chain.clone())
+        },
+    );
+    let acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("acceptor"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+    );
+    let p = Pair {
+        funder,
+        acceptor,
+        queue: VecDeque::new(),
+    };
+    (p, wallet, chain, dir, sent)
+}
+
+/// N4: the funding is signed when the acceptor accepts and broadcast a round
+/// trip later, after its FundingSigned. Meanwhile its coins were in no
+/// mempool, and any other send chose them again, turning the funding into a
+/// double spend. They are held back from signing until the funding confirms,
+/// and again after a restart.
+#[test]
+fn funding_coins_are_held_back_until_the_funding_confirms() {
+    let (p, wallet, chain, dir, sent) =
+        unconfirmed_funding_pair([0xb1u8; 32], [0xb2u8; 32], "n4-hold");
+    let one = |r: q21_core::channel::manager::Reaction| -> Vec<u8> {
+        assert_eq!(r.penalize, 0);
+        r.frames.into_iter().next().expect("a frame")
+    };
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    let back = one(p.acceptor.deliver(F_PEER, "", &hello));
+    let open = one(p.funder.deliver(A_PEER, "", &back));
+    let accept = one(p.acceptor.deliver(F_PEER, "", &open));
+    let funding = one(p.funder.deliver(A_PEER, "", &accept));
+    let cid = p.funder.list()[0].channel_id;
+    let txid = p.funder.info(cid).unwrap().funding.unwrap().txid;
+    // Signed, not broadcast: a send now picks other coins.
+    assert!(sent.lock().unwrap().is_empty());
+    let spend_avoids_funding = |inputs: &[OutPoint]| {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        let (chosen, _) = w
+            .select_coins_avoiding(&c.chain.utxo, c.chain.height(), 1, &|_| false, &[])
+            .expect("other coins");
+        chosen.iter().all(|(o, _, _)| !inputs.contains(o)) && inputs.iter().all(|o| w.is_locked(o))
+    };
+    let signed = one(p.acceptor.deliver(F_PEER, "", &funding));
+    assert_eq!(p.funder.deliver(A_PEER, "", &signed).penalize, 0);
+    let tx = sent.lock().unwrap()[0].clone();
+    assert_eq!(tx.txid(), txid);
+    let inputs: Vec<OutPoint> = tx.inputs.iter().map(|i| i.prev_out).collect();
+    assert!(
+        spend_avoids_funding(&inputs),
+        "the funding's coins chosen again"
+    );
+
+    // A restart, its locks lost with the process: held back again.
+    wallet.lock().unwrap().unlock_coins(&inputs);
+    let Pair { funder, .. } = p;
+    drop(funder);
+    let funder = restart_and_rescan(
+        [0xb1u8; 32],
+        &dir.join("funder"),
+        Hooks {
+            broadcast: Box::new(|_| Ok(())),
+            ..funder_hooks(wallet.clone(), chain.clone())
+        },
+        &chain,
+    );
+    assert!(
+        spend_avoids_funding(&inputs),
+        "not held back after a restart"
+    );
+
+    // Confirmed: nothing left to hold.
+    chain.lock().unwrap().mine(std::slice::from_ref(&tx));
+    drive(&funder, &chain);
+    assert!(inputs.iter().all(|o| !wallet.lock().unwrap().is_locked(o)));
+}
+
+/// N4: a coin our unconfirmed funding spends is spent on chain by something
+/// else: the funding can never confirm, and once that spend is buried the
+/// channel is given up, its journal deleted.
+#[test]
+fn a_funding_whose_coin_is_spent_elsewhere_is_given_up() {
+    let (mut p, wallet, chain, dir, sent) =
+        unconfirmed_funding_pair([0xb3u8; 32], [0xb4u8; 32], "n4-conflict");
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    let funding = sent.lock().unwrap()[0].clone();
+    // The same coin, spent by another transaction that confirms.
+    let conflict = {
+        let mut w = wallet.lock().unwrap();
+        let coins: Vec<OutPoint> = funding.inputs.iter().map(|i| i.prev_out).collect();
+        w.unlock_coins(&coins);
+        let c = chain.lock().unwrap();
+        let (utxo, height) = (&c.chain.utxo, c.chain.height());
+        let to = w.new_address();
+        let prepared = w
+            .prepare_spend(
+                utxo,
+                height,
+                &[(to, Amount::from_units(MIN_OUTPUT_VALUE))],
+                Amount::from_units(FUND_FEE),
+            )
+            .unwrap();
+        let tx = w.sign_spend(utxo, prepared).unwrap();
+        assert!(tx.inputs.iter().any(|i| coins.contains(&i.prev_out)));
+        tx
+    };
+    chain.lock().unwrap().mine(std::slice::from_ref(&conflict));
+    let journal = dir.join("funder").join(format!("{}.jrnl", cid.to_hex()));
+    drive(&p.funder, &chain);
+    assert!(
+        p.funder.info(cid).is_some(),
+        "not before the spend is buried"
+    );
+    for _ in 1..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+        drive(&p.funder, &chain);
+    }
+    assert!(p.funder.info(cid).is_none(), "given up");
+    assert!(!journal.exists());
 }

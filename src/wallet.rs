@@ -206,6 +206,10 @@ pub struct Wallet {
     /// addresses remain recognized and spendable. It only serves to know
     /// which ones to show first.
     requested: BTreeSet<u32>,
+    /// Coins held back from every selection: the inputs of a channel funding
+    /// signed and not yet confirmed (see [`Wallet::lock_coins`]). In memory
+    /// only; the channel manager holds them again after a restart.
+    locked: BTreeSet<OutPoint>,
 }
 
 /// Wipes the seed when the wallet is dropped.
@@ -233,6 +237,7 @@ impl Wallet {
             verified_up_to: 0,
             labels: HashMap::new(),
             requested: BTreeSet::new(),
+            locked: BTreeSet::new(),
         }
     }
 
@@ -265,6 +270,7 @@ impl Wallet {
             verified_up_to: 0,
             labels: HashMap::new(),
             requested: BTreeSet::new(),
+            locked: BTreeSet::new(),
         })
     }
 
@@ -1277,6 +1283,28 @@ impl Wallet {
         (room / per_input.max(1)).max(1) as usize
     }
 
+    /// Holds `coins` back from every coin selection until
+    /// [`Wallet::unlock_coins`]. A channel funding is signed when the peer
+    /// accepts, and broadcast only once the peer has signed our first
+    /// commitment, a round trip later: meanwhile its inputs are in no
+    /// mempool, and a send chosen from them would make the funding a double
+    /// spend.
+    pub fn lock_coins(&mut self, coins: &[OutPoint]) {
+        self.locked.extend(coins.iter().copied());
+    }
+
+    /// Lifts [`Wallet::lock_coins`].
+    pub fn unlock_coins(&mut self, coins: &[OutPoint]) {
+        for c in coins {
+            self.locked.remove(c);
+        }
+    }
+
+    /// Is this coin held back by [`Wallet::lock_coins`]?
+    pub fn is_locked(&self, coin: &OutPoint) -> bool {
+        self.locked.contains(coin)
+    }
+
     /// Does this output pay one of the wallet's keys?
     pub fn owns_output(&self, output: &TxOut) -> bool {
         output.scheme == self.scheme && self.known.contains_key(&output.pubkey_hash)
@@ -1311,7 +1339,7 @@ impl Wallet {
         pending: &[(OutPoint, TxOut)],
     ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
         let mut available = self.spendable(utxo, height);
-        available.retain(|e| !avoid(&e.0));
+        available.retain(|e| !avoid(&e.0) && !self.locked.contains(&e.0));
         // --- The largest coins first (0.4.7).
         //
         // The order was the outpoint's: arbitrary as to value. After a load
@@ -1329,7 +1357,7 @@ impl Wallet {
         let mut pending_coins: Vec<(OutPoint, TxOut, u32)> = Vec::new();
         let one_time_scheme = self.scheme.is_one_time();
         for (o, output) in pending {
-            if avoid(o) || !self.owns_output(output) {
+            if avoid(o) || self.locked.contains(o) || !self.owns_output(output) {
                 continue;
             }
             let Some(index) = self.known.get(&output.pubkey_hash).copied() else {
@@ -1735,7 +1763,7 @@ impl Wallet {
             return Err(WalletError::UnsupportedScheme(self.scheme));
         }
         let mut available = self.spendable(utxo, height);
-        available.retain(|e| !avoid(&e.0));
+        available.retain(|e| !avoid(&e.0) && !self.locked.contains(&e.0));
         available.sort_by(|a, b| {
             a.1.value
                 .units()
