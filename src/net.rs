@@ -390,30 +390,38 @@ pub fn follows_activation(network: Network, version: u32) -> bool {
     !crate::policy::has_transition(network) || version >= crate::wire::POLICY_ACTIVATION_VERSION
 }
 
+/// What of a message a peer may receive: see [`for_peer`].
+enum ForPeer {
+    /// All of it, as it is: the common case, which copies nothing.
+    Unchanged,
+    /// Only this part of it.
+    Part(Message),
+    /// Nothing.
+    Withheld,
+}
+
 /// `m` as peer `peer` may receive it.
 ///
 /// A peer that does not follow the policy activation reads a policy output
 /// as a malformed message and drops the link: it is never offered, nor
-/// sent, a transaction that creates or spends one. `None` when nothing of
-/// `m` is left for it.
-fn for_peer<'a>(g: &Shared, peer: u64, m: &'a Message) -> Option<std::borrow::Cow<'a, Message>> {
-    use std::borrow::Cow;
+/// sent, a transaction that creates or spends one.
+fn for_peer(g: &Shared, peer: u64, m: &Message) -> ForPeer {
     let follows = g
         .peers
         .get(&peer)
         .is_some_and(|p| follows_activation(g.network, p.version));
     if follows {
-        return Some(Cow::Borrowed(m));
+        return ForPeer::Unchanged;
     }
     let withheld = |hash: &Hash256| g.mempool.touches_policy(hash);
     match m {
-        Message::Tx(t) => {
-            let policy = t
-                .outputs
+        Message::Tx(t)
+            if t.outputs
                 .iter()
                 .any(|o| o.scheme == crate::sig::SchemeId::Policy)
-                || withheld(&t.txid());
-            (!policy).then_some(Cow::Borrowed(m))
+                || withheld(&t.txid()) =>
+        {
+            ForPeer::Withheld
         }
         Message::Inv(items)
             if items
@@ -425,9 +433,13 @@ fn for_peer<'a>(g: &Shared, peer: u64, m: &'a Message) -> Option<std::borrow::Co
                 .filter(|i| i.kind != InvKind::Tx || !withheld(&i.hash))
                 .copied()
                 .collect();
-            (!kept.is_empty()).then_some(Cow::Owned(Message::Inv(kept)))
+            if kept.is_empty() {
+                ForPeer::Withheld
+            } else {
+                ForPeer::Part(Message::Inv(kept))
+            }
         }
-        _ => Some(Cow::Borrowed(m)),
+        _ => ForPeer::Unchanged,
     }
 }
 
@@ -4063,29 +4075,23 @@ impl Node {
         // and broadcast without holding it.
         self.scan_connected_blocks_for_channels();
 
-        for e in outgoing {
-            let sent = {
+        for mut e in outgoing {
+            let writer = {
                 let mut g = self.shared.lock().unwrap();
                 match for_peer(&g, e.peer, &e.message) {
-                    Some(m) => {
-                        let m = m.into_owned();
-                        // A requested body is noted, so we know whether it
-                        // arrives — within the limit of in-flight slots, as
-                        // everywhere. A header request too: only an expected
-                        // reply will be read.
-                        g.peers.get_mut(&e.peer).map(|p| {
-                            p.note_sent(&m, Instant::now());
-                            (p.writer.clone(), m)
-                        })
-                    }
-                    None => None,
+                    ForPeer::Unchanged => {}
+                    ForPeer::Part(m) => e.message = m,
+                    ForPeer::Withheld => continue,
                 }
+                // A requested body is noted, so we know whether it arrives —
+                // within the limit of in-flight slots, as everywhere. A header
+                // request too: only an expected reply will be read.
+                g.peers.get_mut(&e.peer).map(|p| {
+                    p.note_sent(&e.message, Instant::now());
+                    p.writer.clone()
+                })
             };
-            if let Some((s, message)) = sent {
-                let e = Outgoing {
-                    peer: e.peer,
-                    message,
-                };
+            if let Some(s) = writer {
                 let frame = frame_of(&e.message, self.magic);
                 if must_deliver(&e.message) {
                     // Recorded as sent just above: it must not be dropped.
@@ -4613,18 +4619,22 @@ impl Node {
     /// Sends a message to a peer, outside the lock, noting the requested
     /// bodies as `handle` does.
     fn send_to(&self, id: u64, m: &Message) {
-        let sent = {
+        let mut part = None;
+        let writer = {
             let mut g = self.shared.lock().unwrap();
-            match for_peer(&g, id, m).map(|m| m.into_owned()) {
-                Some(m) => g.peers.get_mut(&id).map(|p| {
-                    p.note_sent(&m, Instant::now());
-                    (p.writer.clone(), m)
-                }),
-                None => None,
+            match for_peer(&g, id, m) {
+                ForPeer::Unchanged => {}
+                ForPeer::Part(p) => part = Some(p),
+                ForPeer::Withheld => return,
             }
+            let m = part.as_ref().unwrap_or(m);
+            g.peers.get_mut(&id).map(|p| {
+                p.note_sent(m, Instant::now());
+                p.writer.clone()
+            })
         };
-        if let Some((s, m)) = sent {
-            let m = &m;
+        if let Some(s) = writer {
+            let m = part.as_ref().unwrap_or(m);
             let frame = frame_of(m, self.magic);
             if must_deliver(m) {
                 let _ = s.push_force(frame);
