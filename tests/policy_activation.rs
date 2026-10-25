@@ -959,7 +959,12 @@ mod channels {
             if let Some(p) = node
                 .peer_list()
                 .into_iter()
-                .find(|p| p.handshake_complete && p.supports_channels)
+                // A peer below protocol 5 is no channel peer on testnet,
+                // whatever its user agent: wait for the handshake alone.
+                .find(|p| {
+                    p.handshake_complete
+                        && (p.supports_channels || version < POLICY_ACTIVATION_VERSION)
+                })
             {
                 return (s, p.id);
             }
@@ -1000,7 +1005,14 @@ mod channels {
     #[test]
     fn a_channel_message_from_an_older_peer_before_h_cuts_the_link() {
         let (node, sink, _) = node_before_h();
-        let (mut s, _) = chan_peer(&node, 4);
+        let (mut s, id) = chan_peer(&node, 4);
+        assert!(
+            !node
+                .peer_list()
+                .iter()
+                .any(|p| p.id == id && p.supports_channels),
+            "a version-4 peer is no channel peer on testnet"
+        );
         let _ = s.write_all(&channel_frame());
         let t = Instant::now();
         while node.peer_count() != 0 {
