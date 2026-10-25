@@ -645,9 +645,10 @@ impl RpcContext {
 /// The optional `delay` and `min_depth` of a `channelopen`, checked against the
 /// range a peer accepts. A value was cut to 16 bits with `as u16`: 65548 became
 /// a delay of 12, and the channel opened on terms nobody asked for.
+/// The bounds are those `network`'s acceptors apply ([`crate::channel::terms`]).
 #[cfg(feature = "mldsa")]
-fn channel_open_terms(params: &Json) -> Result<(Option<u16>, Option<u16>), Json> {
-    use crate::channel::{DEFAULT_FUNDING_DEPTH, MAX_DELAY, MIN_DELAY_REGTEST};
+fn channel_open_terms(network: Network, params: &Json) -> Result<(Option<u16>, Option<u16>), Json> {
+    let t = crate::channel::terms(network);
     let term = |name: &str, min: u16, max: u16| -> Result<Option<u16>, Json> {
         match params.get(name) {
             None | Some(Json::Null) => Ok(None),
@@ -664,8 +665,8 @@ fn channel_open_terms(params: &Json) -> Result<(Option<u16>, Option<u16>), Json>
         }
     };
     Ok((
-        term("delay", MIN_DELAY_REGTEST, MAX_DELAY)?,
-        term("min_depth", DEFAULT_FUNDING_DEPTH, MAX_DELAY)?,
+        term("delay", t.min_delay, t.max_delay)?,
+        term("min_depth", t.funding_depth, t.max_delay)?,
     ))
 }
 
@@ -704,17 +705,16 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
 /// show it before the open.
 pub const CHANNEL_FUND_FEE: u64 = 50_000;
 
-/// The terms of a channel opened with the defaults: capacity bounds, the
-/// on-chain fees of the funding and of a cooperative close, the to-self delay
-/// of a forced close and the confirmations a funding waits for. Null without
-/// the signing backend, where no channel runs.
-fn channel_terms() -> Json {
+/// The terms of a channel opened with the defaults on `network`: capacity
+/// bounds, the on-chain fees of the funding and of a cooperative close, the
+/// to-self delay of a forced close (and the range a peer accepts) and the
+/// confirmations a funding waits for ([`crate::channel::terms`]). Null
+/// without the signing backend, where no channel runs.
+fn channel_terms(network: Network) -> Json {
     #[cfg(feature = "mldsa")]
     {
-        use crate::channel::{
-            manager::CLOSE_FEE, DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH, MAX_CAPACITY,
-            MIN_CAPACITY,
-        };
+        use crate::channel::{manager::CLOSE_FEE, MAX_CAPACITY, MIN_CAPACITY};
+        let t = crate::channel::terms(network);
         Json::obj()
             .set(
                 "min_capacity",
@@ -729,12 +729,15 @@ fn channel_terms() -> Json {
                 amount_json(Amount::from_units(CHANNEL_FUND_FEE)),
             )
             .set("close_fee", amount_json(Amount::from_units(CLOSE_FEE)))
-            .set("delay_blocks", Json::u64(u64::from(DEFAULT_DELAY_REGTEST)))
-            .set("funding_depth", Json::u64(u64::from(DEFAULT_FUNDING_DEPTH)))
+            .set("delay_blocks", Json::u64(u64::from(t.default_delay)))
+            .set("min_delay_blocks", Json::u64(u64::from(t.min_delay)))
+            .set("max_delay_blocks", Json::u64(u64::from(t.max_delay)))
+            .set("funding_depth", Json::u64(u64::from(t.funding_depth)))
             .build()
     }
     #[cfg(not(feature = "mldsa"))]
     {
+        let _ = network;
         Json::Null
     }
 }
@@ -1296,7 +1299,7 @@ impl RpcContext {
             .get("capacity")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| rpc_error(ERR_PARAMS, "capacity (in units) is required"))?;
-        let (delay, depth) = channel_open_terms(params)?;
+        let (delay, depth) = channel_open_terms(self.network, params)?;
         let frame = mgr
             .open(peer, capacity, delay, depth)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
@@ -1660,7 +1663,7 @@ impl RpcContext {
             })
             // The terms of a channel, for the same reason: the page checks a
             // capacity and states the fees before an open or a close.
-            .set("channel_terms", channel_terms())
+            .set("channel_terms", channel_terms(self.network))
             .set(
                 "network_stats",
                 Json::obj()
@@ -4226,7 +4229,7 @@ mod tests {
     #[test]
     #[cfg(feature = "mldsa")]
     fn channel_open_terms_are_checked_not_truncated() {
-        let terms = |p: &str| super::channel_open_terms(&jparse(p).unwrap());
+        let terms = |p: &str| super::channel_open_terms(Network::Regtest, &jparse(p).unwrap());
         assert_eq!(terms("{}").unwrap(), (None, None));
         assert_eq!(
             terms(r#"{"delay":144,"min_depth":3}"#).unwrap(),
@@ -4269,6 +4272,41 @@ mod tests {
         );
         let r = call(&c, "channelpay", r#"{"channel_id":"00","amount":1}"#);
         assert!(r.get("error").is_some());
+    }
+
+    /// On testnet `channelopen` takes only what a testnet peer accepts: a
+    /// delay from 720 to 2016 blocks, and at least six confirmations.
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn channel_open_terms_follow_the_network() {
+        let terms = |p: &str| super::channel_open_terms(Network::Testnet, &jparse(p).unwrap());
+        assert_eq!(
+            terms(r#"{"delay":720,"min_depth":6}"#).unwrap(),
+            (Some(720), Some(6))
+        );
+        assert_eq!(terms(r#"{"delay":2016}"#).unwrap(), (Some(2016), None));
+        for bad in [
+            r#"{"delay":12}"#,
+            r#"{"delay":719}"#,
+            r#"{"delay":2017}"#,
+            r#"{"min_depth":2}"#,
+            r#"{"min_depth":5}"#,
+        ] {
+            assert!(terms(bad).is_err(), "{bad} accepted on testnet");
+        }
+    }
+
+    /// `getinfo` announces the terms of the network it answers for.
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn getinfo_states_the_testnet_channel_terms() {
+        let r = call_ok(&context_on(Network::Testnet), "getinfo", "{}");
+        let t = r.get("channel_terms").cloned().expect("channel terms");
+        let n = |k: &str| t.get(k).and_then(|v| v.as_u64());
+        assert_eq!(n("delay_blocks"), Some(1_440));
+        assert_eq!(n("min_delay_blocks"), Some(720));
+        assert_eq!(n("max_delay_blocks"), Some(2_016));
+        assert_eq!(n("funding_depth"), Some(6));
     }
 
     /// `getinfo` states the terms of a channel, so that the wallet page checks

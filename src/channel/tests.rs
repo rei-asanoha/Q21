@@ -1432,6 +1432,85 @@ fn accept_rejects_dangerous_open_parameters() {
     .is_ok());
 }
 
+/// H3 on testnet: the bounds are the network's. An open on regtest terms
+/// (twelve blocks, two confirmations) leaves a testnet acceptor that goes
+/// offline for an afternoon open to a revoked-state theft, and is refused;
+/// one on testnet terms is accepted, from its minimum up to `MAX_DELAY`.
+#[test]
+fn a_testnet_acceptor_applies_the_testnet_bounds() {
+    use crate::channel::{terms, MAX_DELAY, MIN_DELAY_TESTNET};
+    let net = Network::Testnet;
+    let t = terms(net);
+    assert_eq!(
+        (t.default_delay, t.min_delay, t.max_delay, t.funding_depth),
+        (1_440, 720, 2_016, 6)
+    );
+    assert_eq!(
+        terms(NET),
+        crate::channel::Terms {
+            default_delay: DELAY,
+            min_delay: 6,
+            max_delay: MAX_DELAY,
+            funding_depth: DEPTH,
+        },
+        "regtest keeps its short terms"
+    );
+    let payout = Hash256([0xf0u8; 32]);
+    let try_open = |delay: u16, depth: u16| {
+        let dir = tmpdir();
+        let a_signer = akey();
+        let a_pub = a_signer.pubkey().to_vec();
+        let (_f, open) = Machine::new_funder(
+            dir.join("f.jrnl"),
+            net,
+            fkey(),
+            a_pub,
+            CAP,
+            delay,
+            depth,
+            RATE,
+            payout,
+            payout,
+        )
+        .unwrap();
+        Machine::accept(
+            dir.join("a.jrnl"),
+            net,
+            a_signer,
+            RATE,
+            &open,
+            payout,
+            payout,
+        )
+        .map(|_| ())
+    };
+    for (delay, depth) in [
+        (DELAY, DEPTH),
+        (DELAY, t.funding_depth),
+        (MIN_DELAY_TESTNET - 1, t.funding_depth),
+        (t.default_delay, DEPTH),
+        (t.default_delay, t.funding_depth - 1),
+        (MAX_DELAY + 1, t.funding_depth),
+    ] {
+        assert_eq!(
+            try_open(delay, depth),
+            Err(ChannelError::BadParameters),
+            "testnet must refuse delay={delay} depth={depth}"
+        );
+    }
+    for (delay, depth) in [
+        (MIN_DELAY_TESTNET, t.funding_depth),
+        (t.default_delay, t.funding_depth),
+        (MAX_DELAY, t.funding_depth + 4),
+    ] {
+        assert_eq!(
+            try_open(delay, depth),
+            Ok(()),
+            "delay={delay} depth={depth}"
+        );
+    }
+}
+
 // --- D11: a crash at every journal write of an update, on either side --------
 
 /// Keeps only the first `keep` record frames of a journal, as a crash right

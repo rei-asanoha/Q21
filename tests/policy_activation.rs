@@ -1031,8 +1031,8 @@ mod channels {
             10,
             [0x61; 32],
             dir.clone(),
-            12,
-            2,
+            q21_core::channel::terms(NET).default_delay,
+            q21_core::channel::terms(NET).funding_depth,
             Hooks {
                 fund: Box::new(|_, _| Err("no wallet here".into())),
                 broadcast: Box::new(|_| Err("no relay here".into())),

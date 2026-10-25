@@ -46,11 +46,74 @@ pub use watcher::{classify, Watch, WatchContext};
 pub const DEFAULT_DELAY_REGTEST: u16 = 12;
 /// Smallest to-self delay a party should accept on regtest.
 pub const MIN_DELAY_REGTEST: u16 = 6;
-/// Largest to-self delay a party should accept: beyond about two weeks of
-/// blocks a channel's funds would be frozen for an unreasonable time.
+/// Largest to-self delay a party should accept, on any network: about three
+/// days at the two-minute spacing. Beyond it a channel's funds would be
+/// frozen for an unreasonable time after a forced close.
 pub const MAX_DELAY: u16 = 2016;
-/// Confirmations before a funding output is considered final.
+/// Confirmations before a funding output is considered final on regtest.
 pub const DEFAULT_FUNDING_DEPTH: u16 = 2;
+
+/// Default to-self delay on testnet, in blocks: about two days at the
+/// two-minute spacing. It is the time a wallet may stay offline and still
+/// punish a revoked state its peer broadcasts; on a public network wallets
+/// go offline for days, so the regtest delay of a few minutes would hand a
+/// cheater the funds of anyone who closed a laptop.
+pub const DEFAULT_DELAY_TESTNET: u16 = 1_440;
+/// Smallest to-self delay an acceptor takes on testnet: about one day.
+pub const MIN_DELAY_TESTNET: u16 = 720;
+/// Confirmations before a funding output is considered final on testnet, and
+/// the fewest an acceptor takes: a public chain reorganizes, regtest does not.
+pub const FUNDING_DEPTH_TESTNET: u16 = 6;
+
+/// The channel terms of a network: what this node proposes when it opens a
+/// channel, and the least it accepts from a peer that opens one to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Terms {
+    /// The to-self delay proposed by default, in blocks.
+    pub default_delay: u16,
+    /// The shortest to-self delay accepted (H3).
+    pub min_delay: u16,
+    /// The longest to-self delay accepted.
+    pub max_delay: u16,
+    /// Confirmations a funding waits for by default, and the fewest accepted.
+    pub funding_depth: u16,
+}
+
+/// The channel terms of `network`. Regtest keeps short values, so that tests
+/// run in a few blocks. Testnet uses values a public network needs; mainnet,
+/// where channels do not run, would start from the same.
+pub const fn terms(network: crate::address::Network) -> Terms {
+    match network {
+        crate::address::Network::Regtest => Terms {
+            default_delay: DEFAULT_DELAY_REGTEST,
+            min_delay: MIN_DELAY_REGTEST,
+            max_delay: MAX_DELAY,
+            funding_depth: DEFAULT_FUNDING_DEPTH,
+        },
+        crate::address::Network::Testnet | crate::address::Network::Mainnet => Terms {
+            default_delay: DEFAULT_DELAY_TESTNET,
+            min_delay: MIN_DELAY_TESTNET,
+            max_delay: MAX_DELAY,
+            funding_depth: FUNDING_DEPTH_TESTNET,
+        },
+    }
+}
+
+// Each network's default sits within what it accepts.
+const _: () = {
+    let nets = [
+        crate::address::Network::Regtest,
+        crate::address::Network::Testnet,
+        crate::address::Network::Mainnet,
+    ];
+    let mut i = 0;
+    while i < nets.len() {
+        let t = terms(nets[i]);
+        assert!(t.min_delay <= t.default_delay && t.default_delay <= t.max_delay);
+        assert!(t.funding_depth >= 1 && t.funding_depth <= t.max_delay);
+        i += 1;
+    }
+};
 /// Smallest channel capacity an acceptor will take: enough for two outputs and
 /// the commitment fee, so a close can always pay both sides above dust.
 pub const MIN_CAPACITY: u64 = 4 * crate::consensus::MIN_OUTPUT_VALUE;

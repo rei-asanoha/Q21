@@ -346,9 +346,12 @@ impl Machine {
         // gives a revoked cheater's own sweep no head-start over our penalty; a
         // huge one freezes funds for years; depth 0 would treat an unconfirmed
         // funding as final; a dust capacity cannot carry two outputs and a fee.
-        if *delay < crate::channel::MIN_DELAY_REGTEST
-            || *delay > crate::channel::MAX_DELAY
-            || *funding_depth < crate::channel::DEFAULT_FUNDING_DEPTH
+        // The bounds are the network's (`crate::channel::terms`): a delay or a
+        // depth fit for regtest is no protection on a public chain.
+        let terms = crate::channel::terms(network);
+        if *delay < terms.min_delay
+            || *delay > terms.max_delay
+            || *funding_depth < terms.funding_depth
             || *capacity < crate::channel::MIN_CAPACITY
             || *capacity > crate::channel::MAX_CAPACITY
         {

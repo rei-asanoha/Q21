@@ -4729,7 +4729,6 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         if q21_core::policy::may_appear_on(network) && rpc_wallet && rpc.is_some() {
             use q21_core::amount::Amount;
             use q21_core::channel::manager::{ChannelManager, Hooks};
-            use q21_core::channel::{DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH};
             use q21_core::rpc::CHANNEL_FUND_FEE;
             use q21_core::tx::{Transaction, TxOut};
 
@@ -4834,8 +4833,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 q21_core::mempool::MIN_FEE_RATE,
                 seed,
                 jdir,
-                DEFAULT_DELAY_REGTEST,
-                DEFAULT_FUNDING_DEPTH,
+                // The network's terms: short on regtest, days on testnet.
+                q21_core::channel::terms(network).default_delay,
+                q21_core::channel::terms(network).funding_depth,
                 Hooks {
                     fund,
                     broadcast,
