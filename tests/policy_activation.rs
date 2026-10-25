@@ -848,3 +848,56 @@ mod warnings {
         node.shutdown();
     }
 }
+
+/// `channelstatus` and `getinfo` count down to `H` and turn active at it.
+mod status {
+    use super::*;
+    use q21_core::net::Node;
+    use q21_core::rpc::RpcContext;
+    use std::sync::Arc;
+
+    fn call(ctx: &RpcContext, method: &str) -> q21_core::json::Json {
+        let raw = ctx.handle(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#
+        ));
+        q21_core::json::parse(&raw)
+            .unwrap()
+            .get("result")
+            .cloned()
+            .expect("result")
+    }
+
+    fn u(j: &q21_core::json::Json, k: &str) -> Option<u64> {
+        j.get(k).and_then(|v| v.as_u64())
+    }
+
+    #[test]
+    fn the_status_counts_down_to_h_and_turns_active_at_it() {
+        let (mut c, _) = at_h_minus_2();
+        let b = mine(&c, &[], Hash256([0x22; 32]));
+        connect(&mut c, &b).unwrap();
+        let next = mine(&c, &[], Hash256([0x22; 32]));
+        let node = Arc::new(Node::new(NET, c));
+        let ctx = RpcContext::read_only(node.clone(), NET);
+
+        let s = call(&ctx, "channelstatus");
+        assert_eq!(s.get("network").and_then(|v| v.as_str()), Some("Testnet"));
+        assert_eq!(u(&s, "activation_height"), Some(H));
+        assert_eq!(u(&s, "tip"), Some(H - 1));
+        assert_eq!(s.get("active"), Some(&q21_core::json::Json::Bool(false)));
+        assert_eq!(u(&s, "blocks_remaining"), Some(1));
+        assert_eq!(u(&s, "eta_seconds"), Some(TARGET_BLOCK_SECS));
+        let i = call(&ctx, "getinfo");
+        let a = i.get("policy_activation").unwrap();
+        assert_eq!(u(a, "activation_height"), Some(H));
+        assert_eq!(u(a, "blocks_remaining"), Some(1));
+
+        node.with_chain(|c| c.connect(&next, next.header.time + 1))
+            .unwrap();
+        let s = call(&ctx, "channelstatus");
+        assert_eq!(u(&s, "tip"), Some(H));
+        assert_eq!(s.get("active"), Some(&q21_core::json::Json::Bool(true)));
+        assert_eq!(u(&s, "blocks_remaining"), Some(0));
+        assert_eq!(u(&s, "eta_seconds"), Some(0));
+    }
+}

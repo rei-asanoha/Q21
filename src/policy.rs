@@ -205,6 +205,57 @@ pub fn has_transition(network: Network) -> bool {
     h > 1 && h != u64::MAX
 }
 
+/// Has the chain whose tip is at `tip` reached the activation?
+///
+/// True once the tip is at the activation height or above, and always on a
+/// network without a transition where the rule may appear. This is what
+/// opens payment channels: a funding broadcast from then on confirms at the
+/// activation height or above.
+pub fn reached(network: Network, tip: u64) -> bool {
+    may_appear_on(network) && (!has_transition(network) || tip >= activation_height(network))
+}
+
+/// Where a network stands with respect to the activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivationStatus {
+    /// `None` on a network where the rule never opens.
+    pub activation_height: Option<u64>,
+    pub tip: u64,
+    /// See [`reached`].
+    pub active: bool,
+    /// Blocks still to be mined before the tip reaches the activation height;
+    /// zero once it has. `None` where the rule never opens.
+    pub blocks_remaining: Option<u64>,
+}
+
+impl ActivationStatus {
+    /// `blocks_remaining` at the target spacing.
+    pub fn eta_seconds(&self) -> Option<u64> {
+        self.blocks_remaining
+            .map(|b| b.saturating_mul(crate::consensus::TARGET_BLOCK_SECS))
+    }
+}
+
+/// The activation status of `network` at tip `tip`.
+pub fn status(network: Network, tip: u64) -> ActivationStatus {
+    if !may_appear_on(network) {
+        return ActivationStatus {
+            activation_height: None,
+            tip,
+            active: false,
+            blocks_remaining: None,
+        };
+    }
+    let h = activation_height(network);
+    let active = reached(network, tip);
+    ActivationStatus {
+        activation_height: Some(h),
+        tip,
+        active,
+        blocks_remaining: Some(if active { 0 } else { h - tip }),
+    }
+}
+
 /// Moves the activation height of `network` for this process.
 ///
 /// Audit builds only, for the tests and the lab that must cross a real

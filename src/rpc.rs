@@ -1047,6 +1047,10 @@ impl RpcContext {
         #[allow(unused_mut)]
         let mut m = vec![
             ("getinfo", "State of the chain, the network and the mempool"),
+            (
+                "channelstatus",
+                "Activation of policy outputs and channels: height, whether reached, blocks and seconds to go",
+            ),
             ("getblock", "Full block, by height or by id"),
             ("getblockheader", "Header only"),
             (
@@ -1367,6 +1371,7 @@ impl RpcContext {
         };
         match method {
             "getinfo" => Ok(self.getinfo()),
+            "channelstatus" => Ok(self.channelstatus()),
             "getutxocommitment" => Ok(self.getutxocommitment()),
             "getblock" => self.getblock(params, true),
             "getblockheader" => self.getblock(params, false),
@@ -1429,6 +1434,27 @@ impl RpcContext {
     // -----------------------------------------------------------------------
     // Read
     // -----------------------------------------------------------------------
+
+    /// Where the network stands with respect to the activation of policy
+    /// outputs, and so of channels: the height, the tip, whether the tip has
+    /// reached it ([`crate::policy::reached`]), and how many blocks and
+    /// seconds, at the target spacing, are left. On a network where the rule
+    /// never opens, the height, blocks and seconds are `null`.
+    ///
+    /// The field names are an interface: the wallet page reads them.
+    fn channelstatus(&self) -> Json {
+        let tip = self.node.height();
+        let st = crate::policy::status(self.network, tip);
+        let opt = |v: Option<u64>| v.map(Json::u64).unwrap_or(Json::Null);
+        Json::obj()
+            .set("network", Json::str(format!("{:?}", self.network)))
+            .set("activation_height", opt(st.activation_height))
+            .set("tip", Json::u64(st.tip))
+            .set("active", Json::Bool(st.active))
+            .set("blocks_remaining", opt(st.blocks_remaining))
+            .set("eta_seconds", opt(st.eta_seconds()))
+            .build()
+    }
 
     fn getinfo(&self) -> Json {
         use std::sync::atomic::Ordering;
@@ -1535,6 +1561,23 @@ impl RpcContext {
             // source entitled to state them.
             .set("coinbase_maturity", Json::u64(COINBASE_MATURITY))
             .set("target_interval_seconds", Json::u64(TARGET_BLOCK_SECS))
+            // --- The activation of policy outputs, as `channelstatus`
+            //     reports it, at the same tip as the rest of this answer, and
+            //     the peers that will not follow it.
+            .set("policy_activation", {
+                let st = crate::policy::status(self.network, height);
+                let opt = |v: Option<u64>| v.map(Json::u64).unwrap_or(Json::Null);
+                Json::obj()
+                    .set("activation_height", opt(st.activation_height))
+                    .set("active", Json::Bool(st.active))
+                    .set("blocks_remaining", opt(st.blocks_remaining))
+                    .set("eta_seconds", opt(st.eta_seconds()))
+                    .set(
+                        "peers_predating_activation",
+                        Json::u64(self.node.peers_predating_activation() as u64),
+                    )
+                    .build()
+            })
             .set(
                 "network_stats",
                 Json::obj()
@@ -4185,6 +4228,89 @@ mod tests {
         call_ok(&c, "setreachable", r#"{"active":true}"#);
         let info = call_ok(&c, "getinfo", "{}");
         assert_eq!(info.get("reachable"), Some(&Json::Bool(true)));
+    }
+
+    /// A read-only context that answers for `network`, over a regtest chain:
+    /// building the genesis of another network costs its proof of work.
+    fn context_on(network: Network) -> RpcContext {
+        let g = genesis_block(NETWORK);
+        RpcContext::read_only(
+            Arc::new(Node::new(NETWORK, Chain::new(NETWORK, g))),
+            network,
+        )
+    }
+
+    fn keys(r: &Json) -> Vec<String> {
+        match r {
+            Json::Object(fields) => fields.keys().cloned().collect(),
+            _ => panic!("not an object: {r:?}"),
+        }
+    }
+
+    /// `channelstatus` answers exactly the fields the wallet page reads.
+    /// Regtest opens the rule at its first block: no transition, active from
+    /// the genesis.
+    #[test]
+    fn channelstatus_answers_its_six_fields() {
+        let c = context(false);
+        let r = call_ok(&c, "channelstatus", "{}");
+        assert_eq!(
+            keys(&r),
+            [
+                "activation_height",
+                "active",
+                "blocks_remaining",
+                "eta_seconds",
+                "network",
+                "tip"
+            ]
+        );
+        assert_eq!(r.get("network").and_then(|v| v.as_str()), Some("Regtest"));
+        assert_eq!(r.get("activation_height").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(r.get("tip").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(r.get("active"), Some(&Json::Bool(true)));
+        assert_eq!(r.get("blocks_remaining").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(r.get("eta_seconds").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    /// Mainnet never opens the rule: no height, nothing to count down.
+    #[test]
+    fn channelstatus_on_mainnet_has_no_activation() {
+        let c = context_on(Network::Mainnet);
+        let r = call_ok(&c, "channelstatus", "{}");
+        assert_eq!(r.get("network").and_then(|v| v.as_str()), Some("Mainnet"));
+        assert_eq!(r.get("activation_height"), Some(&Json::Null));
+        assert_eq!(r.get("active"), Some(&Json::Bool(false)));
+        assert_eq!(r.get("blocks_remaining"), Some(&Json::Null));
+        assert_eq!(r.get("eta_seconds"), Some(&Json::Null));
+        let i = call_ok(&c, "getinfo", "{}");
+        let a = i.get("policy_activation").expect("policy_activation");
+        assert_eq!(a.get("activation_height"), Some(&Json::Null));
+        assert_eq!(a.get("active"), Some(&Json::Bool(false)));
+    }
+
+    /// `getinfo` carries the same activation status, and counts the peers
+    /// that predate it.
+    #[test]
+    fn getinfo_reports_the_policy_activation() {
+        let c = context(false);
+        let a = call_ok(&c, "getinfo", "{}")
+            .get("policy_activation")
+            .cloned()
+            .expect("policy_activation");
+        let s = call_ok(&c, "channelstatus", "{}");
+        for k in [
+            "activation_height",
+            "active",
+            "blocks_remaining",
+            "eta_seconds",
+        ] {
+            assert_eq!(a.get(k), s.get(k), "{k}");
+        }
+        assert_eq!(
+            a.get("peers_predating_activation").and_then(|v| v.as_u64()),
+            Some(0)
+        );
     }
 
     #[test]
