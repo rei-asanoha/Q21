@@ -1332,12 +1332,39 @@ impl RpcContext {
             .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))
     }
 
+    /// The methods that sign and send funds, on chain or in a channel.
+    fn moves_funds(method: &str) -> bool {
+        matches!(
+            method,
+            "sendtoaddress"
+                | "sendmany"
+                | "consolidate"
+                | "channelopen"
+                | "channelpay"
+                | "channelclose"
+        )
+    }
+
     fn dispatch(
         &self,
         method: &str,
         params: &Json,
         client: Option<std::net::IpAddr>,
     ) -> Result<Json, Json> {
+        // What moves funds is refused once a shutdown is asked for, and runs
+        // under a hold the shutdown waits for before writing the pool and the
+        // wallet: a send answered "accepted" is never lost by the shutdown.
+        // The wallet page goes through here too.
+        let _sending = if Self::moves_funds(method) {
+            Some(crate::shutdown::begin_send().ok_or_else(|| {
+                rpc_error(
+                    ERR_REQUEST,
+                    "the node is shutting down: nothing new is sent. Send again once it has restarted",
+                )
+            })?)
+        } else {
+            None
+        };
         match method {
             "getinfo" => Ok(self.getinfo()),
             "getutxocommitment" => Ok(self.getutxocommitment()),
@@ -4045,6 +4072,13 @@ mod tests {
     }
 
     fn call(c: &RpcContext, method: &str, params: &str) -> Json {
+        // A test that raises the shutdown flag would have this send refused
+        // meanwhile: sends take the same lock as such tests.
+        let _v = RpcContext::moves_funds(method).then(|| {
+            crate::shutdown::TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
         jparse(&c.handle(&body)).expect("valid JSON response")
     }

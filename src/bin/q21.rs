@@ -4712,6 +4712,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 move |_cid: q21_core::hash::Hash256,
                       funding_output: TxOut|
                       -> Result<Transaction, String> {
+                    // No new funding once a shutdown is asked for: it would be
+                    // signed after the wallet and the pool are written.
+                    let _sending = q21_core::shutdown::begin_send()
+                        .ok_or_else(|| "the node is shutting down".to_string())?;
                     // Built and signed only: the manager broadcasts it once the
                     // acceptor has signed our first commitment.
                     let mut w = w_fund.lock().map_err(|_| "wallet locked".to_string())?;
@@ -6275,6 +6279,15 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         }
     }
 
+    // --- No send is left behind.
+    //
+    // The RPC serves until the process exits. A send answered "accepted"
+    // after the pool below was written went into a pool that was about to
+    // vanish: gone at the next start, though the wallet had said it was sent
+    // (five such payments in the load test of 25 October 2026, all in the
+    // half-second after `stop`). From here on every new send is refused, and
+    // those in progress finish first — while the node still relays them.
+    q21_core::shutdown::drain_sends();
     node.shutdown();
     // The Tor this node started goes with it.
     if let Some(t) = &managed_tor {

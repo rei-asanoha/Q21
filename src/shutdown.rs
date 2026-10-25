@@ -62,6 +62,47 @@ pub fn request_shutdown() {
     REQUESTED.store(true, Ordering::Relaxed);
 }
 
+/// Sends in progress, against the writes of the shutdown.
+///
+/// # The defect this closes
+///
+/// The RPC kept serving while the node wrote its state: a send answered
+/// "accepted" after the pool had been written went into a pool about to
+/// vanish, and was gone at the next start, though the wallet had been told it
+/// was sent. A send now runs under a read hold of this lock, taken only while
+/// no shutdown is asked for; the shutdown takes the lock for writing before
+/// it writes the pool, so every send already answered is in it.
+static SENDS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A send in progress: while one is held, the shutdown waits before writing
+/// the pool and the wallet. See [`begin_send`].
+pub struct SendInProgress {
+    _hold: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+/// Starts a send — a payment, a consolidation, a channel open or payment —
+/// or refuses it with `None` once a shutdown is asked for. Hold the result
+/// until the transaction is in the pool and the wallet written.
+pub fn begin_send() -> Option<SendInProgress> {
+    if requested() {
+        return None;
+    }
+    let hold = SENDS.read().unwrap_or_else(|e| e.into_inner());
+    // Checked again under the hold: once `drain_sends` has passed, the flag is
+    // visible here and nothing new starts.
+    if requested() {
+        return None;
+    }
+    Some(SendInProgress { _hold: hold })
+}
+
+/// Refuses every new send and waits for those in progress to finish. The
+/// shutdown calls it before writing the pool and the wallet.
+pub fn drain_sends() {
+    request_shutdown();
+    drop(SENDS.write().unwrap_or_else(|e| e.into_inner()));
+}
+
 /// Installs the handler. To be called once, at startup.
 ///
 /// Returns `false` if the system refused: the program stays usable, it will
