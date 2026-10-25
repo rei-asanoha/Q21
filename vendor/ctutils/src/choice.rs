@@ -1,33 +1,9 @@
+use crate::primitives::{bitle, bitlt, bitnz};
 use crate::{CtAssign, CtAssignSlice, CtEq, CtEqSlice, CtSelectUsingCtAssign};
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not};
 
 #[cfg(feature = "subtle")]
 use crate::CtSelect;
-
-/// Bitwise less-than-or equal: returns `1` if `x <= y`, and otherwise returns `0`.
-///
-/// See "Hacker's Delight" 2nd edition, section 2-12 (Comparison predicates)
-macro_rules! bitle {
-    ($x:expr, $y:expr, $bits:expr) => {
-        (((!$x) | $y) & (($x ^ $y) | !($y.wrapping_sub($x)))) >> ($bits - 1)
-    };
-}
-
-/// Bitwise less-than: returns `1` if `x < y`, and otherwise returns `0`.
-///
-/// See "Hacker's Delight" 2nd edition, section 2-12 (Comparison predicates)
-macro_rules! bitlt {
-    ($x:expr, $y:expr, $bits:expr) => {
-        (((!$x) & $y) | (((!$x) | $y) & $x.wrapping_sub($y))) >> ($bits - 1)
-    };
-}
-
-/// Bitwise non-zero: returns `1` if `x != 0`, and otherwise returns `0`.
-macro_rules! bitnz {
-    ($value:expr, $bits:expr) => {
-        ($value | $value.wrapping_neg()) >> ($bits - 1)
-    };
-}
 
 /// Constant-time analogue of `bool` providing a "best effort" optimization barrier.
 ///
@@ -56,7 +32,15 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn and(self, rhs: Choice) -> Choice {
-        Self(self.0 & rhs.0)
+        #[cfg(all(target_arch = "arm", not(target_has_atomic = "ptr")))]
+        {
+            // Keep loop-carried predicates from becoming a short-circuiting boolean.
+            Self(self.to_u8() & rhs.to_u8())
+        }
+        #[cfg(not(all(target_arch = "arm", not(target_has_atomic = "ptr"))))]
+        {
+            Self(self.0 & rhs.0)
+        }
     }
 
     /// Apply an `or` conditional to the given [`Choice`]s.
@@ -108,10 +92,8 @@ impl Choice {
     /// Returns [`Choice::TRUE`] if `x == y`, and [`Choice::FALSE`] otherwise.
     #[inline]
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub const fn from_i64_eq(x: i64, y: i64) -> Self {
-        // TODO(tarcieri): use `cast_unsigned` when MSRV is 1.87
-        Self::from_u64_nz(x as u64 ^ y as u64).not()
+        Self::from_u64_nz(x.cast_unsigned() ^ y.cast_unsigned()).not()
     }
 
     // u8
@@ -201,7 +183,7 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn from_u32_le(x: u32, y: u32) -> Self {
-        Self::from_u32_lsb(bitle!(x, y, u32::BITS))
+        crate::primitives::le_u32(x, y)
     }
 
     /// Initialize from the least significant bit of a `u32`.
@@ -215,14 +197,14 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn from_u32_lt(x: u32, y: u32) -> Self {
-        Self::from_u32_lsb(bitlt!(x, y, u32::BITS))
+        crate::primitives::lt_u32(x, y)
     }
 
     /// Returns [`Choice::TRUE`] if `value != 0`, and [`Choice::FALSE`] otherwise.
     #[inline]
     #[must_use]
     pub const fn from_u32_nz(value: u32) -> Self {
-        Self::from_u32_lsb(bitnz!(value, u32::BITS))
+        crate::primitives::nz_u32(value)
     }
 
     // u64
@@ -238,7 +220,7 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn from_u64_le(x: u64, y: u64) -> Self {
-        Self::from_u64_lsb(bitle!(x, y, u64::BITS))
+        crate::primitives::le_u64(x, y)
     }
 
     /// Initialize from the least significant bit of a `u64`.
@@ -252,14 +234,14 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn from_u64_lt(x: u64, y: u64) -> Self {
-        Self::from_u64_lsb(bitlt!(x, y, u64::BITS))
+        crate::primitives::lt_u64(x, y)
     }
 
     /// Returns [`Choice::TRUE`] if `value != 0`, and [`Choice::FALSE`] otherwise.
     #[inline]
     #[must_use]
     pub const fn from_u64_nz(value: u64) -> Self {
-        Self::from_u64_lsb(bitnz!(value, u64::BITS))
+        crate::primitives::nz_u64(value)
     }
 
     // u128
@@ -275,7 +257,14 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn from_u128_le(x: u128, y: u128) -> Self {
-        Self::from_u128_lsb(bitle!(x, y, u128::BITS))
+        #[cfg(target_pointer_width = "32")]
+        {
+            Self::from_u128_lt(y, x).not()
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            Self::from_u128_lsb(bitle!(x, y, u128::BITS))
+        }
     }
 
     /// Initialize from the least significant bit of a `u128`.
@@ -289,7 +278,29 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn from_u128_lt(x: u128, y: u128) -> Self {
-        Self::from_u128_lsb(bitlt!(x, y, u128::BITS))
+        #[cfg(target_pointer_width = "32")]
+        {
+            Self::from_u128_lt_halves(x, y)
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            Self::from_u128_lsb(bitlt!(x, y, u128::BITS))
+        }
+    }
+
+    #[cfg(any(target_pointer_width = "32", test))]
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    const fn from_u128_lt_halves(x: u128, y: u128) -> Self {
+        // Full-width subtraction can introduce conditional borrow propagation.
+        // Keep the half-width predicates opaque so LLVM cannot combine them into a short-circuiting
+        // multiword comparison.
+        let x_hi = (x >> 64) as u64;
+        let y_hi = (y >> 64) as u64;
+        let hi_lt = Self::from_u64_lt(x_hi, y_hi).to_u8();
+        let hi_eq = Self::from_u64_eq(x_hi, y_hi).to_u8();
+        let lo_lt = Self::from_u64_lt(x as u64, y as u64).to_u8();
+        Self::from_u8_lsb(hi_lt | (hi_eq & lo_lt))
     }
 
     /// Returns [`Choice::TRUE`] if `value != 0`, and [`Choice::FALSE`] otherwise.
@@ -309,10 +320,9 @@ impl Choice {
     /// and can't use the trait. The former will provide better constant-time assurances.
     #[inline]
     #[must_use]
-    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     pub const fn select_i64(self, a: i64, b: i64) -> i64 {
-        // TODO(tarcieri): use `cast_signed` when MSRV is 1.87
-        self.select_u64(a as u64, b as u64) as i64
+        self.select_u64(a.cast_unsigned(), b.cast_unsigned())
+            .cast_signed()
     }
 
     /// `const fn` helper: return `b` if `self` is [`Choice::TRUE`], otherwise return `a`.
@@ -386,44 +396,42 @@ impl Choice {
     /// the small amount of timing variability it introduces can potentially be exploited. Whenever
     /// possible, prefer fully constant-time approaches instead.
     /// </div>
-    // TODO(tarcieri): `const fn` when MSRV 1.86
     #[must_use]
-    pub fn to_bool(self) -> bool {
+    pub const fn to_bool(self) -> bool {
         self.to_u8() != 0
     }
 
     /// Convert [`Choice`] to a `u8`, attempting to apply a "best effort" optimization barrier.
-    // TODO(tarcieri): `const fn` when MSRV 1.86
     #[must_use]
-    pub fn to_u8(self) -> u8 {
+    pub const fn to_u8(self) -> u8 {
         // `black_box` is documented as working on a "best effort" basis. That's fine, this type is
         // likewise documented as only working on a "best effort" basis itself. The only way we
         // rely on `black_box` for correctness is it behaving as the identity function.
         core::hint::black_box(self.0)
     }
 
-    /// HACK: workaround to allow `const fn` boolean support on Rust 1.85.
+    /// DEPRECATED: previously a workaround to allow `const fn` boolean support on Rust 1.85.
     ///
-    /// This does not apply `black_box` to the output.
+    /// Use [`Choice::to_bool`] instead.
     ///
     /// <div class = "warning">
     /// <b>Security Warning</b>
     ///
     /// See the security warnings for [`Choice::to_bool`].
     /// </div>
-    // TODO(tarcieri): deprecate/remove this in favor of `to_bool` when MSRV is Rust 1.86
+    #[deprecated(since = "0.4.3", note = "use `Choice::to_bool` instead")]
     #[must_use]
     pub const fn to_bool_vartime(self) -> bool {
-        self.0 != 0
+        self.to_bool()
     }
 
-    /// HACK: workaround to allow `const fn` boolean support on Rust 1.85.
+    /// DEPRECATED: previously a workaround to allow `const fn` boolean support on Rust 1.85.
     ///
-    /// This does not apply `black_box` to the output.
-    // TODO(tarcieri): deprecate/remove this in favor of `to_u8` when MSRV is Rust 1.86
+    /// Use [`Choice::to_u8`] instead.
+    #[deprecated(since = "0.4.3", note = "use `Choice::to_u8` instead")]
     #[must_use]
     pub const fn to_u8_vartime(self) -> u8 {
-        self.0
+        self.to_u8()
     }
 
     /// Create a `u8` bitmask.
@@ -434,7 +442,7 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn to_u8_mask(self) -> u8 {
-        self.0.wrapping_neg()
+        self.to_u8().wrapping_neg()
     }
 
     /// Create a `u16` bitmask.
@@ -445,7 +453,7 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn to_u16_mask(self) -> u16 {
-        (self.0 as u16).wrapping_neg()
+        (self.to_u8() as u16).wrapping_neg()
     }
 
     /// Create a `u32` bitmask.
@@ -456,7 +464,7 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn to_u32_mask(self) -> u32 {
-        (self.0 as u32).wrapping_neg()
+        (self.to_u8() as u32).wrapping_neg()
     }
 
     /// Create a `u64` bitmask.
@@ -467,7 +475,7 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn to_u64_mask(self) -> u64 {
-        (self.0 as u64).wrapping_neg()
+        (self.to_u8() as u64).wrapping_neg()
     }
 
     /// Create a `u128` bitmask.
@@ -478,7 +486,7 @@ impl Choice {
     #[inline]
     #[must_use]
     pub const fn to_u128_mask(self) -> u128 {
-        (self.0 as u128).wrapping_neg()
+        (self.to_u8() as u128).wrapping_neg()
     }
 }
 
@@ -627,7 +635,7 @@ impl subtle::ConstantTimeEq for Choice {
 #[cfg(test)]
 mod tests {
     use super::Choice;
-    use crate::{CtEq, CtSelect};
+    use crate::{CtEq, CtGt, CtLt, CtSelect};
 
     #[test]
     fn ct_eq() {
@@ -860,6 +868,38 @@ mod tests {
         assert!(Choice::from_u128_lt(1, 0).eq(Choice::FALSE).to_bool());
         assert!(Choice::from_u128_lt(1, 1).eq(Choice::FALSE).to_bool());
         assert!(Choice::from_u128_lt(1, 2).eq(Choice::TRUE).to_bool());
+    }
+
+    #[test]
+    fn from_u128_comparison_boundaries() {
+        const LT: Choice = Choice::from_u128_lt_halves((1 << 96) - 1, 1 << 96);
+        const LE: Choice = Choice::from_u128_le(1 << 64, 1 << 64);
+        assert!(LT.to_bool());
+        assert!(LE.to_bool());
+
+        let values = [
+            0,
+            1,
+            (1 << 32) - 1,
+            1 << 32,
+            (1 << 64) - 1,
+            1 << 64,
+            (1 << 64) + 1,
+            (1 << 96) - 1,
+            1 << 96,
+            u128::MAX - 1,
+            u128::MAX,
+        ];
+
+        for x in values {
+            for y in values {
+                assert_eq!(x < y, Choice::from_u128_lt_halves(x, y).to_bool());
+                assert_eq!(x < y, Choice::from_u128_lt(x, y).to_bool());
+                assert_eq!(x <= y, Choice::from_u128_le(x, y).to_bool());
+                assert_eq!(x < y, x.ct_lt(&y).to_bool());
+                assert_eq!(x > y, x.ct_gt(&y).to_bool());
+            }
+        }
     }
 
     #[test]

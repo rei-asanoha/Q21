@@ -26,7 +26,14 @@ macro_rules! impl_unsigned_ct_lt {
     };
 }
 
-impl_unsigned_ct_lt!(u8, u16, u32, u64, u128, usize);
+impl_unsigned_ct_lt!(u8, u16, u32, u64, usize);
+
+impl CtLt for u128 {
+    #[inline]
+    fn ct_lt(&self, other: &Self) -> Choice {
+        Choice::from_u128_lt(*self, *other)
+    }
+}
 
 /// Impl `CtLt` for `NonZero<T>` by calling `NonZero::get`.
 macro_rules! impl_ct_lt_for_nonzero_integer {
@@ -55,13 +62,11 @@ impl CtLt for cmp::Ordering {
     #[inline]
     #[allow(clippy::arithmetic_side_effects, clippy::cast_sign_loss)]
     fn ct_lt(&self, other: &Self) -> Choice {
-        // No impl of `CtLt` for `i8`, so use `u8`
-        // TODO(tarcieri): use `cast_signed` when MSRV is 1.87
         let a = (*self as i8) + 1;
         let b = (*other as i8) + 1;
 
-        // TODO(tarcieri): use `cast_unsigned` when MSRV is 1.87
-        (a as u8).ct_lt(&(b as u8))
+        // No impl of `CtLt` for `i8`, so use `u8`
+        a.cast_unsigned().ct_lt(&b.cast_unsigned())
     }
 }
 

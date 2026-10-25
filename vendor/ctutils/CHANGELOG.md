@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.5 (2026-10-23)
+### Added
+- `primitives` module ([#1570], [#1572])
+
+### Fixed
+- Harden Thumb-1 comparisons and `Choice` composition ([#1571])
+
+[#1570]: https://github.com/RustCrypto/utils/pull/1570
+[#1571]: https://github.com/RustCrypto/utils/pull/1571
+[#1572]: https://github.com/RustCrypto/utils/pull/1572
+
+## 0.4.4 (2026-10-23)
+### Security
+- Fix and verify `Choice::to_*_mask` constant-time codegen ([#1567])
+- Fix constant-time `u128` comparisons on 32-bit targets ([#1568])
+
+[#1567]: https://github.com/RustCrypto/utils/pull/1567
+[#1568]: https://github.com/RustCrypto/utils/pull/1568
+
+## 0.4.3 (2026-10-06)
+### Changed
+- Make `Choice::{to_bool, to_u8}` into `const fn` ([#1547])
+- MSRV 1.87 ([#1548])
+
+[#1547]: https://github.com/RustCrypto/utils/pull/1547
+[#1548]: https://github.com/RustCrypto/utils/pull/1548
+
 ## 0.4.2 (2026-04-02)
 ### Fixed
 - `cmov` v0.5.3 version requirement ([#1467])
