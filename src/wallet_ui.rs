@@ -451,6 +451,12 @@ details.fold p:last-child{margin-bottom:0}
 
 .recap{background:var(--card-2);border:1px solid var(--border);border-radius:14px;
   padding:1rem;font-family:var(--mono);font-size:.85rem;word-break:break-all}
+/* A line of a confirmation: the label, then the value it confirms. */
+.recap .l{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.15rem 1rem;
+  padding:.2rem 0}
+.recap .l .k{font-family:var(--sans);color:var(--muted);word-break:normal}
+.recap .l .v{text-align:right;margin-left:auto}
+.recap .l.total{border-top:1px solid var(--border);margin-top:.3rem;padding-top:.5rem;font-weight:600}
 footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--border);
   color:var(--muted);font-size:.76rem}
 code{background:var(--quantum-bg);color:var(--quantum);padding:.12em .38em;border-radius:5px;
