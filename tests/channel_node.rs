@@ -1366,6 +1366,17 @@ fn channels_per_peer_are_bounded() {
         let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
         p.queue.push_back((1, hello));
         p.pump();
+        // Funded and open: unfunded channels have a budget of their own.
+        for _ in 0..DEPTH {
+            chain.lock().unwrap().mine(&[]);
+        }
+        for (_, f) in drive(&p.funder, &chain) {
+            p.queue.push_back((1, f));
+        }
+        for (_, f) in drive(&p.acceptor, &chain) {
+            p.queue.push_back((0, f));
+        }
+        p.pump();
     }
     assert_eq!(p.funder.list().len(), MAX_CHANNELS_PER_PEER);
     assert_eq!(p.acceptor.list().len(), MAX_CHANNELS_PER_PEER);
@@ -1813,11 +1824,13 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
     assert_eq!(again.lock().unwrap()[0], first);
 }
 
-/// The acceptor opens a channel only on the real funding output: when the
-/// outpoint the funder named holds anything but the 2-of-2 policy output for
-/// the whole capacity, the channel never opens, however deep it is buried.
+/// The acceptor opens a channel only on its real funding output: the 2-of-2
+/// policy for the whole capacity. An outpoint names one output forever, so a
+/// Funding that names any other — an existing coin, chosen by a stranger to
+/// hold one of the bounded unfunded slots for good — is final: the channel is
+/// forgotten at once, its journal deleted, as soon as a block shows it.
 #[test]
-fn a_channel_opens_only_on_its_real_funding_output() {
+fn a_channel_named_on_another_output_is_forgotten_at_once() {
     let funder_seed = [0xc7u8; 32];
     let acceptor_seed = [0xc8u8; 32];
     let (wallet, chain) = setup(funder_seed);
@@ -1831,40 +1844,62 @@ fn a_channel_opens_only_on_its_real_funding_output() {
         &dir,
     );
     let capacity = 4 * MIN_OUTPUT_VALUE * 10;
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
-    p.queue.push_back((1, hello));
-    p.pump();
-    let cid = p.acceptor.list()[0].channel_id;
-    let real = p.acceptor.list()[0].funding.is_some();
-    assert!(real, "the acceptor learned the funding outpoint");
-    let funding_output = TxOut {
+    let journal_of = |cid: Hash256| dir.join("acceptor").join(format!("{}.jrnl", cid.to_hex()));
+    let open_one = |p: &mut Pair| -> Hash256 {
+        let before: Vec<Hash256> = p.acceptor.list().iter().map(|c| c.channel_id).collect();
+        let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+        p.queue.push_back((1, hello));
+        p.pump();
+        let new = p
+            .acceptor
+            .list()
+            .into_iter()
+            .find(|c| !before.contains(&c.channel_id))
+            .expect("a new channel");
+        assert!(
+            new.funding.is_some(),
+            "the acceptor learned the funding outpoint"
+        );
+        new.channel_id
+    };
+    let wrongs = |real: TxOut| {
+        [
+            // An ordinary key output of the right value.
+            TxOut {
+                scheme: SchemeId::MlDsa87,
+                ..real
+            },
+            // The right policy, too little.
+            TxOut {
+                value: Amount::from_units(capacity - 1),
+                ..real
+            },
+            // Another policy.
+            TxOut {
+                pubkey_hash: Hash256([0x42; 32]),
+                ..real
+            },
+        ]
+    };
+    for k in 0..3 {
+        let cid = open_one(&mut p);
+        let real = TxOut {
+            value: Amount::from_units(capacity),
+            ..p.funder_funding_output(cid)
+        };
+        let out = wrongs(real)[k];
+        assert!(journal_of(cid).exists());
+        p.acceptor.on_connected_block(&[], 900, &|_| Some((1, out)));
+        assert!(p.acceptor.info(cid).is_none(), "forgotten at once");
+        assert!(!journal_of(cid).exists(), "its journal deleted");
+    }
+    let cid = open_one(&mut p);
+    let real = TxOut {
         value: Amount::from_units(capacity),
         ..p.funder_funding_output(cid)
     };
-    let wrong = [
-        // An ordinary key output of the right value.
-        TxOut {
-            scheme: SchemeId::MlDsa87,
-            ..funding_output
-        },
-        // The right policy, too little.
-        TxOut {
-            value: Amount::from_units(capacity - 1),
-            ..funding_output
-        },
-        // Another policy.
-        TxOut {
-            pubkey_hash: Hash256([0x42; 32]),
-            ..funding_output
-        },
-    ];
-    for out in wrong {
-        p.acceptor
-            .on_connected_block(&[], 900, &|_| Some((50, out)));
-        assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Opening);
-    }
     p.acceptor
-        .on_connected_block(&[], 900, &|_| Some((50, funding_output)));
+        .on_connected_block(&[], 900, &|_| Some((50, real)));
     assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
 }
 
@@ -2146,9 +2181,15 @@ fn unfunded_channels_are_bounded() {
     let (wallet, chain) = setup([0xdfu8; 32]);
     let dir = tmpdir("unfunded-cap");
     let acceptor = one_manager([0xe0u8; 32], wallet.clone(), chain.clone(), &dir.join("a"));
-    let spammer = one_manager([0xe3u8; 32], wallet, chain, &dir.join("s"));
+    // Two spammers, each on its own connections, so neither its own bound on
+    // the opens it funds nor the bound per peer stops them first.
+    let spammers = [
+        one_manager([0xe3u8; 32], wallet.clone(), chain.clone(), &dir.join("s1")),
+        one_manager([0xe4u8; 32], wallet, chain, &dir.join("s2")),
+    ];
     let mut opened = 0;
     for k in 0..(MAX_UNFUNDED_CHANNELS as u64 + 3) {
+        let spammer = &spammers[(k % 2) as usize];
         let hello = spammer.open(k, "", 4 * MIN_OUTPUT_VALUE * 10, None, None);
         let Ok(hello) = hello else { break };
         let r = acceptor.deliver(1_000 + k, "", &hello);
@@ -2164,6 +2205,106 @@ fn unfunded_channels_are_bounded() {
     }
     assert_eq!(opened, MAX_UNFUNDED_CHANNELS);
     assert_eq!(acceptor.list().len(), MAX_UNFUNDED_CHANNELS);
+    // Channels others opened to us never block one we open.
+    assert!(
+        acceptor
+            .open(9_999, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+            .is_ok(),
+        "inbound unfunded channels block our own open"
+    );
+}
+
+/// One peer — by its announced identity, over any number of connections —
+/// holds only a few unfunded channels with us.
+#[test]
+fn unfunded_channels_are_budgeted_per_peer() {
+    use q21_core::channel::manager::MAX_UNFUNDED_PER_PEER;
+    let (wallet, chain) = setup([0xe5u8; 32]);
+    let dir = tmpdir("unfunded-per-peer");
+    let acceptor = one_manager([0xe6u8; 32], wallet.clone(), chain.clone(), &dir.join("a"));
+    let spammer = one_manager([0xe7u8; 32], wallet, chain, &dir.join("s"));
+    let mut opened = 0;
+    for k in 0..8u64 {
+        let Ok(hello) = spammer.open(k, "", 4 * MIN_OUTPUT_VALUE * 10, None, None) else {
+            break;
+        };
+        let r = acceptor.deliver(1_000 + k, "evil", &hello);
+        let Some(back) = r.frames.into_iter().next() else {
+            continue;
+        };
+        let r = spammer.deliver(k, "", &back);
+        if let Some(open) = r.frames.into_iter().next() {
+            if !acceptor.deliver(1_000 + k, "evil", &open).frames.is_empty() {
+                opened += 1;
+            }
+        }
+    }
+    assert_eq!(opened, MAX_UNFUNDED_PER_PEER);
+}
+
+/// A channel we accepted whose Funding never came is forgotten after an
+/// hour, not a day; one whose Funding came waits for its confirmation as
+/// before.
+#[test]
+fn an_accepted_channel_without_its_funding_expires_within_the_hour() {
+    use q21_core::channel::manager::{INBOUND_FUNDING_TTL, UNFUNDED_TTL};
+    let funder_seed = [0xe8u8; 32];
+    let acceptor_seed = [0xe9u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("inbound-ttl");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet,
+        chain,
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let one = |r: q21_core::channel::manager::Reaction| -> Vec<u8> {
+        r.frames.into_iter().next().expect("a frame")
+    };
+    // Up to the acceptor's Accept: no Funding follows.
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    let back = one(p.acceptor.deliver(F_PEER, "", &hello));
+    let open = one(p.funder.deliver(A_PEER, "", &back));
+    let _accept = one(p.acceptor.deliver(F_PEER, "", &open));
+    let waiting = p.acceptor.list()[0].channel_id;
+    // A second, complete up to the Funding (never broadcast here).
+    let hello = p
+        .funder
+        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let funded = p
+        .acceptor
+        .list()
+        .into_iter()
+        .map(|c| c.channel_id)
+        .find(|c| *c != waiting)
+        .unwrap();
+    assert!(p.acceptor.info(funded).unwrap().funding.is_some());
+    // Both journals last written past the hour, inside the day.
+    assert!(INBOUND_FUNDING_TTL * 2 < UNFUNDED_TTL);
+    let then = std::time::SystemTime::now() - INBOUND_FUNDING_TTL * 2;
+    for cid in [waiting, funded] {
+        let path = dir.join("acceptor").join(format!("{}.jrnl", cid.to_hex()));
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+    p.acceptor.on_connected_block(&[], 900, &|_| None);
+    assert!(p.acceptor.info(waiting).is_none(), "no Funding: forgotten");
+    assert!(
+        p.acceptor.info(funded).is_some(),
+        "Funding in: still waiting"
+    );
 }
 
 /// A cooperative close is settled only once buried to the funding depth. One

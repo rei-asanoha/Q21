@@ -192,13 +192,22 @@ enum CloseTracker {
     },
 }
 
-/// Channels not yet funded on chain, across all peers. Each holds a journal
-/// and is reloaded at every start until it opens or expires.
+/// Channels we accepted that are not yet funded on chain, across all peers.
+/// Each holds a journal and is reloaded at every start until it opens or
+/// expires. Counted apart from the ones we open, which they never block.
 pub const MAX_UNFUNDED_CHANNELS: usize = 32;
+/// Channels we accepted from one peer — by connection or announced identity —
+/// that are not yet funded on chain.
+pub const MAX_UNFUNDED_PER_PEER: usize = 4;
+/// Channels we open whose funding is not on chain yet.
+pub const MAX_UNFUNDED_OUTBOUND: usize = 32;
 /// How long a channel may wait for its funding before it is forgotten, its
 /// journal deleted — only when nothing is at stake: our side accepted it and
 /// put nothing in, or we fund it and never broadcast the funding.
 pub const UNFUNDED_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// How long a channel we accepted may wait for the funder's Funding message:
+/// an honest funder sends it within a round trip of our Accept.
+pub const INBOUND_FUNDING_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Opens in progress from one announced identity, whatever its connections.
 pub const MAX_PENDING_PER_IDENTITY: usize = 2;
@@ -249,6 +258,8 @@ struct Inner {
     pending_ttl: std::time::Duration,
     /// See [`UNFUNDED_TTL`]; shortened by tests.
     unfunded_ttl: std::time::Duration,
+    /// See [`INBOUND_FUNDING_TTL`]; shortened by tests.
+    inbound_funding_ttl: std::time::Duration,
     /// A wallet payout address offered in a Hello or HelloBack and not yet
     /// used by a channel: offered again until one is, so opens that never
     /// complete do not grow the wallet by an address each.
@@ -263,12 +274,35 @@ impl Inner {
         self.pending_acceptor.retain(|_, p| p.since.elapsed() < ttl);
     }
 
-    /// Channels whose funding is not on chain yet.
-    fn unfunded(&self) -> usize {
-        self.channels
-            .values()
-            .filter(|c| matches!(c.machine.phase(), Phase::Opening | Phase::Funded))
+    /// Channels whose funding is not on chain yet: those we accepted
+    /// (`inbound`), or those we open.
+    fn unfunded(&self, inbound: bool) -> usize {
+        self.unfunded_iter(inbound).count()
+    }
+
+    fn unfunded_iter(&self, inbound: bool) -> impl Iterator<Item = &Chan> {
+        let side = if inbound {
+            crate::channel::txbuild::ACCEPTOR
+        } else {
+            crate::channel::txbuild::FUNDER
+        };
+        self.channels.values().filter(move |c| {
+            matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
+                && c.machine.our_index() == side
+        })
+    }
+
+    /// Unfunded channels we accepted from a peer, by connection or identity.
+    fn unfunded_inbound_with(&self, peer: u64, identity: &str) -> usize {
+        self.unfunded_iter(true)
+            .filter(|c| c.peer == peer || (!identity.is_empty() && c.peer_identity == identity))
             .count()
+    }
+
+    /// Room for one more channel accepted from this peer.
+    fn inbound_room(&self, peer: u64, identity: &str) -> bool {
+        self.unfunded(true) < MAX_UNFUNDED_CHANNELS
+            && self.unfunded_inbound_with(peer, identity) < MAX_UNFUNDED_PER_PEER
     }
 
     /// Channels held with a peer, known by its connection id or its durable
@@ -332,6 +366,7 @@ impl ChannelManager {
                 pending_ttl: PENDING_OPEN_TTL,
                 spare_payout: None,
                 unfunded_ttl: UNFUNDED_TTL,
+                inbound_funding_ttl: INBOUND_FUNDING_TTL,
             }),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
@@ -585,7 +620,7 @@ impl ChannelManager {
         if g.channels_with(peer, peer_identity) >= MAX_CHANNELS_PER_PEER {
             return Err("too many channels with this peer".into());
         }
-        if g.unfunded() >= MAX_UNFUNDED_CHANNELS {
+        if g.unfunded(false) >= MAX_UNFUNDED_OUTBOUND {
             return Err("too many channels waiting for their funding".into());
         }
         let index = g.next_index;
@@ -795,7 +830,7 @@ impl ChannelManager {
             !full
                 && !same_identity
                 && g.channels_with(peer, peer_identity) < MAX_CHANNELS_PER_PEER
-                && g.unfunded() < MAX_UNFUNDED_CHANNELS
+                && g.inbound_room(peer, peer_identity)
         };
         if !admitted(&mut self.inner.lock().unwrap()) {
             return Ok(Vec::new());
@@ -855,7 +890,7 @@ impl ChannelManager {
             g.spare_payout = None;
         }
         let cid = channel_id(&funding);
-        let (mut machine, open) = Machine::new_funder(
+        let (machine, open) = Machine::new_funder(
             self.journal_path(cid),
             self.network,
             signer,
@@ -1084,6 +1119,11 @@ impl ChannelManager {
             .pending_acceptor
             .remove(&peer)
             .ok_or("no pending accept")?;
+        // Checked again: other channels may have taken the room since the
+        // Hello. Not answered, as a Hello beyond the bounds is not.
+        if !g.inbound_room(peer, &pending.peer_identity) {
+            return Ok(Vec::new());
+        }
         // The engine Open must match what the Hello promised: same funder key
         // and same terms, or the peer changed its mind mid-handshake.
         if let ChMsg::Open {
@@ -1103,7 +1143,7 @@ impl ChannelManager {
             }
         }
         let signer = self.signer(pending.index);
-        let (mut machine, accept) = Machine::accept(
+        let (machine, accept) = Machine::accept(
             self.journal_path(cid),
             self.network,
             signer,
@@ -1197,7 +1237,9 @@ impl ChannelManager {
     /// [`UNFUNDED_TTL`]), for tests.
     #[doc(hidden)]
     pub fn set_unfunded_ttl(&self, ttl: std::time::Duration) {
-        self.inner.lock().unwrap().unfunded_ttl = ttl;
+        let mut g = self.inner.lock().unwrap();
+        g.unfunded_ttl = ttl;
+        g.inbound_funding_ttl = g.inbound_funding_ttl.min(ttl);
     }
 
     /// Forgets the channels that waited longer than [`UNFUNDED_TTL`] for a
@@ -1208,10 +1250,22 @@ impl ChannelManager {
     /// (we never received the acceptor's signature). A channel we funded and
     /// broadcast is kept: should its funding confirm late, our commitment is
     /// how the capacity comes back.
+    ///
+    /// A channel we accepted whose Funding never came waits only
+    /// [`INBOUND_FUNDING_TTL`].
     fn expire_unfunded(&self, depth_of: &DepthOf) {
         let mut g = self.inner.lock().unwrap();
-        let ttl = g.unfunded_ttl;
-        let stale: Vec<Hash256> = g
+        let (long, short) = (g.unfunded_ttl, g.inbound_funding_ttl);
+        let ttl_of = |c: &Chan| {
+            if c.machine.our_index() == crate::channel::txbuild::ACCEPTOR
+                && c.machine.funding_outpoint().is_none()
+            {
+                short
+            } else {
+                long
+            }
+        };
+        let stale: Vec<(Hash256, std::time::Duration)> = g
             .channels
             .values()
             .filter(|c| matches!(c.machine.phase(), Phase::Opening | Phase::Funded))
@@ -1230,20 +1284,25 @@ impl ChannelManager {
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age >= ttl)
+                    .is_some_and(|age| age >= ttl_of(c))
             })
-            .map(|c| c.machine.channel_id())
+            .map(|c| (c.machine.channel_id(), ttl_of(c)))
             .collect();
-        for cid in stale {
-            g.channels.remove(&cid);
-            let _ = std::fs::remove_file(self.journal_path(cid));
-            let _ = std::fs::remove_file(self.peer_identity_path(cid));
+        for (cid, ttl) in stale {
+            self.forget(&mut g, cid);
             eprintln!(
                 "channel {}: never funded; forgotten after waiting {}s",
                 cid.to_hex(),
                 ttl.as_secs()
             );
         }
+    }
+
+    /// Drops a channel with nothing at stake, its journal and sidecar too.
+    fn forget(&self, g: &mut Inner, cid: Hash256) {
+        g.channels.remove(&cid);
+        let _ = std::fs::remove_file(self.journal_path(cid));
+        let _ = std::fs::remove_file(self.peer_identity_path(cid));
     }
 
     /// Catches up, at startup, with what happened on chain while the node was
@@ -1500,6 +1559,30 @@ impl ChannelManager {
                 }
             }
         }
+        // The outpoint the funder named must be the channel's funding output:
+        // the 2-of-2 policy, for the whole capacity. An outpoint names one
+        // output forever, so any other is final: a channel we accepted on it
+        // is forgotten at once — the funder alone would have put funds in,
+        // and nothing on chain backs it. Left waiting, any existing coin
+        // named by a stranger held one of the bounded unfunded slots for good.
+        let named_elsewhere: Vec<Hash256> = g
+            .unfunded_iter(true)
+            .filter(|c| {
+                c.machine
+                    .funding_outpoint()
+                    .and_then(|op| depth_of(&op))
+                    .is_some_and(|(_, output)| output != c.machine.funding_output())
+            })
+            .map(|c| c.machine.channel_id())
+            .collect();
+        for cid in named_elsewhere {
+            eprintln!(
+                "channel {}: the announced funding output is not the channel's 2-of-2 \
+                 output for its capacity; forgotten",
+                cid.to_hex()
+            );
+            self.forget(&mut g, cid);
+        }
         let ready: Vec<(Hash256, u64)> = g
             .channels
             .values()
@@ -1513,9 +1596,7 @@ impl ChannelManager {
             .filter_map(|c| {
                 let op = c.machine.funding_outpoint()?;
                 let (depth, output) = depth_of(&op)?;
-                // The outpoint the funder named must be the channel's funding
-                // output: the 2-of-2 policy, for the whole capacity. Any other
-                // output would open a channel that nothing on chain backs.
+                // Ours, as funder, cannot differ; never open on another one.
                 if output != c.machine.funding_output() {
                     if depth == 1 {
                         eprintln!(
