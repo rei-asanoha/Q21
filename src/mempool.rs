@@ -35,6 +35,7 @@ use crate::address::Network;
 use crate::amount::Amount;
 use crate::consensus::{COINBASE_MATURITY, MAX_BLOCK_SIZE, TARGET_BLOCK_WEIGHT, WITNESS_DISCOUNT};
 use crate::hash::Hash256;
+use crate::sig::SchemeId;
 use crate::tx::{OutPoint, Transaction, TxOut};
 use crate::utxo::{UtxoEntry, UtxoSet, UtxoView};
 use crate::validate::{self, ValidationError};
@@ -103,6 +104,9 @@ pub struct MempoolEntry {
     /// makes room for it rather than refusing it. See
     /// [`Mempool::return_abandoned`].
     pub returned: bool,
+    /// Creates or spends a policy output ([`SchemeId::Policy`]). Such a
+    /// transaction can enter a block only from the activation height on.
+    pub policy: bool,
 }
 
 impl MempoolEntry {
@@ -701,6 +705,11 @@ impl Mempool {
         let mut seen: HashSet<OutPoint> = HashSet::new();
         unconfirmed_relative_lock(tx, &self.created, height)?;
         let fee = validate::check_transaction(tx, &view, network, height + 1, &mut seen)?;
+        let policy = tx.outputs.iter().any(|o| o.scheme == SchemeId::Policy)
+            || tx.inputs.iter().any(|i| {
+                view.lookup(&i.prev_out)
+                    .is_some_and(|e| e.output.scheme == SchemeId::Policy)
+            });
         let entry = MempoolEntry {
             tx: tx.clone(),
             fee,
@@ -709,6 +718,7 @@ impl Mempool {
             arrival: self.counter,
             local,
             returned,
+            policy,
         };
 
         // --- Abuse: flooding for free.
@@ -1263,7 +1273,7 @@ impl Mempool {
     ///
     /// Needed after a reorg: confirmed transactions can become valid again,
     /// and others become impossible.
-    pub fn revalidate(&mut self, utxo: &UtxoSet, _network: Network, height: u64) {
+    pub fn revalidate(&mut self, utxo: &UtxoSet, network: Network, height: u64) {
         // The previous version revalidated each transaction with
         // `check_transaction` against a view where the spent set contained
         // **its own inputs**. Each transaction therefore saw itself as a double
@@ -1303,6 +1313,22 @@ impl Mempool {
                     self.local_confirmed.clear();
                 }
                 self.local_confirmed.insert(id);
+            }
+        }
+        // A reorganization can take the tip back below the activation of
+        // policies: what creates or spends one was admitted for a next block
+        // at the activation height or above, and the next block is below it
+        // again. Kept, it would make every miner build an invalid block.
+        if !crate::policy::is_active(network, height + 1) {
+            let dormant: Vec<Hash256> = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.policy)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in dormant {
+                // `remove` takes the descendants along.
+                self.remove(&id);
             }
         }
         loop {

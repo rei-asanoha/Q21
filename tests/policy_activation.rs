@@ -335,6 +335,47 @@ fn a_reorganization_below_h_puts_the_policy_back_in_the_pool() {
     assert!(m.contains(&tx.txid()));
 }
 
+/// The tip going back below `H - 1` (a disconnected tip, a shorter branch of
+/// more work) leaves the pool holding a policy output the next block can no
+/// longer carry. The pool drops it, or every miner would build an invalid
+/// block.
+#[test]
+fn the_pool_drops_its_policies_when_the_tip_goes_back_below_h_minus_1() {
+    let (mut c, mut w) = at_h_minus_2();
+    let blk = mine(&c, &[], Hash256([0x22; 32]));
+    connect(&mut c, &blk).unwrap();
+    let tx = funding(&c, &mut w, 1_000_000);
+    // An ordinary payment beside it, which must stay.
+    let plain = {
+        let mut other = Wallet::from_seed_scheme([0x77; 32], NET, SchemeId::LamportOts).unwrap();
+        let to = other.new_address();
+        w.create_transaction(
+            &c.utxo,
+            c.height(),
+            &to,
+            Amount::from_units(10_000),
+            Amount::from_units(FEE),
+        )
+        .expect("plain payment")
+    };
+    let mut m = Mempool::new();
+    m.accept(&tx, &c.utxo, NET, c.height()).expect("at H - 1");
+    m.accept(&plain, &c.utxo, NET, c.height()).expect("plain");
+
+    m.revalidate(&c.utxo, NET, c.height());
+    assert_eq!(m.len(), 2, "nothing changes while the next block is at H");
+
+    assert!(c.disconnect());
+    assert_eq!(c.height(), H - 2);
+    m.revalidate(&c.utxo, NET, c.height());
+    assert!(!m.contains(&tx.txid()), "the next block is at H - 1 again");
+    assert!(m.contains(&plain.txid()));
+    assert!(m
+        .select_for_block(u64::MAX)
+        .iter()
+        .all(|t| t.outputs.iter().all(|o| o.scheme != SchemeId::Policy)));
+}
+
 /// Spends need an ML-DSA key leaf: a policy refuses a one-time key.
 #[cfg(feature = "mldsa")]
 mod spends {
