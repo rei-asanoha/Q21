@@ -4680,11 +4680,15 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // of side branches — is written to disk at the moment it is accepted.
     node.set_journal(archive.clone());
 
-    // Payment channels run on regtest, on a node that serves its wallet over
-    // RPC: the manager owns the engines, the node routes channel messages to
-    // it, and these hooks move funding, closes and penalties through the
-    // ordinary mempool and relay. Off regtest, or without a wallet, no manager
-    // is installed and the channel RPC refuses cleanly.
+    // Payment channels run where policy outputs can appear — regtest, and
+    // testnet — on a node that serves its wallet over RPC: the manager owns
+    // the engines, the node routes channel messages to it, and these hooks
+    // move funding, closes and penalties through the ordinary mempool and
+    // relay. On testnet it is installed at once, before the activation height:
+    // until the tip reaches it the channel RPC that opens, pays or closes
+    // refuses, and no channel message is sent (see `policy::reached`). On
+    // mainnet, or without a wallet, no manager is installed and the channel
+    // RPC refuses cleanly.
     //
     // Installed before the node listens or dials anyone. The capability and
     // the stable channel node id travel in our `Version`, and a peer that
@@ -4693,7 +4697,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // a restart, every reloaded channel stayed unbound from its peer.
     #[cfg(feature = "mldsa")]
     let channel_manager: Option<std::sync::Arc<q21_core::channel::manager::ChannelManager>> =
-        if network == q21_core::address::Network::Regtest && rpc_wallet && rpc.is_some() {
+        if q21_core::policy::may_appear_on(network) && rpc_wallet && rpc.is_some() {
             use q21_core::amount::Amount;
             use q21_core::channel::manager::{ChannelManager, Hooks};
             use q21_core::channel::{DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH};
@@ -4818,6 +4822,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // (the funding confirmed while this node was down): confirm them now
             // so they open without waiting for the next block.
             node.rescan_channels();
+            let st = q21_core::policy::status(network, node.height());
+            if !st.active {
+                println!(
+                    "  channels: open at block {} ({} blocks to go)",
+                    st.activation_height.unwrap_or(u64::MAX),
+                    st.blocks_remaining.unwrap_or(u64::MAX)
+                );
+            }
             Some(mgr)
         } else {
             None

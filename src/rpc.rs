@@ -1159,20 +1159,46 @@ impl RpcContext {
     }
 
     // -----------------------------------------------------------------------
-    // Payment channels (regtest only)
+    // Payment channels (regtest, and testnet from the policy activation)
     // -----------------------------------------------------------------------
 
     #[cfg(feature = "mldsa")]
     fn channels(&self) -> Result<&Arc<crate::channel::manager::ChannelManager>, Json> {
-        if self.network != Network::Regtest {
+        if !crate::policy::may_appear_on(self.network) {
             return Err(rpc_error(
                 ERR_REQUEST,
-                "payment channels are available on regtest only",
+                "payment channels are not available on this network",
             ));
         }
         self.channels
             .as_ref()
             .ok_or_else(|| rpc_error(ERR_REQUEST, "this node does not run payment channels"))
+    }
+
+    /// The manager, for a call that opens, pays over or closes a channel:
+    /// refused until the tip has reached the activation height of policy
+    /// outputs ([`crate::policy::reached`]). A funding broadcast from then on
+    /// confirms at the activation height or above, and no channel message
+    /// leaves before it. Listing and reading channels need no such wait.
+    #[cfg(feature = "mldsa")]
+    fn channels_open(&self) -> Result<&Arc<crate::channel::manager::ChannelManager>, Json> {
+        let mgr = self.channels()?;
+        let st = crate::policy::status(self.network, self.node.height());
+        if st.active {
+            return Ok(mgr);
+        }
+        let h = st.activation_height.unwrap_or(u64::MAX);
+        let left = st.blocks_remaining.unwrap_or(u64::MAX);
+        let minutes = st.eta_seconds().unwrap_or(u64::MAX) / 60;
+        Err(rpc_error(
+            ERR_REQUEST,
+            &format!(
+                "payment channels open on this network at block {h}, when policy outputs \
+                 activate; the tip is at {}: {left} blocks to go (about {minutes} minutes). \
+                 See channelstatus",
+                st.tip
+            ),
+        ))
     }
 
     #[cfg(feature = "mldsa")]
@@ -1186,7 +1212,7 @@ impl RpcContext {
 
     #[cfg(feature = "mldsa")]
     fn channelopen(&self, params: &Json) -> Result<Json, Json> {
-        let mgr = self.channels()?;
+        let mgr = self.channels_open()?;
         // `peer` is either a numeric connection id (as getpeers reports) or a
         // durable peer identity — an address or the peer's stable channel node
         // id. Resolve a string to the live id of a connected channel-capable
@@ -1235,7 +1261,7 @@ impl RpcContext {
 
     #[cfg(feature = "mldsa")]
     fn channelpay(&self, params: &Json) -> Result<Json, Json> {
-        let mgr = self.channels()?;
+        let mgr = self.channels_open()?;
         let cid = self.channel_id_param(params)?;
         let amount = params
             .get("amount")
@@ -1285,7 +1311,7 @@ impl RpcContext {
 
     #[cfg(feature = "mldsa")]
     fn channelclose(&self, params: &Json) -> Result<Json, Json> {
-        let mgr = self.channels()?;
+        let mgr = self.channels_open()?;
         let cid = self.channel_id_param(params)?;
         let force = matches!(params.get("force"), Some(Json::Bool(true)));
         if force {
@@ -4271,6 +4297,34 @@ mod tests {
         assert_eq!(r.get("active"), Some(&Json::Bool(true)));
         assert_eq!(r.get("blocks_remaining").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(r.get("eta_seconds").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    /// Mainnet never opens channels: every channel call refuses, reading
+    /// ones included, before even looking for a manager.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn channels_are_refused_on_mainnet() {
+        let c = context_on(Network::Mainnet);
+        for (m, p) in [
+            ("channellist", "{}"),
+            ("channelinfo", r#"{"channel_id":"00"}"#),
+            ("channelopen", r#"{"peer":1,"capacity":1}"#),
+            ("channelpay", r#"{"channel_id":"00","amount":1}"#),
+            ("channelclose", r#"{"channel_id":"00"}"#),
+        ] {
+            let r = call(&c, m, p);
+            let text = r
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                text.contains("not available on this network"),
+                "{m}: {}",
+                r.encode()
+            );
+        }
     }
 
     /// Mainnet never opens the rule: no height, nothing to count down.

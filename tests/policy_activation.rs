@@ -901,3 +901,192 @@ mod status {
         assert_eq!(u(&s, "eta_seconds"), Some(0));
     }
 }
+
+/// Channels open with the tip at `H`: before it no channel message leaves,
+/// one received is ignored from a peer that follows the activation (it may
+/// be ahead) and malformed from one that predates it, and the RPC that
+/// opens, pays or closes refuses.
+mod channels {
+    use super::*;
+    use q21_core::net::{magic_for, ChannelOutcome, ChannelSink, Node};
+    use q21_core::wire::{Message, POLICY_ACTIVATION_VERSION};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Counting(AtomicUsize);
+
+    impl ChannelSink for Counting {
+        fn deliver(&self, _peer: u64, _identity: &str, _bytes: &[u8]) -> ChannelOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ChannelOutcome::default()
+        }
+    }
+
+    /// A node at `H - 1` running channels, and the block at `H` for it.
+    fn node_before_h() -> (Node, Arc<Counting>, Block) {
+        let (mut c, _) = at_h_minus_2();
+        let b = mine(&c, &[], Hash256([0x22; 32]));
+        connect(&mut c, &b).unwrap();
+        let at_h = mine(&c, &[], Hash256([0x22; 32]));
+        let node = Node::new(NET, c);
+        let sink = Arc::new(Counting::default());
+        node.set_channel_sink(sink.clone());
+        (node, sink, at_h)
+    }
+
+    /// A raw channel-capable peer of `version`; returns its stream and id.
+    fn chan_peer(node: &Node, version: u32) -> (std::net::TcpStream, u64) {
+        let addr = node.listen("127.0.0.1:0").expect("listen");
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        let magic = magic_for(NET);
+        let v = Message::Version {
+            version,
+            timestamp: 0,
+            nonce: 0xc4a2 + u64::from(version),
+            user_agent: "q21:0.4+chan0123456789abcdef0123456789abcdef".into(),
+            start_height: H - 1,
+        };
+        s.write_all(&v.frame(magic)).unwrap();
+        s.write_all(&Message::VerAck.frame(magic)).unwrap();
+        let t = Instant::now();
+        loop {
+            if let Some(p) = node
+                .peer_list()
+                .into_iter()
+                .find(|p| p.handshake_complete && p.supports_channels)
+            {
+                return (s, p.id);
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "handshake");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn channel_frame() -> Vec<u8> {
+        Message::Channel(vec![0u8; 40]).frame(magic_for(NET))
+    }
+
+    #[test]
+    fn no_channel_message_moves_before_h() {
+        let (node, sink, at_h) = node_before_h();
+        let (mut s, id) = chan_peer(&node, POLICY_ACTIVATION_VERSION);
+        assert!(
+            !node.send_channel(id, vec![1, 2, 3]),
+            "nothing leaves at H - 1"
+        );
+        let _ = s.write_all(&channel_frame());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(sink.0.load(Ordering::SeqCst), 0, "ignored at H - 1");
+        assert_eq!(node.peer_count(), 1, "a following peer may be ahead: kept");
+
+        node.with_chain(|c| c.connect(&at_h, at_h.header.time + 1))
+            .unwrap();
+        assert!(node.send_channel(id, vec![1, 2, 3]), "open at H");
+        let _ = s.write_all(&channel_frame());
+        let t = Instant::now();
+        while sink.0.load(Ordering::SeqCst) == 0 {
+            assert!(t.elapsed() < Duration::from_secs(10), "delivered at H");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        node.shutdown();
+    }
+
+    #[test]
+    fn a_channel_message_from_an_older_peer_before_h_cuts_the_link() {
+        let (node, sink, _) = node_before_h();
+        let (mut s, _) = chan_peer(&node, 4);
+        let _ = s.write_all(&channel_frame());
+        let t = Instant::now();
+        while node.peer_count() != 0 {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "malformed, as in 0.4.10"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(sink.0.load(Ordering::SeqCst), 0);
+        node.shutdown();
+    }
+
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn the_channel_rpc_that_moves_funds_waits_for_h() {
+        use q21_core::channel::manager::{ChannelManager, Hooks};
+        use q21_core::json::Json;
+        use q21_core::rpc::RpcContext;
+
+        let (node, _, at_h) = node_before_h();
+        let node = Arc::new(node);
+        let dir = std::env::temp_dir().join(format!("q21-activation-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = Arc::new(ChannelManager::new(
+            NET,
+            10,
+            [0x61; 32],
+            dir.clone(),
+            12,
+            2,
+            Hooks {
+                fund: Box::new(|_, _| Err("no wallet here".into())),
+                broadcast: Box::new(|_| Err("no relay here".into())),
+                sweep_address: Box::new(|| Hash256([0x71; 32])),
+                payout_address: Box::new(|| Hash256([0x72; 32])),
+                reserve: Box::new(|_, _| {}),
+            },
+        ));
+        let mut ctx = RpcContext::read_only(node.clone(), NET);
+        ctx.channels = Some(mgr);
+        let call = |m: &str, p: &str| -> Json {
+            let raw = ctx.handle(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{m}","params":{p}}}"#
+            ));
+            q21_core::json::parse(&raw).unwrap()
+        };
+        let cid = "00".repeat(32);
+        let moving = [
+            (
+                "channelopen",
+                r#"{"peer":7,"capacity":1000000}"#.to_string(),
+            ),
+            (
+                "channelpay",
+                format!(r#"{{"channel_id":"{cid}","amount":1000}}"#),
+            ),
+            ("channelclose", format!(r#"{{"channel_id":"{cid}"}}"#)),
+        ];
+        let message = |r: &Json| {
+            r.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        for (m, p) in &moving {
+            let r = call(m, p);
+            let text = message(&r);
+            assert!(
+                text.contains(&format!("at block {H}")) && text.contains("1 blocks to go"),
+                "{m} at H - 1: {r:?}"
+            );
+        }
+        // Reading needs no wait.
+        let r = call("channellist", "{}");
+        assert_eq!(r.get("result"), Some(&Json::Array(Vec::new())), "{r:?}");
+        let r = call("channelinfo", &format!(r#"{{"channel_id":"{cid}"}}"#));
+        assert!(message(&r).contains("unknown channel"), "{r:?}");
+
+        node.with_chain(|c| c.connect(&at_h, at_h.header.time + 1))
+            .unwrap();
+        for (m, p) in &moving {
+            let r = call(m, p);
+            let text = message(&r);
+            assert!(!text.is_empty(), "{m}: no peer, no channel");
+            assert!(!text.contains("blocks to go"), "{m} at H: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

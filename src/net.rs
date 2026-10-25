@@ -357,6 +357,31 @@ pub fn policy_output_is_malformed(
     !crate::policy::is_active(network, mined_at)
 }
 
+/// Is a channel message, received while channels are not open yet at our
+/// tip `tip` ([`crate::policy::reached`]), malformed?
+///
+/// Yes, as 0.4.9 read an unknown command, where channels never open
+/// (mainnet), from a peer that predates the activation, and from one that
+/// follows it but sends it earlier than
+/// [`crate::consensus::POLICY_ACTIVATION_NOTICE`] blocks before the
+/// activation height, counted from our tip or the height it announced. A
+/// peer closer than that may just be ahead of us: its message is ignored.
+pub fn channel_message_is_malformed(
+    network: Network,
+    tip: u64,
+    peer_version: u32,
+    peer_height: u64,
+) -> bool {
+    !crate::policy::may_appear_on(network)
+        || peer_version < crate::wire::POLICY_ACTIVATION_VERSION
+        || !crate::policy::is_active(
+            network,
+            tip.max(peer_height)
+                .saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE)
+                .saturating_add(1),
+        )
+}
+
 /// Does a peer that announced protocol `version` follow the policy
 /// activation of `network`? Always, where the network has no transition
 /// ([`crate::policy::has_transition`]): there, every version reads policies
@@ -1293,7 +1318,8 @@ pub struct Node {
     /// link to one of them can make a later link to the same node redundant:
     /// see the `Version` arm.
     configured: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
-    /// The payment-channel component, when this node runs channels (regtest).
+    /// The payment-channel component, when this node runs channels (regtest,
+    /// testnet).
     /// Its presence is what makes the node advertise the channel capability and
     /// accept channel messages; without it, channel frames are never sent and a
     /// received one is ignored.
@@ -1457,11 +1483,16 @@ impl Node {
     /// channel capability. Returns false if the peer is unknown or did not
     /// advertise it — so a node that does not speak the protocol is never sent
     /// one.
+    ///
+    /// Nor is one sent before channels open on this network
+    /// ([`crate::policy::reached`]): a peer that predates them reads it as
+    /// malformed.
     pub fn send_channel(&self, peer: u64, payload: Vec<u8>) -> bool {
         let writer = {
             let g = self.shared.lock().unwrap();
+            let open = crate::policy::reached(g.network, g.chain.height());
             match g.peers.get(&peer) {
-                Some(p) if p.handshaked && p.channels => Some(p.writer.clone()),
+                Some(p) if open && p.handshaked && p.channels => Some(p.writer.clone()),
                 _ => None,
             }
         };
@@ -3922,14 +3953,20 @@ impl Node {
                 // must stay within its per-peer rate. The decoded bytes are
                 // handed to the channel component after the lock is released,
                 // never under it.
-                // Channels exist on regtest only. Anywhere else this message
-                // gets what 0.4.9 gave it as an unknown command: malformed,
-                // and the link is cut.
-                Message::Channel(_) if network != Network::Regtest => {
+                // Channels open with policies: on regtest from the start, on
+                // testnet once the tip has reached the activation height,
+                // never on mainnet. Before that this message gets what 0.4.9
+                // gave it as an unknown command — malformed, and the link is
+                // cut — unless a peer that follows the activation may just
+                // be ahead of us: then it is ignored.
+                Message::Channel(_) if !crate::policy::reached(network, g.chain.height()) => {
+                    let tip = g.chain.height();
                     if let Some(p) = g.peers.get_mut(&id) {
-                        p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
+                        if channel_message_is_malformed(network, tip, p.version, p.start_height) {
+                            p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
+                            drop_peer = true;
+                        }
                     }
-                    drop_peer = true;
                 }
                 Message::Channel(bytes) => {
                     let (hs, cap) = g
@@ -6247,6 +6284,25 @@ mod tests_hardening {
         a.shared.lock().unwrap().peers.get_mut(&7).unwrap().version = 4;
         assert_eq!(a.peers_predating_activation(), 0);
         assert_eq!(a.warn_peers_predating_activation(), 0);
+    }
+
+    /// A channel message before channels open: malformed where they never
+    /// open and from a peer that predates them; from one that follows them,
+    /// only when it is earlier than the notice before the activation.
+    #[test]
+    fn a_channel_message_before_activation_is_malformed_unless_the_peer_may_be_ahead() {
+        let new = crate::wire::POLICY_ACTIVATION_VERSION;
+        for v in [0, 4, new] {
+            assert!(channel_message_is_malformed(Network::Mainnet, 0, v, 0));
+            assert!(channel_message_is_malformed(
+                Network::Mainnet,
+                1 << 40,
+                v,
+                1 << 40
+            ));
+        }
+        assert!(channel_message_is_malformed(Network::Regtest, 0, 4, 0));
+        assert!(!channel_message_is_malformed(Network::Regtest, 0, new, 0));
     }
 
     /// Finding 14: off regtest, where channels do not exist, a channel
