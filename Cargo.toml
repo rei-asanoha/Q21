@@ -63,6 +63,13 @@ path = "src/lib.rs"
 [dependencies]
 ml-dsa = { version = "0.1.1", optional = true, default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 
+# ML-KEM-1024 (FIPS 203), for the encrypted transport between channel peers:
+# the post-quantum key exchange that matches ML-DSA for signatures. Same
+# family, same vendored dependencies, plus `kem` (traits) and `sha3`.
+# `default-features = false`: no `getrandom`, no `pkcs8`; randomness comes from
+# `rng.rs`, as for signing.
+ml-kem = { version = "0.3.3", optional = true, default-features = false, features = ["zeroize"] }
+
 # A single function is used from it: `setrlimit`, to forbid core dumps of a
 # process that holds a seed. `libc` is already in the dependency graph
 # (through `getrandom`), vendored like the rest; declaring it here adds
@@ -74,7 +81,7 @@ libc = "0.2"
 
 [features]
 default = ["mldsa"]
-mldsa = ["dep:ml-dsa"]
+mldsa = ["dep:ml-dsa", "dep:ml-kem"]
 # Exposes a few internal hooks to the audit tests outside the crate. Never
 # enabled in a production build: they manufacture inconsistent state, useful
 # to prove that a barrier holds, dangerous anywhere else.
