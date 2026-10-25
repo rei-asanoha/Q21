@@ -310,14 +310,51 @@ pub const MISCONDUCT_BAD_TX: u32 = 20;
 
 /// Is `msg` unreadable on `network` for carrying a policy output?
 ///
-/// Policies are dormant on testnet and mainnet (activation height
-/// `u64::MAX`). There, a message carrying a policy output gets exactly what
-/// 0.4.9 gave it — it did not decode: [`MISCONDUCT_MALFORMED`] and the
-/// connection dropped — rather than the milder penalty of an invalid
-/// transaction, so that a dormant rule changes nothing in how peers are
-/// treated.
-pub fn policy_output_is_malformed(network: Network, msg: &Message) -> bool {
-    !crate::policy::may_appear_on(network) && msg.carries_policy_output()
+/// Where the rule is not in force, a message carrying a policy output gets
+/// exactly what 0.4.9 gave it — it did not decode: [`MISCONDUCT_MALFORMED`]
+/// and the connection dropped — rather than the milder penalty of an invalid
+/// transaction, so that a rule not yet open changes nothing in how peers are
+/// treated. That is always the case on mainnet, where it never opens.
+///
+/// Elsewhere it depends on the height the content could be mined at:
+///
+/// - a block, or a compact block, carries its height: below the activation
+///   height a policy output in it is malformed, from the activation height
+///   on it is validated like anything else;
+/// - a transaction (or the transactions of a compact block) is judged against
+///   our tip, `tip`. A peer that predates the activation
+///   ([`crate::wire::POLICY_ACTIVATION_VERSION`]) sending one before our next
+///   block is at the activation height gets the 0.4.9 treatment. A peer that
+///   follows it relays one only once its own next block is there, and it may
+///   be ahead of us — we may even be syncing from far behind: its
+///   transaction is refused without penalty (see `Node::tx_invalid_in_itself`)
+///   unless it comes earlier than [`crate::consensus::POLICY_ACTIVATION_NOTICE`]
+///   blocks before the activation height, counted from our tip or from the
+///   height the peer announced at the handshake (`peer_height`), whichever is
+///   higher.
+pub fn policy_output_is_malformed(
+    network: Network,
+    tip: u64,
+    peer_version: u32,
+    peer_height: u64,
+    msg: &Message,
+) -> bool {
+    if !msg.carries_policy_output() {
+        return false;
+    }
+    if !crate::policy::may_appear_on(network) {
+        return true;
+    }
+    let mined_at = match msg {
+        Message::Block(b) => b.header.height,
+        Message::CmpctBlock(c) => c.header.height,
+        _ if peer_version >= crate::wire::POLICY_ACTIVATION_VERSION => tip
+            .max(peer_height)
+            .saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE)
+            .saturating_add(1),
+        _ => tip.saturating_add(1),
+    };
+    !crate::policy::is_active(network, mined_at)
 }
 
 /// See [`crate::validate::ValidationError::locally_unverifiable_scheme`].
@@ -2383,7 +2420,6 @@ impl Node {
     fn read_loop(&self, id: u64, mut stream: TcpStream) {
         let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut chunk = [0u8; 32 * 1024];
-        let network = self.shared.lock().unwrap().network;
 
         loop {
             if self.is_stopped() {
@@ -2412,7 +2448,7 @@ impl Node {
                 match Message::parse(&buffer, self.magic) {
                     Ok((msg, consumed)) => {
                         buffer.drain(..consumed);
-                        if policy_output_is_malformed(network, &msg) {
+                        if msg.carries_policy_output() && self.policy_is_malformed_from(id, &msg) {
                             self.penalize(id, MISCONDUCT_MALFORMED);
                             return;
                         }
@@ -2431,6 +2467,21 @@ impl Node {
         }
     }
 
+    /// [`policy_output_is_malformed`] for a message of peer `id`, against
+    /// our tip and what the peer announced at the handshake.
+    fn policy_is_malformed_from(&self, id: u64, msg: &Message) -> bool {
+        let (network, tip, version, height) = {
+            let g = self.shared.lock().unwrap();
+            let (version, height) = g
+                .peers
+                .get(&id)
+                .map(|p| (p.version, p.start_height))
+                .unwrap_or((0, 0));
+            (g.network, g.chain.height(), version, height)
+        };
+        policy_output_is_malformed(network, tip, version, height, msg)
+    }
+
     /// A transaction that only its author could have made invalid.
     fn tx_invalid_in_itself(e: &crate::mempool::MempoolError) -> bool {
         use crate::mempool::MempoolError as M;
@@ -2439,6 +2490,11 @@ impl Node {
             // "I cannot verify" is not "you are lying": see
             // `locally_unverifiable_scheme`.
             M::Validation(v) if locally_unverifiable_scheme(v).is_some() => false,
+            // A policy output our next block cannot carry yet, from a peer
+            // ahead of us: the height, not its author, makes it invalid. Where
+            // the peer could not honestly be ahead, the message never got
+            // this far (`policy_output_is_malformed`).
+            M::Validation(V::SchemeForbiddenOnNetwork(crate::sig::SchemeId::Policy)) => false,
             M::Validation(
                 V::Signature(_)
                 | V::KeyDoesNotMatchLock

@@ -2856,16 +2856,49 @@ mod dormant_tests {
             },
         ] {
             let read = frame_and_parse(&msg).expect("the frame itself is well formed");
-            assert!(policy_output_is_malformed(Network::Testnet, &read));
-            assert!(policy_output_is_malformed(Network::Mainnet, &read));
-            // Regtest, where the rule is active, reads it normally.
-            assert!(!policy_output_is_malformed(Network::Regtest, &read));
+            for version in [4, crate::wire::PROTOCOL_VERSION] {
+                assert!(policy_output_is_malformed(
+                    Network::Testnet,
+                    0,
+                    version,
+                    0,
+                    &read
+                ));
+                assert!(policy_output_is_malformed(
+                    Network::Mainnet,
+                    u64::MAX - 1,
+                    version,
+                    u64::MAX - 1,
+                    &read
+                ));
+                // Regtest, where the rule is active, reads it normally.
+                assert!(!policy_output_is_malformed(
+                    Network::Regtest,
+                    0,
+                    version,
+                    0,
+                    &read
+                ));
+            }
         }
         // Without a policy output, nothing changes anywhere.
         let mut plain = t.clone();
         plain.outputs = vec![key_out(900_000)];
         let read = frame_and_parse(&Message::Tx(Box::new(plain))).unwrap();
-        assert!(!policy_output_is_malformed(Network::Testnet, &read));
+        assert!(!policy_output_is_malformed(
+            Network::Testnet,
+            0,
+            4,
+            0,
+            &read
+        ));
+        assert!(!policy_output_is_malformed(
+            Network::Mainnet,
+            0,
+            4,
+            0,
+            &read
+        ));
 
         // The 0.4.9 path is unchanged: an unknown scheme byte still fails to
         // decode at all.

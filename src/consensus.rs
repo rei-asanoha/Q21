@@ -612,6 +612,16 @@ pub const POLICY_ACTIVATION_MAINNET: u64 = u64::MAX;
 pub const POLICY_ACTIVATION_TESTNET: u64 = u64::MAX;
 pub const POLICY_ACTIVATION_REGTEST: u64 = 1;
 
+/// How long before the activation height a node prepares its peers for it,
+/// in blocks: two days at the target spacing.
+///
+/// From `activation - POLICY_ACTIVATION_NOTICE` on, a node logs a warning for
+/// every connected peer that predates the activation: past the activation
+/// height that peer stops at the first block carrying a policy. And a peer
+/// that follows the activation may relay a policy transaction without
+/// penalty: it may be ahead of us, or we behind it.
+pub const POLICY_ACTIVATION_NOTICE: u64 = 1_440;
+
 /// Deepest nesting of a policy, the root counting as level one and a leaf
 /// as a level of its own.
 ///

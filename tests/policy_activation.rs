@@ -485,3 +485,157 @@ mod spends {
         assert!(!has_policy_output(&c));
     }
 }
+
+/// On the wire, a policy output is malformed — the 0.4.9 treatment: penalty
+/// and disconnection — only where the content could not be mined: a block
+/// below `H`, or a transaction from a peer that predates the activation
+/// while our next block is below `H`.
+mod wire {
+    use super::*;
+    use q21_core::net::{magic_for, policy_output_is_malformed, Node};
+    use q21_core::wire::{Message, POLICY_ACTIVATION_VERSION};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    const OLD: u32 = 4;
+    const NEW: u32 = POLICY_ACTIVATION_VERSION;
+
+    fn creating_tx() -> Transaction {
+        let (c, mut w) = at_h_minus_2();
+        funding(&c, &mut w, 1_000_000)
+    }
+
+    #[test]
+    fn a_block_is_judged_by_its_own_height() {
+        let (c, mut w) = at_h_minus_2();
+        let tx = funding(&c, &mut w, 1_000_000);
+        let mut b = mine(&c, &[tx], Hash256([0x22; 32]));
+        for version in [OLD, NEW] {
+            for tip in [0, H - 2, H + 10] {
+                b.header.height = H - 1;
+                let early = Message::Block(Box::new(b.clone()));
+                assert!(policy_output_is_malformed(NET, tip, version, tip, &early));
+                b.header.height = H;
+                let due = Message::Block(Box::new(b.clone()));
+                assert!(!policy_output_is_malformed(NET, tip, version, tip, &due));
+            }
+        }
+    }
+
+    #[test]
+    fn a_transaction_is_judged_by_our_next_block_and_the_peer_version() {
+        let m = Message::Tx(Box::new(creating_tx()));
+        // A peer that predates the activation: exactly 0.4.10 until our next
+        // block is at H.
+        assert!(policy_output_is_malformed(NET, H - 2, OLD, H + 50, &m));
+        assert!(!policy_output_is_malformed(NET, H - 1, OLD, 0, &m));
+        // A peer that follows it may be ahead of us: here H is within the
+        // notice of any tip, so it is never malformed.
+        assert!(!policy_output_is_malformed(NET, 0, NEW, 0, &m));
+        // Mainnet never opens the rule.
+        assert!(policy_output_is_malformed(
+            Network::Mainnet,
+            H + 1,
+            NEW,
+            H + 1,
+            &m
+        ));
+    }
+
+    /// A raw peer that completed the handshake with `version`, announcing
+    /// `height`.
+    fn peer(node: &Node, version: u32, height: u64) -> std::net::TcpStream {
+        let addr = node.listen("127.0.0.1:0").expect("listen");
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        let magic = magic_for(NET);
+        let hello = Message::Version {
+            version,
+            timestamp: 0,
+            nonce: 0x0bad_cafe,
+            user_agent: "q21:0.4".into(),
+            start_height: height,
+        };
+        s.write_all(&hello.frame(magic)).unwrap();
+        s.write_all(&Message::VerAck.frame(magic)).unwrap();
+        assert!(
+            wait(|| node.peer_list().iter().any(|p| p.handshake_complete)),
+            "handshake"
+        );
+        s
+    }
+
+    fn wait(mut f: impl FnMut() -> bool) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(10) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// A write the node may refuse by cutting the link: that is what some
+    /// tests check, not an error.
+    fn send(s: &mut std::net::TcpStream, m: &Message) {
+        let _ = s.write_all(&m.frame(magic_for(NET)));
+    }
+
+    /// Our tip at `H - 2`. A peer that follows the activation and is ahead
+    /// of us relays policy transactions: refused, since our next block
+    /// cannot carry them, but the peer is not charged and stays — charged as
+    /// invalid transactions, six of them would cut it. The same transaction
+    /// from a peer that predates the activation is what 0.4.10 made of it:
+    /// malformed, and the link is cut at the first.
+    #[test]
+    fn a_policy_transaction_costs_a_following_peer_nothing_and_an_older_one_the_link() {
+        let tx = creating_tx();
+        for (version, kept) in [(NEW, true), (OLD, false)] {
+            let (c, _) = at_h_minus_2();
+            let node = Node::new(NET, c);
+            let mut s = peer(&node, version, H);
+            // Distinct transactions, so none is skipped as already refused.
+            // The changed value breaks no check that comes first: the output
+            // scheme is refused before any signature is looked at.
+            for i in 0..6 {
+                let mut t = tx.clone();
+                t.outputs[0].value = Amount::from_units(t.outputs[0].value.units() - i);
+                send(&mut s, &Message::Tx(Box::new(t)));
+            }
+            if kept {
+                std::thread::sleep(Duration::from_millis(500));
+                assert_eq!(node.peer_count(), 1, "version {version} must stay");
+                assert_eq!(node.mempool_len(), 0);
+            } else {
+                assert!(
+                    wait(|| node.peer_count() == 0),
+                    "version {version} must be cut"
+                );
+            }
+            node.shutdown();
+        }
+    }
+
+    /// Our tip at `H - 1`: a peer sends the block at `H` carrying a policy
+    /// output. Whatever its version, the block is valid and adopted, and the
+    /// peer is not charged.
+    #[test]
+    fn a_policy_block_at_h_is_adopted_from_any_peer() {
+        for version in [NEW, OLD] {
+            let (mut c, mut w) = at_h_minus_2();
+            let tx = funding(&c, &mut w, 1_000_000);
+            let b = mine(&c, &[], Hash256([0x22; 32]));
+            connect(&mut c, &b).unwrap();
+            let at_h = mine(&c, &[tx.clone()], Hash256([0x22; 32]));
+            let node = Node::new(NET, c);
+            let mut s = peer(&node, version, H);
+            send(&mut s, &Message::Block(Box::new(at_h.clone())));
+            assert!(
+                wait(|| node.tip_id() == at_h.header.block_id()),
+                "the block at H is adopted from version {version}"
+            );
+            assert_eq!(node.peer_count(), 1);
+            node.shutdown();
+        }
+    }
+}
