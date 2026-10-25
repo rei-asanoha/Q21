@@ -485,3 +485,29 @@ fn the_released_binary_is_built_without_the_audit_hooks() {
         );
     }
 }
+
+/// The upgrade notes announce the testnet activation height. The height is
+/// set at release: the notes must follow it, or operators would upgrade by
+/// the wrong date.
+#[test]
+fn upgrading_md_announces_the_compiled_testnet_activation() {
+    let h = q21_core::consensus::POLICY_ACTIVATION_TESTNET;
+    let digits = h.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    let text = read("UPGRADING.md");
+    let start = text
+        .find("# Upgrading from 0.4.10 to 0.4.11")
+        .expect("UPGRADING.md has no 0.4.10 to 0.4.11 section");
+    let section = &text[start..];
+    let section = &section[..section[1..].find("\n# ").map_or(section.len(), |e| e + 1)];
+    assert!(
+        section.contains(&format!("block {grouped}")),
+        "the 0.4.11 notes do not announce block {grouped}, the compiled testnet activation"
+    );
+}
