@@ -2877,3 +2877,42 @@ fn an_unconfirmed_funding_is_announced_again_and_released_when_the_channel_ends(
         "coins held after the channel ended"
     );
 }
+
+/// A payee's reported balance counts a payment only once the payer can no
+/// longer undo it: once the payer has revoked the state before it. Until
+/// then the payer could still broadcast that state, and the payment shows
+/// as pending, not as balance. The payer's own balance drops at once.
+#[test]
+fn a_payment_counts_for_the_payee_only_once_it_is_irrevocable() {
+    let (p, _wallet, _chain, _dir, cid, capacity) =
+        open_channel([0xbbu8; 32], [0xbcu8; 32], "irrevocable");
+    let one = |r: q21_core::channel::manager::Reaction| -> Vec<u8> {
+        assert_eq!(r.penalize, 0);
+        assert_eq!(r.frames.len(), 1);
+        r.frames.into_iter().next().unwrap()
+    };
+    let update = p.funder.pay(cid, 300_000).unwrap();
+    // The payee holds the signed update: not yet its balance.
+    let ack = one(p.acceptor.deliver(F_PEER, "", &update));
+    let a = p.acceptor.info(cid).unwrap();
+    assert_eq!(a.local_balance, 0, "counted before the payer revoked");
+    assert_eq!(a.pending_incoming, 300_000);
+    assert!(a.in_flight);
+    // The payer's side drops at once.
+    let f = p.funder.info(cid).unwrap();
+    assert_eq!(f.local_balance, capacity - 300_000);
+    assert_eq!(f.pending_incoming, 0);
+    // The payer revokes the old state: settled on its side ...
+    let revoke = one(p.funder.deliver(A_PEER, "", &ack));
+    let f = p.funder.info(cid).unwrap();
+    assert!(!f.in_flight);
+    assert_eq!(f.local_balance + f.remote_balance, capacity);
+    // ... and, the revocation received, on the payee's.
+    let r = p.acceptor.deliver(F_PEER, "", &revoke);
+    assert_eq!(r.penalize, 0);
+    let a = p.acceptor.info(cid).unwrap();
+    assert_eq!(a.local_balance, 300_000);
+    assert_eq!(a.pending_incoming, 0);
+    assert!(!a.in_flight);
+    assert_eq!(a.local_balance + a.remote_balance, capacity);
+}

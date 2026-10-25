@@ -2283,6 +2283,57 @@ impl Machine {
     pub fn balances(&self) -> Balances {
         self.current_balances()
     }
+
+    /// The balances of the newest state either side has signed: a payment
+    /// of ours shows here as soon as we proposed it, one to us as soon as we
+    /// hold it.
+    pub fn latest_balances(&self) -> Balances {
+        let local = self
+            .local_commits
+            .iter()
+            .next_back()
+            .map(|(n, (b, _))| (*n, *b));
+        let remote = self
+            .remote_balances
+            .iter()
+            .next_back()
+            .map(|(n, b)| (*n, *b));
+        match (local, remote) {
+            (Some((l, lb)), Some((r, rb))) => {
+                if r > l {
+                    rb
+                } else {
+                    lb
+                }
+            }
+            (Some((_, b)), None) | (None, Some((_, b))) => b,
+            (None, None) => self.current_balances(),
+        }
+    }
+
+    /// Our balance that the counterparty can no longer take back: the
+    /// lowest it is in any of the counterparty's commitments not yet revoked
+    /// to us, since the counterparty may still broadcast any of them. A
+    /// payment to us counts here only once the payer has revoked the state
+    /// before it; a payment of ours counts against us at once.
+    pub fn irrevocable_balance(&self) -> u64 {
+        let us = self.our_index;
+        let latest = self.current_balances()[us];
+        let Some(top) = self.remote_commit_number else {
+            return latest;
+        };
+        let low = self.revocations_recv.map_or(0, |m| m + 1);
+        if low > top {
+            return latest;
+        }
+        self.remote_balances
+            .range(low..=top)
+            .map(|(_, b)| b[us])
+            .chain(self.local_commits.range(low..=top).map(|(_, (b, _))| b[us]))
+            .chain(std::iter::once(latest))
+            .min()
+            .unwrap_or(latest)
+    }
     pub fn local_commit_number(&self) -> Option<u64> {
         self.local_commit_number
     }

@@ -100,10 +100,21 @@ pub struct ChannelSummary {
     pub peer: u64,
     pub phase: Phase,
     pub capacity: u64,
+    /// Ours irrevocably: what the counterparty can no longer take back by
+    /// broadcasting a state it has not revoked (see
+    /// [`Machine::irrevocable_balance`]).
     pub local_balance: u64,
+    /// Paid to us in the latest state, not yet irrevocable: the payer has
+    /// not revoked the state before it. `local_balance + pending_incoming +
+    /// remote_balance` is the capacity.
+    pub pending_incoming: u64,
+    /// The counterparty's balance in the latest state.
     pub remote_balance: u64,
     pub state_number: u64,
     pub funding: Option<OutPoint>,
+    /// An update is still settling: proposed, acknowledged, or a revocation
+    /// still owed either way.
+    pub in_flight: bool,
 }
 
 /// Authenticated connections remembered per channel, and challenges awaiting
@@ -2150,17 +2161,20 @@ fn finish_settling(chan: &mut Chan, height: u64, network: Network) {
 }
 
 fn summary(c: &Chan) -> ChannelSummary {
-    let bal = c.machine.balances();
+    let bal = c.machine.latest_balances();
     let us = c.machine.our_index();
+    let sure = c.machine.irrevocable_balance().min(bal[us]);
     ChannelSummary {
         channel_id: c.machine.channel_id(),
         peer: c.peer,
         phase: c.machine.phase(),
         capacity: c.capacity,
-        local_balance: bal[us],
+        local_balance: sure,
+        pending_incoming: bal[us] - sure,
         remote_balance: bal[1 - us],
         state_number: c.machine.local_commit_number().unwrap_or(0),
         funding: c.machine.funding_outpoint(),
+        in_flight: c.machine.update_in_flight(),
     }
 }
 

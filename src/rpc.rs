@@ -669,7 +669,14 @@ fn channel_open_terms(params: &Json) -> Result<(Option<u16>, Option<u16>), Json>
     ))
 }
 
+/// How long `channelpay` waits for its payment to become irrevocable before
+/// answering "pending".
+#[cfg(feature = "mldsa")]
+const CHANNELPAY_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// One channel as a small JSON object, for `channellist` and `channelinfo`.
+/// `local_balance` is ours irrevocably; `pending_incoming` is paid to us in
+/// the latest state but not yet irrevocable.
 #[cfg(feature = "mldsa")]
 fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
     Json::obj()
@@ -678,8 +685,10 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("phase", Json::str(format!("{:?}", s.phase).to_lowercase()))
         .set("capacity", Json::u64(s.capacity))
         .set("local_balance", Json::u64(s.local_balance))
+        .set("pending_incoming", Json::u64(s.pending_incoming))
         .set("remote_balance", Json::u64(s.remote_balance))
         .set("state", Json::u64(s.state_number))
+        .set("in_flight", Json::Bool(s.in_flight))
         .set(
             "funding_txid",
             match s.funding {
@@ -1133,7 +1142,7 @@ impl RpcContext {
             ),
             (
                 "channelpay",
-                "[wallet] Pay over a channel (channel_id, amount)",
+                "[wallet] Pay over a channel (channel_id, amount); settled once irrevocable",
             ),
             (
                 "channelclose",
@@ -1236,6 +1245,7 @@ impl RpcContext {
         if !self.node.channel_peers().contains(&peer) {
             return Err(rpc_error(ERR_REQUEST, "peer is not connected"));
         }
+        let before = mgr.info(cid).map_or(0, |s| s.state_number);
         let frame = mgr
             .pay(cid, amount)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
@@ -1245,8 +1255,25 @@ impl RpcContext {
                 "peer disconnected; the payment completes when the channel reconnects",
             ));
         }
+        // "settled" means what the payee's balance means: we have revoked the
+        // state before the payment, so it can no longer be undone. A payment
+        // still settling when the wait ends is "pending": it completes on its
+        // own, or at the next reestablish.
+        let deadline = std::time::Instant::now() + CHANNELPAY_SETTLE_WAIT;
+        let settled = loop {
+            let done = mgr
+                .info(cid)
+                .is_some_and(|s| s.state_number > before && !s.in_flight);
+            if done || std::time::Instant::now() >= deadline {
+                break done;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         Ok(Json::obj()
-            .set("status", Json::str("sent"))
+            .set(
+                "status",
+                Json::str(if settled { "settled" } else { "pending" }),
+            )
             .set("channel_id", Json::str(cid.to_hex()))
             .set("amount", Json::u64(amount))
             .build())
