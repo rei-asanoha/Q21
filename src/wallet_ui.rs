@@ -142,6 +142,17 @@ h1{font-size:inherit;font-weight:inherit;margin:0;letter-spacing:inherit}
   letter-spacing:.08em;text-transform:uppercase;color:var(--accent);
   background:var(--accent-bg);padding:.18rem .45rem;border-radius:5px;white-space:nowrap}
 .bar .push{margin-left:auto}
+/* On a phone the bar holds the logo and the languages, and the state of the
+   connection takes the line below: on one line, the flags were pushed off a
+   375-pixel screen. */
+.bar{flex-wrap:wrap;row-gap:.3rem}
+.bar .pulse{order:3;flex-basis:100%;margin-left:0}
+.bar .languages{margin-left:auto}
+@media(min-width:640px){
+  .bar{flex-wrap:nowrap}
+  .bar .pulse{order:0;flex-basis:auto;margin-left:auto}
+  .bar .languages{margin-left:.75rem}
+}
 .pulse{display:flex;align-items:center;gap:.45rem;font-size:.76rem;color:var(--soft);
   font-variant-numeric:tabular-nums;white-space:nowrap}
 .dot{width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);flex:0 0 auto}
