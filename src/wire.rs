@@ -767,8 +767,8 @@ impl Message {
     /// ([`crate::sig::SchemeId::Policy`])?
     ///
     /// Up to 0.4.9 such an output did not decode at all. Where policies are
-    /// dormant, the node uses this to treat the message exactly as it did
-    /// then: unreadable. Inputs need no look: an input spending a policy
+    /// not open yet, the node uses this to treat the message exactly as it
+    /// did then: unreadable (see [`crate::net::policy_output_is_malformed`]). Inputs need no look: an input spending a policy
     /// output only exists if one was created.
     pub fn carries_policy_output(&self) -> bool {
         fn any<'a>(mut txs: impl Iterator<Item = &'a Transaction>) -> bool {

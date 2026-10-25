@@ -4327,6 +4327,22 @@ mod tests {
         }
     }
 
+    /// Testnet counts down to its activation height.
+    #[test]
+    fn channelstatus_on_testnet_counts_down_to_the_activation() {
+        let c = context_on(Network::Testnet);
+        let r = call_ok(&c, "channelstatus", "{}");
+        let h = crate::consensus::POLICY_ACTIVATION_TESTNET;
+        assert_eq!(r.get("network").and_then(|v| v.as_str()), Some("Testnet"));
+        assert_eq!(r.get("activation_height").and_then(|v| v.as_u64()), Some(h));
+        assert_eq!(r.get("active"), Some(&Json::Bool(false)));
+        assert_eq!(r.get("blocks_remaining").and_then(|v| v.as_u64()), Some(h));
+        assert_eq!(
+            r.get("eta_seconds").and_then(|v| v.as_u64()),
+            Some(h * TARGET_BLOCK_SECS)
+        );
+    }
+
     /// Mainnet never opens the rule: no height, nothing to count down.
     #[test]
     fn channelstatus_on_mainnet_has_no_activation() {

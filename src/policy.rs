@@ -1168,12 +1168,23 @@ mod tests {
     }
 
     #[test]
-    fn activation_is_regtest_only() {
+    fn activation_is_never_on_mainnet_and_at_its_height_elsewhere() {
         assert!(!is_active(Network::Mainnet, u64::MAX - 1));
-        assert!(!is_active(Network::Testnet, u64::MAX - 1));
+        assert!(!is_active(Network::Testnet, POLICY_ACTIVATION_TESTNET - 1));
+        assert!(is_active(Network::Testnet, POLICY_ACTIVATION_TESTNET));
         assert!(!is_active(Network::Regtest, 0));
         assert!(is_active(Network::Regtest, 1));
         assert!(!scheme_allowed(SchemeId::Policy, Network::Testnet, 1_000));
+        assert!(scheme_allowed(
+            SchemeId::Policy,
+            Network::Testnet,
+            POLICY_ACTIVATION_TESTNET
+        ));
+        assert!(!scheme_allowed(
+            SchemeId::Policy,
+            Network::Mainnet,
+            u64::MAX - 1
+        ));
         assert!(scheme_allowed(SchemeId::MlDsa87, Network::Mainnet, 0));
         assert!(!scheme_allowed(SchemeId::LamportOts, Network::Mainnet, 0));
     }
@@ -1489,13 +1500,14 @@ mod spend_tests {
             lone(&tx, &e.output, &p2.encode(), 1, &sig_b),
             Err(ValidationError::Policy(PolicyError::DoesNotMatchLock))
         );
-        // Not a policy output at all, or not on a network where it is active.
+        // Not a policy output at all, or on a network where the rule never
+        // opens.
         assert!(lone(&tx, &b.output(VALUE), &pb, 1, &sig_b).is_err());
         assert_eq!(
             check_signature(
                 &tx,
                 0,
-                Network::Testnet,
+                Network::Mainnet,
                 &e.output,
                 &pb,
                 1,
@@ -2804,8 +2816,9 @@ mod spend_tests {
     }
 }
 
-/// The rule is dormant on testnet and mainnet: nothing carrying a policy
-/// output is treated more leniently there than 0.4.9 treated it.
+/// The rule is dormant on mainnet, and on testnet below its activation
+/// height: nothing carrying a policy output is treated more leniently there
+/// than 0.4.9 treated it.
 #[cfg(test)]
 mod dormant_tests {
     use super::*;
@@ -2881,9 +2894,10 @@ mod dormant_tests {
         Message::parse(&m.frame(NETWORK_MAGIC_TESTNET), NETWORK_MAGIC_TESTNET).map(|(m, _)| m)
     }
 
-    /// A transaction or a block with a policy output, received on testnet
-    /// or mainnet: unreadable, as in 0.4.9 — the node penalizes the sender
-    /// with `MISCONDUCT_MALFORMED` and drops it (see `Node::read_loop`).
+    /// A transaction or a block with a policy output, received on mainnet,
+    /// or on testnet far below the activation: unreadable, as in 0.4.9 — the
+    /// node penalizes the sender with `MISCONDUCT_MALFORMED` and drops it
+    /// (see `Node::read_loop`).
     #[test]
     fn a_live_node_treats_a_policy_output_as_unreadable() {
         let (t, _) = creating();
@@ -2972,6 +2986,128 @@ mod dormant_tests {
         assert_eq!(raw[pos], SchemeId::Policy.as_u8());
         raw[pos] = 200;
         assert!(Transaction::decode(&raw).is_err());
+    }
+
+    /// The testnet activation is the one compiled in: a real height, with a
+    /// transition, between today's tip and anything that would leave too
+    /// little notice.
+    #[test]
+    fn testnet_schedules_the_activation_at_a_real_height() {
+        assert_eq!(
+            scheduled_activation(Network::Testnet),
+            crate::consensus::POLICY_ACTIVATION_TESTNET
+        );
+        assert_eq!(activation_height(Network::Testnet), 17_000);
+        assert!(has_transition(Network::Testnet));
+        assert!(!is_active(Network::Testnet, 16_999));
+        assert!(is_active(Network::Testnet, 17_000));
+        let st = status(Network::Testnet, 4_440);
+        assert_eq!(st.activation_height, Some(17_000));
+        assert!(!st.active);
+        assert_eq!(st.blocks_remaining, Some(12_560));
+        assert_eq!(st.eta_seconds(), Some(12_560 * 120));
+        assert!(!reached(Network::Testnet, 16_999));
+        assert!(reached(Network::Testnet, 17_000));
+        assert!(!may_appear_on(Network::Mainnet));
+        assert!(!reached(Network::Mainnet, u64::MAX - 1));
+    }
+
+    /// Around the testnet activation: a block is judged by its own height; a
+    /// transaction from a peer that predates the activation by our next
+    /// block; one from a peer that follows it is tolerated from the notice
+    /// before the activation on, counted from our tip or its announced height.
+    #[test]
+    fn testnet_wire_reading_around_the_activation() {
+        let (t, _) = creating();
+        let new = crate::wire::POLICY_ACTIVATION_VERSION;
+        let tx = Message::Tx(Box::new(t.clone()));
+        let notice = crate::consensus::POLICY_ACTIVATION_NOTICE;
+        let h = 17_000;
+        assert!(policy_output_is_malformed(
+            Network::Testnet,
+            h - 2,
+            4,
+            h,
+            &tx
+        ));
+        assert!(!policy_output_is_malformed(
+            Network::Testnet,
+            h - 1,
+            4,
+            0,
+            &tx
+        ));
+        let edge = h - 1 - notice;
+        assert!(!policy_output_is_malformed(
+            Network::Testnet,
+            edge,
+            new,
+            0,
+            &tx
+        ));
+        assert!(policy_output_is_malformed(
+            Network::Testnet,
+            edge - 1,
+            new,
+            0,
+            &tx
+        ));
+        assert!(!policy_output_is_malformed(
+            Network::Testnet,
+            0,
+            new,
+            edge,
+            &tx
+        ));
+        let block = |height: u64| {
+            let mut header = BlockHeader {
+                version: 1,
+                prev_block: Hash256::ZERO,
+                merkle_root: Hash256::ZERO,
+                uncles_root: Hash256::ZERO,
+                miner: Hash256::ZERO,
+                time: 0,
+                bits: 0,
+                height,
+                nonce: 0,
+            };
+            header.height = height;
+            Message::Block(Box::new(Block {
+                header,
+                transactions: vec![t.clone()],
+                uncles: Vec::new(),
+            }))
+        };
+        for v in [4, new] {
+            assert!(policy_output_is_malformed(
+                Network::Testnet,
+                h + 5,
+                v,
+                h + 5,
+                &block(h - 1)
+            ));
+            assert!(!policy_output_is_malformed(
+                Network::Testnet,
+                0,
+                v,
+                0,
+                &block(h)
+            ));
+        }
+        // The mempool's own gate: the next block at the activation height.
+        let (t, u) = creating();
+        assert_eq!(
+            Mempool::new().accept(&t, &u, Network::Testnet, h - 2),
+            Err(MempoolError::Validation(
+                ValidationError::SchemeForbiddenOnNetwork(SchemeId::Policy)
+            ))
+        );
+        assert!(!matches!(
+            Mempool::new().accept(&t, &u, Network::Testnet, h - 1),
+            Err(MempoolError::Validation(
+                ValidationError::SchemeForbiddenOnNetwork(_)
+            ))
+        ));
     }
 
     /// The mempool of a live network refuses a policy output, created or

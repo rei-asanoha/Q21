@@ -214,3 +214,78 @@ fn a_node_dialing_at_startup_announces_the_channel_capability() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A testnet wallet node runs the channel manager from its start, before the
+/// activation height of policy outputs: it lists its channels, and refuses
+/// to open one until the tip reaches that height.
+#[test]
+fn a_testnet_wallet_node_runs_channels_and_waits_for_the_activation() {
+    let base = dir("testnet");
+    let d = base.join("t");
+    std::fs::create_dir_all(&d).unwrap();
+    let passphrase = base.join("passphrase.txt");
+    private_file(&passphrase, "channel startup passphrase\n");
+    let token = base.join("token.txt");
+    private_file(&token, TOKEN);
+    let out = Command::new(q21())
+        .arg("--datadir")
+        .arg(&d)
+        .arg("--passphrase-file")
+        .arg(&passphrase)
+        .args(["init", "testnet"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("starting q21 init");
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let port = free_port();
+    let _n = NodeProcess(
+        Command::new(q21())
+            .arg("--datadir")
+            .arg(&d)
+            .arg("--passphrase-file")
+            .arg(&passphrase)
+            .args([
+                "node",
+                "--network",
+                "testnet",
+                "--no-bootstrap",
+                "--rpc-wallet",
+            ])
+            .arg("--rpc-token-file")
+            .arg(&token)
+            .args(["--rpc", &format!("127.0.0.1:{port}"), "--seconds", "90"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("launching the node"),
+    );
+    let start = Instant::now();
+    while rpc(port, "getinfo").is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the node does not start"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let list = rpc(port, "channellist").unwrap();
+    assert!(list.contains("\"result\":[]"), "channellist: {list}");
+    let status = rpc(port, "channelstatus").unwrap();
+    assert!(status.contains("\"active\":false"), "{status}");
+    assert!(
+        status.contains(&format!(
+            "\"activation_height\":{}",
+            q21_core::consensus::POLICY_ACTIVATION_TESTNET
+        )),
+        "{status}"
+    );
+    let open = rpc(port, "channelopen").unwrap();
+    assert!(
+        open.contains("payment channels open on this network at block"),
+        "channelopen before the activation: {open}"
+    );
+}
