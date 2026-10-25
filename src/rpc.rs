@@ -699,6 +699,46 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .build()
 }
 
+/// The fee a channel funding transaction pays, in units. The node funds
+/// channels with it, and `getinfo` announces it so that the wallet page can
+/// show it before the open.
+pub const CHANNEL_FUND_FEE: u64 = 50_000;
+
+/// The terms of a channel opened with the defaults: capacity bounds, the
+/// on-chain fees of the funding and of a cooperative close, the to-self delay
+/// of a forced close and the confirmations a funding waits for. Null without
+/// the signing backend, where no channel runs.
+fn channel_terms() -> Json {
+    #[cfg(feature = "mldsa")]
+    {
+        use crate::channel::{
+            manager::CLOSE_FEE, DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH, MAX_CAPACITY,
+            MIN_CAPACITY,
+        };
+        Json::obj()
+            .set(
+                "min_capacity",
+                amount_json(Amount::from_units(MIN_CAPACITY)),
+            )
+            .set(
+                "max_capacity",
+                amount_json(Amount::from_units(MAX_CAPACITY)),
+            )
+            .set(
+                "open_fee",
+                amount_json(Amount::from_units(CHANNEL_FUND_FEE)),
+            )
+            .set("close_fee", amount_json(Amount::from_units(CLOSE_FEE)))
+            .set("delay_blocks", Json::u64(u64::from(DEFAULT_DELAY_REGTEST)))
+            .set("funding_depth", Json::u64(u64::from(DEFAULT_FUNDING_DEPTH)))
+            .build()
+    }
+    #[cfg(not(feature = "mldsa"))]
+    {
+        Json::Null
+    }
+}
+
 /// `channelstatus` at chain height `tip`: active on regtest from its policy
 /// activation height; elsewhere not active, with that network's activation
 /// height (`u64::MAX` while none is scheduled). The wait is in blocks and in
@@ -1583,6 +1623,9 @@ impl RpcContext {
             // source entitled to state them.
             .set("coinbase_maturity", Json::u64(COINBASE_MATURITY))
             .set("target_interval_seconds", Json::u64(TARGET_BLOCK_SECS))
+            // The terms of a channel, for the same reason: the page checks a
+            // capacity and states the fees before an open or a close.
+            .set("channel_terms", channel_terms())
             .set(
                 "network_stats",
                 Json::obj()
@@ -4219,6 +4262,32 @@ mod tests {
         assert_eq!(
             field(&super::channel_status(Network::Testnet, 1), "network").as_str(),
             Some("testnet")
+        );
+    }
+
+    /// `getinfo` states the terms of a channel, so that the wallet page checks
+    /// a capacity and shows the fees without copying them.
+    #[test]
+    #[cfg(feature = "mldsa")]
+    fn getinfo_states_the_channel_terms() {
+        let r = call_ok(&context(false), "getinfo", "{}");
+        let t = r.get("channel_terms").cloned().expect("channel terms");
+        let units = |k: &str| {
+            t.get(k)
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+        };
+        assert_eq!(units("min_capacity"), Some(crate::channel::MIN_CAPACITY));
+        assert_eq!(units("max_capacity"), Some(crate::channel::MAX_CAPACITY));
+        assert_eq!(units("open_fee"), Some(CHANNEL_FUND_FEE));
+        assert_eq!(units("close_fee"), Some(crate::channel::manager::CLOSE_FEE));
+        assert_eq!(
+            t.get("delay_blocks").and_then(|v| v.as_u64()),
+            Some(u64::from(crate::channel::DEFAULT_DELAY_REGTEST))
+        );
+        assert_eq!(
+            t.get("funding_depth").and_then(|v| v.as_u64()),
+            Some(u64::from(crate::channel::DEFAULT_FUNDING_DEPTH))
         );
     }
 

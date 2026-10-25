@@ -4697,8 +4697,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             use q21_core::amount::Amount;
             use q21_core::channel::manager::{ChannelManager, Hooks};
             use q21_core::channel::{DEFAULT_DELAY_REGTEST, DEFAULT_FUNDING_DEPTH};
+            use q21_core::rpc::CHANNEL_FUND_FEE;
             use q21_core::tx::{Transaction, TxOut};
-            const CHANNEL_FUND_FEE: u64 = 50_000;
 
             let folder = datadir.to_path_buf();
             let mut seed = wallet.lock().unwrap().channel_seed();
