@@ -6,6 +6,10 @@
 //! channels never share a key. A second seed, derived the same way under a
 //! different tag, feeds the revocation shachain ([`crate::shachain`]).
 //!
+//! A wallet also holds one static [`NodeIdentity`], derived from the same
+//! seed under its own tag, which authenticates the transport between channel
+//! peers.
+//!
 //! Verification always goes through [`crate::sig::verify`], exactly as it does
 //! for an ordinary spend. Only *signing* is placed behind a trait, so the
 //! engine never carries a private-key format of its own and a test can sign
@@ -104,6 +108,91 @@ impl ChannelKey {
     #[cfg(test)]
     pub(crate) fn seed_location(&self) -> *const [u8; 32] {
         &self.seed
+    }
+}
+
+/// Derivation tag of the node identity key's seed.
+#[cfg(feature = "mldsa")]
+const TAG_NODE_IDENTITY: &str = "Q21/channel/node-identity-key";
+/// Tag of a node id: the hash of a node identity public key.
+const TAG_NODE_ID: &str = "Q21/channel/node-id/3";
+/// Tag of the node id that wallets advertised before the transport existed:
+/// a hash of the channel seed itself, bound to nothing a peer could check.
+#[cfg(feature = "mldsa")]
+const TAG_LEGACY_NODE_ID: &str = "Q21/channel/node-id";
+
+/// Bytes of a legacy node id (see [`NodeIdentity::legacy_id`]).
+pub const LEGACY_NODE_ID_LEN: usize = 16;
+
+/// The node id of an identity public key: what a channel is bound to, and
+/// what the transport authenticates (see [`crate::channel::transport`]).
+pub fn node_id(identity_pubkey: &[u8]) -> Hash256 {
+    tagged_hash_parts(TAG_NODE_ID, &[identity_pubkey])
+}
+
+/// A node's static channel identity: one ML-DSA-87 key per wallet, derived
+/// from the channel seed under a tag of its own, so it shares nothing with a
+/// channel's funding keys or revocation roots. It signs the transport
+/// handshake only; its hash, the node id, is the identity every channel of
+/// the wallet is bound to.
+///
+/// Its seed lives only while the key is expanded, and is wiped then; the
+/// expanded signing key wipes itself on drop.
+#[cfg(feature = "mldsa")]
+pub struct NodeIdentity {
+    sk: ml_dsa::SigningKey<ml_dsa::MlDsa87>,
+    pubkey: Vec<u8>,
+    id: Hash256,
+    legacy: [u8; LEGACY_NODE_ID_LEN],
+}
+
+#[cfg(feature = "mldsa")]
+impl NodeIdentity {
+    /// The identity of the wallet whose channel seed is `channel_seed`.
+    pub fn derive(channel_seed: &[u8; 32]) -> NodeIdentity {
+        use ml_dsa::{signature::Keypair, SigningKey, B32};
+        let mut seed = tagged_hash_parts(TAG_NODE_IDENTITY, &[channel_seed]).0;
+        let mut b32 = B32::from(seed);
+        let sk = SigningKey::<ml_dsa::MlDsa87>::from_seed(&b32);
+        crate::kdf::wipe(&mut seed);
+        crate::kdf::wipe(&mut b32);
+        let pubkey = sk.verifying_key().encode()[..].to_vec();
+        let id = node_id(&pubkey);
+        let mut legacy = [0u8; LEGACY_NODE_ID_LEN];
+        legacy.copy_from_slice(
+            &tagged_hash_parts(TAG_LEGACY_NODE_ID, &[channel_seed]).0[..LEGACY_NODE_ID_LEN],
+        );
+        NodeIdentity {
+            sk,
+            pubkey,
+            id,
+            legacy,
+        }
+    }
+
+    /// The public key, `CHANNEL_SCHEME.pubkey_len()` bytes.
+    pub fn pubkey(&self) -> &[u8] {
+        &self.pubkey
+    }
+
+    /// The node id: [`node_id`] of the public key.
+    pub fn id(&self) -> Hash256 {
+        self.id
+    }
+
+    /// The node id this wallet advertised before the transport, a hash of
+    /// its channel seed. Carried, signed, in the handshake so that a channel
+    /// whose journal still names its peer that way can be bound again (see
+    /// [`crate::channel::manager`]); it authenticates nothing on its own.
+    pub fn legacy_id(&self) -> [u8; LEGACY_NODE_ID_LEN] {
+        self.legacy
+    }
+
+    /// Signs a 32-byte message (deterministic FIPS 204: what it signs is a
+    /// transcript hash that already holds fresh ephemeral keys).
+    pub fn sign(&self, message: &Hash256) -> Vec<u8> {
+        use ml_dsa::Signer as _;
+        self.sk.sign(message.as_bytes()).encode()[..].to_vec()
     }
 }
 

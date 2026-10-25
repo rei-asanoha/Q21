@@ -25,6 +25,9 @@ pub mod machine;
 #[cfg(feature = "mldsa")]
 pub mod manager;
 pub mod messages;
+/// The authenticated, encrypted session between channel peers.
+#[cfg(feature = "mldsa")]
+pub mod transport;
 pub mod txbuild;
 pub mod watcher;
 
