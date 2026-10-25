@@ -804,7 +804,11 @@ fn a_revoked_two_output_commitment_is_punished() {
         "state-1 commitment has both outputs"
     );
 
-    // Advance to state 2, revoking state 1.
+    // Advance to state 2, revoking state 1. The victim's balance counts the
+    // payment only once the funder's revocation of state 1 is in: before it,
+    // the cheat below would be the funder's latest unrevoked state, not a
+    // revoked one, and the victim could only claim its own output. (Waiting
+    // on the balance used to race the revocation under load.)
     let pay2 = net.fmgr.pay(cid, 500_000).unwrap();
     assert!(net.a.send_channel(net.bid, pay2));
     assert!(
@@ -814,6 +818,9 @@ fn a_revoked_two_output_commitment_is_punished() {
         ),
         "second payment did not land"
     );
+    let b = net.amgr.info(cid).unwrap();
+    assert_eq!(b.pending_incoming, 0);
+    assert!(!b.in_flight, "the funder's revocation of state 1 is in");
 
     let b_before = net.b_balance();
     net.cheat_broadcast(&revoked);
