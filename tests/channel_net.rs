@@ -822,6 +822,20 @@ fn a_revoked_two_output_commitment_is_punished() {
     assert_eq!(b.pending_incoming, 0);
     assert!(!b.in_flight, "the funder's revocation of state 1 is in");
 
+    // What the victim must end with in its wallet: the cheater's to_local,
+    // less the penalty fee, and its own to_remote in the revoked state, less
+    // the claim fee — that one pays its channel key, as in any commitment.
+    let close_fee = q21_core::channel::manager::CLOSE_FEE;
+    let value = |policy: bool| {
+        revoked
+            .outputs
+            .iter()
+            .find(|o| (o.scheme == SchemeId::Policy) == policy)
+            .map(|o| o.value.units())
+            .unwrap()
+    };
+    let (to_local, own) = (value(true), value(false));
+    let at_least = to_local - 16 * close_fee + own - close_fee;
     let b_before = net.b_balance();
     net.cheat_broadcast(&revoked);
     net.mine();
@@ -830,12 +844,14 @@ fn a_revoked_two_output_commitment_is_punished() {
         wait(
             || {
                 net.mine();
-                net.b_balance() > b_before
+                net.b_balance() >= b_before + at_least
             },
             15
         ),
-        "the revoked two-output broadcast was not punished"
+        "the victim was not made whole: {} of at least {at_least}",
+        net.b_balance() - b_before
     );
+    assert!(net.b_balance() - b_before <= to_local + own);
     assert!(
         net.height() < cheat_h + DELAY as u64,
         "penalty before the delay"
@@ -1135,6 +1151,12 @@ fn an_offline_victim_node_punishes_on_restart() {
         .find(|o| o.scheme == SchemeId::Policy)
         .map(|o| o.value.units())
         .expect("a to_local");
+    let own = revoked
+        .outputs
+        .iter()
+        .find(|o| o.scheme != SchemeId::Policy)
+        .map(|o| o.value.units())
+        .expect("the victim's own to_remote");
 
     // The victim's process stops: its blocks arrive, nobody watches them.
     net.amgr = Arc::new(ChannelManager::new(
@@ -1182,10 +1204,12 @@ fn an_offline_victim_node_punishes_on_restart() {
         net.height() < cheat_h + u64::from(DELAY),
         "before the delay"
     );
+    let close_fee = q21_core::channel::manager::CLOSE_FEE;
     let gained = net.b_balance() - b_before;
     assert!(
-        gained + 16 * q21_core::channel::manager::CLOSE_FEE >= to_local,
-        "the victim took the cheater's to_local ({gained} of {to_local})"
+        gained + 16 * close_fee + close_fee >= to_local + own,
+        "the victim took the cheater's to_local and its own to_remote \
+         ({gained} of {to_local} + {own})"
     );
     for _ in 1..DEPTH {
         net.mine();

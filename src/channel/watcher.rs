@@ -25,11 +25,14 @@ pub struct OutputRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Watch {
     /// The counterparty broadcast a state it had revoked. Sweep its `to_local`
-    /// output with the revocation secret before its delay elapses.
+    /// output with the revocation secret before its delay elapses, and claim
+    /// our own `to_remote` there: like every commitment's, it pays our
+    /// channel key, not a wallet address.
     RevokedByPeer {
         state: u64,
         to_local: OutputRef,
         revocation_secret: [u8; 32],
+        to_remote: Option<OutputRef>,
     },
     /// The counterparty broadcast its latest state. Our funds sit in the
     /// `to_remote` output, already ours to claim with our key.
@@ -111,6 +114,10 @@ pub fn classify(ctx: &WatchContext, funding: OutPoint, tx: &Transaction) -> Watc
                         output: out,
                     },
                     revocation_secret: secret,
+                    to_remote: to_remote_ours.map(|(idx, out)| OutputRef {
+                        outpoint: OutPoint { txid, index: idx },
+                        output: out,
+                    }),
                 };
             }
             // Revoked but its to_local was trimmed to dust: nothing to sweep

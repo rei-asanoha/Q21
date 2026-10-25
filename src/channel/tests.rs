@@ -2124,11 +2124,21 @@ fn run_crossing(choices: &[bool], crash: Option<(usize, To)>) -> Result<Vec<bool
         return Err(format!("{ctx}: still in flight"));
     }
     // Every variant at index 3 is revoked: each side's own commitment there
-    // (the peer's payment to it) is punishable by the other.
+    // (the peer's payment to it) is punishable by the other, and the
+    // watcher's own balance in it is located, to be claimed with the penalty.
     for (holder, watcher) in [(&f, &a), (&a, &f)] {
         let variant = holder.signed_commitment_at(3, FeeTier::Low).unwrap();
+        let ours = watcher.params().funding[watcher.our_index()];
+        let own = variant
+            .outputs
+            .iter()
+            .position(|o| o.scheme != crate::sig::SchemeId::Policy && o.pubkey_hash == ours);
         match watcher.identify_spend(&variant) {
-            Watch::RevokedByPeer { state: 3, .. } => {}
+            Watch::RevokedByPeer {
+                state: 3,
+                to_remote,
+                ..
+            } if to_remote.map(|r| r.outpoint.index as usize) == own => {}
             other => {
                 return Err(format!(
                     "{ctx}: a state-3 variant is not revoked: {other:?}"

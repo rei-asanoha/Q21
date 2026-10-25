@@ -2405,6 +2405,7 @@ impl Machine {
                         state: n,
                         to_local: as_ref,
                         revocation_secret: secret,
+                        to_remote: self.find_our_output(tx, txid),
                     };
                 }
             }
@@ -2464,6 +2465,7 @@ impl Machine {
             state,
             to_local,
             revocation_secret,
+            ..
         } = watch
         else {
             return Err(ChannelError::Unexpected);

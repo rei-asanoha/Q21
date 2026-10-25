@@ -202,18 +202,26 @@ enum CloseTracker {
     /// this transaction, or by an earlier version of it broadcast before a
     /// restart. Kept whole, to be broadcast again after a restart.
     Finalizing { spends: OutPoint, tx: Transaction },
-    /// A penalty has been broadcast at [`txbuild::penalty_fee`]. While it stays
-    /// unconfirmed and the cheater's delay runs, it is announced again at
-    /// every block, for the nodes that dropped it or never had it. Settled
-    /// once the revoked output is spent: by it, by a version built before a
-    /// restart, or — too late — by the cheater.
-    Penalty { watch: Watch, current: Transaction },
-    /// The transaction `by` that ends the channel confirmed at `height`. The
-    /// channel is marked closed — and no longer reloaded — only once that is
-    /// buried to the funding depth; until then a reorganization that takes
-    /// `by` off the chain brings back what was awaited before it.
+    /// A penalty has been broadcast at [`txbuild::penalty_fee`], with the
+    /// claim of our own `to_remote` in the revoked commitment when it has
+    /// one. While either stays unconfirmed it is announced again at every
+    /// block, for the nodes that dropped it or never had it. Settled once
+    /// the revoked output is spent — by the penalty, by a version built
+    /// before a restart, or, too late, by the cheater — and our `to_remote`
+    /// is spent too: `swept` and `claimed` name the spends seen.
+    Penalty {
+        watch: Box<Watch>,
+        current: Transaction,
+        claim: Option<Transaction>,
+        swept: Option<Hash256>,
+        claimed: Option<Hash256>,
+    },
+    /// The transactions `by` that end the channel confirmed, the last at
+    /// `height`. The channel is marked closed — and no longer reloaded — only
+    /// once that is buried to the settle depth; until then a reorganization
+    /// that takes any of them off the chain brings back what was awaited.
     Settling {
-        by: Hash256,
+        by: Vec<Hash256>,
         height: u64,
         prior: Option<Box<CloseTracker>>,
     },
@@ -1503,7 +1511,8 @@ impl ChannelManager {
     /// For every reloaded channel whose funding output is spent at the tip,
     /// the blocks from the funding's confirmation height (journaled; without
     /// it, the last [`MAX_RESCAN_BLOCKS`]) up to the tip are replayed through
-    /// the same reactions as live blocks: a revoked commitment is punished, our
+    /// the same reactions as live blocks: a revoked commitment is punished
+    /// (and our own balance in it claimed), our
     /// own commitment's delayed sweep is scheduled, and a cooperative close, or
     /// a claim, sweep or penalty already confirmed, settles the channel once
     /// buried to the funding depth. Nothing is
@@ -1592,8 +1601,19 @@ impl ChannelManager {
                     }
                 }
                 match &c.close {
-                    Some(CloseTracker::Penalty { current, .. }) => {
-                        pending.push((current.clone(), "penalty"));
+                    Some(CloseTracker::Penalty {
+                        current,
+                        claim,
+                        swept,
+                        claimed,
+                        ..
+                    }) => {
+                        if swept.is_none() {
+                            pending.push((current.clone(), "penalty"));
+                        }
+                        if let (Some(claim), None) = (claim, claimed) {
+                            pending.push((claim.clone(), "to_remote claim"));
+                        }
                     }
                     Some(CloseTracker::Finalizing { tx, .. }) => {
                         pending.push((tx.clone(), "claim or sweep"));
@@ -1658,9 +1678,21 @@ impl ChannelManager {
         for chan in g.channels.values_mut() {
             // The transaction that was settling the channel left the chain:
             // wait again for what it ended.
-            if matches!(&chan.close, Some(CloseTracker::Settling { by, .. }) if gone.contains(by)) {
+            if matches!(&chan.close, Some(CloseTracker::Settling { by, .. })
+                if by.iter().any(|b| gone.contains(b)))
+            {
                 if let Some(CloseTracker::Settling { prior, .. }) = chan.close.take() {
                     chan.close = prior.map(|p| *p);
+                }
+            }
+            // A penalty or claim seen confirmed that left the chain: awaited
+            // again, and announced again at the next block.
+            if let Some(CloseTracker::Penalty { swept, claimed, .. }) = &mut chan.close {
+                if swept.is_some_and(|t| gone.contains(&t)) {
+                    *swept = None;
+                }
+                if claimed.is_some_and(|t| gone.contains(&t)) {
+                    *claimed = None;
                 }
             }
             if chan.spend.is_some_and(|s| gone.contains(&s)) {
@@ -1927,7 +1959,8 @@ impl ChannelManager {
     }
 
     /// Builds and broadcasts the penalty against a revoked commitment, at
-    /// [`txbuild::penalty_fee`], and keeps it to announce again until it settles.
+    /// [`txbuild::penalty_fee`], and the claim of our own `to_remote` there,
+    /// and keeps both to announce again until they settle.
     fn start_penalty(
         &self,
         chan: &mut Chan,
@@ -1943,28 +1976,55 @@ impl ChannelManager {
             .machine
             .build_penalty(&watch, sweep_to, txbuild::penalty_fee(&draft))
             .ok()?;
+        // Our own balance in the revoked state pays our channel key, as in
+        // any commitment: claimed to the wallet like the peer's latest.
+        let claim = match &watch {
+            Watch::RevokedByPeer {
+                to_remote: Some(to_remote),
+                ..
+            } => Some(
+                chan.machine
+                    .build_to_remote_claim(to_remote, sweep_to, CLOSE_FEE),
+            ),
+            _ => None,
+        };
         let _ = chan.machine.mark_penalised();
         chan.close = Some(CloseTracker::Penalty {
-            watch,
+            watch: Box::new(watch),
             current: penalty.clone(),
+            claim: claim.clone(),
+            swept: None,
+            claimed: None,
         });
         self.broadcast_or_warn(&penalty, "penalty");
+        if let Some(claim) = &claim {
+            self.broadcast_or_warn(claim, "to_remote claim");
+        }
         Some(penalty)
     }
 
-    /// One block for a channel whose penalty is out: settle it once the
-    /// revoked output is spent, or else announce the penalty again. Past the
-    /// cheater's delay it stays valid until the cheater sweeps, so it is
-    /// still worth announcing.
+    /// One block for a channel whose penalty is out: note the revoked output
+    /// and our `to_remote` spent, settle once both are, and announce again
+    /// whichever is still awaited. Past the cheater's delay the penalty stays
+    /// valid until the cheater sweeps, so it is still worth announcing.
     fn advance_penalty(&self, chan: &mut Chan, txs: &[Transaction], height: u64) {
-        let Some(CloseTracker::Penalty { watch, current }) = &chan.close else {
+        let in_commitment_block = txs.iter().any(|t| Some(t.txid()) == chan.spend);
+        let Some(CloseTracker::Penalty {
+            watch,
+            current,
+            claim,
+            swept,
+            claimed,
+        }) = &mut chan.close
+        else {
             return;
         };
         let Watch::RevokedByPeer {
             to_local,
             revocation_secret,
+            to_remote,
             ..
-        } = watch
+        } = watch.as_ref()
         else {
             return;
         };
@@ -1986,16 +2046,34 @@ impl ChannelManager {
             if !ours {
                 eprintln!("ALERT: a revoked channel output was swept before the penalty confirmed");
             }
+            *swept = Some(tx.txid());
+        }
+        if let Some(op) = to_remote.map(|r| r.outpoint) {
+            if let Some(by) = spender(txs, op) {
+                *claimed = Some(by);
+            }
+        }
+        let done_claim = to_remote.is_none() || claimed.is_some();
+        if let (Some(s), true) = (*swept, done_claim) {
+            let by: Vec<Hash256> = std::iter::once(s).chain(*claimed).collect();
             let _ = chan.machine.mark_penalised();
-            settle(chan, tx.txid(), height);
+            settle_all(chan, by, height);
             return;
         }
-        // In the block holding the revoked commitment it has just gone out.
-        if txs.iter().any(|t| Some(t.txid()) == chan.spend) {
+        // In the block holding the revoked commitment they have just gone out.
+        if in_commitment_block {
             return;
         }
-        let tx = current.clone();
-        self.broadcast_or_warn(&tx, "penalty");
+        let mut again = Vec::new();
+        if swept.is_none() {
+            again.push((current.clone(), "penalty"));
+        }
+        if let (Some(c), None) = (claim.as_ref(), *claimed) {
+            again.push((c.clone(), "to_remote claim"));
+        }
+        for (tx, what) in again {
+            self.broadcast_or_warn(&tx, what);
+        }
     }
 
     /// The funding outpoints this manager is watching, with their channel ids.
@@ -2130,6 +2208,11 @@ fn spender(txs: &[Transaction], op: OutPoint) -> Option<Hash256> {
 /// to be buried before marking the channel closed, keeping what was awaited
 /// in case a reorganization takes it away.
 fn settle(chan: &mut Chan, by: Hash256, height: u64) {
+    settle_all(chan, vec![by], height);
+}
+
+/// [`settle`], for a channel ended by several transactions.
+fn settle_all(chan: &mut Chan, by: Vec<Hash256>, height: u64) {
     let prior = chan.close.take().map(Box::new);
     chan.close = Some(CloseTracker::Settling { by, height, prior });
 }

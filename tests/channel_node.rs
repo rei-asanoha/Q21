@@ -178,11 +178,7 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
                 .map_err(|e| format!("{e:?}"))
         },
     );
-    let c2 = chain.clone();
-    let broadcast = Box::new(move |tx: &Transaction| -> Result<(), String> {
-        c2.lock().unwrap().mine(std::slice::from_ref(tx));
-        Ok(())
-    });
+    let broadcast = mining_broadcast(chain.clone());
     Hooks {
         fund,
         broadcast,
@@ -190,6 +186,84 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
         payout_address: Box::new(|| FUNDER_PAYOUT),
         reserve: wallet_reserve(wallet),
     }
+}
+
+/// A broadcast hook that mines the transaction at once when it is valid
+/// against the chain, and refuses it otherwise, as a mempool would: one
+/// announced again after it confirmed spends what is already spent.
+fn mining_broadcast(
+    chain: Arc<Mutex<SharedChain>>,
+) -> Box<q21_core::channel::manager::BroadcastFn> {
+    Box::new(move |tx: &Transaction| {
+        let mut c = chain.lock().unwrap();
+        if tx
+            .inputs
+            .iter()
+            .any(|i| c.chain.utxo.get(&i.prev_out).is_none())
+        {
+            return Err("missing input".into());
+        }
+        c.mine(std::slice::from_ref(tx));
+        Ok(())
+    })
+}
+
+/// Feeds a manager every block from `from` to the tip, as the node's block
+/// hook does, and returns the frames it wants sent.
+fn catch_up(mgr: &ChannelManager, chain: &Arc<Mutex<SharedChain>>, from: u64) {
+    let mut h = from;
+    loop {
+        let (txs, tip) = {
+            let c = chain.lock().unwrap();
+            (
+                c.chain.block_at(h).map(|b| b.transactions),
+                c.chain.height(),
+            )
+        };
+        if h > tip {
+            break;
+        }
+        let c = chain.clone();
+        let depth_of = move |op: &OutPoint| chain_depth(&c, op);
+        mgr.on_connected_block(&txs.unwrap_or_default(), h, &depth_of);
+        h += 1;
+    }
+}
+
+/// What a victim recovered from a revoked two-output commitment: the
+/// penalty's output (the cheater's to_local) and the claim of its own
+/// to_remote, both paying `sweep`. Asserts the claim recovered the victim's
+/// own balance less the claim fee.
+fn assert_victim_made_whole(
+    chain: &Arc<Mutex<SharedChain>>,
+    revoked: &Transaction,
+    sweep: Hash256,
+) {
+    let own = revoked
+        .outputs
+        .iter()
+        .position(|o| o.scheme != SchemeId::Policy)
+        .expect("the victim's to_remote");
+    let own_value = revoked.outputs[own].value.units();
+    let back = chain.lock().unwrap().height();
+    let claim = spender_of(
+        chain,
+        &OutPoint {
+            txid: revoked.txid(),
+            index: own as u32,
+        },
+        back,
+    )
+    .expect("the victim's own to_remote was claimed");
+    assert_eq!(claim.pubkey_hash, sweep, "claimed to the wallet");
+    assert_eq!(claim.value.units(), own_value - CLOSE_FEE);
+    let penalty = spender_of(chain, &to_local_of(revoked), back).expect("the penalty confirmed");
+    assert_eq!(penalty.pubkey_hash, sweep);
+    assert_eq!(
+        paid_to(chain, sweep),
+        claim.value.units() + penalty.value.units(),
+        "the victim's wallet holds both"
+    );
 }
 
 /// The reserve hook a node installs: the funding's coins locked in the
@@ -213,13 +287,9 @@ const ACCEPTOR_PAYOUT: Hash256 = Hash256([0xa0; 32]);
 
 /// The acceptor's hooks: it never funds; it broadcasts penalties/claims.
 fn acceptor_hooks(chain: Arc<Mutex<SharedChain>>, sweep: Hash256) -> Hooks {
-    let c = chain.clone();
     Hooks {
         fund: Box::new(|_, _| Err("acceptor does not fund".into())),
-        broadcast: Box::new(move |tx: &Transaction| {
-            c.lock().unwrap().mine(std::slice::from_ref(tx));
-            Ok(())
-        }),
+        broadcast: mining_broadcast(chain),
         sweep_address: Box::new(move || sweep),
         payout_address: Box::new(|| ACCEPTOR_PAYOUT),
         reserve: Box::new(|_, _| {}),
@@ -499,6 +569,8 @@ fn a_revoked_broadcast_is_punished_before_the_delay() {
         "the acceptor recovered the to_local"
     );
     assert_eq!(penalty.outputs[0].pubkey_hash, sweep);
+    // And its own balance in that state, from its channel key to its wallet.
+    assert_victim_made_whole(&chain, &revoked, sweep);
 }
 
 #[test]
@@ -1202,8 +1274,12 @@ fn an_unconfirmed_penalty_pays_the_top_fee_at_once_and_is_announced_again() {
     // the top fee, not at a tier it could never climb from.
     let h = 1_000u64;
     victim.on_connected_block(std::slice::from_ref(&revoked), h, &no_depth);
-    assert_eq!(sent.lock().unwrap().len(), 1);
+    // With it, the claim of the victim's own to_remote there.
+    assert_eq!(sent.lock().unwrap().len(), 2);
+    let is_penalty = |t: &Transaction| t.inputs[0].prev_out == to_local_of(&revoked);
     let penalty = sent.lock().unwrap()[0].clone();
+    let claim = sent.lock().unwrap()[1].clone();
+    assert!(is_penalty(&penalty) && !is_penalty(&claim));
     let fee = fee_of(&penalty);
     assert!(fee > SWEEP_FEE, "more than a plain sweep");
     assert_eq!(fee, penalty_fee(&penalty));
@@ -1221,13 +1297,21 @@ fn an_unconfirmed_penalty_pays_the_top_fee_at_once_and_is_announced_again() {
         victim.on_connected_block(&[], h + k, &no_depth);
     }
     let all = sent.lock().unwrap().clone();
-    assert_eq!(all.len() as u64, 1 + blocks, "announced at every block");
-    assert!(all.iter().all(|t| t.txid() == penalty.txid()));
+    assert_eq!(
+        all.len() as u64,
+        2 * (1 + blocks),
+        "both announced at every block"
+    );
+    assert!(all
+        .iter()
+        .all(|t| t.txid() == penalty.txid() || t.txid() == claim.txid()));
     assert_eq!(victim.info(cid).unwrap().phase, Phase::Penalised);
 
-    // It is a valid spend on chain.
+    // Both are valid spends on chain.
     chain.lock().unwrap().mine(std::slice::from_ref(&revoked));
     chain.lock().unwrap().mine(std::slice::from_ref(&penalty));
+    chain.lock().unwrap().mine(std::slice::from_ref(&claim));
+    assert_victim_made_whole(&chain, &revoked, sweep);
 
     // A penalty built before a restart, paying another address, settles it
     // just the same, without an alert.
@@ -1237,14 +1321,19 @@ fn an_unconfirmed_penalty_pays_the_top_fee_at_once_and_is_announced_again() {
     other.on_connected_block(std::slice::from_ref(&revoked), h, &no_depth);
     let rebuilt = other_sent.lock().unwrap()[0].clone();
     assert_ne!(rebuilt.txid(), penalty.txid());
+    // The penalty alone does not settle it: the claim is still awaited, and
+    // announced again.
     other.on_connected_block(std::slice::from_ref(&penalty), h + 1, &no_depth);
+    assert_eq!(other.info(cid).unwrap().phase, Phase::Penalised);
+    assert_eq!(other_sent.lock().unwrap().len(), 3, "the claim, again");
+    other.on_connected_block(std::slice::from_ref(&claim), h + 2, &no_depth);
     for k in 1..u64::from(DEPTH) {
-        other.on_connected_block(&[], h + 1 + k, &no_depth);
+        other.on_connected_block(&[], h + 2 + k, &no_depth);
     }
     assert_eq!(other.info(cid).unwrap().phase, Phase::Closed);
     assert_eq!(
         other_sent.lock().unwrap().len(),
-        1,
+        3,
         "nothing more once settled"
     );
 }
@@ -1291,26 +1380,45 @@ fn a_revoked_commitment_that_replaces_a_reorged_spend_is_punished() {
             Phase::Penalised,
             "the revoked replacement is punished (told_of_disconnect={told_of_disconnect})"
         );
-        let penalty = sent.lock().unwrap().last().unwrap().clone();
-        assert_eq!(penalty.outputs[0].pubkey_hash, sweep);
-        assert!(revoked
-            .outputs
+        // Reclassified: the penalty of the cheater's to_local, and the claim
+        // of the victim's own to_remote in the revoked commitment.
+        let out = sent.lock().unwrap()[1..].to_vec();
+        assert_eq!(out.len(), 2, "the penalty and the claim");
+        let spends = |t: &Transaction, op: OutPoint| t.inputs[0].prev_out == op;
+        let own = OutPoint {
+            txid: revoked.txid(),
+            index: revoked
+                .outputs
+                .iter()
+                .position(|o| o.scheme != SchemeId::Policy)
+                .unwrap() as u32,
+        };
+        let penalty = out
             .iter()
-            .enumerate()
-            .any(|(i, _)| penalty.inputs[0].prev_out
-                == OutPoint {
-                    txid: revoked.txid(),
-                    index: i as u32
-                }));
+            .find(|t| spends(t, to_local_of(&revoked)))
+            .expect("the penalty")
+            .clone();
+        let claim = out
+            .iter()
+            .find(|t| spends(t, own))
+            .expect("the claim of the victim's own to_remote")
+            .clone();
+        assert_eq!(penalty.outputs[0].pubkey_hash, sweep);
+        assert_eq!(claim.outputs[0].pubkey_hash, sweep);
         // Seen again in a later block (another reorganization), the same spend
         // is not punished twice.
         victim.on_connected_block(std::slice::from_ref(&revoked), 501, &no_depth);
-        assert_eq!(sent.lock().unwrap().len(), 2);
+        assert_eq!(sent.lock().unwrap().len(), 3);
 
-        // The penalty is valid on chain against the revoked commitment.
-        let mut c = chain.lock().unwrap();
-        c.mine(std::slice::from_ref(&revoked));
-        c.mine(std::slice::from_ref(&penalty));
+        // Both are valid on chain against the revoked commitment, and the
+        // victim's wallet ends with both.
+        {
+            let mut c = chain.lock().unwrap();
+            c.mine(std::slice::from_ref(&revoked));
+            c.mine(std::slice::from_ref(&penalty));
+            c.mine(std::slice::from_ref(&claim));
+        }
+        assert_victim_made_whole(&chain, &revoked, sweep);
     }
 }
 
@@ -1502,14 +1610,10 @@ fn an_offline_victim_punishes_a_revoked_commitment_on_restart() {
         acceptor_hooks(chain.clone(), sweep),
         &chain,
     );
-    let to_local = to_local_of(&revoked);
-    let paid = spender_of(&chain, &to_local, 2).expect("the penalty confirmed");
-    assert_eq!(
-        paid.pubkey_hash, sweep,
-        "the cheater's to_local went to the victim"
-    );
     assert!(chain.lock().unwrap().height() < committed_at + u64::from(DELAY));
-    drive(&victim, &chain);
+    // Penalty and claim went out at the tip of the rescan: both credited.
+    assert_victim_made_whole(&chain, &revoked, sweep);
+    catch_up(&victim, &chain, committed_at + 5);
     bury(&[&victim], &chain);
     assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
 }
@@ -1542,7 +1646,11 @@ fn a_penalty_lost_in_a_crash_is_broadcast_again_on_restart() {
         c.height()
     };
     victim.on_connected_block(std::slice::from_ref(&revoked), h, &|_| None);
-    assert_eq!(sent.lock().unwrap().len(), 1, "the penalty went out");
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        2,
+        "the penalty and the claim went out"
+    );
     drop(victim);
     chain.lock().unwrap().mine(&[]);
     let sweep = Hash256([0x7eu8; 32]);
@@ -1552,9 +1660,8 @@ fn a_penalty_lost_in_a_crash_is_broadcast_again_on_restart() {
         acceptor_hooks(chain.clone(), sweep),
         &chain,
     );
-    let paid = spender_of(&chain, &to_local_of(&revoked), 2).expect("the penalty confirmed");
-    assert_eq!(paid.pubkey_hash, sweep);
-    drive(&victim, &chain);
+    assert_victim_made_whole(&chain, &revoked, sweep);
+    catch_up(&victim, &chain, h + 2);
     bury(&[&victim], &chain);
     assert_eq!(victim.info(cid).unwrap().phase, Phase::Closed);
 }
@@ -1716,7 +1823,21 @@ fn a_to_local_taken_by_a_penalty_settles_our_side() {
     p.acceptor
         .on_funding_spend(cid, &revoked)
         .expect("the acceptor punishes");
-    let penalty_block = chain.lock().unwrap().last_txs.clone();
+    // Its penalty and its claim, each mined at once in a block of its own.
+    let penalty_block = chain
+        .lock()
+        .unwrap()
+        .chain
+        .block_at(h + 1)
+        .unwrap()
+        .transactions;
+    let claim_block = chain
+        .lock()
+        .unwrap()
+        .chain
+        .block_at(h + 2)
+        .unwrap()
+        .transactions;
     for _ in 0..DELAY {
         chain.lock().unwrap().mine(&[]);
     }
@@ -1732,7 +1853,8 @@ fn a_to_local_taken_by_a_penalty_settles_our_side() {
     let (live, sent) = relaying_manager(funder_seed, &dir.join("funder"), Hash256([3; 32]));
     live.on_connected_block(std::slice::from_ref(&revoked), h, &|_| None);
     live.on_connected_block(&penalty_block, h + 1, &|_| None);
-    for k in 2..=u64::from(DELAY) + 2 {
+    live.on_connected_block(&claim_block, h + 2, &|_| None);
+    for k in 3..=u64::from(DELAY) + 2 {
         live.on_connected_block(&[], h + k, &|_| None);
     }
     assert_eq!(live.info(cid).unwrap().phase, Phase::Closed);
@@ -2389,9 +2511,9 @@ fn a_close_settles_only_once_buried_and_survives_a_reorganization() {
     assert_eq!(acceptor.info(cid).unwrap().phase, Phase::Closed);
 }
 
-/// A penalty that confirmed, then left the chain in a reorganization, is
-/// announced again: the channel stays penalised, not closed, until a penalty
-/// is buried.
+/// A penalty and the claim of the victim's own to_remote that confirmed,
+/// then left the chain in a reorganization, are announced again: the channel
+/// stays penalised, not closed, until both are buried.
 #[test]
 #[cfg(feature = "audit")]
 fn a_reorganized_penalty_is_announced_again() {
@@ -2411,21 +2533,32 @@ fn a_reorganized_penalty_is_announced_again() {
     let no_depth = |_: &OutPoint| None;
     let h = 1_000u64;
     victim.on_connected_block(std::slice::from_ref(&revoked), h, &no_depth);
-    let penalty = sent.lock().unwrap()[0].clone();
+    let (penalty, claim) = {
+        let sent = sent.lock().unwrap();
+        (sent[0].clone(), sent[1].clone())
+    };
+    assert_eq!(penalty.inputs[0].prev_out, to_local_of(&revoked));
 
-    // The penalty confirms: penalised, not yet closed.
-    victim.on_connected_block(std::slice::from_ref(&penalty), h + 1, &no_depth);
+    // Both confirm: penalised, not yet closed.
+    let both = [penalty.clone(), claim.clone()];
+    victim.on_connected_block(&both, h + 1, &no_depth);
     assert_eq!(victim.info(cid).unwrap().phase, Phase::Penalised);
 
-    // It leaves the chain: the next block announces it again.
-    victim.on_disconnected_block(std::slice::from_ref(&penalty));
-    let before = sent.lock().unwrap().len();
-    victim.on_connected_block(&[], h + 1, &no_depth);
-    assert_eq!(sent.lock().unwrap().len(), before + 1, "announced again");
-    assert_eq!(sent.lock().unwrap()[before].txid(), penalty.txid());
+    // Either leaving the chain is awaited again, and only it is announced
+    // at the next block.
+    for gone in [&penalty, &claim] {
+        victim.on_disconnected_block(std::slice::from_ref(gone));
+        let before = sent.lock().unwrap().len();
+        victim.on_connected_block(&[], h + 1, &no_depth);
+        let sent_now = sent.lock().unwrap().clone();
+        assert_eq!(sent_now.len(), before + 1, "announced again");
+        assert_eq!(sent_now[before].txid(), gone.txid());
+        // Confirmed again: settling once more.
+        victim.on_connected_block(std::slice::from_ref(gone), h + 2, &no_depth);
+        assert_eq!(victim.info(cid).unwrap().phase, Phase::Penalised);
+    }
 
-    // Confirmed again and buried: closed, and announced no more.
-    victim.on_connected_block(std::slice::from_ref(&penalty), h + 2, &no_depth);
+    // Buried: closed, and announced no more.
     for k in 1..u64::from(DEPTH) {
         victim.on_connected_block(&[], h + 2 + k, &no_depth);
     }
