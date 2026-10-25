@@ -142,6 +142,17 @@ h1{font-size:inherit;font-weight:inherit;margin:0;letter-spacing:inherit}
   letter-spacing:.08em;text-transform:uppercase;color:var(--accent);
   background:var(--accent-bg);padding:.18rem .45rem;border-radius:5px;white-space:nowrap}
 .bar .push{margin-left:auto}
+/* On a phone the bar holds the logo and the languages, and the state of the
+   connection takes the line below: on one line, the flags were pushed off a
+   375-pixel screen. */
+.bar{flex-wrap:wrap;row-gap:.3rem}
+.bar .pulse{order:3;flex-basis:100%;margin-left:0}
+.bar .languages{margin-left:auto}
+@media(min-width:640px){
+  .bar{flex-wrap:nowrap}
+  .bar .pulse{order:0;flex-basis:auto;margin-left:auto}
+  .bar .languages{margin-left:.75rem}
+}
 .pulse{display:flex;align-items:center;gap:.45rem;font-size:.76rem;color:var(--soft);
   font-variant-numeric:tabular-nums;white-space:nowrap}
 .dot{width:.5rem;height:.5rem;border-radius:50%;background:var(--muted);flex:0 0 auto}
@@ -196,8 +207,11 @@ nav.tabs{
 }
 nav.tabs button{
   flex:1;display:flex;flex-direction:column;align-items:center;gap:.15rem;
-  background:none;border:none;color:var(--muted);font:inherit;font-size:.68rem;
-  padding:.45rem .2rem;border-radius:10px;cursor:pointer;letter-spacing:.01em}
+  background:none;border:none;color:var(--muted);font:inherit;font-size:.62rem;
+  padding:.45rem .1rem;border-radius:10px;cursor:pointer;letter-spacing:.01em;min-width:0}
+/* Eight tabs share a phone's width: the labels are a touch smaller there, so
+   that "Channels" or its Japanese fits on one line. */
+@media(min-width:420px){nav.tabs button{font-size:.68rem;padding:.45rem .2rem}}
 nav.tabs button svg{width:1.25rem;height:1.25rem;stroke:currentColor;fill:none;
   stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 nav.tabs button:hover{color:var(--soft)}
@@ -365,11 +379,12 @@ td.minus{color:var(--danger);font-weight:600}
 
 /* ---- Controls ----------------------------------------------------------- */
 label{display:block;font-size:.8rem;font-weight:600;margin:1rem 0 .35rem;color:var(--soft)}
-input[type=text],input[type=password]{
+input[type=text],input[type=password],select{
   width:100%;padding:.7rem .85rem;font:inherit;font-family:var(--mono);font-size:.9rem;
   color:var(--text);background:var(--card-2);border:1.5px solid var(--border);
   border-radius:11px;outline:none}
-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+select:disabled{opacity:.6;cursor:not-allowed}
 .buttons{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1rem}
 button.action,button.secondary,button.flat{
   font:inherit;font-weight:600;font-size:.9rem;border-radius:11px;cursor:pointer;
@@ -429,6 +444,16 @@ td{font-family:var(--mono);font-variant-numeric:tabular-nums}
 @keyframes spinning{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion: reduce){.spin-dot{animation:none}}
 
+/* --- Channels: the first cell carries the peer, the state and the actions,
+   so that on a phone they stay in view without scrolling the table
+   sideways. */
+td.peer .full{display:block}
+td.peer .id{display:block;font-size:.72rem;color:var(--muted)}
+td.peer .state{display:block;margin-top:.3rem}
+td.peer .row-actions{display:flex;gap:.35rem;margin-top:.35rem}
+#channel-action:not(:empty){margin-top:1.8rem}
+td.peer .row-actions button.flat{padding:.2rem .55rem;font-size:.72rem}
+
 details.fold{background:var(--card-2);border:1px solid var(--border);border-radius:14px;
   padding:.85rem 1.05rem;margin:1rem 0;font-size:.87rem;color:var(--soft)}
 details.fold summary{cursor:pointer;font-weight:600;color:var(--text);
@@ -440,6 +465,12 @@ details.fold p:last-child{margin-bottom:0}
 
 .recap{background:var(--card-2);border:1px solid var(--border);border-radius:14px;
   padding:1rem;font-family:var(--mono);font-size:.85rem;word-break:break-all}
+/* A line of a confirmation: the label, then the value it confirms. */
+.recap .l{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.15rem 1rem;
+  padding:.2rem 0}
+.recap .l .k{font-family:var(--sans);color:var(--muted);word-break:normal}
+.recap .l .v{text-align:right;margin-left:auto}
+.recap .l.total{border-top:1px solid var(--border);margin-top:.3rem;padding-top:.5rem;font-weight:600}
 footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--border);
   color:var(--muted);font-size:.76rem}
 code{background:var(--quantum-bg);color:var(--quantum);padding:.12em .38em;border-radius:5px;
@@ -498,6 +529,9 @@ code{background:var(--quantum-bg);color:var(--quantum);padding:.12em .38em;borde
   <button type="button" data-view="send">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V7"/><path d="M6 12l6-6 6 6"/><path d="M4 4h16"/></svg>
     Send</button>
+  <button type="button" data-view="channels">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="12" r="2.6"/><path d="M7.6 10h8.8"/><path d="M7.6 14h8.8"/></svg>
+    Channels</button>
   <button type="button" data-view="network">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>
     Network</button>
@@ -754,6 +788,72 @@ code{background:var(--quantum-bg);color:var(--quantum);padding:.12em .38em;borde
   <div id="send-result"></div>
 </section>
 
+<section class="view" id="view-channels" hidden>
+  <h2>Payment channels</h2>
+  <div id="channel-state"><p class="help">Loading…</p></div>
+
+  <div id="channel-zone" hidden>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Channel</th><th>My balance</th><th>Arriving</th><th>Peer's balance</th><th>Capacity</th></tr></thead>
+        <tbody id="channel-rows"></tbody>
+      </table>
+    </div>
+    <p class="help">
+      <strong>My balance</strong> is yours for good: the peer can no longer
+      take it back. <strong>Arriving</strong> has been paid to you and becomes
+      yours for good as soon as the peer confirms it, usually within a second.
+    </p>
+    <div id="channel-action"></div>
+
+    <h2>Open a channel</h2>
+    <div class="card" id="channel-open-card">
+    <form id="channel-open-form" autocomplete="off">
+      <label for="channel-peer-field">Peer</label>
+      <select id="channel-peer-field"></select>
+      <div class="help" id="channel-peer-help"></div>
+
+      <label for="channel-capacity-field">Capacity (Q21)</label>
+      <input type="text" id="channel-capacity-field" placeholder="0.00000000" inputmode="decimal" spellcheck="false" autocomplete="off">
+      <div class="help" id="channel-capacity-help"></div>
+      <div class="help" id="channel-minimum-help"></div>
+      <div class="buttons">
+        <button type="submit" class="action" id="channel-review-button">Review</button>
+      </div>
+    </form>
+    </div>
+
+    <div id="channel-open-confirmation" hidden>
+      <h2>Confirm the channel</h2>
+      <div class="warn">
+        <h3>Funds locked in the channel</h3>
+        <p>
+          The capacity leaves your available balance while the channel is
+          open. You pay the peer from it, and what remains comes back to you
+          when the channel closes.
+        </p>
+        <p id="channel-open-delay"></p>
+      </div>
+      <div class="recap" id="channel-open-recap"></div>
+      <div class="buttons">
+        <button type="button" class="secondary" id="channel-open-cancel">Back</button>
+        <button type="button" class="action" id="channel-open-button">Open the channel</button>
+      </div>
+    </div>
+    <div id="channel-open-result"></div>
+  </div>
+
+  <div class="note">
+    <h3>What is a payment channel?</h3>
+    <p>
+      A channel sets part of your balance aside with one peer, in a single
+      transaction on the chain. The two of you can then pay each other back
+      and forth instantly and without fees; only the final balances go back
+      to the chain when the channel closes.
+    </p>
+  </div>
+</section>
+
 <section class="view" id="view-network" hidden>
   <h2>The network</h2>
   <div class="card">
@@ -980,9 +1080,24 @@ code{background:var(--quantum-bg);color:var(--quantum);padding:.12em .38em;borde
 
    Nothing leaves the page: no translation service, no request.
 */
-const I18N = {"fr": {"Every connection goes through Tor": "Toutes les connexions passent par Tor", "Connections go out directly": "Les connexions sortent directement", "The nodes you reach see a Tor relay, not your address.": "Les nœuds que vous joignez voient un relais Tor, pas votre adresse.", "The nodes you connect to see your IP address (or your VPN's).": "Les nœuds auxquels vous vous connectez voient votre adresse IP (ou celle de votre VPN).", "Stop using Tor": "Ne plus utiliser Tor", "Use Tor": "Utiliser Tor", "Hide your address with Tor": "Cacher votre adresse avec Tor", "Tor comes with the wallet: there is nothing to install. The wallet starts it when it needs it, and stops it when it closes.": "Tor est fourni avec le portefeuille\u00a0: il n'y a rien à installer. Le portefeuille le démarre quand il en a besoin, et l'arrête en se fermant.", "A copy without Tor of its own (Raspberry Pi, Linux on ARM) uses a Tor already running on this computer: the Tor service, or Tor Browser left open.": "Une copie sans Tor à elle (Raspberry Pi, Linux sur ARM) utilise un Tor déjà lancé sur cet ordinateur\u00a0: le service Tor, ou Tor Browser laissé ouvert.", "Tor is on, but no connection has gone through it yet: Tor is still connecting, or this network blocks it.": "Tor est activé, mais aucune connexion n'est encore passée par lui\u00a0: Tor se connecte encore, ou ce réseau le bloque.", "If Tor cannot start, the wallet does not connect in the clear: it waits for Tor.": "Si Tor ne peut pas démarrer, le portefeuille ne se connecte pas en clair\u00a0: il attend Tor.", "With the Tor that comes with the wallet, being reachable makes it a hidden node: Tor gives it an onion address of its own, the network reaches it there, and nobody learns where it is. The wallet never opens your router. With another Tor, an onion service has to be set up by hand (see the guide).": "Avec le Tor fourni avec le portefeuille, être joignable en fait un nœud caché\u00a0: Tor lui donne une adresse onion à lui, le réseau le joint par là, et personne ne sait où il se trouve. Le portefeuille n'ouvre jamais votre box. Avec un autre Tor, le service onion se crée à la main (voir le guide).", "Tor will be used the next time the wallet starts.": "Tor sera utilisé au prochain lancement du portefeuille.", "Tor will no longer be used the next time the wallet starts.": "Tor ne sera plus utilisé au prochain lancement du portefeuille.", "Tor is on, but no connection could be made through it: is Tor (or Tor Browser) running?": "Tor est activé, mais aucune connexion n'a pu passer par lui\u00a0: Tor (ou Tor Browser) est-il lancé\u00a0?", "This wallet mines and is reachable: your IP address is public, and the blocks you find leave from it first. Anyone watching the network can link your address to your rewards. To mine privately, make this node client-only.": "Ce portefeuille mine et il est joignable\u00a0: votre adresse IP est publique, et les blocs que vous trouvez partent d'abord de chez vous. Quiconque observe le réseau peut relier votre adresse à vos récompenses. Pour miner discrètement, repassez en simple client.", "Do not combine it with mining on a home connection: the blocks you find would leave from your address first, and could be linked to your rewards.": "Ne le combinez pas avec le minage sur une connexion à domicile\u00a0: les blocs que vous trouvez partiraient d'abord de votre adresse, et pourraient être reliés à vos récompenses.", "Your router did not open the port: your wallet stays a client.": "Votre box n'a pas ouvert l'accès\u00a0: votre portefeuille reste un simple client.", "Your router opened the port (NAT-PMP).": "Votre box a ouvert l'accès (NAT-PMP).", "Your router opened the port (UPnP).": "Votre box a ouvert l'accès (UPnP).", "Your router opened the port.": "Votre box a ouvert l'accès.", "It is off by default: turn it on only if you accept that other nodes see your address.": "Il est éteint par défaut\u00a0: ne l'allumez que si vous acceptez que les autres nœuds voient votre adresse.", "Syncing": "Synchronisation", "Offline": "Hors connexion", "Your wallet helps the network": "Votre portefeuille aide le réseau", "Your wallet is client-only": "Votre portefeuille est un simple client", "It accepts connections from others, so the network does not rely on a single machine.": "Il accepte les connexions des autres, pour que le réseau ne dépende pas d'une seule machine.", "It reaches out to the network but does not accept incoming connections.": "Il sort vers le réseau, mais n'accepte pas de connexions entrantes.", "Make this node reachable": "Rendre ce nœud joignable", "Stop being reachable": "Ne plus être joignable", "What this setting does": "Ce que fait ce réglage", "Your node will be reachable the next time the wallet starts.": "Votre nœud sera joignable au prochain lancement du portefeuille.", "Your node will be client-only the next time the wallet starts.": "Votre nœud sera un simple client au prochain lancement du portefeuille.", "No bootstrap address: this node is not looking for anyone": "Aucune adresse de départ : ce nœud ne cherche personne", "The program contains no server address, and that is deliberate: an address hard-coded into distributed software would become a permanent dependency on whoever controls it. It is provided separately, in a file you can edit. Create q21-data/bootstrap.txt next to the program, add the line bootstrap.q21.dev:21121 to it, then restart. JOIN.md, which ships with the program, explains this step and how to add more entry points.": "Le programme ne contient l'adresse d'aucun serveur, et c'est voulu : une adresse gravée dans un logiciel distribué deviendrait une dépendance permanente envers celui qui la tient. Elle se donne à côté, dans un fichier que vous pouvez modifier. Créez q21-data/bootstrap.txt auprès du programme, écrivez-y la ligne bootstrap.q21.dev:21121, puis relancez. JOIN.md, livré avec le programme, détaille ce geste et la façon d'ajouter d'autres points d'entrée.", "Hide the mining addresses": "Ranger les adresses de minage", "Mining also derives one per block found, for the same reason. Those addresses have already received their reward and need not be handed out: they are tucked away below, and only the ones you requested or named are shown.": "Le minage en dérive aussi une par bloc trouvé, pour la même raison. Ces adresses-là ont déjà reçu leur récompense et n'ont pas besoin d'être distribuées\u00a0: elles sont rangées ci-dessous, et seules celles que vous avez demandées ou nommées sont montrées.", "Wallet": "Portefeuille", "Connecting…": "Connexion…", "Balance": "Solde", "Mine": "Miner", "Receive": "Recevoir", "Send": "Envoyer", "Network": "Réseau", "Activity": "Activité", "Info": "Infos", "Loading…": "Chargement…", "Details": "Détail", "Close": "Fermer", "Back": "Revenir", "All": "Tout", "Received": "Reçu", "Sent": "Envoyé", "Type": "Quoi", "Date": "Date", "Reference": "Référence", "Confirmations": "Confirmations", "Block": "Bloc n°", "Available": "Disponible", "Mining": "Minage", "Chain": "Chaîne", "Your blocks": "Vos blocs", "Your addresses": "Vos adresses", "The network": "Le réseau", "Your security": "Votre sécurité", "Your machine": "Votre machine", "Measuring…": "Mesure en cours…", "Node unreachable": "Nœud injoignable", "Unlock": "Déverrouiller", "New address": "Nouvelle adresse", "Show more": "Afficher les suivantes", "Search your address book": "Chercher dans votre carnet", "+ Add a recipient": "+ Ajouter un destinataire", "Recalculate fee": "Recalculer les frais", "Review": "Vérifier", "Send now": "Envoyer définitivement", "Close the wallet": "Fermer le portefeuille", "Send Q21": "Envoyer du Q21", "Recipient address": "Adresse du destinataire", "Amount (Q21)": "Montant, en Q21", "Fee (Q21)": "Frais, en Q21", "Suggested by the node; you can change it.": "Suggestion du nœud, modifiable.", "Confirm the payment": "Confirmer l'envoi", "A payment is final": "Un envoi est définitif", "Expected inputs, for the fee estimate": "Entrées supposées, pour l'estimation des frais", "The address has a checksum: a typo will be caught by the node, not silently accepted.": "L'adresse porte une somme de contrôle\u00a0: une faute de frappe sera détectée par le nœud, pas subie.", "At most eight decimal places. One unit is 0.00000001 Q21.": "Huit décimales au maximum. Une unité vaut 0.00000001\u00a0Q21.", "No authority can reverse an accepted transaction. Re-read the address character by character: it is the only check you have left.": "Aucune autorité ne peut annuler une transaction acceptée. Relisez l'adresse caractère par caractère\u00a0: c'est la seule vérification qui vous reste.", "One payment can go to several recipients at once: a single transaction with a shared fee, rather than several separate payments.": "Un seul envoi peut payer plusieurs destinataires à la fois\u00a0: c'est une transaction unique, aux frais partagés, plutôt que plusieurs envois séparés.", "Your machine is not mining": "Votre machine ne cherche pas", "Mining searches for the next block. It uses all CPU cores.": "Le minage cherche le prochain bloc. Il utilise tous les cœurs.", "attempts per second": "tentatives par seconde", "Earned by mining": "Gagné en minant", "since launch, including immature rewards": "depuis le lancement — maturité comprise", "Blocks found": "Blocs trouvés", "since launch": "depuis le lancement", "Attempts": "Tentatives", "Chain pace": "Rythme de la chaîne", "target: one block every 2 minutes": "cible : un bloc toutes les 2 minutes", "Memory in use": "Mémoire occupée", "the computation table, in RAM": "la table de calcul, en mémoire vive", "Network hash rate": "Puissance de calcul du réseau", "measured on your machine, live": "mesurée chez vous, en direct", "Computers connected to yours": "Ordinateurs reliés au vôtre", "your direct neighbors, not the whole network": "vos voisins directs, pas le réseau entier", "The backup code is your wallet": "Le code de sauvegarde est votre portefeuille", "The file on this disk is only a working copy.": "Le fichier sur ce disque n'est qu'une copie de travail.", "Two things you must never do": "Deux choses à ne jamais faire", "For developers": "Pour les développeurs", "Chain explorer": "Explorateur de la chaîne", "Access token required": "Jeton d'accès requis", "Catching up on chain history": "Récupération de l'historique de la chaîne", "Why part of the balance is immature": "Pourquoi une part du solde est immature", "Why you have several": "Pourquoi vous en avez plusieurs", "What your machine does when this switch is on": "Ce que fait votre machine quand ce bouton est allumé", "Every payment deserves a fresh address. Reusing one costs the protocol nothing, but publicly links your payments together.": "Chaque paiement mérite une adresse neuve. Réutiliser une adresse ne coûte rien au protocole, mais relie publiquement vos paiements entre eux.", "Testnet — the Q21 mined here have no value, and never will. Research software, not externally audited.": "Réseau d'essai — les Q21 qui s'y minent n'ont aucune valeur, et n'en auront jamais. Logiciel de recherche, non audité de l'extérieur.", "Turn mining on": "Activer le minage", "Turn mining off": "Arrêter le minage", "This node cannot mine": "Ce nœud ne peut pas miner", "Connected": "Connecté", "Shutting down…": "Fermeture…", "Confirm shutdown": "Confirmer la fermeture", "Click again to stop the wallet.": "Cliquez une seconde fois pour arrêter le portefeuille.", "Blocks verified": "Blocs vérifiés", "Latest block": "Dernier bloc", "Recipient": "Destinataire", "Awaiting maturity": "En attente de maturité", "State commitment": "Empreinte de l'état", "Waiting for a computer to ask for the chain": "En attente d'un ordinateur à qui demander la chaîne", "Mining rate over the last few minutes": "Débit de minage des dernières minutes", "It uses all available cores.": "Elle utilise tous les cœurs disponibles.", "No recipient address.": "Aucune adresse de destination.", "Each amount must be greater than zero.": "Chaque montant doit être strictement positif.", "The minimum amount is 0.0001 Q21: below that, the network rejects the output as dust.": "Le montant minimal est 0,0001 Q21 : en dessous, le réseau refuse la sortie comme poussière.", "Each amount must be at least 0.0001 Q21: below that, the network rejects the output as dust.": "Chaque montant doit valoir au moins 0,0001 Q21 : en dessous, le réseau refuse la sortie comme poussière.", "Invalid fee. Expected a number in Q21, with at most eight decimal places.": "Frais illisibles. Attendu : un nombre en Q21, huit décimales au maximum.", "The node requires a token. The launcher normally passes it in the address fragment; if you opened this page manually, enter the token given to": "Le nœud exige un jeton. Il est normalement transmis par le lanceur dans le fragment de l'adresse\u00a0; si vous avez ouvert cette page à la main, saisissez ici le jeton passé à", "If you have just restored a wallet": "Si vous venez de restaurer un portefeuille", ", your funds will reappear at the end of this step: they are in the chain, and your machine has not read them yet. The displayed balance is incomplete until then.": ", vos fonds réapparaîtront à la fin de cette étape\u00a0: ils sont dans la chaîne, et votre machine ne les a pas encore lus. Le solde affiché est incomplet jusque-là.", "A mining reward can only be spent after a long maturity period. Until it has elapsed, the amount exists and belongs to you, but no transaction can spend it. It is counted separately rather than folded into a total that would be wrong.": "Une récompense de minage n'est dépensable qu'après un long délai de maturation. Tant qu'il n'est pas écoulé, la somme existe, elle vous appartient, mais aucune transaction ne peut la dépenser. Elle est comptée séparément plutôt que fondue dans un total qui serait faux.", "It searches a two-gigabyte table in memory, hundreds of thousands of times per second, looking for a value that meets the current difficulty. It is a lottery: you do not win every time, and you win more often the faster you search.": "Elle fouille une table de deux gigaoctets en mémoire, des centaines de milliers de fois par seconde, à la recherche d'une valeur qui satisfasse la difficulté du moment. C'est une loterie\u00a0: on ne gagne pas à tous les coups, on gagne d'autant plus souvent qu'on cherche vite.", "The reward for a block found is paid to an address in this wallet. It can only be spent after the maturity period.": "La récompense d'un bloc trouvé est versée à une adresse de ce portefeuille. Elle n'est dépensable qu'après le délai de maturation.", "Your wallet holds": "Votre portefeuille ne contient", "only one secret": "qu'un seul secret", ": the seed, the one behind the backup code you wrote down. All your addresses are": "\u00a0: la graine, celle du code de sauvegarde que vous avez recopié. Toutes vos adresses en sont", "built": "fabriquées", "from it by computation — the first, the second, the thousandth. This is called": "par un calcul — la première, la deuxième, la millième. C'est ce qu'on appelle les", "derivation": "dériver", "A reassuring consequence:": "Conséquence rassurante\u00a0:", "this code restores everything": "ce code sauve tout", ". No need to back up each address; they can all be recomputed from it.": ". Pas besoin de sauvegarder chaque adresse\u00a0; elles se recalculent toutes à partir de lui.", "A useful consequence: giving a fresh one to each person who pays you costs nothing, and keeps an onlooker from linking all your incoming payments together by reading the chain. Your balance is the sum of them all.": "Conséquence utile\u00a0: en donner une neuve à chaque personne qui vous paie ne coûte rien, et évite qu'un curieux relie tous vos encaissements entre eux en lisant la chaîne. Votre solde est la somme de toutes.", "With ML-DSA-87 the witness makes up almost all of a transaction: the fee depends mostly on the": "Avec ML-DSA-87 le témoin pèse la quasi-totalité d'une transaction\u00a0: les frais dépendent surtout du", "number of inputs": "nombre d'entrées", "consumed, which the node only picks when it builds the transaction. If the payment is rejected because the fee rate is too low, increase this number and recalculate.": "consommées, que le nœud ne choisit qu'au moment de construire la transaction. Si l'envoi est refusé pour taux de frais trop bas, augmentez ce nombre et recalculez.", "Why we don't tell you “how many miners”": "Pourquoi on ne vous dit pas «\u00a0combien de mineurs\u00a0»", "Because nobody can know, and a made-up figure would be worse than no figure at all. A miner does not announce itself: it just produces blocks. Nothing distinguishes a thousand machines from one person who owns a thousand.": "Parce que personne ne peut le savoir, et qu'un chiffre inventé serait pire que pas de chiffre. Un mineur ne s'annonce pas\u00a0: il pose des blocs. Rien ne distingue mille machines d'une personne qui en possède mille.", "And Q21 makes counting even harder, on purpose: your wallet uses": "Et Q21 rend le comptage encore plus impossible, volontairement\u00a0: votre portefeuille utilise", "a different address for each reward": "une adresse différente pour chaque récompense", ", so that your earnings cannot be linked together. Counting miner addresses would amount to counting blocks.": ", pour qu'on ne puisse pas relier vos gains entre eux. Compter les adresses de mineurs reviendrait donc à compter les blocs.", "What can be measured, on the other hand, cannot be faked:": "Ce qui se mesure, en revanche, ne se truque pas\u00a0:", "the work actually spent": "le travail réellement dépensé", ". It can be read from the difficulty, which adjusts so that a block is found every two minutes. Compared with what": ". Il se lit dans la difficulté, qui s'ajuste pour qu'un bloc tombe toutes les deux minutes. Comparé à ce que fait", "your": "votre", "machine does, it gives your share, shown above.": "machine, il donne la part qu'elle représente, indiquée ci-dessus.", "Your entire wallet — every address, all your funds — can be rebuilt from the single backup code you wrote down when you created it.": "Tout votre portefeuille — chaque adresse, chaque fonds — se refabrique à partir du seul code de sauvegarde que vous avez recopié à la création.", "On any machine: Windows, Intel Mac, Apple Silicon Mac, Linux, Raspberry Pi.": "Sur n'importe quelle machine\u00a0: Windows, Mac Intel, Mac Apple Silicon, Linux, Raspberry Pi.", "You enter it there with “I already have a backup code”, and the chain does the rest — verified by a full restore test on all five platforms we build for.": "Vous l'y saisissez via «\u00a0J'ai déjà un code de sauvegarde\u00a0», et la chaîne fait le reste — vérifié par une épreuve de restauration complète, sur les cinq systèmes construits.", "Do not photograph the code, and do not paste it into a cloud service: whoever reads it holds your funds, for good. And do not confuse the code with your": "Ne photographiez pas le code, ne le collez pas dans un nuage\u00a0: qui le lit détient vos fonds, définitivement. Et ne confondez pas le code avec votre", "passphrase": "phrase secrète", "— which only protects the file on": "\u00a0— elle, ne protège que le fichier de", "this": "cette", "machine, and can be different elsewhere.": "machine, et peut être différente ailleurs.", "ML-DSA-87 (FIPS 204, NIST level 5) — why it resists quantum computers": "ML-DSA-87 (FIPS\u00a0204, niveau NIST\u00a05) — pourquoi ça résiste au quantique", "This wallet's signatures rest on ML-DSA, the lattice-based scheme standardized by NIST in 2024 as FIPS 204. Q21 uses the strongest parameter set, ML-DSA-87, whose target security matches level 5 — on the order of AES-256.": "Les signatures de ce portefeuille reposent sur ML-DSA, le schéma à réseaux euclidiens normalisé par le NIST en 2024 sous le nom FIPS\u00a0204. Q21 retient le paramétrage le plus élevé, ML-DSA-87, dont la sécurité visée correspond au niveau\u00a05 — de l'ordre d'AES-256.", "This is what sets the project apart. The ECDSA signatures that protect most chains today fall to Shor's algorithm as soon as a large enough quantum computer exists; these rest on no problem that Shor's algorithm solves. The price shows in the figures above: a 2,592-byte public key and a 4,627-byte signature, where ECDSA needs a few dozen bytes.": "C'est le point qui distingue ce projet. Les signatures ECDSA que protègent aujourd'hui la plupart des chaînes tombent devant l'algorithme de Shor dès qu'une machine quantique suffisante existe\u00a0; celles-ci ne reposent sur aucun problème que Shor résout. Le prix se lit dans les chiffres ci-dessus\u00a0: une clef publique de 2\u00a0592 octets, une signature de 4\u00a0627 octets, là où ECDSA tient en quelques dizaines.", "The core does not implement this scheme itself: writing your own lattice-based signature would be professional malpractice. It plugs in an audited implementation.": "Le noyau n'implémente pas lui-même ce schéma\u00a0: écrire soi-même une signature à réseaux euclidiens est une faute professionnelle. Il branche une implémentation auditée.", "The node serves a JSON-RPC API at": "Le nœud sert une API JSON-RPC sur", "lists the methods. The session access token is sent as": "énumère les méthodes. Le jeton d'accès de la session s'envoie en", "; it never leaves this page. Nothing else is written to the browser except the token and the language choice, both cleared when the tab closes. The explorer and the wallet are served by the same process, on the same port, with no external resource.": "; il ne quitte jamais cette page. Rien d'autre n'est écrit dans le navigateur que lui et le choix de langue, tous deux effacés à la fermeture de l'onglet. L'explorateur et le portefeuille sont servis par le même processus, sur le même port, sans aucune ressource externe.", "This wallet is served by a node running in the window the launcher opened. This button asks it to shut down cleanly: it writes out the mempool, the state snapshot and the wallet, then exits.": "Ce portefeuille est servi par un nœud qui tourne dans la fenêtre ouverte par le lanceur. Ce bouton lui demande de s'arrêter proprement\u00a0: il écrit le réservoir de transactions en attente, l'instantané de l'état et le portefeuille, puis rend la main.", "This is the recommended way to stop. Closing the launcher window also works.": "C'est la façon recommandée d'arrêter. Fermer la fenêtre du lanceur fonctionne aussi.", "works too, but Windows then asks its own question — “Terminate batch job (Y/N)?”: answer": "fonctionne également, mais Windows pose alors sa propre question — «\u00a0Terminer le programme de commandes (O/N)\u00a0?\u00a0»\u00a0: répondez", "; everything has already been saved by then.": ", tout est déjà enregistré à ce moment-là.", "— everything your node has verified, browsable without trusting anyone.": "— tout ce que votre nœud a vérifié, consultable sans faire confiance à personne.", "Copy": "Copier", "copy": "copier", "Save": "Enregistrer", "Name": "Nommer", "Rename": "Renommer", "unnamed": "sans nom", "used": "servie", "Full history": "Historique complet", "Q21 issued to date": "Q21 créés à ce jour", "Signature scheme": "Schéma de signature", "Unspent outputs": "Sommes non dépensées", "Total held": "Total détenu", "available and pending combined": "disponible et en attente réunis", "across the whole chain, all holders combined": "sur toute la chaîne, tous porteurs confondus", "no block since this screen was opened": "aucun bloc depuis le lancement de cet écran", "Mining requires a wallet: without one, the reward would go nowhere.": "Miner demande un portefeuille : sans lui, la récompense n'irait nulle part.", "testnet": "réseau d'essai", "mining": "minage", "attempts/s": "tentatives/s", "Wallet closed": "Portefeuille fermé", "The amount must be greater than zero.": "Le montant doit être strictement positif.", "The fee cannot be negative.": "Les frais ne peuvent pas être négatifs.", "Invalid amount. Expected a number in Q21, with at most eight decimal places.": "Montant illisible. Attendu : un nombre en Q21, huit décimales au maximum.", "An additional amount is invalid. Expected a number in Q21.": "Un montant supplémentaire est illisible. Attendu : un nombre en Q21.", "An additional recipient has no address. Remove the row or fill it in.": "Un destinataire supplémentaire est sans adresse. Retirez la ligne ou remplissez-la.", "the network cannot be measured yet": "le réseau n'est pas encore mesurable", "at this rate, you produce most of the recent blocks": "à ce rythme, vous produisez l'essentiel des blocs récents", "resistant to quantum computers — see below": "résistant à l'ordinateur quantique — voir ci-dessous", "a unique fingerprint of all the money in existence: two nodes at the same height show the same value — your proof that you are on the real chain, without trusting anyone": "une signature unique de tout l'argent qui existe : deux nœuds à la même hauteur l'affichent identique — votre preuve d'être sur la vraie chaîne, sans faire confiance à personne", "incomplete figure, see the warning above": "chiffre incomplet, voir l'avertissement ci-dessus", "turn mining on to see your share": "allumez le minage pour vous situer", "measuring speed": "vitesse en cours de mesure", "time left unknown": "durée inconnue", "stopped": "à l'arrêt", "· no computer reachable": "· aucun ordinateur joignable", "the browser blocked copying": "copie refusée par le navigateur", "copied": "copié", "access token missing or rejected": "jeton d'accès manquant ou refusé", "Your machine is looking for a block": "Votre machine cherche un bloc", "Q21 — wallet": "Q21 — portefeuille", "Wallet sections": "Sections du portefeuille", "access token": "jeton d'accès", "a name, a number (#12) or part of an address": "un nom, un numéro (#12) ou un morceau d'adresse", "Also show the mining addresses": "Afficher aussi les adresses de minage", "When it is on, your wallet asks your router to open its port, and becomes an entry point to the network: others can connect to you. This is what lets the network live without depending on a single server. Most routers open the port on their own.": "Quand il est allumé, votre portefeuille demande à votre box d'ouvrir son accès, et devient un point d'entrée du réseau\u00a0: les autres peuvent se connecter à vous. C'est ce qui permet au réseau de vivre sans dépendre d'un serveur unique. La plupart des box ouvrent l'accès toutes seules.", "In return, your": "En échange, votre", "IP address becomes visible": "adresse internet devient visible", "to other nodes — that is how a peer-to-peer network normally works. If you would rather stay a plain client, turn it off: your wallet works exactly the same, using the nodes that others keep open.": "des autres nœuds — c'est le fonctionnement normal d'un réseau pair-à-pair. Si vous préférez rester un simple client, éteignez\u00a0: votre portefeuille marche exactement pareil, il profite des nœuds ouverts par les autres.", "A change": "Un changement", "takes effect the next time": "prend effet au prochain lancement", "the wallet starts.": "du portefeuille.", "Show only": "Ne montrer que", "who or what it is for — visible only to you": "pour qui, ou pourquoi — visible de vous seul", "Received and sent on the same row": "Reçu et sorti sur une même ligne", "A payment almost never spends a coin of the exact size: the wallet spends a bigger one, and the difference comes back to it as change, on a fresh address, like a bill handed back. The": "Un envoi n'ouvre presque jamais une pièce de la taille exacte\u00a0: le portefeuille en ouvre une plus grosse, et la différence lui revient en monnaie sur une adresse neuve, comme un billet rendu. La colonne", "received": "reçu", "column holds that change; the": "porte cette monnaie, la colonne", "sent": "sorti", "column, what actually left the wallet — amount paid and fee included.": "ce qui a réellement quitté le portefeuille — montant versé et frais compris.", "Amounts sent incomplete": "Sommes sorties incomplètes", "For at least one payment, the coin spent predates the window examined: its value was not found, so the amount sent cannot be established. These amounts are shown preceded by “≥” — a minimum, not a fact.": "Pour au moins un envoi, la pièce ouverte est antérieure à la fenêtre examinée\u00a0: sa valeur n'a pas été retrouvée, et la somme sortie ne peut donc pas être établie. Ces montants s'affichent précédés de «\u00a0≥\u00a0» — un minimum, pas un fait.", "Program version": "Version du programme", "the one you are running — compare it with the version announced in the release": "celle que vous exécutez — à comparer à la version annoncée par la livraison", "Single-use address": "Adresse à usage unique", "Reuse": "Réutilisation", "Scheme": "Schéma", "Requesting…": "Demande en cours…", "Address not created": "Adresse non créée", "Payment not prepared": "Envoi non préparé", "Address of another recipient": "Adresse d'un autre destinataire", "Remove": "Retirer", "Amount": "Montant", "Fee": "Frais", "Total debited": "Débité au total", "Balance after": "Solde après", "✓ Payment sent to the network": "✓ Envoi transmis au réseau", "It has been announced to peers and is waiting to enter a block — expect about two minutes. Until a block contains it, it is": "Il est annoncé aux pairs et attend d'entrer dans un bloc — comptez l'ordre de deux minutes. Tant qu'aucun bloc ne le contient, il n'est", "not confirmed yet": "pas encore confirmé", "Follow this transaction in the explorer": "Suivre cette transaction dans l'explorateur", "Reference:": "Référence :", "Payment rejected": "Envoi refusé", "No funds have moved.": "Aucun fonds n'a bougé.", "Sending…": "Envoi…", "pending": "en attente", "Partial history": "Historique partiel", "Your funds are not lost": "Vos fonds ne sont pas perdus", ": the balance is still correct. Close and reopen the wallet: it will request these blocks from the network again.": ": le solde reste juste. Fermez puis rouvrez le portefeuille\u00a0: il redemandera ces blocs au réseau.", "History unavailable": "Historique indisponible", "No address derived yet. The button above creates one.": "Aucune adresse encore dérivée. Le bouton ci-dessus en crée une.", "Nothing yet. Your first movements will appear here — receive Q21 from the Receive tab, or find a block from the Mine tab.": "Rien pour l'instant. Vos premiers mouvements apparaîtront ici — recevez du Q21 depuis l'onglet Recevoir, ou trouvez un bloc depuis l'onglet Miner.", "mining rewards: they belong to you, but cannot be used yet": "récompenses de minage : elles vous appartiennent, mais ne sont pas encore utilisables", "No block found yet. It is a lottery: the switch above buys attempts, and luck decides when.": "Aucun bloc trouvé pour l'instant. C'est une loterie : le bouton ci-dessus achète des tentatives, la chance décide du moment.", "Not enough blocks yet to measure anything. At least two are needed, spread out in time.": "Pas encore assez de blocs pour mesurer quoi que ce soit. Il en faut au moins deux, séparés dans le temps.", "catching up": "rattrapage en cours", "observed pace — target: 2 minutes": "cadence observée — cible : 2 minutes", "The node has saved its state and stopped. You can close this tab; the black window will close by itself.": "Le nœud a écrit son état et s'est arrêté. Vous pouvez fermer cet onglet ; la fenêtre noire se referme d'elle-même.", "This link has already been used, or has expired. Start the wallet again to get a new one.": "Ce lien a déjà servi, ou a expiré. Relancez le portefeuille pour en obtenir un neuf.", "Could not reach the node: access token missing or rejected": "Impossible d'interroger le nœud : jeton d'accès manquant ou refusé", "Y": "O", "outgoing": "envoi", "incoming": "reception", "No movement of this type in the history searched.": "Aucun mouvement de ce type dans l'historique parcouru.", "Your address": "Votre adresse", "This is what you give to someone who wants to send you Q21 — what is usually called your “wallet address”.": "C'est ce que vous donnez à quelqu'un qui veut vous envoyer des Q21 — ce qu'on appelle couramment votre «\u00a0adresse de portefeuille\u00a0».", "Which address should I give?": "Quelle adresse donner\u00a0?", "The one above. Every address of this wallet stays valid forever: a payment sent to an older one still arrives here, even years later.": "Celle ci-dessus. Toutes les adresses de ce portefeuille restent valables pour toujours\u00a0: un paiement envoyé à une ancienne arrive quand même ici, même des années plus tard.", "To check that a payment has arrived, open the address in the explorer: it shows what it received, even before the next block.": "Pour vérifier qu'un paiement est arrivé, ouvrez l'adresse dans l'explorateur\u00a0: il montre ce qu'elle a reçu, même avant le bloc suivant.", "Copy the address": "Copier l'adresse", "See it in the explorer": "La voir dans l'explorateur", "Explorer": "Explorateur", "The “New address” button below creates one.": "Le bouton «\u00a0Nouvelle adresse\u00a0» ci-dessous en crée une.", "Show older movements": "Afficher les mouvements plus anciens", "INCOMPLETE history: the body of some blocks of the active chain could not be read, and what they contained does not appear here. This is not a loss of funds - the balance itself stays correct. Restart the node: it will request these blocks from the network again.": "Historique INCOMPLET\u00a0: le contenu de certains blocs de la chaîne active n'a pas pu être lu, et ce qu'ils contenaient n'apparaît pas ici. Ce n'est pas une perte de fonds\u00a0: le solde, lui, reste exact. Relancez le nœud\u00a0: il redemandera ces blocs au réseau.", "Full history: the address index covers the whole chain.": "Historique complet\u00a0: l'index d'adresses couvre toute la chaîne.", "Full history: the search went all the way back to genesis.": "Historique complet\u00a0: la recherche est remontée jusqu'au bloc de genèse.", "Partial history. This node has no index by address: the search stops at the height shown.": "Historique partiel. Ce nœud n'a pas d'index d'adresses\u00a0: la recherche s'arrête à la hauteur indiquée.", "Your wallet is a hidden node": "Votre portefeuille est un nœud caché", "Others reach it through Tor, at an onion address of its own: your IP address stays hidden, and your router is not touched.": "Les autres le joignent par Tor, à une adresse onion qui lui est propre\u00a0: votre adresse IP reste cachée, et votre box n'est pas touchée.", "Its onion address is published: the network can reach it.": "Son adresse onion est publiée\u00a0: le réseau peut le joindre.", "Tor is preparing its onion address.": "Tor prépare son adresse onion.", "Gather my small coins": "Regrouper mes petites pièces", "One transaction gathers up to a hundred of your smallest coins into a single one, paid to yourself. After the next block, send again; if the amount still needs too many coins, gather once more.": "Une transaction regroupe jusqu'à cent de vos plus petites pièces en une seule, payée à vous-même. Après le prochain bloc, renvoyez le paiement\u00a0; si le montant demande encore trop de pièces, regroupez une fois de plus.", "Gathering…": "Regroupement…", "Wait for the next block — about two minutes — then send your payment again.": "Attendez le prochain bloc — environ deux minutes — puis renvoyez votre paiement.", "The coins could not be gathered: ": "Les pièces n'ont pas pu être regroupées\u00a0: "}, "ja": {"Every connection goes through Tor": "すべての接続がTorを経由します", "Connections go out directly": "接続は直接行われます", "The nodes you reach see a Tor relay, not your address.": "接続先のノードに見えるのはTorのリレーで、あなたのアドレスではありません。", "The nodes you connect to see your IP address (or your VPN's).": "接続先のノードにはあなたのIPアドレス（またはVPNのアドレス）が見えます。", "Stop using Tor": "Torの使用をやめる", "Use Tor": "Torを使う", "Hide your address with Tor": "Torでアドレスを隠す", "Tor comes with the wallet: there is nothing to install. The wallet starts it when it needs it, and stops it when it closes.": "Torはウォレットに同梱されています。インストールは不要です。ウォレットが必要なときに起動し、終了時に停止します。", "A copy without Tor of its own (Raspberry Pi, Linux on ARM) uses a Tor already running on this computer: the Tor service, or Tor Browser left open.": "Torが同梱されていない版（Raspberry Pi、ARM版Linux）は、このコンピュータで動作中のTor（Torサービス、または開いたままのTor Browser）を使います。", "Tor is on, but no connection has gone through it yet: Tor is still connecting, or this network blocks it.": "Torは有効ですが、まだTor経由の接続がありません。Torが接続中か、このネットワークがTorを遮断しています。", "If Tor cannot start, the wallet does not connect in the clear: it waits for Tor.": "Torを起動できない場合、ウォレットは暗号化されていない直接接続を行わず、Torを待ちます。", "With the Tor that comes with the wallet, being reachable makes it a hidden node: Tor gives it an onion address of its own, the network reaches it there, and nobody learns where it is. The wallet never opens your router. With another Tor, an onion service has to be set up by hand (see the guide).": "ウォレットに同梱のTorでは、接続を受け付けるとこのウォレットは隠しノードになります。Torが専用のオニオンアドレスを与え、ネットワークはそこから接続し、場所は誰にも分かりません。ルーターのポートは開きません。別のTorを使う場合、オニオンサービスは手動で設定します（ガイド参照）。", "Tor will be used the next time the wallet starts.": "次回ウォレット起動時からTorを使用します。", "Tor will no longer be used the next time the wallet starts.": "次回ウォレット起動時からTorを使用しなくなります。", "Tor is on, but no connection could be made through it: is Tor (or Tor Browser) running?": "Torは有効ですが、Tor経由の接続ができませんでした。Tor（またはTor Browser）は起動していますか？", "This wallet mines and is reachable: your IP address is public, and the blocks you find leave from it first. Anyone watching the network can link your address to your rewards. To mine privately, make this node client-only.": "このウォレットはマイニング中で、外部から接続可能です。あなたのIPアドレスは公開され、見つけたブロックは最初にそこから送信されます。ネットワークを観察する人は、あなたのアドレスと報酬を結び付けることができます。目立たずにマイニングするには、クライアント専用に戻してください。", "Do not combine it with mining on a home connection: the blocks you find would leave from your address first, and could be linked to your rewards.": "自宅の回線でマイニングと併用しないでください。見つけたブロックが最初にあなたのアドレスから送信され、報酬と結び付けられる可能性があります。", "Your router did not open the port: your wallet stays a client.": "ルーターはポートを開きませんでした。ウォレットはクライアントのままです。", "Your router opened the port (NAT-PMP).": "ルーターがポートを開きました（NAT-PMP）。", "Your router opened the port (UPnP).": "ルーターがポートを開きました（UPnP）。", "Your router opened the port.": "ルーターがポートを開きました。", "It is off by default: turn it on only if you accept that other nodes see your address.": "初期設定ではオフです。他のノードにあなたのアドレスが見えることを受け入れる場合にのみオンにしてください。", "Syncing": "同期中", "Offline": "オフライン", "Your wallet helps the network": "あなたのウォレットはネットワークを支えています", "Your wallet is client-only": "あなたのウォレットは単なるクライアントです", "It accepts connections from others, so the network does not rely on a single machine.": "他のノードからの接続を受け入れ、ネットワークが一台のマシンに依存しないようにします。", "It reaches out to the network but does not accept incoming connections.": "ネットワークへは接続しますが、着信接続は受け付けません。", "Make this node reachable": "このノードを到達可能にする", "Stop being reachable": "到達可能をやめる", "What this setting does": "この設定の働き", "Your node will be reachable the next time the wallet starts.": "次回ウォレットを起動したときにノードは到達可能になります。", "Your node will be client-only the next time the wallet starts.": "次回ウォレットを起動したときにノードは単なるクライアントになります。", "No bootstrap address: this node is not looking for anyone": "開始アドレスがありません：このノードは誰も探していません", "The program contains no server address, and that is deliberate: an address hard-coded into distributed software would become a permanent dependency on whoever controls it. It is provided separately, in a file you can edit. Create q21-data/bootstrap.txt next to the program, add the line bootstrap.q21.dev:21121 to it, then restart. JOIN.md, which ships with the program, explains this step and how to add more entry points.": "プログラムにはサーバーのアドレスが含まれていません。これは意図的です：配布されるソフトウェアに刻まれたアドレスは、それを保持する者への恒久的な依存になります。アドレスは隣に置かれた、編集可能なファイルで与えます。プログラムの隣に q21-data/bootstrap.txt を作成し、bootstrap.q21.dev:21121 の行を書いてから、再起動してください。プログラムに同梱の JOIN.md（英語）に、この手順と他の入口の追加方法が書かれています。", "Hide the mining addresses": "マイニング用アドレスを畳む", "Mining also derives one per block found, for the same reason. Those addresses have already received their reward and need not be handed out: they are tucked away below, and only the ones you requested or named are shown.": "マイニングも同じ理由で、発見したブロックごとにアドレスを 1 つ導出します。それらはすでに報酬を受け取っており、誰かに渡す必要はありません。下に畳まれており、あなたが要求または命名したものだけが表示されます。", "Wallet": "ウォレット", "Connecting…": "接続中…", "Balance": "残高", "Mine": "マイニング", "Receive": "受け取る", "Send": "送る", "Network": "ネットワーク", "Activity": "履歴", "Info": "情報", "Loading…": "読み込み中…", "Details": "詳細", "Close": "閉じる", "Back": "戻る", "All": "すべて", "Received": "受取", "Sent": "送金", "Type": "種別", "Date": "日付", "Reference": "参照", "Confirmations": "承認数", "Block": "ブロック番号", "Available": "利用可能", "Mining": "マイニング", "Chain": "チェーン", "Your blocks": "あなたのブロック", "Your addresses": "あなたのアドレス", "The network": "ネットワーク", "Your security": "セキュリティ", "Your machine": "あなたのマシン", "Measuring…": "測定中…", "Node unreachable": "ノードに接続できません", "Unlock": "ロック解除", "New address": "新しいアドレス", "Show more": "さらに表示", "Search your address book": "アドレス帳を検索", "+ Add a recipient": "+ 宛先を追加", "Recalculate fee": "手数料を再計算", "Review": "確認", "Send now": "確定して送る", "Close the wallet": "ウォレットを終了", "Send Q21": "Q21 を送る", "Recipient address": "宛先アドレス", "Amount (Q21)": "金額 (Q21)", "Fee (Q21)": "手数料 (Q21)", "Suggested by the node; you can change it.": "ノードの提案値です。変更できます。", "Confirm the payment": "送金の確認", "A payment is final": "送金は取り消せません", "Expected inputs, for the fee estimate": "手数料見積り用の入力数", "The address has a checksum: a typo will be caught by the node, not silently accepted.": "アドレスにはチェックサムがあります。打ち間違いはノードが検出します。", "At most eight decimal places. One unit is 0.00000001 Q21.": "小数点以下は最大 8 桁。1 単位は 0.00000001 Q21 です。", "No authority can reverse an accepted transaction. Re-read the address character by character: it is the only check you have left.": "承認された取引を取り消せる権威は存在しません。アドレスを一文字ずつ読み直してください。それが最後の確認です。", "One payment can go to several recipients at once: a single transaction with a shared fee, rather than several separate payments.": "一度の送金で複数の宛先に支払えます。手数料を分け合う単一の取引になります。", "Your machine is not mining": "マシンは探索していません", "Mining searches for the next block. It uses all CPU cores.": "マイニングは次のブロックを探します。全コアを使います。", "attempts per second": "秒あたりの試行", "Earned by mining": "マイニング報酬", "since launch, including immature rewards": "起動以降 — 成熟待ちを含む", "Blocks found": "発見ブロック", "since launch": "起動以降", "Attempts": "試行回数", "Chain pace": "チェーンの速度", "target: one block every 2 minutes": "目標: 2 分に 1 ブロック", "Memory in use": "使用メモリ", "the computation table, in RAM": "計算テーブル (RAM 上)", "Network hash rate": "ネットワークの計算力", "measured on your machine, live": "あなたのマシンでの実測値", "Computers connected to yours": "接続中のコンピュータ", "your direct neighbors, not the whole network": "直接の隣接ノードのみ", "The backup code is your wallet": "バックアップコードがあなたのウォレットです", "The file on this disk is only a working copy.": "このディスク上のファイルは作業用の複製にすぎません。", "Two things you must never do": "絶対にしてはいけない二つのこと", "For developers": "開発者向け", "Chain explorer": "チェーンエクスプローラ", "Access token required": "アクセストークンが必要です", "Catching up on chain history": "チェーン履歴を取得中", "Why part of the balance is immature": "残高の一部が未成熟な理由", "Why you have several": "複数ある理由", "What your machine does when this switch is on": "このスイッチが入っているとき、マシンは何をするか", "Every payment deserves a fresh address. Reusing one costs the protocol nothing, but publicly links your payments together.": "支払いごとに新しいアドレスを。再利用はプロトコル上は無料ですが、支払い同士が公に結び付きます。", "Testnet — the Q21 mined here have no value, and never will. Research software, not externally audited.": "テストネット — ここで採掘される Q21 に価値はなく、今後もありません。外部監査を受けていない研究用ソフトウェアです。", "Turn mining on": "マイニングを開始", "Turn mining off": "マイニングを停止", "This node cannot mine": "このノードはマイニングできません", "Connected": "接続済み", "Shutting down…": "終了中…", "Confirm shutdown": "終了の確認", "Click again to stop the wallet.": "もう一度クリックするとウォレットを停止します。", "Blocks verified": "検証済みブロック", "Latest block": "最新ブロック", "Recipient": "宛先", "Awaiting maturity": "成熟待ち", "State commitment": "状態フィンガープリント", "Waiting for a computer to ask for the chain": "チェーンを要求する相手を待っています", "Mining rate over the last few minutes": "直近数分のマイニング速度", "It uses all available cores.": "利用可能な全コアを使用します。", "No recipient address.": "宛先アドレスがありません。", "Each amount must be greater than zero.": "金額は必ず正の値である必要があります。", "The minimum amount is 0.0001 Q21: below that, the network rejects the output as dust.": "最小金額は 0.0001 Q21 です。それ未満の出力はダストとしてネットワークに拒否されます。", "Each amount must be at least 0.0001 Q21: below that, the network rejects the output as dust.": "各金額は 0.0001 Q21 以上である必要があります。それ未満の出力はダストとしてネットワークに拒否されます。", "Invalid fee. Expected a number in Q21, with at most eight decimal places.": "手数料を解釈できません。Q21 の数値 (小数点以下 8 桁まで) を入力してください。", "The node requires a token. The launcher normally passes it in the address fragment; if you opened this page manually, enter the token given to": "ノードはトークンを要求します。通常はランチャーがアドレスのフラグメントで渡します。このページを手動で開いた場合は、次に渡したトークンをここに入力してください:", "If you have just restored a wallet": "ウォレットを復元した直後の場合", ", your funds will reappear at the end of this step: they are in the chain, and your machine has not read them yet. The displayed balance is incomplete until then.": "、資金はこの工程の終わりに再表示されます。資金はチェーン上にあり、あなたのマシンがまだ読み終えていないだけです。それまで表示残高は不完全です。", "A mining reward can only be spent after a long maturity period. Until it has elapsed, the amount exists and belongs to you, but no transaction can spend it. It is counted separately rather than folded into a total that would be wrong.": "マイニング報酬は長い成熟期間を経てはじめて使用できます。期間が終わるまで、その金額は存在しあなたのものですが、どの取引でも使えません。誤った合計に紛れ込ませず、別枠で数えています。", "It searches a two-gigabyte table in memory, hundreds of thousands of times per second, looking for a value that meets the current difficulty. It is a lottery: you do not win every time, and you win more often the faster you search.": "メモリ上の 2 ギガバイトのテーブルを毎秒何十万回も探索し、その時点の難易度を満たす値を探します。これは宝くじです。毎回当たるわけではなく、速く探すほど当たりやすくなります。", "The reward for a block found is paid to an address in this wallet. It can only be spent after the maturity period.": "発見したブロックの報酬は、このウォレットのアドレスに支払われます。成熟期間の経過後にのみ使用できます。", "Your wallet holds": "あなたのウォレットが持つ秘密は", "only one secret": "ただ一つだけです", ": the seed, the one behind the backup code you wrote down. All your addresses are": ": 書き写したバックアップコードのもとになる種です。すべてのアドレスは計算によって", "built": "作られます", "from it by computation — the first, the second, the thousandth. This is called": "— 1 番目も 2 番目も 1000 番目も。これを", "derivation": "導出という", "A reassuring consequence:": "安心できる帰結:", "this code restores everything": "このコードがすべてを救う", ". No need to back up each address; they can all be recomputed from it.": "。個々のアドレスを保存する必要はありません。すべてそこから再計算されます。", "A useful consequence: giving a fresh one to each person who pays you costs nothing, and keeps an onlooker from linking all your incoming payments together by reading the chain. Your balance is the sum of them all.": "実用的な帰結: 支払う人ごとに新しいアドレスを渡しても費用はかからず、チェーンを読む者があなたの入金を結び付けることを防げます。残高はそれらすべての合計です。", "With ML-DSA-87 the witness makes up almost all of a transaction: the fee depends mostly on the": "ML-DSA-87 では証人データが取引のほぼ全体を占めます。手数料は主に消費される", "number of inputs": "入力の数", "consumed, which the node only picks when it builds the transaction. If the payment is rejected because the fee rate is too low, increase this number and recalculate.": "に依存し、ノードは取引を組み立てる時にはじめてそれを決めます。手数料率が低すぎて送金が拒否された場合は、この数を増やして再計算してください。", "Why we don't tell you “how many miners”": "「マイナーの数」をお伝えしない理由", "Because nobody can know, and a made-up figure would be worse than no figure at all. A miner does not announce itself: it just produces blocks. Nothing distinguishes a thousand machines from one person who owns a thousand.": "誰にも知りようがなく、でっち上げた数字は数字がないより悪いからです。マイナーは名乗らず、ただブロックを置きます。千台のマシンと、千台を所有する一人とを区別する手立てはありません。", "And Q21 makes counting even harder, on purpose: your wallet uses": "さらに Q21 は意図的に集計を不可能にしています。ウォレットは報酬ごとに", "a different address for each reward": "異なるアドレスを使います", ", so that your earnings cannot be linked together. Counting miner addresses would amount to counting blocks.": "。そのため収益同士を結び付けられません。マイナーのアドレスを数えることは、ブロックを数えることと同じになります。", "What can be measured, on the other hand, cannot be faked:": "一方、測定できるものは偽装できません:", "the work actually spent": "実際に費やされた仕事量", ". It can be read from the difficulty, which adjusts so that a block is found every two minutes. Compared with what": "。これは 2 分に 1 ブロックとなるよう調整される難易度から読み取れます。それを", "your": "あなたの", "machine does, it gives your share, shown above.": "マシンと比べると、その占める割合（上に表示）になります。", "Your entire wallet — every address, all your funds — can be rebuilt from the single backup code you wrote down when you created it.": "ウォレット全体 — すべてのアドレス、すべての資金 — は、作成時に書き写した唯一のバックアップコードから復元されます。", "On any machine: Windows, Intel Mac, Apple Silicon Mac, Linux, Raspberry Pi.": "どのマシンでも: Windows、Intel Mac、Apple Silicon Mac、Linux、Raspberry Pi。", "You enter it there with “I already have a backup code”, and the chain does the rest — verified by a full restore test on all five platforms we build for.": "「バックアップコードを持っています」から入力すれば、あとはチェーンが行います — 構築される 5 つのシステムすべてで、完全な復元テストにより検証済みです。", "Do not photograph the code, and do not paste it into a cloud service: whoever reads it holds your funds, for good. And do not confuse the code with your": "コードを撮影せず、クラウドに貼り付けないでください。読んだ者が資金を永久に手にします。また、このコードを", "passphrase": "パスフレーズ", "— which only protects the file on": "と混同しないでください。パスフレーズが守るのは", "this": "この", "machine, and can be different elsewhere.": "マシンのファイルだけで、他の場所では異なる場合があります。", "ML-DSA-87 (FIPS 204, NIST level 5) — why it resists quantum computers": "ML-DSA-87 (FIPS 204、NIST レベル 5) — 量子計算に耐える理由", "This wallet's signatures rest on ML-DSA, the lattice-based scheme standardized by NIST in 2024 as FIPS 204. Q21 uses the strongest parameter set, ML-DSA-87, whose target security matches level 5 — on the order of AES-256.": "このウォレットの署名は、NIST が 2024 年に FIPS 204 として標準化した格子ベース方式 ML-DSA に基づきます。Q21 は最上位のパラメータ ML-DSA-87 を採用し、目標とする安全性はレベル 5 — AES-256 に相当します。", "This is what sets the project apart. The ECDSA signatures that protect most chains today fall to Shor's algorithm as soon as a large enough quantum computer exists; these rest on no problem that Shor's algorithm solves. The price shows in the figures above: a 2,592-byte public key and a 4,627-byte signature, where ECDSA needs a few dozen bytes.": "これがこのプロジェクトを際立たせる点です。今日ほとんどのチェーンを守る ECDSA 署名は、十分な量子計算機が現れれば Shor のアルゴリズムに屈します。こちらは Shor が解ける問題に依存していません。その代償は上の数字に表れます: 公開鍵 2,592 バイト、署名 4,627 バイト。ECDSA なら数十バイトです。", "The core does not implement this scheme itself: writing your own lattice-based signature would be professional malpractice. It plugs in an audited implementation.": "コア自身はこの方式を実装しません。格子署名を自作することは専門家として許されない過ちです。監査済みの実装を組み込んでいます。", "The node serves a JSON-RPC API at": "ノードは次の場所で JSON-RPC API を提供します:", "lists the methods. The session access token is sent as": "がメソッドを列挙します。セッションのアクセストークンは次の形式で送ります:", "; it never leaves this page. Nothing else is written to the browser except the token and the language choice, both cleared when the tab closes. The explorer and the wallet are served by the same process, on the same port, with no external resource.": "。これはこのページから外に出ません。ブラウザに書き込まれるのはこれと言語の選択だけで、どちらもタブを閉じると消えます。エクスプローラとウォレットは同一プロセス・同一ポートで提供され、外部リソースは一切使いません。", "This wallet is served by a node running in the window the launcher opened. This button asks it to shut down cleanly: it writes out the mempool, the state snapshot and the wallet, then exits.": "このウォレットは、ランチャーが開いたウィンドウで動くノードが提供しています。このボタンはノードに正常終了を求めます: 保留中の取引プール、状態のスナップショット、ウォレットを書き出してから制御を返します。", "This is the recommended way to stop. Closing the launcher window also works.": "これが推奨される停止方法です。ランチャーのウィンドウを閉じても構いません。", "works too, but Windows then asks its own question — “Terminate batch job (Y/N)?”: answer": "も使えますが、その場合 Windows が独自の確認 —「バッチ ジョブを終了しますか (Y/N)?」— を出します。次のように答えてください:", "; everything has already been saved by then.": "。その時点ですべて保存済みです。", "— everything your node has verified, browsable without trusting anyone.": "— あなたのノードが検証したすべてを、誰も信頼することなく閲覧できます。", "Copy": "コピー", "copy": "コピー", "Save": "保存", "Name": "名前を付ける", "Rename": "名前を変更", "unnamed": "名前なし", "used": "使用済み", "Full history": "完全な履歴", "Q21 issued to date": "これまでに発行された Q21", "Signature scheme": "署名方式", "Unspent outputs": "未使用額", "Total held": "保有総額", "available and pending combined": "利用可能分と待機分の合計", "across the whole chain, all holders combined": "チェーン全体、全保有者の合計", "no block since this screen was opened": "この画面を開いてからブロックはありません", "Mining requires a wallet: without one, the reward would go nowhere.": "マイニングにはウォレットが必要です。ないと報酬の宛先がありません。", "testnet": "テストネット", "mining": "マイニング", "attempts/s": "回試行/秒", "Wallet closed": "ウォレットを終了しました", "The amount must be greater than zero.": "金額は正の値である必要があります。", "The fee cannot be negative.": "手数料を負の値にはできません。", "Invalid amount. Expected a number in Q21, with at most eight decimal places.": "金額を解釈できません。Q21 の数値 (小数点以下 8 桁まで) を入力してください。", "An additional amount is invalid. Expected a number in Q21.": "追加の金額を解釈できません。Q21 の数値を入力してください。", "An additional recipient has no address. Remove the row or fill it in.": "追加の宛先にアドレスがありません。行を削除するか入力してください。", "the network cannot be measured yet": "ネットワークはまだ測定できません", "at this rate, you produce most of the recent blocks": "このペースでは、最近のブロックの大半をあなたが生成しています", "resistant to quantum computers — see below": "量子コンピュータに耐性 — 下記を参照", "a unique fingerprint of all the money in existence: two nodes at the same height show the same value — your proof that you are on the real chain, without trusting anyone": "存在するすべての通貨の一意な署名。同じ高さの二つのノードは同一の値を示します — 誰も信用せずに本物のチェーン上にいるという証拠です", "incomplete figure, see the warning above": "不完全な数値です。上の警告を参照してください", "turn mining on to see your share": "自分の位置を知るにはマイニングを開始してください", "measuring speed": "速度を測定中", "time left unknown": "所要時間は不明", "stopped": "停止中", "· no computer reachable": "· 接続可能なコンピュータなし", "the browser blocked copying": "ブラウザがコピーを拒否しました", "copied": "コピーしました", "access token missing or rejected": "アクセストークンがないか拒否されました", "Your machine is looking for a block": "マシンがブロックを探しています", "Q21 — wallet": "Q21 — ウォレット", "access token": "アクセストークン", "Fee": "手数料", "pending": "保留中", "Not enough blocks yet to measure anything. At least two are needed, spread out in time.": "測定に足るブロックがまだありません。時間を空けた 2 つ以上が必要です。", "The node has saved its state and stopped. You can close this tab; the black window will close by itself.": "ノードは状態を書き出して停止しました。このタブを閉じて構いません。黒いウィンドウは自動的に閉じます。", "This link has already been used, or has expired. Start the wallet again to get a new one.": "このリンクはすでに使用済みか、期限切れです。ウォレットを再起動して新しいリンクを取得してください。", "Could not reach the node: access token missing or rejected": "ノードに問い合わせできません: アクセストークンがないか拒否されました", "No movement of this type in the history searched.": "検索した履歴に、この種類の入出金はありません。", "Your address": "あなたのアドレス", "This is what you give to someone who wants to send you Q21 — what is usually called your “wallet address”.": "Q21 を送ってもらうときに相手に伝えるのがこれです。一般に「ウォレットのアドレス」と呼ばれるものです。", "Which address should I give?": "どのアドレスを伝えればよいですか?", "The one above. Every address of this wallet stays valid forever: a payment sent to an older one still arrives here, even years later.": "上に表示されているものです。このウォレットのアドレスはすべて永久に有効です。古いアドレスに送られた支払いも、何年後であってもここに届きます。", "To check that a payment has arrived, open the address in the explorer: it shows what it received, even before the next block.": "支払いが届いたか確かめるには、エクスプローラーでアドレスを開いてください。次のブロックを待たずに、受け取った内容が表示されます。", "Copy the address": "アドレスをコピー", "See it in the explorer": "エクスプローラーで見る", "Explorer": "エクスプローラー", "The “New address” button below creates one.": "下の「新しいアドレス」ボタンで作成できます。", "Show older movements": "それ以前の入出金を表示", "INCOMPLETE history: the body of some blocks of the active chain could not be read, and what they contained does not appear here. This is not a loss of funds - the balance itself stays correct. Restart the node: it will request these blocks from the network again.": "履歴が不完全です:アクティブなチェーンの一部のブロック本体を読み取れなかったため、その内容はここに表示されていません。資金が失われたわけではなく、残高自体は正確です。ノードを再起動すると、これらのブロックをネットワークから再取得します。", "Full history: the address index covers the whole chain.": "完全な履歴:アドレス・インデックスがチェーン全体をカバーしています。", "Full history: the search went all the way back to genesis.": "完全な履歴:ジェネシスブロックまで遡って検索しました。", "Partial history. This node has no index by address: the search stops at the height shown.": "部分的な履歴です。このノードにはアドレス・インデックスがないため、検索は表示された高さで止まります。", "Your wallet is a hidden node": "ウォレットは秘匿ノードです", "Others reach it through Tor, at an onion address of its own: your IP address stays hidden, and your router is not touched.": "他のノードは Tor を通じて、このウォレット専用の onion アドレスに接続します。IP アドレスは隠されたままで、ルーターには一切触れません。", "Its onion address is published: the network can reach it.": "onion アドレスが公開されています。ネットワークから接続できます。", "Tor is preparing its onion address.": "Tor が onion アドレスを準備しています。", "Gather my small coins": "小さなコインをまとめる", "One transaction gathers up to a hundred of your smallest coins into a single one, paid to yourself. After the next block, send again; if the amount still needs too many coins, gather once more.": "1回の取引で、最も小さなコインを最大100枚まとめて1枚にし、自分自身に送ります。次のブロックの後にもう一度送金してください。まだコインが多すぎる場合は、もう一度まとめてください。", "Gathering…": "まとめています…", "Wait for the next block — about two minutes — then send your payment again.": "次のブロック（約2分）を待ってから、もう一度送金してください。", "The coins could not be gathered: ": "コインをまとめられませんでした: "}};
+const I18N = {"fr": {"Every connection goes through Tor": "Toutes les connexions passent par Tor", "Connections go out directly": "Les connexions sortent directement", "The nodes you reach see a Tor relay, not your address.": "Les nœuds que vous joignez voient un relais Tor, pas votre adresse.", "The nodes you connect to see your IP address (or your VPN's).": "Les nœuds auxquels vous vous connectez voient votre adresse IP (ou celle de votre VPN).", "Stop using Tor": "Ne plus utiliser Tor", "Use Tor": "Utiliser Tor", "Hide your address with Tor": "Cacher votre adresse avec Tor", "Tor comes with the wallet: there is nothing to install. The wallet starts it when it needs it, and stops it when it closes.": "Tor est fourni avec le portefeuille\u00a0: il n'y a rien à installer. Le portefeuille le démarre quand il en a besoin, et l'arrête en se fermant.", "A copy without Tor of its own (Raspberry Pi, Linux on ARM) uses a Tor already running on this computer: the Tor service, or Tor Browser left open.": "Une copie sans Tor à elle (Raspberry Pi, Linux sur ARM) utilise un Tor déjà lancé sur cet ordinateur\u00a0: le service Tor, ou Tor Browser laissé ouvert.", "Tor is on, but no connection has gone through it yet: Tor is still connecting, or this network blocks it.": "Tor est activé, mais aucune connexion n'est encore passée par lui\u00a0: Tor se connecte encore, ou ce réseau le bloque.", "If Tor cannot start, the wallet does not connect in the clear: it waits for Tor.": "Si Tor ne peut pas démarrer, le portefeuille ne se connecte pas en clair\u00a0: il attend Tor.", "With the Tor that comes with the wallet, being reachable makes it a hidden node: Tor gives it an onion address of its own, the network reaches it there, and nobody learns where it is. The wallet never opens your router. With another Tor, an onion service has to be set up by hand (see the guide).": "Avec le Tor fourni avec le portefeuille, être joignable en fait un nœud caché\u00a0: Tor lui donne une adresse onion à lui, le réseau le joint par là, et personne ne sait où il se trouve. Le portefeuille n'ouvre jamais votre box. Avec un autre Tor, le service onion se crée à la main (voir le guide).", "Tor will be used the next time the wallet starts.": "Tor sera utilisé au prochain lancement du portefeuille.", "Tor will no longer be used the next time the wallet starts.": "Tor ne sera plus utilisé au prochain lancement du portefeuille.", "Tor is on, but no connection could be made through it: is Tor (or Tor Browser) running?": "Tor est activé, mais aucune connexion n'a pu passer par lui\u00a0: Tor (ou Tor Browser) est-il lancé\u00a0?", "This wallet mines and is reachable: your IP address is public, and the blocks you find leave from it first. Anyone watching the network can link your address to your rewards. To mine privately, make this node client-only.": "Ce portefeuille mine et il est joignable\u00a0: votre adresse IP est publique, et les blocs que vous trouvez partent d'abord de chez vous. Quiconque observe le réseau peut relier votre adresse à vos récompenses. Pour miner discrètement, repassez en simple client.", "Do not combine it with mining on a home connection: the blocks you find would leave from your address first, and could be linked to your rewards.": "Ne le combinez pas avec le minage sur une connexion à domicile\u00a0: les blocs que vous trouvez partiraient d'abord de votre adresse, et pourraient être reliés à vos récompenses.", "Your router did not open the port: your wallet stays a client.": "Votre box n'a pas ouvert l'accès\u00a0: votre portefeuille reste un simple client.", "Your router opened the port (NAT-PMP).": "Votre box a ouvert l'accès (NAT-PMP).", "Your router opened the port (UPnP).": "Votre box a ouvert l'accès (UPnP).", "Your router opened the port.": "Votre box a ouvert l'accès.", "It is off by default: turn it on only if you accept that other nodes see your address.": "Il est éteint par défaut\u00a0: ne l'allumez que si vous acceptez que les autres nœuds voient votre adresse.", "Syncing": "Synchronisation", "Offline": "Hors connexion", "Your wallet helps the network": "Votre portefeuille aide le réseau", "Your wallet is client-only": "Votre portefeuille est un simple client", "It accepts connections from others, so the network does not rely on a single machine.": "Il accepte les connexions des autres, pour que le réseau ne dépende pas d'une seule machine.", "It reaches out to the network but does not accept incoming connections.": "Il sort vers le réseau, mais n'accepte pas de connexions entrantes.", "Make this node reachable": "Rendre ce nœud joignable", "Stop being reachable": "Ne plus être joignable", "What this setting does": "Ce que fait ce réglage", "Your node will be reachable the next time the wallet starts.": "Votre nœud sera joignable au prochain lancement du portefeuille.", "Your node will be client-only the next time the wallet starts.": "Votre nœud sera un simple client au prochain lancement du portefeuille.", "No bootstrap address: this node is not looking for anyone": "Aucune adresse de départ : ce nœud ne cherche personne", "The program contains no server address, and that is deliberate: an address hard-coded into distributed software would become a permanent dependency on whoever controls it. It is provided separately, in a file you can edit. Create q21-data/bootstrap.txt next to the program, add the line bootstrap.q21.dev:21121 to it, then restart. JOIN.md, which ships with the program, explains this step and how to add more entry points.": "Le programme ne contient l'adresse d'aucun serveur, et c'est voulu : une adresse gravée dans un logiciel distribué deviendrait une dépendance permanente envers celui qui la tient. Elle se donne à côté, dans un fichier que vous pouvez modifier. Créez q21-data/bootstrap.txt auprès du programme, écrivez-y la ligne bootstrap.q21.dev:21121, puis relancez. JOIN.md, livré avec le programme, détaille ce geste et la façon d'ajouter d'autres points d'entrée.", "Hide the mining addresses": "Ranger les adresses de minage", "Mining also derives one per block found, for the same reason. Those addresses have already received their reward and need not be handed out: they are tucked away below, and only the ones you requested or named are shown.": "Le minage en dérive aussi une par bloc trouvé, pour la même raison. Ces adresses-là ont déjà reçu leur récompense et n'ont pas besoin d'être distribuées\u00a0: elles sont rangées ci-dessous, et seules celles que vous avez demandées ou nommées sont montrées.", "Wallet": "Portefeuille", "Connecting…": "Connexion…", "Balance": "Solde", "Mine": "Miner", "Receive": "Recevoir", "Send": "Envoyer", "Network": "Réseau", "Activity": "Activité", "Info": "Infos", "Loading…": "Chargement…", "Details": "Détail", "Close": "Fermer", "Back": "Revenir", "All": "Tout", "Received": "Reçu", "Sent": "Envoyé", "Type": "Quoi", "Date": "Date", "Reference": "Référence", "Confirmations": "Confirmations", "Block": "Bloc n°", "Available": "Disponible", "Mining": "Minage", "Chain": "Chaîne", "Your blocks": "Vos blocs", "Your addresses": "Vos adresses", "The network": "Le réseau", "Your security": "Votre sécurité", "Your machine": "Votre machine", "Measuring…": "Mesure en cours…", "Node unreachable": "Nœud injoignable", "Unlock": "Déverrouiller", "New address": "Nouvelle adresse", "Show more": "Afficher les suivantes", "Search your address book": "Chercher dans votre carnet", "+ Add a recipient": "+ Ajouter un destinataire", "Recalculate fee": "Recalculer les frais", "Review": "Vérifier", "Send now": "Envoyer définitivement", "Close the wallet": "Fermer le portefeuille", "Send Q21": "Envoyer du Q21", "Recipient address": "Adresse du destinataire", "Amount (Q21)": "Montant, en Q21", "Fee (Q21)": "Frais, en Q21", "Suggested by the node; you can change it.": "Suggestion du nœud, modifiable.", "Confirm the payment": "Confirmer l'envoi", "A payment is final": "Un envoi est définitif", "Expected inputs, for the fee estimate": "Entrées supposées, pour l'estimation des frais", "The address has a checksum: a typo will be caught by the node, not silently accepted.": "L'adresse porte une somme de contrôle\u00a0: une faute de frappe sera détectée par le nœud, pas subie.", "At most eight decimal places. One unit is 0.00000001 Q21.": "Huit décimales au maximum. Une unité vaut 0.00000001\u00a0Q21.", "No authority can reverse an accepted transaction. Re-read the address character by character: it is the only check you have left.": "Aucune autorité ne peut annuler une transaction acceptée. Relisez l'adresse caractère par caractère\u00a0: c'est la seule vérification qui vous reste.", "One payment can go to several recipients at once: a single transaction with a shared fee, rather than several separate payments.": "Un seul envoi peut payer plusieurs destinataires à la fois\u00a0: c'est une transaction unique, aux frais partagés, plutôt que plusieurs envois séparés.", "Your machine is not mining": "Votre machine ne cherche pas", "Mining searches for the next block. It uses all CPU cores.": "Le minage cherche le prochain bloc. Il utilise tous les cœurs.", "attempts per second": "tentatives par seconde", "Earned by mining": "Gagné en minant", "since launch, including immature rewards": "depuis le lancement — maturité comprise", "Blocks found": "Blocs trouvés", "since launch": "depuis le lancement", "Attempts": "Tentatives", "Chain pace": "Rythme de la chaîne", "target: one block every 2 minutes": "cible : un bloc toutes les 2 minutes", "Memory in use": "Mémoire occupée", "the computation table, in RAM": "la table de calcul, en mémoire vive", "Network hash rate": "Puissance de calcul du réseau", "measured on your machine, live": "mesurée chez vous, en direct", "Computers connected to yours": "Ordinateurs reliés au vôtre", "your direct neighbors, not the whole network": "vos voisins directs, pas le réseau entier", "The backup code is your wallet": "Le code de sauvegarde est votre portefeuille", "The file on this disk is only a working copy.": "Le fichier sur ce disque n'est qu'une copie de travail.", "Two things you must never do": "Deux choses à ne jamais faire", "For developers": "Pour les développeurs", "Chain explorer": "Explorateur de la chaîne", "Access token required": "Jeton d'accès requis", "Catching up on chain history": "Récupération de l'historique de la chaîne", "Why part of the balance is immature": "Pourquoi une part du solde est immature", "Why you have several": "Pourquoi vous en avez plusieurs", "What your machine does when this switch is on": "Ce que fait votre machine quand ce bouton est allumé", "Every payment deserves a fresh address. Reusing one costs the protocol nothing, but publicly links your payments together.": "Chaque paiement mérite une adresse neuve. Réutiliser une adresse ne coûte rien au protocole, mais relie publiquement vos paiements entre eux.", "Testnet — the Q21 mined here have no value, and never will. Research software, not externally audited.": "Réseau d'essai — les Q21 qui s'y minent n'ont aucune valeur, et n'en auront jamais. Logiciel de recherche, non audité de l'extérieur.", "Turn mining on": "Activer le minage", "Turn mining off": "Arrêter le minage", "This node cannot mine": "Ce nœud ne peut pas miner", "Connected": "Connecté", "Shutting down…": "Fermeture…", "Confirm shutdown": "Confirmer la fermeture", "Click again to stop the wallet.": "Cliquez une seconde fois pour arrêter le portefeuille.", "Blocks verified": "Blocs vérifiés", "Latest block": "Dernier bloc", "Recipient": "Destinataire", "Awaiting maturity": "En attente de maturité", "State commitment": "Empreinte de l'état", "Waiting for a computer to ask for the chain": "En attente d'un ordinateur à qui demander la chaîne", "Mining rate over the last few minutes": "Débit de minage des dernières minutes", "It uses all available cores.": "Elle utilise tous les cœurs disponibles.", "No recipient address.": "Aucune adresse de destination.", "Each amount must be greater than zero.": "Chaque montant doit être strictement positif.", "The minimum amount is 0.0001 Q21: below that, the network rejects the output as dust.": "Le montant minimal est 0,0001 Q21 : en dessous, le réseau refuse la sortie comme poussière.", "Each amount must be at least 0.0001 Q21: below that, the network rejects the output as dust.": "Chaque montant doit valoir au moins 0,0001 Q21 : en dessous, le réseau refuse la sortie comme poussière.", "Invalid fee. Expected a number in Q21, with at most eight decimal places.": "Frais illisibles. Attendu : un nombre en Q21, huit décimales au maximum.", "The node requires a token. The launcher normally passes it in the address fragment; if you opened this page manually, enter the token given to": "Le nœud exige un jeton. Il est normalement transmis par le lanceur dans le fragment de l'adresse\u00a0; si vous avez ouvert cette page à la main, saisissez ici le jeton passé à", "If you have just restored a wallet": "Si vous venez de restaurer un portefeuille", ", your funds will reappear at the end of this step: they are in the chain, and your machine has not read them yet. The displayed balance is incomplete until then.": ", vos fonds réapparaîtront à la fin de cette étape\u00a0: ils sont dans la chaîne, et votre machine ne les a pas encore lus. Le solde affiché est incomplet jusque-là.", "A mining reward can only be spent after a long maturity period. Until it has elapsed, the amount exists and belongs to you, but no transaction can spend it. It is counted separately rather than folded into a total that would be wrong.": "Une récompense de minage n'est dépensable qu'après un long délai de maturation. Tant qu'il n'est pas écoulé, la somme existe, elle vous appartient, mais aucune transaction ne peut la dépenser. Elle est comptée séparément plutôt que fondue dans un total qui serait faux.", "It searches a two-gigabyte table in memory, hundreds of thousands of times per second, looking for a value that meets the current difficulty. It is a lottery: you do not win every time, and you win more often the faster you search.": "Elle fouille une table de deux gigaoctets en mémoire, des centaines de milliers de fois par seconde, à la recherche d'une valeur qui satisfasse la difficulté du moment. C'est une loterie\u00a0: on ne gagne pas à tous les coups, on gagne d'autant plus souvent qu'on cherche vite.", "The reward for a block found is paid to an address in this wallet. It can only be spent after the maturity period.": "La récompense d'un bloc trouvé est versée à une adresse de ce portefeuille. Elle n'est dépensable qu'après le délai de maturation.", "Your wallet holds": "Votre portefeuille ne contient", "only one secret": "qu'un seul secret", ": the seed, the one behind the backup code you wrote down. All your addresses are": "\u00a0: la graine, celle du code de sauvegarde que vous avez recopié. Toutes vos adresses en sont", "built": "fabriquées", "from it by computation — the first, the second, the thousandth. This is called": "par un calcul — la première, la deuxième, la millième. C'est ce qu'on appelle les", "derivation": "dériver", "A reassuring consequence:": "Conséquence rassurante\u00a0:", "this code restores everything": "ce code sauve tout", ". No need to back up each address; they can all be recomputed from it.": ". Pas besoin de sauvegarder chaque adresse\u00a0; elles se recalculent toutes à partir de lui.", "A useful consequence: giving a fresh one to each person who pays you costs nothing, and keeps an onlooker from linking all your incoming payments together by reading the chain. Your balance is the sum of them all.": "Conséquence utile\u00a0: en donner une neuve à chaque personne qui vous paie ne coûte rien, et évite qu'un curieux relie tous vos encaissements entre eux en lisant la chaîne. Votre solde est la somme de toutes.", "With ML-DSA-87 the witness makes up almost all of a transaction: the fee depends mostly on the": "Avec ML-DSA-87 le témoin pèse la quasi-totalité d'une transaction\u00a0: les frais dépendent surtout du", "number of inputs": "nombre d'entrées", "consumed, which the node only picks when it builds the transaction. If the payment is rejected because the fee rate is too low, increase this number and recalculate.": "consommées, que le nœud ne choisit qu'au moment de construire la transaction. Si l'envoi est refusé pour taux de frais trop bas, augmentez ce nombre et recalculez.", "Why we don't tell you “how many miners”": "Pourquoi on ne vous dit pas «\u00a0combien de mineurs\u00a0»", "Because nobody can know, and a made-up figure would be worse than no figure at all. A miner does not announce itself: it just produces blocks. Nothing distinguishes a thousand machines from one person who owns a thousand.": "Parce que personne ne peut le savoir, et qu'un chiffre inventé serait pire que pas de chiffre. Un mineur ne s'annonce pas\u00a0: il pose des blocs. Rien ne distingue mille machines d'une personne qui en possède mille.", "And Q21 makes counting even harder, on purpose: your wallet uses": "Et Q21 rend le comptage encore plus impossible, volontairement\u00a0: votre portefeuille utilise", "a different address for each reward": "une adresse différente pour chaque récompense", ", so that your earnings cannot be linked together. Counting miner addresses would amount to counting blocks.": ", pour qu'on ne puisse pas relier vos gains entre eux. Compter les adresses de mineurs reviendrait donc à compter les blocs.", "What can be measured, on the other hand, cannot be faked:": "Ce qui se mesure, en revanche, ne se truque pas\u00a0:", "the work actually spent": "le travail réellement dépensé", ". It can be read from the difficulty, which adjusts so that a block is found every two minutes. Compared with what": ". Il se lit dans la difficulté, qui s'ajuste pour qu'un bloc tombe toutes les deux minutes. Comparé à ce que fait", "your": "votre", "machine does, it gives your share, shown above.": "machine, il donne la part qu'elle représente, indiquée ci-dessus.", "Your entire wallet — every address, all your funds — can be rebuilt from the single backup code you wrote down when you created it.": "Tout votre portefeuille — chaque adresse, chaque fonds — se refabrique à partir du seul code de sauvegarde que vous avez recopié à la création.", "On any machine: Windows, Intel Mac, Apple Silicon Mac, Linux, Raspberry Pi.": "Sur n'importe quelle machine\u00a0: Windows, Mac Intel, Mac Apple Silicon, Linux, Raspberry Pi.", "You enter it there with “I already have a backup code”, and the chain does the rest — verified by a full restore test on all five platforms we build for.": "Vous l'y saisissez via «\u00a0J'ai déjà un code de sauvegarde\u00a0», et la chaîne fait le reste — vérifié par une épreuve de restauration complète, sur les cinq systèmes construits.", "Do not photograph the code, and do not paste it into a cloud service: whoever reads it holds your funds, for good. And do not confuse the code with your": "Ne photographiez pas le code, ne le collez pas dans un nuage\u00a0: qui le lit détient vos fonds, définitivement. Et ne confondez pas le code avec votre", "passphrase": "phrase secrète", "— which only protects the file on": "\u00a0— elle, ne protège que le fichier de", "this": "cette", "machine, and can be different elsewhere.": "machine, et peut être différente ailleurs.", "ML-DSA-87 (FIPS 204, NIST level 5) — why it resists quantum computers": "ML-DSA-87 (FIPS\u00a0204, niveau NIST\u00a05) — pourquoi ça résiste au quantique", "This wallet's signatures rest on ML-DSA, the lattice-based scheme standardized by NIST in 2024 as FIPS 204. Q21 uses the strongest parameter set, ML-DSA-87, whose target security matches level 5 — on the order of AES-256.": "Les signatures de ce portefeuille reposent sur ML-DSA, le schéma à réseaux euclidiens normalisé par le NIST en 2024 sous le nom FIPS\u00a0204. Q21 retient le paramétrage le plus élevé, ML-DSA-87, dont la sécurité visée correspond au niveau\u00a05 — de l'ordre d'AES-256.", "This is what sets the project apart. The ECDSA signatures that protect most chains today fall to Shor's algorithm as soon as a large enough quantum computer exists; these rest on no problem that Shor's algorithm solves. The price shows in the figures above: a 2,592-byte public key and a 4,627-byte signature, where ECDSA needs a few dozen bytes.": "C'est le point qui distingue ce projet. Les signatures ECDSA que protègent aujourd'hui la plupart des chaînes tombent devant l'algorithme de Shor dès qu'une machine quantique suffisante existe\u00a0; celles-ci ne reposent sur aucun problème que Shor résout. Le prix se lit dans les chiffres ci-dessus\u00a0: une clef publique de 2\u00a0592 octets, une signature de 4\u00a0627 octets, là où ECDSA tient en quelques dizaines.", "The core does not implement this scheme itself: writing your own lattice-based signature would be professional malpractice. It plugs in an audited implementation.": "Le noyau n'implémente pas lui-même ce schéma\u00a0: écrire soi-même une signature à réseaux euclidiens est une faute professionnelle. Il branche une implémentation auditée.", "The node serves a JSON-RPC API at": "Le nœud sert une API JSON-RPC sur", "lists the methods. The session access token is sent as": "énumère les méthodes. Le jeton d'accès de la session s'envoie en", "; it never leaves this page. Nothing else is written to the browser except the token and the language choice, both cleared when the tab closes. The explorer and the wallet are served by the same process, on the same port, with no external resource.": "; il ne quitte jamais cette page. Rien d'autre n'est écrit dans le navigateur que lui et le choix de langue, tous deux effacés à la fermeture de l'onglet. L'explorateur et le portefeuille sont servis par le même processus, sur le même port, sans aucune ressource externe.", "This wallet is served by a node running in the window the launcher opened. This button asks it to shut down cleanly: it writes out the mempool, the state snapshot and the wallet, then exits.": "Ce portefeuille est servi par un nœud qui tourne dans la fenêtre ouverte par le lanceur. Ce bouton lui demande de s'arrêter proprement\u00a0: il écrit le réservoir de transactions en attente, l'instantané de l'état et le portefeuille, puis rend la main.", "This is the recommended way to stop. Closing the launcher window also works.": "C'est la façon recommandée d'arrêter. Fermer la fenêtre du lanceur fonctionne aussi.", "works too, but Windows then asks its own question — “Terminate batch job (Y/N)?”: answer": "fonctionne également, mais Windows pose alors sa propre question — «\u00a0Terminer le programme de commandes (O/N)\u00a0?\u00a0»\u00a0: répondez", "; everything has already been saved by then.": ", tout est déjà enregistré à ce moment-là.", "— everything your node has verified, browsable without trusting anyone.": "— tout ce que votre nœud a vérifié, consultable sans faire confiance à personne.", "Copy": "Copier", "copy": "copier", "Save": "Enregistrer", "Name": "Nommer", "Rename": "Renommer", "unnamed": "sans nom", "used": "servie", "Full history": "Historique complet", "Q21 issued to date": "Q21 créés à ce jour", "Signature scheme": "Schéma de signature", "Unspent outputs": "Sommes non dépensées", "Total held": "Total détenu", "available and pending combined": "disponible et en attente réunis", "across the whole chain, all holders combined": "sur toute la chaîne, tous porteurs confondus", "no block since this screen was opened": "aucun bloc depuis le lancement de cet écran", "Mining requires a wallet: without one, the reward would go nowhere.": "Miner demande un portefeuille : sans lui, la récompense n'irait nulle part.", "testnet": "réseau d'essai", "mining": "minage", "attempts/s": "tentatives/s", "Wallet closed": "Portefeuille fermé", "The amount must be greater than zero.": "Le montant doit être strictement positif.", "The fee cannot be negative.": "Les frais ne peuvent pas être négatifs.", "Invalid amount. Expected a number in Q21, with at most eight decimal places.": "Montant illisible. Attendu : un nombre en Q21, huit décimales au maximum.", "An additional amount is invalid. Expected a number in Q21.": "Un montant supplémentaire est illisible. Attendu : un nombre en Q21.", "An additional recipient has no address. Remove the row or fill it in.": "Un destinataire supplémentaire est sans adresse. Retirez la ligne ou remplissez-la.", "the network cannot be measured yet": "le réseau n'est pas encore mesurable", "at this rate, you produce most of the recent blocks": "à ce rythme, vous produisez l'essentiel des blocs récents", "resistant to quantum computers — see below": "résistant à l'ordinateur quantique — voir ci-dessous", "a unique fingerprint of all the money in existence: two nodes at the same height show the same value — your proof that you are on the real chain, without trusting anyone": "une signature unique de tout l'argent qui existe : deux nœuds à la même hauteur l'affichent identique — votre preuve d'être sur la vraie chaîne, sans faire confiance à personne", "incomplete figure, see the warning above": "chiffre incomplet, voir l'avertissement ci-dessus", "turn mining on to see your share": "allumez le minage pour vous situer", "measuring speed": "vitesse en cours de mesure", "time left unknown": "durée inconnue", "stopped": "à l'arrêt", "· no computer reachable": "· aucun ordinateur joignable", "the browser blocked copying": "copie refusée par le navigateur", "copied": "copié", "access token missing or rejected": "jeton d'accès manquant ou refusé", "Your machine is looking for a block": "Votre machine cherche un bloc", "Q21 — wallet": "Q21 — portefeuille", "Wallet sections": "Sections du portefeuille", "access token": "jeton d'accès", "a name, a number (#12) or part of an address": "un nom, un numéro (#12) ou un morceau d'adresse", "Also show the mining addresses": "Afficher aussi les adresses de minage", "When it is on, your wallet asks your router to open its port, and becomes an entry point to the network: others can connect to you. This is what lets the network live without depending on a single server. Most routers open the port on their own.": "Quand il est allumé, votre portefeuille demande à votre box d'ouvrir son accès, et devient un point d'entrée du réseau\u00a0: les autres peuvent se connecter à vous. C'est ce qui permet au réseau de vivre sans dépendre d'un serveur unique. La plupart des box ouvrent l'accès toutes seules.", "In return, your": "En échange, votre", "IP address becomes visible": "adresse internet devient visible", "to other nodes — that is how a peer-to-peer network normally works. If you would rather stay a plain client, turn it off: your wallet works exactly the same, using the nodes that others keep open.": "des autres nœuds — c'est le fonctionnement normal d'un réseau pair-à-pair. Si vous préférez rester un simple client, éteignez\u00a0: votre portefeuille marche exactement pareil, il profite des nœuds ouverts par les autres.", "A change": "Un changement", "takes effect the next time": "prend effet au prochain lancement", "the wallet starts.": "du portefeuille.", "Show only": "Ne montrer que", "who or what it is for — visible only to you": "pour qui, ou pourquoi — visible de vous seul", "Received and sent on the same row": "Reçu et sorti sur une même ligne", "A payment almost never spends a coin of the exact size: the wallet spends a bigger one, and the difference comes back to it as change, on a fresh address, like a bill handed back. The": "Un envoi n'ouvre presque jamais une pièce de la taille exacte\u00a0: le portefeuille en ouvre une plus grosse, et la différence lui revient en monnaie sur une adresse neuve, comme un billet rendu. La colonne", "received": "reçu", "column holds that change; the": "porte cette monnaie, la colonne", "sent": "sorti", "column, what actually left the wallet — amount paid and fee included.": "ce qui a réellement quitté le portefeuille — montant versé et frais compris.", "Amounts sent incomplete": "Sommes sorties incomplètes", "For at least one payment, the coin spent predates the window examined: its value was not found, so the amount sent cannot be established. These amounts are shown preceded by “≥” — a minimum, not a fact.": "Pour au moins un envoi, la pièce ouverte est antérieure à la fenêtre examinée\u00a0: sa valeur n'a pas été retrouvée, et la somme sortie ne peut donc pas être établie. Ces montants s'affichent précédés de «\u00a0≥\u00a0» — un minimum, pas un fait.", "Program version": "Version du programme", "the one you are running — compare it with the version announced in the release": "celle que vous exécutez — à comparer à la version annoncée par la livraison", "Single-use address": "Adresse à usage unique", "Reuse": "Réutilisation", "Scheme": "Schéma", "Requesting…": "Demande en cours…", "Address not created": "Adresse non créée", "Payment not prepared": "Envoi non préparé", "Address of another recipient": "Adresse d'un autre destinataire", "Remove": "Retirer", "Amount": "Montant", "Fee": "Frais", "Total debited": "Débité au total", "Balance after": "Solde après", "✓ Payment sent to the network": "✓ Envoi transmis au réseau", "It has been announced to peers and is waiting to enter a block — expect about two minutes. Until a block contains it, it is": "Il est annoncé aux pairs et attend d'entrer dans un bloc — comptez l'ordre de deux minutes. Tant qu'aucun bloc ne le contient, il n'est", "not confirmed yet": "pas encore confirmé", "Follow this transaction in the explorer": "Suivre cette transaction dans l'explorateur", "Reference:": "Référence :", "Payment rejected": "Envoi refusé", "No funds have moved.": "Aucun fonds n'a bougé.", "Sending…": "Envoi…", "pending": "en attente", "Partial history": "Historique partiel", "Your funds are not lost": "Vos fonds ne sont pas perdus", ": the balance is still correct. Close and reopen the wallet: it will request these blocks from the network again.": ": le solde reste juste. Fermez puis rouvrez le portefeuille\u00a0: il redemandera ces blocs au réseau.", "History unavailable": "Historique indisponible", "No address derived yet. The button above creates one.": "Aucune adresse encore dérivée. Le bouton ci-dessus en crée une.", "Nothing yet. Your first movements will appear here — receive Q21 from the Receive tab, or find a block from the Mine tab.": "Rien pour l'instant. Vos premiers mouvements apparaîtront ici — recevez du Q21 depuis l'onglet Recevoir, ou trouvez un bloc depuis l'onglet Miner.", "mining rewards: they belong to you, but cannot be used yet": "récompenses de minage : elles vous appartiennent, mais ne sont pas encore utilisables", "No block found yet. It is a lottery: the switch above buys attempts, and luck decides when.": "Aucun bloc trouvé pour l'instant. C'est une loterie : le bouton ci-dessus achète des tentatives, la chance décide du moment.", "Not enough blocks yet to measure anything. At least two are needed, spread out in time.": "Pas encore assez de blocs pour mesurer quoi que ce soit. Il en faut au moins deux, séparés dans le temps.", "catching up": "rattrapage en cours", "observed pace — target: 2 minutes": "cadence observée — cible : 2 minutes", "The node has saved its state and stopped. You can close this tab; the black window will close by itself.": "Le nœud a écrit son état et s'est arrêté. Vous pouvez fermer cet onglet ; la fenêtre noire se referme d'elle-même.", "This link has already been used, or has expired. Start the wallet again to get a new one.": "Ce lien a déjà servi, ou a expiré. Relancez le portefeuille pour en obtenir un neuf.", "Could not reach the node: access token missing or rejected": "Impossible d'interroger le nœud : jeton d'accès manquant ou refusé", "Y": "O", "outgoing": "envoi", "incoming": "reception", "No movement of this type in the history searched.": "Aucun mouvement de ce type dans l'historique parcouru.", "Your address": "Votre adresse", "This is what you give to someone who wants to send you Q21 — what is usually called your “wallet address”.": "C'est ce que vous donnez à quelqu'un qui veut vous envoyer des Q21 — ce qu'on appelle couramment votre «\u00a0adresse de portefeuille\u00a0».", "Which address should I give?": "Quelle adresse donner\u00a0?", "The one above. Every address of this wallet stays valid forever: a payment sent to an older one still arrives here, even years later.": "Celle ci-dessus. Toutes les adresses de ce portefeuille restent valables pour toujours\u00a0: un paiement envoyé à une ancienne arrive quand même ici, même des années plus tard.", "To check that a payment has arrived, open the address in the explorer: it shows what it received, even before the next block.": "Pour vérifier qu'un paiement est arrivé, ouvrez l'adresse dans l'explorateur\u00a0: il montre ce qu'elle a reçu, même avant le bloc suivant.", "Copy the address": "Copier l'adresse", "See it in the explorer": "La voir dans l'explorateur", "Explorer": "Explorateur", "The “New address” button below creates one.": "Le bouton «\u00a0Nouvelle adresse\u00a0» ci-dessous en crée une.", "Show older movements": "Afficher les mouvements plus anciens", "INCOMPLETE history: the body of some blocks of the active chain could not be read, and what they contained does not appear here. This is not a loss of funds - the balance itself stays correct. Restart the node: it will request these blocks from the network again.": "Historique INCOMPLET\u00a0: le contenu de certains blocs de la chaîne active n'a pas pu être lu, et ce qu'ils contenaient n'apparaît pas ici. Ce n'est pas une perte de fonds\u00a0: le solde, lui, reste exact. Relancez le nœud\u00a0: il redemandera ces blocs au réseau.", "Full history: the address index covers the whole chain.": "Historique complet\u00a0: l'index d'adresses couvre toute la chaîne.", "Full history: the search went all the way back to genesis.": "Historique complet\u00a0: la recherche est remontée jusqu'au bloc de genèse.", "Partial history. This node has no index by address: the search stops at the height shown.": "Historique partiel. Ce nœud n'a pas d'index d'adresses\u00a0: la recherche s'arrête à la hauteur indiquée.", "Your wallet is a hidden node": "Votre portefeuille est un nœud caché", "Others reach it through Tor, at an onion address of its own: your IP address stays hidden, and your router is not touched.": "Les autres le joignent par Tor, à une adresse onion qui lui est propre\u00a0: votre adresse IP reste cachée, et votre box n'est pas touchée.", "Its onion address is published: the network can reach it.": "Son adresse onion est publiée\u00a0: le réseau peut le joindre.", "Tor is preparing its onion address.": "Tor prépare son adresse onion.", "Gather my small coins": "Regrouper mes petites pièces", "One transaction gathers up to a hundred of your smallest coins into a single one, paid to yourself. After the next block, send again; if the amount still needs too many coins, gather once more.": "Une transaction regroupe jusqu'à cent de vos plus petites pièces en une seule, payée à vous-même. Après le prochain bloc, renvoyez le paiement\u00a0; si le montant demande encore trop de pièces, regroupez une fois de plus.", "Gathering…": "Regroupement…", "Wait for the next block — about two minutes — then send your payment again.": "Attendez le prochain bloc — environ deux minutes — puis renvoyez votre paiement.", "The coins could not be gathered: ": "Les pièces n'ont pas pu être regroupées\u00a0: ", "Channels": "Canaux", "Payment channels": "Canaux de paiement", "Peer": "Pair", "Capacity": "Capacité", "My balance": "Mon solde", "Arriving": "En arrivée", "Peer's balance": "Solde du pair", "is yours for good: the peer can no longer take it back.": "vous appartient définitivement\u00a0: le pair ne peut plus le reprendre.", "has been paid to you and becomes yours for good as soon as the peer confirms it, usually within a second.": "vous a été payé, et vous appartient définitivement dès que le pair le confirme, en général en moins d'une seconde.", "Open a channel": "Ouvrir un canal", "Capacity (Q21)": "Capacité, en Q21", "Confirm the channel": "Confirmer le canal", "Funds locked in the channel": "Des fonds bloqués dans le canal", "The capacity leaves your available balance while the channel is open. You pay the peer from it, and what remains comes back to you when the channel closes.": "La capacité quitte votre solde disponible tant que le canal est ouvert. Vous payez le pair sur cette somme, et ce qui reste vous revient à la fermeture du canal.", "Open the channel": "Ouvrir le canal", "What is a payment channel?": "Qu'est-ce qu'un canal de paiement\u00a0?", "A channel sets part of your balance aside with one peer, in a single transaction on the chain. The two of you can then pay each other back and forth instantly and without fees; only the final balances go back to the chain when the channel closes.": "Un canal met de côté une partie de votre solde avec un seul pair, en une seule transaction sur la chaîne. Vous pouvez ensuite vous payer l'un l'autre, dans les deux sens, instantanément et sans frais\u00a0; seuls les soldes finaux reviennent sur la chaîne à la fermeture du canal.", "opening": "ouverture en cours", "waiting for confirmations": "en attente de confirmations", "open": "ouvert", "closing": "fermeture en cours", "funds returning after a delay": "fonds en retour après un délai", "closed: the peer cheated and lost its share": "fermé\u00a0: le pair a triché et perdu sa part", "closed": "fermé", "payment settling": "paiement en cours", "not connected": "non connecté", "Pay": "Payer", "No channel yet. Open one below, with a peer that accepts channels.": "Aucun canal pour l'instant. Ouvrez-en un ci-dessous, avec un pair qui accepte les canaux.", "The wallet is shutting down: nothing new leaves it. Try again once it has restarted.": "Le portefeuille est en cours de fermeture\u00a0: plus rien de nouveau n'en sort. Réessayez une fois qu'il aura redémarré.", "Payment channels are not active on this network yet.": "Les canaux de paiement ne sont pas encore actifs sur ce réseau.", "This node does not run payment channels.": "Ce nœud ne fait pas fonctionner de canaux de paiement.", "A payment is already in flight in this channel. Wait a few seconds for it to settle, then pay again.": "Un paiement est déjà en cours dans ce canal. Attendez quelques secondes qu'il aboutisse, puis payez de nouveau.", "Your balance in this channel is too low for this amount.": "Votre solde dans ce canal est trop bas pour ce montant.", "Your available balance is too low for this channel and its funding fee.": "Votre solde disponible est trop bas pour ce canal et ses frais d'ouverture.", "This channel is reconnecting to its peer. Try again in a few seconds.": "Ce canal se reconnecte à son pair. Réessayez dans quelques secondes.", "The peer is offline. Wait for it to reconnect, then try again.": "Le pair est hors connexion. Attendez qu'il se reconnecte, puis réessayez.", "This channel is not open: it can no longer carry payments.": "Ce canal n'est pas ouvert\u00a0: il ne peut plus transporter de paiements.", "The node already has as many channels in progress as it allows. Wait for one to open, or close one.": "Le nœud a déjà autant de canaux en cours qu'il en accepte. Attendez qu'un canal s'ouvre, ou fermez-en un.", "This channel no longer exists on the node.": "Ce canal n'existe plus sur le nœud.", "Could not reach the node. Is the wallet still running?": "Impossible de joindre le nœud. Le portefeuille tourne-t-il encore\u00a0?", "Payment channels are not active yet": "Les canaux de paiement ne sont pas encore actifs", "No activation block has been set for this network yet.": "Aucun bloc d'activation n'a encore été fixé pour ce réseau.", "Nothing to do until then: this tab offers channels by itself once they are active.": "Rien à faire d'ici là\u00a0: cet onglet proposera les canaux de lui-même dès qu'ils seront actifs.", "If the peer disappears, your funds stay recoverable: closing without it returns them after a delay.": "Si le pair disparaît, vos fonds restent récupérables\u00a0: une fermeture sans lui vous les rend après un délai.", "Only connected peers whose node runs channels are listed: the address, then the start of the node's id.": "Seuls les pairs connectés dont le nœud fait fonctionner les canaux sont proposés\u00a0: l'adresse, puis le début de l'identifiant du nœud.", "No connected peer accepts channels right now. One shows up here as soon as it connects.": "Aucun pair connecté n'accepte les canaux pour l'instant. Il apparaîtra ici dès qu'il se connectera.", "Channels unavailable": "Canaux indisponibles", "Channel not prepared": "Canal non préparé", "Choose a peer that accepts channels.": "Choisissez un pair qui accepte les canaux.", "Invalid capacity. Expected a number in Q21, with at most eight decimal places.": "Capacité illisible. Attendu\u00a0: un nombre en Q21, huit décimales au maximum.", "The capacity must be greater than zero.": "La capacité doit être strictement positive.", "Funding fee, on the chain": "Frais d'ouverture, sur la chaîne", "Locked in the channel": "Bloqué dans le canal", "Opening…": "Ouverture…", "✓ Opening requested": "✓ Ouverture demandée", "Channel not opened": "Canal non ouvert", "The peer is offline": "Le pair est hors connexion", "A closing agreed with the peer needs it online. If it is gone for good, the channel can be closed without it.": "Une fermeture convenue avec le pair exige qu'il soit en ligne. S'il a disparu pour de bon, le canal peut être fermé sans lui.", "Close without the peer…": "Fermer sans le pair…", "Pay in a channel": "Payer dans un canal", "A channel payment is final": "Un paiement dans un canal est définitif", "It reaches the peer at once, with no fee, and cannot be taken back once settled. Re-read the amount: it is the only check you have left.": "Il parvient au pair aussitôt, sans frais, et ne peut plus être repris une fois réglé. Relisez le montant\u00a0: c'est la seule vérification qu'il vous reste.", "Left in the channel": "Reste dans le canal", "Pay now": "Payer définitivement", "Closing fee": "Frais de fermeture", "Your balance in the channel": "Votre solde dans le canal", "Close the channel": "Fermer le canal", "Closing ends the channel": "Fermer met fin au canal", "Both balances go back to the chain in one transaction agreed with the peer. Your share joins your available balance once a block confirms it, about two minutes later: a closing agreed with the peer has no delay.": "Les deux soldes reviennent sur la chaîne en une transaction convenue avec le pair. Votre part rejoint votre solde disponible dès qu'un bloc la confirme, environ deux minutes plus tard\u00a0: une fermeture convenue avec le pair n'a pas de délai.", "Close now": "Fermer maintenant", "Close without the peer": "Fermer sans le pair", "Use this only if the peer is gone": "À n'utiliser que si le pair a disparu", "Your node puts the latest state of the channel on the chain by itself. The peer's share goes back to it; yours comes back once the delay has passed.": "Votre nœud publie seul sur la chaîne le dernier état du canal. La part du pair lui revient\u00a0; la vôtre revient une fois le délai écoulé.", "A closing agreed with the peer is faster: if it may come back, wait for it.": "Une fermeture convenue avec le pair est plus rapide\u00a0: s'il peut revenir, attendez-le.", "Paying…": "Paiement…", "✓ Payment settled": "✓ Paiement réglé", "It reached the peer at once, and can no longer be undone.": "Il est parvenu au pair aussitôt, et ne peut plus être annulé.", "Payment pending": "Paiement en attente", "The peer went offline during the payment. It completes on its own when the peer reconnects.": "Le pair s'est déconnecté pendant le paiement. Il aboutira de lui-même quand le pair se reconnectera.", "The peer has not confirmed it yet. It completes on its own, even after a reconnection: the balances above show it once it does.": "Le pair ne l'a pas encore confirmé. Il aboutira de lui-même, même après une reconnexion\u00a0: les soldes ci-dessus le montreront alors.", "Closing…": "Fermeture…", "Your node has put the latest state on the chain. The list above shows “funds returning after a delay” until your share is back in your wallet.": "Votre nœud a publié le dernier état sur la chaîne. La liste ci-dessus indique «\u00a0fonds en retour après un délai\u00a0» jusqu'à ce que votre part soit revenue dans votre portefeuille.", "The peer has the closing to sign. The closing transaction then waits for a block, and the list above shows the channel closed.": "Le pair a la fermeture à signer. La transaction de fermeture attend ensuite un bloc, puis la liste ci-dessus montre le canal fermé.", "The peer went offline during the closing. It completes on its own when the peer reconnects.": "Le pair s'est déconnecté pendant la fermeture. Elle aboutira d'elle-même quand le pair se reconnectera.", "✓ Closing requested": "✓ Fermeture demandée", "Payment not made": "Paiement non effectué", "Channel not closed": "Canal non fermé", "Channel": "Canal"}, "ja": {"Every connection goes through Tor": "すべての接続がTorを経由します", "Connections go out directly": "接続は直接行われます", "The nodes you reach see a Tor relay, not your address.": "接続先のノードに見えるのはTorのリレーで、あなたのアドレスではありません。", "The nodes you connect to see your IP address (or your VPN's).": "接続先のノードにはあなたのIPアドレス（またはVPNのアドレス）が見えます。", "Stop using Tor": "Torの使用をやめる", "Use Tor": "Torを使う", "Hide your address with Tor": "Torでアドレスを隠す", "Tor comes with the wallet: there is nothing to install. The wallet starts it when it needs it, and stops it when it closes.": "Torはウォレットに同梱されています。インストールは不要です。ウォレットが必要なときに起動し、終了時に停止します。", "A copy without Tor of its own (Raspberry Pi, Linux on ARM) uses a Tor already running on this computer: the Tor service, or Tor Browser left open.": "Torが同梱されていない版（Raspberry Pi、ARM版Linux）は、このコンピュータで動作中のTor（Torサービス、または開いたままのTor Browser）を使います。", "Tor is on, but no connection has gone through it yet: Tor is still connecting, or this network blocks it.": "Torは有効ですが、まだTor経由の接続がありません。Torが接続中か、このネットワークがTorを遮断しています。", "If Tor cannot start, the wallet does not connect in the clear: it waits for Tor.": "Torを起動できない場合、ウォレットは暗号化されていない直接接続を行わず、Torを待ちます。", "With the Tor that comes with the wallet, being reachable makes it a hidden node: Tor gives it an onion address of its own, the network reaches it there, and nobody learns where it is. The wallet never opens your router. With another Tor, an onion service has to be set up by hand (see the guide).": "ウォレットに同梱のTorでは、接続を受け付けるとこのウォレットは隠しノードになります。Torが専用のオニオンアドレスを与え、ネットワークはそこから接続し、場所は誰にも分かりません。ルーターのポートは開きません。別のTorを使う場合、オニオンサービスは手動で設定します（ガイド参照）。", "Tor will be used the next time the wallet starts.": "次回ウォレット起動時からTorを使用します。", "Tor will no longer be used the next time the wallet starts.": "次回ウォレット起動時からTorを使用しなくなります。", "Tor is on, but no connection could be made through it: is Tor (or Tor Browser) running?": "Torは有効ですが、Tor経由の接続ができませんでした。Tor（またはTor Browser）は起動していますか？", "This wallet mines and is reachable: your IP address is public, and the blocks you find leave from it first. Anyone watching the network can link your address to your rewards. To mine privately, make this node client-only.": "このウォレットはマイニング中で、外部から接続可能です。あなたのIPアドレスは公開され、見つけたブロックは最初にそこから送信されます。ネットワークを観察する人は、あなたのアドレスと報酬を結び付けることができます。目立たずにマイニングするには、クライアント専用に戻してください。", "Do not combine it with mining on a home connection: the blocks you find would leave from your address first, and could be linked to your rewards.": "自宅の回線でマイニングと併用しないでください。見つけたブロックが最初にあなたのアドレスから送信され、報酬と結び付けられる可能性があります。", "Your router did not open the port: your wallet stays a client.": "ルーターはポートを開きませんでした。ウォレットはクライアントのままです。", "Your router opened the port (NAT-PMP).": "ルーターがポートを開きました（NAT-PMP）。", "Your router opened the port (UPnP).": "ルーターがポートを開きました（UPnP）。", "Your router opened the port.": "ルーターがポートを開きました。", "It is off by default: turn it on only if you accept that other nodes see your address.": "初期設定ではオフです。他のノードにあなたのアドレスが見えることを受け入れる場合にのみオンにしてください。", "Syncing": "同期中", "Offline": "オフライン", "Your wallet helps the network": "あなたのウォレットはネットワークを支えています", "Your wallet is client-only": "あなたのウォレットは単なるクライアントです", "It accepts connections from others, so the network does not rely on a single machine.": "他のノードからの接続を受け入れ、ネットワークが一台のマシンに依存しないようにします。", "It reaches out to the network but does not accept incoming connections.": "ネットワークへは接続しますが、着信接続は受け付けません。", "Make this node reachable": "このノードを到達可能にする", "Stop being reachable": "到達可能をやめる", "What this setting does": "この設定の働き", "Your node will be reachable the next time the wallet starts.": "次回ウォレットを起動したときにノードは到達可能になります。", "Your node will be client-only the next time the wallet starts.": "次回ウォレットを起動したときにノードは単なるクライアントになります。", "No bootstrap address: this node is not looking for anyone": "開始アドレスがありません：このノードは誰も探していません", "The program contains no server address, and that is deliberate: an address hard-coded into distributed software would become a permanent dependency on whoever controls it. It is provided separately, in a file you can edit. Create q21-data/bootstrap.txt next to the program, add the line bootstrap.q21.dev:21121 to it, then restart. JOIN.md, which ships with the program, explains this step and how to add more entry points.": "プログラムにはサーバーのアドレスが含まれていません。これは意図的です：配布されるソフトウェアに刻まれたアドレスは、それを保持する者への恒久的な依存になります。アドレスは隣に置かれた、編集可能なファイルで与えます。プログラムの隣に q21-data/bootstrap.txt を作成し、bootstrap.q21.dev:21121 の行を書いてから、再起動してください。プログラムに同梱の JOIN.md（英語）に、この手順と他の入口の追加方法が書かれています。", "Hide the mining addresses": "マイニング用アドレスを畳む", "Mining also derives one per block found, for the same reason. Those addresses have already received their reward and need not be handed out: they are tucked away below, and only the ones you requested or named are shown.": "マイニングも同じ理由で、発見したブロックごとにアドレスを 1 つ導出します。それらはすでに報酬を受け取っており、誰かに渡す必要はありません。下に畳まれており、あなたが要求または命名したものだけが表示されます。", "Wallet": "ウォレット", "Connecting…": "接続中…", "Balance": "残高", "Mine": "マイニング", "Receive": "受け取る", "Send": "送る", "Network": "ネットワーク", "Activity": "履歴", "Info": "情報", "Loading…": "読み込み中…", "Details": "詳細", "Close": "閉じる", "Back": "戻る", "All": "すべて", "Received": "受取", "Sent": "送金", "Type": "種別", "Date": "日付", "Reference": "参照", "Confirmations": "承認数", "Block": "ブロック番号", "Available": "利用可能", "Mining": "マイニング", "Chain": "チェーン", "Your blocks": "あなたのブロック", "Your addresses": "あなたのアドレス", "The network": "ネットワーク", "Your security": "セキュリティ", "Your machine": "あなたのマシン", "Measuring…": "測定中…", "Node unreachable": "ノードに接続できません", "Unlock": "ロック解除", "New address": "新しいアドレス", "Show more": "さらに表示", "Search your address book": "アドレス帳を検索", "+ Add a recipient": "+ 宛先を追加", "Recalculate fee": "手数料を再計算", "Review": "確認", "Send now": "確定して送る", "Close the wallet": "ウォレットを終了", "Send Q21": "Q21 を送る", "Recipient address": "宛先アドレス", "Amount (Q21)": "金額 (Q21)", "Fee (Q21)": "手数料 (Q21)", "Suggested by the node; you can change it.": "ノードの提案値です。変更できます。", "Confirm the payment": "送金の確認", "A payment is final": "送金は取り消せません", "Expected inputs, for the fee estimate": "手数料見積り用の入力数", "The address has a checksum: a typo will be caught by the node, not silently accepted.": "アドレスにはチェックサムがあります。打ち間違いはノードが検出します。", "At most eight decimal places. One unit is 0.00000001 Q21.": "小数点以下は最大 8 桁。1 単位は 0.00000001 Q21 です。", "No authority can reverse an accepted transaction. Re-read the address character by character: it is the only check you have left.": "承認された取引を取り消せる権威は存在しません。アドレスを一文字ずつ読み直してください。それが最後の確認です。", "One payment can go to several recipients at once: a single transaction with a shared fee, rather than several separate payments.": "一度の送金で複数の宛先に支払えます。手数料を分け合う単一の取引になります。", "Your machine is not mining": "マシンは探索していません", "Mining searches for the next block. It uses all CPU cores.": "マイニングは次のブロックを探します。全コアを使います。", "attempts per second": "秒あたりの試行", "Earned by mining": "マイニング報酬", "since launch, including immature rewards": "起動以降 — 成熟待ちを含む", "Blocks found": "発見ブロック", "since launch": "起動以降", "Attempts": "試行回数", "Chain pace": "チェーンの速度", "target: one block every 2 minutes": "目標: 2 分に 1 ブロック", "Memory in use": "使用メモリ", "the computation table, in RAM": "計算テーブル (RAM 上)", "Network hash rate": "ネットワークの計算力", "measured on your machine, live": "あなたのマシンでの実測値", "Computers connected to yours": "接続中のコンピュータ", "your direct neighbors, not the whole network": "直接の隣接ノードのみ", "The backup code is your wallet": "バックアップコードがあなたのウォレットです", "The file on this disk is only a working copy.": "このディスク上のファイルは作業用の複製にすぎません。", "Two things you must never do": "絶対にしてはいけない二つのこと", "For developers": "開発者向け", "Chain explorer": "チェーンエクスプローラ", "Access token required": "アクセストークンが必要です", "Catching up on chain history": "チェーン履歴を取得中", "Why part of the balance is immature": "残高の一部が未成熟な理由", "Why you have several": "複数ある理由", "What your machine does when this switch is on": "このスイッチが入っているとき、マシンは何をするか", "Every payment deserves a fresh address. Reusing one costs the protocol nothing, but publicly links your payments together.": "支払いごとに新しいアドレスを。再利用はプロトコル上は無料ですが、支払い同士が公に結び付きます。", "Testnet — the Q21 mined here have no value, and never will. Research software, not externally audited.": "テストネット — ここで採掘される Q21 に価値はなく、今後もありません。外部監査を受けていない研究用ソフトウェアです。", "Turn mining on": "マイニングを開始", "Turn mining off": "マイニングを停止", "This node cannot mine": "このノードはマイニングできません", "Connected": "接続済み", "Shutting down…": "終了中…", "Confirm shutdown": "終了の確認", "Click again to stop the wallet.": "もう一度クリックするとウォレットを停止します。", "Blocks verified": "検証済みブロック", "Latest block": "最新ブロック", "Recipient": "宛先", "Awaiting maturity": "成熟待ち", "State commitment": "状態フィンガープリント", "Waiting for a computer to ask for the chain": "チェーンを要求する相手を待っています", "Mining rate over the last few minutes": "直近数分のマイニング速度", "It uses all available cores.": "利用可能な全コアを使用します。", "No recipient address.": "宛先アドレスがありません。", "Each amount must be greater than zero.": "金額は必ず正の値である必要があります。", "The minimum amount is 0.0001 Q21: below that, the network rejects the output as dust.": "最小金額は 0.0001 Q21 です。それ未満の出力はダストとしてネットワークに拒否されます。", "Each amount must be at least 0.0001 Q21: below that, the network rejects the output as dust.": "各金額は 0.0001 Q21 以上である必要があります。それ未満の出力はダストとしてネットワークに拒否されます。", "Invalid fee. Expected a number in Q21, with at most eight decimal places.": "手数料を解釈できません。Q21 の数値 (小数点以下 8 桁まで) を入力してください。", "The node requires a token. The launcher normally passes it in the address fragment; if you opened this page manually, enter the token given to": "ノードはトークンを要求します。通常はランチャーがアドレスのフラグメントで渡します。このページを手動で開いた場合は、次に渡したトークンをここに入力してください:", "If you have just restored a wallet": "ウォレットを復元した直後の場合", ", your funds will reappear at the end of this step: they are in the chain, and your machine has not read them yet. The displayed balance is incomplete until then.": "、資金はこの工程の終わりに再表示されます。資金はチェーン上にあり、あなたのマシンがまだ読み終えていないだけです。それまで表示残高は不完全です。", "A mining reward can only be spent after a long maturity period. Until it has elapsed, the amount exists and belongs to you, but no transaction can spend it. It is counted separately rather than folded into a total that would be wrong.": "マイニング報酬は長い成熟期間を経てはじめて使用できます。期間が終わるまで、その金額は存在しあなたのものですが、どの取引でも使えません。誤った合計に紛れ込ませず、別枠で数えています。", "It searches a two-gigabyte table in memory, hundreds of thousands of times per second, looking for a value that meets the current difficulty. It is a lottery: you do not win every time, and you win more often the faster you search.": "メモリ上の 2 ギガバイトのテーブルを毎秒何十万回も探索し、その時点の難易度を満たす値を探します。これは宝くじです。毎回当たるわけではなく、速く探すほど当たりやすくなります。", "The reward for a block found is paid to an address in this wallet. It can only be spent after the maturity period.": "発見したブロックの報酬は、このウォレットのアドレスに支払われます。成熟期間の経過後にのみ使用できます。", "Your wallet holds": "あなたのウォレットが持つ秘密は", "only one secret": "ただ一つだけです", ": the seed, the one behind the backup code you wrote down. All your addresses are": ": 書き写したバックアップコードのもとになる種です。すべてのアドレスは計算によって", "built": "作られます", "from it by computation — the first, the second, the thousandth. This is called": "— 1 番目も 2 番目も 1000 番目も。これを", "derivation": "導出という", "A reassuring consequence:": "安心できる帰結:", "this code restores everything": "このコードがすべてを救う", ". No need to back up each address; they can all be recomputed from it.": "。個々のアドレスを保存する必要はありません。すべてそこから再計算されます。", "A useful consequence: giving a fresh one to each person who pays you costs nothing, and keeps an onlooker from linking all your incoming payments together by reading the chain. Your balance is the sum of them all.": "実用的な帰結: 支払う人ごとに新しいアドレスを渡しても費用はかからず、チェーンを読む者があなたの入金を結び付けることを防げます。残高はそれらすべての合計です。", "With ML-DSA-87 the witness makes up almost all of a transaction: the fee depends mostly on the": "ML-DSA-87 では証人データが取引のほぼ全体を占めます。手数料は主に消費される", "number of inputs": "入力の数", "consumed, which the node only picks when it builds the transaction. If the payment is rejected because the fee rate is too low, increase this number and recalculate.": "に依存し、ノードは取引を組み立てる時にはじめてそれを決めます。手数料率が低すぎて送金が拒否された場合は、この数を増やして再計算してください。", "Why we don't tell you “how many miners”": "「マイナーの数」をお伝えしない理由", "Because nobody can know, and a made-up figure would be worse than no figure at all. A miner does not announce itself: it just produces blocks. Nothing distinguishes a thousand machines from one person who owns a thousand.": "誰にも知りようがなく、でっち上げた数字は数字がないより悪いからです。マイナーは名乗らず、ただブロックを置きます。千台のマシンと、千台を所有する一人とを区別する手立てはありません。", "And Q21 makes counting even harder, on purpose: your wallet uses": "さらに Q21 は意図的に集計を不可能にしています。ウォレットは報酬ごとに", "a different address for each reward": "異なるアドレスを使います", ", so that your earnings cannot be linked together. Counting miner addresses would amount to counting blocks.": "。そのため収益同士を結び付けられません。マイナーのアドレスを数えることは、ブロックを数えることと同じになります。", "What can be measured, on the other hand, cannot be faked:": "一方、測定できるものは偽装できません:", "the work actually spent": "実際に費やされた仕事量", ". It can be read from the difficulty, which adjusts so that a block is found every two minutes. Compared with what": "。これは 2 分に 1 ブロックとなるよう調整される難易度から読み取れます。それを", "your": "あなたの", "machine does, it gives your share, shown above.": "マシンと比べると、その占める割合（上に表示）になります。", "Your entire wallet — every address, all your funds — can be rebuilt from the single backup code you wrote down when you created it.": "ウォレット全体 — すべてのアドレス、すべての資金 — は、作成時に書き写した唯一のバックアップコードから復元されます。", "On any machine: Windows, Intel Mac, Apple Silicon Mac, Linux, Raspberry Pi.": "どのマシンでも: Windows、Intel Mac、Apple Silicon Mac、Linux、Raspberry Pi。", "You enter it there with “I already have a backup code”, and the chain does the rest — verified by a full restore test on all five platforms we build for.": "「バックアップコードを持っています」から入力すれば、あとはチェーンが行います — 構築される 5 つのシステムすべてで、完全な復元テストにより検証済みです。", "Do not photograph the code, and do not paste it into a cloud service: whoever reads it holds your funds, for good. And do not confuse the code with your": "コードを撮影せず、クラウドに貼り付けないでください。読んだ者が資金を永久に手にします。また、このコードを", "passphrase": "パスフレーズ", "— which only protects the file on": "と混同しないでください。パスフレーズが守るのは", "this": "この", "machine, and can be different elsewhere.": "マシンのファイルだけで、他の場所では異なる場合があります。", "ML-DSA-87 (FIPS 204, NIST level 5) — why it resists quantum computers": "ML-DSA-87 (FIPS 204、NIST レベル 5) — 量子計算に耐える理由", "This wallet's signatures rest on ML-DSA, the lattice-based scheme standardized by NIST in 2024 as FIPS 204. Q21 uses the strongest parameter set, ML-DSA-87, whose target security matches level 5 — on the order of AES-256.": "このウォレットの署名は、NIST が 2024 年に FIPS 204 として標準化した格子ベース方式 ML-DSA に基づきます。Q21 は最上位のパラメータ ML-DSA-87 を採用し、目標とする安全性はレベル 5 — AES-256 に相当します。", "This is what sets the project apart. The ECDSA signatures that protect most chains today fall to Shor's algorithm as soon as a large enough quantum computer exists; these rest on no problem that Shor's algorithm solves. The price shows in the figures above: a 2,592-byte public key and a 4,627-byte signature, where ECDSA needs a few dozen bytes.": "これがこのプロジェクトを際立たせる点です。今日ほとんどのチェーンを守る ECDSA 署名は、十分な量子計算機が現れれば Shor のアルゴリズムに屈します。こちらは Shor が解ける問題に依存していません。その代償は上の数字に表れます: 公開鍵 2,592 バイト、署名 4,627 バイト。ECDSA なら数十バイトです。", "The core does not implement this scheme itself: writing your own lattice-based signature would be professional malpractice. It plugs in an audited implementation.": "コア自身はこの方式を実装しません。格子署名を自作することは専門家として許されない過ちです。監査済みの実装を組み込んでいます。", "The node serves a JSON-RPC API at": "ノードは次の場所で JSON-RPC API を提供します:", "lists the methods. The session access token is sent as": "がメソッドを列挙します。セッションのアクセストークンは次の形式で送ります:", "; it never leaves this page. Nothing else is written to the browser except the token and the language choice, both cleared when the tab closes. The explorer and the wallet are served by the same process, on the same port, with no external resource.": "。これはこのページから外に出ません。ブラウザに書き込まれるのはこれと言語の選択だけで、どちらもタブを閉じると消えます。エクスプローラとウォレットは同一プロセス・同一ポートで提供され、外部リソースは一切使いません。", "This wallet is served by a node running in the window the launcher opened. This button asks it to shut down cleanly: it writes out the mempool, the state snapshot and the wallet, then exits.": "このウォレットは、ランチャーが開いたウィンドウで動くノードが提供しています。このボタンはノードに正常終了を求めます: 保留中の取引プール、状態のスナップショット、ウォレットを書き出してから制御を返します。", "This is the recommended way to stop. Closing the launcher window also works.": "これが推奨される停止方法です。ランチャーのウィンドウを閉じても構いません。", "works too, but Windows then asks its own question — “Terminate batch job (Y/N)?”: answer": "も使えますが、その場合 Windows が独自の確認 —「バッチ ジョブを終了しますか (Y/N)?」— を出します。次のように答えてください:", "; everything has already been saved by then.": "。その時点ですべて保存済みです。", "— everything your node has verified, browsable without trusting anyone.": "— あなたのノードが検証したすべてを、誰も信頼することなく閲覧できます。", "Copy": "コピー", "copy": "コピー", "Save": "保存", "Name": "名前を付ける", "Rename": "名前を変更", "unnamed": "名前なし", "used": "使用済み", "Full history": "完全な履歴", "Q21 issued to date": "これまでに発行された Q21", "Signature scheme": "署名方式", "Unspent outputs": "未使用額", "Total held": "保有総額", "available and pending combined": "利用可能分と待機分の合計", "across the whole chain, all holders combined": "チェーン全体、全保有者の合計", "no block since this screen was opened": "この画面を開いてからブロックはありません", "Mining requires a wallet: without one, the reward would go nowhere.": "マイニングにはウォレットが必要です。ないと報酬の宛先がありません。", "testnet": "テストネット", "mining": "マイニング", "attempts/s": "回試行/秒", "Wallet closed": "ウォレットを終了しました", "The amount must be greater than zero.": "金額は正の値である必要があります。", "The fee cannot be negative.": "手数料を負の値にはできません。", "Invalid amount. Expected a number in Q21, with at most eight decimal places.": "金額を解釈できません。Q21 の数値 (小数点以下 8 桁まで) を入力してください。", "An additional amount is invalid. Expected a number in Q21.": "追加の金額を解釈できません。Q21 の数値を入力してください。", "An additional recipient has no address. Remove the row or fill it in.": "追加の宛先にアドレスがありません。行を削除するか入力してください。", "the network cannot be measured yet": "ネットワークはまだ測定できません", "at this rate, you produce most of the recent blocks": "このペースでは、最近のブロックの大半をあなたが生成しています", "resistant to quantum computers — see below": "量子コンピュータに耐性 — 下記を参照", "a unique fingerprint of all the money in existence: two nodes at the same height show the same value — your proof that you are on the real chain, without trusting anyone": "存在するすべての通貨の一意な署名。同じ高さの二つのノードは同一の値を示します — 誰も信用せずに本物のチェーン上にいるという証拠です", "incomplete figure, see the warning above": "不完全な数値です。上の警告を参照してください", "turn mining on to see your share": "自分の位置を知るにはマイニングを開始してください", "measuring speed": "速度を測定中", "time left unknown": "所要時間は不明", "stopped": "停止中", "· no computer reachable": "· 接続可能なコンピュータなし", "the browser blocked copying": "ブラウザがコピーを拒否しました", "copied": "コピーしました", "access token missing or rejected": "アクセストークンがないか拒否されました", "Your machine is looking for a block": "マシンがブロックを探しています", "Q21 — wallet": "Q21 — ウォレット", "access token": "アクセストークン", "Fee": "手数料", "pending": "保留中", "Not enough blocks yet to measure anything. At least two are needed, spread out in time.": "測定に足るブロックがまだありません。時間を空けた 2 つ以上が必要です。", "The node has saved its state and stopped. You can close this tab; the black window will close by itself.": "ノードは状態を書き出して停止しました。このタブを閉じて構いません。黒いウィンドウは自動的に閉じます。", "This link has already been used, or has expired. Start the wallet again to get a new one.": "このリンクはすでに使用済みか、期限切れです。ウォレットを再起動して新しいリンクを取得してください。", "Could not reach the node: access token missing or rejected": "ノードに問い合わせできません: アクセストークンがないか拒否されました", "No movement of this type in the history searched.": "検索した履歴に、この種類の入出金はありません。", "Your address": "あなたのアドレス", "This is what you give to someone who wants to send you Q21 — what is usually called your “wallet address”.": "Q21 を送ってもらうときに相手に伝えるのがこれです。一般に「ウォレットのアドレス」と呼ばれるものです。", "Which address should I give?": "どのアドレスを伝えればよいですか?", "The one above. Every address of this wallet stays valid forever: a payment sent to an older one still arrives here, even years later.": "上に表示されているものです。このウォレットのアドレスはすべて永久に有効です。古いアドレスに送られた支払いも、何年後であってもここに届きます。", "To check that a payment has arrived, open the address in the explorer: it shows what it received, even before the next block.": "支払いが届いたか確かめるには、エクスプローラーでアドレスを開いてください。次のブロックを待たずに、受け取った内容が表示されます。", "Copy the address": "アドレスをコピー", "See it in the explorer": "エクスプローラーで見る", "Explorer": "エクスプローラー", "The “New address” button below creates one.": "下の「新しいアドレス」ボタンで作成できます。", "Show older movements": "それ以前の入出金を表示", "INCOMPLETE history: the body of some blocks of the active chain could not be read, and what they contained does not appear here. This is not a loss of funds - the balance itself stays correct. Restart the node: it will request these blocks from the network again.": "履歴が不完全です:アクティブなチェーンの一部のブロック本体を読み取れなかったため、その内容はここに表示されていません。資金が失われたわけではなく、残高自体は正確です。ノードを再起動すると、これらのブロックをネットワークから再取得します。", "Full history: the address index covers the whole chain.": "完全な履歴:アドレス・インデックスがチェーン全体をカバーしています。", "Full history: the search went all the way back to genesis.": "完全な履歴:ジェネシスブロックまで遡って検索しました。", "Partial history. This node has no index by address: the search stops at the height shown.": "部分的な履歴です。このノードにはアドレス・インデックスがないため、検索は表示された高さで止まります。", "Your wallet is a hidden node": "ウォレットは秘匿ノードです", "Others reach it through Tor, at an onion address of its own: your IP address stays hidden, and your router is not touched.": "他のノードは Tor を通じて、このウォレット専用の onion アドレスに接続します。IP アドレスは隠されたままで、ルーターには一切触れません。", "Its onion address is published: the network can reach it.": "onion アドレスが公開されています。ネットワークから接続できます。", "Tor is preparing its onion address.": "Tor が onion アドレスを準備しています。", "Gather my small coins": "小さなコインをまとめる", "One transaction gathers up to a hundred of your smallest coins into a single one, paid to yourself. After the next block, send again; if the amount still needs too many coins, gather once more.": "1回の取引で、最も小さなコインを最大100枚まとめて1枚にし、自分自身に送ります。次のブロックの後にもう一度送金してください。まだコインが多すぎる場合は、もう一度まとめてください。", "Gathering…": "まとめています…", "Wait for the next block — about two minutes — then send your payment again.": "次のブロック（約2分）を待ってから、もう一度送金してください。", "The coins could not be gathered: ": "コインをまとめられませんでした: ", "Channels": "チャネル", "Payment channels": "ペイメントチャネル", "Peer": "相手", "Capacity": "容量", "My balance": "自分の残高", "Arriving": "受取中", "Peer's balance": "相手の残高", "is yours for good: the peer can no longer take it back.": "は確定したあなたの残高です。相手が取り戻すことはもうできません。", "has been paid to you and becomes yours for good as soon as the peer confirms it, usually within a second.": "はあなたに支払われた金額で、相手が確認するとすぐに確定します。通常は 1 秒もかかりません。", "Open a channel": "チャネルを開設", "Capacity (Q21)": "容量 (Q21)", "Confirm the channel": "チャネルの確認", "Funds locked in the channel": "チャネルに預ける資金", "The capacity leaves your available balance while the channel is open. You pay the peer from it, and what remains comes back to you when the channel closes.": "チャネルが開いている間、容量の分は利用可能残高から外れます。相手への支払いはそこから行い、残りはチャネルを閉じたときにあなたに戻ります。", "Open the channel": "チャネルを開設する", "What is a payment channel?": "ペイメントチャネルとは?", "A channel sets part of your balance aside with one peer, in a single transaction on the chain. The two of you can then pay each other back and forth instantly and without fees; only the final balances go back to the chain when the channel closes.": "チャネルは、チェーン上の 1 回の取引で、残高の一部を特定の相手との間に取り分けます。その後は互いに即座に、手数料なしで何度でも支払い合えます。チャネルを閉じるときに、最終的な残高だけがチェーンに戻ります。", "opening": "開設中", "waiting for confirmations": "承認待ち", "open": "開通", "closing": "閉鎖中", "funds returning after a delay": "待機期間の後に資金が戻ります", "closed: the peer cheated and lost its share": "閉鎖済み: 相手が不正を試み、その取り分を失いました", "closed": "閉鎖済み", "payment settling": "支払い処理中", "not connected": "未接続", "Pay": "支払う", "No channel yet. Open one below, with a peer that accepts channels.": "チャネルはまだありません。チャネルに対応した相手と、下で開設してください。", "The wallet is shutting down: nothing new leaves it. Try again once it has restarted.": "ウォレットは終了処理中のため、新しい送金は行われません。再起動してからもう一度お試しください。", "Payment channels are not active on this network yet.": "このネットワークでは、ペイメントチャネルはまだ有効になっていません。", "This node does not run payment channels.": "このノードはペイメントチャネルを動かしていません。", "A payment is already in flight in this channel. Wait a few seconds for it to settle, then pay again.": "このチャネルではすでに支払いが処理中です。完了するまで数秒待ってから、もう一度支払ってください。", "Your balance in this channel is too low for this amount.": "このチャネルの残高では、この金額に足りません。", "Your available balance is too low for this channel and its funding fee.": "利用可能残高が、このチャネルと開設手数料に足りません。", "This channel is reconnecting to its peer. Try again in a few seconds.": "このチャネルは相手と再接続中です。数秒後にもう一度お試しください。", "The peer is offline. Wait for it to reconnect, then try again.": "相手がオフラインです。再接続を待ってから、もう一度お試しください。", "This channel is not open: it can no longer carry payments.": "このチャネルは開通していないため、支払いには使えません。", "The node already has as many channels in progress as it allows. Wait for one to open, or close one.": "このノードは、許容する数のチャネルをすでに処理中です。どれかが開通するのを待つか、1 つ閉じてください。", "This channel no longer exists on the node.": "このチャネルはノード上にもう存在しません。", "Could not reach the node. Is the wallet still running?": "ノードに接続できません。ウォレットはまだ動いていますか?", "Payment channels are not active yet": "ペイメントチャネルはまだ有効ではありません", "No activation block has been set for this network yet.": "このネットワークでは、有効化のブロックはまだ決まっていません。", "Nothing to do until then: this tab offers channels by itself once they are active.": "それまでは何もする必要はありません。有効になると、このタブで自動的にチャネルを利用できるようになります。", "If the peer disappears, your funds stay recoverable: closing without it returns them after a delay.": "相手がいなくなっても、資金は取り戻せます。相手なしで閉じると、待機期間の後に戻ります。", "Only connected peers whose node runs channels are listed: the address, then the start of the node's id.": "接続中で、ノードがチャネルを動かしている相手だけが表示されます。アドレスと、ノード ID の先頭部分です。", "No connected peer accepts channels right now. One shows up here as soon as it connects.": "現在、チャネルに対応した接続中の相手はいません。接続されるとすぐにここに表示されます。", "Channels unavailable": "チャネルを利用できません", "Channel not prepared": "チャネルを準備できませんでした", "Choose a peer that accepts channels.": "チャネルに対応した相手を選んでください。", "Invalid capacity. Expected a number in Q21, with at most eight decimal places.": "容量を解釈できません。Q21 の数値 (小数点以下 8 桁まで) を入力してください。", "The capacity must be greater than zero.": "容量は正の値である必要があります。", "Funding fee, on the chain": "開設手数料 (チェーン上)", "Locked in the channel": "チャネルに預ける額", "Opening…": "開設中…", "✓ Opening requested": "✓ 開設を依頼しました", "Channel not opened": "チャネルを開設できませんでした", "The peer is offline": "相手がオフラインです", "A closing agreed with the peer needs it online. If it is gone for good, the channel can be closed without it.": "相手と合意して閉じるには、相手がオンラインである必要があります。相手が完全にいなくなった場合は、相手なしでチャネルを閉じられます。", "Close without the peer…": "相手なしで閉じる…", "Pay in a channel": "チャネルで支払う", "A channel payment is final": "チャネルでの支払いは取り消せません", "It reaches the peer at once, with no fee, and cannot be taken back once settled. Re-read the amount: it is the only check you have left.": "支払いは手数料なしで即座に相手に届き、確定した後は取り戻せません。金額を読み直してください。残された確認はそれだけです。", "Left in the channel": "チャネルの残り", "Pay now": "確定して支払う", "Closing fee": "閉鎖手数料", "Your balance in the channel": "チャネル内のあなたの残高", "Close the channel": "チャネルを閉じる", "Closing ends the channel": "閉じるとチャネルは終了します", "Both balances go back to the chain in one transaction agreed with the peer. Your share joins your available balance once a block confirms it, about two minutes later: a closing agreed with the peer has no delay.": "双方の残高は、相手と合意した 1 つの取引でチェーンに戻ります。あなたの取り分は、ブロックで承認されると (約 2 分後) 利用可能残高に加わります。相手と合意して閉じる場合、待機期間はありません。", "Close now": "今すぐ閉じる", "Close without the peer": "相手なしで閉じる", "Use this only if the peer is gone": "相手がいなくなった場合にだけ使ってください", "Your node puts the latest state of the channel on the chain by itself. The peer's share goes back to it; yours comes back once the delay has passed.": "あなたのノードが、チャネルの最新の状態を単独でチェーンに載せます。相手の取り分は相手に戻り、あなたの取り分は待機期間の後に戻ります。", "A closing agreed with the peer is faster: if it may come back, wait for it.": "相手と合意して閉じる方が早く済みます。相手が戻ってくる可能性があるなら、待ってください。", "Paying…": "支払い中…", "✓ Payment settled": "✓ 支払いが確定しました", "It reached the peer at once, and can no longer be undone.": "支払いは即座に相手に届き、もう取り消すことはできません。", "Payment pending": "支払いは保留中です", "The peer went offline during the payment. It completes on its own when the peer reconnects.": "支払いの途中で相手がオフラインになりました。相手が再接続すると自動的に完了します。", "The peer has not confirmed it yet. It completes on its own, even after a reconnection: the balances above show it once it does.": "相手はまだ確認していません。再接続後であっても自動的に完了し、完了すると上の残高に反映されます。", "Closing…": "閉鎖中…", "Your node has put the latest state on the chain. The list above shows “funds returning after a delay” until your share is back in your wallet.": "あなたのノードが最新の状態をチェーンに載せました。あなたの取り分がウォレットに戻るまで、上の一覧には「待機期間の後に資金が戻ります」と表示されます。", "The peer has the closing to sign. The closing transaction then waits for a block, and the list above shows the channel closed.": "相手が閉鎖に署名します。その後、閉鎖の取引がブロックに入るのを待ち、上の一覧でチャネルが閉鎖済みになります。", "The peer went offline during the closing. It completes on its own when the peer reconnects.": "閉鎖の途中で相手がオフラインになりました。相手が再接続すると自動的に完了します。", "✓ Closing requested": "✓ 閉鎖を依頼しました", "Payment not made": "支払いは行われませんでした", "Channel not closed": "チャネルは閉じられませんでした", "Amount": "金額", "Total debited": "引き落とし合計", "Balance after": "処理後の残高", "Payment not prepared": "支払いを準備できませんでした", "No funds have moved.": "資金は動いていません。", "Channel": "チャネル"}};
 const I18N_PATTERNS = {
   "fr": [
+    [/^Channels activate at block (.+)\.$/, "Les canaux s'activent au bloc $1."],
+    [/^(.+) block\(s\) remain, about (.+) days\.$/, "Il reste $1 bloc(s), soit environ $2 jours."],
+    [/^(.+) block\(s\) remain, about (.+)\.$/, "Il reste $1 bloc(s), soit environ $2."],
+    [/^If the peer disappears, your funds stay recoverable: closing without it returns them after a delay of (.+) blocks, about (.+) days\.$/, "Si le pair disparaît, vos fonds restent récupérables : une fermeture sans lui vous les rend après un délai de $1 blocs, soit environ $2 jours."],
+    [/^If the peer disappears, your funds stay recoverable: closing without it returns them after a delay of (.+) blocks, about (.+)\.$/, "Si le pair disparaît, vos fonds restent récupérables : une fermeture sans lui vous les rend après un délai de $1 blocs, soit environ $2."],
+    [/^The peer is setting up the channel\. Its funding transaction then waits for (.+) confirmation\(s\), about (.+) days: the list above shows the channel open once they are in\.$/, "Le pair met le canal en place. Sa transaction d'ouverture attend ensuite $1 confirmation(s), soit environ $2 jours : la liste ci-dessus montre le canal ouvert dès qu'elles sont là."],
+    [/^The peer is setting up the channel\. Its funding transaction then waits for (.+) confirmation\(s\), about (.+): the list above shows the channel open once they are in\.$/, "Le pair met le canal en place. Sa transaction d'ouverture attend ensuite $1 confirmation(s), soit environ $2 : la liste ci-dessus montre le canal ouvert dès qu'elles sont là."],
+    [/^You can lock up to (.+) Q21: your available balance, less the funding fee of (.+) Q21\.$/, "Vous pouvez bloquer jusqu'à $1 Q21 : votre solde disponible, moins les frais d'ouverture de $2 Q21."],
+    [/^The smallest channel holds (.+) Q21\.$/, "Le plus petit canal contient $1 Q21."],
+    [/^The capacity must be at least (.+) Q21\.$/, "La capacité doit être d'au moins $1 Q21."],
+    [/^The capacity can be at most (.+) Q21\.$/, "La capacité ne peut pas dépasser $1 Q21."],
+    [/^Not enough funds: (.+) Q21 needed with the fee, (.+) Q21 spendable\.$/, "Fonds insuffisants : $1 Q21 nécessaires avec les frais, $2 Q21 dépensables."],
+    [/^You can send up to (.+) Q21 in this channel, at once and with no fee\.$/, "Vous pouvez envoyer jusqu'à $1 Q21 dans ce canal, aussitôt et sans frais."],
+    [/^Not enough in this channel: (.+) Q21 requested, (.+) Q21 available\.$/, "Pas assez dans ce canal : $1 Q21 demandés, $2 Q21 disponibles."],
+    [/^The closing fee, (.+) Q21, is taken from your balance in the channel\.$/, "Les frais de fermeture, $1 Q21, sont pris sur votre solde dans le canal."],
     [/^✓ (.+) coins gathered into one$/, "✓ $1 pièces regroupées en une seule"],
     [/^Fee: (.+) Q21\.$/, "Frais : $1 Q21."],
     [/^(.+) address\(es\) in total$/, "$1 adresse(s) au total"],
@@ -1031,6 +1146,21 @@ const I18N_PATTERNS = {
     [/^(\d+) B$/, "$1 o"]
   ],
   "ja": [
+    [/^Channels activate at block (.+)\.$/, "チャネルはブロック $1 で有効になります。"],
+    [/^(.+) block\(s\) remain, about (.+) days\.$/, "残り $1 ブロック、約 $2 日です。"],
+    [/^(.+) block\(s\) remain, about (.+)\.$/, "残り $1 ブロック、約 $2 です。"],
+    [/^If the peer disappears, your funds stay recoverable: closing without it returns them after a delay of (.+) blocks, about (.+) days\.$/, "相手がいなくなっても、資金は取り戻せます。相手なしで閉じると、$1 ブロック (約 $2 日) の待機期間の後に戻ります。"],
+    [/^If the peer disappears, your funds stay recoverable: closing without it returns them after a delay of (.+) blocks, about (.+)\.$/, "相手がいなくなっても、資金は取り戻せます。相手なしで閉じると、$1 ブロック (約 $2) の待機期間の後に戻ります。"],
+    [/^The peer is setting up the channel\. Its funding transaction then waits for (.+) confirmation\(s\), about (.+) days: the list above shows the channel open once they are in\.$/, "相手がチャネルを準備しています。その後、開設の取引が $1 回の承認 (約 $2 日) を待ちます。承認がそろうと、上の一覧でチャネルが開通になります。"],
+    [/^The peer is setting up the channel\. Its funding transaction then waits for (.+) confirmation\(s\), about (.+): the list above shows the channel open once they are in\.$/, "相手がチャネルを準備しています。その後、開設の取引が $1 回の承認 (約 $2) を待ちます。承認がそろうと、上の一覧でチャネルが開通になります。"],
+    [/^You can lock up to (.+) Q21: your available balance, less the funding fee of (.+) Q21\.$/, "最大 $1 Q21 まで預けられます。利用可能残高から、開設手数料 $2 Q21 を引いた額です。"],
+    [/^The smallest channel holds (.+) Q21\.$/, "最小のチャネルの容量は $1 Q21 です。"],
+    [/^The capacity must be at least (.+) Q21\.$/, "容量は $1 Q21 以上である必要があります。"],
+    [/^The capacity can be at most (.+) Q21\.$/, "容量は最大 $1 Q21 までです。"],
+    [/^Not enough funds: (.+) Q21 needed with the fee, (.+) Q21 spendable\.$/, "残高不足: 手数料込みで $1 Q21 が必要ですが、使えるのは $2 Q21 です。"],
+    [/^You can send up to (.+) Q21 in this channel, at once and with no fee\.$/, "このチャネルでは最大 $1 Q21 を、即座に手数料なしで送れます。"],
+    [/^Not enough in this channel: (.+) Q21 requested, (.+) Q21 available\.$/, "このチャネルの残高不足: $1 Q21 を指定しましたが、使えるのは $2 Q21 です。"],
+    [/^The closing fee, (.+) Q21, is taken from your balance in the channel\.$/, "閉鎖手数料 $1 Q21 は、チャネル内のあなたの残高から差し引かれます。"],
     [/^✓ (.+) coins gathered into one$/, "✓ $1 枚のコインを1枚にまとめました"],
     [/^Fee: (.+) Q21\.$/, "手数料: $1 Q21"],
     [/^(.+) address\(es\) in total$/, "合計 $1 件のアドレス"],
@@ -1060,7 +1190,7 @@ const I18N_PATTERNS = {
     [/^(\d+) B$/, "$1 B"]
   ]
 };
-const I18N_PREFIXES = {"fr": {"Tor is starting: ": "Tor démarre\u00a0: ", "Hidden node on. Onion services known, connected, reaching this wallet: ": "Nœud caché actif. Services onion connus, joints, qui joignent ce portefeuille\u00a0: ", "The Tor setting could not be changed: ": "Le réglage Tor n'a pas pu être changé : ", "Onion services known, connected, reaching this wallet: ": "Services onion connus, joints, qui joignent ce portefeuille : ", "Could not reach the node: ": "Impossible d'interroger le nœud : ", "Fee estimate failed: ": "Frais non estimés : ", "Information unavailable: ": "Informations indisponibles : ", "Could not read the balance again; payment stopped: ": "Solde non relu, envoi interrompu : ", "Name not saved: ": "Nom non enregistré : ", "The setting could not be changed: ": "Le réglage n'a pas pu être changé : ", "Mining could not be turned on: ": "Le minage n'a pas pu être activé : ", "Mining could not be turned off: ": "Le minage n'a pas pu être arrêté : "}, "ja": {"Tor is starting: ": "Torを起動中: ", "Hidden node on. Onion services known, connected, reaching this wallet: ": "隠しノード有効。既知・接続中・このウォレットへ接続中のオニオンサービス: ", "Onion services known, connected, reaching this wallet: ": "既知・接続中・このウォレットへ接続中のオニオンサービス: ", "Could not reach the node: ": "ノードに問い合わせできません: ", "Fee estimate failed: ": "手数料を見積れません: ", "Insufficient funds: ": "残高不足: ", "Name not saved: ": "名前を保存できませんでした: "}};
+const I18N_PREFIXES = {"fr": {"Tor is starting: ": "Tor démarre\u00a0: ", "Hidden node on. Onion services known, connected, reaching this wallet: ": "Nœud caché actif. Services onion connus, joints, qui joignent ce portefeuille\u00a0: ", "The Tor setting could not be changed: ": "Le réglage Tor n'a pas pu être changé : ", "Onion services known, connected, reaching this wallet: ": "Services onion connus, joints, qui joignent ce portefeuille : ", "Could not reach the node: ": "Impossible d'interroger le nœud : ", "Fee estimate failed: ": "Frais non estimés : ", "Information unavailable: ": "Informations indisponibles : ", "Could not read the balance again; payment stopped: ": "Solde non relu, envoi interrompu : ", "Name not saved: ": "Nom non enregistré : ", "The setting could not be changed: ": "Le réglage n'a pas pu être changé : ", "Mining could not be turned on: ": "Le minage n'a pas pu être activé : ", "Mining could not be turned off: ": "Le minage n'a pas pu être arrêté : ", "Node message: ": "Message du nœud\u00a0: ", "Could not read the balance again; nothing was opened: ": "Relecture du solde impossible\u00a0; rien n'a été ouvert\u00a0: "}, "ja": {"Tor is starting: ": "Torを起動中: ", "Hidden node on. Onion services known, connected, reaching this wallet: ": "隠しノード有効。既知・接続中・このウォレットへ接続中のオニオンサービス: ", "Onion services known, connected, reaching this wallet: ": "既知・接続中・このウォレットへ接続中のオニオンサービス: ", "Could not reach the node: ": "ノードに問い合わせできません: ", "Fee estimate failed: ": "手数料を見積れません: ", "Insufficient funds: ": "残高不足: ", "Name not saved: ": "名前を保存できませんでした: ", "Node message: ": "ノードのメッセージ: ", "Could not read the balance again; nothing was opened: ": "残高を再読み込みできなかったため、何も開設していません: "}};
 let LANG = "en";
 
 // Dates and numbers follow the language too: "08/12/2025" does not read like
@@ -1376,7 +1506,12 @@ const date = t => new Date(Number(t) * 1000).toISOString().replace("T"," ").slic
 // so that there is only one place in the world where that figure is written.
 function blocksDuration(blocks, info){
   const t = Number(info && info.target_interval_seconds) || 120;
-  const sec = Math.max(0, Number(blocks) || 0) * t;
+  return aboutSeconds(Math.max(0, Number(blocks) || 0) * t);
+}
+
+// A wait in seconds, in the same words.
+function aboutSeconds(seconds){
+  const sec = Math.max(0, Number(seconds) || 0);
   if (sec < 90) return "about " + Math.round(sec) + " s";
   if (sec < 5400) return "about " + Math.round(sec / 60) + " min";
   if (sec < 172800) return "about " + (sec / 3600).toFixed(1) + " h";
@@ -1449,7 +1584,7 @@ function bigAmount(q21){
 // Tabs
 // ---------------------------------------------------------------------------
 
-const VIEWS = ["balance","mine","receive","network","send","activity","info"];
+const VIEWS = ["balance","mine","receive","network","send","channels","activity","info"];
 
 function show(name){
   for (const v of VIEWS){
@@ -1464,6 +1599,7 @@ function show(name){
   if (name === "receive") listAddresses();
   if (name === "mine") loadMining();
   if (name === "network") loadNetwork();
+  if (name === "channels") loadChannels();
 }
 
 document.getElementById("tabs").addEventListener("click", ev => {
@@ -2979,6 +3115,591 @@ document.getElementById("address-list").addEventListener("keydown", ev => {
   z.querySelector("button[data-save]").click();
 });
 
+// ---------------------------------------------------------------------------
+// Payment channels
+// ---------------------------------------------------------------------------
+//
+// A channel sets part of the balance aside with one peer, in one transaction
+// on the chain; payments then go back and forth between the two at once, and
+// only the final balances return to the chain. The node runs the whole
+// protocol: this view shows its channels, and asks it to open, pay and close.
+// Each of those three moves funds, so each goes through a confirmation, like
+// a send.
+//
+// `channellist` gives its amounts as plain integers of units. They go through
+// `BigInt`, never through a float, and leave the page as digits.
+
+// The phases the node reports, and the words this page shows for them.
+const CHANNEL_PHASES = {
+  opening: "opening",
+  funded: "waiting for confirmations",
+  open: "open",
+  closing: "closing",
+  forcing: "funds returning after a delay",
+  penalised: "closed: the peer cheated and lost its share",
+  closed: "closed"
+};
+
+// A channel id is 64 hex digits; nothing else goes back to the node as one.
+const CHANNEL_ID = /^[0-9a-f]{64}$/;
+
+let channelLoading = false;
+let channelBusy = false;
+let channelList = [];
+let channelPeers = [];
+let channelInfo = null;
+let channelTerms = null;
+let channelSpendable = null;
+let channelPeerKeys = null;
+let preparedOpen = null;
+let preparedChannel = null;
+let openNoted = 0;
+
+function channelUnits(v){
+  try { return unitsOf(v); } catch (e) { return null; }
+}
+
+function channelAmount(v){
+  const u = channelUnits(v);
+  return u === null ? "—" : q21FromUnits(u);
+}
+
+// What can be paid from a channel: ours for good, plus what has arrived and
+// is not final yet — the node lets both leave.
+function channelSendable(ch){
+  const a = channelUnits(ch.local_balance), b = channelUnits(ch.pending_incoming);
+  return (a === null ? 0n : a) + (b === null ? 0n : b);
+}
+
+// What a refusal of the node means for the person in front of the page.
+// A message not listed here is shown as it is.
+function channelProblem(message){
+  const m = String(message);
+  if (/shutting down/i.test(m))
+    return "The wallet is shutting down: nothing new leaves it. Try again once it has restarted.";
+  if (/regtest only|not active/i.test(m))
+    return "Payment channels are not active on this network yet.";
+  if (/does not run payment channels|unknown method/i.test(m))
+    return "This node does not run payment channels.";
+  if (/already in flight/i.test(m))
+    return "A payment is already in flight in this channel. Wait a few seconds for it to settle, then pay again.";
+  if (/insufficient channel balance/i.test(m))
+    return "Your balance in this channel is too low for this amount.";
+  if (/insufficient/i.test(m))
+    return "Your available balance is too low for this channel and its funding fee.";
+  if (/resynchronized/i.test(m))
+    return "This channel is reconnecting to its peer. Try again in a few seconds.";
+  if (/not connected|disconnected|channel-capable peer|does not support payment channels/i.test(m))
+    return "The peer is offline. Wait for it to reconnect, then try again.";
+  if (/channel not open/i.test(m))
+    return "This channel is not open: it can no longer carry payments.";
+  if (/too many/i.test(m))
+    return "The node already has as many channels in progress as it allows. Wait for one to open, or close one.";
+  if (/unknown channel/i.test(m))
+    return "This channel no longer exists on the node.";
+  if (/failed to fetch|networkerror|load failed/i.test(m))
+    return "Could not reach the node. Is the wallet still running?";
+  return null;
+}
+
+// A refusal: what it means, then the node's own words for whoever needs
+// them.
+function channelRefusal(title, e, tail){
+  const m = String(e && e.message !== undefined ? e.message : e);
+  const plain = channelProblem(m);
+  const words = plain ? `<p class="help">${esc("Node message: " + m)}</p>` : "";
+  return `<div class="warn"><h3>${esc(title)}</h3><p>${esc(plain || m)}</p>${html(words)}${html(tail || "")}</div>`;
+}
+
+// Not active yet: when, in blocks and in time. A null height (mainnet) means
+// none is scheduled, and so would a height a Number cannot hold exactly:
+// announcing it would announce a date that does not exist.
+function paintChannelStatus(st){
+  const zone = document.getElementById("channel-state");
+  const body = document.getElementById("channel-zone");
+  if (st && st.active === true){
+    zone.innerHTML = "";
+    body.hidden = false;
+    return true;
+  }
+  body.hidden = true;
+  const h = st && st.activation_height != null ? Number(st.activation_height) : NaN;
+  const left = st && st.blocks_remaining != null ? Number(st.blocks_remaining) : NaN;
+  const when = Number.isSafeInteger(h) && Number.isSafeInteger(left)
+    ? `<p>${esc("Channels activate at block " + h.toLocaleString(q21Locale()) + ".")}</p>
+       <p>${esc(left.toLocaleString(q21Locale()) + " block(s) remain, " + aboutSeconds(st.eta_seconds) + ".")}</p>`
+    : `<p>No activation block has been set for this network yet.</p>`;
+  zone.innerHTML = `<div class="card"><h3>Payment channels are not active yet</h3>${html(when)}
+    <p class="help">Nothing to do until then: this tab offers channels by itself once they are active.</p></div>`;
+  return false;
+}
+
+// The value `channelopen` receives for a peer: its stable channel node id,
+// which survives a reconnection, or else its address.
+function channelPeerKey(p){
+  return String(p.channel_id || "") || String(p.address);
+}
+
+function peerOf(ch){
+  return channelPeers.find(p => String(p.id) === String(ch.peer)) || null;
+}
+
+function channelPeerText(ch){
+  const p = peerOf(ch);
+  return p ? String(p.address) : "not connected";
+}
+
+function channelById(cid){
+  return channelList.find(ch => String(ch.channel_id) === cid) || null;
+}
+
+function channelDelayText(){
+  if (!channelTerms) return "If the peer disappears, your funds stay recoverable: closing without it returns them after a delay.";
+  const d = Number(channelTerms.delay_blocks) || 0;
+  return "If the peer disappears, your funds stay recoverable: closing without it returns them after a delay of " +
+    d + " blocks, " + blocksDuration(d, channelInfo) + ".";
+}
+
+function channelDepthText(){
+  const n = channelTerms ? Number(channelTerms.funding_depth) || 1 : 1;
+  return "The peer is setting up the channel. Its funding transaction then waits for " + n +
+    " confirmation(s), " + blocksDuration(n, channelInfo) +
+    ": the list above shows the channel open once they are in.";
+}
+
+// The peer list is rebuilt only when the peers change, and keeps the one
+// chosen: a refresh must not switch the peer under the user's eyes.
+function paintChannelPeers(){
+  const field = document.getElementById("channel-peer-field");
+  const ok = channelPeers.filter(p => p.supports_channels && p.handshake_complete);
+  const keys = ok.map(p => channelPeerKey(p) + "@" + String(p.address)).join(" ");
+  if (keys === channelPeerKeys) return;
+  channelPeerKeys = keys;
+  const chosen = field.value;
+  field.innerHTML = ok.map(p =>
+    `<option value="${esc(channelPeerKey(p))}">${esc(String(p.address))} · ${trunc(p.channel_id, 8)}</option>`
+  ).join("");
+  if (ok.some(p => channelPeerKey(p) === chosen)) field.value = chosen;
+  field.disabled = !ok.length;
+  document.getElementById("channel-review-button").disabled = !ok.length;
+  document.getElementById("channel-peer-help").textContent = ok.length
+    ? "Only connected peers whose node runs channels are listed: the address, then the start of the node's id."
+    : "No connected peer accepts channels right now. One shows up here as soon as it connects.";
+}
+
+function paintCapacityHelp(){
+  const help = document.getElementById("channel-capacity-help");
+  const least = document.getElementById("channel-minimum-help");
+  if (!channelTerms || channelSpendable === null){
+    help.textContent = "";
+    least.textContent = "";
+    return;
+  }
+  let most = channelSpendable - unitsOf(channelTerms.open_fee);
+  if (most > unitsOf(channelTerms.max_capacity)) most = unitsOf(channelTerms.max_capacity);
+  if (most < 0n) most = 0n;
+  help.textContent = "You can lock up to " + q21FromUnits(most) +
+    " Q21: your available balance, less the funding fee of " + channelTerms.open_fee.q21 + " Q21.";
+  least.textContent = "The smallest channel holds " + channelTerms.min_capacity.q21 + " Q21.";
+}
+
+function channelState(ch){
+  const phase = String(ch.phase);
+  const word = CHANNEL_PHASES[phase] || phase;
+  if (phase === "open" && ch.in_flight)
+    return `<span class="badge pending">${render(spinner())} payment settling</span>`;
+  if (phase === "open") return `<span class="badge">${esc(word)}</span>`;
+  if (phase === "closed" || phase === "penalised") return `<span class="badge gray">${esc(word)}</span>`;
+  return `<span class="badge pending">${render(spinner())} ${esc(word)}</span>`;
+}
+
+// The table, in the history's style. The first cell carries the peer, the
+// state and the actions, so that a phone shows them next to the balance
+// without scrolling sideways. An open channel pays and closes; a closing one
+// can be closed again — that is how a close interrupted by a lost link is
+// finished.
+function paintChannels(){
+  const tbody = document.getElementById("channel-rows");
+  if (!channelList.length){
+    tbody.innerHTML = `<tr><td colspan="5">No channel yet. Open one below, with a peer that accepts channels.</td></tr>`;
+    return;
+  }
+  // The channels still in use first; closed ones stay at the end, as a
+  // record.
+  const done = ch => ["closed", "penalised"].includes(String(ch.phase));
+  const rows = channelList.filter(ch => !done(ch)).concat(channelList.filter(done));
+  tbody.innerHTML = rows.map(ch => {
+    const cid = String(ch.channel_id);
+    const phase = String(ch.phase);
+    const p = peerOf(ch);
+    const who = p
+      ? `<span class="full">${esc(String(p.address))}</span><span class="id">${trunc(p.channel_id, 8)}</span>`
+      : `<span class="badge gray">not connected</span>`;
+    const pay = phase === "open"
+      ? `<button type="button" class="flat" data-pay="${esc(cid)}">Pay</button>` : "";
+    const close = phase === "open" || phase === "closing"
+      ? `<button type="button" class="flat" data-close="${esc(cid)}">Close</button>` : "";
+    const actions = CHANNEL_ID.test(cid) && (pay || close)
+      ? `<span class="row-actions">${html(pay)}${html(close)}</span>` : "";
+    const arriving = channelUnits(ch.pending_incoming);
+    const comes = arriving !== null && arriving > 0n;
+    return `
+      <tr>
+        <td class="peer">${html(who)}<span class="state">${html(channelState(ch))}</span>${html(actions)}</td>
+        <td>${esc(channelAmount(ch.local_balance))}</td>
+        <td${html(comes ? ' class="plus"' : '')}>${esc(comes ? "+ " + q21FromUnits(arriving) : "—")}</td>
+        <td>${esc(channelAmount(ch.remote_balance))}</td>
+        <td>${esc(channelAmount(ch.capacity))}</td>
+      </tr>`;
+  }).join("");
+}
+
+async function loadChannels(){
+  // Two overlapping rounds would paint twice, the older one last.
+  if (channelLoading) return;
+  channelLoading = true;
+  try{
+    if (!paintChannelStatus(await call("channelstatus"))) return;
+    const [list, peers, balance] = await Promise.all([
+      call("channellist"), call("getpeers"), call("getbalance")
+    ]);
+    // The terms are constants of the node: read once.
+    if (!channelInfo){
+      channelInfo = await call("getinfo");
+      channelTerms = channelInfo.channel_terms || null;
+    }
+    channelList = Array.isArray(list) ? list : [];
+    channelPeers = (peers && Array.isArray(peers.peers)) ? peers.peers : [];
+    channelSpendable = channelUnits(balance.spendable);
+    paintChannels();
+    paintChannelPeers();
+    paintCapacityHelp();
+    // The note of an opening stays until the channel it announced is open.
+    if (openNoted && Date.now() - openNoted > 10000 &&
+        !channelList.some(ch => ["opening", "funded"].includes(String(ch.phase)))){
+      openNoted = 0;
+      document.getElementById("channel-open-result").innerHTML = "";
+    }
+  }catch(e){
+    document.getElementById("channel-zone").hidden = true;
+    document.getElementById("channel-state").innerHTML = channelRefusal("Channels unavailable", e);
+  }finally{
+    channelLoading = false;
+  }
+}
+
+// Every five seconds while the tab is in view, and not at all otherwise: a
+// wallet left on another tab, or in a hidden window, costs the node nothing.
+setInterval(() => {
+  if (!document.getElementById("view-channels").hidden && !document.hidden) loadChannels();
+}, 5000);
+
+// --- Opening: review, then confirm.
+
+function showOpenForm(){
+  preparedOpen = null;
+  document.getElementById("channel-open-confirmation").hidden = true;
+  document.getElementById("channel-open-card").hidden = false;
+}
+
+document.getElementById("channel-open-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const out = document.getElementById("channel-open-result");
+  out.innerHTML = "";
+  openNoted = 0;
+  const refuse = m => {
+    out.innerHTML = `<div class="warn"><h3>Channel not prepared</h3><p>${esc(m)}</p></div>`;
+  };
+  const field = document.getElementById("channel-peer-field");
+  const peer = field.value;
+  if (!peer) return refuse("Choose a peer that accepts channels.");
+  const capacity = unitsFromQ21(document.getElementById("channel-capacity-field").value);
+  if (capacity === null) return refuse("Invalid capacity. Expected a number in Q21, with at most eight decimal places.");
+  if (capacity <= 0n) return refuse("The capacity must be greater than zero.");
+
+  // Read again now, as for a send: a block may have arrived, or a payment
+  // left, since the page last looked.
+  let spendable = null;
+  try{
+    const [balance, info] = await Promise.all([call("getbalance"), call("getinfo")]);
+    spendable = unitsOf(balance.spendable);
+    channelInfo = info;
+    channelTerms = info.channel_terms || null;
+  }catch(e){
+    return refuse("Could not read the balance again; nothing was opened: " + e.message);
+  }
+  const terms = channelTerms;
+  if (terms && capacity < unitsOf(terms.min_capacity))
+    return refuse("The capacity must be at least " + terms.min_capacity.q21 + " Q21.");
+  if (terms && capacity > unitsOf(terms.max_capacity))
+    return refuse("The capacity can be at most " + terms.max_capacity.q21 + " Q21.");
+  const fee = terms ? unitsOf(terms.open_fee) : 0n;
+  const total = capacity + fee;
+  if (total > spendable){
+    return refuse("Not enough funds: " + q21FromUnits(total) + " Q21 needed with the fee, " +
+                  q21FromUnits(spendable) + " Q21 spendable.");
+  }
+  const label = field.selectedOptions.length ? field.selectedOptions[0].textContent : peer;
+  const feeRow = terms
+    ? `<div class="l"><span class="k">Funding fee, on the chain</span><span class="v">${esc(q21FromUnits(fee))} Q21</span></div>`
+    : "";
+  document.getElementById("channel-open-recap").innerHTML =
+      `<div class="l"><span class="k">Peer</span><span class="v">${esc(label)}</span></div>`
+    + `<div class="l"><span class="k">Locked in the channel</span><span class="v">${esc(q21FromUnits(capacity))} Q21</span></div>`
+    + html(feeRow)
+    + `<div class="l total"><span class="k">Total debited</span><span class="v">${esc(q21FromUnits(total))} Q21</span></div>`
+    + `<div class="l"><span class="k">Balance after</span><span class="v">${esc(q21FromUnits(spendable - total))} Q21</span></div>`;
+  document.getElementById("channel-open-delay").textContent = channelDelayText();
+  preparedOpen = {peer: peer, capacity: capacity};
+  document.getElementById("channel-open-card").hidden = true;
+  document.getElementById("channel-open-confirmation").hidden = false;
+});
+
+document.getElementById("channel-open-cancel").addEventListener("click", showOpenForm);
+
+document.getElementById("channel-open-button").addEventListener("click", async () => {
+  if (!preparedOpen || channelBusy) return;
+  channelBusy = true;
+  const b = document.getElementById("channel-open-button");
+  b.disabled = true;
+  b.textContent = "Opening…";
+  const p = preparedOpen;
+  const out = document.getElementById("channel-open-result");
+  try{
+    // The capacity leaves as digits, like the amount of a send.
+    await call("channelopen", '{"peer":' + JSON.stringify(p.peer) +
+                              ',"capacity":' + p.capacity.toString() + '}');
+    document.getElementById("channel-capacity-field").value = "";
+    out.innerHTML = `<div class="note"><h3>✓ Opening requested</h3><p>${esc(channelDepthText())}</p></div>`;
+    openNoted = Date.now();
+  }catch(e){
+    out.innerHTML = channelRefusal("Channel not opened", e, `<p>No funds have moved.</p>`);
+  }finally{
+    showOpenForm();
+    b.disabled = false;
+    b.textContent = "Open the channel";
+    channelBusy = false;
+    loadChannels();
+  }
+});
+
+// --- Paying and closing, from the buttons of a row.
+
+function forceOffer(cid){
+  return `<div class="note"><h3>The peer is offline</h3>
+    <p>A closing agreed with the peer needs it online. If it is gone for good, the channel can be closed without it.</p>
+    <div class="buttons"><button type="button" class="secondary" data-channel-force="${esc(cid)}">Close without the peer…</button></div></div>`;
+}
+
+function paintPayForm(cid){
+  const zone = document.getElementById("channel-action");
+  const ch = channelById(cid);
+  preparedChannel = null;
+  if (!ch || !CHANNEL_ID.test(cid)){ zone.innerHTML = ""; return; }
+  zone.innerHTML = `
+    <h2>Pay in a channel</h2>
+    <div class="card">
+    <form id="channel-pay-form" autocomplete="off" data-channel="${esc(cid)}">
+      <h3>${esc(channelPeerText(ch))}</h3>
+      <label for="channel-pay-field">Amount (Q21)</label>
+      <input type="text" id="channel-pay-field" placeholder="0.00000000" inputmode="decimal" spellcheck="false" autocomplete="off">
+      <div class="help">${esc("You can send up to " + q21FromUnits(channelSendable(ch)) + " Q21 in this channel, at once and with no fee.")}</div>
+      <div class="buttons">
+        <button type="button" class="secondary" data-channel-back>Back</button>
+        <button type="submit" class="action">Review</button>
+      </div>
+    </form>
+    </div>
+    <div id="channel-pay-result"></div>`;
+  zone.scrollIntoView({block: "nearest"});
+  document.getElementById("channel-pay-field").focus();
+}
+
+async function reviewPayment(form){
+  const cid = form.dataset.channel;
+  const zone = document.getElementById("channel-action");
+  const out = document.getElementById("channel-pay-result");
+  const refuse = m => {
+    out.innerHTML = `<div class="warn"><h3>Payment not prepared</h3><p>${esc(m)}</p></div>`;
+  };
+  if (!CHANNEL_ID.test(cid)) return;
+  const amount = unitsFromQ21(document.getElementById("channel-pay-field").value);
+  if (amount === null) return refuse("Invalid amount. Expected a number in Q21, with at most eight decimal places.");
+  if (amount <= 0n) return refuse("The amount must be greater than zero.");
+  // The channel is read again: a payment may have arrived or left since the
+  // table was drawn.
+  let ch;
+  try{
+    ch = await call("channelinfo", '{"channel_id":' + JSON.stringify(cid) + '}');
+  }catch(e){
+    out.innerHTML = channelRefusal("Payment not prepared", e);
+    return;
+  }
+  if (String(ch.phase) !== "open") return refuse("This channel is not open: it can no longer carry payments.");
+  if (ch.in_flight) return refuse("A payment is already in flight in this channel. Wait a few seconds for it to settle, then pay again.");
+  const can = channelSendable(ch);
+  if (amount > can){
+    return refuse("Not enough in this channel: " + q21FromUnits(amount) + " Q21 requested, " +
+                  q21FromUnits(can) + " Q21 available.");
+  }
+  preparedChannel = {kind: "pay", cid: cid, amount: amount};
+  zone.innerHTML = `
+    <h2>Confirm the payment</h2>
+    <div class="warn">
+      <h3>A channel payment is final</h3>
+      <p>It reaches the peer at once, with no fee, and cannot be taken back once settled. Re-read the amount: it is the only check you have left.</p>
+    </div>
+    <div class="recap">
+      <div class="l"><span class="k">Peer</span><span class="v">${esc(channelPeerText(ch))}</span></div>
+      <div class="l"><span class="k">Amount</span><span class="v">${esc(q21FromUnits(amount))} Q21</span></div>
+      <div class="l"><span class="k">Fee</span><span class="v">${esc(q21FromUnits(0n))} Q21</span></div>
+      <div class="l"><span class="k">Left in the channel</span><span class="v">${esc(q21FromUnits(can - amount))} Q21</span></div>
+    </div>
+    <div class="buttons">
+      <button type="button" class="secondary" data-channel-back>Back</button>
+      <button type="button" class="action" data-channel-confirm>Pay now</button>
+    </div>`;
+}
+
+function closeRecap(ch){
+  const fee = channelTerms ? channelTerms.close_fee.q21 : null;
+  const feeRow = fee
+    ? `<div class="l"><span class="k">Closing fee</span><span class="v">${esc(fee)} Q21</span></div>` : "";
+  return `<div class="recap">
+      <div class="l"><span class="k">Peer</span><span class="v">${esc(channelPeerText(ch))}</span></div>
+      <div class="l"><span class="k">Your balance in the channel</span><span class="v">${esc(q21FromUnits(channelSendable(ch)))} Q21</span></div>
+      ${html(feeRow)}
+    </div>`;
+}
+
+function paintCloseDialog(cid){
+  const zone = document.getElementById("channel-action");
+  const ch = channelById(cid);
+  preparedChannel = null;
+  if (!ch || !CHANNEL_ID.test(cid)){ zone.innerHTML = ""; return; }
+  preparedChannel = {kind: "close", cid: cid};
+  const fee = channelTerms
+    ? `<p>${esc("The closing fee, " + channelTerms.close_fee.q21 + " Q21, is taken from your balance in the channel.")}</p>` : "";
+  zone.innerHTML = `
+    <h2>Close the channel</h2>
+    <div class="warn">
+      <h3>Closing ends the channel</h3>
+      <p>Both balances go back to the chain in one transaction agreed with the peer. Your share joins your available balance once a block confirms it, about two minutes later: a closing agreed with the peer has no delay.</p>
+      ${html(fee)}
+      <p>${esc(channelDelayText())}</p>
+    </div>
+    ${html(closeRecap(ch))}
+    <div class="buttons">
+      <button type="button" class="secondary" data-channel-back>Back</button>
+      <button type="button" class="action" data-channel-confirm>Close now</button>
+    </div>
+    ${html(peerOf(ch) ? "" : forceOffer(cid))}`;
+  zone.scrollIntoView({block: "nearest"});
+}
+
+function paintForceDialog(cid){
+  const zone = document.getElementById("channel-action");
+  const ch = channelById(cid);
+  preparedChannel = null;
+  if (!ch || !CHANNEL_ID.test(cid)){ zone.innerHTML = ""; return; }
+  preparedChannel = {kind: "force", cid: cid};
+  zone.innerHTML = `
+    <h2>Close without the peer</h2>
+    <div class="warn">
+      <h3>Use this only if the peer is gone</h3>
+      <p>Your node puts the latest state of the channel on the chain by itself. The peer's share goes back to it; yours comes back once the delay has passed.</p>
+      <p>${esc(channelDelayText())}</p>
+      <p>A closing agreed with the peer is faster: if it may come back, wait for it.</p>
+    </div>
+    ${html(closeRecap(ch))}
+    <div class="buttons">
+      <button type="button" class="secondary" data-channel-back>Back</button>
+      <button type="button" class="action" data-channel-confirm>Close without the peer</button>
+    </div>`;
+}
+
+// The payment or the close confirmed on screen, sent. Its figures are the
+// ones prepared at review; the node checks them again on its side.
+async function confirmChannel(button){
+  const p = preparedChannel;
+  if (!p || channelBusy) return;
+  channelBusy = true;
+  button.disabled = true;
+  const zone = document.getElementById("channel-action");
+  try{
+    if (p.kind === "pay"){
+      button.textContent = "Paying…";
+      let r;
+      try{
+        r = await call("channelpay", '{"channel_id":' + JSON.stringify(p.cid) +
+                                     ',"amount":' + p.amount.toString() + '}');
+      }catch(e){
+        // The peer dropped after the payment was signed: it is not lost, it
+        // completes when the link comes back.
+        if (!/completes when the channel reconnects/i.test(e.message)) throw e;
+        r = {status: "pending", offline: true};
+      }
+      preparedChannel = null;
+      zone.innerHTML = String(r.status) === "settled"
+        ? `<div class="note"><h3>✓ Payment settled</h3><p>It reached the peer at once, and can no longer be undone.</p></div>`
+        : `<div class="note"><h3><span class="badge pending">${render(spinner())} pending</span> Payment pending</h3>
+           <p>${esc(r.offline
+             ? "The peer went offline during the payment. It completes on its own when the peer reconnects."
+             : "The peer has not confirmed it yet. It completes on its own, even after a reconnection: the balances above show it once it does.")}</p></div>`;
+    } else {
+      button.textContent = "Closing…";
+      let note = p.kind === "force"
+        ? "Your node has put the latest state on the chain. The list above shows “funds returning after a delay” until your share is back in your wallet."
+        : "The peer has the closing to sign. The closing transaction then waits for a block, and the list above shows the channel closed.";
+      try{
+        await call("channelclose", '{"channel_id":' + JSON.stringify(p.cid) +
+                                   (p.kind === "force" ? ',"force":true' : '') + '}');
+      }catch(e){
+        if (p.kind === "force" || !/completes when the channel reconnects/i.test(e.message)) throw e;
+        note = "The peer went offline during the closing. It completes on its own when the peer reconnects.";
+      }
+      preparedChannel = null;
+      zone.innerHTML = `<div class="note"><h3>✓ Closing requested</h3><p>${esc(note)}</p></div>`;
+    }
+  }catch(e){
+    preparedChannel = null;
+    const offline = p.kind === "close" && /not connected/i.test(e.message);
+    zone.innerHTML = channelRefusal(p.kind === "pay" ? "Payment not made" : "Channel not closed", e,
+                                    `<p>No funds have moved.</p>`) +
+                     (offline ? forceOffer(p.cid) : "");
+  }finally{
+    channelBusy = false;
+    loadChannels();
+  }
+}
+
+document.getElementById("channel-rows").addEventListener("click", ev => {
+  const pay = ev.target.closest("button[data-pay]");
+  if (pay){ paintPayForm(pay.dataset.pay); return; }
+  const close = ev.target.closest("button[data-close]");
+  if (close) paintCloseDialog(close.dataset.close);
+});
+
+// One listener each for the whole zone: its content is rebuilt at every step.
+document.getElementById("channel-action").addEventListener("click", ev => {
+  if (ev.target.closest("button[data-channel-back]")){
+    preparedChannel = null;
+    document.getElementById("channel-action").innerHTML = "";
+    return;
+  }
+  const f = ev.target.closest("button[data-channel-force]");
+  if (f){ paintForceDialog(f.dataset.channelForce); return; }
+  const c = ev.target.closest("button[data-channel-confirm]");
+  if (c) confirmChannel(c);
+});
+
+document.getElementById("channel-action").addEventListener("submit", ev => {
+  const form = ev.target.closest("#channel-pay-form");
+  if (!form) return;
+  ev.preventDefault();
+  reviewPayment(form);
+});
+
 </script>
 </body>
 </html>
@@ -4038,16 +4759,16 @@ mod tests {
         );
     }
 
-    /// The seven views exist, and mining as well as the network are among
-    /// them.
+    /// The eight views exist: mining, the network and the payment channels
+    /// are among them.
     ///
-    /// The previous test counted five. It was extended, not replaced: a view
-    /// that disappears is a regression, a view that is added must be declared
-    /// here.
+    /// The first version of this test counted five. It is extended, not
+    /// replaced: a view that disappears is a regression, a view that is added
+    /// must be declared here.
     #[test]
-    fn the_seven_views_exist() {
+    fn the_eight_views_exist() {
         for v in [
-            "balance", "mine", "receive", "network", "send", "activity", "info",
+            "balance", "mine", "receive", "network", "send", "channels", "activity", "info",
         ] {
             assert!(
                 PAGE.contains(&format!(r#"id="view-{v}""#)),
@@ -4060,7 +4781,7 @@ mod tests {
         }
         assert!(
             script().contains(
-                r#"const VIEWS = ["balance","mine","receive","network","send","activity","info"];"#
+                r#"const VIEWS = ["balance","mine","receive","network","send","channels","activity","info"];"#
             ),
             "the script's list of views does not match the markup"
         );
@@ -4754,5 +5475,376 @@ mod tests {
             assert!(fr.contains_key(note), "no French for: {note}");
             assert!(ja.contains_key(note), "no Japanese for: {note}");
         }
+    }
+
+    /// The script of the Channels tab, from its heading to the end.
+    fn channel_script() -> &'static str {
+        let s = script();
+        let start = s
+            .find("// Payment channels\n// ---")
+            .expect("the channels section of the script");
+        &s[start..]
+    }
+
+    /// The body of a function of the channels script, up to its closing
+    /// brace at the start of a line.
+    fn channel_function(head: &str) -> &'static str {
+        let s = channel_script();
+        let d = s.find(head).unwrap_or_else(|| panic!("no {head}"));
+        let f = s[d..].find("\n}").expect("its end") + d;
+        &s[d..f]
+    }
+
+    /// The text nodes of a markup fragment, as the translation engine sees
+    /// them: what lies between tags, its white space collapsed, its
+    /// interpolations taken out.
+    fn text_nodes(markup: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = markup;
+        while let Some(close) = rest.find('>') {
+            rest = &rest[close + 1..];
+            let end = rest.find('<').unwrap_or(rest.len());
+            let mut text = rest[..end].to_string();
+            // `${...}` is a value, not a text of the page.
+            while let Some(i) = text.find("${") {
+                let j = text[i..].find('}').map_or(text.len(), |j| i + j + 1);
+                text.replace_range(i..j, "\u{1}");
+            }
+            for piece in text.split('\u{1}') {
+                let t = piece
+                    .replace("&nbsp;", " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // A unit after a figure ("Q21") is not a text to translate.
+                if t.chars().any(|c| c.is_ascii_lowercase()) {
+                    out.push(t);
+                }
+            }
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    /// Every text of the Channels tab reads in French and in Japanese.
+    ///
+    /// The tab is checked whole: its markup, the markup its script writes,
+    /// the sentences it writes whole, and the ones it builds around a figure,
+    /// which go through a pattern of both languages. A sentence added in
+    /// English alone fails here, not in front of a reader.
+    #[test]
+    fn every_channel_text_is_translated() {
+        let fr = table("I18N", "fr");
+        let ja = table("I18N", "ja");
+        let both = |t: &str| fr.contains_key(t) && ja.contains_key(t);
+
+        let start = PAGE
+            .find(r#"<section class="view" id="view-channels""#)
+            .expect("the channels view");
+        let end = start + PAGE[start..].find("</section>").expect("its end");
+        let mut texts = text_nodes(&PAGE[start..end]);
+        texts.push("Channels".to_string());
+
+        // The markup the script writes, and its whole sentences.
+        let s = channel_script();
+        let mut i = 0;
+        while let Some(a) = s[i..].find('`') {
+            let a = i + a + 1;
+            let b = a + s[a..].find('`').expect("closed template");
+            texts.extend(text_nodes(&s[a..b]));
+            i = b + 1;
+        }
+        let mut fragments = Vec::new();
+        let mut i = 0;
+        while let Some(a) = s[i..].find('"') {
+            let a = i + a + 1;
+            let b = a + s[a..].find('"').expect("closed string");
+            let lit = &s[a..b];
+            i = b + 1;
+            let starts = lit
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_uppercase() || c == '✓');
+            if !starts || lit.contains('#') || lit.contains("view-") {
+                continue;
+            }
+            if lit.ends_with(' ') {
+                fragments.push(lit.to_string());
+            } else {
+                texts.push(lit.to_string());
+            }
+        }
+        // The words of the channel states.
+        let phases = channel_function("const CHANNEL_PHASES = {");
+        for line in phases.lines().skip(1) {
+            if let Some((_, v)) = line.split_once(": \"") {
+                texts.push(v.trim_end_matches(',').trim_end_matches('"').to_string());
+            }
+        }
+        let missing: Vec<&String> = texts.iter().filter(|t| !both(t)).collect();
+        assert!(
+            missing.is_empty(),
+            "channel texts without French or Japanese: {missing:#?}"
+        );
+        assert!(texts.len() > 80, "only {} texts found", texts.len());
+
+        // A sentence built around a figure starts with a fragment: it must
+        // open a prefix or a pattern of both languages.
+        let prefixes_fr = table("I18N_PREFIXES", "fr");
+        let prefixes_ja = table("I18N_PREFIXES", "ja");
+        let patterns = {
+            let page = script();
+            let a = page.find("const I18N_PATTERNS = {").expect("patterns");
+            let b = a + page[a..].find("\n};").expect("their end");
+            &page[a..b]
+        };
+        let ja_at = patterns.find("\"ja\": [").expect("Japanese patterns");
+        let (pat_fr, pat_ja) = patterns.split_at(ja_at);
+        let opens = |block: &str, fragment: &str| {
+            block
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("[/^"))
+                .any(|p| p.replace('\\', "").starts_with(fragment))
+        };
+        for f in &fragments {
+            let prefixed = prefixes_fr.contains_key(f) && prefixes_ja.contains_key(f);
+            assert!(
+                prefixed || (opens(pat_fr, f) && opens(pat_ja, f)),
+                "a sentence starting with {f:?} has no pattern in both languages"
+            );
+        }
+        assert!(fragments.len() >= 10, "only {} fragments", fragments.len());
+        // And the counts that end a sentence.
+        for tail in [
+            r"/^(.+) block\(s\) remain, about (.+) days\.$/",
+            r"/^(.+) block\(s\) remain, about (.+)\.$/",
+        ] {
+            assert_eq!(patterns.matches(tail).count(), 2, "{tail}");
+        }
+    }
+
+    /// What comes from the node is escaped on its way into the tab: peer
+    /// addresses and ids, channel ids — in the text and in the attributes —
+    /// amounts, states and error messages.
+    #[test]
+    fn channel_values_are_escaped() {
+        let s = channel_script();
+        // All the markup is in template literals, whose interpolations the
+        // test above checks one by one; no markup is concatenated by hand.
+        assert!(!s.contains("'<"), "markup assembled outside a template");
+        assert!(!s.contains("\"<"), "markup assembled outside a template");
+
+        let rows = channel_function("function paintChannels(");
+        for e in [
+            "esc(String(p.address))",
+            "trunc(p.channel_id, 8)",
+            r#"data-pay="${esc(cid)}""#,
+            r#"data-close="${esc(cid)}""#,
+            "esc(channelAmount(ch.capacity))",
+            "esc(channelAmount(ch.local_balance))",
+            "esc(channelAmount(ch.remote_balance))",
+            "q21FromUnits(arriving)",
+        ] {
+            assert!(rows.contains(e), "the channel table does not escape: {e}");
+        }
+        // An unknown state from the node is shown, escaped, rather than
+        // dropped.
+        assert!(channel_function("function channelState(").contains("${esc(word)}"));
+        let peers = channel_function("function paintChannelPeers(");
+        assert!(peers.contains(r#"value="${esc(channelPeerKey(p))}""#));
+        assert!(peers.contains("${esc(String(p.address))}"));
+        let refusal = channel_function("function channelRefusal(");
+        assert!(refusal.contains("esc(plain || m)"));
+        assert!(refusal.contains(r#"esc("Node message: " + m)"#));
+
+        // A channel id read back from the page is checked before it is sent.
+        for f in [
+            "function paintPayForm(",
+            "async function reviewPayment(",
+            "function paintCloseDialog(",
+            "function paintForceDialog(",
+        ] {
+            assert!(
+                channel_function(f).contains("CHANNEL_ID.test(cid)"),
+                "{f} uses a channel id without checking it"
+            );
+        }
+        assert!(s.contains("const CHANNEL_ID = /^[0-9a-f]{64}$/;"));
+        // Amounts: integers of units, through BigInt, out as digits.
+        assert!(channel_function("function channelUnits(").contains("unitsOf(v)"));
+        assert!(s.contains(r#"',"amount":' + p.amount.toString() + '}'"#));
+        assert!(s.contains(r#"',"capacity":' + p.capacity.toString() + '}'"#));
+    }
+
+    /// Opening, paying and closing each go through a confirmation that says
+    /// what moves, and the call that moves funds is only reachable from it.
+    #[test]
+    fn every_channel_action_goes_through_a_confirmation() {
+        let s = channel_script();
+        // Opening: the call leaves only from the button of the confirmation,
+        // which states what gets locked, the fee, and that the funds stay
+        // recoverable.
+        assert_eq!(s.matches(r#"call("channelopen""#).count(), 1);
+        let open = s
+            .find(r#"document.getElementById("channel-open-button").addEventListener"#)
+            .expect("the confirmation button");
+        let call = s.find(r#"call("channelopen""#).expect("the call");
+        assert!(
+            call > open && call - open < 600,
+            "channelopen outside its confirmation"
+        );
+        assert!(channel_function("function showOpenForm(").contains("preparedOpen = null"));
+        let confirmation = PAGE
+            .find(r#"<div id="channel-open-confirmation" hidden>"#)
+            .expect("the open confirmation");
+        let end = confirmation
+            + PAGE[confirmation..]
+                .find("</div>\n    <div id=\"channel-open-result\"")
+                .expect("its end");
+        let block = &PAGE[confirmation..end];
+        for e in [
+            "Funds locked in the channel",
+            r#"id="channel-open-delay""#,
+            r#"id="channel-open-recap""#,
+            r#"id="channel-open-cancel""#,
+            r#"id="channel-open-button""#,
+        ] {
+            assert!(block.contains(e), "the open confirmation lacks {e}");
+        }
+        for e in [
+            "Locked in the channel",
+            "Funding fee, on the chain",
+            "Total debited",
+        ] {
+            assert!(s.contains(e), "the open recap lacks {e}");
+        }
+        assert!(
+            channel_function("function channelDelayText(").contains("your funds stay recoverable")
+        );
+
+        // Paying and closing: one function sends them, only from the
+        // confirmation's button, and only what was prepared.
+        let confirm = channel_function("async function confirmChannel(");
+        assert!(confirm.contains("const p = preparedChannel;\n  if (!p || channelBusy) return;"));
+        for m in ["channelpay", "channelclose"] {
+            let call = format!(r#"call("{m}""#);
+            assert_eq!(s.matches(&call).count(), 1, "{m} called more than once");
+            assert!(confirm.contains(&call), "{m} sent outside the confirmation");
+        }
+        assert_eq!(
+            s.matches("confirmChannel(").count(),
+            2,
+            "one definition, one caller"
+        );
+        assert!(s.contains("if (c) confirmChannel(c);"));
+        assert!(s.contains(r#"ev.target.closest("button[data-channel-confirm]")"#));
+        for (f, warning) in [
+            (
+                "async function reviewPayment(",
+                "A channel payment is final",
+            ),
+            ("function paintCloseDialog(", "Closing ends the channel"),
+            (
+                "function paintForceDialog(",
+                "Use this only if the peer is gone",
+            ),
+        ] {
+            let body = channel_function(f);
+            assert!(body.contains(warning), "{f}: no warning");
+            assert!(
+                body.contains("data-channel-confirm"),
+                "{f}: no confirm button"
+            );
+            assert!(body.contains("data-channel-back"), "{f}: no way back");
+            assert!(
+                body.contains("preparedChannel = {kind:"),
+                "{f}: nothing prepared"
+            );
+        }
+        // The close states its fee and the delay of a close without the peer.
+        let close = channel_function("function paintCloseDialog(");
+        assert!(close.contains("channelTerms.close_fee.q21"));
+        assert!(close.contains("channelDelayText()"));
+        // The two answers of a payment are told apart.
+        assert!(confirm.contains(r#"String(r.status) === "settled""#));
+        assert!(confirm.contains("Payment pending"));
+    }
+
+    /// The tab says when channels activate, and offers nothing before.
+    #[test]
+    fn the_channels_tab_waits_for_their_activation() {
+        let s = channel_script();
+        let status = channel_function("function paintChannelStatus(");
+        assert!(status.contains("st.active === true"));
+        assert!(status.contains("body.hidden = true;"));
+        // No height is announced while none is scheduled (null, on mainnet).
+        assert!(status.contains("Number.isSafeInteger(h)"));
+        assert!(status.contains("st.activation_height != null"));
+        assert!(status.contains("Channels activate at block "));
+        assert!(status.contains(" block(s) remain, "));
+        assert!(status.contains("aboutSeconds(st.eta_seconds)"));
+        // The status comes first, and nothing else is asked before it says
+        // channels are active.
+        let load = channel_function("async function loadChannels(");
+        let first = load.find(r#"call("channelstatus")"#).expect("status read");
+        let list = load.find(r#"call("channellist")"#).expect("list read");
+        assert!(first < list);
+        assert!(load.contains(r#"if (!paintChannelStatus(await call("channelstatus"))) return;"#));
+        // The open form lives in the zone that stays hidden until then.
+        let zone = PAGE
+            .find(r#"<div id="channel-zone" hidden>"#)
+            .expect("zone");
+        let form = PAGE.find(r#"<form id="channel-open-form""#).expect("form");
+        let note = PAGE
+            .find("What is a payment channel?")
+            .expect("explanation");
+        assert!(zone < form && form < note);
+        assert!(s.contains("Payment channels are not active yet"));
+    }
+
+    /// The five refusals a user meets are told in plain words.
+    #[test]
+    fn channel_errors_are_explained() {
+        let problem = channel_function("function channelProblem(");
+        for (node, plain) in [
+            ("/not connected|disconnected", "The peer is offline."),
+            ("/shutting down/", "The wallet is shutting down"),
+            (
+                "/already in flight/",
+                "A payment is already in flight in this channel.",
+            ),
+            (
+                "/insufficient channel balance/",
+                "Your balance in this channel is too low",
+            ),
+            ("/insufficient/", "Your available balance is too low"),
+            (
+                "/regtest only|not active/",
+                "Payment channels are not active on this network yet.",
+            ),
+        ] {
+            assert!(problem.contains(node), "not recognized: {node}");
+            assert!(problem.contains(plain), "not explained: {plain}");
+        }
+        // A payment the peer did not hear the end of is pending, not lost.
+        let confirm = channel_function("async function confirmChannel(");
+        assert!(confirm.contains("completes when the channel reconnects"));
+        // And a close refused for an absent peer offers the way out.
+        assert!(confirm.contains("forceOffer(p.cid)"));
+    }
+
+    /// The channel data is read every few seconds, and only while the tab is
+    /// in view.
+    #[test]
+    fn the_channels_tab_polls_only_while_visible() {
+        let s = channel_script();
+        assert!(s.contains(
+            r#"if (!document.getElementById("view-channels").hidden && !document.hidden) loadChannels();
+}, 5000);"#
+        ));
+        assert!(s.contains("if (channelLoading) return;"));
+        assert!(script().contains(r#"if (name === "channels") loadChannels();"#));
+        // The node's terms are constants: read once, not at every round.
+        assert!(channel_function("async function loadChannels(").contains("if (!channelInfo){"));
     }
 }
