@@ -1090,3 +1090,112 @@ mod channels {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The lab's switch: an audit build of the node takes the activation height
+/// of a regtest or testnet process from the command line, never mainnet's.
+mod node_option {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn q21() -> &'static str {
+        env!("CARGO_BIN_EXE_q21")
+    }
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("q21-activation-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn rpc(port: u16, method: &str) -> Option<String> {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#);
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        write!(
+            s,
+            "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .ok()?;
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).ok()?;
+        let at = resp.find("\r\n\r\n")?;
+        Some(resp[at + 4..].to_string())
+    }
+
+    /// The option names the network it moves; mainnet cannot even be named.
+    #[test]
+    fn the_option_needs_regtest_or_testnet() {
+        for network in [None, Some("mainnet")] {
+            let d = dir("unnamed");
+            let mut args = vec!["node", "--no-bootstrap"];
+            if let Some(n) = network {
+                args.extend(["--network", n]);
+            }
+            args.extend(["--audit-policy-activation", "5", "--seconds", "1"]);
+            let out = Command::new(q21())
+                .arg("--datadir")
+                .arg(&d)
+                .args(&args)
+                .stdin(Stdio::null())
+                .output()
+                .expect("q21");
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            assert!(!out.status.success(), "{network:?}: {err}");
+            assert!(
+                err.contains("requires --network regtest or testnet")
+                    || err.contains("mainnet does not exist"),
+                "{network:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_regtest_node_takes_the_lab_height() {
+        let d = dir("regtest");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut child = Command::new(q21())
+            .arg("--datadir")
+            .arg(&d)
+            .args([
+                "node",
+                "--network",
+                "regtest",
+                "--no-bootstrap",
+                "--audit-policy-activation",
+                "50",
+                "--rpc",
+                &format!("127.0.0.1:{port}"),
+                "--seconds",
+                "60",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("q21");
+        let t = Instant::now();
+        let status = loop {
+            if let Some(r) = rpc(port, "channelstatus") {
+                break r;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "the node does not start"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(status.contains("\"activation_height\":50"), "{status}");
+        assert!(status.contains("\"blocks_remaining\":50"), "{status}");
+        assert!(status.contains("\"active\":false"), "{status}");
+    }
+}

@@ -4464,6 +4464,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut address_index = false;
     let mut prune = false;
     let mut forced_network: Option<Network> = None;
+    // Audit builds only: the lab's activation height of policy outputs.
+    #[cfg(feature = "audit")]
+    let mut audit_activation: Option<u64> = None;
     let mut no_bootstrap = false;
     let mut upnp = false;
     // Tor (0.4.7): `--tor` finds the local Tor, `--proxy` names any SOCKS5
@@ -4585,11 +4588,37 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 forced_network = Some(network_from_name(&args[i + 1])?);
                 i += 2;
             }
+            // A lab that must cross a real activation height of policy
+            // outputs, on regtest or testnet. Not in a release build: there,
+            // this option does not exist.
+            #[cfg(feature = "audit")]
+            "--audit-policy-activation" if i + 1 < args.len() => {
+                audit_activation = Some(
+                    args[i + 1]
+                        .parse()
+                        .ok()
+                        .filter(|h| *h >= 1)
+                        .ok_or("--audit-policy-activation: a height of 1 or more")?,
+                );
+                i += 2;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
 
     check_rpc_token(rpc_wallet, rpc_token.as_deref())?;
+    // Before anything is loaded: replaying the chain already validates.
+    #[cfg(feature = "audit")]
+    if let Some(h) = audit_activation {
+        let network = forced_network
+            .filter(|n| *n != Network::Mainnet)
+            .ok_or("--audit-policy-activation requires --network regtest or testnet")?;
+        q21_core::policy::audit_set_activation_height(network, h);
+        eprintln!(
+            "warning: audit build: policy outputs activate at block {h} on {network:?} \
+             in this process, not at the height this release schedules"
+        );
+    }
     if rpc_wallet && std::env::args().any(|a| a == "--rpc-token") && cfg!(unix) {
         eprintln!(
             "warning: --rpc-token on the command line is readable by any\n\
