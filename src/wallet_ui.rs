@@ -207,8 +207,11 @@ nav.tabs{
 }
 nav.tabs button{
   flex:1;display:flex;flex-direction:column;align-items:center;gap:.15rem;
-  background:none;border:none;color:var(--muted);font:inherit;font-size:.68rem;
-  padding:.45rem .2rem;border-radius:10px;cursor:pointer;letter-spacing:.01em}
+  background:none;border:none;color:var(--muted);font:inherit;font-size:.62rem;
+  padding:.45rem .1rem;border-radius:10px;cursor:pointer;letter-spacing:.01em;min-width:0}
+/* Eight tabs share a phone's width: the labels are a touch smaller there, so
+   that "Channels" or its Japanese fits on one line. */
+@media(min-width:420px){nav.tabs button{font-size:.68rem;padding:.45rem .2rem}}
 nav.tabs button svg{width:1.25rem;height:1.25rem;stroke:currentColor;fill:none;
   stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 nav.tabs button:hover{color:var(--soft)}
@@ -376,11 +379,12 @@ td.minus{color:var(--danger);font-weight:600}
 
 /* ---- Controls ----------------------------------------------------------- */
 label{display:block;font-size:.8rem;font-weight:600;margin:1rem 0 .35rem;color:var(--soft)}
-input[type=text],input[type=password]{
+input[type=text],input[type=password],select{
   width:100%;padding:.7rem .85rem;font:inherit;font-family:var(--mono);font-size:.9rem;
   color:var(--text);background:var(--card-2);border:1.5px solid var(--border);
   border-radius:11px;outline:none}
-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+select:disabled{opacity:.6;cursor:not-allowed}
 .buttons{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1rem}
 button.action,button.secondary,button.flat{
   font:inherit;font-weight:600;font-size:.9rem;border-radius:11px;cursor:pointer;
@@ -439,6 +443,16 @@ td{font-family:var(--mono);font-variant-numeric:tabular-nums}
   border-radius:50%;animation:spinning .9s linear infinite}
 @keyframes spinning{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion: reduce){.spin-dot{animation:none}}
+
+/* --- Channels: the first cell carries the peer, the state and the actions,
+   so that on a phone they stay in view without scrolling the table
+   sideways. */
+td.peer .full{display:block}
+td.peer .id{display:block;font-size:.72rem;color:var(--muted)}
+td.peer .state{display:block;margin-top:.3rem}
+td.peer .row-actions{display:flex;gap:.35rem;margin-top:.35rem}
+#channel-action:not(:empty){margin-top:1.8rem}
+td.peer .row-actions button.flat{padding:.2rem .55rem;font-size:.72rem}
 
 details.fold{background:var(--card-2);border:1px solid var(--border);border-radius:14px;
   padding:.85rem 1.05rem;margin:1rem 0;font-size:.87rem;color:var(--soft)}
@@ -515,6 +529,9 @@ code{background:var(--quantum-bg);color:var(--quantum);padding:.12em .38em;borde
   <button type="button" data-view="send">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V7"/><path d="M6 12l6-6 6 6"/><path d="M4 4h16"/></svg>
     Send</button>
+  <button type="button" data-view="channels">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="12" r="2.6"/><path d="M7.6 10h8.8"/><path d="M7.6 14h8.8"/></svg>
+    Channels</button>
   <button type="button" data-view="network">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>
     Network</button>
@@ -769,6 +786,72 @@ code{background:var(--quantum-bg);color:var(--quantum);padding:.12em .38em;borde
   </div>
 
   <div id="send-result"></div>
+</section>
+
+<section class="view" id="view-channels" hidden>
+  <h2>Payment channels</h2>
+  <div id="channel-state"><p class="help">Loading…</p></div>
+
+  <div id="channel-zone" hidden>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Channel</th><th>My balance</th><th>Arriving</th><th>Peer's balance</th><th>Capacity</th></tr></thead>
+        <tbody id="channel-rows"></tbody>
+      </table>
+    </div>
+    <p class="help">
+      <strong>My balance</strong> is yours for good: the peer can no longer
+      take it back. <strong>Arriving</strong> has been paid to you and becomes
+      yours for good as soon as the peer confirms it, usually within a second.
+    </p>
+    <div id="channel-action"></div>
+
+    <h2>Open a channel</h2>
+    <div class="card" id="channel-open-card">
+    <form id="channel-open-form" autocomplete="off">
+      <label for="channel-peer-field">Peer</label>
+      <select id="channel-peer-field"></select>
+      <div class="help" id="channel-peer-help"></div>
+
+      <label for="channel-capacity-field">Capacity (Q21)</label>
+      <input type="text" id="channel-capacity-field" placeholder="0.00000000" inputmode="decimal" spellcheck="false" autocomplete="off">
+      <div class="help" id="channel-capacity-help"></div>
+      <div class="help" id="channel-minimum-help"></div>
+      <div class="buttons">
+        <button type="submit" class="action" id="channel-review-button">Review</button>
+      </div>
+    </form>
+    </div>
+
+    <div id="channel-open-confirmation" hidden>
+      <h2>Confirm the channel</h2>
+      <div class="warn">
+        <h3>Funds locked in the channel</h3>
+        <p>
+          The capacity leaves your available balance while the channel is
+          open. You pay the peer from it, and what remains comes back to you
+          when the channel closes.
+        </p>
+        <p id="channel-open-delay"></p>
+      </div>
+      <div class="recap" id="channel-open-recap"></div>
+      <div class="buttons">
+        <button type="button" class="secondary" id="channel-open-cancel">Back</button>
+        <button type="button" class="action" id="channel-open-button">Open the channel</button>
+      </div>
+    </div>
+    <div id="channel-open-result"></div>
+  </div>
+
+  <div class="note">
+    <h3>What is a payment channel?</h3>
+    <p>
+      A channel sets part of your balance aside with one peer, in a single
+      transaction on the chain. The two of you can then pay each other back
+      and forth instantly and without fees; only the final balances go back
+      to the chain when the channel closes.
+    </p>
+  </div>
 </section>
 
 <section class="view" id="view-network" hidden>
@@ -1393,7 +1476,12 @@ const date = t => new Date(Number(t) * 1000).toISOString().replace("T"," ").slic
 // so that there is only one place in the world where that figure is written.
 function blocksDuration(blocks, info){
   const t = Number(info && info.target_interval_seconds) || 120;
-  const sec = Math.max(0, Number(blocks) || 0) * t;
+  return aboutSeconds(Math.max(0, Number(blocks) || 0) * t);
+}
+
+// A wait in seconds, in the same words.
+function aboutSeconds(seconds){
+  const sec = Math.max(0, Number(seconds) || 0);
   if (sec < 90) return "about " + Math.round(sec) + " s";
   if (sec < 5400) return "about " + Math.round(sec / 60) + " min";
   if (sec < 172800) return "about " + (sec / 3600).toFixed(1) + " h";
@@ -1466,7 +1554,7 @@ function bigAmount(q21){
 // Tabs
 // ---------------------------------------------------------------------------
 
-const VIEWS = ["balance","mine","receive","network","send","activity","info"];
+const VIEWS = ["balance","mine","receive","network","send","channels","activity","info"];
 
 function show(name){
   for (const v of VIEWS){
@@ -1481,6 +1569,7 @@ function show(name){
   if (name === "receive") listAddresses();
   if (name === "mine") loadMining();
   if (name === "network") loadNetwork();
+  if (name === "channels") loadChannels();
 }
 
 document.getElementById("tabs").addEventListener("click", ev => {
@@ -2996,6 +3085,591 @@ document.getElementById("address-list").addEventListener("keydown", ev => {
   z.querySelector("button[data-save]").click();
 });
 
+// ---------------------------------------------------------------------------
+// Payment channels
+// ---------------------------------------------------------------------------
+//
+// A channel sets part of the balance aside with one peer, in one transaction
+// on the chain; payments then go back and forth between the two at once, and
+// only the final balances return to the chain. The node runs the whole
+// protocol: this view shows its channels, and asks it to open, pay and close.
+// Each of those three moves funds, so each goes through a confirmation, like
+// a send.
+//
+// `channellist` gives its amounts as plain integers of units. They go through
+// `BigInt`, never through a float, and leave the page as digits.
+
+// The phases the node reports, and the words this page shows for them.
+const CHANNEL_PHASES = {
+  opening: "opening",
+  funded: "waiting for confirmations",
+  open: "open",
+  closing: "closing",
+  forcing: "funds returning after a delay",
+  penalised: "closed: the peer cheated and lost its share",
+  closed: "closed"
+};
+
+// A channel id is 64 hex digits; nothing else goes back to the node as one.
+const CHANNEL_ID = /^[0-9a-f]{64}$/;
+
+let channelLoading = false;
+let channelBusy = false;
+let channelList = [];
+let channelPeers = [];
+let channelInfo = null;
+let channelTerms = null;
+let channelSpendable = null;
+let channelPeerKeys = null;
+let preparedOpen = null;
+let preparedChannel = null;
+let openNoted = 0;
+
+function channelUnits(v){
+  try { return unitsOf(v); } catch (e) { return null; }
+}
+
+function channelAmount(v){
+  const u = channelUnits(v);
+  return u === null ? "—" : q21FromUnits(u);
+}
+
+// What can be paid from a channel: ours for good, plus what has arrived and
+// is not final yet — the node lets both leave.
+function channelSendable(ch){
+  const a = channelUnits(ch.local_balance), b = channelUnits(ch.pending_incoming);
+  return (a === null ? 0n : a) + (b === null ? 0n : b);
+}
+
+// What a refusal of the node means for the person in front of the page.
+// A message not listed here is shown as it is.
+function channelProblem(message){
+  const m = String(message);
+  if (/shutting down/i.test(m))
+    return "The wallet is shutting down: nothing new leaves it. Try again once it has restarted.";
+  if (/regtest only|not active/i.test(m))
+    return "Payment channels are not active on this network yet.";
+  if (/does not run payment channels|unknown method/i.test(m))
+    return "This node does not run payment channels.";
+  if (/already in flight/i.test(m))
+    return "A payment is already in flight in this channel. Wait a few seconds for it to settle, then pay again.";
+  if (/insufficient channel balance/i.test(m))
+    return "Your balance in this channel is too low for this amount.";
+  if (/insufficient/i.test(m))
+    return "Your available balance is too low for this channel and its funding fee.";
+  if (/resynchronized/i.test(m))
+    return "This channel is reconnecting to its peer. Try again in a few seconds.";
+  if (/not connected|disconnected|channel-capable peer|does not support payment channels/i.test(m))
+    return "The peer is offline. Wait for it to reconnect, then try again.";
+  if (/channel not open/i.test(m))
+    return "This channel is not open: it can no longer carry payments.";
+  if (/too many/i.test(m))
+    return "The node already has as many channels in progress as it allows. Wait for one to open, or close one.";
+  if (/unknown channel/i.test(m))
+    return "This channel no longer exists on the node.";
+  if (/failed to fetch|networkerror|load failed/i.test(m))
+    return "Could not reach the node. Is the wallet still running?";
+  return null;
+}
+
+// A refusal: what it means, then the node's own words for whoever needs
+// them.
+function channelRefusal(title, e, tail){
+  const m = String(e && e.message !== undefined ? e.message : e);
+  const plain = channelProblem(m);
+  const words = plain ? `<p class="help">${esc("Node message: " + m)}</p>` : "";
+  return `<div class="warn"><h3>${esc(title)}</h3><p>${esc(plain || m)}</p>${html(words)}${html(tail || "")}</div>`;
+}
+
+// Not active yet: when, in blocks and in time. A height of `u64::MAX` means
+// none is scheduled; a Number cannot even hold it exactly, and announcing it
+// would announce a date that does not exist.
+function paintChannelStatus(st){
+  const zone = document.getElementById("channel-state");
+  const body = document.getElementById("channel-zone");
+  if (st && st.active === true){
+    zone.innerHTML = "";
+    body.hidden = false;
+    return true;
+  }
+  body.hidden = true;
+  const h = Number(st && st.activation_height);
+  const left = Number(st && st.blocks_remaining);
+  const when = Number.isSafeInteger(h) && Number.isSafeInteger(left)
+    ? `<p>${esc("Channels activate at block " + h.toLocaleString(q21Locale()) + ".")}</p>
+       <p>${esc(left.toLocaleString(q21Locale()) + " block(s) remain, " + aboutSeconds(st.eta_seconds) + ".")}</p>`
+    : `<p>No activation block has been set for this network yet.</p>`;
+  zone.innerHTML = `<div class="card"><h3>Payment channels are not active yet</h3>${html(when)}
+    <p class="help">Nothing to do until then: this tab offers channels by itself once they are active.</p></div>`;
+  return false;
+}
+
+// The value `channelopen` receives for a peer: its stable channel node id,
+// which survives a reconnection, or else its address.
+function channelPeerKey(p){
+  return String(p.channel_id || "") || String(p.address);
+}
+
+function peerOf(ch){
+  return channelPeers.find(p => String(p.id) === String(ch.peer)) || null;
+}
+
+function channelPeerText(ch){
+  const p = peerOf(ch);
+  return p ? String(p.address) : "not connected";
+}
+
+function channelById(cid){
+  return channelList.find(ch => String(ch.channel_id) === cid) || null;
+}
+
+function channelDelayText(){
+  if (!channelTerms) return "If the peer disappears, your funds stay recoverable: closing without it returns them after a delay.";
+  const d = Number(channelTerms.delay_blocks) || 0;
+  return "If the peer disappears, your funds stay recoverable: closing without it returns them after a delay of " +
+    d + " blocks, " + blocksDuration(d, channelInfo) + ".";
+}
+
+function channelDepthText(){
+  const n = channelTerms ? Number(channelTerms.funding_depth) || 1 : 1;
+  return "The peer is setting up the channel. Its funding transaction then waits for " + n +
+    " confirmation(s), " + blocksDuration(n, channelInfo) +
+    ": the list above shows the channel open once they are in.";
+}
+
+// The peer list is rebuilt only when the peers change, and keeps the one
+// chosen: a refresh must not switch the peer under the user's eyes.
+function paintChannelPeers(){
+  const field = document.getElementById("channel-peer-field");
+  const ok = channelPeers.filter(p => p.supports_channels && p.handshake_complete);
+  const keys = ok.map(p => channelPeerKey(p) + "@" + String(p.address)).join(" ");
+  if (keys === channelPeerKeys) return;
+  channelPeerKeys = keys;
+  const chosen = field.value;
+  field.innerHTML = ok.map(p =>
+    `<option value="${esc(channelPeerKey(p))}">${esc(String(p.address))} · ${trunc(p.channel_id, 8)}</option>`
+  ).join("");
+  if (ok.some(p => channelPeerKey(p) === chosen)) field.value = chosen;
+  field.disabled = !ok.length;
+  document.getElementById("channel-review-button").disabled = !ok.length;
+  document.getElementById("channel-peer-help").textContent = ok.length
+    ? "Only connected peers whose node runs channels are listed: the address, then the start of the node's id."
+    : "No connected peer accepts channels right now. One shows up here as soon as it connects.";
+}
+
+function paintCapacityHelp(){
+  const help = document.getElementById("channel-capacity-help");
+  const least = document.getElementById("channel-minimum-help");
+  if (!channelTerms || channelSpendable === null){
+    help.textContent = "";
+    least.textContent = "";
+    return;
+  }
+  let most = channelSpendable - unitsOf(channelTerms.open_fee);
+  if (most > unitsOf(channelTerms.max_capacity)) most = unitsOf(channelTerms.max_capacity);
+  if (most < 0n) most = 0n;
+  help.textContent = "You can lock up to " + q21FromUnits(most) +
+    " Q21: your available balance, less the funding fee of " + channelTerms.open_fee.q21 + " Q21.";
+  least.textContent = "The smallest channel holds " + channelTerms.min_capacity.q21 + " Q21.";
+}
+
+function channelState(ch){
+  const phase = String(ch.phase);
+  const word = CHANNEL_PHASES[phase] || phase;
+  if (phase === "open" && ch.in_flight)
+    return `<span class="badge pending">${render(spinner())} payment settling</span>`;
+  if (phase === "open") return `<span class="badge">${esc(word)}</span>`;
+  if (phase === "closed" || phase === "penalised") return `<span class="badge gray">${esc(word)}</span>`;
+  return `<span class="badge pending">${render(spinner())} ${esc(word)}</span>`;
+}
+
+// The table, in the history's style. The first cell carries the peer, the
+// state and the actions, so that a phone shows them next to the balance
+// without scrolling sideways. An open channel pays and closes; a closing one
+// can be closed again — that is how a close interrupted by a lost link is
+// finished.
+function paintChannels(){
+  const tbody = document.getElementById("channel-rows");
+  if (!channelList.length){
+    tbody.innerHTML = `<tr><td colspan="5">No channel yet. Open one below, with a peer that accepts channels.</td></tr>`;
+    return;
+  }
+  // The channels still in use first; closed ones stay at the end, as a
+  // record.
+  const done = ch => ["closed", "penalised"].includes(String(ch.phase));
+  const rows = channelList.filter(ch => !done(ch)).concat(channelList.filter(done));
+  tbody.innerHTML = rows.map(ch => {
+    const cid = String(ch.channel_id);
+    const phase = String(ch.phase);
+    const p = peerOf(ch);
+    const who = p
+      ? `<span class="full">${esc(String(p.address))}</span><span class="id">${trunc(p.channel_id, 8)}</span>`
+      : `<span class="badge gray">not connected</span>`;
+    const pay = phase === "open"
+      ? `<button type="button" class="flat" data-pay="${esc(cid)}">Pay</button>` : "";
+    const close = phase === "open" || phase === "closing"
+      ? `<button type="button" class="flat" data-close="${esc(cid)}">Close</button>` : "";
+    const actions = CHANNEL_ID.test(cid) && (pay || close)
+      ? `<span class="row-actions">${html(pay)}${html(close)}</span>` : "";
+    const arriving = channelUnits(ch.pending_incoming);
+    const comes = arriving !== null && arriving > 0n;
+    return `
+      <tr>
+        <td class="peer">${html(who)}<span class="state">${html(channelState(ch))}</span>${html(actions)}</td>
+        <td>${esc(channelAmount(ch.local_balance))}</td>
+        <td${html(comes ? ' class="plus"' : '')}>${esc(comes ? "+ " + q21FromUnits(arriving) : "—")}</td>
+        <td>${esc(channelAmount(ch.remote_balance))}</td>
+        <td>${esc(channelAmount(ch.capacity))}</td>
+      </tr>`;
+  }).join("");
+}
+
+async function loadChannels(){
+  // Two overlapping rounds would paint twice, the older one last.
+  if (channelLoading) return;
+  channelLoading = true;
+  try{
+    if (!paintChannelStatus(await call("channelstatus"))) return;
+    const [list, peers, balance] = await Promise.all([
+      call("channellist"), call("getpeers"), call("getbalance")
+    ]);
+    // The terms are constants of the node: read once.
+    if (!channelInfo){
+      channelInfo = await call("getinfo");
+      channelTerms = channelInfo.channel_terms || null;
+    }
+    channelList = Array.isArray(list) ? list : [];
+    channelPeers = (peers && Array.isArray(peers.peers)) ? peers.peers : [];
+    channelSpendable = channelUnits(balance.spendable);
+    paintChannels();
+    paintChannelPeers();
+    paintCapacityHelp();
+    // The note of an opening stays until the channel it announced is open.
+    if (openNoted && Date.now() - openNoted > 10000 &&
+        !channelList.some(ch => ["opening", "funded"].includes(String(ch.phase)))){
+      openNoted = 0;
+      document.getElementById("channel-open-result").innerHTML = "";
+    }
+  }catch(e){
+    document.getElementById("channel-zone").hidden = true;
+    document.getElementById("channel-state").innerHTML = channelRefusal("Channels unavailable", e);
+  }finally{
+    channelLoading = false;
+  }
+}
+
+// Every five seconds while the tab is in view, and not at all otherwise: a
+// wallet left on another tab, or in a hidden window, costs the node nothing.
+setInterval(() => {
+  if (!document.getElementById("view-channels").hidden && !document.hidden) loadChannels();
+}, 5000);
+
+// --- Opening: review, then confirm.
+
+function showOpenForm(){
+  preparedOpen = null;
+  document.getElementById("channel-open-confirmation").hidden = true;
+  document.getElementById("channel-open-card").hidden = false;
+}
+
+document.getElementById("channel-open-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const out = document.getElementById("channel-open-result");
+  out.innerHTML = "";
+  openNoted = 0;
+  const refuse = m => {
+    out.innerHTML = `<div class="warn"><h3>Channel not prepared</h3><p>${esc(m)}</p></div>`;
+  };
+  const field = document.getElementById("channel-peer-field");
+  const peer = field.value;
+  if (!peer) return refuse("Choose a peer that accepts channels.");
+  const capacity = unitsFromQ21(document.getElementById("channel-capacity-field").value);
+  if (capacity === null) return refuse("Invalid capacity. Expected a number in Q21, with at most eight decimal places.");
+  if (capacity <= 0n) return refuse("The capacity must be greater than zero.");
+
+  // Read again now, as for a send: a block may have arrived, or a payment
+  // left, since the page last looked.
+  let spendable = null;
+  try{
+    const [balance, info] = await Promise.all([call("getbalance"), call("getinfo")]);
+    spendable = unitsOf(balance.spendable);
+    channelInfo = info;
+    channelTerms = info.channel_terms || null;
+  }catch(e){
+    return refuse("Could not read the balance again; nothing was opened: " + e.message);
+  }
+  const terms = channelTerms;
+  if (terms && capacity < unitsOf(terms.min_capacity))
+    return refuse("The capacity must be at least " + terms.min_capacity.q21 + " Q21.");
+  if (terms && capacity > unitsOf(terms.max_capacity))
+    return refuse("The capacity can be at most " + terms.max_capacity.q21 + " Q21.");
+  const fee = terms ? unitsOf(terms.open_fee) : 0n;
+  const total = capacity + fee;
+  if (total > spendable){
+    return refuse("Not enough funds: " + q21FromUnits(total) + " Q21 needed with the fee, " +
+                  q21FromUnits(spendable) + " Q21 spendable.");
+  }
+  const label = field.selectedOptions.length ? field.selectedOptions[0].textContent : peer;
+  const feeRow = terms
+    ? `<div class="l"><span class="k">Funding fee, on the chain</span><span class="v">${esc(q21FromUnits(fee))} Q21</span></div>`
+    : "";
+  document.getElementById("channel-open-recap").innerHTML =
+      `<div class="l"><span class="k">Peer</span><span class="v">${esc(label)}</span></div>`
+    + `<div class="l"><span class="k">Locked in the channel</span><span class="v">${esc(q21FromUnits(capacity))} Q21</span></div>`
+    + html(feeRow)
+    + `<div class="l total"><span class="k">Total debited</span><span class="v">${esc(q21FromUnits(total))} Q21</span></div>`
+    + `<div class="l"><span class="k">Balance after</span><span class="v">${esc(q21FromUnits(spendable - total))} Q21</span></div>`;
+  document.getElementById("channel-open-delay").textContent = channelDelayText();
+  preparedOpen = {peer: peer, capacity: capacity};
+  document.getElementById("channel-open-card").hidden = true;
+  document.getElementById("channel-open-confirmation").hidden = false;
+});
+
+document.getElementById("channel-open-cancel").addEventListener("click", showOpenForm);
+
+document.getElementById("channel-open-button").addEventListener("click", async () => {
+  if (!preparedOpen || channelBusy) return;
+  channelBusy = true;
+  const b = document.getElementById("channel-open-button");
+  b.disabled = true;
+  b.textContent = "Opening…";
+  const p = preparedOpen;
+  const out = document.getElementById("channel-open-result");
+  try{
+    // The capacity leaves as digits, like the amount of a send.
+    await call("channelopen", '{"peer":' + JSON.stringify(p.peer) +
+                              ',"capacity":' + p.capacity.toString() + '}');
+    document.getElementById("channel-capacity-field").value = "";
+    out.innerHTML = `<div class="note"><h3>✓ Opening requested</h3><p>${esc(channelDepthText())}</p></div>`;
+    openNoted = Date.now();
+  }catch(e){
+    out.innerHTML = channelRefusal("Channel not opened", e, `<p>No funds have moved.</p>`);
+  }finally{
+    showOpenForm();
+    b.disabled = false;
+    b.textContent = "Open the channel";
+    channelBusy = false;
+    loadChannels();
+  }
+});
+
+// --- Paying and closing, from the buttons of a row.
+
+function forceOffer(cid){
+  return `<div class="note"><h3>The peer is offline</h3>
+    <p>A closing agreed with the peer needs it online. If it is gone for good, the channel can be closed without it.</p>
+    <div class="buttons"><button type="button" class="secondary" data-channel-force="${esc(cid)}">Close without the peer…</button></div></div>`;
+}
+
+function paintPayForm(cid){
+  const zone = document.getElementById("channel-action");
+  const ch = channelById(cid);
+  preparedChannel = null;
+  if (!ch || !CHANNEL_ID.test(cid)){ zone.innerHTML = ""; return; }
+  zone.innerHTML = `
+    <h2>Pay in a channel</h2>
+    <div class="card">
+    <form id="channel-pay-form" autocomplete="off" data-channel="${esc(cid)}">
+      <h3>${esc(channelPeerText(ch))}</h3>
+      <label for="channel-pay-field">Amount (Q21)</label>
+      <input type="text" id="channel-pay-field" placeholder="0.00000000" inputmode="decimal" spellcheck="false" autocomplete="off">
+      <div class="help">${esc("You can send up to " + q21FromUnits(channelSendable(ch)) + " Q21 in this channel, at once and with no fee.")}</div>
+      <div class="buttons">
+        <button type="button" class="secondary" data-channel-back>Back</button>
+        <button type="submit" class="action">Review</button>
+      </div>
+    </form>
+    </div>
+    <div id="channel-pay-result"></div>`;
+  zone.scrollIntoView({block: "nearest"});
+  document.getElementById("channel-pay-field").focus();
+}
+
+async function reviewPayment(form){
+  const cid = form.dataset.channel;
+  const zone = document.getElementById("channel-action");
+  const out = document.getElementById("channel-pay-result");
+  const refuse = m => {
+    out.innerHTML = `<div class="warn"><h3>Payment not prepared</h3><p>${esc(m)}</p></div>`;
+  };
+  if (!CHANNEL_ID.test(cid)) return;
+  const amount = unitsFromQ21(document.getElementById("channel-pay-field").value);
+  if (amount === null) return refuse("Invalid amount. Expected a number in Q21, with at most eight decimal places.");
+  if (amount <= 0n) return refuse("The amount must be greater than zero.");
+  // The channel is read again: a payment may have arrived or left since the
+  // table was drawn.
+  let ch;
+  try{
+    ch = await call("channelinfo", '{"channel_id":' + JSON.stringify(cid) + '}');
+  }catch(e){
+    out.innerHTML = channelRefusal("Payment not prepared", e);
+    return;
+  }
+  if (String(ch.phase) !== "open") return refuse("This channel is not open: it can no longer carry payments.");
+  if (ch.in_flight) return refuse("A payment is already in flight in this channel. Wait a few seconds for it to settle, then pay again.");
+  const can = channelSendable(ch);
+  if (amount > can){
+    return refuse("Not enough in this channel: " + q21FromUnits(amount) + " Q21 requested, " +
+                  q21FromUnits(can) + " Q21 available.");
+  }
+  preparedChannel = {kind: "pay", cid: cid, amount: amount};
+  zone.innerHTML = `
+    <h2>Confirm the payment</h2>
+    <div class="warn">
+      <h3>A channel payment is final</h3>
+      <p>It reaches the peer at once, with no fee, and cannot be taken back once settled. Re-read the amount: it is the only check you have left.</p>
+    </div>
+    <div class="recap">
+      <div class="l"><span class="k">Peer</span><span class="v">${esc(channelPeerText(ch))}</span></div>
+      <div class="l"><span class="k">Amount</span><span class="v">${esc(q21FromUnits(amount))} Q21</span></div>
+      <div class="l"><span class="k">Fee</span><span class="v">${esc(q21FromUnits(0n))} Q21</span></div>
+      <div class="l"><span class="k">Left in the channel</span><span class="v">${esc(q21FromUnits(can - amount))} Q21</span></div>
+    </div>
+    <div class="buttons">
+      <button type="button" class="secondary" data-channel-back>Back</button>
+      <button type="button" class="action" data-channel-confirm>Pay now</button>
+    </div>`;
+}
+
+function closeRecap(ch){
+  const fee = channelTerms ? channelTerms.close_fee.q21 : null;
+  const feeRow = fee
+    ? `<div class="l"><span class="k">Closing fee</span><span class="v">${esc(fee)} Q21</span></div>` : "";
+  return `<div class="recap">
+      <div class="l"><span class="k">Peer</span><span class="v">${esc(channelPeerText(ch))}</span></div>
+      <div class="l"><span class="k">Your balance in the channel</span><span class="v">${esc(q21FromUnits(channelSendable(ch)))} Q21</span></div>
+      ${html(feeRow)}
+    </div>`;
+}
+
+function paintCloseDialog(cid){
+  const zone = document.getElementById("channel-action");
+  const ch = channelById(cid);
+  preparedChannel = null;
+  if (!ch || !CHANNEL_ID.test(cid)){ zone.innerHTML = ""; return; }
+  preparedChannel = {kind: "close", cid: cid};
+  const fee = channelTerms
+    ? `<p>${esc("The closing fee, " + channelTerms.close_fee.q21 + " Q21, is taken from your balance in the channel.")}</p>` : "";
+  zone.innerHTML = `
+    <h2>Close the channel</h2>
+    <div class="warn">
+      <h3>Closing ends the channel</h3>
+      <p>Both balances go back to the chain in one transaction agreed with the peer. Your share joins your available balance once a block confirms it, about two minutes later: a closing agreed with the peer has no delay.</p>
+      ${html(fee)}
+      <p>${esc(channelDelayText())}</p>
+    </div>
+    ${html(closeRecap(ch))}
+    <div class="buttons">
+      <button type="button" class="secondary" data-channel-back>Back</button>
+      <button type="button" class="action" data-channel-confirm>Close now</button>
+    </div>
+    ${html(peerOf(ch) ? "" : forceOffer(cid))}`;
+  zone.scrollIntoView({block: "nearest"});
+}
+
+function paintForceDialog(cid){
+  const zone = document.getElementById("channel-action");
+  const ch = channelById(cid);
+  preparedChannel = null;
+  if (!ch || !CHANNEL_ID.test(cid)){ zone.innerHTML = ""; return; }
+  preparedChannel = {kind: "force", cid: cid};
+  zone.innerHTML = `
+    <h2>Close without the peer</h2>
+    <div class="warn">
+      <h3>Use this only if the peer is gone</h3>
+      <p>Your node puts the latest state of the channel on the chain by itself. The peer's share goes back to it; yours comes back once the delay has passed.</p>
+      <p>${esc(channelDelayText())}</p>
+      <p>A closing agreed with the peer is faster: if it may come back, wait for it.</p>
+    </div>
+    ${html(closeRecap(ch))}
+    <div class="buttons">
+      <button type="button" class="secondary" data-channel-back>Back</button>
+      <button type="button" class="action" data-channel-confirm>Close without the peer</button>
+    </div>`;
+}
+
+// The payment or the close confirmed on screen, sent. Its figures are the
+// ones prepared at review; the node checks them again on its side.
+async function confirmChannel(button){
+  const p = preparedChannel;
+  if (!p || channelBusy) return;
+  channelBusy = true;
+  button.disabled = true;
+  const zone = document.getElementById("channel-action");
+  try{
+    if (p.kind === "pay"){
+      button.textContent = "Paying…";
+      let r;
+      try{
+        r = await call("channelpay", '{"channel_id":' + JSON.stringify(p.cid) +
+                                     ',"amount":' + p.amount.toString() + '}');
+      }catch(e){
+        // The peer dropped after the payment was signed: it is not lost, it
+        // completes when the link comes back.
+        if (!/completes when the channel reconnects/i.test(e.message)) throw e;
+        r = {status: "pending", offline: true};
+      }
+      preparedChannel = null;
+      zone.innerHTML = String(r.status) === "settled"
+        ? `<div class="note"><h3>✓ Payment settled</h3><p>It reached the peer at once, and can no longer be undone.</p></div>`
+        : `<div class="note"><h3><span class="badge pending">${render(spinner())} pending</span> Payment pending</h3>
+           <p>${esc(r.offline
+             ? "The peer went offline during the payment. It completes on its own when the peer reconnects."
+             : "The peer has not confirmed it yet. It completes on its own, even after a reconnection: the balances above show it once it does.")}</p></div>`;
+    } else {
+      button.textContent = "Closing…";
+      let note = p.kind === "force"
+        ? "Your node has put the latest state on the chain. The list above shows “funds returning after a delay” until your share is back in your wallet."
+        : "The peer has the closing to sign. The closing transaction then waits for a block, and the list above shows the channel closed.";
+      try{
+        await call("channelclose", '{"channel_id":' + JSON.stringify(p.cid) +
+                                   (p.kind === "force" ? ',"force":true' : '') + '}');
+      }catch(e){
+        if (p.kind === "force" || !/completes when the channel reconnects/i.test(e.message)) throw e;
+        note = "The peer went offline during the closing. It completes on its own when the peer reconnects.";
+      }
+      preparedChannel = null;
+      zone.innerHTML = `<div class="note"><h3>✓ Closing requested</h3><p>${esc(note)}</p></div>`;
+    }
+  }catch(e){
+    preparedChannel = null;
+    const offline = p.kind === "close" && /not connected/i.test(e.message);
+    zone.innerHTML = channelRefusal(p.kind === "pay" ? "Payment not made" : "Channel not closed", e,
+                                    `<p>No funds have moved.</p>`) +
+                     (offline ? forceOffer(p.cid) : "");
+  }finally{
+    channelBusy = false;
+    loadChannels();
+  }
+}
+
+document.getElementById("channel-rows").addEventListener("click", ev => {
+  const pay = ev.target.closest("button[data-pay]");
+  if (pay){ paintPayForm(pay.dataset.pay); return; }
+  const close = ev.target.closest("button[data-close]");
+  if (close) paintCloseDialog(close.dataset.close);
+});
+
+// One listener each for the whole zone: its content is rebuilt at every step.
+document.getElementById("channel-action").addEventListener("click", ev => {
+  if (ev.target.closest("button[data-channel-back]")){
+    preparedChannel = null;
+    document.getElementById("channel-action").innerHTML = "";
+    return;
+  }
+  const f = ev.target.closest("button[data-channel-force]");
+  if (f){ paintForceDialog(f.dataset.channelForce); return; }
+  const c = ev.target.closest("button[data-channel-confirm]");
+  if (c) confirmChannel(c);
+});
+
+document.getElementById("channel-action").addEventListener("submit", ev => {
+  const form = ev.target.closest("#channel-pay-form");
+  if (!form) return;
+  ev.preventDefault();
+  reviewPayment(form);
+});
+
 </script>
 </body>
 </html>
@@ -4055,16 +4729,16 @@ mod tests {
         );
     }
 
-    /// The seven views exist, and mining as well as the network are among
-    /// them.
+    /// The eight views exist: mining, the network and the payment channels
+    /// are among them.
     ///
-    /// The previous test counted five. It was extended, not replaced: a view
-    /// that disappears is a regression, a view that is added must be declared
-    /// here.
+    /// The first version of this test counted five. It is extended, not
+    /// replaced: a view that disappears is a regression, a view that is added
+    /// must be declared here.
     #[test]
-    fn the_seven_views_exist() {
+    fn the_eight_views_exist() {
         for v in [
-            "balance", "mine", "receive", "network", "send", "activity", "info",
+            "balance", "mine", "receive", "network", "send", "channels", "activity", "info",
         ] {
             assert!(
                 PAGE.contains(&format!(r#"id="view-{v}""#)),
@@ -4077,7 +4751,7 @@ mod tests {
         }
         assert!(
             script().contains(
-                r#"const VIEWS = ["balance","mine","receive","network","send","activity","info"];"#
+                r#"const VIEWS = ["balance","mine","receive","network","send","channels","activity","info"];"#
             ),
             "the script's list of views does not match the markup"
         );
@@ -4771,5 +5445,247 @@ mod tests {
             assert!(fr.contains_key(note), "no French for: {note}");
             assert!(ja.contains_key(note), "no Japanese for: {note}");
         }
+    }
+
+    /// The script of the Channels tab, from its heading to the end.
+    fn channel_script() -> &'static str {
+        let s = script();
+        let start = s
+            .find("// Payment channels\n// ---")
+            .expect("the channels section of the script");
+        &s[start..]
+    }
+
+    /// The body of a function of the channels script, up to its closing
+    /// brace at the start of a line.
+    fn channel_function(head: &str) -> &'static str {
+        let s = channel_script();
+        let d = s.find(head).unwrap_or_else(|| panic!("no {head}"));
+        let f = s[d..].find("\n}").expect("its end") + d;
+        &s[d..f]
+    }
+
+    /// What comes from the node is escaped on its way into the tab: peer
+    /// addresses and ids, channel ids — in the text and in the attributes —
+    /// amounts, states and error messages.
+    #[test]
+    fn channel_values_are_escaped() {
+        let s = channel_script();
+        // All the markup is in template literals, whose interpolations the
+        // test above checks one by one; no markup is concatenated by hand.
+        assert!(!s.contains("'<"), "markup assembled outside a template");
+        assert!(!s.contains("\"<"), "markup assembled outside a template");
+
+        let rows = channel_function("function paintChannels(");
+        for e in [
+            "esc(String(p.address))",
+            "trunc(p.channel_id, 8)",
+            r#"data-pay="${esc(cid)}""#,
+            r#"data-close="${esc(cid)}""#,
+            "esc(channelAmount(ch.capacity))",
+            "esc(channelAmount(ch.local_balance))",
+            "esc(channelAmount(ch.remote_balance))",
+            "q21FromUnits(arriving)",
+        ] {
+            assert!(rows.contains(e), "the channel table does not escape: {e}");
+        }
+        // An unknown state from the node is shown, escaped, rather than
+        // dropped.
+        assert!(channel_function("function channelState(").contains("${esc(word)}"));
+        let peers = channel_function("function paintChannelPeers(");
+        assert!(peers.contains(r#"value="${esc(channelPeerKey(p))}""#));
+        assert!(peers.contains("${esc(String(p.address))}"));
+        let refusal = channel_function("function channelRefusal(");
+        assert!(refusal.contains("esc(plain || m)"));
+        assert!(refusal.contains(r#"esc("Node message: " + m)"#));
+
+        // A channel id read back from the page is checked before it is sent.
+        for f in [
+            "function paintPayForm(",
+            "async function reviewPayment(",
+            "function paintCloseDialog(",
+            "function paintForceDialog(",
+        ] {
+            assert!(
+                channel_function(f).contains("CHANNEL_ID.test(cid)"),
+                "{f} uses a channel id without checking it"
+            );
+        }
+        assert!(s.contains("const CHANNEL_ID = /^[0-9a-f]{64}$/;"));
+        // Amounts: integers of units, through BigInt, out as digits.
+        assert!(channel_function("function channelUnits(").contains("unitsOf(v)"));
+        assert!(s.contains(r#"',"amount":' + p.amount.toString() + '}'"#));
+        assert!(s.contains(r#"',"capacity":' + p.capacity.toString() + '}'"#));
+    }
+
+    /// Opening, paying and closing each go through a confirmation that says
+    /// what moves, and the call that moves funds is only reachable from it.
+    #[test]
+    fn every_channel_action_goes_through_a_confirmation() {
+        let s = channel_script();
+        // Opening: the call leaves only from the button of the confirmation,
+        // which states what gets locked, the fee, and that the funds stay
+        // recoverable.
+        assert_eq!(s.matches(r#"call("channelopen""#).count(), 1);
+        let open = s
+            .find(r#"document.getElementById("channel-open-button").addEventListener"#)
+            .expect("the confirmation button");
+        let call = s.find(r#"call("channelopen""#).expect("the call");
+        assert!(
+            call > open && call - open < 600,
+            "channelopen outside its confirmation"
+        );
+        assert!(channel_function("function showOpenForm(").contains("preparedOpen = null"));
+        let confirmation = PAGE
+            .find(r#"<div id="channel-open-confirmation" hidden>"#)
+            .expect("the open confirmation");
+        let end = confirmation
+            + PAGE[confirmation..]
+                .find("</div>\n    <div id=\"channel-open-result\"")
+                .expect("its end");
+        let block = &PAGE[confirmation..end];
+        for e in [
+            "Funds locked in the channel",
+            r#"id="channel-open-delay""#,
+            r#"id="channel-open-recap""#,
+            r#"id="channel-open-cancel""#,
+            r#"id="channel-open-button""#,
+        ] {
+            assert!(block.contains(e), "the open confirmation lacks {e}");
+        }
+        for e in [
+            "Locked in the channel",
+            "Funding fee, on the chain",
+            "Total debited",
+        ] {
+            assert!(s.contains(e), "the open recap lacks {e}");
+        }
+        assert!(
+            channel_function("function channelDelayText(").contains("your funds stay recoverable")
+        );
+
+        // Paying and closing: one function sends them, only from the
+        // confirmation's button, and only what was prepared.
+        let confirm = channel_function("async function confirmChannel(");
+        assert!(confirm.contains("const p = preparedChannel;\n  if (!p || channelBusy) return;"));
+        for m in ["channelpay", "channelclose"] {
+            let call = format!(r#"call("{m}""#);
+            assert_eq!(s.matches(&call).count(), 1, "{m} called more than once");
+            assert!(confirm.contains(&call), "{m} sent outside the confirmation");
+        }
+        assert_eq!(
+            s.matches("confirmChannel(").count(),
+            2,
+            "one definition, one caller"
+        );
+        assert!(s.contains("if (c) confirmChannel(c);"));
+        assert!(s.contains(r#"ev.target.closest("button[data-channel-confirm]")"#));
+        for (f, warning) in [
+            (
+                "async function reviewPayment(",
+                "A channel payment is final",
+            ),
+            ("function paintCloseDialog(", "Closing ends the channel"),
+            (
+                "function paintForceDialog(",
+                "Use this only if the peer is gone",
+            ),
+        ] {
+            let body = channel_function(f);
+            assert!(body.contains(warning), "{f}: no warning");
+            assert!(
+                body.contains("data-channel-confirm"),
+                "{f}: no confirm button"
+            );
+            assert!(body.contains("data-channel-back"), "{f}: no way back");
+            assert!(
+                body.contains("preparedChannel = {kind:"),
+                "{f}: nothing prepared"
+            );
+        }
+        // The close states its fee and the delay of a close without the peer.
+        let close = channel_function("function paintCloseDialog(");
+        assert!(close.contains("channelTerms.close_fee.q21"));
+        assert!(close.contains("channelDelayText()"));
+        // The two answers of a payment are told apart.
+        assert!(confirm.contains(r#"String(r.status) === "settled""#));
+        assert!(confirm.contains("Payment pending"));
+    }
+
+    /// The tab says when channels activate, and offers nothing before.
+    #[test]
+    fn the_channels_tab_waits_for_their_activation() {
+        let s = channel_script();
+        let status = channel_function("function paintChannelStatus(");
+        assert!(status.contains("st.active === true"));
+        assert!(status.contains("body.hidden = true;"));
+        // No height is announced while none is scheduled (`u64::MAX`).
+        assert!(status.contains("Number.isSafeInteger(h)"));
+        assert!(status.contains("Channels activate at block "));
+        assert!(status.contains(" block(s) remain, "));
+        assert!(status.contains("aboutSeconds(st.eta_seconds)"));
+        // The status comes first, and nothing else is asked before it says
+        // channels are active.
+        let load = channel_function("async function loadChannels(");
+        let first = load.find(r#"call("channelstatus")"#).expect("status read");
+        let list = load.find(r#"call("channellist")"#).expect("list read");
+        assert!(first < list);
+        assert!(load.contains(r#"if (!paintChannelStatus(await call("channelstatus"))) return;"#));
+        // The open form lives in the zone that stays hidden until then.
+        let zone = PAGE
+            .find(r#"<div id="channel-zone" hidden>"#)
+            .expect("zone");
+        let form = PAGE.find(r#"<form id="channel-open-form""#).expect("form");
+        let note = PAGE
+            .find("What is a payment channel?")
+            .expect("explanation");
+        assert!(zone < form && form < note);
+        assert!(s.contains("Payment channels are not active yet"));
+    }
+
+    /// The five refusals a user meets are told in plain words.
+    #[test]
+    fn channel_errors_are_explained() {
+        let problem = channel_function("function channelProblem(");
+        for (node, plain) in [
+            ("/not connected|disconnected", "The peer is offline."),
+            ("/shutting down/", "The wallet is shutting down"),
+            (
+                "/already in flight/",
+                "A payment is already in flight in this channel.",
+            ),
+            (
+                "/insufficient channel balance/",
+                "Your balance in this channel is too low",
+            ),
+            ("/insufficient/", "Your available balance is too low"),
+            (
+                "/regtest only|not active/",
+                "Payment channels are not active on this network yet.",
+            ),
+        ] {
+            assert!(problem.contains(node), "not recognized: {node}");
+            assert!(problem.contains(plain), "not explained: {plain}");
+        }
+        // A payment the peer did not hear the end of is pending, not lost.
+        let confirm = channel_function("async function confirmChannel(");
+        assert!(confirm.contains("completes when the channel reconnects"));
+        // And a close refused for an absent peer offers the way out.
+        assert!(confirm.contains("forceOffer(p.cid)"));
+    }
+
+    /// The channel data is read every few seconds, and only while the tab is
+    /// in view.
+    #[test]
+    fn the_channels_tab_polls_only_while_visible() {
+        let s = channel_script();
+        assert!(s.contains(
+            r#"if (!document.getElementById("view-channels").hidden && !document.hidden) loadChannels();
+}, 5000);"#
+        ));
+        assert!(s.contains("if (channelLoading) return;"));
+        assert!(script().contains(r#"if (name === "channels") loadChannels();"#));
+        // The node's terms are constants: read once, not at every round.
+        assert!(channel_function("async function loadChannels(").contains("if (!channelInfo){"));
     }
 }
