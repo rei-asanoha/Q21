@@ -1765,7 +1765,7 @@ impl Machine {
                 }
                 Record::Forcing => self.phase = Phase::Forcing,
                 Record::Penalised => self.phase = Phase::Penalised,
-                Record::Closed => self.phase = Phase::Closed,
+                Record::Closed | Record::Abandoned => self.phase = Phase::Closed,
                 Record::Confirmed { height } => self.funding_height = Some(*height),
                 Record::KeyIndex { index } => self.key_index = Some(*index),
                 Record::FundingTx { tx } => {
@@ -2200,6 +2200,16 @@ impl Machine {
         if self.phase != Phase::Penalised {
             self.journal.append(&Record::Penalised)?;
             self.phase = Phase::Penalised;
+        }
+        Ok(())
+    }
+
+    /// Records that we gave the channel up before its funding confirmed (see
+    /// [`Record::Abandoned`]); moves to [`Phase::Closed`].
+    pub fn mark_abandoned(&mut self) -> Result<(), ChannelError> {
+        if self.phase != Phase::Closed {
+            self.journal.append(&Record::Abandoned)?;
+            self.phase = Phase::Closed;
         }
         Ok(())
     }

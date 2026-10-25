@@ -130,6 +130,10 @@ pub enum Record {
     /// The sequence number of the last signed control message accepted from
     /// the peer: one at or below it is a replay.
     ControlRecv { seq: u64 },
+    /// We gave the channel up: our funding can never confirm, a coin it
+    /// spends being spent on chain by another transaction, buried. Settled
+    /// like [`Record::Closed`]; the journal is kept, never deleted.
+    Abandoned,
 }
 
 const R_OPENED: u8 = 1;
@@ -155,6 +159,7 @@ const R_KEY_INDEX: u8 = 19;
 const R_OPENED_INDEXED: u8 = 20;
 const R_CONTROL_SENT: u8 = 21;
 const R_CONTROL_RECV: u8 = 22;
+const R_ABANDONED: u8 = 23;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -272,6 +277,9 @@ impl Record {
             Record::ControlRecv { seq } => {
                 w.u8(R_CONTROL_RECV).u64(*seq);
             }
+            Record::Abandoned => {
+                w.u8(R_ABANDONED);
+            }
         }
         w.finish()
     }
@@ -361,6 +369,7 @@ impl Record {
             R_KEY_INDEX => Record::KeyIndex { index: r.u32()? },
             R_CONTROL_SENT => Record::ControlSent { seq: r.u64()? },
             R_CONTROL_RECV => Record::ControlRecv { seq: r.u64()? },
+            R_ABANDONED => Record::Abandoned,
             R_FUNDING_TX => Record::FundingTx {
                 tx: r.var_bytes()?.to_vec(),
             },

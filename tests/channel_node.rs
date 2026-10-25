@@ -2610,7 +2610,8 @@ fn funding_coins_are_held_back_until_the_funding_confirms() {
 
 /// N4: a coin our unconfirmed funding spends is spent on chain by something
 /// else: the funding can never confirm, and once that spend is buried the
-/// channel is given up, its journal deleted.
+/// channel is given up — marked abandoned, its coins released, its journal
+/// kept (M1).
 #[test]
 fn a_funding_whose_coin_is_spent_elsewhere_is_given_up() {
     let (mut p, wallet, chain, dir, sent) =
@@ -2641,21 +2642,28 @@ fn a_funding_whose_coin_is_spent_elsewhere_is_given_up() {
             .unwrap();
         let tx = w.sign_spend(utxo, prepared).unwrap();
         assert!(tx.inputs.iter().any(|i| coins.contains(&i.prev_out)));
+        // Held back again, as the node still holds them.
+        w.lock_coins(&coins);
         tx
     };
     chain.lock().unwrap().mine(std::slice::from_ref(&conflict));
     let journal = dir.join("funder").join(format!("{}.jrnl", cid.to_hex()));
     drive(&p.funder, &chain);
-    assert!(
-        p.funder.info(cid).is_some(),
+    let phase = |p: &Pair| p.funder.info(cid).map(|i| i.phase);
+    assert_eq!(
+        phase(&p),
+        Some(Phase::Funded),
         "not before the spend is buried"
     );
     for _ in 1..DEPTH {
         chain.lock().unwrap().mine(&[]);
         drive(&p.funder, &chain);
     }
-    assert!(p.funder.info(cid).is_none(), "given up");
-    assert!(!journal.exists());
+    assert_eq!(phase(&p), Some(Phase::Closed), "given up");
+    assert!(journal.exists(), "the journal is kept, marked abandoned");
+    // Its coins are free again: the conflict spent one, the rest are back.
+    let w = wallet.lock().unwrap();
+    assert!(funding.inputs.iter().all(|i| !w.is_locked(&i.prev_out)));
 }
 
 /// An engine frame as the manager writes it: the channel id, the kind, the
@@ -2763,4 +2771,73 @@ fn a_challenge_does_not_name_its_channel_in_clear() {
     let r = p.acceptor.deliver(F_PEER, "", &frames[0]);
     assert_eq!(r.penalize, 0);
     assert!(!r.frames.is_empty());
+}
+
+/// M1: we fund, and go down before the funding confirms: no funding height
+/// is journaled. The funding confirms and the acceptor broadcasts its
+/// commitment 0. On restart the channel must be rescanned — its funding's
+/// coins are spent, by the funding itself — and our capacity claimed, never
+/// taken for a funding beaten by a conflict, and the journal never deleted.
+#[test]
+fn a_funding_confirmed_while_we_were_down_is_claimed_not_given_up() {
+    let funder_seed = [0xb5u8; 32];
+    let acceptor_seed = [0xb6u8; 32];
+    let (mut p, wallet, chain, dir, sent) =
+        unconfirmed_funding_pair(funder_seed, acceptor_seed, "m1-offline-funder");
+    let capacity = 4 * MIN_OUTPUT_VALUE * 10;
+    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    let funding = sent.lock().unwrap()[0].clone();
+    // The funder goes down; the funding confirms without it.
+    let Pair {
+        funder, acceptor, ..
+    } = p;
+    drop(funder);
+    chain.lock().unwrap().mine(std::slice::from_ref(&funding));
+    drive(&acceptor, &chain);
+    bury(&[&acceptor], &chain);
+    assert_eq!(acceptor.info(cid).unwrap().phase, Phase::Open);
+    // The acceptor force-closes: its commitment 0 pays the funder's whole
+    // balance to the funder's channel key.
+    let commitment = acceptor.force_close(cid).unwrap();
+    assert_eq!(chain.lock().unwrap().last_txs[1].txid(), commitment.txid());
+    chain.lock().unwrap().mine(&[]);
+
+    let before = held(&chain, FUNDER_PAYOUT);
+    // Its broadcasts are mined when they are valid, refused otherwise, as a
+    // mempool would.
+    let c = chain.clone();
+    let funder = restart_and_rescan(
+        funder_seed,
+        &dir.join("funder"),
+        Hooks {
+            broadcast: Box::new(move |tx: &Transaction| {
+                let mut c = c.lock().unwrap();
+                if tx
+                    .inputs
+                    .iter()
+                    .any(|i| c.chain.utxo.get(&i.prev_out).is_none())
+                {
+                    return Err("missing input".into());
+                }
+                c.mine(std::slice::from_ref(tx));
+                Ok(())
+            }),
+            ..funder_hooks(wallet, chain.clone())
+        },
+        &chain,
+    );
+    for _ in 0..(2 * DEPTH + 2) {
+        chain.lock().unwrap().mine(&[]);
+        drive(&funder, &chain);
+    }
+    let journal = dir.join("funder").join(format!("{}.jrnl", cid.to_hex()));
+    assert!(journal.exists(), "the funder's journal was deleted");
+    let claimed = held(&chain, FUNDER_PAYOUT) - before;
+    assert!(
+        claimed + 100_000 >= capacity,
+        "the funder's capacity was not claimed ({claimed} of {capacity})"
+    );
 }

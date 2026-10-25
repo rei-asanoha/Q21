@@ -169,10 +169,10 @@ struct Chan {
     /// Whether the coins of our funding transaction are held back in the
     /// wallet (see [`ReserveFn`]).
     reserved: bool,
-    /// Blocks in a row in which a coin our unconfirmed funding spends was
-    /// seen spent on chain by something else: once that is buried, the
-    /// funding can never confirm and the channel is given up.
-    conflicted: u64,
+    /// A transaction other than our funding seen confirmed spending one of
+    /// its coins, with its height: once that is buried, the funding can never
+    /// confirm and the channel is given up.
+    conflict: Option<(Hash256, u64)>,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -518,7 +518,7 @@ impl ChannelManager {
                         close: None,
                         spend: None,
                         reserved: false,
-                        conflicted: 0,
+                        conflict: None,
                     },
                 );
             }
@@ -947,7 +947,7 @@ impl ChannelManager {
                 close: None,
                 spend: None,
                 reserved: false,
-                conflicted: 0,
+                conflict: None,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
@@ -1247,7 +1247,7 @@ impl ChannelManager {
                 close: None,
                 spend: None,
                 reserved: false,
-                conflicted: 0,
+                conflict: None,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
@@ -1302,11 +1302,36 @@ impl ChannelManager {
         height: u64,
         depth_of: &DepthOf,
     ) -> Vec<(u64, Vec<u8>)> {
+        self.watch_fundings(txs, height);
         self.react_to_spends(txs, height);
         let frames = self.confirm_buried(height, depth_of);
         self.advance_closes(txs, height);
-        self.expire_unfunded(depth_of);
+        self.expire_unfunded(height, depth_of);
         frames
+    }
+
+    /// Follows our own fundings not yet open in the block at `height`: the
+    /// funding itself confirming (its height journaled, so a restart scans
+    /// from there), or another transaction spending one of its coins — the
+    /// only conflict there is: the funding spending them is no conflict.
+    fn watch_fundings(&self, txs: &[Transaction], height: u64) {
+        let mut g = self.inner.lock().unwrap();
+        for c in g.unfunded_iter_mut(false) {
+            let Some(funding) = c.machine.funding_tx() else {
+                continue;
+            };
+            let txid = funding.txid();
+            let coins: Vec<OutPoint> = funding.inputs.iter().map(|i| i.prev_out).collect();
+            if txs.iter().any(|t| t.txid() == txid) {
+                let _ = c.machine.note_funding_height(height);
+                c.conflict = None;
+            } else if let Some(t) = txs
+                .iter()
+                .find(|t| t.inputs.iter().any(|i| coins.contains(&i.prev_out)))
+            {
+                c.conflict = Some((t.txid(), height));
+            }
+        }
     }
 
     /// Shortens how long a channel may wait for its funding (see
@@ -1329,7 +1354,7 @@ impl ChannelManager {
     ///
     /// A channel we accepted whose Funding never came waits only
     /// [`INBOUND_FUNDING_TTL`].
-    fn expire_unfunded(&self, depth_of: &DepthOf) {
+    fn expire_unfunded(&self, height: u64, depth_of: &DepthOf) {
         let mut g = self.inner.lock().unwrap();
         let (long, short) = (g.unfunded_ttl, g.inbound_funding_ttl);
         let ttl_of = |c: &Chan| {
@@ -1373,31 +1398,36 @@ impl ChannelManager {
                 ttl.as_secs()
             );
         }
-        // Our funding, unconfirmed, whose coins something else spent on chain:
-        // it can never confirm. Given up once that spend is buried — nothing
-        // of ours went into a channel that never existed.
+        // Our funding, unconfirmed, one of whose coins another transaction
+        // spent on chain: it can never confirm. Given up once that spend is
+        // buried — the coins released, the channel marked abandoned, its
+        // journal kept: were the funding on chain after all, its key and
+        // commitments are still there to recover the capacity.
         let network = self.network;
-        let mut given_up = Vec::new();
         for c in g.unfunded_iter_mut(false) {
-            let lost = c.spend.is_none()
-                && c.machine.funding_tx().is_some_and(|tx| {
-                    c.machine
-                        .funding_outpoint()
-                        .is_some_and(|op| depth_of(&op).is_none())
-                        && tx.inputs.iter().any(|i| depth_of(&i.prev_out).is_none())
-                });
-            c.conflicted = if lost { c.conflicted + 1 } else { 0 };
-            if c.conflicted >= settle_depth(network, c.machine.funding_depth()) {
-                given_up.push(c.machine.channel_id());
+            let Some((_, at)) = c.conflict else {
+                continue;
+            };
+            let funded = c
+                .machine
+                .funding_outpoint()
+                .is_some_and(|op| depth_of(&op).is_some());
+            let buried = height.saturating_add(1).saturating_sub(at)
+                >= settle_depth(network, c.machine.funding_depth());
+            if c.spend.is_some() || funded || c.machine.funding_height().is_some() || !buried {
+                continue;
             }
-        }
-        for cid in given_up {
-            release.extend(self.forget(&mut g, cid));
-            eprintln!(
-                "channel {}: a coin its funding spends was spent elsewhere; the funding \
-                 can never confirm, channel given up",
-                cid.to_hex()
-            );
+            if c.machine.mark_abandoned().is_ok() {
+                if c.reserved {
+                    c.reserved = false;
+                    release.extend(c.machine.funding_tx().cloned());
+                }
+                eprintln!(
+                    "channel {}: a coin its funding spends was spent by another \
+                     transaction; the funding can never confirm, channel abandoned",
+                    c.machine.channel_id().to_hex()
+                );
+            }
         }
         drop(g);
         for tx in release {
@@ -1447,10 +1477,17 @@ impl ChannelManager {
                         return false;
                     };
                     // Spent, or never seen confirmed: only a funding known to
-                    // have confirmed is looked for.
+                    // have confirmed is looked for — or our own funding one
+                    // of whose coins is spent on chain: by the funding itself,
+                    // confirmed (and maybe spent) while we were down, or by a
+                    // conflict. Either is in the blocks scanned.
+                    let coin_spent = c.machine.funding_tx().is_some_and(|tx| {
+                        tx.inputs.iter().any(|i| depth_of(&i.prev_out).is_none())
+                    });
                     depth_of(&op).is_none()
                         && (c.machine.funding_height().is_some()
-                            || !matches!(c.machine.phase(), Phase::Opening | Phase::Funded))
+                            || !matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
+                            || coin_spent)
                 })
                 .map(|c| {
                     c.machine
@@ -1463,6 +1500,7 @@ impl ChannelManager {
             self.replaying.store(true, Ordering::SeqCst);
             for h in start..=tip {
                 if let Some(txs) = txs_at(h) {
+                    self.watch_fundings(&txs, h);
                     self.react_to_spends(&txs, h);
                     self.advance_closes(&txs, h);
                 }
@@ -1578,6 +1616,9 @@ impl ChannelManager {
             if chan.spend.is_some_and(|s| gone.contains(&s)) {
                 chan.spend = None;
                 chan.close = None;
+            }
+            if chan.conflict.is_some_and(|(t, _)| gone.contains(&t)) {
+                chan.conflict = None;
             }
         }
     }
