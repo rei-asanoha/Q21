@@ -154,6 +154,8 @@ struct After {
     closed: bool,
     /// A session was established, with this node id, legacy id and binding.
     established: Option<(String, String, [u8; 32])>,
+    /// How long its handshake took from this side, and in which role.
+    took: Option<(Duration, &'static str)>,
     penalize: u32,
 }
 
@@ -423,6 +425,13 @@ impl ChannelTransport {
             self.mgr.on_session_closed(peer);
         }
         if let Some((identity, legacy, binding)) = after.established {
+            if let Some((took, role)) = after.took {
+                eprintln!(
+                    "channel session with node {} on peer {peer}: up as {role}, handshake {} ms",
+                    &identity[..16],
+                    took.as_millis()
+                );
+            }
             for frame in self.mgr.on_session(peer, &identity, &legacy, binding) {
                 self.send(peer, frame);
             }
@@ -463,6 +472,7 @@ impl ChannelTransport {
             }
             Err((e, had)) => {
                 if had {
+                    eprintln!("channel session on peer {peer} ended ({e:?}); negotiating another");
                     self.mgr.on_session_closed(peer);
                 }
                 match e {
@@ -527,7 +537,8 @@ impl ChannelTransport {
     }
 
     fn on_resp(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
-        let Handshake::Initiating(ini, _) = std::mem::replace(&mut c.handshake, Handshake::Idle)
+        let Handshake::Initiating(ini, since) =
+            std::mem::replace(&mut c.handshake, Handshake::Idle)
         else {
             return After::default();
         };
@@ -540,6 +551,7 @@ impl ChannelTransport {
                 After {
                     closed,
                     established: Some(identity_of(&peer_info)),
+                    took: Some((since.elapsed(), "initiator")),
                     penalize: 0,
                 }
             }
@@ -554,7 +566,7 @@ impl ChannelTransport {
     }
 
     fn on_fin(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
-        let Handshake::Responding(r, _) = std::mem::replace(&mut c.handshake, Handshake::Idle)
+        let Handshake::Responding(r, since) = std::mem::replace(&mut c.handshake, Handshake::Idle)
         else {
             return After::default();
         };
@@ -566,6 +578,7 @@ impl ChannelTransport {
                 After {
                     closed,
                     established: Some(identity_of(&peer_info)),
+                    took: Some((since.elapsed(), "responder")),
                     penalize: 0,
                 }
             }
