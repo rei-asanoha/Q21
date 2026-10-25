@@ -84,6 +84,12 @@ pub const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cost of a body requested and never delivered. Two are enough to disconnect.
 pub const MISCONDUCT_BODY_WITHHELD: u32 = 50;
 
+/// Maintenance rounds in a row in which a peer let a body go overdue without
+/// delivering a single one, on time or late, before it is charged with
+/// withholding even though it answers our transaction requests. See
+/// `Peer::body_overdue_rounds`.
+pub const MAX_BODY_OVERDUE_ROUNDS: u8 = 3;
+
 /// Block bodies we accept having requested from one peer without having
 /// received them yet.
 ///
@@ -450,6 +456,11 @@ pub const MAX_REQUESTED_TXS: usize = TX_BUCKET_MAX as usize;
 /// `Shared::rejected`.
 pub const MAX_RECENT_REJECTS: usize = 20_000;
 
+/// Blocks a full-pool refusal is remembered for. Past them the transaction is
+/// worth one more download: a refusal that held only for a stale copy, or for
+/// a pool that has since changed, does not keep it out for good.
+pub const FULL_POOL_REFUSAL_BLOCKS: u64 = 6;
+
 /// Announced transactions waiting, per peer, for its budget to refill before
 /// they are requested. Sized to hold a re-offer of a full pool
 /// ([`MEMPOOL_REOFFER_MAX_TXS`]), so that a node catching up never has to
@@ -742,6 +753,18 @@ struct Peer {
     /// that has delivered nothing at all within that window. See
     /// [`Node::maintain_peers`].
     last_delivered: Instant,
+    /// Maintenance rounds in a row in which a body requested from this peer
+    /// went overdue, with no body delivered since. A peer that serves every
+    /// transaction we ask for but never a block body kept `last_delivered`
+    /// fresh, was never charged, and delayed each block by [`BODY_TIMEOUT`]
+    /// for as long as it liked. A body, even one that arrives after it was
+    /// asked elsewhere, resets it: a slow link delivers late, a withholder
+    /// never. Charged at [`MAX_BODY_OVERDUE_ROUNDS`].
+    body_overdue_rounds: u8,
+    /// Bodies that went overdue from this peer, most recent last: one of them
+    /// arriving late still shows the peer delivers. Bounded by
+    /// [`MAX_BODIES_IN_FLIGHT`].
+    late_bodies: VecDeque<Hash256>,
     /// Instant of the last `Ping` sent that has gone unanswered.
     pending_ping: Option<Instant>,
     /// Transactions we asked this peer for and that have not arrived yet.
@@ -778,6 +801,19 @@ struct Peer {
 }
 
 impl Peer {
+    /// A block body arrived from this peer: if we had asked it for that body,
+    /// on time or past its deadline, it is answering, and owes us no body.
+    fn note_body_delivered(&mut self, bid: &Hash256) {
+        let late = self.late_bodies.iter().position(|h| h == bid);
+        if let Some(i) = late {
+            self.late_bodies.remove(i);
+        }
+        if late.is_some() || self.requested_bodies.contains_key(bid) {
+            self.last_delivered = Instant::now();
+            self.body_overdue_rounds = 0;
+        }
+    }
+
     /// How many more transactions can be requested from this peer now: its
     /// budget, less what is already asked and not received. Forgets the
     /// requests older than [`TX_REQUEST_MEMORY`].
@@ -966,8 +1002,14 @@ struct Shared {
     /// below its rate. Without it, every peer re-offered its whole pool after
     /// each block and the node re-downloaded everything it had just refused
     /// (measured at 8.7 transactions received per accepted payment, against
-    /// 1.7 before). Bounded by [`MAX_RECENT_REJECTS`].
-    full_pool_rejected: HashMap<Hash256, (u64, usize)>,
+    /// 1.7 before). Bounded by [`MAX_RECENT_REJECTS`]; each entry, with the
+    /// height it was refused at, lasts [`FULL_POOL_REFUSAL_BLOCKS`].
+    ///
+    /// Keyed by `txid`, which announcements carry and which leaves the witness
+    /// out: only a refusal of a copy whose witness has the sizes its schemes
+    /// fix is recorded ([`Mempool::witness_is_canonical`]), so that a copy
+    /// padded to a lower rate cannot get the honest one ignored.
+    full_pool_rejected: HashMap<Hash256, (u64, usize, u64)>,
     /// Transactions that arrived before their parent. See
     /// [`crate::mempool::OrphanPool`].
     orphans: crate::mempool::OrphanPool,
@@ -1349,10 +1391,10 @@ impl Node {
             .read()
             .ok()
             .and_then(|g| g.as_ref().cloned());
+        // No channel manager, nothing queued: the queues fill only once one is
+        // installed (`channels_active`). Called after every message handled,
+        // so the global lock is not taken for nothing.
         let Some(sink) = sink else {
-            let mut g = self.shared.lock().unwrap();
-            g.channel_scan.clear();
-            g.channel_unscan.clear();
             return;
         };
         let (untxs, txs) = {
@@ -1971,6 +2013,7 @@ impl Node {
             let mut holders: Vec<(u64, bool)> = Vec::new();
             for (id, p) in peers.iter_mut() {
                 let mut overdue = 0u32;
+                let late = &mut p.late_bodies;
                 p.requested_bodies.retain(|h, since| {
                     if chain.has_block(h) {
                         return false;
@@ -1978,12 +2021,24 @@ impl Node {
                     if now.duration_since(*since) >= BODY_TIMEOUT {
                         overdue += 1;
                         withheld.push(*h);
+                        if late.len() >= MAX_BODIES_IN_FLIGHT {
+                            late.pop_front();
+                        }
+                        late.push_back(*h);
                         return false;
                     }
                     true
                 });
                 if overdue > 0 {
-                    let delivered_nothing = now.duration_since(p.last_delivered) >= BODY_TIMEOUT;
+                    // Nothing we asked for within the window, or not one body
+                    // for several rounds while answering only transactions.
+                    p.body_overdue_rounds = p.body_overdue_rounds.saturating_add(1);
+                    let no_body = p.body_overdue_rounds >= MAX_BODY_OVERDUE_ROUNDS;
+                    if no_body {
+                        p.body_overdue_rounds = 0;
+                    }
+                    let delivered_nothing =
+                        now.duration_since(p.last_delivered) >= BODY_TIMEOUT || no_body;
                     holders.push((*id, delivered_nothing));
                 }
             }
@@ -2275,6 +2330,8 @@ impl Node {
                     remote_nonce: None,
                     last_received: Instant::now(),
                     last_delivered: Instant::now(),
+                    body_overdue_rounds: 0,
+                    late_bodies: VecDeque::new(),
                     pending_ping: None,
                     requested_txs: HashMap::new(),
                     announced_waiting: VecDeque::new(),
@@ -2989,9 +3046,7 @@ impl Node {
                         // is not a withholder even if another body of its lags.
                         let bid = b.header.block_id();
                         if let Some(p) = g.peers.get_mut(&id) {
-                            if p.requested_bodies.contains_key(&bid) {
-                                p.last_delivered = Instant::now();
-                            }
+                            p.note_body_delivered(&bid);
                         }
                         drop_peer = !Self::integrate(&mut g, &b, &self.stats, &mut outgoing, id);
                     }
@@ -3002,9 +3057,7 @@ impl Node {
                     let bid = c.header.block_id();
                     // A body we asked for marks this peer as answering us.
                     if let Some(p) = g.peers.get_mut(&id) {
-                        if p.requested_bodies.contains_key(&bid) {
-                            p.last_delivered = Instant::now();
-                        }
+                        p.note_body_delivered(&bid);
                     }
                     if g.chain.has_block(&bid) {
                         // Already known: nothing to reconstruct. But if it was a
@@ -3364,6 +3417,20 @@ impl Node {
                                 // side can lift, so it is not downloaded again
                                 // at every offer (0.4.9 offered every two
                                 // minutes).
+                                //
+                                // A rate refusal is decided before any
+                                // signature, on this copy's weight: it is
+                                // remembered by id only if the witness has
+                                // the sizes every valid copy has. A padded
+                                // copy refused here, then remembered, kept the
+                                // honest one from ever being fetched while the
+                                // pool stayed full — a penalty included.
+                                let rememberable =
+                                    !matches!(
+                                        e,
+                                        crate::mempool::MempoolError::FullAndUnderpaid
+                                            | crate::mempool::MempoolError::FeeRateTooLow { .. }
+                                    ) || g.mempool.witness_is_canonical(&t, &g.chain.utxo);
                                 match &e {
                                     // A full pool is lifted not by a mere block
                                     // but by room: this refusal is remembered
@@ -3372,12 +3439,22 @@ impl Node {
                                     // asked for again only once the pool could
                                     // take it. See `full_pool_rejected` and
                                     // `should_request_tx`.
-                                    crate::mempool::MempoolError::FullAndUnderpaid => {
+                                    crate::mempool::MempoolError::FullAndUnderpaid
+                                        if rememberable =>
+                                    {
                                         let size = t.encode().len();
                                         let rate = g
                                             .mempool
                                             .apparent_fee_rate(&t, &g.chain.utxo)
                                             .unwrap_or(0);
+                                        if g.full_pool_rejected.len() >= MAX_RECENT_REJECTS
+                                            && !g.full_pool_rejected.contains_key(&txid)
+                                        {
+                                            g.full_pool_rejected.retain(|_, r| {
+                                                height.saturating_sub(r.2)
+                                                    < FULL_POOL_REFUSAL_BLOCKS
+                                            });
+                                        }
                                         if g.full_pool_rejected.len() >= MAX_RECENT_REJECTS
                                             && !g.full_pool_rejected.contains_key(&txid)
                                         {
@@ -3387,13 +3464,15 @@ impl Node {
                                                 g.full_pool_rejected.remove(&evict);
                                             }
                                         }
-                                        g.full_pool_rejected.insert(txid, (rate, size));
+                                        g.full_pool_rejected.insert(txid, (rate, size, height));
                                     }
                                     // A conflict or a fee below the floor can be
                                     // cleared by the next block; remembered only
                                     // until the tip moves.
                                     crate::mempool::MempoolError::SpendConflict(_)
-                                    | crate::mempool::MempoolError::FeeRateTooLow { .. } => {
+                                    | crate::mempool::MempoolError::FeeRateTooLow { .. }
+                                        if rememberable =>
+                                    {
                                         let tip = g.chain.tip_id();
                                         if g.rejected_at != tip
                                             || g.rejected.len() >= MAX_RECENT_REJECTS
@@ -3671,6 +3750,15 @@ impl Node {
                 // must stay within its per-peer rate. The decoded bytes are
                 // handed to the channel component after the lock is released,
                 // never under it.
+                // Channels exist on regtest only. Anywhere else this message
+                // gets what 0.4.9 gave it as an unknown command: malformed,
+                // and the link is cut.
+                Message::Channel(_) if network != Network::Regtest => {
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
+                    }
+                    drop_peer = true;
+                }
                 Message::Channel(bytes) => {
                     let (hs, cap) = g
                         .peers
@@ -3805,8 +3893,9 @@ impl Node {
         if g.rejected_at == g.chain.tip_id() && g.rejected.contains(hash) {
             return false;
         }
-        if let Some((rate, size)) = g.full_pool_rejected.get(hash) {
-            if !g.mempool.would_admit(*rate, *size) {
+        if let Some((rate, size, at)) = g.full_pool_rejected.get(hash) {
+            let fresh = g.chain.height().saturating_sub(*at) < FULL_POOL_REFUSAL_BLOCKS;
+            if fresh && !g.mempool.would_admit(*rate, *size) {
                 return false;
             }
         }
@@ -5127,6 +5216,8 @@ mod tests {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 last_delivered: Instant::now(),
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -5324,7 +5415,7 @@ mod tests {
         let too_big = 1usize << 40;
         {
             let mut g = n.shared.lock().unwrap();
-            g.full_pool_rejected.insert(h, (1_000, too_big));
+            g.full_pool_rejected.insert(h, (1_000, too_big, 0));
             // A stale tip-scoped set: a block has moved the tip since, so this
             // would no longer block on its own.
             g.rejected_at = Hash256([9u8; 32]);
@@ -5341,7 +5432,7 @@ mod tests {
             .lock()
             .unwrap()
             .full_pool_rejected
-            .insert(h, (1_000, 500));
+            .insert(h, (1_000, 500, 0));
         assert!(
             Node::should_request_tx(&n.shared.lock().unwrap(), &h),
             "once the pool has room, the transaction is requested again"
@@ -5531,6 +5622,8 @@ mod tests_hardening {
                 remote_nonce: None,
                 last_received: Instant::now(),
                 last_delivered: Instant::now(),
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -5547,6 +5640,120 @@ mod tests_hardening {
             c.mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
         })
         .expect("regtest mining")
+    }
+
+    /// Mines and connects one block on `n`; returns it.
+    fn connect_block(n: &Node) -> Block {
+        let b = next_block(n);
+        n.with_chain(|c| c.connect(&b, b.header.time + 1))
+            .expect("connect");
+        b
+    }
+
+    /// A spend of `b`'s coinbase whose key and signature have the sizes the
+    /// scheme fixes (their content does not matter: a rate refusal comes before
+    /// any signature), paying `fee`.
+    fn canonical_spend(b: &Block, fee: u64) -> Transaction {
+        let cb = &b.transactions[0];
+        let s = SchemeId::LamportOts;
+        Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn {
+                prev_out: crate::tx::OutPoint {
+                    txid: cb.txid(),
+                    index: 0,
+                },
+                witness: crate::tx::Witness {
+                    pubkey: vec![1u8; s.pubkey_len()],
+                    signature: vec![2u8; s.sig_len()],
+                },
+                sequence: 0,
+            }],
+            outputs: vec![crate::tx::TxOut {
+                value: crate::amount::Amount::from_units(cb.outputs[0].value.units() - fee),
+                scheme: s,
+                pubkey_hash: Hash256([5u8; 32]),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// The same transaction, its signature padded: same `txid`, heavier.
+    fn padded(tx: &Transaction, extra: usize) -> Transaction {
+        let mut p = tx.clone();
+        p.inputs[0].witness.signature.extend(vec![0u8; extra]);
+        assert_eq!(p.txid(), tx.txid());
+        p
+    }
+
+    /// Finding 9: a copy of a transaction padded to a lower rate, refused by a
+    /// full pool, must not get the honest copy ignored. The `txid` leaves the
+    /// witness out, so the refusal was remembered for every copy, and the
+    /// honest one was never requested again while the pool stayed full.
+    #[test]
+    fn a_padded_copy_refused_by_a_full_pool_does_not_shut_out_the_honest_one() {
+        let (_a, b) = node_pair();
+        let _p = established_peer(&b, 7);
+        let block = connect_block(&b);
+        let honest = canonical_spend(&block, block.transactions[0].outputs[0].value.units() / 2);
+        let bloated = padded(&honest, 50_000);
+        let txid = honest.txid();
+
+        // A pool with no room at all: refused before any signature.
+        b.shared.lock().unwrap().mempool = Mempool::with_capacity(1);
+        let _ = b.handle(7, Message::Tx(Box::new(bloated)));
+
+        // Now room for the honest copy, not for the padded one.
+        b.shared.lock().unwrap().mempool = Mempool::with_capacity(honest.encode().len() + 100);
+        assert!(
+            Node::should_request_tx(&b.shared.lock().unwrap(), &txid),
+            "a padded copy's refusal shut the honest transaction out"
+        );
+    }
+
+    /// The same for a fee-floor refusal: a copy padded below the minimum rate
+    /// must not keep the honest one away until the next block.
+    #[test]
+    fn a_padded_copy_under_the_fee_floor_does_not_shut_out_the_honest_one() {
+        let (_a, b) = node_pair();
+        let _p = established_peer(&b, 7);
+        let block = connect_block(&b);
+        // Just above the floor as it is; far below it once padded.
+        let probe = canonical_spend(&block, 0);
+        let weight = probe.weight(crate::consensus::WITNESS_DISCOUNT);
+        let fee = crate::mempool::MIN_FEE_RATE * weight / 1000 + 10;
+        let honest = canonical_spend(&block, fee);
+        let bloated = padded(&honest, 200_000);
+        let _ = b.handle(7, Message::Tx(Box::new(bloated)));
+        assert!(
+            Node::should_request_tx(&b.shared.lock().unwrap(), &honest.txid()),
+            "a padded copy's fee refusal shut the honest transaction out"
+        );
+    }
+
+    /// What finding 9 must not undo: the refusal of a copy of the right sizes
+    /// is still remembered, so a full pool does not download it again at every
+    /// offer — but only for a few blocks.
+    #[test]
+    fn a_full_pool_refusal_of_a_canonical_copy_is_kept_for_a_few_blocks() {
+        let (_a, b) = node_pair();
+        let _p = established_peer(&b, 7);
+        let block = connect_block(&b);
+        let honest = canonical_spend(&block, block.transactions[0].outputs[0].value.units() / 2);
+        let txid = honest.txid();
+        b.shared.lock().unwrap().mempool = Mempool::with_capacity(1);
+        let _ = b.handle(7, Message::Tx(Box::new(honest)));
+        assert!(
+            !Node::should_request_tx(&b.shared.lock().unwrap(), &txid),
+            "a refusal that holds for every copy is remembered"
+        );
+        for _ in 0..FULL_POOL_REFUSAL_BLOCKS {
+            connect_block(&b);
+        }
+        assert!(
+            Node::should_request_tx(&b.shared.lock().unwrap(), &txid),
+            "the refusal expired after a few blocks"
+        );
     }
 
     /// A sink that records the blocks and transactions handed to its watcher.
@@ -5765,6 +5972,41 @@ mod tests_hardening {
             !a.handle(7, Message::Channel(vec![0u8; 40])),
             "a peer at the threshold is still disconnected"
         );
+    }
+
+    /// Finding 14: off regtest, where channels do not exist, a channel
+    /// message gets what 0.4.9 gave an unknown command — malformed, and the
+    /// link is cut — not a 20-point charge on a link that stays up.
+    #[test]
+    fn a_channel_message_off_regtest_is_malformed_and_cuts_the_link() {
+        let net = Network::Testnet;
+        let n = Node::new(net, Chain::new(net, crate::chain::genesis_block(net)));
+        let _e = established_peer(&n, 7);
+        assert!(
+            !n.handle(7, Message::Channel(vec![0u8; 40])),
+            "a channel message off regtest must cut the link"
+        );
+        assert_eq!(
+            n.shared.lock().unwrap().peers[&7].ban_score,
+            MISCONDUCT_MALFORMED
+        );
+    }
+
+    /// Finding 14: with no channel manager installed, the scan run after
+    /// every message handled does not take the global lock.
+    #[test]
+    fn the_channel_scan_takes_no_lock_without_a_channel_manager() {
+        let (a, _) = node_pair();
+        let held = a.shared.lock().unwrap();
+        let other = a.clone();
+        let (done, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            other.scan_connected_blocks_for_channels();
+            let _ = done.send(());
+        });
+        let returned = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(held);
+        assert!(returned, "the scan waited for the global lock");
     }
 
     /// A block connected through the node reaches the channel watcher, off the
@@ -6466,6 +6708,66 @@ mod tests_hardening {
         );
     }
 
+    /// Finding 12: a peer that answers every transaction we ask for but never
+    /// a block body is charged with withholding after a few rounds. Before,
+    /// each answered transaction counted as a delivery, and the peer delayed
+    /// every block by `BODY_TIMEOUT` for as long as it liked.
+    #[test]
+    fn a_peer_that_serves_transactions_but_no_body_is_charged() {
+        let (_a, b) = node_pair();
+        let _w = established_peer(&b, 7);
+        let _other = established_peer(&b, 8);
+        for round in 0..MAX_BODY_OVERDUE_ROUNDS {
+            let mut g = b.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.requested_bodies.insert(
+                Hash256([10 + round; 32]),
+                Instant::now() - BODY_TIMEOUT - Duration::from_secs(1),
+            );
+            // It answered a transaction request a moment ago.
+            p.last_delivered = Instant::now();
+            drop(g);
+            b.maintain_peers();
+        }
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].ban_score,
+            MISCONDUCT_BODY_WITHHELD,
+            "a peer that never delivers a body is charged, transactions or not"
+        );
+    }
+
+    /// What finding 12 must not undo (the L1-B partition): a peer whose bodies
+    /// arrive late, on a saturated link, is never charged — each late body
+    /// shows it delivers.
+    #[test]
+    fn a_peer_whose_bodies_arrive_late_is_never_charged() {
+        let (a, b) = node_pair();
+        let _slow = established_peer(&b, 7);
+        let _other = established_peer(&b, 8);
+        let rounds = 2 * MAX_BODY_OVERDUE_ROUNDS as u64;
+        crate::net::tests_util::mine_locally(&a, rounds as usize);
+        for h in 1..=rounds {
+            let body = a.with_chain(|c| c.block_at(h).unwrap());
+            {
+                let mut g = b.shared.lock().unwrap();
+                let p = g.peers.get_mut(&7).unwrap();
+                p.requested_bodies.insert(
+                    body.header.block_id(),
+                    Instant::now() - BODY_TIMEOUT - Duration::from_secs(1),
+                );
+                p.last_delivered = Instant::now();
+            }
+            b.maintain_peers();
+            // The overdue body arrives after all, late.
+            assert!(b.handle(7, Message::Block(Box::new(body))));
+        }
+        assert_eq!(
+            b.shared.lock().unwrap().peers[&7].ban_score,
+            0,
+            "a peer that delivers its bodies late is not a withholder"
+        );
+    }
+
     /// A peer that delivered nothing we asked for within the window is charged
     /// with withholding — a genuine withholder is still removed.
     #[test]
@@ -6781,6 +7083,8 @@ mod tests_handler_fuzz {
                 remote_nonce: None,
                 last_received: now,
                 last_delivered: now,
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
@@ -7614,6 +7918,8 @@ mod tests_handler_review {
                 remote_nonce: None,
                 last_received: now,
                 last_delivered: now,
+                body_overdue_rounds: 0,
+                late_bodies: VecDeque::new(),
                 pending_ping: None,
                 requested_txs: HashMap::new(),
                 announced_waiting: VecDeque::new(),
