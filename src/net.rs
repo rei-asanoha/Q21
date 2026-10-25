@@ -1101,22 +1101,75 @@ struct Outgoing {
     message: Message,
 }
 
-/// What a payment-channel component plugs into the node through. The node hands
-/// it the bytes of an inbound channel message and the peer they came from, and
-/// it returns the replies to send back (opaque bytes, each re-wrapped in a
-/// [`Message::Channel`]) and a misconduct score for a malformed one. The node
-/// calls it off the chain lock, so the component may do cryptography freely.
-pub trait ChannelSink: Send + Sync {
-    /// Handles one inbound channel frame from `peer`, whose durable identity
-    /// (used to re-bind channels across a reconnect) is `peer_identity`.
-    fn deliver(&self, peer: u64, peer_identity: &str, bytes: &[u8]) -> ChannelOutcome;
+/// What a channel component knows of the connection a frame came on: enough
+/// to bind its transport handshake to this connection and to no other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelLink {
+    /// True if this node dialed the peer.
+    pub outbound: bool,
+    /// The nonce this node introduced itself with in its `Version`.
+    pub local_nonce: u64,
+    /// The nonce the peer introduced itself with in its `Version`.
+    pub remote_nonce: u64,
+}
 
-    /// This node's stable channel identity (hex), advertised in the handshake so
-    /// peers can re-bind channels to it across reconnects. `None` means none is
-    /// advertised.
+/// A handle that queues channel payloads to a peer, for a channel component
+/// that must send on its own, in its own order — an encrypted session numbers
+/// its records, and a record queued out of order is a lost one. It holds the
+/// node weakly: it never keeps a stopped node alive.
+#[derive(Clone)]
+pub struct ChannelSender {
+    shared: std::sync::Weak<Mutex<Shared>>,
+    magic: [u8; 4],
+    stats: Arc<Stats>,
+}
+
+impl ChannelSender {
+    /// Queues `payload` to `peer` as a [`Message::Channel`], if the peer is
+    /// connected and channel-capable. Never waits on the network.
+    pub fn send(&self, peer: u64, payload: Vec<u8>) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let writer = {
+            let g = shared.lock().unwrap();
+            match g.peers.get(&peer) {
+                Some(p) if p.handshaked && p.channels => Some(p.writer.clone()),
+                _ => None,
+            }
+        };
+        match writer {
+            Some(w) => {
+                if w.push(frame_of(&Message::Channel(payload), self.magic)) == Push::Full {
+                    self.stats.outbox_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// What a payment-channel component plugs into the node through. The node hands
+/// it the bytes of an inbound channel message, the peer they came from and that
+/// connection's [`ChannelLink`], and it returns the replies to send back
+/// (opaque bytes, each re-wrapped in a [`Message::Channel`]) and a misconduct
+/// score for a malformed one; a component that must order its own sends uses
+/// the [`ChannelSender`] it is given instead. The node calls it off the chain
+/// lock, so the component may do cryptography freely.
+pub trait ChannelSink: Send + Sync {
+    /// Handles one inbound channel frame from `peer`.
+    fn deliver(&self, peer: u64, link: &ChannelLink, bytes: &[u8]) -> ChannelOutcome;
+
+    /// This node's channel node id (hex), advertised in the handshake as a hint
+    /// for an operator naming the peer. `None` means none is advertised.
     fn node_identity(&self) -> Option<String> {
         None
     }
+
+    /// Called once, when the component is installed, with the handle it may
+    /// send through at any time. The default ignores it.
+    fn attach(&self, _sender: ChannelSender) {}
 
     /// Called after each connected block, off the chain lock, with the block's
     /// transactions, the new chain `height`, and a `depth_of` oracle giving the
@@ -1135,12 +1188,19 @@ pub trait ChannelSink: Send + Sync {
     }
 
     /// Called when a channel-capable peer completes the handshake, off the chain
-    /// lock, with its live connection id and its durable identity. Returns the
-    /// frames to send it — the reestablish of every channel we hold with it,
-    /// re-bound to the live id. The default does nothing.
-    fn on_peer_connected(&self, _peer: u64, _peer_identity: &str) -> Vec<Vec<u8>> {
+    /// lock, with its live connection id and the connection's [`ChannelLink`].
+    /// Returns frames to send it. The default does nothing.
+    fn on_peer_connected(&self, _peer: u64, _link: &ChannelLink) -> Vec<Vec<u8>> {
         Vec::new()
     }
+
+    /// Called once a channel-capable peer's connection is gone, off the chain
+    /// lock. The default does nothing.
+    fn on_peer_disconnected(&self, _peer: u64) {}
+
+    /// Called at each peer maintenance round, off the chain lock, for work
+    /// that waits on time rather than on a message. The default does nothing.
+    fn tick(&self) {}
 
     /// Called, off the chain lock and before the blocks that replace them,
     /// with the ids of every transaction a reorganization disconnected, so a
@@ -1328,6 +1388,7 @@ impl Node {
         if let Ok(mut g) = self.own_channel_id.write() {
             *g = sink.node_identity();
         }
+        sink.attach(self.channel_sender());
         if let Ok(mut g) = self.channel_sink.write() {
             *g = Some(sink);
         }
@@ -1345,9 +1406,10 @@ impl Node {
     /// Our user agent, carrying the channel capability token when enabled.
     fn user_agent(&self) -> String {
         if self.channels_enabled() {
-            // The channel capability, followed by this node's stable channel id
-            // so peers can re-bind channels to it across reconnects. The whole
-            // string stays within `MAX_USER_AGENT`: "q21:0.4" + "+chan" + 32 hex.
+            // The channel capability, followed by the first half of this node's
+            // node id, a hint an operator may name the peer by (channels are
+            // bound to the id its session authenticates). The whole string
+            // stays within `MAX_USER_AGENT`: "q21:0.4" + "+chanv3" + 32 hex.
             let id = self
                 .own_channel_id
                 .read()
@@ -1365,32 +1427,31 @@ impl Node {
     /// advertise it — so a node that does not speak the protocol is never sent
     /// one.
     pub fn send_channel(&self, peer: u64, payload: Vec<u8>) -> bool {
-        let writer = {
-            let g = self.shared.lock().unwrap();
-            match g.peers.get(&peer) {
-                Some(p) if p.handshaked && p.channels => Some(p.writer.clone()),
-                _ => None,
-            }
-        };
-        match writer {
-            Some(w) => {
-                let frame = frame_of(&Message::Channel(payload), self.magic);
-                self.queue(&w, frame);
-                true
-            }
-            None => false,
+        self.channel_sender().send(peer, payload)
+    }
+
+    /// A [`ChannelSender`] for this node.
+    pub fn channel_sender(&self) -> ChannelSender {
+        ChannelSender {
+            shared: Arc::downgrade(&self.shared),
+            magic: self.magic,
+            stats: self.stats.clone(),
         }
+    }
+
+    /// The installed channel component, if any.
+    fn channel_sink(&self) -> Option<Arc<dyn ChannelSink>> {
+        self.channel_sink
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
     }
 
     /// Drains the transactions of blocks connected since the last call and
     /// hands them to the channel watcher, off the chain lock. Called after
     /// handling a message and usable by a startup rescan.
     pub fn scan_connected_blocks_for_channels(&self) {
-        let sink = self
-            .channel_sink
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().cloned());
+        let sink = self.channel_sink();
         // No channel manager, nothing queued: the queues fill only once one is
         // installed (`channels_active`). Called after every message handled,
         // so the global lock is not taken for nothing.
@@ -2179,6 +2240,11 @@ impl Node {
             // loop, which was waiting, exits with an error and its thread dies.
             self.disconnect(id);
         }
+        // The channel component's timed work: a handshake to retry, one that
+        // waited too long to forget.
+        if let Some(sink) = self.channel_sink() {
+            sink.tick();
+        }
         dropped
     }
 
@@ -2372,6 +2438,11 @@ impl Node {
         let removed = self.shared.lock().unwrap().peers.remove(&id);
         if let Some(p) = removed {
             p.writer.close();
+            if p.channels {
+                if let Some(sink) = self.channel_sink() {
+                    sink.on_peer_disconnected(id);
+                }
+            }
         }
     }
 
@@ -2535,12 +2606,12 @@ impl Node {
         // Set under the lock, acted on after it is released: a channel message
         // to hand to the channel component (off the chain lock, so it may do
         // cryptography), and a misconduct score for an unsolicited one.
-        let mut channel_in: Option<Vec<u8>> = None;
+        let mut channel_in: Option<(Vec<u8>, ChannelLink)> = None;
         let mut channel_penalty: u32 = 0;
         // Set when this message completes the handshake with a channel-capable
-        // peer: once the lock is released, the channel component is asked to
-        // resync (reestablish) every channel it holds with that peer.
-        let mut channel_peer_ready = false;
+        // peer: once the lock is released, the channel component is told, so
+        // it can start its session with that peer.
+        let mut channel_peer_ready: Option<ChannelLink> = None;
 
         // The work of a block or of an announcement is checked before the lock.
         match &msg {
@@ -2676,7 +2747,13 @@ impl Node {
                             // (connection to oneself) is not bypassed.
                             Some(p) if p.version_received => {
                                 p.handshaked = true;
-                                channel_peer_ready = p.channels;
+                                if p.channels {
+                                    channel_peer_ready = Some(ChannelLink {
+                                        outbound: p.outbound,
+                                        local_nonce,
+                                        remote_nonce: p.remote_nonce.unwrap_or(0),
+                                    });
+                                }
                                 (p.start_height > height, g.chain.locator())
                             }
                             _ => (false, Vec::new()),
@@ -3760,14 +3837,25 @@ impl Node {
                     drop_peer = true;
                 }
                 Message::Channel(bytes) => {
-                    let (hs, cap) = g
+                    let (hs, cap, legacy) = g
                         .peers
                         .get(&id)
-                        .map(|p| (p.handshaked, p.channels))
-                        .unwrap_or((false, false));
+                        .map(|p| {
+                            (
+                                p.handshaked,
+                                p.channels,
+                                crate::wire::user_agent_advertises_legacy_channels(&p.user_agent),
+                            )
+                        })
+                        .unwrap_or((false, false, false));
                     if !hs {
                         // Pre-handshake: ignored, like every other expensive
                         // message, without penalty.
+                    } else if !cap && legacy {
+                        // A node of the earlier channel protocol, whose frames
+                        // went in clear: it advertised what it speaks, and we
+                        // speak another. Refused without blame; its opens
+                        // simply go unanswered.
                     } else if !cap {
                         // The peer never told us it speaks the protocol, yet
                         // sent a channel message: unsolicited.
@@ -3783,7 +3871,12 @@ impl Node {
                             })
                             .unwrap_or(false);
                         if allowed {
-                            channel_in = Some(bytes);
+                            let link = g.peers.get(&id).map(|p| ChannelLink {
+                                outbound: p.outbound,
+                                local_nonce,
+                                remote_nonce: p.remote_nonce.unwrap_or(0),
+                            });
+                            channel_in = link.map(|l| (bytes, l));
                         }
                         // Beyond the rate we drop it silently: an honest peer
                         // slows down and resends, as for snapshot chunks.
@@ -3804,15 +3897,9 @@ impl Node {
         if channel_penalty > 0 && !self.penalize(id, channel_penalty) {
             drop_peer = true;
         }
-        if let Some(bytes) = channel_in {
-            let sink = self
-                .channel_sink
-                .read()
-                .ok()
-                .and_then(|g| g.as_ref().cloned());
-            if let Some(sink) = sink {
-                let identity = self.peer_identity(id);
-                let outcome = sink.deliver(id, &identity, &bytes);
+        if let Some((bytes, link)) = channel_in {
+            if let Some(sink) = self.channel_sink() {
+                let outcome = sink.deliver(id, &link, &bytes);
                 if outcome.penalize > 0 && !self.penalize(id, outcome.penalize) {
                     drop_peer = true;
                 }
@@ -3824,17 +3911,11 @@ impl Node {
                 }
             }
         }
-        // A channel-capable peer that just finished the handshake is resynced:
-        // we send it the reestablish of every channel we hold with it.
-        if channel_peer_ready {
-            let sink = self
-                .channel_sink
-                .read()
-                .ok()
-                .and_then(|g| g.as_ref().cloned());
-            if let Some(sink) = sink {
-                let identity = self.peer_identity(id);
-                for frame in sink.on_peer_connected(id, &identity) {
+        // A channel-capable peer that just finished the handshake: the channel
+        // component starts its session with it.
+        if let Some(link) = channel_peer_ready {
+            if let Some(sink) = self.channel_sink() {
+                for frame in sink.on_peer_connected(id, &link) {
                     self.send_channel(id, frame);
                 }
             }
@@ -5762,7 +5843,7 @@ mod tests_hardening {
     }
 
     impl ChannelSink for BlockRecorder {
-        fn deliver(&self, _peer: u64, _peer_identity: &str, _bytes: &[u8]) -> ChannelOutcome {
+        fn deliver(&self, _peer: u64, _link: &ChannelLink, _bytes: &[u8]) -> ChannelOutcome {
             ChannelOutcome::default()
         }
         fn on_connected_block(
@@ -5788,7 +5869,7 @@ mod tests_hardening {
     }
 
     impl ChannelSink for ReorgRecorder {
-        fn deliver(&self, _peer: u64, _peer_identity: &str, _bytes: &[u8]) -> ChannelOutcome {
+        fn deliver(&self, _peer: u64, _link: &ChannelLink, _bytes: &[u8]) -> ChannelOutcome {
             ChannelOutcome::default()
         }
         fn on_connected_block(
@@ -5933,7 +6014,7 @@ mod tests_hardening {
     struct Rejecter;
 
     impl ChannelSink for Rejecter {
-        fn deliver(&self, _peer: u64, _peer_identity: &str, _bytes: &[u8]) -> ChannelOutcome {
+        fn deliver(&self, _peer: u64, _link: &ChannelLink, _bytes: &[u8]) -> ChannelOutcome {
             ChannelOutcome {
                 replies: Vec::new(),
                 penalize: MISCONDUCT_CHANNEL,

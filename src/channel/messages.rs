@@ -17,7 +17,11 @@ use crate::ser::{ReadError, Reader, Writer};
 /// 2: `Ready` and `Close` carry a sequence number and the sender's funding
 /// signature, a `Challenge` names its channel only through a locator, and a
 /// reestablish proof covers every field.
-pub const WIRE_VERSION: u8 = 2;
+///
+/// 3: frames travel only inside an authenticated session
+/// ([`crate::channel::transport`]); `Challenge` is gone, and a reestablish
+/// proof signs the session's binding value.
+pub const WIRE_VERSION: u8 = 3;
 
 const T_OPEN: u8 = 1;
 const T_ACCEPT: u8 = 2;
@@ -31,7 +35,7 @@ const T_REESTABLISH: u8 = 9;
 const T_CLOSE: u8 = 10;
 const T_CLOSE_SIGNED: u8 = 11;
 const T_ERROR: u8 = 12;
-const T_CHALLENGE: u8 = 13;
+// 13 was `Challenge`, in version 2.
 
 /// Most announced revocation hashes a message may carry. A channel announces
 /// the next one or two points ahead; a larger count is a malformed frame.
@@ -116,9 +120,8 @@ pub enum Message {
     },
     /// Initiator → responder: the initiator's revocation of the previous state.
     Revoke { state: u64, revocation: Revocation },
-    /// On reconnection, answering a [`Message::Challenge`]: where this side
-    /// stands, the challenge's nonce, and a proof of the funding key over
-    /// every other field.
+    /// At each new session: where this side stands, the session's binding
+    /// value as nonce, and a proof of the funding key over every other field.
     Reestablish {
         channel_id: Hash256,
         local_commit_number: u64,
@@ -146,13 +149,6 @@ pub enum Message {
     CloseSigned { fee: u64, signature: Vec<u8> },
     /// An abort, with a short reason. Informational: nothing acts on it.
     Error { reason: String },
-    /// On a new connection: a fresh nonce the receiver must sign, with its
-    /// funding key, in the [`Message::Reestablish`] it answers with. Issued by
-    /// the side that wants the connection authenticated, so a captured
-    /// reestablish never answers a later challenge. The connection is not
-    /// authenticated yet: the channel is named by [`challenge_locator`], which
-    /// only a party that already knows the channel id can match.
-    Challenge { locator: Hash256, nonce: [u8; 32] },
 }
 
 /// The control message kinds a [`control_message`] signature covers.
@@ -162,9 +158,9 @@ pub const CONTROL_CLOSE: u8 = T_CLOSE;
 /// What the funding key signs for a control message that carries no other
 /// signature: the channel, the sender's side, a sequence number that only
 /// grows (per channel and sender, journaled on both ends, so a captured
-/// message is never accepted twice), the kind, and its fields. Without it a
-/// relay that passed both sides' challenges along, and so got both of its
-/// connections authenticated, could inject a `Close` on each side.
+/// message is never accepted twice), the kind, and its fields. The session
+/// already keeps a relay out; this keeps a control message bound to the
+/// channel's own key, as every other message that moves the channel is.
 pub fn control_message(
     channel_id: Hash256,
     sender: u8,
@@ -182,14 +178,6 @@ pub fn control_message(
             fields,
         ],
     )
-}
-
-/// How a [`Message::Challenge`] names its channel: a hash of the channel id
-/// and the challenge's own nonce. The id is never sent in clear to a
-/// connection that has not proved itself; a stranger learns nothing from the
-/// locator, while the real counterparty finds its channel by recomputing it.
-pub fn challenge_locator(channel_id: Hash256, nonce: &[u8; 32]) -> Hash256 {
-    crate::hash::tagged_hash_parts("Q21/channel/challenge", &[channel_id.as_bytes(), nonce])
 }
 
 /// The deterministic tie-break for simultaneous updates: the party whose
@@ -370,9 +358,6 @@ impl Message {
                 w.u8(T_CLOSE_SIGNED).u64(*fee);
                 write_crypto(&mut w, signature);
             }
-            Message::Challenge { locator, nonce } => {
-                w.u8(T_CHALLENGE).bytes(locator.as_bytes()).bytes(nonce);
-            }
             Message::Error { reason } => {
                 let bytes = reason.as_bytes();
                 let bytes = &bytes[..bytes.len().min(MAX_ERROR_LEN)];
@@ -485,10 +470,6 @@ impl Message {
                 let signature = read_sig(&mut r)?;
                 Message::CloseSigned { fee, signature }
             }
-            T_CHALLENGE => Message::Challenge {
-                locator: Hash256(r.array32()?),
-                nonce: r.array32()?,
-            },
             T_ERROR => {
                 let bytes = read_bounded(&mut r, MAX_ERROR_LEN)?;
                 Message::Error {

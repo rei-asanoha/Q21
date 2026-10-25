@@ -19,6 +19,9 @@ pub mod keys;
 /// cSHAKE256 and KMAC256 for the transport, over the vendored permutation.
 #[cfg(feature = "mldsa")]
 pub mod kmac;
+/// The node side of the transport: sessions over P2P connections.
+#[cfg(feature = "mldsa")]
+pub mod link;
 pub mod machine;
 /// The node's channel manager needs to construct signing keys, so it compiles
 /// only with the signing backend.

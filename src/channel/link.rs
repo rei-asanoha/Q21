@@ -1,0 +1,686 @@
+//! The node side of the channel transport: one session per channel-capable
+//! P2P connection, between the network ([`crate::net::ChannelSink`]) and the
+//! [`ChannelManager`].
+//!
+//! Every channel payload is a transport frame ([`crate::channel::transport`]).
+//! Handshake frames build the connection's session; a record is opened in it
+//! and its plaintext handed to the manager, tagged with the node id the
+//! session authenticated. Nothing reaches the manager any other way. What the
+//! manager sends is sealed here and queued at once, under the connection's
+//! lock, so records leave in the order they are numbered.
+//!
+//! # Roles and recovery
+//!
+//! The side that dialed starts the handshake as soon as the P2P handshake
+//! completes. A session ends on any record that does not open — tampered,
+//! replayed, or after a gap left by a dropped one — and the channels on it
+//! wait, unsynchronized. The initiator then starts a new handshake; a
+//! responder that lost its session tells it so with a `Reset`. A new session
+//! resynchronizes every channel through the manager's reestablish, as a
+//! reconnection does.
+//!
+//! # Work a stranger can cause
+//!
+//! A responder signs before its peer has proven anything, and either side
+//! verifies, decapsulates and encapsulates once per handshake. So:
+//!
+//! - each connection gets [`HANDSHAKE_BURST`] handshakes, then one per
+//!   [`HANDSHAKE_REFILL`] — as responder (an `Init` answered) and as initiator
+//!   (one started, a `Reset` answered or sent) alike;
+//! - all connections together get [`GLOBAL_HANDSHAKE_BURST`] answered `Init`s,
+//!   then [`GLOBAL_HANDSHAKES_PER_SEC`] a second;
+//! - at most [`MAX_PENDING_HANDSHAKES`] responders wait for a `Fin` at once,
+//!   one per connection, each for [`HANDSHAKE_TIMEOUT`];
+//! - a handshake frame nobody asked for (`Resp` or `Fin` with no handshake
+//!   pending) is dropped unread, and a `Resp` is verified once: the
+//!   initiator's state is consumed by the first one.
+//!
+//! Beyond a budget a frame is dropped, not answered. The P2P layer's own
+//! per-peer rate on channel messages ([`crate::net::CHAN_RATE_PER_SEC`]) and
+//! frame bound come first.
+
+use crate::channel::manager::ChannelManager;
+use crate::channel::transport::{
+    self, Context, Initiator, Limits, Responder, Session, TransportError,
+};
+use crate::net::{ChannelLink, ChannelOutcome, ChannelSender, ChannelSink, MISCONDUCT_CHANNEL};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+/// Handshakes a connection may cause at once.
+pub const HANDSHAKE_BURST: u32 = 4;
+/// Then one per this period, per connection.
+pub const HANDSHAKE_REFILL: Duration = Duration::from_secs(15);
+/// `Init`s answered at once, across all connections.
+pub const GLOBAL_HANDSHAKE_BURST: u32 = 32;
+/// Then this many a second, across all connections.
+pub const GLOBAL_HANDSHAKES_PER_SEC: u32 = 4;
+/// Responders waiting for their `Fin`, across all connections.
+pub const MAX_PENDING_HANDSHAKES: usize = 64;
+/// How long a handshake may wait for its next frame.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connections tracked at once. The P2P layer bounds its peers well below.
+const MAX_CONNECTIONS: usize = 1024;
+
+/// The bounds above, as one value a test may change.
+#[derive(Clone, Copy, Debug)]
+pub struct DosLimits {
+    pub burst: u32,
+    pub refill: Duration,
+    pub global_burst: u32,
+    pub global_refill: Duration,
+    pub max_pending: usize,
+    pub timeout: Duration,
+}
+
+impl Default for DosLimits {
+    fn default() -> DosLimits {
+        DosLimits {
+            burst: HANDSHAKE_BURST,
+            refill: HANDSHAKE_REFILL,
+            global_burst: GLOBAL_HANDSHAKE_BURST,
+            global_refill: Duration::from_millis(1000 / u64::from(GLOBAL_HANDSHAKES_PER_SEC)),
+            max_pending: MAX_PENDING_HANDSHAKES,
+            timeout: HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
+/// A token bucket: `max` tokens, one more every `every`.
+struct Budget {
+    tokens: u32,
+    max: u32,
+    every: Duration,
+    last: Instant,
+}
+
+impl Budget {
+    fn new(max: u32, every: Duration) -> Budget {
+        Budget {
+            tokens: max,
+            max,
+            every,
+            last: Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        if !self.every.is_zero() {
+            let earned = now.duration_since(self.last).as_nanos() / self.every.as_nanos();
+            if earned > 0 {
+                self.tokens = self
+                    .tokens
+                    .saturating_add(u32::try_from(earned).unwrap_or(u32::MAX))
+                    .min(self.max);
+                self.last = now;
+            }
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+enum Handshake {
+    Idle,
+    Initiating(Initiator, Instant),
+    Responding(Responder, Instant),
+}
+
+struct Established {
+    session: Session,
+}
+
+/// One channel-capable connection.
+struct Conn {
+    link: ChannelLink,
+    handshake: Handshake,
+    session: Option<Established>,
+    budget: Budget,
+    /// Initiator: a handshake is due, and waits for the budget.
+    wanted: bool,
+    /// Responder: when a `Reset` last went out since the last session ended.
+    reset_sent: Option<Instant>,
+}
+
+/// What a handshake frame left to do once the connection's lock is released.
+#[derive(Default)]
+struct After {
+    /// The previous session ended: the manager forgets it.
+    closed: bool,
+    /// A session was established, with this node id, legacy id and binding.
+    established: Option<(String, String, [u8; 32])>,
+    penalize: u32,
+}
+
+/// Lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The node id of a session's peer, as the manager names it: [`is_node_id`].
+///
+/// [`is_node_id`]: crate::channel::manager::is_node_id
+fn identity_of(peer: &transport::Peer) -> (String, String, [u8; 32]) {
+    (hex(&peer.id.0), hex(&peer.legacy_id), peer.binding)
+}
+
+/// The transport context of a connection, by role.
+fn context(network: crate::address::Network, link: &ChannelLink) -> Context {
+    if link.outbound {
+        Context {
+            network,
+            initiator_nonce: link.local_nonce,
+            responder_nonce: link.remote_nonce,
+        }
+    } else {
+        Context {
+            network,
+            initiator_nonce: link.remote_nonce,
+            responder_nonce: link.local_nonce,
+        }
+    }
+}
+
+/// Misconduct for a handshake frame that failed: a malformed one, or a key
+/// that is not one, is misconduct of the sender. A signature that does not
+/// verify may be an honest answer to a handshake already replaced.
+fn handshake_penalty(e: TransportError) -> u32 {
+    match e {
+        TransportError::Malformed | TransportError::BadKey | TransportError::Reflected => {
+            MISCONDUCT_CHANNEL
+        }
+        _ => 0,
+    }
+}
+
+type SendFrame = dyn Fn(u64, Vec<u8>) -> bool + Send + Sync;
+
+/// The channel component a node installs: sessions over its connections,
+/// in front of the manager.
+pub struct ChannelTransport {
+    mgr: Arc<ChannelManager>,
+    sender: RwLock<Option<Box<SendFrame>>>,
+    conns: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
+    /// Responders waiting for a `Fin`, by connection.
+    pending: Mutex<HashMap<u64, Instant>>,
+    global: Mutex<Budget>,
+    dos: RwLock<DosLimits>,
+    rekey: RwLock<Limits>,
+}
+
+impl ChannelTransport {
+    /// The transport in front of `mgr`; the manager's own sends go through it.
+    pub fn new(mgr: Arc<ChannelManager>) -> Arc<ChannelTransport> {
+        let dos = DosLimits::default();
+        let t = Arc::new(ChannelTransport {
+            mgr,
+            sender: RwLock::new(None),
+            conns: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            global: Mutex::new(Budget::new(dos.global_burst, dos.global_refill)),
+            dos: RwLock::new(dos),
+            rekey: RwLock::new(Limits::default()),
+        });
+        let weak = Arc::downgrade(&t);
+        t.mgr.set_outbound(Box::new(move |peer, frame| {
+            weak.upgrade().is_some_and(|t| t.send(peer, frame))
+        }));
+        t
+    }
+
+    pub fn manager(&self) -> &Arc<ChannelManager> {
+        &self.mgr
+    }
+
+    /// Where transport frames go: the node's [`ChannelSender`] once attached,
+    /// or anything a test wires in.
+    pub fn set_sender(&self, send: Box<SendFrame>) {
+        if let Ok(mut g) = self.sender.write() {
+            *g = Some(send);
+        }
+    }
+
+    /// Changes the handshake bounds, for tests.
+    #[doc(hidden)]
+    pub fn set_dos_limits(&self, dos: DosLimits) {
+        *self.global.lock().unwrap() = Budget::new(dos.global_burst, dos.global_refill);
+        *self.dos.write().unwrap() = dos;
+    }
+
+    /// Changes when new sessions rekey, for tests; both ends must agree.
+    #[doc(hidden)]
+    pub fn set_rekey_limits(&self, limits: Limits) {
+        *self.rekey.write().unwrap() = limits;
+    }
+
+    fn dos(&self) -> DosLimits {
+        *self.dos.read().unwrap()
+    }
+
+    fn raw_send(&self, peer: u64, bytes: Vec<u8>) -> bool {
+        match self.sender.read() {
+            Ok(g) => g.as_ref().is_some_and(|f| f(peer, bytes)),
+            Err(_) => false,
+        }
+    }
+
+    fn conn(&self, peer: u64) -> Option<Arc<Mutex<Conn>>> {
+        self.conns.lock().unwrap().get(&peer).cloned()
+    }
+
+    /// The connection's entry, made on first sight; `None` past the bound.
+    fn conn_or_insert(&self, peer: u64, link: &ChannelLink) -> Option<Arc<Mutex<Conn>>> {
+        let mut g = self.conns.lock().unwrap();
+        if let Some(c) = g.get(&peer) {
+            return Some(c.clone());
+        }
+        if g.len() >= MAX_CONNECTIONS {
+            return None;
+        }
+        let dos = self.dos();
+        let c = Arc::new(Mutex::new(Conn {
+            link: *link,
+            handshake: Handshake::Idle,
+            session: None,
+            budget: Budget::new(dos.burst, dos.refill),
+            wanted: false,
+            reset_sent: None,
+        }));
+        g.insert(peer, c.clone());
+        Some(c)
+    }
+
+    /// Whether connection `peer` has an established session.
+    pub fn has_session(&self, peer: u64) -> bool {
+        self.conn(peer)
+            .is_some_and(|c| c.lock().unwrap().session.is_some())
+    }
+
+    /// Seals `frame` into `peer`'s session and queues it. False without a
+    /// session.
+    pub fn send(&self, peer: u64, frame: Vec<u8>) -> bool {
+        let Some(conn) = self.conn(peer) else {
+            return false;
+        };
+        let mut c = conn.lock().unwrap();
+        let Some(est) = c.session.as_mut() else {
+            return false;
+        };
+        match est.session.seal(&frame) {
+            // Queued under the lock: the record numbered next leaves next.
+            Ok(record) => self.raw_send(peer, record),
+            Err(e) => {
+                eprintln!("channel frame to peer {peer} not sent: {e:?}");
+                false
+            }
+        }
+    }
+
+    /// A channel-capable connection completed its P2P handshake.
+    pub fn connect(&self, peer: u64, link: &ChannelLink) {
+        let Some(conn) = self.conn_or_insert(peer, link) else {
+            return;
+        };
+        let mut c = conn.lock().unwrap();
+        c.link = *link;
+        if link.outbound {
+            self.start_handshake(peer, &mut c);
+        }
+    }
+
+    /// The connection is gone.
+    pub fn disconnect(&self, peer: u64) {
+        let removed = self.conns.lock().unwrap().remove(&peer);
+        self.pending.lock().unwrap().remove(&peer);
+        if removed.is_some() {
+            self.mgr.on_session_closed(peer);
+        }
+    }
+
+    /// Starts a handshake as initiator, within the connection's budget, or
+    /// marks one due.
+    fn start_handshake(&self, peer: u64, c: &mut Conn) {
+        if let Handshake::Initiating(_, since) = &c.handshake {
+            if since.elapsed() < self.dos().timeout {
+                return;
+            }
+        }
+        if !c.budget.take() {
+            c.wanted = true;
+            return;
+        }
+        c.wanted = false;
+        let ctx = context(self.mgr.network(), &c.link);
+        match Initiator::start(self.mgr.identity(), ctx) {
+            Ok((ini, init)) => {
+                c.handshake = Handshake::Initiating(ini, Instant::now());
+                self.raw_send(peer, init);
+            }
+            Err(_) => c.wanted = true,
+        }
+    }
+
+    /// Ends the connection's session after a failure, and asks for or starts
+    /// the next. Returns whether there was one.
+    fn fail_session(&self, peer: u64, c: &mut Conn) -> bool {
+        let had = c.session.take().is_some();
+        if c.link.outbound {
+            self.start_handshake(peer, c);
+        } else {
+            self.send_reset(peer, c);
+        }
+        had
+    }
+
+    /// Responder: tells the initiator to start a session — once per ended
+    /// session, again only if no handshake came of it in time, and within
+    /// the budget.
+    fn send_reset(&self, peer: u64, c: &mut Conn) {
+        let timeout = self.dos().timeout;
+        if c.reset_sent.is_some_and(|at| at.elapsed() < timeout) || !c.budget.take() {
+            return;
+        }
+        c.reset_sent = Some(Instant::now());
+        self.raw_send(peer, vec![transport::VERSION, transport::T_RESET]);
+    }
+
+    /// Handles one channel payload from `peer`.
+    pub fn deliver(&self, peer: u64, link: &ChannelLink, bytes: &[u8]) -> ChannelOutcome {
+        let outcome = |penalize| ChannelOutcome {
+            replies: Vec::new(),
+            penalize,
+        };
+        // Not a frame of this transport: a node that advertised it sends
+        // nothing else.
+        let Some(kind) = transport::frame_type(bytes) else {
+            return outcome(MISCONDUCT_CHANNEL);
+        };
+        let Some(conn) = self.conn_or_insert(peer, link) else {
+            return outcome(0);
+        };
+        if kind == transport::T_RECORD {
+            return outcome(self.on_record(peer, &conn, bytes));
+        }
+        let after = {
+            let mut c = conn.lock().unwrap();
+            match kind {
+                transport::T_INIT => self.on_init(peer, &mut c, bytes),
+                transport::T_RESP => self.on_resp(peer, &mut c, bytes),
+                transport::T_FIN => self.on_fin(peer, &mut c, bytes),
+                transport::T_RESET => self.on_reset(peer, &mut c, bytes),
+                _ => After {
+                    penalize: MISCONDUCT_CHANNEL,
+                    ..After::default()
+                },
+            }
+        };
+        if after.closed {
+            self.mgr.on_session_closed(peer);
+        }
+        if let Some((identity, legacy, binding)) = after.established {
+            for frame in self.mgr.on_session(peer, &identity, &legacy, binding) {
+                self.send(peer, frame);
+            }
+        }
+        outcome(after.penalize)
+    }
+
+    fn on_record(&self, peer: u64, conn: &Arc<Mutex<Conn>>, bytes: &[u8]) -> u32 {
+        let opened = {
+            let mut c = conn.lock().unwrap();
+            let Some(est) = c.session.as_mut() else {
+                // The peer still holds a session we no longer do: ours
+                // failed, or a handshake to replace it is under way.
+                if c.link.outbound {
+                    if matches!(c.handshake, Handshake::Idle) {
+                        self.start_handshake(peer, &mut c);
+                    }
+                } else {
+                    self.send_reset(peer, &mut c);
+                }
+                return 0;
+            };
+            match est.session.open(bytes) {
+                Ok(plaintext) => Ok(plaintext),
+                Err(e) => {
+                    let had = self.fail_session(peer, &mut c);
+                    Err((e, had))
+                }
+            }
+        };
+        match opened {
+            Ok(plaintext) => {
+                let r = self.mgr.deliver(peer, &plaintext);
+                for frame in r.frames {
+                    self.send(peer, frame);
+                }
+                r.penalize
+            }
+            Err((e, had)) => {
+                if had {
+                    self.mgr.on_session_closed(peer);
+                }
+                match e {
+                    // A record lost on the way, most likely dropped by a rate
+                    // limit on this side: nothing the peer did.
+                    TransportError::Gap | TransportError::Exhausted => 0,
+                    _ => MISCONDUCT_CHANNEL,
+                }
+            }
+        }
+    }
+
+    fn on_init(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
+        // Only the side that was dialed answers: both ends of a link agree on
+        // who that is, a relay that dialed both does not get a session.
+        if c.link.outbound {
+            return After::default();
+        }
+        if bytes.len() != transport::INIT_LEN {
+            return After {
+                penalize: MISCONDUCT_CHANNEL,
+                ..After::default()
+            };
+        }
+        let dos = self.dos();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.retain(|_, since| since.elapsed() < dos.timeout);
+            if pending.len() >= dos.max_pending && !pending.contains_key(&peer) {
+                return After::default();
+            }
+        }
+        if !c.budget.take() || !self.global.lock().unwrap().take() {
+            return After::default();
+        }
+        // A new handshake replaces the session: the initiator starts one only
+        // once it holds none.
+        let closed = c.session.take().is_some();
+        c.reset_sent = None;
+        let ctx = context(self.mgr.network(), &c.link);
+        match Responder::accept(self.mgr.identity(), ctx, bytes) {
+            Ok((r, resp)) => {
+                let now = Instant::now();
+                c.handshake = Handshake::Responding(r, now);
+                self.pending.lock().unwrap().insert(peer, now);
+                self.raw_send(peer, resp);
+                After {
+                    closed,
+                    ..After::default()
+                }
+            }
+            Err(e) => {
+                c.handshake = Handshake::Idle;
+                self.pending.lock().unwrap().remove(&peer);
+                After {
+                    closed,
+                    penalize: handshake_penalty(e),
+                    ..After::default()
+                }
+            }
+        }
+    }
+
+    fn on_resp(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
+        let Handshake::Initiating(ini, _) = std::mem::replace(&mut c.handshake, Handshake::Idle)
+        else {
+            return After::default();
+        };
+        match ini.finish(self.mgr.identity(), bytes) {
+            Ok((mut session, peer_info, fin)) => {
+                session.set_limits(*self.rekey.read().unwrap());
+                // The Fin leaves before any record of the new session.
+                self.raw_send(peer, fin);
+                let closed = c.session.replace(Established { session }).is_some();
+                After {
+                    closed,
+                    established: Some(identity_of(&peer_info)),
+                    penalize: 0,
+                }
+            }
+            Err(e) => {
+                c.wanted = true;
+                After {
+                    penalize: handshake_penalty(e),
+                    ..After::default()
+                }
+            }
+        }
+    }
+
+    fn on_fin(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
+        let Handshake::Responding(r, _) = std::mem::replace(&mut c.handshake, Handshake::Idle)
+        else {
+            return After::default();
+        };
+        self.pending.lock().unwrap().remove(&peer);
+        match r.finish(bytes) {
+            Ok((mut session, peer_info)) => {
+                session.set_limits(*self.rekey.read().unwrap());
+                let closed = c.session.replace(Established { session }).is_some();
+                After {
+                    closed,
+                    established: Some(identity_of(&peer_info)),
+                    penalize: 0,
+                }
+            }
+            Err(e) => After {
+                penalize: handshake_penalty(e),
+                ..After::default()
+            },
+        }
+    }
+
+    fn on_reset(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
+        if !c.link.outbound {
+            return After::default();
+        }
+        if bytes.len() != 2 {
+            return After {
+                penalize: MISCONDUCT_CHANNEL,
+                ..After::default()
+            };
+        }
+        if matches!(c.handshake, Handshake::Initiating(..)) {
+            return After::default();
+        }
+        let closed = c.session.take().is_some();
+        self.start_handshake(peer, c);
+        After {
+            closed,
+            ..After::default()
+        }
+    }
+
+    /// Timed work: forgets handshakes that waited too long, and starts the
+    /// ones due once the budget allows.
+    pub fn tick(&self) {
+        let timeout = self.dos().timeout;
+        self.pending
+            .lock()
+            .unwrap()
+            .retain(|_, since| since.elapsed() < timeout);
+        let conns: Vec<(u64, Arc<Mutex<Conn>>)> = self
+            .conns
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, c)| (*p, c.clone()))
+            .collect();
+        for (peer, conn) in conns {
+            let mut c = conn.lock().unwrap();
+            let expired = match &c.handshake {
+                Handshake::Initiating(_, since) | Handshake::Responding(_, since) => {
+                    since.elapsed() >= timeout
+                }
+                Handshake::Idle => false,
+            };
+            if expired {
+                c.handshake = Handshake::Idle;
+            }
+            if c.link.outbound && c.session.is_none() && matches!(c.handshake, Handshake::Idle) {
+                c.wanted = true;
+            }
+            if c.wanted {
+                self.start_handshake(peer, &mut c);
+            }
+        }
+    }
+}
+
+impl ChannelSink for ChannelTransport {
+    fn deliver(&self, peer: u64, link: &ChannelLink, bytes: &[u8]) -> ChannelOutcome {
+        ChannelTransport::deliver(self, peer, link, bytes)
+    }
+
+    fn node_identity(&self) -> Option<String> {
+        Some(self.mgr.node_id_hex())
+    }
+
+    fn attach(&self, sender: ChannelSender) {
+        self.set_sender(Box::new(move |peer, bytes| sender.send(peer, bytes)));
+    }
+
+    fn on_connected_block(
+        &self,
+        txs: &[crate::tx::Transaction],
+        height: u64,
+        depth_of: &crate::channel::manager::DepthOf,
+    ) -> Vec<(u64, Vec<u8>)> {
+        for (peer, frame) in self.mgr.on_connected_block(txs, height, depth_of) {
+            self.send(peer, frame);
+        }
+        Vec::new()
+    }
+
+    fn on_peer_connected(&self, peer: u64, link: &ChannelLink) -> Vec<Vec<u8>> {
+        self.connect(peer, link);
+        Vec::new()
+    }
+
+    fn on_peer_disconnected(&self, peer: u64) {
+        self.disconnect(peer);
+    }
+
+    fn tick(&self) {
+        ChannelTransport::tick(self);
+    }
+
+    fn on_disconnected_txids(&self, txids: &[crate::hash::Hash256]) {
+        self.mgr.on_disconnected_txids(txids);
+    }
+
+    fn rescan(
+        &self,
+        tip: u64,
+        txs_at: &dyn Fn(u64) -> Option<Vec<crate::tx::Transaction>>,
+        depth_of: &crate::channel::manager::DepthOf,
+    ) {
+        self.mgr.rescan(tip, txs_at, depth_of);
+    }
+}

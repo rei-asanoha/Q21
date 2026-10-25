@@ -135,6 +135,13 @@ pub const RECORD_OVERHEAD: usize = RECORD_HEADER + TAG_LEN;
 /// message.
 pub const MAX_RECORD: usize = crate::wire::MAX_CHANNEL_MSG - RECORD_OVERHEAD;
 
+// Every frame fits one P2P `channel` message, and so does a record of the
+// heaviest engine frame (three tier signatures, a channel id and a kind).
+const _: () = assert!(INIT_LEN <= crate::wire::MAX_CHANNEL_MSG);
+const _: () = assert!(RESP_LEN <= crate::wire::MAX_CHANNEL_MSG);
+const _: () = assert!(FIN_LEN <= crate::wire::MAX_CHANNEL_MSG);
+const _: () = assert!(33 + 64 + 3 * (SIG_LEN + 4) < MAX_RECORD);
+
 /// Records a direction carries under one key before it rekeys.
 pub const REKEY_RECORDS: u64 = 1 << 20;
 /// Plaintext bytes a direction carries under one key before it rekeys.
@@ -247,9 +254,19 @@ fn signed_message(role: u8, transcript: &[u8; 32]) -> Hash256 {
     Hash256(h.finalize32())
 }
 
-fn verify(pubkey: &[u8], role: u8, transcript: &[u8; 32], sig: &[u8]) -> Result<(), TransportError> {
-    crate::sig::verify(CHANNEL_SCHEME, pubkey, &signed_message(role, transcript), sig)
-        .map_err(|_| TransportError::BadSignature)
+fn verify(
+    pubkey: &[u8],
+    role: u8,
+    transcript: &[u8; 32],
+    sig: &[u8],
+) -> Result<(), TransportError> {
+    crate::sig::verify(
+        CHANNEL_SCHEME,
+        pubkey,
+        &signed_message(role, transcript),
+        sig,
+    )
+    .map_err(|_| TransportError::BadSignature)
 }
 
 /// A fresh ML-KEM-1024 key pair. The decapsulation key wipes itself when
@@ -274,7 +291,8 @@ fn ephemeral() -> Result<Ephemeral, TransportError> {
 fn encapsulate(ek: &[u8]) -> Result<(Vec<u8>, [u8; 32]), TransportError> {
     let key = ml_kem::Key::<ml_kem::EncapsulationKey<MlKem1024>>::try_from(ek)
         .map_err(|_| TransportError::BadKey)?;
-    let ek = ml_kem::EncapsulationKey::<MlKem1024>::new(&key).map_err(|_| TransportError::BadKey)?;
+    let ek =
+        ml_kem::EncapsulationKey::<MlKem1024>::new(&key).map_err(|_| TransportError::BadKey)?;
     let mut m = crate::rng::bytes::<32>().map_err(|_| TransportError::NoRandomness)?;
     let mut mb = B32::from(m);
     let (ct, mut k) = ek.encapsulate_deterministic(&mb);
@@ -316,11 +334,11 @@ fn session_secrets(ss_r: &[u8; 32], ss_i: &[u8; 32], tf: &[u8; 32]) -> [[u8; 32]
 
 /// Splits `frame` into fields of the given lengths after the version and the
 /// expected type byte; the lengths must cover it exactly.
-fn fields<'a, const N: usize>(
-    frame: &'a [u8],
+fn fields<const N: usize>(
+    frame: &[u8],
     kind: u8,
     lens: [usize; N],
-) -> Result<[&'a [u8]; N], TransportError> {
+) -> Result<[&[u8]; N], TransportError> {
     if frame.len() != 2 + lens.iter().sum::<usize>() || frame[0] != VERSION || frame[1] != kind {
         return Err(TransportError::Malformed);
     }
@@ -722,15 +740,6 @@ mod tests {
     }
 
     #[test]
-    fn frames_fit_the_channel_message() {
-        assert!(RESP_LEN <= crate::wire::MAX_CHANNEL_MSG);
-        assert!(INIT_LEN <= crate::wire::MAX_CHANNEL_MSG);
-        assert!(FIN_LEN <= crate::wire::MAX_CHANNEL_MSG);
-        // The heaviest engine frame (three tier signatures) fits a record.
-        assert!(33 + 64 + 3 * (SIG_LEN + 4) < MAX_RECORD);
-    }
-
-    #[test]
     fn a_handshake_authenticates_both_ends_and_agrees_on_keys() {
         let (a, b) = (identity(1), identity(2));
         let (mut sa, mut sb, peer_b, peer_a) = handshake(&a, &b);
@@ -776,7 +785,12 @@ mod tests {
         let (mut sa, mut sb, _, _) = handshake(&a, &b);
         let r = sa.seal(b"pay 1000").unwrap();
         // Every byte of the ciphertext and the tag is covered.
-        for at in [RECORD_HEADER, RECORD_HEADER + 4, r.len() - TAG_LEN, r.len() - 1] {
+        for at in [
+            RECORD_HEADER,
+            RECORD_HEADER + 4,
+            r.len() - TAG_LEN,
+            r.len() - 1,
+        ] {
             let mut t = r.clone();
             t[at] ^= 0x01;
             assert_eq!(sb.open(&t), Err(TransportError::BadTag), "byte {at}");
@@ -818,7 +832,10 @@ mod tests {
         let (_, mut resp) = Responder::accept(&b, ctx(), &init).unwrap();
         let last = resp.len() - 10;
         resp[last] ^= 1;
-        assert_eq!(ini.finish(&a, &resp).err(), Some(TransportError::BadSignature));
+        assert_eq!(
+            ini.finish(&a, &resp).err(),
+            Some(TransportError::BadSignature)
+        );
 
         let (ini, init) = Initiator::start(&a, ctx()).unwrap();
         let (r, resp) = Responder::accept(&b, ctx(), &init).unwrap();
@@ -838,15 +855,27 @@ mod tests {
         );
         let mut v2 = init.clone();
         v2[0] = 2;
-        assert_eq!(Responder::accept(&b, ctx(), &v2).err(), Some(TransportError::Malformed));
+        assert_eq!(
+            Responder::accept(&b, ctx(), &v2).err(),
+            Some(TransportError::Malformed)
+        );
         // An encapsulation key whose coefficients exceed the modulus.
         let mut bad = init.clone();
         bad[2..2 + EK_LEN].fill(0xff);
-        assert_eq!(Responder::accept(&b, ctx(), &bad).err(), Some(TransportError::BadKey));
+        assert_eq!(
+            Responder::accept(&b, ctx(), &bad).err(),
+            Some(TransportError::BadKey)
+        );
         // Our own Init reflected back to us.
-        assert_eq!(Responder::accept(&a, ctx(), &init).err(), Some(TransportError::Reflected));
+        assert_eq!(
+            Responder::accept(&a, ctx(), &init).err(),
+            Some(TransportError::Reflected)
+        );
         let (_, resp) = Responder::accept(&b, ctx(), &init).unwrap();
-        assert_eq!(ini.finish(&a, &resp[..100]).err(), Some(TransportError::Malformed));
+        assert_eq!(
+            ini.finish(&a, &resp[..100]).err(),
+            Some(TransportError::Malformed)
+        );
     }
 
     /// The P2P nonces and the network are bound: a handshake whose two ends
@@ -870,7 +899,10 @@ mod tests {
         ] {
             let (ini, init) = Initiator::start(&a, ctx()).unwrap();
             let (_, resp) = Responder::accept(&b, other, &init).unwrap();
-            assert_eq!(ini.finish(&a, &resp).err(), Some(TransportError::BadSignature));
+            assert_eq!(
+                ini.finish(&a, &resp).err(),
+                Some(TransportError::BadSignature)
+            );
         }
     }
 
@@ -886,7 +918,10 @@ mod tests {
         resp[pk_at..pk_at + PK_LEN].copy_from_slice(b.pubkey());
         let legacy_at = pk_at + PK_LEN;
         resp[legacy_at..legacy_at + LEGACY_NODE_ID_LEN].copy_from_slice(&b.legacy_id());
-        assert_eq!(ini.finish(&a, &resp).err(), Some(TransportError::BadSignature));
+        assert_eq!(
+            ini.finish(&a, &resp).err(),
+            Some(TransportError::BadSignature)
+        );
 
         let (_, _, peer, _) = handshake(&a, &mallory);
         assert_eq!(peer.id, mallory.id());
@@ -906,7 +941,10 @@ mod tests {
         let mut forged = init.clone();
         forged[2..2 + EK_LEN].copy_from_slice(&mine.ek);
         let (_, resp) = Responder::accept(&b, ctx(), &forged).unwrap();
-        assert_eq!(ini.finish(&a, &resp).err(), Some(TransportError::BadSignature));
+        assert_eq!(
+            ini.finish(&a, &resp).err(),
+            Some(TransportError::BadSignature)
+        );
 
         // 2. It substitutes B's ephemeral key and ciphertext in the Resp.
         let (ini, init) = Initiator::start(&a, ctx()).unwrap();
@@ -915,7 +953,10 @@ mod tests {
         forged[2..2 + EK_LEN].copy_from_slice(&mine.ek);
         let (ct, _) = encapsulate(&init[2..2 + EK_LEN]).unwrap();
         forged[2 + EK_LEN..2 + EK_LEN + CT_LEN].copy_from_slice(&ct);
-        assert_eq!(ini.finish(&a, &forged).err(), Some(TransportError::BadSignature));
+        assert_eq!(
+            ini.finish(&a, &forged).err(),
+            Some(TransportError::BadSignature)
+        );
 
         // 3. It substitutes A's ciphertext in the Fin.
         let (ini, init) = Initiator::start(&a, ctx()).unwrap();
@@ -935,7 +976,10 @@ mod tests {
         };
         let (ini, init) = Initiator::start(&a, ctx_ar).unwrap();
         let (_, resp) = Responder::accept(&b, ctx_rb, &init).unwrap();
-        assert_eq!(ini.finish(&a, &resp).err(), Some(TransportError::BadSignature));
+        assert_eq!(
+            ini.finish(&a, &resp).err(),
+            Some(TransportError::BadSignature)
+        );
 
         // 5. It forwards unchanged and copies the nonces, so the handshake
         //    completes end to end: it is a pipe that holds no key. It can
