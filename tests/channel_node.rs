@@ -302,7 +302,45 @@ struct Pair {
     queue: VecDeque<(u64, Vec<u8>)>, // (destination node: 0 funder / 1 acceptor, frame)
 }
 
+/// A fresh session binding value, as the transport derives one per session:
+/// never the same twice.
+fn next_binding() -> [u8; 32] {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    q21_core::hash::tagged_hash_parts(
+        "test/binding",
+        &[&n.to_le_bytes(), &std::process::id().to_le_bytes()],
+    )
+    .0
+}
+
+/// A node id for test peer number `n`.
+fn id_of(n: u64) -> String {
+    format!("{n:064x}")
+}
+
+/// Registers a session on connection `peer` of `mgr`, authenticated as
+/// `identity`, as the transport does once a handshake completes. Returns the
+/// reestablish frames the manager wants sent on it.
+fn session(mgr: &ChannelManager, peer: u64, identity: &str) -> Vec<Vec<u8>> {
+    mgr.on_session(peer, identity, "", next_binding())
+}
+
 impl Pair {
+    /// A new session between the two, as the transport establishes one after
+    /// a (re)connection: each learns the other's node id and the session's
+    /// binding, and the reestablish frames both produce are queued.
+    fn reconnect(&mut self) {
+        let binding = next_binding();
+        let (fid, aid) = (self.funder.node_id(), self.acceptor.node_id());
+        for f in self.funder.on_session(A_PEER, &aid, "", binding) {
+            self.queue.push_back((1, f));
+        }
+        for f in self.acceptor.on_session(F_PEER, &fid, "", binding) {
+            self.queue.push_back((0, f));
+        }
+    }
+
     /// The funding output of `cid` as the funder's channel defines it.
     fn funder_funding_output(&self, cid: Hash256) -> TxOut {
         self.funder.funding_output_of(cid).expect("a channel")
@@ -335,9 +373,9 @@ impl Pair {
             steps += 1;
             assert!(steps < 1000, "protocol did not settle");
             let r = if to == 1 {
-                self.acceptor.deliver(F_PEER, "", &frame)
+                self.acceptor.deliver(F_PEER, &frame)
             } else {
-                self.funder.deliver(A_PEER, "", &frame)
+                self.funder.deliver(A_PEER, &frame)
             };
             assert_eq!(r.penalize, 0, "a frame was treated as misconduct");
             let reply_to = if to == 1 { 0 } else { 1 };
@@ -376,11 +414,14 @@ fn managers(
     );
     std::fs::create_dir_all(dir.join("funder")).unwrap();
     std::fs::create_dir_all(dir.join("acceptor")).unwrap();
-    Pair {
+    let mut p = Pair {
         funder,
         acceptor,
         queue: VecDeque::new(),
-    }
+    };
+    p.reconnect();
+    p.reconnect();
+    p
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -416,7 +457,7 @@ fn two_nodes_open_pay_and_cooperatively_close() {
 
     // Open: funder sends Hello; the pump drives key exchange, Open/Accept,
     // funding (built, signed and mined by the hook), funding_signed.
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
 
@@ -509,7 +550,7 @@ fn a_revoked_broadcast_is_punished_before_the_delay() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -592,7 +633,7 @@ fn reestablish_after_a_clean_reconnect_resends_nothing() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -610,12 +651,7 @@ fn reestablish_after_a_clean_reconnect_resends_nothing() {
 
     // Reconnect: both sides exchange reestablish; since they are in sync, the
     // pump produces no further protocol messages and both agree.
-    for f in p.funder.reestablish(A_PEER) {
-        p.queue.push_back((1, f));
-    }
-    for f in p.acceptor.reestablish(F_PEER) {
-        p.queue.push_back((0, f));
-    }
+    p.reconnect();
     p.pump();
     let fi = p.funder.info(cid).unwrap();
     let ai = p.acceptor.info(cid).unwrap();
@@ -657,7 +693,7 @@ fn two_nodes_reach_open_through_the_block_hook() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -714,7 +750,7 @@ fn a_unilateral_close_is_swept_after_the_delay() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -787,7 +823,7 @@ fn a_manager_reloads_its_channels_on_restart() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -837,7 +873,7 @@ fn a_manager_reloads_its_channels_on_restart() {
 }
 
 /// D3: after a message is dropped mid-update, a reconnect (the node's
-/// handshake hook calling `on_peer_connected`) resyncs both sides to the same
+/// new session registered with `on_session`) resyncs both sides to the same
 /// state through the engine's reestablish.
 #[test]
 fn reestablish_recovers_a_dropped_update() {
@@ -858,7 +894,7 @@ fn reestablish_recovers_a_dropped_update() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -878,18 +914,13 @@ fn reestablish_recovers_a_dropped_update() {
     // A second payment, but the acceptor's acknowledgement is dropped on the
     // wire: the two sides are now out of step.
     let upd = p.funder.pay(cid, 300_000).unwrap();
-    let dropped = p.acceptor.deliver(F_PEER, "", &upd);
+    let dropped = p.acceptor.deliver(F_PEER, &upd);
     assert_eq!(dropped.penalize, 0, "the update was well formed");
     assert!(!dropped.frames.is_empty(), "the acceptor produced an ack");
     // ... and we deliberately do not deliver it.
 
     // Reconnect: the node's handshake hook asks each side to resync.
-    for f in p.funder.on_peer_connected(A_PEER, "") {
-        p.queue.push_back((1, f));
-    }
-    for f in p.acceptor.on_peer_connected(F_PEER, "") {
-        p.queue.push_back((0, f));
-    }
+    p.reconnect();
     p.pump();
 
     let fi = p.funder.info(cid).unwrap();
@@ -927,7 +958,7 @@ fn a_reloaded_channel_reconciles_an_incomplete_update() {
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -952,12 +983,7 @@ fn a_reloaded_channel_reconciles_an_incomplete_update() {
 
     // Reconnect: both sides exchange reestablish; the engine resends the one
     // in-flight message and both converge.
-    for f in p.funder.on_peer_connected(A_PEER, "") {
-        p.queue.push_back((1, f));
-    }
-    for f in p.acceptor.on_peer_connected(F_PEER, "") {
-        p.queue.push_back((0, f));
-    }
+    p.reconnect();
     p.pump();
 
     let fi = p.funder.info(cid).unwrap();
@@ -1012,7 +1038,7 @@ fn open_channel(funder_seed: [u8; 32], acceptor_seed: [u8; 32], tag: &str) -> Op
         let c = chain.lock().unwrap();
         (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
     };
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -1030,12 +1056,7 @@ fn open_channel(funder_seed: [u8; 32], acceptor_seed: [u8; 32], tag: &str) -> Op
 /// Both sides exchange reestablish over a fresh connection, as the node's
 /// handshake hook does, and the pump settles what each owes.
 fn reconnect(p: &mut Pair) {
-    for f in p.funder.on_peer_connected(A_PEER, "") {
-        p.queue.push_back((1, f));
-    }
-    for f in p.acceptor.on_peer_connected(F_PEER, "") {
-        p.queue.push_back((0, f));
-    }
+    p.reconnect();
     p.pump();
 }
 
@@ -1148,47 +1169,60 @@ fn a_reestablish_for_a_forgotten_channel_is_not_misconduct() {
     let (p, wallet, chain, _dir, _cid, _capacity) =
         open_channel([0xe7u8; 32], [0xe8u8; 32], "d11-forgotten");
     let stranger = one_manager([0xe9u8; 32], wallet, chain, &tmpdir("d11-stranger"));
-    let frames = p.funder.on_peer_connected(A_PEER, "");
+    let binding = next_binding();
+    let frames = p
+        .funder
+        .on_session(A_PEER, &p.acceptor.node_id(), "", binding);
     assert!(!frames.is_empty());
+    stranger.on_session(F_PEER, &p.funder.node_id(), "", binding);
     for f in frames {
-        let r = stranger.deliver(F_PEER, "", &f);
+        let r = stranger.deliver(F_PEER, &f);
         assert_eq!(r.penalize, 0, "a reestablish for an unknown channel");
         assert!(r.frames.is_empty());
     }
 }
 
-/// D11: a channel frame arriving on a connection the channel is not bound to,
-/// with no identity tying it to the counterparty, is not acted on; a
-/// reestablish whose proof verifies moves the binding to that connection.
+/// D11: a channel frame arriving on a session authenticated as another node
+/// is not acted on, whatever connection it uses; a new session authenticated
+/// as the counterparty, on another connection, takes the channel over once
+/// its reestablish verifies, and the dropped payment completes there.
 #[test]
-fn only_a_verified_reestablish_rebinds_a_channel_to_another_connection() {
+fn only_the_counterpartys_session_moves_a_channel_to_another_connection() {
     let (p, _wallet, _chain, _dir, cid, _capacity) =
         open_channel([0xeau8; 32], [0xebu8; 32], "d11-rebind");
     const OTHER: u64 = 77;
     let m = p.funder.pay(cid, 400_000).unwrap();
-    let r = p.acceptor.deliver(OTHER, "", &m);
+    let _ = session(&p.acceptor, OTHER, &"ab".repeat(32));
+    let r = p.acceptor.deliver(OTHER, &m);
     assert_eq!(r.penalize, 0);
-    assert!(r.frames.is_empty(), "a frame from an unbound connection");
+    assert!(r.frames.is_empty(), "a frame from another node's session");
     assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 0);
     assert_eq!(p.acceptor.peer_of(cid), Some(F_PEER));
 
     // The funder reconnects on the other connection: its reestablish proves
-    // its funding key, the acceptor re-binds there, and the dropped payment
-    // completes.
+    // its funding key over the new session, the acceptor moves the channel
+    // there, and the dropped payment completes.
+    let binding = next_binding();
     let mut queue: VecDeque<(u64, Vec<u8>)> = p
-        .funder
-        .reestablish(A_PEER)
+        .acceptor
+        .on_session(OTHER, &p.funder.node_id(), "", binding)
         .into_iter()
-        .map(|f| (1, f))
+        .map(|f| (0, f))
+        .chain(
+            p.funder
+                .on_session(A_PEER, &p.acceptor.node_id(), "", binding)
+                .into_iter()
+                .map(|f| (1, f)),
+        )
         .collect();
     let mut steps = 0;
     while let Some((to, frame)) = queue.pop_front() {
         steps += 1;
         assert!(steps < 100, "did not settle");
         let r = if to == 1 {
-            p.acceptor.deliver(OTHER, "", &frame)
+            p.acceptor.deliver(OTHER, &frame)
         } else {
-            p.funder.deliver(A_PEER, "", &frame)
+            p.funder.deliver(A_PEER, &frame)
         };
         assert_eq!(r.penalize, 0);
         queue.extend(r.frames.into_iter().map(|f| (1 - to, f)));
@@ -1444,14 +1478,17 @@ fn pending_opens_are_bounded_and_expire() {
     // The funder side: its own opens in progress are bounded too.
     let mut hello = None;
     for peer in 0..MAX_PENDING_OPENS as u64 {
-        hello = Some(p.funder.open(100 + peer, "", capacity, None, None).unwrap());
+        session(&p.funder, 100 + peer, &id_of(100 + peer));
+        hello = Some(p.funder.open(100 + peer, capacity, None, None).unwrap());
     }
-    assert!(p.funder.open(999, "", capacity, None, None).is_err());
+    session(&p.funder, 999, &id_of(999));
+    assert!(p.funder.open(999, capacity, None, None).is_err());
     assert_eq!(p.funder.pending_opens().0, MAX_PENDING_OPENS);
     // The acceptor side: Hellos from as many connections as it takes.
     let hello = hello.unwrap();
     for peer in 0..(MAX_PENDING_OPENS as u64 + 5) {
-        let r = p.acceptor.deliver(200 + peer, "", &hello);
+        session(&p.acceptor, 200 + peer, &id_of(200 + peer));
+        let r = p.acceptor.deliver(200 + peer, &hello);
         assert_eq!(r.penalize, 0);
         assert_eq!(
             r.frames.is_empty(),
@@ -1467,7 +1504,8 @@ fn pending_opens_are_bounded_and_expire() {
     assert_eq!(p.funder.pending_opens(), (0, 0));
     p.acceptor
         .set_pending_open_ttl(q21_core::channel::manager::PENDING_OPEN_TTL);
-    assert!(!p.acceptor.deliver(300, "", &hello).frames.is_empty());
+    session(&p.acceptor, 300, &id_of(300));
+    assert!(!p.acceptor.deliver(300, &hello).frames.is_empty());
 }
 
 /// L6: the channels one peer holds with a node are bounded, on both sides.
@@ -1488,7 +1526,7 @@ fn channels_per_peer_are_bounded() {
     );
     let capacity = 4 * MIN_OUTPUT_VALUE;
     for _ in 0..MAX_CHANNELS_PER_PEER {
-        let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+        let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
         p.queue.push_back((1, hello));
         p.pump();
         // Funded and open: unfunded channels have a budget of their own.
@@ -1506,22 +1544,20 @@ fn channels_per_peer_are_bounded() {
     assert_eq!(p.funder.list().len(), MAX_CHANNELS_PER_PEER);
     assert_eq!(p.acceptor.list().len(), MAX_CHANNELS_PER_PEER);
     assert!(
-        p.funder.open(A_PEER, "", capacity, None, None).is_err(),
+        p.funder.open(A_PEER, capacity, None, None).is_err(),
         "one channel too many with this peer"
     );
     // A Hello arriving from that same peer is not answered by the acceptor.
     let elsewhere = one_manager([0xa5u8; 32], wallet, chain, &dir.join("elsewhere"));
-    let hello = elsewhere.open(A_PEER, "", capacity, None, None).unwrap();
-    let r = p.acceptor.deliver(F_PEER, "", &hello);
+    session(&elsewhere, A_PEER, &p.acceptor.node_id());
+    let hello = elsewhere.open(A_PEER, capacity, None, None).unwrap();
+    let r = p.acceptor.deliver(F_PEER, &hello);
     assert_eq!(r.penalize, 0);
     assert!(r.frames.is_empty(), "a ninth channel with the same peer");
     assert_eq!(p.acceptor.pending_opens().1, 0);
     // Another peer is still served.
-    assert!(!p
-        .acceptor
-        .deliver(F_PEER + 50, "", &hello)
-        .frames
-        .is_empty());
+    session(&p.acceptor, F_PEER + 50, &elsewhere.node_id());
+    assert!(!p.acceptor.deliver(F_PEER + 50, &hello).frames.is_empty());
 }
 
 // --- Startup rescan: what confirmed while a node was down ---------------------
@@ -1734,10 +1770,10 @@ fn an_unconfirmed_close_is_broadcast_again_on_restart() {
     p.funder = lost;
     reconnect(&mut p);
     let close = p.funder.close(cid).unwrap().expect("a close frame");
-    let signed = p.acceptor.deliver(F_PEER, "", &close);
+    let signed = p.acceptor.deliver(F_PEER, &close);
     assert_eq!(signed.penalize, 0);
     for f in signed.frames {
-        assert_eq!(p.funder.deliver(A_PEER, "", &f).penalize, 0);
+        assert_eq!(p.funder.deliver(A_PEER, &f).penalize, 0);
     }
     assert_eq!(
         held(&chain, ACCEPTOR_PAYOUT),
@@ -1925,25 +1961,27 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
         assert_eq!(r.frames.len(), 1);
         r.frames.into_iter().next().unwrap()
     };
+    session(&funder, A_PEER, &acceptor.node_id());
+    session(&acceptor, F_PEER, &funder.node_id());
     let hello = funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
-    let hello_back = one(acceptor.deliver(F_PEER, "", &hello));
-    let open = one(funder.deliver(A_PEER, "", &hello_back));
-    let accept = one(acceptor.deliver(F_PEER, "", &open));
-    let funding = one(funder.deliver(A_PEER, "", &accept));
+    let hello_back = one(acceptor.deliver(F_PEER, &hello));
+    let open = one(funder.deliver(A_PEER, &hello_back));
+    let accept = one(acceptor.deliver(F_PEER, &open));
+    let funding = one(funder.deliver(A_PEER, &accept));
     assert_eq!(*built.lock().unwrap(), 1);
     assert!(
         sent.lock().unwrap().is_empty(),
         "funding broadcast before FundingSigned"
     );
     // The same Accept again: the same Funding, nothing built or sent.
-    let again = one(funder.deliver(A_PEER, "", &accept));
+    let again = one(funder.deliver(A_PEER, &accept));
     assert_eq!(again, funding);
     assert_eq!(*built.lock().unwrap(), 1, "a replayed Accept funded again");
     assert!(sent.lock().unwrap().is_empty());
-    let signed = one(acceptor.deliver(F_PEER, "", &funding));
-    let r = funder.deliver(A_PEER, "", &signed);
+    let signed = one(acceptor.deliver(F_PEER, &funding));
+    let r = funder.deliver(A_PEER, &signed);
     assert_eq!(r.penalize, 0);
     let first = {
         let sent = sent.lock().unwrap();
@@ -1987,7 +2025,7 @@ fn a_channel_named_on_another_output_is_forgotten_at_once() {
     let journal_of = |cid: Hash256| dir.join("acceptor").join(format!("{}.jrnl", cid.to_hex()));
     let open_one = |p: &mut Pair| -> Hash256 {
         let before: Vec<Hash256> = p.acceptor.list().iter().map(|c| c.channel_id).collect();
-        let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+        let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
         p.queue.push_back((1, hello));
         p.pump();
         let new = p
@@ -2043,20 +2081,24 @@ fn a_channel_named_on_another_output_is_forgotten_at_once() {
     assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
 }
 
-/// A connection that merely announces the counterparty's identity gets
-/// nothing acted on — not even an unsigned Close — and a reestablish captured
-/// from an earlier exchange, replayed on another connection or after a
-/// restart, binds nothing: only the answer to a challenge we issued on that
-/// connection does.
+/// A session authenticated as another node gets nothing acted on — not even
+/// a Close — whatever it claims, and a reestablish captured from one session,
+/// replayed in another (even one authenticated as the counterparty, after a
+/// restart), binds nothing: its proof covers the session it was made for.
 #[test]
-fn only_an_answered_challenge_authenticates_a_connection() {
+fn only_the_counterpartys_session_is_heard_and_a_reestablish_is_good_for_one_session() {
     let funder_seed = [0xedu8; 32];
     let (mut p, wallet, chain, dir, cid, _capacity) =
-        open_channel(funder_seed, [0xeeu8; 32], "auth-challenge");
+        open_channel(funder_seed, [0xeeu8; 32], "auth-session");
     const IMPOSTOR: u64 = 66;
-    // The impostor claims the acceptor's identity. Its Close is ignored.
-    // Whatever the funder challenges it with, it cannot answer.
-    let _ = p.funder.on_peer_connected(IMPOSTOR, "acceptor-node");
+    let impostor = "cd".repeat(32);
+    // The impostor's session claims, as its legacy id, what the acceptor's
+    // would: a channel bound to a node id gives that no weight.
+    let legacy = "00".repeat(16);
+    assert!(p
+        .funder
+        .on_session(IMPOSTOR, &impostor, &legacy, next_binding())
+        .is_empty());
     let close = [
         cid.as_bytes().as_slice(),
         &[0u8],
@@ -2068,45 +2110,55 @@ fn only_an_answered_challenge_authenticates_a_connection() {
         .encode(),
     ]
     .concat();
-    let r = p.funder.deliver(IMPOSTOR, "acceptor-node", &close);
+    let r = p.funder.deliver(IMPOSTOR, &close);
     assert_eq!(r.penalize, 0);
     assert!(r.frames.is_empty());
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Open);
     assert_eq!(p.funder.peer_of(cid), Some(A_PEER));
 
-    // A real reconnect: capture the acceptor's answer to the funder's
-    // challenge, and let the exchange complete.
+    // A real reconnect: capture the acceptor's reestablish, and let the
+    // exchange complete.
     let mut captured = None;
+    let binding = next_binding();
+    let (fid, aid) = (p.funder.node_id(), p.acceptor.node_id());
     let mut queue: VecDeque<(u64, Vec<u8>)> = p
         .funder
-        .on_peer_connected(A_PEER, "")
+        .on_session(A_PEER, &aid, "", binding)
         .into_iter()
         .map(|f| (1, f))
+        .chain(
+            p.acceptor
+                .on_session(F_PEER, &fid, "", binding)
+                .into_iter()
+                .map(|f| (0, f)),
+        )
         .collect();
     while let Some((to, frame)) = queue.pop_front() {
         let r = if to == 1 {
-            p.acceptor.deliver(F_PEER, "", &frame)
+            p.acceptor.deliver(F_PEER, &frame)
         } else {
             if frame[32] == 0 && captured.is_none() && frame.len() > 1000 {
                 captured = Some(frame.clone());
             }
-            p.funder.deliver(A_PEER, "", &frame)
+            p.funder.deliver(A_PEER, &frame)
         };
         assert_eq!(r.penalize, 0);
         queue.extend(r.frames.into_iter().map(|f| (1 - to, f)));
     }
     let captured = captured.expect("the acceptor's reestablish");
-    // Replayed on another connection: ignored, nothing rebound.
-    let r = p.funder.deliver(IMPOSTOR, "acceptor-node", &captured);
+    // Replayed in the impostor's session: ignored, nothing rebound.
+    let r = p.funder.deliver(IMPOSTOR, &captured);
     assert!(r.frames.is_empty());
     assert_eq!(p.funder.peer_of(cid), Some(A_PEER));
-    // Replayed to the funder after its restart, even on the same id: the
-    // funder never issued that challenge, so it binds nothing.
+    // Replayed after the funder's restart, in a new session authenticated as
+    // the acceptor: its proof covers the old session's binding, not this one.
     p.reload_funder(funder_seed, wallet, chain, &dir);
-    let r = p.funder.deliver(A_PEER, "", &captured);
+    let _ = session(&p.funder, A_PEER, &aid);
+    let r = p.funder.deliver(A_PEER, &captured);
+    assert_eq!(r.penalize, 0);
     assert!(r.frames.is_empty());
     assert_ne!(p.funder.peer_of(cid), Some(A_PEER));
-    assert!(p.funder.pay(cid, 1).is_err(), "unauthenticated");
+    assert!(p.funder.pay(cid, 1).is_err(), "not resynchronized");
 }
 
 // --- Hello spam -------------------------------------------------------------
@@ -2143,12 +2195,16 @@ fn hello_spam_spends_nothing_and_a_real_channel_still_reloads() {
     );
     acceptor.set_pending_open_ttl(std::time::Duration::ZERO);
     let spammer = one_manager([0xd7u8; 32], wallet.clone(), chain.clone(), &dir.join("s"));
+    session(&spammer, 1, &acceptor.node_id());
     let hello = spammer
-        .open(1, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(1, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
     for conn in 0..1_200u64 {
-        let r = acceptor.deliver(10_000 + conn, "", &hello);
+        // Each a node of its own, on a connection that then goes away.
+        session(&acceptor, 10_000 + conn, &id_of(10_000 + conn));
+        let r = acceptor.deliver(10_000 + conn, &hello);
         assert_eq!(r.penalize, 0);
+        acceptor.on_session_closed(10_000 + conn);
     }
     assert_eq!(
         *addresses.lock().unwrap(),
@@ -2164,9 +2220,10 @@ fn hello_spam_spends_nothing_and_a_real_channel_still_reloads() {
         acceptor,
         queue: VecDeque::new(),
     };
+    p.reconnect();
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
     p.queue.push_back((1, hello));
     p.pump();
@@ -2198,11 +2255,15 @@ fn pending_opens_are_bounded_per_identity() {
     let dir = tmpdir("hello-identity");
     let acceptor = one_manager([0xd9u8; 32], wallet.clone(), chain.clone(), &dir.join("a"));
     let spammer = one_manager([0xdau8; 32], wallet, chain, &dir.join("s"));
+    session(&spammer, 1, &acceptor.node_id());
     let hello = spammer
-        .open(1, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(1, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
     for conn in 0..(MAX_PENDING_PER_IDENTITY as u64 + 3) {
-        let r = acceptor.deliver(50 + conn, "the-same-node", &hello);
+        // The same node over many connections: its sessions all
+        // authenticate the one node id.
+        session(&acceptor, 50 + conn, &spammer.node_id());
+        let r = acceptor.deliver(50 + conn, &hello);
         assert_eq!(r.penalize, 0);
         assert_eq!(
             r.frames.is_empty(),
@@ -2240,11 +2301,11 @@ fn unfunded_channels_expire_when_nothing_is_at_stake() {
     // Opened as far as the acceptor's Accept; the funder never answers.
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
-    let hello_back = one(p.acceptor.deliver(F_PEER, "", &hello));
-    let open = one(p.funder.deliver(A_PEER, "", &hello_back));
-    let _accept = one(p.acceptor.deliver(F_PEER, "", &open));
+    let hello_back = one(p.acceptor.deliver(F_PEER, &hello));
+    let open = one(p.funder.deliver(A_PEER, &hello_back));
+    let _accept = one(p.acceptor.deliver(F_PEER, &open));
     let cid = p.acceptor.list()[0].channel_id;
     let journals = |side: &str| {
         std::fs::read_dir(dir.join(side))
@@ -2303,9 +2364,10 @@ fn a_broadcast_funding_is_never_forgotten() {
         acceptor,
         queue: VecDeque::new(),
     };
+    p.reconnect();
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
     p.queue.push_back((1, hello));
     p.pump();
@@ -2326,24 +2388,35 @@ fn unfunded_channels_are_bounded() {
     let (wallet, chain) = setup([0xdfu8; 32]);
     let dir = tmpdir("unfunded-cap");
     let acceptor = one_manager([0xe0u8; 32], wallet.clone(), chain.clone(), &dir.join("a"));
-    // Two spammers, each on its own connections, so neither its own bound on
-    // the opens it funds nor the bound per peer stops them first.
-    let spammers = [
-        one_manager([0xe3u8; 32], wallet.clone(), chain.clone(), &dir.join("s1")),
-        one_manager([0xe4u8; 32], wallet, chain, &dir.join("s2")),
-    ];
+    // Five spammers, each on its own connections, so neither the bound on
+    // the opens each funds nor its bound on channels with one peer — the
+    // acceptor, as each spammer's sessions authenticate it — stops them
+    // first.
+    let spammers: Vec<ChannelManager> = (0..5u8)
+        .map(|i| {
+            one_manager(
+                [0xf0 + i; 32],
+                wallet.clone(),
+                chain.clone(),
+                &dir.join(format!("s{i}")),
+            )
+        })
+        .collect();
     let mut opened = 0;
     for k in 0..(MAX_UNFUNDED_CHANNELS as u64 + 3) {
-        let spammer = &spammers[(k % 2) as usize];
-        let hello = spammer.open(k, "", 4 * MIN_OUTPUT_VALUE * 10, None, None);
+        let spammer = &spammers[(k % 5) as usize];
+        // Each connection a node of its own, as far as the acceptor knows.
+        session(spammer, k, &acceptor.node_id());
+        session(&acceptor, 1_000 + k, &id_of(1_000 + k));
+        let hello = spammer.open(k, 4 * MIN_OUTPUT_VALUE * 10, None, None);
         let Ok(hello) = hello else { break };
-        let r = acceptor.deliver(1_000 + k, "", &hello);
+        let r = acceptor.deliver(1_000 + k, &hello);
         let Some(back) = r.frames.into_iter().next() else {
             continue;
         };
-        let r = spammer.deliver(k, "", &back);
+        let r = spammer.deliver(k, &back);
         if let Some(open) = r.frames.into_iter().next() {
-            if !acceptor.deliver(1_000 + k, "", &open).frames.is_empty() {
+            if !acceptor.deliver(1_000 + k, &open).frames.is_empty() {
                 opened += 1;
             }
         }
@@ -2351,9 +2424,10 @@ fn unfunded_channels_are_bounded() {
     assert_eq!(opened, MAX_UNFUNDED_CHANNELS);
     assert_eq!(acceptor.list().len(), MAX_UNFUNDED_CHANNELS);
     // Channels others opened to us never block one we open.
+    session(&acceptor, 9_999, &id_of(9_999));
     assert!(
         acceptor
-            .open(9_999, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+            .open(9_999, 4 * MIN_OUTPUT_VALUE * 10, None, None)
             .is_ok(),
         "inbound unfunded channels block our own open"
     );
@@ -2370,16 +2444,19 @@ fn unfunded_channels_are_budgeted_per_peer() {
     let spammer = one_manager([0xe7u8; 32], wallet, chain, &dir.join("s"));
     let mut opened = 0;
     for k in 0..8u64 {
-        let Ok(hello) = spammer.open(k, "", 4 * MIN_OUTPUT_VALUE * 10, None, None) else {
+        // One node, many connections: each session authenticates its id.
+        session(&spammer, k, &acceptor.node_id());
+        session(&acceptor, 1_000 + k, &spammer.node_id());
+        let Ok(hello) = spammer.open(k, 4 * MIN_OUTPUT_VALUE * 10, None, None) else {
             break;
         };
-        let r = acceptor.deliver(1_000 + k, "evil", &hello);
+        let r = acceptor.deliver(1_000 + k, &hello);
         let Some(back) = r.frames.into_iter().next() else {
             continue;
         };
-        let r = spammer.deliver(k, "", &back);
+        let r = spammer.deliver(k, &back);
         if let Some(open) = r.frames.into_iter().next() {
-            if !acceptor.deliver(1_000 + k, "evil", &open).frames.is_empty() {
+            if !acceptor.deliver(1_000 + k, &open).frames.is_empty() {
                 opened += 1;
             }
         }
@@ -2411,16 +2488,16 @@ fn an_accepted_channel_without_its_funding_expires_within_the_hour() {
     // Up to the acceptor's Accept: no Funding follows.
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
-    let back = one(p.acceptor.deliver(F_PEER, "", &hello));
-    let open = one(p.funder.deliver(A_PEER, "", &back));
-    let _accept = one(p.acceptor.deliver(F_PEER, "", &open));
+    let back = one(p.acceptor.deliver(F_PEER, &hello));
+    let open = one(p.funder.deliver(A_PEER, &back));
+    let _accept = one(p.acceptor.deliver(F_PEER, &open));
     let waiting = p.acceptor.list()[0].channel_id;
     // A second, complete up to the Funding (never broadcast here).
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
     p.queue.push_back((1, hello));
     p.pump();
@@ -2666,11 +2743,12 @@ fn unconfirmed_funding_pair(
         DEPTH,
         acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
     );
-    let p = Pair {
+    let mut p = Pair {
         funder,
         acceptor,
         queue: VecDeque::new(),
     };
+    p.reconnect();
     (p, wallet, chain, dir, sent)
 }
 
@@ -2689,12 +2767,12 @@ fn funding_coins_are_held_back_until_the_funding_confirms() {
     };
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
-    let back = one(p.acceptor.deliver(F_PEER, "", &hello));
-    let open = one(p.funder.deliver(A_PEER, "", &back));
-    let accept = one(p.acceptor.deliver(F_PEER, "", &open));
-    let funding = one(p.funder.deliver(A_PEER, "", &accept));
+    let back = one(p.acceptor.deliver(F_PEER, &hello));
+    let open = one(p.funder.deliver(A_PEER, &back));
+    let accept = one(p.acceptor.deliver(F_PEER, &open));
+    let funding = one(p.funder.deliver(A_PEER, &accept));
     let cid = p.funder.list()[0].channel_id;
     let txid = p.funder.info(cid).unwrap().funding.unwrap().txid;
     // Signed, not broadcast: a send now picks other coins.
@@ -2707,8 +2785,8 @@ fn funding_coins_are_held_back_until_the_funding_confirms() {
             .expect("other coins");
         chosen.iter().all(|(o, _, _)| !inputs.contains(o)) && inputs.iter().all(|o| w.is_locked(o))
     };
-    let signed = one(p.acceptor.deliver(F_PEER, "", &funding));
-    assert_eq!(p.funder.deliver(A_PEER, "", &signed).penalize, 0);
+    let signed = one(p.acceptor.deliver(F_PEER, &funding));
+    assert_eq!(p.funder.deliver(A_PEER, &signed).penalize, 0);
     let tx = sent.lock().unwrap()[0].clone();
     assert_eq!(tx.txid(), txid);
     let inputs: Vec<OutPoint> = tx.inputs.iter().map(|i| i.prev_out).collect();
@@ -2751,7 +2829,7 @@ fn a_funding_whose_coin_is_spent_elsewhere_is_given_up() {
         unconfirmed_funding_pair([0xb3u8; 32], [0xb4u8; 32], "n4-conflict");
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
     p.queue.push_back((1, hello));
     p.pump();
@@ -2809,12 +2887,11 @@ fn engine_frame(cid: Hash256, msg: &q21_core::channel::messages::Message) -> Vec
 }
 
 /// N1: a relay between the two ends of a channel — connected to each,
-/// passing every frame on — gets both of its connections authenticated: each
-/// side's challenge is answered by the real other side. Before control
-/// messages were signed, it could then inject a Close on each side: both
-/// went to closing, each believing the other proposed, and only a unilateral
-/// close was left. Now a frame it makes up is refused on both sides, and a
-/// signed one replayed is ignored.
+/// passing every frame on. Its sessions authenticate its own node id, never
+/// the counterparty's: no channel is offered to it, and nothing it sends is
+/// acted on. A Close made up and injected over the real counterparty's
+/// session is refused too: control messages carry the funding key's
+/// signature, whatever carried them.
 #[test]
 fn a_relay_cannot_close_a_channel_it_sits_in() {
     use q21_core::channel::messages::Message;
@@ -2826,32 +2903,27 @@ fn a_relay_cannot_close_a_channel_it_sits_in() {
     // The relay's connections: 77 on the funder, 88 on the acceptor.
     const ON_F: u64 = 77;
     const ON_A: u64 = 88;
-    // It challenges the funder itself, then only passes frames along until
-    // both sides fall quiet.
-    let mut to_f: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut to_a: VecDeque<Vec<u8>> = VecDeque::new();
-    // It knows the channel id: it saw the earlier traffic.
-    to_f.push_back(engine_frame(
-        Hash256::ZERO,
-        &Message::Challenge {
-            locator: q21_core::channel::messages::challenge_locator(cid, &[0x11; 32]),
-            nonce: [0x11; 32],
-        },
-    ));
+    let relay = "77".repeat(32);
+    let mut to_f: VecDeque<Vec<u8>> = session(&p.acceptor, ON_A, &relay).into();
+    let mut to_a: VecDeque<Vec<u8>> = session(&p.funder, ON_F, &relay).into();
+    assert!(
+        to_f.is_empty() && to_a.is_empty(),
+        "a channel offered to it"
+    );
+    // It knows the channel id: it saw the earlier traffic. It passes along
+    // the funder's last payment and every answer.
+    to_a.push_back(p.funder.pay(cid, 1).unwrap_or_default());
     let mut steps = 0;
     while !(to_f.is_empty() && to_a.is_empty()) {
         steps += 1;
         assert!(steps < 100);
         if let Some(f) = to_f.pop_front() {
-            to_a.extend(p.funder.deliver(ON_F, "", &f).frames);
+            to_a.extend(p.funder.deliver(ON_F, &f).frames);
         }
         if let Some(f) = to_a.pop_front() {
-            to_f.extend(p.acceptor.deliver(ON_A, "", &f).frames);
+            to_f.extend(p.acceptor.deliver(ON_A, &f).frames);
         }
     }
-    // Both connections now speak for the channel: its frames are acted on.
-    // A Close it makes up — unsigned, or signed by a key of its own — is
-    // injected on both sides.
     use q21_core::channel::keys::{ChannelKey, Signer, CHANNEL_SCHEME};
     let own = ChannelKey::from_seed(&[0x66; 32]);
     for sender in [0u8, 1] {
@@ -2872,38 +2944,42 @@ fn a_relay_cannot_close_a_channel_it_sits_in() {
                 },
             );
             let to = if sender == 1 { &p.funder } else { &p.acceptor };
-            let conn = if sender == 1 { ON_F } else { ON_A };
-            let r = to.deliver(conn, "", &forged);
+            // Over its own session, and over the counterparty's.
+            let (relayed, genuine) = if sender == 1 {
+                (ON_F, A_PEER)
+            } else {
+                (ON_A, F_PEER)
+            };
+            let r = to.deliver(relayed, &forged);
+            assert!(r.frames.is_empty());
+            assert_eq!(r.penalize, 0, "ignored, not blamed");
+            let r = to.deliver(genuine, &forged);
             assert!(r.frames.is_empty());
         }
     }
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Open, "funder");
     assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open, "acceptor");
-    // The channel still pays.
+    // The relayed payment was never acted on; the channel still pays.
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 300_000);
+    p.reconnect();
+    p.pump();
     let m = p.funder.pay(cid, 1_000).unwrap();
     p.queue.push_back((1, m));
     p.pump();
-    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 301_000);
+    assert!(p.acceptor.info(cid).unwrap().local_balance >= 301_000);
 }
 
-/// N1: a challenge goes to a connection that has proved nothing yet, so it
-/// does not name its channel in clear: a stranger announcing the
-/// counterparty's identity learns no channel id from it.
+/// N1: a session tells a node who its peer is before any channel frame
+/// moves: a session from another node is offered no reestablish, and so
+/// learns no channel id, while the counterparty's gets one per channel.
 #[test]
-fn a_challenge_does_not_name_its_channel_in_clear() {
+fn a_session_from_another_node_learns_no_channel() {
     let (p, _wallet, _chain, _dir, cid, _capacity) =
         open_channel([0xa9u8; 32], [0xaau8; 32], "n1-locator");
-    // A new connection under the counterparty's id: challenged.
-    let frames = p.funder.on_peer_connected(A_PEER, "");
-    assert_eq!(frames.len(), 1, "challenged");
-    assert!(
-        !frames[0].windows(32).any(|w| w == cid.as_bytes()),
-        "the channel id travels in clear"
-    );
-    // The real counterparty still finds its channel and answers.
-    let r = p.acceptor.deliver(F_PEER, "", &frames[0]);
-    assert_eq!(r.penalize, 0);
-    assert!(!r.frames.is_empty());
+    assert!(session(&p.funder, 99, &"99".repeat(32)).is_empty());
+    let frames = session(&p.funder, A_PEER, &p.acceptor.node_id());
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0].windows(32).any(|w| w == cid.as_bytes()));
 }
 
 /// M1: we fund, and go down before the funding confirms: no funding height
@@ -2918,7 +2994,7 @@ fn a_funding_confirmed_while_we_were_down_is_claimed_not_given_up() {
     let (mut p, wallet, chain, dir, sent) =
         unconfirmed_funding_pair(funder_seed, acceptor_seed, "m1-offline-funder");
     let capacity = 4 * MIN_OUTPUT_VALUE * 10;
-    let hello = p.funder.open(A_PEER, "", capacity, None, None).unwrap();
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
     p.queue.push_back((1, hello));
     p.pump();
     let cid = p.funder.list()[0].channel_id;
@@ -2985,7 +3061,7 @@ fn an_unconfirmed_funding_is_announced_again_and_released_when_the_channel_ends(
         unconfirmed_funding_pair([0xb7u8; 32], [0xb8u8; 32], "m2-rebroadcast");
     let hello = p
         .funder
-        .open(A_PEER, "", 4 * MIN_OUTPUT_VALUE * 10, None, None)
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE * 10, None, None)
         .unwrap();
     p.queue.push_back((1, hello));
     p.pump();
@@ -3026,7 +3102,7 @@ fn a_payment_counts_for_the_payee_only_once_it_is_irrevocable() {
     };
     let update = p.funder.pay(cid, 300_000).unwrap();
     // The payee holds the signed update: not yet its balance.
-    let ack = one(p.acceptor.deliver(F_PEER, "", &update));
+    let ack = one(p.acceptor.deliver(F_PEER, &update));
     let a = p.acceptor.info(cid).unwrap();
     assert_eq!(a.local_balance, 0, "counted before the payer revoked");
     assert_eq!(a.pending_incoming, 300_000);
@@ -3036,12 +3112,12 @@ fn a_payment_counts_for_the_payee_only_once_it_is_irrevocable() {
     assert_eq!(f.local_balance, capacity - 300_000);
     assert_eq!(f.pending_incoming, 0);
     // The payer revokes the old state: settled on its side ...
-    let revoke = one(p.funder.deliver(A_PEER, "", &ack));
+    let revoke = one(p.funder.deliver(A_PEER, &ack));
     let f = p.funder.info(cid).unwrap();
     assert!(!f.in_flight);
     assert_eq!(f.local_balance + f.remote_balance, capacity);
     // ... and, the revocation received, on the payee's.
-    let r = p.acceptor.deliver(F_PEER, "", &revoke);
+    let r = p.acceptor.deliver(F_PEER, &revoke);
     assert_eq!(r.penalize, 0);
     let a = p.acceptor.info(cid).unwrap();
     assert_eq!(a.local_balance, 300_000);

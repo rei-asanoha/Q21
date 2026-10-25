@@ -4,7 +4,7 @@
 
 use q21_core::address::Network;
 use q21_core::chain::{genesis_block, Chain};
-use q21_core::net::{ChannelOutcome, ChannelSink, Node};
+use q21_core::net::{ChannelLink, ChannelOutcome, ChannelSink, Node};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +18,7 @@ struct Recorder {
 }
 
 impl ChannelSink for Recorder {
-    fn deliver(&self, _peer: u64, _peer_identity: &str, bytes: &[u8]) -> ChannelOutcome {
+    fn deliver(&self, _peer: u64, _link: &ChannelLink, bytes: &[u8]) -> ChannelOutcome {
         self.count.fetch_add(1, Ordering::SeqCst);
         *self.last.lock().unwrap() = bytes.to_vec();
         ChannelOutcome::default()

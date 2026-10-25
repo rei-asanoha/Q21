@@ -908,7 +908,7 @@ mod status {
 /// opens, pays or closes refuses.
 mod channels {
     use super::*;
-    use q21_core::net::{magic_for, ChannelOutcome, ChannelSink, Node};
+    use q21_core::net::{magic_for, ChannelLink, ChannelOutcome, ChannelSink, Node};
     use q21_core::wire::{Message, POLICY_ACTIVATION_VERSION};
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -919,7 +919,7 @@ mod channels {
     struct Counting(AtomicUsize);
 
     impl ChannelSink for Counting {
-        fn deliver(&self, _peer: u64, _identity: &str, _bytes: &[u8]) -> ChannelOutcome {
+        fn deliver(&self, _peer: u64, _link: &ChannelLink, _bytes: &[u8]) -> ChannelOutcome {
             self.0.fetch_add(1, Ordering::SeqCst);
             ChannelOutcome::default()
         }
@@ -946,7 +946,10 @@ mod channels {
             version,
             timestamp: 0,
             nonce: 0xc4a2 + u64::from(version),
-            user_agent: "q21:0.4+chan0123456789abcdef0123456789abcdef".into(),
+            user_agent: format!(
+                "q21:0.4{}0123456789abcdef0123456789abcdef",
+                q21_core::wire::CHANNELS_CAPABILITY
+            ),
             start_height: H - 1,
         };
         s.write_all(&v.frame(magic)).unwrap();

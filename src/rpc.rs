@@ -1213,43 +1213,57 @@ impl RpcContext {
     #[cfg(feature = "mldsa")]
     fn channelopen(&self, params: &Json) -> Result<Json, Json> {
         let mgr = self.channels_open()?;
-        // `peer` is either a numeric connection id (as getpeers reports) or a
-        // durable peer identity — an address or the peer's stable channel node
-        // id. Resolve a string to the live id of a connected channel-capable
-        // peer; the node id survives reconnects, the connection id does not.
-        let peer = match params.get("peer") {
-            Some(v) if v.as_u64().is_some() => v.as_u64().unwrap(),
-            Some(Json::Str(key)) => self
-                .node
-                .peer_list()
-                .into_iter()
-                .find(|p| p.supports_channels && (&p.address == key || &p.channel_id == key))
-                .map(|p| p.id)
-                .ok_or_else(|| {
-                    rpc_error(
+        // `peer` is either a numeric connection id (as getpeers reports), an
+        // address, or a node id. A node id is matched against what each
+        // connection's session authenticated — the full id, or the 32-hex
+        // prefix peers advertise — never against what a peer claims, so a
+        // party relaying the connection cannot take the channel in its place.
+        let peer =
+            match params.get("peer") {
+                Some(v) if v.as_u64().is_some() => v.as_u64().unwrap(),
+                Some(Json::Str(key)) => {
+                    let by_address = self
+                        .node
+                        .peer_list()
+                        .into_iter()
+                        .filter(|p| p.supports_channels && &p.address == key)
+                        .map(|p| p.id)
+                        .find(|id| mgr.peer_node_id(*id).is_some());
+                    let by_node_id = || {
+                        let key = key.to_ascii_lowercase();
+                        (key.len() >= crate::wire::CHANNEL_NODE_ID_HEX)
+                            .then(|| {
+                                mgr.sessions()
+                                    .into_iter()
+                                    .find(|(_, id)| id.starts_with(&key))
+                                    .map(|(conn, _)| conn)
+                            })
+                            .flatten()
+                    };
+                    by_address.or_else(by_node_id).ok_or_else(|| {
+                        rpc_error(
                         ERR_PARAMS,
-                        "no connected channel-capable peer at that address or node id",
+                        "no channel peer with an established session at that address or node id",
                     )
-                })?,
-            _ => {
-                return Err(rpc_error(
+                    })?
+                }
+                _ => return Err(rpc_error(
                     ERR_PARAMS,
-                    "peer must be a numeric peer id (see getpeers) or a peer address",
-                ))
-            }
-        };
+                    "peer must be a numeric peer id (see getpeers), a peer address or a node id",
+                )),
+            };
         let capacity = params
             .get("capacity")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| rpc_error(ERR_PARAMS, "capacity (in units) is required"))?;
         let (delay, depth) = channel_open_terms(params)?;
         let frame = mgr
-            .open(peer, &self.node.peer_identity(peer), capacity, delay, depth)
+            .open(peer, capacity, delay, depth)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
-        if !self.node.send_channel(peer, frame) {
+        if !mgr.send(peer, frame) {
             return Err(rpc_error(
                 ERR_REQUEST,
-                "peer is not connected or does not support payment channels",
+                "peer is not connected or holds no channel session",
             ));
         }
         Ok(Json::obj()
@@ -1279,7 +1293,7 @@ impl RpcContext {
         let frame = mgr
             .pay(cid, amount)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
-        if !self.node.send_channel(peer, frame) {
+        if !mgr.send(peer, frame) {
             return Err(rpc_error(
                 ERR_REQUEST,
                 "peer disconnected; the payment completes when the channel reconnects",
@@ -1332,7 +1346,7 @@ impl RpcContext {
         // `None`: a payment is still settling; the close is agreed and its
         // message leaves as soon as the payment completes.
         if let Some(frame) = mgr.close(cid).map_err(|e| rpc_error(ERR_REQUEST, &e))? {
-            if !self.node.send_channel(peer, frame) {
+            if !mgr.send(peer, frame) {
                 return Err(rpc_error(
                     ERR_REQUEST,
                     "peer disconnected; the close completes when the channel reconnects",
@@ -1789,6 +1803,15 @@ impl RpcContext {
 
     fn getpeers(&self) -> Json {
         let peers = self.node.peer_list();
+        // The node id a peer's channel session authenticated, unlike the
+        // `channel_id` it advertises.
+        let session_of = |_id: u64| -> Json {
+            #[cfg(feature = "mldsa")]
+            if let Some(n) = self.channels.as_ref().and_then(|m| m.peer_node_id(_id)) {
+                return Json::str(n);
+            }
+            Json::Null
+        };
         Json::obj()
             .set("peer_count", Json::u64(self.node.peer_count() as u64))
             .set("maximum", Json::u64(crate::net::MAX_PEERS as u64))
@@ -1810,6 +1833,7 @@ impl RpcContext {
                                 .set("channel_id", Json::str(p.channel_id))
                                 .set("protocol_version", Json::u64(u64::from(p.version)))
                                 .set("follows_activation", Json::Bool(p.follows_activation))
+                                .set("channel_session", session_of(p.id))
                                 .build()
                         })
                         .collect(),

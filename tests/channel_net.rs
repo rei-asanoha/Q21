@@ -1,6 +1,7 @@
 //! Node-level payment-channel tests: two real [`Node`]s with wallets, connected
-//! over TCP, drive open → pay → close end to end. Channel frames travel through
-//! `send_channel` and the nodes' message handlers; the on-chain reactions run
+//! over TCP, drive open → pay → close end to end. Channel frames travel sealed
+//! in the transport session between the nodes ([`ChannelTransport`]) and
+//! through the nodes' message handlers; the on-chain reactions run
 //! through the nodes' real block hook. The point every test makes is about
 //! **wallet funds**: a settled channel must leave each party spendable coin.
 
@@ -9,6 +10,7 @@
 use q21_core::address::Network;
 use q21_core::amount::Amount;
 use q21_core::chain::{genesis_block, Chain, GENESIS_TIME};
+use q21_core::channel::link::ChannelTransport;
 use q21_core::channel::manager::{ChannelManager, Hooks};
 use q21_core::consensus::{COINBASE_MATURITY, TARGET_BLOCK_SECS};
 use q21_core::hash::Hash256;
@@ -187,8 +189,8 @@ fn setup_as(tag: &str, funder_seed: [u8; 32], acceptor_seed: [u8; 32], funder_di
         DEPTH,
         hooks(bwallet.clone(), b.clone(), pending.clone(), false),
     ));
-    a.set_channel_sink(fmgr.clone());
-    b.set_channel_sink(amgr.clone());
+    a.set_channel_sink(ChannelTransport::new(fmgr.clone()));
+    b.set_channel_sink(ChannelTransport::new(amgr.clone()));
 
     // Give the funder some coinbase, then mine enough burn blocks that ALL of
     // it is mature before the test starts. Test-phase blocks are mined to a
@@ -222,6 +224,7 @@ fn setup_as(tag: &str, funder_seed: [u8; 32], acceptor_seed: [u8; 32], funder_di
     let bid = *wait_vec(|| a.channel_peers(), 5)
         .first()
         .expect("A sees B as channel-capable");
+    wait_sessions(&fmgr, &amgr, bid);
 
     Net {
         a,
@@ -238,6 +241,19 @@ fn setup_as(tag: &str, funder_seed: [u8; 32], acceptor_seed: [u8; 32], funder_di
         dir,
         b_listen,
     }
+}
+
+/// Waits until the funder's connection `bid` carries an established session
+/// at both ends, authenticated as the right node each way.
+fn wait_sessions(fmgr: &ChannelManager, amgr: &ChannelManager, bid: u64) {
+    assert!(
+        wait(
+            || fmgr.peer_node_id(bid) == Some(amgr.node_id())
+                && amgr.sessions().iter().any(|(_, id)| *id == fmgr.node_id()),
+            10
+        ),
+        "the channel session did not come up"
+    );
 }
 
 fn wait_vec(f: impl Fn() -> Vec<u64>, secs: u64) -> Vec<u64> {
@@ -280,13 +296,9 @@ impl Net {
 
     /// Opens a channel A→B over the wire and drives it to `open` on both sides.
     fn open(&self, capacity: u64) -> Hash256 {
-        let identity = self.a.peer_identity(self.bid);
         let known: Vec<Hash256> = self.fmgr.list().iter().map(|c| c.channel_id).collect();
-        let hello = self
-            .fmgr
-            .open(self.bid, &identity, capacity, None, None)
-            .unwrap();
-        assert!(self.a.send_channel(self.bid, hello));
+        let hello = self.fmgr.open(self.bid, capacity, None, None).unwrap();
+        assert!(self.fmgr.send(self.bid, hello));
         let fresh = || {
             self.fmgr
                 .list()
@@ -347,6 +359,7 @@ impl Net {
             wait(|| self.a.channel_peers().contains(&bid2), 10),
             "the link did not re-establish after the flap"
         );
+        wait_sessions(&self.fmgr, &self.amgr, bid2);
         self.bid = bid2;
         bid2
     }
@@ -370,13 +383,15 @@ impl Net {
                 true,
             ),
         ));
-        self.a.set_channel_sink(fmgr2.clone());
+        self.a
+            .set_channel_sink(ChannelTransport::new(fmgr2.clone()));
         self.fmgr = fmgr2;
         let bid2 = self.a.connect(self.b_listen).expect("redial the acceptor");
         assert!(
             wait(|| self.a.channel_peers().contains(&bid2), 10),
             "reconnect did not establish a channel-capable link"
         );
+        wait_sessions(&self.fmgr, &self.amgr, bid2);
         self.bid = bid2;
         bid2
     }
@@ -405,7 +420,7 @@ fn cooperative_close_credits_both_wallets() {
     // Pay the acceptor; now the acceptor holds 1_000_000, the funder the rest.
     let paid = 1_000_000u64;
     let pay = net.fmgr.pay(cid, paid).unwrap();
-    assert!(net.a.send_channel(net.bid, pay));
+    assert!(net.fmgr.send(net.bid, pay));
     assert!(
         wait(
             || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == paid,
@@ -421,7 +436,7 @@ fn cooperative_close_credits_both_wallets() {
     // Cooperative close, proposed by the funder.
     // `None`: a payment still settling; the Close follows it on its own.
     if let Some(close) = net.fmgr.close(cid).unwrap() {
-        assert!(net.a.send_channel(net.bid, close));
+        assert!(net.fmgr.send(net.bid, close));
     }
     assert!(
         wait(|| net.pending_len() >= 1, 10),
@@ -490,7 +505,7 @@ fn force_close_sweeps_to_wallet_after_delay() {
     // Move some balance so the funder's to_local is well above dust.
     let paid = 1_000_000u64;
     let pay = net.fmgr.pay(cid, paid).unwrap();
-    assert!(net.a.send_channel(net.bid, pay));
+    assert!(net.fmgr.send(net.bid, pay));
     assert!(
         wait(
             || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == paid,
@@ -601,12 +616,12 @@ fn an_accepting_node_can_open_back_to_the_dialer() {
     // A (accepting side) opens a channel to the inbound dialer, naming it by its
     // stable node id, and it reaches open.
     let cid = {
-        let identity = net.a.peer_identity(net.bid);
         assert_eq!(
-            identity,
-            net.amgr.node_id_hex(),
-            "peer identity is the node id"
+            net.fmgr.peer_node_id(net.bid),
+            Some(net.amgr.node_id()),
+            "the session authenticated the acceptor's node id"
         );
+        assert!(net.amgr.node_id().starts_with(&net.amgr.node_id_hex()));
         net.open(4_000_000)
     };
     assert!(phase_is_open(&net.fmgr, cid) && phase_is_open(&net.amgr, cid));
@@ -629,7 +644,7 @@ fn channelpay_survives_a_restart_and_reconnect() {
 
     // A settled payment, so there is persisted state to recover.
     let pay = net.fmgr.pay(cid, 500_000).unwrap();
-    assert!(net.a.send_channel(net.bid, pay));
+    assert!(net.fmgr.send(net.bid, pay));
     assert!(
         wait(
             || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 500_000,
@@ -651,7 +666,7 @@ fn channelpay_survives_a_restart_and_reconnect() {
             || {
                 net.fmgr
                     .pay(cid, 300_000)
-                    .map(|f| net.a.send_channel(net.bid, f))
+                    .map(|f| net.fmgr.send(net.bid, f))
                     .unwrap_or(false)
             },
             10
@@ -676,7 +691,7 @@ fn channelpay_survives_a_restart_and_reconnect() {
         .expect("a reloaded channel can be cooperatively closed");
     // `None`: the payment is still settling; the Close follows it on its own.
     if let Some(close) = close {
-        assert!(net.a.send_channel(net.bid, close));
+        assert!(net.fmgr.send(net.bid, close));
     }
     assert!(
         wait(|| net.pending_len() >= 1, 10),
@@ -725,7 +740,7 @@ fn a_revoked_single_output_commitment_is_punished() {
 
     // Pay the acceptor, revoking state 0.
     let pay = net.fmgr.pay(cid, 1_000_000).unwrap();
-    assert!(net.a.send_channel(net.bid, pay));
+    assert!(net.fmgr.send(net.bid, pay));
     assert!(
         wait(
             || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 1_000_000,
@@ -786,7 +801,7 @@ fn a_revoked_two_output_commitment_is_punished() {
 
     // Pay to state 1 (both outputs present), keep state-1 as the revoked one.
     let pay1 = net.fmgr.pay(cid, 1_500_000).unwrap();
-    assert!(net.a.send_channel(net.bid, pay1));
+    assert!(net.fmgr.send(net.bid, pay1));
     assert!(
         wait(
             || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 1_500_000,
@@ -810,7 +825,7 @@ fn a_revoked_two_output_commitment_is_punished() {
     // revoked one, and the victim could only claim its own output. (Waiting
     // on the balance used to race the revocation under load.)
     let pay2 = net.fmgr.pay(cid, 500_000).unwrap();
-    assert!(net.a.send_channel(net.bid, pay2));
+    assert!(net.fmgr.send(net.bid, pay2));
     assert!(
         wait(
             || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 2_000_000,
@@ -952,7 +967,7 @@ fn a_channel_survives_repeated_link_flaps() {
                 || net
                     .fmgr
                     .pay(cid, 400_000)
-                    .map(|f| net.a.send_channel(net.bid, f))
+                    .map(|f| net.fmgr.send(net.bid, f))
                     .unwrap_or(false),
                 10
             ),
@@ -971,7 +986,7 @@ fn a_channel_survives_repeated_link_flaps() {
     let b_before = net.b_balance();
     // `None`: a payment still settling; the Close follows it on its own.
     if let Some(close) = net.fmgr.close(cid).unwrap() {
-        assert!(net.a.send_channel(net.bid, close));
+        assert!(net.fmgr.send(net.bid, close));
     }
     assert!(wait(|| net.pending_len() >= 1, 10), "close not broadcast");
     net.mine();
@@ -999,7 +1014,7 @@ fn crossed_payments_are_not_misconduct() {
 
     // Give the acceptor a balance to pay with.
     let first = net.fmgr.pay(cid, 1_000_000).unwrap();
-    assert!(net.a.send_channel(net.bid, first));
+    assert!(net.fmgr.send(net.bid, first));
     assert!(
         wait(
             || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == 1_000_000,
@@ -1025,12 +1040,8 @@ fn crossed_payments_are_not_misconduct() {
 
     // Each proposal reaches the other side.
     let b_peer = *net.b.channel_peers().first().expect("B sees A");
-    let at_acceptor = net
-        .amgr
-        .deliver(b_peer, &net.b.peer_identity(b_peer), &from_funder);
-    let at_funder = net
-        .fmgr
-        .deliver(net.bid, &net.a.peer_identity(net.bid), &from_acceptor);
+    let at_acceptor = net.amgr.deliver(b_peer, &from_funder);
+    let at_funder = net.fmgr.deliver(net.bid, &from_acceptor);
     assert_eq!(at_acceptor.penalize, 0, "the acceptor charged the race");
     assert_eq!(at_funder.penalize, 0, "the funder charged the race");
 
@@ -1039,27 +1050,24 @@ fn crossed_payments_are_not_misconduct() {
 }
 
 /// D14: two wallets that dial each other hold two links to the same peer.
-/// Once the second link has answered the challenge sent at its handshake, a
+/// Once the second link's session is up and its reestablish verified, a
 /// payment arriving on it settles and the channel stays usable, not waiting
-/// for a reestablish that no one sends while both links stay up. Before it
-/// has, a frame there — from a connection merely claiming the peer's
-/// identity — is not acted on.
+/// for a reestablish that no one sends while both links stay up. A session
+/// there authenticated as another node is not heard.
 #[test]
 fn a_payment_on_the_second_link_leaves_the_channel_usable() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let net = setup("d14second", [0xd1u8; 32], [0xd2u8; 32]);
     let cid = net.open(4_000_000);
+    let (fid, aid) = (net.fmgr.node_id(), net.amgr.node_id());
+    // The second link, at each end.
+    let (second_a, second_f) = (1_000_001u64, 1_000_002u64);
 
-    let b_peer = *net.b.channel_peers().first().expect("B sees A");
-    let identity = net.b.peer_identity(b_peer);
-    let a_identity = net.a.peer_identity(net.bid);
-    // The second link: another live connection announcing the same peer.
-    let second = b_peer + 1000;
-
-    // Not yet authenticated: a Close there is ignored.
+    // A session there authenticated as another node: its Close is ignored.
+    net.amgr
+        .on_session(second_a, &"ee".repeat(32), "", [0x50; 32]);
     let close = net.amgr.deliver(
-        second,
-        &identity,
+        second_a,
         &[
             cid.as_bytes().as_slice(),
             &[0u8],
@@ -1079,17 +1087,19 @@ fn a_payment_on_the_second_link_leaves_the_channel_usable() {
         Some(q21_core::channel::Phase::Open)
     );
 
-    // Its handshake: the acceptor challenges it, the funder answers there.
-    let mut to_f: Vec<Vec<u8>> = net.amgr.on_peer_connected(second, &identity);
+    // The second link's own session, authenticated as each other's node id:
+    // both reestablish over it.
+    let binding = [0x51; 32];
+    let mut to_f: Vec<Vec<u8>> = net.amgr.on_session(second_a, &fid, "", binding);
+    let mut to_a: Vec<Vec<u8>> = net.fmgr.on_session(second_f, &aid, "", binding);
     for _ in 0..4 {
-        let mut to_a = Vec::new();
         for f in to_f.drain(..) {
-            let r = net.fmgr.deliver(net.bid, &a_identity, &f);
+            let r = net.fmgr.deliver(second_f, &f);
             assert_eq!(r.penalize, 0);
             to_a.extend(r.frames);
         }
-        for f in to_a {
-            let r = net.amgr.deliver(second, &identity, &f);
+        for f in to_a.drain(..) {
+            let r = net.amgr.deliver(second_a, &f);
             assert_eq!(r.penalize, 0);
             to_f.extend(r.frames);
         }
@@ -1098,13 +1108,13 @@ fn a_payment_on_the_second_link_leaves_the_channel_usable() {
     // The funder's payment reaches the acceptor on the second link; the rest
     // of the exchange follows the same path.
     let update = net.fmgr.pay(cid, 1_000_000).unwrap();
-    let ack = net.amgr.deliver(second, &identity, &update);
+    let ack = net.amgr.deliver(second_a, &update);
     assert_eq!(ack.penalize, 0);
     for frame in ack.frames {
-        let revoke = net.fmgr.deliver(net.bid, &a_identity, &frame);
+        let revoke = net.fmgr.deliver(second_f, &frame);
         assert_eq!(revoke.penalize, 0);
         for frame in revoke.frames {
-            assert_eq!(net.amgr.deliver(second, &identity, &frame).penalize, 0);
+            assert_eq!(net.amgr.deliver(second_a, &frame).penalize, 0);
         }
     }
     assert_eq!(
@@ -1135,7 +1145,7 @@ fn an_offline_victim_node_punishes_on_restart() {
     let cid = net.open(4_000_000);
     for (amount, total) in [(1_500_000u64, 1_500_000u64), (500_000, 2_000_000)] {
         let pay = net.fmgr.pay(cid, amount).unwrap();
-        assert!(net.a.send_channel(net.bid, pay));
+        assert!(net.fmgr.send(net.bid, pay));
         assert!(
             wait(
                 || net.amgr.info(cid).map(|i| i.local_balance).unwrap_or(0) == total,
@@ -1173,7 +1183,8 @@ fn an_offline_victim_node_punishes_on_restart() {
             false,
         ),
     ));
-    net.b.set_channel_sink(net.amgr.clone());
+    net.b
+        .set_channel_sink(ChannelTransport::new(net.amgr.clone()));
     net.cheat_broadcast(&revoked);
     net.mine();
     let cheat_h = net.height();
@@ -1196,7 +1207,8 @@ fn an_offline_victim_node_punishes_on_restart() {
             false,
         ),
     ));
-    net.b.set_channel_sink(victim.clone());
+    net.b
+        .set_channel_sink(ChannelTransport::new(victim.clone()));
     net.b.rescan_channels();
     assert!(net.pending_len() >= 1, "no penalty after the rescan");
     net.mine();
@@ -1244,14 +1256,14 @@ fn crossed_payments_merge_and_the_channel_keeps_paying() {
         }
     };
     let first = pay(&net.fmgr, 1_000_000);
-    assert!(net.a.send_channel(net.bid, first));
+    assert!(net.fmgr.send(net.bid, first));
     let mut expect_b = 1_000_000u64;
     for round in 0..5u64 {
         // Both propose before either hears from the other.
         let from_funder = pay(&net.fmgr, 10_000 + round);
         let from_acceptor = pay(&net.amgr, 4_000 + round);
-        assert!(net.a.send_channel(net.bid, from_funder));
-        assert!(net.b.send_channel(b_peer, from_acceptor));
+        assert!(net.fmgr.send(net.bid, from_funder));
+        assert!(net.amgr.send(b_peer, from_acceptor));
         expect_b = expect_b + 10_000 + round - (4_000 + round);
         let settled = || {
             let (f, a) = (net.fmgr.info(cid), net.amgr.info(cid));
@@ -1267,7 +1279,7 @@ fn crossed_payments_merge_and_the_channel_keeps_paying() {
     }
     // And the channel keeps paying, one side at a time.
     let last = pay(&net.amgr, 1_000);
-    assert!(net.b.send_channel(b_peer, last));
+    assert!(net.amgr.send(b_peer, last));
     assert!(wait(
         || net.fmgr.info(cid).map(|i| i.local_balance) == Some(cap - expect_b + 1_000),
         10

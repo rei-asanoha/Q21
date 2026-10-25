@@ -182,6 +182,7 @@ dependencies = [
 name = "q21-core"
 version = "0.4.10"
 dependencies = [
+ "keccak",
  "libc",
  "ml-dsa",
  "ml-kem",

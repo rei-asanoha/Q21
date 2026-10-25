@@ -149,7 +149,7 @@ fn prune_to_latest<V>(map: &mut BTreeMap<u64, V>, keep: usize) {
     }
 }
 
-/// The message a reestablish proof signs: the channel, the challenge's nonce,
+/// The message a reestablish proof signs: the channel, the session's binding,
 /// the sender's direction, and the four counters it reports — so a relay
 /// cannot alter where the sender says it stands.
 fn reestablish_message(
@@ -1809,9 +1809,9 @@ impl Machine {
         Ok(self.reestablish_for(nonce))
     }
 
-    /// Our [`Message::Reestablish`] answering the peer's challenge `nonce`:
-    /// the proof of our funding key signs the peer's own fresh nonce, so the
-    /// answer is good for that challenge — that connection — only.
+    /// Our [`Message::Reestablish`] for the session whose binding value is
+    /// `nonce`: the proof of our funding key signs it, so the message is good
+    /// for that session only.
     pub fn reestablish_for(&self, nonce: [u8; 32]) -> Message {
         let counters = [
             self.local_commit_number.map_or(0, |n| n + 1),

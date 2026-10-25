@@ -286,21 +286,35 @@ pub enum Message {
 }
 
 /// Capability token a node appends to its user agent to advertise that it
-/// speaks the payment-channel protocol. A peer that does not carry it in its
-/// `Version` never receives a [`Message::Channel`]; an older node simply reads
-/// a slightly longer, still-bounded user-agent string and is untouched.
-pub const CHANNELS_CAPABILITY: &str = "+chan";
+/// speaks the payment-channel protocol, in its version 3: every channel frame
+/// inside an authenticated session ([`crate::channel::transport`]). A peer that
+/// does not carry it in its `Version` never receives a [`Message::Channel`];
+/// an older node simply reads a slightly longer, still-bounded user-agent
+/// string and is untouched.
+pub const CHANNELS_CAPABILITY: &str = "+chanv3";
 
-/// Does this user agent advertise the channel capability?
+/// The token of the earlier channel protocol (0.4.10), whose frames went in
+/// clear. A node that advertises only this one is not a channel peer: its
+/// frames are refused without blame (see [`user_agent_advertises_legacy_channels`]).
+/// It is a prefix of [`CHANNELS_CAPABILITY`], so such a node sees us as a
+/// channel peer of its own kind, and its opens go unanswered.
+pub const LEGACY_CHANNELS_CAPABILITY: &str = "+chan";
+
+/// Does this user agent advertise the channel capability (version 3)?
 pub fn user_agent_advertises_channels(user_agent: &str) -> bool {
     user_agent.contains(CHANNELS_CAPABILITY)
 }
 
+/// Does this user agent advertise only the earlier channel protocol?
+pub fn user_agent_advertises_legacy_channels(user_agent: &str) -> bool {
+    user_agent.contains(LEGACY_CHANNELS_CAPABILITY) && !user_agent_advertises_channels(user_agent)
+}
+
 /// The hex characters a channel node advertises after [`CHANNELS_CAPABILITY`]:
-/// its stable channel node id (32 hex = 16 bytes), used to re-bind channels to
-/// a peer across reconnects regardless of the connection's ephemeral port.
-/// Empty when the peer advertises the capability without an id (an older
-/// channel build) or does not advertise it at all.
+/// the first 16 bytes of its node id (32 hex), a hint by which an operator may
+/// name the peer. A channel is never bound to it: the node id a session
+/// authenticates is what counts. Empty when the peer advertises the capability
+/// without an id or does not advertise it at all.
 pub fn channel_node_id(user_agent: &str) -> Option<String> {
     let at = user_agent.find(CHANNELS_CAPABILITY)?;
     let rest = &user_agent[at + CHANNELS_CAPABILITY.len()..];
@@ -901,6 +915,25 @@ mod tests {
         // A plain 0.4.9 user agent does not advertise it.
         assert!(!user_agent_advertises_channels("q21:0.4"));
         assert!(!user_agent_advertises_channels("q21:0.3"));
+    }
+
+    /// A 0.4.10 channel node, whose frames went in clear, is told apart from
+    /// a version 3 one: not a channel peer, but not a stranger either.
+    #[test]
+    fn the_earlier_channel_protocol_is_told_apart() {
+        let v2 = "q21:0.4+chan0123456789abcdef0123456789abcdef";
+        let v3 = "q21:0.4+chanv30123456789abcdef0123456789abcdef";
+        assert!(!user_agent_advertises_channels(v2));
+        assert!(user_agent_advertises_legacy_channels(v2));
+        assert!(user_agent_advertises_channels(v3));
+        assert!(!user_agent_advertises_legacy_channels(v3));
+        assert!(!user_agent_advertises_legacy_channels("q21:0.4"));
+        assert_eq!(channel_node_id(v2), None);
+        assert_eq!(
+            channel_node_id(v3).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(v3.len() <= MAX_USER_AGENT);
     }
 
     #[test]

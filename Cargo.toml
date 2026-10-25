@@ -70,6 +70,14 @@ ml-dsa = { version = "0.1.1", optional = true, default-features = false, feature
 # `rng.rs`, as for signing.
 ml-kem = { version = "0.3.3", optional = true, default-features = false, features = ["zeroize"] }
 
+# The Keccak-f[1600] permutation, for cSHAKE256 and KMAC256 (NIST SP 800-185)
+# in the channel transport: its transcript hash, key derivation, keystream
+# and record tag. `sha3` 0.12 carries only the fixed-length SHA-3 hashes, so
+# the two SP 800-185 functions are written over the permutation it uses
+# itself (`src/channel/kmac.rs`), and checked against the NIST samples.
+# Already in the graph through `sha3` and `shake`; nothing new to compile.
+keccak = { version = "0.2.2", optional = true, default-features = false }
+
 # A single function is used from it: `setrlimit`, to forbid core dumps of a
 # process that holds a seed. `libc` is already in the dependency graph
 # (through `getrandom`), vendored like the rest; declaring it here adds
@@ -81,7 +89,7 @@ libc = "0.2"
 
 [features]
 default = ["mldsa"]
-mldsa = ["dep:ml-dsa", "dep:ml-kem"]
+mldsa = ["dep:ml-dsa", "dep:ml-kem", "dep:keccak"]
 # Exposes a few internal hooks to the audit tests outside the crate. Never
 # enabled in a production build: they manufacture inconsistent state, useful
 # to prove that a barrier holds, dangerous anywhere else.

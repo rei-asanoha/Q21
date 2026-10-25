@@ -5,14 +5,26 @@
 //! # Framing
 //!
 //! A channel travels over the network as an opaque payload (see
-//! [`crate::wire::Message::Channel`]). This module gives that payload its
-//! structure: a 32-byte channel id, a one-byte kind, then a body. Two kinds are
-//! control frames the manager handles itself — `Hello` and `HelloBack`, which
+//! [`crate::wire::Message::Channel`]), sealed in the authenticated session
+//! between the two nodes ([`crate::channel::transport`], carried by
+//! [`crate::channel::link`]). This module sees only what a session opened: a
+//! 32-byte channel id, a one-byte kind, then a body. Two kinds are control
+//! frames the manager handles itself — `Hello` and `HelloBack`, which
 //! exchange the two parties' per-channel public keys before the funding policy
 //! (and thus the channel id) can exist — and one kind carries an engine
 //! [`crate::channel::messages::Message`] verbatim. Routing is by channel id,
 //! except the two control frames, which are routed by peer (one open in flight
 //! per peer).
+//!
+//! # Peers
+//!
+//! A peer is a connection with an established session, registered by
+//! [`ChannelManager::on_session`] with the node id the session authenticated.
+//! A channel is bound to that node id, journaled beside it, and to nothing
+//! else: a frame for a channel is acted on only from a session authenticated
+//! as the channel's counterparty, and a new session from it resynchronizes
+//! every channel held with it, with a reestablish whose proof covers the
+//! session's binding value.
 //!
 //! # Locking
 //!
@@ -23,7 +35,7 @@
 //! which take the chain lock themselves, after the cryptography is done.
 
 use crate::address::Network;
-use crate::channel::keys::{ChannelKey, Signer, CHANNEL_SCHEME};
+use crate::channel::keys::{ChannelKey, NodeIdentity, Signer, CHANNEL_SCHEME};
 use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
 use crate::channel::messages::Message as ChMsg;
 use crate::channel::txbuild;
@@ -117,51 +129,19 @@ pub struct ChannelSummary {
     pub in_flight: bool,
 }
 
-/// Authenticated connections remembered per channel, and challenges awaiting
-/// an answer: a handful, enough for two links per peer and a reconnect.
-const MAX_AUTHED: usize = 4;
-const MAX_CHALLENGES: usize = 8;
-
-impl Chan {
-    /// A fresh challenge for connection `conn`: the frame to send it.
-    fn challenge(&mut self, conn: u64) -> Option<Vec<u8>> {
-        let nonce = crate::rng::bytes::<32>().ok()?;
-        let cid = self.machine.channel_id();
-        self.challenges.retain(|(c, _)| *c != conn);
-        if self.challenges.len() >= MAX_CHALLENGES {
-            self.challenges.remove(0);
-        }
-        self.challenges.push((conn, nonce));
-        // The connection has proved nothing yet: the channel id stays out of
-        // the frame, named only by a locator its counterparty can match.
-        Some(write_frame(
-            Hash256::ZERO,
-            KIND_ENGINE,
-            &ChMsg::Challenge {
-                locator: crate::channel::messages::challenge_locator(cid, &nonce),
-                nonce,
-            }
-            .encode(),
-        ))
-    }
-}
-
 struct Chan {
     machine: Machine,
     /// The live network connection id of the peer. Transient: it changes on
-    /// every reconnect and is re-bound from `peer_identity` at handshake time.
+    /// every reconnect and is re-bound at the reestablish of the next session
+    /// authenticated as `peer_identity`.
     peer: u64,
-    /// A durable identifier of the counterparty (its address), persisted so a
-    /// restart or reconnect can map the new connection id back to this channel.
+    /// The counterparty's node id (hex), as its session authenticated it,
+    /// persisted beside the journal: what the channel is bound to. A journal
+    /// written before the transport holds a legacy id there instead (see
+    /// [`is_node_id`]), replaced at the first reestablish that proves the
+    /// channel's funding key over an authenticated session.
     peer_identity: String,
     capacity: u64,
-    /// Connections on which the counterparty proved itself: the one that ran
-    /// the opening handshake, and each that answered our challenge with a
-    /// reestablish signed by its funding key. Only frames from these are acted
-    /// on. Most recent last.
-    authed: Vec<u64>,
-    /// Challenges we issued and not yet seen answered, per connection.
-    challenges: Vec<(u64, [u8; 32])>,
     /// Whether the peer's reestablish has been received and answered on the
     /// current connection. Until it has, a message one side lost may still be
     /// owed, and a new update or close stacked on top of it would be refused
@@ -284,8 +264,24 @@ struct PendingAcceptor {
     peer_identity: String,
 }
 
+/// A connection whose session is established: what it authenticated.
+struct Link {
+    /// The peer's node id, hex ([`is_node_id`]).
+    identity: String,
+    /// The peer's legacy node id, hex, as it signed it in the handshake.
+    legacy: String,
+    /// The session's binding value: the nonce its reestablish proofs sign.
+    binding: [u8; 32],
+}
+
+/// Sessions established at once. A connection holds at most one, and the
+/// link layer bounds connections; this only caps the map.
+const MAX_LINKS: usize = 1024;
+
 struct Inner {
     channels: HashMap<Hash256, Chan>,
+    /// Connections with an established session, by connection id.
+    links: HashMap<u64, Link>,
     pending_funder: HashMap<u64, PendingFunder>,
     pending_acceptor: HashMap<u64, PendingAcceptor>,
     next_index: u32,
@@ -363,10 +359,18 @@ impl Inner {
     }
 }
 
+/// Seals a frame into a peer's session and queues it (see
+/// [`ChannelManager::send`]); installed by the link layer.
+pub type SendFn = dyn Fn(u64, Vec<u8>) -> bool + Send + Sync;
+
 pub struct ChannelManager {
     network: Network,
     base_fee_rate: u64,
     wallet_seed: [u8; 32],
+    /// The static identity the transport authenticates this node by.
+    identity: NodeIdentity,
+    /// Where [`ChannelManager::send`] goes: the link layer's sealing send.
+    outbound: std::sync::RwLock<Option<Box<SendFn>>>,
     journal_dir: PathBuf,
     default_delay: u16,
     default_depth: u16,
@@ -399,6 +403,8 @@ impl ChannelManager {
         let mgr = ChannelManager {
             network,
             base_fee_rate,
+            identity: NodeIdentity::derive(&wallet_seed),
+            outbound: std::sync::RwLock::new(None),
             wallet_seed,
             journal_dir,
             default_delay,
@@ -407,6 +413,7 @@ impl ChannelManager {
             replaying: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 channels: HashMap::new(),
+                links: HashMap::new(),
                 pending_funder: HashMap::new(),
                 pending_acceptor: HashMap::new(),
                 next_index: 0,
@@ -521,8 +528,8 @@ impl ChannelManager {
                 }
                 let cid = machine.channel_id();
                 let capacity = machine.params().capacity.units();
-                // The peer's network id is transient; its durable identity,
-                // persisted in a sidecar, tells a reconnect whom to challenge.
+                // The peer's connection is transient; its node id, persisted
+                // in a sidecar, tells which session the channel is with.
                 let peer_identity = self.read_peer_identity(cid);
                 g.channels.insert(
                     cid,
@@ -531,8 +538,6 @@ impl ChannelManager {
                         peer: u64::MAX,
                         peer_identity,
                         capacity,
-                        authed: Vec::new(),
-                        challenges: Vec::new(),
                         synced: false,
                         close: None,
                         spend: None,
@@ -562,17 +567,59 @@ impl ChannelManager {
         (g.pending_funder.len(), g.pending_acceptor.len())
     }
 
-    /// This node's stable channel identity: the first 16 bytes of a tagged hash
-    /// of the wallet seed, as lowercase hex. It is advertised in the handshake
-    /// and persisted per channel, so a channel re-binds to its peer across a
-    /// reconnect no matter which ephemeral port the peer dials from. It reveals
-    /// nothing about the wallet: it is a one-way hash under a dedicated tag.
-    pub fn node_id_hex(&self) -> String {
-        let h = crate::hash::tagged_hash_parts("Q21/channel/node-id", &[&self.wallet_seed]).0;
-        h[..crate::wire::CHANNEL_NODE_ID_HEX / 2]
+    /// The network the channels live on.
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// This node's channel identity, the key its transport sessions are
+    /// authenticated with.
+    pub fn identity(&self) -> &NodeIdentity {
+        &self.identity
+    }
+
+    /// This node's full node id (64 hex): what a peer's session authenticates
+    /// it as, and what the peer binds its channels with us to.
+    pub fn node_id(&self) -> String {
+        self.identity
+            .id()
+            .0
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
+    }
+
+    /// This node's node id as advertised in the P2P handshake: the first 16
+    /// bytes of [`NodeIdentity::id`], hex. A hint for an operator naming a
+    /// peer, never what a channel is bound to: that is the full id its
+    /// session authenticates.
+    pub fn node_id_hex(&self) -> String {
+        self.identity.id().0[..crate::wire::CHANNEL_NODE_ID_HEX / 2]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The authenticated node id (hex) of the session on connection `peer`.
+    pub fn peer_node_id(&self, peer: u64) -> Option<String> {
+        let g = self.inner.lock().unwrap();
+        g.links.get(&peer).map(|l| l.identity.clone())
+    }
+
+    /// Installs where [`ChannelManager::send`] goes.
+    pub fn set_outbound(&self, send: Box<SendFn>) {
+        if let Ok(mut g) = self.outbound.write() {
+            *g = Some(send);
+        }
+    }
+
+    /// Sends a frame this manager produced to `peer`, sealed in its session.
+    /// False when the peer holds no session, or nothing is installed.
+    pub fn send(&self, peer: u64, frame: Vec<u8>) -> bool {
+        match self.outbound.read() {
+            Ok(g) => g.as_ref().is_some_and(|f| f(peer, frame)),
+            Err(_) => false,
+        }
     }
 
     /// The payout address to offer in a Hello or HelloBack: the spare one if
@@ -622,9 +669,11 @@ impl ChannelManager {
         Box::new(ChannelKey::derive(&self.wallet_seed, index))
     }
 
-    /// The sidecar file holding a channel's durable peer identity, beside its
+    /// The sidecar file holding the node id a channel is bound to, beside its
     /// journal. Kept out of the journal so the engine's crash-safe record
-    /// format is untouched; it carries no money-safety invariant.
+    /// format is untouched. It decides which session the channel listens to,
+    /// not what the channel accepts: every frame that moves it is signed by
+    /// the counterparty's funding key.
     fn peer_identity_path(&self, cid: Hash256) -> PathBuf {
         self.journal_dir.join(format!("{}.peer", cid.to_hex()))
     }
@@ -651,15 +700,19 @@ impl ChannelManager {
 
     /// Opens a channel to `peer` as funder, returning the control frame to
     /// send. The funding policy — and thus the channel id — cannot exist until
-    /// the acceptor's key is known, so this first exchanges keys.
+    /// the acceptor's key is known, so this first exchanges keys. The channel
+    /// is with the node id `peer`'s session authenticated, whoever that is.
     pub fn open(
         &self,
         peer: u64,
-        peer_identity: &str,
         capacity: u64,
         delay: Option<u16>,
         depth: Option<u16>,
     ) -> Result<Vec<u8>, String> {
+        let identity = self
+            .peer_node_id(peer)
+            .ok_or("the peer holds no authenticated channel session")?;
+        let peer_identity = identity.as_str();
         let our_payout = self.spare_payout();
         let mut g = self.inner.lock().unwrap();
         g.expire_pending();
@@ -764,52 +817,105 @@ impl ChannelManager {
         Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
     }
 
-    /// Called when a channel-capable peer completes the handshake, with the
-    /// peer's live connection id and the identity it announced. Every channel
-    /// held with that identity — a hint only: anyone can announce it — or
-    /// bound to that connection id is challenged on the new connection: the
-    /// peer must answer with a reestablish signed by the channel's funding key
-    /// over our fresh nonce before anything it sends there is acted on.
-    pub fn on_peer_connected(&self, peer: u64, peer_identity: &str) -> Vec<Vec<u8>> {
+    /// Called when the session on connection `peer` is established: `identity`
+    /// is the node id it authenticated (hex), `legacy` the legacy node id it
+    /// signed (hex), `binding` its binding value. Returns the reestablish of
+    /// every channel held with that node id, to send on it: each proves our
+    /// funding key over the binding, and the channel resynchronizes once the
+    /// peer's own proof comes back on this session.
+    ///
+    /// A channel whose journal still names its peer by a legacy id is offered
+    /// too when the session signed that id; it is bound to the session's node
+    /// id only once the peer's reestablish proves the channel's funding key.
+    pub fn on_session(
+        &self,
+        peer: u64,
+        identity: &str,
+        legacy: &str,
+        binding: [u8; 32],
+    ) -> Vec<Vec<u8>> {
         let mut g = self.inner.lock().unwrap();
+        if g.links.len() >= MAX_LINKS && !g.links.contains_key(&peer) {
+            return Vec::new();
+        }
+        g.links.insert(
+            peer,
+            Link {
+                identity: identity.to_string(),
+                legacy: legacy.to_string(),
+                binding,
+            },
+        );
         let mut out = Vec::new();
         for c in g.channels.values_mut() {
-            let same_link = c.peer == peer;
-            let same_identity = !peer_identity.is_empty() && c.peer_identity == peer_identity;
-            if same_link || same_identity {
-                // A new connection under this id proves nothing yet; one that
-                // merely claims the identity leaves the current link alone.
-                c.authed.retain(|x| *x != peer);
-                if same_link {
-                    c.synced = false;
-                }
-                out.extend(c.challenge(peer));
+            if !bound_to(c, identity, legacy) {
+                continue;
             }
+            // A new session on the link the channel uses: whatever the last
+            // one left unsent is owed again, so nothing new starts before the
+            // reestablish. A second link leaves the current one alone.
+            if c.peer == peer {
+                c.synced = false;
+            }
+            let cid = c.machine.channel_id();
+            out.push(write_frame(
+                cid,
+                KIND_ENGINE,
+                &c.machine.reestablish_for(binding).encode(),
+            ));
         }
         out
     }
 
-    /// The challenges for every channel bound to `peer`, to send on
-    /// reconnection: the channel resynchronizes once the peer answers.
-    pub fn reestablish(&self, peer: u64) -> Vec<Vec<u8>> {
+    /// Called when the session on connection `peer` ends — the connection
+    /// closed, or the session failed and a new one is to be negotiated.
+    /// Nothing more is taken from it, and its channels wait for the next.
+    pub fn on_session_closed(&self, peer: u64) {
         let mut g = self.inner.lock().unwrap();
-        let mut out = Vec::new();
+        g.links.remove(&peer);
+        g.pending_funder.remove(&peer);
+        g.pending_acceptor.remove(&peer);
         for c in g.channels.values_mut() {
             if c.peer == peer {
-                c.authed.retain(|x| *x != peer);
                 c.synced = false;
-                out.extend(c.challenge(peer));
             }
         }
-        out
+    }
+
+    /// The connections with an established session, and the node id each
+    /// authenticated.
+    pub fn sessions(&self) -> Vec<(u64, String)> {
+        let g = self.inner.lock().unwrap();
+        let mut v: Vec<(u64, String)> = g
+            .links
+            .iter()
+            .map(|(p, l)| (*p, l.identity.clone()))
+            .collect();
+        v.sort();
+        v
     }
 
     // --- Inbound ----------------------------------------------------------
 
-    /// Handles one inbound frame from `peer`, whose durable identity (for
-    /// re-binding on a later reconnect) is `peer_identity`.
-    pub fn deliver(&self, peer: u64, peer_identity: &str, bytes: &[u8]) -> Reaction {
-        match self.deliver_inner(peer, peer_identity, bytes) {
+    /// Handles one frame a session opened on connection `peer`. A frame from
+    /// a connection with no established session is ignored.
+    pub fn deliver(&self, peer: u64, bytes: &[u8]) -> Reaction {
+        let link = {
+            let g = self.inner.lock().unwrap();
+            g.links
+                .get(&peer)
+                .map(|l| (l.identity.clone(), l.legacy.clone(), l.binding))
+        };
+        let Some((identity, legacy, binding)) = link else {
+            return Reaction::default();
+        };
+        let from = From {
+            peer,
+            identity: &identity,
+            legacy: &legacy,
+            binding,
+        };
+        match self.deliver_inner(&from, bytes) {
             Ok(frames) => Reaction {
                 frames,
                 penalize: 0,
@@ -821,12 +927,7 @@ impl ChannelManager {
         }
     }
 
-    fn deliver_inner(
-        &self,
-        peer: u64,
-        peer_identity: &str,
-        bytes: &[u8],
-    ) -> Result<Vec<Vec<u8>>, String> {
+    fn deliver_inner(&self, from: &From, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         if bytes.len() < 33 {
             return Err("short frame".into());
         }
@@ -834,12 +935,13 @@ impl ChannelManager {
         let cid = Hash256(r.array32().map_err(|_| "cid")?);
         let kind = r.u8().map_err(|_| "kind")?;
         let body = &bytes[33..];
+        let (peer, peer_identity) = (from.peer, from.identity);
         match kind {
             KIND_HELLO => self.on_hello(peer, peer_identity, body),
             KIND_HELLO_BACK => self.on_hello_back(peer, peer_identity, body),
             KIND_ENGINE => {
                 let msg = ChMsg::decode(body).map_err(|_| "bad engine message")?;
-                self.on_engine(peer, peer_identity, cid, msg)
+                self.on_engine(from, cid, msg)
             }
             _ => Err("unknown frame kind".into()),
         }
@@ -919,7 +1021,7 @@ impl ChannelManager {
     fn on_hello_back(
         &self,
         peer: u64,
-        _peer_identity: &str,
+        peer_identity: &str,
         body: &[u8],
     ) -> Result<Vec<Vec<u8>>, String> {
         let mut r = Reader::new(body);
@@ -929,6 +1031,14 @@ impl ChannelManager {
         }
         let acceptor_payout = Hash256(r.array32().map_err(|_| "payout")?);
         let mut g = self.inner.lock().unwrap();
+        // Ours to the node id this connection's session authenticated; a
+        // later session on it is another peer's until proven otherwise.
+        if g.pending_funder
+            .get(&peer)
+            .is_some_and(|p| p.peer_identity != peer_identity)
+        {
+            return Ok(Vec::new());
+        }
         let pending = g.pending_funder.remove(&peer).ok_or("no pending open")?;
         let signer = self.signer(pending.index);
         let funding = [
@@ -960,8 +1070,6 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
-                authed: vec![peer],
-                challenges: Vec::new(),
                 synced: true,
                 close: None,
                 spend: None,
@@ -972,94 +1080,43 @@ impl ChannelManager {
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
     }
 
-    fn on_engine(
-        &self,
-        peer: u64,
-        peer_identity: &str,
-        cid: Hash256,
-        msg: ChMsg,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    fn on_engine(&self, from: &From, cid: Hash256, msg: ChMsg) -> Result<Vec<Vec<u8>>, String> {
+        let (peer, peer_identity) = (from.peer, from.identity);
         // The acceptor's first engine message is the funder's Open: build the
         // channel from the pending acceptor state.
         if matches!(msg, ChMsg::Open { .. }) {
             return self.accept_open(peer, peer_identity, cid, msg);
         }
         let mut g = self.inner.lock().unwrap();
-        // A challenge names its channel by a locator only.
-        let cid = match &msg {
-            ChMsg::Challenge { locator, nonce } => {
-                let found =
-                    g.channels.keys().copied().find(|c| {
-                        crate::channel::messages::challenge_locator(*c, nonce) == *locator
-                    });
-                match found {
-                    Some(c) => c,
-                    None => return Ok(Vec::new()),
-                }
-            }
-            _ => cid,
-        };
         let Some(chan) = g.channels.get_mut(&cid) else {
             // A peer that still tracks a channel we have settled and forgotten
             // (closed on our side, still closing on theirs) offers its
-            // reestablish at every connection. Penalising it dropped the link
+            // reestablish at every session. Penalising it dropped the link
             // at every reconnect; there is simply nothing to resynchronize.
-            if matches!(msg, ChMsg::Reestablish { .. } | ChMsg::Challenge { .. }) {
+            if matches!(msg, ChMsg::Reestablish { .. }) {
                 return Ok(Vec::new());
             }
             return Err("unknown channel".into());
         };
-        // Authentication. A challenge is answered on any connection: the
-        // answer proves our key over the asker's own nonce, good for nothing
-        // else. A reestablish is taken only as the answer to a challenge we
-        // issued on that very connection, and its proof must verify: then the
-        // connection speaks for the counterparty. Every other frame is acted
-        // on only from an authenticated connection; from any other it is
-        // ignored, not penalised — an honest frame can trail a reconnect.
-        // A self-declared identity, or a reestablish captured earlier and
-        // replayed (after our restart, or on another connection), proves
-        // nothing.
+        // Authentication. The session proved the sender's node id; a frame is
+        // acted on only for a channel bound to that id. A frame for a channel
+        // held with another node is ignored, not penalised: a node may hold
+        // channels with several peers, and only learns which from the id.
         //
-        // What this cannot stop: a relay connected to both ends, passing each
-        // side's challenge to the other and the answers back, gets both of its
-        // connections authenticated. Binding the answer to the connection
-        // needs a transport whose handshake both ends authenticate with static
-        // keys; nonces exchanged in the clear can be passed along like the
-        // rest. So no frame acted on here relies on the connection alone:
-        // commitments and the close carry signatures over what they commit
-        // to, revocations reveal secrets checked against their points, and
-        // the control messages without either (Ready, Close) are signed with
-        // a sequence number that only grows. A relay can drop or delay
-        // frames, as any hop on the path can; it cannot forge or replay one.
+        // A reestablish is taken only over this session's own binding value,
+        // which its proof signs with the channel's funding key: one captured
+        // from an earlier session, or proven over another, is good for
+        // nothing here. A channel journaled before the transport names its
+        // peer by a legacy id; the session signed one, which proves nothing
+        // alone, so such a channel takes only a reestablish, and is bound to
+        // the session's node id once that proof verifies.
         match &msg {
-            ChMsg::Challenge { nonce, .. } => {
-                // Our own challenge first, if this connection has not been
-                // asked yet: the peer then answers it before it handles our
-                // reestablish, so what it resends after that reaches us on a
-                // connection we already trust.
-                let mut out = Vec::new();
-                let challenged = chan.challenges.iter().any(|(c, _)| *c == peer);
-                if !chan.authed.contains(&peer) && !challenged {
-                    out.extend(chan.challenge(peer));
-                }
-                out.push(write_frame(
-                    cid,
-                    KIND_ENGINE,
-                    &chan.machine.reestablish_for(*nonce).encode(),
-                ));
-                return Ok(out);
-            }
             ChMsg::Reestablish { nonce, .. } => {
-                let Some(at) = chan
-                    .challenges
-                    .iter()
-                    .position(|(c, n)| *c == peer && n == nonce)
-                else {
+                if *nonce != from.binding || !bound_to(chan, peer_identity, from.legacy) {
                     return Ok(Vec::new());
-                };
-                chan.challenges.remove(at);
+                }
             }
-            _ if !chan.authed.contains(&peer) => return Ok(Vec::new()),
+            _ if chan.peer_identity != peer_identity => return Ok(Vec::new()),
             _ => {}
         }
         let mut out = Vec::new();
@@ -1175,17 +1232,11 @@ impl ChannelManager {
             }
             ChMsg::Reestablish { .. } => {
                 let frames = chan.machine.on_reestablish(&msg).map_err(err)?;
-                // The proof verified over our challenge on this connection: it
-                // speaks for the channel's counterparty. Bind to it, and
-                // remember the identity it announced, so a later reconnect
-                // knows whom to challenge.
-                chan.authed.retain(|c| *c != peer);
-                if chan.authed.len() >= MAX_AUTHED {
-                    chan.authed.remove(0);
-                }
-                chan.authed.push(peer);
+                // The channel's funding key proved itself over this session:
+                // the channel's traffic goes over it from now on. A channel
+                // still named by a legacy id is bound to the node id.
                 chan.peer = peer;
-                if !peer_identity.is_empty() && chan.peer_identity != peer_identity {
+                if chan.peer_identity != peer_identity {
                     chan.peer_identity = peer_identity.to_string();
                     self.write_peer_identity(cid, peer_identity);
                 }
@@ -1194,7 +1245,6 @@ impl ChannelManager {
                 }
                 chan.synced = true;
             }
-            ChMsg::Challenge { .. } => {}
             ChMsg::Error { .. } | ChMsg::Open { .. } => {}
         }
         Ok(out)
@@ -1203,11 +1253,17 @@ impl ChannelManager {
     fn accept_open(
         &self,
         peer: u64,
-        _peer_identity: &str,
+        peer_identity: &str,
         cid: Hash256,
         open: ChMsg,
     ) -> Result<Vec<Vec<u8>>, String> {
         let mut g = self.inner.lock().unwrap();
+        if g.pending_acceptor
+            .get(&peer)
+            .is_some_and(|p| p.peer_identity != peer_identity)
+        {
+            return Ok(Vec::new());
+        }
         let pending = g
             .pending_acceptor
             .remove(&peer)
@@ -1260,8 +1316,6 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 capacity: pending.capacity,
-                authed: vec![peer],
-                challenges: Vec::new(),
                 synced: true,
                 close: None,
                 spend: None,
@@ -2275,45 +2329,30 @@ fn fresh<T>(r: Result<T, ChannelError>) -> Result<Option<T>, String> {
     }
 }
 
-/// Adapter so the node's [`crate::net::ChannelSink`] can drive the manager.
-impl crate::net::ChannelSink for ChannelManager {
-    fn deliver(&self, peer: u64, peer_identity: &str, bytes: &[u8]) -> crate::net::ChannelOutcome {
-        let r = ChannelManager::deliver(self, peer, peer_identity, bytes);
-        crate::net::ChannelOutcome {
-            replies: r.frames,
-            penalize: r.penalize,
-        }
-    }
+/// Where an inbound frame comes from: a connection, and what its session
+/// authenticated.
+struct From<'a> {
+    peer: u64,
+    identity: &'a str,
+    legacy: &'a str,
+    binding: [u8; 32],
+}
 
-    fn node_identity(&self) -> Option<String> {
-        Some(self.node_id_hex())
-    }
+/// Whether `s` is a node id, as a session authenticates it: 64 lowercase hex
+/// characters. A channel journaled before the transport names its peer
+/// otherwise — by the 32 hex characters of a legacy id, or an address.
+pub fn is_node_id(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
-    fn on_connected_block(
-        &self,
-        txs: &[Transaction],
-        height: u64,
-        depth_of: &DepthOf,
-    ) -> Vec<(u64, Vec<u8>)> {
-        ChannelManager::on_connected_block(self, txs, height, depth_of)
-    }
-
-    fn on_peer_connected(&self, peer: u64, peer_identity: &str) -> Vec<Vec<u8>> {
-        ChannelManager::on_peer_connected(self, peer, peer_identity)
-    }
-
-    fn on_disconnected_txids(&self, txids: &[Hash256]) {
-        ChannelManager::on_disconnected_txids(self, txids)
-    }
-
-    fn rescan(
-        &self,
-        tip: u64,
-        txs_at: &dyn Fn(u64) -> Option<Vec<Transaction>>,
-        depth_of: &DepthOf,
-    ) {
-        ChannelManager::rescan(self, tip, txs_at, depth_of)
-    }
+/// Whether a channel is held with the peer of a session that authenticated
+/// `identity` and signed `legacy`: by node id, or — for a channel journaled
+/// before the transport, until its first reestablish — by legacy id.
+fn bound_to(chan: &Chan, identity: &str, legacy: &str) -> bool {
+    chan.peer_identity == identity
+        || (!is_node_id(&chan.peer_identity) && !legacy.is_empty() && chan.peer_identity == legacy)
 }
 
 #[cfg(test)]

@@ -4846,7 +4846,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             ));
             // The manager holds its own copy, wiped when it is dropped.
             q21_core::kdf::wipe(&mut seed);
-            node.set_channel_sink(mgr.clone());
+            // Every channel frame travels in an authenticated session: the
+            // transport is what the node talks to, the manager behind it.
+            node.set_channel_sink(q21_core::channel::link::ChannelTransport::new(mgr.clone()));
             // Channels reloaded from the journal may already be funded to depth
             // (the funding confirmed while this node was down): confirm them now
             // so they open without waiting for the next block.
