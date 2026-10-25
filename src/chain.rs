@@ -544,6 +544,10 @@ pub struct Chain {
     /// first, at most [`RETURNED_BLOCKS`]: their transactions go back to the
     /// mempool. See [`Chain::take_disconnected`].
     disconnected: Vec<Block>,
+    /// The ids of every transaction the last reorganization took off the
+    /// active chain, however deep it went. See
+    /// [`Chain::take_disconnected_txids`].
+    disconnected_txids: Vec<Hash256>,
 }
 
 /// Blocks of an abandoned branch whose transactions are offered back to the
@@ -598,6 +602,7 @@ impl Chain {
             table: RefCell::new(None),
             miner_threads: default_threads(),
             disconnected: Vec::new(),
+            disconnected_txids: Vec::new(),
         }
     }
 
@@ -1058,6 +1063,7 @@ impl Chain {
                 table: RefCell::new(None),
                 miner_threads: default_threads(),
                 disconnected: Vec::new(),
+                disconnected_txids: Vec::new(),
             },
             to_replay,
         })
@@ -2123,6 +2129,10 @@ impl Chain {
         // The abandoned blocks, for their transactions: without this, a
         // payment that only the losing block carried left every mempool (each
         // node had removed it on receiving that block) and never happened.
+        self.disconnected_txids = old_bodies
+            .iter()
+            .flat_map(|b| b.transactions.iter().map(|t| t.txid()))
+            .collect();
         let keep = old_bodies.len().saturating_sub(RETURNED_BLOCKS);
         self.disconnected = old_bodies.split_off(keep);
         Ok(depth)
@@ -2132,6 +2142,14 @@ impl Chain {
     /// caller puts their transactions back in the mempool.
     pub fn take_disconnected(&mut self) -> Vec<Block> {
         std::mem::take(&mut self.disconnected)
+    }
+
+    /// The ids of every transaction the last reorganization disconnected, all
+    /// its blocks included and not only the [`RETURNED_BLOCKS`] newest, once:
+    /// what was reacted to on the abandoned branch must be forgotten whatever
+    /// its depth.
+    pub fn take_disconnected_txids(&mut self) -> Vec<Hash256> {
+        std::mem::take(&mut self.disconnected_txids)
     }
 
     // -----------------------------------------------------------------------

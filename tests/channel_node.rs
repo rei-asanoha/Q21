@@ -2448,3 +2448,17 @@ fn a_journal_without_a_key_index_record_still_reloads() {
         "the accepted channel reloads"
     );
 }
+
+/// N5: off regtest, a closed channel stays watched until its close is past
+/// the deepest reorganization a node accepts, not merely as deep as its
+/// funding had to be; on regtest the funding depth keeps tests short.
+#[test]
+fn a_close_settles_past_the_deepest_reorganization_off_regtest() {
+    use q21_core::channel::manager::settle_depth;
+    use q21_core::consensus::MAX_REORG_DEPTH;
+    assert_eq!(settle_depth(Network::Regtest, DEPTH), u64::from(DEPTH));
+    for net in [Network::Testnet, Network::Mainnet] {
+        assert!(settle_depth(net, DEPTH) > MAX_REORG_DEPTH);
+        assert!(settle_depth(net, 2016) >= 2016);
+    }
+}

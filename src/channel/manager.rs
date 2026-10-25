@@ -1431,7 +1431,13 @@ impl ChannelManager {
     /// connected; if the same one comes back, it is re-armed from its new
     /// height.
     pub fn on_disconnected_block(&self, txs: &[Transaction]) {
-        let gone: std::collections::HashSet<Hash256> = txs.iter().map(|t| t.txid()).collect();
+        let gone: Vec<Hash256> = txs.iter().map(|t| t.txid()).collect();
+        self.on_disconnected_txids(&gone);
+    }
+
+    /// [`ChannelManager::on_disconnected_block`], from the transaction ids.
+    pub fn on_disconnected_txids(&self, txids: &[Hash256]) {
+        let gone: std::collections::HashSet<Hash256> = txids.iter().copied().collect();
         let mut g = self.inner.lock().unwrap();
         for chan in g.channels.values_mut() {
             // The transaction that was settling the channel left the chain:
@@ -1653,7 +1659,7 @@ impl ChannelManager {
                             cid.to_hex()
                         );
                         settle(chan, by, height);
-                        finish_settling(chan, height);
+                        finish_settling(chan, height, self.network);
                         continue;
                     }
                     // `Older(D)` is satisfied once the chain is `D` blocks past
@@ -1686,7 +1692,7 @@ impl ChannelManager {
                 Some(CloseTracker::Penalty { .. }) => self.advance_penalty(chan, txs, height),
                 Some(CloseTracker::Settling { .. }) | None => {}
             }
-            finish_settling(chan, height);
+            finish_settling(chan, height, self.network);
         }
     }
 
@@ -1898,12 +1904,26 @@ fn settle(chan: &mut Chan, by: Hash256, height: u64) {
     chan.close = Some(CloseTracker::Settling { by, height, prior });
 }
 
+/// How deep the transaction that ends a channel must be buried before the
+/// channel is marked closed and no longer watched or reloaded. On regtest,
+/// the funding depth, as a funding is buried to open the channel; elsewhere,
+/// past the deepest reorganization a node accepts
+/// ([`crate::consensus::MAX_REORG_DEPTH`]), so a closed channel is never
+/// forgotten while a reorganization could still take its close away.
+pub fn settle_depth(network: Network, funding_depth: u16) -> u64 {
+    let funding = u64::from(funding_depth.max(1));
+    match network {
+        Network::Regtest => funding,
+        _ => funding.max(crate::consensus::MAX_REORG_DEPTH + 1),
+    }
+}
+
 /// Marks a settling channel closed once its last transaction is buried to
-/// the funding depth at chain height `height`, as a funding is to open it.
-fn finish_settling(chan: &mut Chan, height: u64) {
+/// [`settle_depth`] at chain height `height`.
+fn finish_settling(chan: &mut Chan, height: u64, network: Network) {
     if let Some(CloseTracker::Settling { height: at, .. }) = &chan.close {
         let depth = height.saturating_add(1).saturating_sub(*at);
-        if depth >= u64::from(chan.machine.funding_depth().max(1)) {
+        if depth >= settle_depth(network, chan.machine.funding_depth()) {
             let _ = chan.machine.mark_closed();
             chan.close = None;
         }
@@ -1956,8 +1976,8 @@ impl crate::net::ChannelSink for ChannelManager {
         ChannelManager::on_peer_connected(self, peer, peer_identity)
     }
 
-    fn on_disconnected_block(&self, txs: &[Transaction]) {
-        ChannelManager::on_disconnected_block(self, txs)
+    fn on_disconnected_txids(&self, txids: &[Hash256]) {
+        ChannelManager::on_disconnected_txids(self, txids)
     }
 
     fn rescan(

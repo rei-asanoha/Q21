@@ -1044,7 +1044,7 @@ struct Shared {
     channel_scan: Vec<(u64, Vec<crate::tx::Transaction>)>,
     /// Transactions of blocks a reorganization took off the active chain since
     /// the last drain, handed to the channel watcher before `channel_scan`.
-    channel_unscan: Vec<crate::tx::Transaction>,
+    channel_unscan: Vec<Hash256>,
 }
 
 /// How many requested compact blocks may wait for their parent. Two batches
@@ -1143,10 +1143,10 @@ pub trait ChannelSink: Send + Sync {
     }
 
     /// Called, off the chain lock and before the blocks that replace them,
-    /// with the transactions of blocks a reorganization disconnected, so a
+    /// with the ids of every transaction a reorganization disconnected, so a
     /// spend the component reacted to and that left the chain can be forgotten
     /// and a different one classified afresh. The default does nothing.
-    fn on_disconnected_block(&self, _txs: &[crate::tx::Transaction]) {}
+    fn on_disconnected_txids(&self, _txids: &[Hash256]) {}
 
     /// Called once at startup, off the chain lock, with the chain height, the
     /// transactions of the active chain's block at a height, and the depth
@@ -1405,7 +1405,7 @@ impl Node {
             )
         };
         if !untxs.is_empty() {
-            sink.on_disconnected_block(&untxs);
+            sink.on_disconnected_txids(&untxs);
         }
         // Block by block, each at its own height: a commitment's height
         // starts its to-self delay and the penalty's deadline.
@@ -4151,10 +4151,11 @@ impl Node {
     /// height. (Only the last [`crate::chain::RETURNED_BLOCKS`] abandoned
     /// bodies are kept; the fork comes from the reorganization's depth, not
     /// from them.)
-    fn queue_reorg_for_channels(g: &mut Shared, abandoned: &[Block], fork_height: u64) {
-        for gone in abandoned {
-            g.channel_unscan.extend(gone.transactions.iter().cloned());
-        }
+    fn queue_reorg_for_channels(g: &mut Shared, fork_height: u64) {
+        // Every transaction of the abandoned branch, not only those of the
+        // newest blocks offered back to the mempool.
+        let gone = g.chain.take_disconnected_txids();
+        g.channel_unscan.extend(gone);
         let tip = g.chain.height();
         for h in fork_height.saturating_add(1)..=tip {
             if let Some(blk) = g.chain.block_at(h) {
@@ -4192,11 +4193,9 @@ impl Node {
                 let abandoned = g.chain.take_disconnected();
                 if g.channels_active {
                     match accepted {
-                        Accept::Reorganized { depth } => Self::queue_reorg_for_channels(
-                            g,
-                            &abandoned,
-                            before.saturating_sub(depth),
-                        ),
+                        Accept::Reorganized { depth } => {
+                            Self::queue_reorg_for_channels(g, before.saturating_sub(depth))
+                        }
                         _ => g.channel_scan.push((height, b.transactions.clone())),
                     }
                 }
@@ -5806,9 +5805,9 @@ mod tests_hardening {
                 .push((height, txs.iter().map(|t| t.txid()).collect()));
             Vec::new()
         }
-        fn on_disconnected_block(&self, txs: &[crate::tx::Transaction]) {
+        fn on_disconnected_txids(&self, txids: &[Hash256]) {
             let mut d = self.disconnected.lock().unwrap();
-            d.extend(txs.iter().map(|t| t.txid()));
+            d.extend_from_slice(txids);
         }
     }
 
@@ -5888,8 +5887,10 @@ mod tests_hardening {
             blk
         };
         let deep = crate::chain::RETURNED_BLOCKS as u64 + 3;
+        let mut abandoned = Vec::new();
         for _ in 0..deep {
             let blk = mine_on(&a, 2);
+            abandoned.push(blk.clone());
             assert!(b.handle(7, Message::Block(Box::new(blk))));
         }
         let mut branch = Vec::new();
@@ -5916,6 +5917,16 @@ mod tests_hardening {
             seen, expected,
             "the new branch, block by block, from the fork"
         );
+        // And every abandoned transaction is forgotten, from the deepest
+        // block too, not only the newest ones offered back to the mempool.
+        let mut gone = rec.disconnected.lock().unwrap().clone();
+        gone.sort();
+        let mut want: Vec<Hash256> = abandoned
+            .iter()
+            .flat_map(|b| b.transactions.iter().map(|t| t.txid()))
+            .collect();
+        want.sort();
+        assert_eq!(gone, want, "every disconnected transaction");
     }
 
     /// A sink that rejects every channel message as misconduct.
