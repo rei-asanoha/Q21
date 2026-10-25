@@ -699,6 +699,35 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .build()
 }
 
+/// `channelstatus` at chain height `tip`: active on regtest from its policy
+/// activation height; elsewhere not active, with that network's activation
+/// height (`u64::MAX` while none is scheduled). The wait is in blocks and in
+/// seconds at the target block interval.
+fn channel_status(network: Network, tip: u64) -> Json {
+    let activation_height = match network {
+        Network::Mainnet => POLICY_ACTIVATION_MAINNET,
+        Network::Testnet => POLICY_ACTIVATION_TESTNET,
+        Network::Regtest => POLICY_ACTIVATION_REGTEST,
+    };
+    let active = network == Network::Regtest && tip >= activation_height;
+    let blocks_remaining = if active {
+        0
+    } else {
+        activation_height.saturating_sub(tip)
+    };
+    Json::obj()
+        .set("network", Json::str(format!("{network:?}").to_lowercase()))
+        .set("activation_height", Json::u64(activation_height))
+        .set("tip", Json::u64(tip))
+        .set("active", Json::Bool(active))
+        .set("blocks_remaining", Json::u64(blocks_remaining))
+        .set(
+            "eta_seconds",
+            Json::u64(blocks_remaining.saturating_mul(TARGET_BLOCK_SECS)),
+        )
+        .build()
+}
+
 fn rpc_error(code: i64, message: &str) -> Json {
     Json::obj()
         .set("code", Json::Int(code))
@@ -1133,6 +1162,10 @@ impl RpcContext {
                 "getamount",
                 "Transactions carrying an output of a given amount, over a bounded window",
             ),
+            (
+                "channelstatus",
+                "Whether payment channels are active on this network, and from which block",
+            ),
         ];
         #[cfg(feature = "mldsa")]
         m.extend([
@@ -1332,6 +1365,20 @@ impl RpcContext {
             .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))
     }
 
+    // -----------------------------------------------------------------------
+    // Channel activation status (minimal)
+    //
+    // When channels work on this network, for the wallet page to say so before
+    // offering them. The activation gating brings the full method under the
+    // same name and the same shape; this one only follows the policy
+    // activation heights, and goes away when that one lands.
+    // -----------------------------------------------------------------------
+
+    fn channelstatus(&self) -> Json {
+        let tip = self.node.with_chain(|c| c.height());
+        channel_status(self.network, tip)
+    }
+
     /// The methods that sign and send funds, on chain or in a channel.
     fn moves_funds(method: &str) -> bool {
         matches!(
@@ -1409,6 +1456,7 @@ impl RpcContext {
             "search" => self.search(params, client),
             "getaddress" => self.getaddress(params, client),
             "getamount" => self.getamount(params, client),
+            "channelstatus" => Ok(self.channelstatus()),
             #[cfg(feature = "mldsa")]
             "channelopen" => self.channelopen(params),
             #[cfg(feature = "mldsa")]
@@ -4131,6 +4179,47 @@ mod tests {
         );
         let r = call(&c, "channelpay", r#"{"channel_id":"00","amount":1}"#);
         assert!(r.get("error").is_some());
+    }
+
+    /// `channelstatus` says when channels work: on regtest from block 1, and
+    /// nowhere else while no activation is scheduled.
+    #[test]
+    fn channelstatus_follows_the_activation_height() {
+        let names: Vec<&str> = RpcContext::methods().into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"channelstatus"));
+        let field = |j: &Json, k: &str| j.get(k).cloned().unwrap_or(Json::Null);
+
+        // A regtest chain at its genesis: one block to go.
+        let r = call_ok(&context(false), "channelstatus", "{}");
+        assert_eq!(field(&r, "network").as_str(), Some("regtest"));
+        assert_eq!(field(&r, "activation_height").as_u64(), Some(1));
+        assert_eq!(field(&r, "tip").as_u64(), Some(0));
+        assert_eq!(field(&r, "active"), Json::Bool(false));
+        assert_eq!(field(&r, "blocks_remaining").as_u64(), Some(1));
+        assert_eq!(field(&r, "eta_seconds").as_u64(), Some(TARGET_BLOCK_SECS));
+
+        // Past block 1, active, with nothing left to wait for.
+        let r = call_ok(&context_with_funds(), "channelstatus", "{}");
+        assert_eq!(field(&r, "active"), Json::Bool(true));
+        assert_eq!(field(&r, "blocks_remaining").as_u64(), Some(0));
+        assert_eq!(field(&r, "eta_seconds").as_u64(), Some(0));
+
+        // Testnet and mainnet: never active while unscheduled, whatever the
+        // height.
+        for network in [Network::Testnet, Network::Mainnet] {
+            let r = super::channel_status(network, 5_000);
+            assert_eq!(field(&r, "active"), Json::Bool(false), "{network:?}");
+            assert_eq!(field(&r, "activation_height").as_u64(), Some(u64::MAX));
+            assert_eq!(
+                field(&r, "blocks_remaining").as_u64(),
+                Some(u64::MAX - 5_000)
+            );
+            assert_eq!(field(&r, "eta_seconds").as_u64(), Some(u64::MAX));
+        }
+        assert_eq!(
+            field(&super::channel_status(Network::Testnet, 1), "network").as_str(),
+            Some("testnet")
+        );
     }
 
     fn call_ok(c: &RpcContext, method: &str, params: &str) -> Json {
