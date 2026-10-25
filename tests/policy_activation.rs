@@ -1217,3 +1217,123 @@ mod node_option {
         assert!(status.contains("\"active\":false"), "{status}");
     }
 }
+
+/// Channel sessions on a network with a transition: below `H` the transport
+/// starts, answers and retries no handshake — the node would send none of
+/// its frames — and at `H` the session comes up at once, whichever side of
+/// the link reaches it first.
+#[cfg(feature = "mldsa")]
+mod sessions {
+    use super::*;
+    use q21_core::channel::link::ChannelTransport;
+    use q21_core::channel::manager::{ChannelManager, Hooks};
+    use q21_core::net::Node;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const MINER: Hash256 = Hash256([0x33; 32]);
+
+    fn hooks() -> Hooks {
+        Hooks {
+            fund: Box::new(|_, _| Err("no funding here".into())),
+            broadcast: Box::new(|_| Ok(())),
+            sweep_address: Box::new(|| Hash256([1; 32])),
+            payout_address: Box::new(|| Hash256([2; 32])),
+            reserve: Box::new(|_, _| {}),
+        }
+    }
+
+    struct Side {
+        node: Node,
+        mgr: Arc<ChannelManager>,
+        t: Arc<ChannelTransport>,
+    }
+
+    /// A channel node with its tip at `H - 1`.
+    fn side(seed: u8, tag: &str, at_h_minus_1: &Block) -> Side {
+        let (mut c, _) = at_h_minus_2();
+        connect(&mut c, at_h_minus_1).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "q21-activation-sessions-{}-{tag}-{seed}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = Arc::new(ChannelManager::new(
+            NET,
+            10,
+            [seed; 32],
+            dir,
+            12,
+            2,
+            hooks(),
+        ));
+        let t = ChannelTransport::new(mgr.clone());
+        let node = Node::new(NET, c);
+        node.set_channel_sink(t.clone());
+        Side { node, mgr, t }
+    }
+
+    /// The block at `H` connected, and handed to the channel component as
+    /// the node's block hook does.
+    fn reach_h(s: &Side, at_h: &Block) {
+        s.node
+            .with_chain(|c| c.connect(at_h, at_h.header.time + 1))
+            .unwrap();
+        s.node.note_local_block_for_channels(at_h);
+        s.node.scan_connected_blocks_for_channels();
+    }
+
+    fn up(s: &Side, other: &Side) -> bool {
+        s.mgr
+            .sessions()
+            .iter()
+            .any(|(_, id)| *id == other.mgr.node_id())
+    }
+
+    #[test]
+    fn no_handshake_before_h_and_a_session_as_soon_as_both_reach_it() {
+        let (mut c, _) = at_h_minus_2();
+        let b = mine(&c, &[], MINER);
+        connect(&mut c, &b).unwrap();
+        let at_h = mine(&c, &[], MINER);
+        for (tag, dialer_first) in [("responder-first", false), ("dialer-first", true)] {
+            // `a` is dialed, `b` dials: `b` starts the handshake.
+            let a = side(0x41, tag, &b);
+            let d = side(0x42, tag, &b);
+            let addr = a.node.listen("127.0.0.1:0").expect("listen");
+            d.node.connect(addr).expect("connect");
+            let t = Instant::now();
+            while a.node.channel_peers().is_empty() || d.node.channel_peers().is_empty() {
+                assert!(t.elapsed() < Duration::from_secs(10), "{tag}: link");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Maintenance rounds below `H`: no handshake, no retry.
+            for _ in 0..15 {
+                a.node.maintain_peers();
+                d.node.maintain_peers();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(a.t.handshake_attempts(), 0, "{tag}: responder below H");
+            assert_eq!(d.t.handshake_attempts(), 0, "{tag}: dialer below H");
+            assert!(!up(&a, &d) && !up(&d, &a));
+
+            // One side reaches `H`, the other a moment later. Its frames go
+            // out; the other drops them until it gets there too.
+            let (first, second) = if dialer_first { (&d, &a) } else { (&a, &d) };
+            reach_h(first, &at_h);
+            std::thread::sleep(Duration::from_millis(300));
+            reach_h(second, &at_h);
+            let t = Instant::now();
+            while !(up(&a, &d) && up(&d, &a)) {
+                assert!(
+                    t.elapsed() < Duration::from_secs(1),
+                    "{tag}: no session within a second of H"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            a.node.shutdown();
+            d.node.shutdown();
+        }
+    }
+}

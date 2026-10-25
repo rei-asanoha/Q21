@@ -1258,6 +1258,16 @@ pub struct ChannelSender {
 }
 
 impl ChannelSender {
+    /// Whether channels are open on this node's network at its tip
+    /// ([`crate::policy::reached`]): before that, [`ChannelSender::send`]
+    /// sends nothing, so a channel component has no reason to work.
+    pub fn channels_open(&self) -> bool {
+        self.shared.upgrade().is_some_and(|shared| {
+            let g = shared.lock().unwrap();
+            crate::policy::reached(g.network, g.chain.height())
+        })
+    }
+
     /// Queues `payload` to `peer` as a [`Message::Channel`], if the peer is
     /// connected and channel-capable. Never waits on the network.
     ///

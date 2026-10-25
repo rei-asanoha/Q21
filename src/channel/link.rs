@@ -35,6 +35,13 @@
 //!   pending) is dropped unread, and a `Resp` is verified once: the
 //!   initiator's state is consumed by the first one.
 //!
+//! Before channels open on the network ([`crate::policy::reached`]: on
+//! testnet, below the activation height) no handshake is started, answered
+//! or retried: nothing could be sent anyway. When the tip reaches it, the
+//! dialer starts at once, and a responder with no session tells its peer
+//! with a `Reset`, for the dialer that got there first and whose `Init` was
+//! dropped.
+//!
 //! Beyond a budget a frame is dropped, not answered. The P2P layer's own
 //! per-peer rate on channel messages ([`crate::net::CHAN_RATE_PER_SEC`]) and
 //! frame bound come first.
@@ -45,6 +52,7 @@ use crate::channel::transport::{
 };
 use crate::net::{ChannelLink, ChannelOutcome, ChannelSender, ChannelSink, MISCONDUCT_CHANNEL};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -201,6 +209,7 @@ fn handshake_penalty(e: TransportError) -> u32 {
 }
 
 type SendFrame = dyn Fn(u64, Vec<u8>) -> bool + Send + Sync;
+type Gate = dyn Fn() -> bool + Send + Sync;
 
 /// The channel component a node installs: sessions over its connections,
 /// in front of the manager.
@@ -213,6 +222,12 @@ pub struct ChannelTransport {
     global: Mutex<Budget>,
     dos: RwLock<DosLimits>,
     rekey: RwLock<Limits>,
+    /// Whether channels are open; absent, they always are.
+    gate: RwLock<Option<Box<Gate>>>,
+    /// The gate's value at the last look, to act once when it opens.
+    was_open: AtomicBool,
+    /// Handshakes started or answered: each an ephemeral key and a signature.
+    attempts: AtomicU64,
 }
 
 impl ChannelTransport {
@@ -227,6 +242,9 @@ impl ChannelTransport {
             global: Mutex::new(Budget::new(dos.global_burst, dos.global_refill)),
             dos: RwLock::new(dos),
             rekey: RwLock::new(Limits::default()),
+            gate: RwLock::new(None),
+            was_open: AtomicBool::new(true),
+            attempts: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&t);
         t.mgr.set_outbound(Box::new(move |peer, frame| {
@@ -245,6 +263,33 @@ impl ChannelTransport {
         if let Ok(mut g) = self.sender.write() {
             *g = Some(send);
         }
+    }
+
+    /// Installs the check of whether channels are open on the network (see
+    /// the module documentation): the node's [`ChannelSender::channels_open`]
+    /// once attached.
+    pub fn set_gate(&self, gate: Box<Gate>) {
+        let open = gate();
+        if let Ok(mut g) = self.gate.write() {
+            *g = Some(gate);
+        }
+        self.was_open.store(open, Ordering::SeqCst);
+    }
+
+    /// Whether channels are open, so that a handshake is worth its work.
+    fn open(&self) -> bool {
+        match self.gate.read() {
+            Ok(g) => match g.as_ref() {
+                Some(f) => f(),
+                None => true,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Handshakes this transport started or answered.
+    pub fn handshake_attempts(&self) -> u64 {
+        self.attempts.load(Ordering::SeqCst)
     }
 
     /// Changes the handshake bounds, for tests.
@@ -347,6 +392,11 @@ impl ChannelTransport {
     /// Starts a handshake as initiator, within the connection's budget, or
     /// marks one due.
     fn start_handshake(&self, peer: u64, c: &mut Conn) {
+        if !self.open() {
+            // Due once channels open: `tick` starts it then.
+            c.wanted = true;
+            return;
+        }
         if let Handshake::Initiating(_, since) = &c.handshake {
             if since.elapsed() < self.dos().timeout {
                 return;
@@ -358,6 +408,7 @@ impl ChannelTransport {
         }
         c.wanted = false;
         let ctx = context(self.mgr.network(), &c.link);
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         match Initiator::start(self.mgr.identity(), ctx) {
             Ok((ini, init)) => {
                 c.handshake = Handshake::Initiating(ini, Instant::now());
@@ -384,7 +435,8 @@ impl ChannelTransport {
     /// the budget.
     fn send_reset(&self, peer: u64, c: &mut Conn) {
         let timeout = self.dos().timeout;
-        if c.reset_sent.is_some_and(|at| at.elapsed() < timeout) || !c.budget.take() {
+        if !self.open() || c.reset_sent.is_some_and(|at| at.elapsed() < timeout) || !c.budget.take()
+        {
             return;
         }
         c.reset_sent = Some(Instant::now());
@@ -488,7 +540,7 @@ impl ChannelTransport {
     fn on_init(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
         // Only the side that was dialed answers: both ends of a link agree on
         // who that is, a relay that dialed both does not get a session.
-        if c.link.outbound {
+        if c.link.outbound || !self.open() {
             return After::default();
         }
         if bytes.len() != transport::INIT_LEN {
@@ -513,6 +565,7 @@ impl ChannelTransport {
         let closed = c.session.take().is_some();
         c.reset_sent = None;
         let ctx = context(self.mgr.network(), &c.link);
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         match Responder::accept(self.mgr.identity(), ctx, bytes) {
             Ok((r, resp)) => {
                 let now = Instant::now();
@@ -599,8 +652,10 @@ impl ChannelTransport {
                 ..After::default()
             };
         }
+        // Initiating already: the responder never saw that `Init`, dropped
+        // while it had not reached the activation yet. Started again.
         if matches!(c.handshake, Handshake::Initiating(..)) {
-            return After::default();
+            c.handshake = Handshake::Idle;
         }
         let closed = c.session.take().is_some();
         self.start_handshake(peer, c);
@@ -613,6 +668,13 @@ impl ChannelTransport {
     /// Timed work: forgets handshakes that waited too long, and starts the
     /// ones due once the budget allows.
     pub fn tick(&self) {
+        // Nothing is due, and no timer runs, before channels open.
+        let open = self.open();
+        let opened = open && !self.was_open.swap(open, Ordering::SeqCst);
+        if !open {
+            self.was_open.store(false, Ordering::SeqCst);
+            return;
+        }
         let timeout = self.dos().timeout;
         self.pending
             .lock()
@@ -639,6 +701,12 @@ impl ChannelTransport {
             if c.link.outbound && c.session.is_none() && matches!(c.handshake, Handshake::Idle) {
                 c.wanted = true;
             }
+            // Just opened: a dialer that got there first sent its `Init`
+            // while we dropped every channel frame.
+            if opened && !c.link.outbound && c.session.is_none() {
+                c.reset_sent = None;
+                self.send_reset(peer, &mut c);
+            }
             if c.wanted {
                 self.start_handshake(peer, &mut c);
             }
@@ -656,6 +724,8 @@ impl ChannelSink for ChannelTransport {
     }
 
     fn attach(&self, sender: ChannelSender) {
+        let gate = sender.clone();
+        self.set_gate(Box::new(move || gate.channels_open()));
         self.set_sender(Box::new(move |peer, bytes| sender.send(peer, bytes)));
     }
 
@@ -668,6 +738,9 @@ impl ChannelSink for ChannelTransport {
         for (peer, frame) in self.mgr.on_connected_block(txs, height, depth_of) {
             self.send(peer, frame);
         }
+        // The block that opens channels starts their sessions at once, not
+        // at the next maintenance round.
+        self.tick();
         Vec::new()
     }
 
