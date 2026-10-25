@@ -57,6 +57,14 @@ pub const ONION_ADDR_VERSION: u32 = 4;
 /// message. See [`crate::policy::has_transition`].
 pub const POLICY_ACTIVATION_VERSION: u32 = 5;
 
+// A version-5 node keeps the 0.4.10 nodes (version 4) as peers until the
+// activation, and the versions only grow.
+const _: () = {
+    assert!(MIN_PROTOCOL_VERSION <= 4);
+    assert!(ONION_ADDR_VERSION < POLICY_ACTIVATION_VERSION);
+    assert!(POLICY_ACTIVATION_VERSION <= PROTOCOL_VERSION);
+};
+
 /// Length of a Tor v3 onion name, without `.onion`: 56 base32 characters.
 pub const ONION_NAME_LEN: usize = 56;
 
@@ -847,8 +855,7 @@ mod tests {
     #[test]
     fn this_version_follows_the_policy_activation_and_accepts_0_4_10() {
         assert_eq!(PROTOCOL_VERSION, POLICY_ACTIVATION_VERSION);
-        assert!(MIN_PROTOCOL_VERSION <= 4);
-        assert!(ONION_ADDR_VERSION < POLICY_ACTIVATION_VERSION);
+        assert_eq!(MIN_PROTOCOL_VERSION, 3);
     }
 
     fn round_trip(m: Message) {

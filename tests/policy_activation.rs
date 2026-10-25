@@ -627,7 +627,7 @@ mod wire {
             let tx = funding(&c, &mut w, 1_000_000);
             let b = mine(&c, &[], Hash256([0x22; 32]));
             connect(&mut c, &b).unwrap();
-            let at_h = mine(&c, &[tx.clone()], Hash256([0x22; 32]));
+            let at_h = mine(&c, std::slice::from_ref(&tx), Hash256([0x22; 32]));
             let node = Node::new(NET, c);
             let mut s = peer(&node, version, H);
             send(&mut s, &Message::Block(Box::new(at_h.clone())));
