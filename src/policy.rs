@@ -157,24 +157,87 @@ impl From<ReadError> for PolicyError {
 ///
 /// `height` is the height of the block that would contain the transaction:
 /// the block's own height in block validation, the tip plus one in the
-/// mempool.
+/// mempool. A block at `activation_height - 1` refuses a policy output or
+/// spend; a block at `activation_height` accepts it.
 pub fn is_active(network: Network, height: u64) -> bool {
     height >= activation_height(network)
 }
 
-/// Can a policy output ever be valid on `network`? False on testnet and
-/// mainnet, where the rule is dormant: there, anything carrying one is
-/// treated as 0.4.9 treated it, as unreadable.
+/// Can a policy output ever be valid on `network`? False on mainnet, where
+/// the rule is dormant: there, anything carrying one is treated as 0.4.9
+/// treated it, as unreadable.
 pub fn may_appear_on(network: Network) -> bool {
     activation_height(network) != u64::MAX
 }
 
 /// Height from which the rule is in force; `u64::MAX` means never.
-fn activation_height(network: Network) -> u64 {
+///
+/// The compiled-in [`scheduled_activation`], except in an audit build whose
+/// tests moved it with [`audit_set_activation_height`]. A release build has
+/// no such switch.
+pub fn activation_height(network: Network) -> u64 {
+    #[cfg(feature = "audit")]
+    if let Some(h) = audit_activation::get(network) {
+        return h;
+    }
+    scheduled_activation(network)
+}
+
+/// The activation height compiled into this binary for `network`.
+pub const fn scheduled_activation(network: Network) -> u64 {
     match network {
         Network::Mainnet => POLICY_ACTIVATION_MAINNET,
         Network::Testnet => POLICY_ACTIVATION_TESTNET,
         Network::Regtest => POLICY_ACTIVATION_REGTEST,
+    }
+}
+
+/// Moves the activation height of `network` for this process.
+///
+/// Audit builds only, for the tests and the lab that must cross a real
+/// activation height on a network with a transition; never mainnet. Set once per process
+/// and network, before anything reads it: setting it again to the same
+/// height does nothing, to another height panics, so that two tests of one
+/// process can never see two different rules.
+#[cfg(feature = "audit")]
+pub fn audit_set_activation_height(network: Network, height: u64) {
+    audit_activation::set(network, height);
+}
+
+#[cfg(feature = "audit")]
+mod audit_activation {
+    use crate::address::Network;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Zero means not moved: the rule never opens at the genesis, which
+    /// holds no transaction.
+    static MAINNET: AtomicU64 = AtomicU64::new(0);
+    static TESTNET: AtomicU64 = AtomicU64::new(0);
+    static REGTEST: AtomicU64 = AtomicU64::new(0);
+
+    fn slot(network: Network) -> &'static AtomicU64 {
+        match network {
+            Network::Mainnet => &MAINNET,
+            Network::Testnet => &TESTNET,
+            Network::Regtest => &REGTEST,
+        }
+    }
+
+    pub fn get(network: Network) -> Option<u64> {
+        match slot(network).load(Ordering::SeqCst) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    pub fn set(network: Network, height: u64) {
+        assert!(height >= 1, "the genesis cannot carry a policy");
+        assert!(network != Network::Mainnet, "mainnet never opens the rule");
+        match slot(network).compare_exchange(0, height, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {}
+            Err(h) if h == height => {}
+            Err(h) => panic!("{network:?} activation already moved to {h}, not {height}"),
+        }
     }
 }
 
