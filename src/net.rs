@@ -2364,7 +2364,9 @@ impl Node {
                 format!("since block {h}")
             };
             eprintln!(
-                "warning: peer {addr} ({agent}, protocol {version}) predates the activation                  of policy outputs {when}: it stops at the first block carrying one.                  Its operator must upgrade it to 0.4.11 or later."
+                "warning: peer {addr} ({agent}, protocol {version}) predates the activation \
+                 of policy outputs {when}: it stops at the first block carrying one. \
+                 Its operator must upgrade it to 0.4.11 or later."
             );
             count += 1;
         }
