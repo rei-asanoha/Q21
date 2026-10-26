@@ -55,6 +55,13 @@
 //!   it a pipe for a session it holds no key of: it can drop or delay
 //!   records, as any hop can, and nothing else.
 //!
+//! The P2P nonces are each node's own, drawn once per process and the same on
+//! all its connections: they bind a handshake to the two node instances at
+//! its ends, as each saw the other introduce itself, not to one connection.
+//! What makes every session unique is the pair of fresh ephemeral keys; the
+//! nonces only stop a relay that does not take the trouble to copy them, and
+//! the protection against one that does is the signatures over the keys.
+//!
 //! # Key schedule
 //!
 //! ```text
@@ -286,9 +293,10 @@ fn ephemeral() -> Result<Ephemeral, TransportError> {
     Ok(Ephemeral { dk, ek })
 }
 
-/// Encapsulates a fresh secret to the encapsulation key `ek`: the
-/// ciphertext, and the shared secret.
-fn encapsulate(ek: &[u8]) -> Result<(Vec<u8>, [u8; 32]), TransportError> {
+/// Encapsulates a fresh secret to the encapsulation key `ek`: the ciphertext,
+/// with the shared secret written into `ss`, where its holder keeps it — not
+/// returned by value, which would leave a copy on the stack.
+fn encapsulate_into(ek: &[u8], ss: &mut [u8; 32]) -> Result<Vec<u8>, TransportError> {
     let key = ml_kem::Key::<ml_kem::EncapsulationKey<MlKem1024>>::try_from(ek)
         .map_err(|_| TransportError::BadKey)?;
     let ek =
@@ -298,10 +306,16 @@ fn encapsulate(ek: &[u8]) -> Result<(Vec<u8>, [u8; 32]), TransportError> {
     let (ct, mut k) = ek.encapsulate_deterministic(&mb);
     crate::kdf::wipe(&mut m);
     crate::kdf::wipe(&mut mb);
-    let mut ss = [0u8; 32];
     ss.copy_from_slice(&k);
     crate::kdf::wipe(&mut k);
-    Ok((ct.to_vec(), ss))
+    Ok(ct.to_vec())
+}
+
+/// [`encapsulate_into`] a local the caller wipes.
+fn encapsulate(ek: &[u8]) -> Result<(Vec<u8>, [u8; 32]), TransportError> {
+    let mut ss = [0u8; 32];
+    let ct = encapsulate_into(ek, &mut ss)?;
+    Ok((ct, ss))
 }
 
 fn decapsulate(dk: &ml_kem::DecapsulationKey<MlKem1024>, ct: &[u8]) -> [u8; 32] {
@@ -432,14 +446,21 @@ impl Initiator {
 pub struct Responder {
     eph: Ephemeral,
     transcript: Transcript,
-    ss_r: [u8; 32],
+    /// On the heap from the start: moving the state moves only the pointer.
+    ss_r: Box<[u8; 32]>,
     peer_pubkey: Vec<u8>,
     peer_legacy: [u8; LEGACY_NODE_ID_LEN],
 }
 
+impl Responder {
+    fn wipe(&mut self) {
+        crate::kdf::wipe(&mut self.ss_r[..]);
+    }
+}
+
 impl Drop for Responder {
     fn drop(&mut self) {
-        crate::kdf::wipe(&mut self.ss_r);
+        self.wipe();
     }
 }
 
@@ -456,7 +477,8 @@ impl Responder {
         if pk_i == me.pubkey() {
             return Err(TransportError::Reflected);
         }
-        let (ct_r, ss_r) = encapsulate(ek_i)?;
+        let mut ss_r = Box::new([0u8; 32]);
+        let ct_r = encapsulate_into(ek_i, &mut ss_r)?;
         let eph = ephemeral()?;
         let mut transcript = Transcript::new(&ctx);
         let t = &mut transcript;
@@ -1084,13 +1106,24 @@ mod tests {
         }
 
         // A responder's encapsulated secret, when the handshake is dropped
-        // before its Fin.
+        // before its Fin: wiped by its drop.
+        let (_, init) = Initiator::start(&a, ctx()).unwrap();
+        let (mut r, _) = Responder::accept(&b, ctx(), &init).unwrap();
+        assert_ne!(*r.ss_r, [0; 32]);
+        r.wipe();
+        assert_eq!(*r.ss_r, [0; 32]);
+    }
+
+    /// The responder's secret is written once, where it stays: moving the
+    /// state, as returning it and storing it per connection do, leaves no
+    /// copy of it behind.
+    #[test]
+    fn the_responder_secret_never_moves() {
+        let (a, b) = (identity(1), identity(2));
         let (_, init) = Initiator::start(&a, ctx()).unwrap();
         let (r, _) = Responder::accept(&b, ctx(), &init).unwrap();
-        let mut slot = std::mem::ManuallyDrop::new(r);
-        let p: *const [u8; 32] = &slot.ss_r;
-        assert_ne!(unsafe { *p }, [0; 32]);
-        unsafe { std::mem::ManuallyDrop::drop(&mut slot) };
-        assert_eq!(unsafe { std::ptr::read_volatile(p) }, [0; 32]);
+        let at: *const [u8; 32] = &*r.ss_r;
+        let stored = vec![r];
+        assert_eq!(&*stored[0].ss_r as *const [u8; 32], at);
     }
 }
