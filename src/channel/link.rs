@@ -49,8 +49,8 @@
 //! - at most [`MAX_PENDING_HANDSHAKES`] responders wait for a `Fin` at once,
 //!   one per connection, each for [`HANDSHAKE_TIMEOUT`];
 //! - a handshake frame nobody asked for (`Resp` or `Fin` with no handshake
-//!   pending) is dropped unread, and a `Resp` is verified once: the
-//!   initiator's state is consumed by the first one.
+//!   pending) is dropped unread, and an initiator verifies at most
+//!   [`RESP_TRIES`] `Resp`s per handshake.
 //!
 //! Before channels open on the network ([`crate::policy::reached`]: on
 //! testnet, below the activation height) no handshake is started, answered
@@ -88,6 +88,11 @@ pub const KNOWN_HANDSHAKE_BURST: u32 = 16;
 pub const KNOWN_HANDSHAKES_PER_SEC: u32 = 2;
 /// Of which any one such key gets at once; then one per [`HANDSHAKE_REFILL`].
 pub const KNOWN_PER_PEER_BURST: u32 = 2;
+/// `Resp`s an initiator verifies in one handshake. Two: when both ends reach
+/// the activation at once, the responder's `Reset` and our `Init` cross, we
+/// start again, and the answer to the first `Init` comes before the one to
+/// the second.
+pub const RESP_TRIES: u32 = 2;
 /// `Init`s gone unanswered on a connection before its retries back off.
 pub const UNANSWERED_BEFORE_BACKOFF: u32 = 3;
 /// Longest wait between two `Init`s on one connection.
@@ -205,6 +210,9 @@ struct Conn {
     /// Responder: this connection claimed a channel peer's key and never
     /// proved it. It draws on the strangers' pool only.
     demoted: bool,
+    /// Initiator: `Resp`s refused in the handshake under way. Each costs a
+    /// verification; past [`RESP_TRIES`], the handshake is given up.
+    resp_failures: u32,
     /// Initiator: `Init`s that timed out unanswered in a row.
     unanswered: u32,
     /// Initiator: no retry before then (see [`UNANSWERED_BEFORE_BACKOFF`]).
@@ -425,6 +433,7 @@ impl ChannelTransport {
             reset_sent: None,
             claimed_known: false,
             demoted: false,
+            resp_failures: 0,
             unanswered: 0,
             next_try: None,
         }));
@@ -507,6 +516,7 @@ impl ChannelTransport {
         match Initiator::start(self.mgr.identity(), ctx) {
             Ok((ini, init)) => {
                 c.handshake = Handshake::Initiating(ini, Instant::now());
+                c.resp_failures = 0;
                 self.raw_send(peer, init);
             }
             Err(_) => c.wanted = true,
@@ -728,16 +738,16 @@ impl ChannelTransport {
     }
 
     fn on_resp(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
-        let Handshake::Initiating(ini, since) =
-            std::mem::replace(&mut c.handshake, Handshake::Idle)
-        else {
+        let Handshake::Initiating(ini, since) = &c.handshake else {
             return After::default();
         };
+        let since = *since;
         // The peer runs the transport: no more backing off.
         c.unanswered = 0;
         c.next_try = None;
-        match ini.finish(self.mgr.identity(), bytes) {
+        match ini.try_finish(self.mgr.identity(), bytes) {
             Ok((mut session, peer_info, fin)) => {
+                c.handshake = Handshake::Idle;
                 session.set_limits(*self.rekey.read().unwrap());
                 // The Fin leaves before any record of the new session.
                 self.raw_send(peer, fin);
@@ -750,7 +760,12 @@ impl ChannelTransport {
                 }
             }
             Err(e) => {
-                c.wanted = true;
+                // Kept for the answer to the `Init` under way, a few tries.
+                c.resp_failures += 1;
+                if c.resp_failures >= RESP_TRIES {
+                    c.handshake = Handshake::Idle;
+                    c.wanted = true;
+                }
                 After {
                     penalize: handshake_penalty(e),
                     ..After::default()

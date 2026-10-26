@@ -396,7 +396,18 @@ impl Initiator {
     /// Takes the responder's `Resp`: the session, the authenticated peer,
     /// and the `Fin` frame to send.
     pub fn finish(
-        mut self,
+        self,
+        me: &NodeIdentity,
+        resp: &[u8],
+    ) -> Result<(Session, Peer, Vec<u8>), TransportError> {
+        self.try_finish(me, resp)
+    }
+
+    /// [`Initiator::finish`], leaving the initiator as it was when `resp` is
+    /// refused: a `Resp` to an earlier `Init` of the same connection, one that
+    /// crossed a restart, does not cost the handshake under way.
+    pub fn try_finish(
+        &self,
         me: &NodeIdentity,
         resp: &[u8],
     ) -> Result<(Session, Peer, Vec<u8>), TransportError> {
@@ -408,7 +419,8 @@ impl Initiator {
         if pk_r == me.pubkey() {
             return Err(TransportError::Reflected);
         }
-        let t = &mut self.transcript;
+        let mut transcript = self.transcript.clone();
+        let t = &mut transcript;
         t.field(F_EK_R, ek_r);
         t.field(F_CT_R, ct_r);
         t.field(F_PK_R, pk_r);

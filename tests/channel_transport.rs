@@ -785,3 +785,27 @@ fn unanswered_inits_back_off() {
     a.t.deliver(a.conn, &a.link, &reset);
     assert_eq!(a.t.handshake_attempts(), attempts + 1);
 }
+
+/// Both ends reach the activation at once: the responder's `Reset` crosses
+/// the dialer's `Init`, the dialer starts again, and the answer to its first
+/// `Init` arrives before the one to the second. The handshake under way is
+/// not lost to it: the session is up without waiting for a retry.
+#[test]
+fn a_resp_to_a_crossed_init_does_not_cost_the_handshake() {
+    let (ends, wire) = link(45, 46, "crossed");
+    let (a, b) = (&ends[0], &ends[1]);
+    a.t.connect(a.conn, &a.link);
+    let init1 = wire.lock().unwrap().pop_front().unwrap().1;
+    b.t.deliver(b.conn, &b.link, &init1);
+    let resp1 = wire.lock().unwrap().pop_front().unwrap().1;
+    // The responder's Reset, sent as it opened, reaches the dialer now.
+    let reset = vec![transport::VERSION, transport::T_RESET];
+    a.t.deliver(a.conn, &a.link, &reset);
+    let init2 = wire.lock().unwrap().pop_front().unwrap().1;
+    assert_eq!(transport::frame_type(&init2), Some(transport::T_INIT));
+    // The answer to the first Init, then the second exchange.
+    assert_eq!(a.t.deliver(a.conn, &a.link, &resp1).penalize, 0);
+    b.t.deliver(b.conn, &b.link, &init2);
+    assert_eq!(pump(&ends, &wire, |_, f| Some(f)), 0);
+    assert!(a.t.has_session(a.conn) && b.t.has_session(b.conn));
+}
