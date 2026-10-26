@@ -4351,9 +4351,6 @@ impl Node {
         if g.mempool.contains(hash) || g.orphans.contains(hash) {
             return false;
         }
-        if Self::syncing_far_before_activation(g) {
-            return false;
-        }
         if g.rejected_at == g.chain.tip_id() && g.rejected.contains(hash) {
             return false;
         }
@@ -4364,26 +4361,6 @@ impl Node {
             }
         }
         true
-    }
-
-    /// Are we catching up a long way behind our peers while our next block
-    /// is still below the policy activation height?
-    ///
-    /// Then a transaction offered to us may be a policy transaction our next
-    /// block cannot carry, from a peer already past the activation: fetching
-    /// it would only be refused. None is requested until the blocks are in.
-    /// "A long way" is read from the bodies this node itself has queued —
-    /// headers chained onto its own chain — never from a height a peer
-    /// claims: a full batch of headers still to follow, or more bodies to
-    /// fetch than two rounds of requests.
-    fn syncing_far_before_activation(g: &Shared) -> bool {
-        crate::policy::has_transition(g.network)
-            && !crate::policy::is_active(g.network, g.chain.height().saturating_add(1))
-            && g.peers.values().any(|p| {
-                p.more_expected
-                    || p.bodies_to_request.len() + p.requested_bodies.len()
-                        > 2 * MAX_BODIES_IN_FLIGHT
-            })
     }
 
     /// Requests, from peer `id`, the announced transactions that waited for
@@ -6693,36 +6670,57 @@ mod tests_hardening {
         assert_eq!(n.shared.lock().unwrap().peers[&7].ban_score, 0);
     }
 
-    /// Review (r11-int): while it catches up a long way behind and its next
-    /// block is below the activation, a node requests no transaction: any of
-    /// them may be a policy transaction it can only refuse. "A long way" is
-    /// what this node queued itself, not what a peer claims.
+    /// Review (final): one peer's sync flags switched off every transaction
+    /// request of the node until the activation — a peer that kept sending
+    /// full header batches and slow bodies, or one honest sync that stalled.
+    /// Nothing a single peer sets decides what this node fetches: below the
+    /// activation, with a peer syncing it and another full of bodies to send,
+    /// a plain payment is still requested, as in 0.4.10.
     #[test]
-    fn no_transaction_is_requested_while_syncing_far_before_activation() {
+    fn a_single_peer_cannot_switch_off_transaction_fetching() {
         let hash = Hash256([9; 32]);
         let n = testnet_node();
         let _e = established_peer(&n, 7);
+        let mut g = n.shared.lock().unwrap();
+        assert!(!crate::policy::is_active(
+            Network::Testnet,
+            g.chain.height() + 1
+        ));
+        let p = g.peers.get_mut(&7).unwrap();
+        p.start_height = u64::MAX / 2;
+        p.more_expected = true;
+        p.bodies_to_request
+            .extend((0..=2 * MAX_BODIES_IN_FLIGHT as u8).map(|i| Hash256([i; 32])));
+        assert!(Node::should_request_tx(&g, &hash));
+    }
+
+    /// Below the activation, an announced plain payment is requested exactly
+    /// as 0.4.10 requests it, whatever state the announcing peer's sync is
+    /// in: the announcement is answered with a `getdata` for it, and the
+    /// request is remembered.
+    #[test]
+    fn plain_payments_are_fetched_below_the_activation_as_in_0_4_10() {
+        let n = testnet_node();
+        let _e = established_peer(&n, 7);
+        let hash = Hash256([0x42; 32]);
         {
             let mut g = n.shared.lock().unwrap();
-            g.peers.get_mut(&7).unwrap().start_height = u64::MAX / 2;
-            assert!(
-                Node::should_request_tx(&g, &hash),
-                "a claim alone stops nothing"
-            );
-            g.peers.get_mut(&7).unwrap().more_expected = true;
-            assert!(!Node::should_request_tx(&g, &hash));
             let p = g.peers.get_mut(&7).unwrap();
-            p.more_expected = false;
-            p.bodies_to_request
-                .extend((0..=2 * MAX_BODIES_IN_FLIGHT as u8).map(|i| Hash256([i; 32])));
-            assert!(!Node::should_request_tx(&g, &hash));
+            p.version = crate::wire::POLICY_ACTIVATION_VERSION;
+            p.more_expected = true;
         }
-        // Regtest has no transition: a syncing node requests as before.
-        let (a, _) = node_pair();
-        let _e = established_peer(&a, 7);
-        let mut g = a.shared.lock().unwrap();
-        g.peers.get_mut(&7).unwrap().more_expected = true;
-        assert!(Node::should_request_tx(&g, &hash));
+        assert!(n.handle(
+            7,
+            Message::Inv(vec![InvItem {
+                kind: InvKind::Tx,
+                hash,
+            }])
+        ));
+        let g = n.shared.lock().unwrap();
+        assert!(
+            g.peers[&7].requested_txs.contains_key(&hash),
+            "the announced payment was not requested"
+        );
     }
 
     /// Finding 14: off regtest, where channels do not exist, a channel
