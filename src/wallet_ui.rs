@@ -3241,10 +3241,12 @@ function channelPeerKey(p){
   return String(p.channel_session || "");
 }
 
-// A peer a channel can be opened with: connected, and its channel session
-// established, so that the node id shown is the one it proved.
+// A peer a channel can be opened with: its channel session is established,
+// so that the node id shown is the one it proved. That alone counts: a link
+// opened before the activation carries no capability flag, yet its session
+// comes up once channels open.
 function channelSessionPeer(p){
-  return p.supports_channels && p.handshake_complete && CHANNEL_ID.test(channelPeerKey(p));
+  return CHANNEL_ID.test(channelPeerKey(p));
 }
 
 function peerOf(ch){
@@ -5644,8 +5646,13 @@ mod tests {
         assert!(key.contains("p.channel_session"));
         assert!(!key.contains("p.address"));
         let listed = channel_function("function channelSessionPeer(");
-        assert!(listed.contains("p.handshake_complete"));
         assert!(listed.contains("CHANNEL_ID.test(channelPeerKey(p))"));
+        // A link with a session but no capability flag — one opened before
+        // the activation — is listed too.
+        assert!(
+            !listed.contains("supports_channels"),
+            "the session alone counts"
+        );
         let peers = channel_function("function paintChannelPeers(");
         assert!(peers.contains("channelPeers.filter(channelSessionPeer)"));
     }
