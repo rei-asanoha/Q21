@@ -561,6 +561,10 @@ pub struct Chain {
 /// back. Twelve blocks of payments are re-checked in under a second.
 pub const RETURNED_BLOCKS: usize = 12;
 
+/// Blocks a startup tip change gives back to the pool at most, as a live
+/// reorganization does: see [`Chain::abandoned_since`].
+pub const MAX_STARTUP_ABANDONED: usize = RETURNED_BLOCKS;
+
 impl Chain {
     pub fn new(network: Network, genesis: Block) -> Chain {
         let mut utxo = UtxoSet::new();
@@ -641,6 +645,25 @@ impl Chain {
     /// write order, which mixes branches, and ran into the anti-reorg defenses
     /// on its own history. See `RECONSTRUCTION` in the tests.
     pub fn block_tree(headers: &[BlockHeader]) -> Result<BlockTree, ResumeError> {
+        Self::block_tree_preferring(headers, None)
+    }
+
+    /// [`Self::block_tree`], keeping `preferred` — the tip that was active
+    /// when the node stopped — when no tip carries more work than it.
+    ///
+    /// # The defect this closes
+    ///
+    /// Between equal-work tips the rebuild took the smallest id, while a
+    /// running node keeps the first one it saw. A node stopped during such a
+    /// tie could come back on the other branch, without any reorganization:
+    /// the transactions of the block it left never went back to its pool, and
+    /// every payment chained on them was dropped at the reload (1502 in the
+    /// load test of 25 October 2026). Which equal-work tip is followed is not
+    /// a consensus matter; the validity of blocks is untouched.
+    pub fn block_tree_preferring(
+        headers: &[BlockHeader],
+        preferred: Option<Hash256>,
+    ) -> Result<BlockTree, ResumeError> {
         // 1. Raw index, by id.
         let mut by_id: HashMap<Hash256, BlockHeader> = HashMap::new();
         let mut genesis = None;
@@ -686,12 +709,18 @@ impl Chain {
             }
         }
 
-        // 3. Best tip, then active chain by walking back.
-        let best = work
+        // 3. Best tip, then active chain by walking back. Between equal-work
+        // tips: the one that was active, else the smallest id.
+        let mut best = work
             .iter()
             .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
             .map(|(id, _)| *id)
             .ok_or(ResumeError::NoGenesis)?;
+        if let Some(p) = preferred {
+            if work.get(&p).is_some_and(|w| *w == work[&best]) {
+                best = p;
+            }
+        }
 
         let mut active = Vec::new();
         let mut current = best;
@@ -1010,6 +1039,17 @@ impl Chain {
         snapshot: Snapshot,
         headers: &[BlockHeader],
     ) -> Result<Resume, ResumeError> {
+        Self::from_snapshot_preferring(network, snapshot, headers, None)
+    }
+
+    /// [`Self::from_snapshot`], keeping the tip that was active when the node
+    /// stopped on equal work: see [`Self::block_tree_preferring`].
+    pub fn from_snapshot_preferring(
+        network: Network,
+        snapshot: Snapshot,
+        headers: &[BlockHeader],
+        preferred: Option<Hash256>,
+    ) -> Result<Resume, ResumeError> {
         if snapshot.network != network {
             return Err(ResumeError::WrongNetwork);
         }
@@ -1019,7 +1059,7 @@ impl Chain {
             work,
             active,
             ..
-        } = Self::block_tree(headers)?;
+        } = Self::block_tree_preferring(headers, preferred)?;
 
         // 4. The snapshot must be on this active chain, at its height.
         let pos = snapshot.height as usize;
@@ -1570,6 +1610,39 @@ impl Chain {
     }
 
     /// Header of a known block, including on a side branch.
+    /// The blocks from `old_tip` back to the active chain, oldest first: what
+    /// a node that stopped on `old_tip` left behind if it came back on another
+    /// tip. Empty when `old_tip` is on the active chain or unknown. Bodies are
+    /// read with `read`; the walk stops at the first one missing.
+    ///
+    /// A tip change at startup — an equal-work tie, a damaged tail, a better
+    /// branch found on disk — happens without any reorganization: the caller
+    /// puts these transactions back into the pool, as a live reorganization
+    /// would, before reloading the saved pool that may depend on them.
+    pub fn abandoned_since(
+        &self,
+        old_tip: &Hash256,
+        read: &dyn Fn(&Hash256) -> Option<Block>,
+    ) -> Vec<Block> {
+        let mut ids = Vec::new();
+        let mut current = *old_tip;
+        while let Some(h) = self.header_of(&current) {
+            if self.active_at(h.height) == Some(current) || ids.len() >= MAX_STARTUP_ABANDONED {
+                break;
+            }
+            ids.push(current);
+            current = h.prev_block;
+        }
+        let mut blocks = Vec::new();
+        for id in ids.iter().rev() {
+            match read(id) {
+                Some(b) => blocks.push(b),
+                None => break,
+            }
+        }
+        blocks
+    }
+
     pub fn header_of(&self, id: &Hash256) -> Option<BlockHeader> {
         self.index.get(id).map(|b| b.header)
     }

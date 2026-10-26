@@ -1084,6 +1084,41 @@ impl Mempool {
         back
     }
 
+    /// What a restart puts back in the pool: first the transactions of the
+    /// blocks the node left behind if it came back on another tip (see
+    /// [`crate::chain::Chain::abandoned_since`]), through the same door as a
+    /// live reorganization; then the pool it saved when it stopped, the
+    /// node's own transactions as its own (`own`). Returns how many of each
+    /// came back.
+    ///
+    /// The order matters: a saved payment chained on a transaction of the
+    /// left block finds its parent in the pool, instead of being dropped as
+    /// spending an output that does not exist.
+    pub fn restore_at_startup(
+        &mut self,
+        abandoned: &[crate::block::Block],
+        saved: &[Transaction],
+        own: &dyn Fn(&Transaction) -> bool,
+        utxo: &UtxoSet,
+        network: Network,
+        height: u64,
+    ) -> (usize, usize) {
+        let returned = self.return_abandoned(abandoned, utxo, network, height);
+        let mut restored = 0;
+        for tx in saved {
+            let ok = if own(tx) {
+                self.accept_local(tx, utxo, network, height)
+            } else {
+                self.accept(tx, utxo, network, height)
+            };
+            // Already back with its block: it counts as restored.
+            if ok.is_ok() || matches!(ok, Err(MempoolError::AlreadyPresent)) {
+                restored += 1;
+            }
+        }
+        (returned, restored)
+    }
+
     /// Removes what a block has just confirmed, or made invalid.
     ///
     /// Two distinct cases: a transaction of the block is now confirmed, and a
