@@ -308,6 +308,19 @@ pub const SNAPSHOT_BUCKET_MAX: u64 = 8 * 1024 * 1024;
 /// peer that fabricates it, never from an honest relay.
 pub const MISCONDUCT_BAD_TX: u32 = 20;
 
+/// Whether we asked a peer for what it sends: see
+/// [`policy_output_is_malformed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// Nothing we asked for: pushed by the peer.
+    No,
+    /// A transaction we requested from this peer.
+    Tx,
+    /// The transactions of a compact block we are reconstructing, at this
+    /// height.
+    BlockAt(u64),
+}
+
 /// Is `msg` unreadable on `network` for carrying a policy output?
 ///
 /// Where the rule is not in force, a message carrying a policy output gets
@@ -316,27 +329,32 @@ pub const MISCONDUCT_BAD_TX: u32 = 20;
 /// transaction, so that a rule not yet open changes nothing in how peers are
 /// treated. That is always the case on mainnet, where it never opens.
 ///
-/// Elsewhere it depends on the height the content could be mined at:
+/// Elsewhere it depends on the height the content could be mined at, judged
+/// only on what this node knows — its own tip `tip`, what it asked for — and
+/// never on a height the peer claims:
 ///
-/// - a block, or a compact block, carries its height: below the activation
-///   height a policy output in it is malformed, from the activation height
-///   on it is validated like anything else;
-/// - a transaction (or the transactions of a compact block) is judged against
-///   our tip, `tip`. A peer that predates the activation
-///   ([`crate::wire::POLICY_ACTIVATION_VERSION`]) sending one before our next
-///   block is at the activation height gets the 0.4.9 treatment. A peer that
-///   follows it relays one only once its own next block is there, and it may
-///   be ahead of us — we may even be syncing from far behind: its
-///   transaction is refused without penalty (see `Node::tx_invalid_in_itself`)
-///   unless it comes earlier than [`crate::consensus::POLICY_ACTIVATION_NOTICE`]
-///   blocks before the activation height, counted from our tip or from the
-///   height the peer announced at the handshake (`peer_height`), whichever is
-///   higher.
+/// - a block, a compact block, or the transactions of a compact block we are
+///   reconstructing ([`Asked::BlockAt`]), carries its height: below the
+///   activation height a policy output in it is malformed, from the
+///   activation height on it is validated like anything else;
+/// - a transaction from a peer that predates the activation
+///   ([`crate::wire::POLICY_ACTIVATION_VERSION`]) gets the 0.4.9 treatment
+///   while our next block is below the activation height;
+/// - a transaction we requested from a peer that follows the activation is
+///   never malformed ([`Asked::Tx`]): it offered it because its own next
+///   block is at the activation height, and we may be syncing far behind.
+///   It is refused without penalty if our next block cannot carry it yet
+///   (see `Node::tx_invalid_in_itself`). An honest node only sends a
+///   transaction it was asked for, so this exemption costs no honest peer
+///   anything and gives a dishonest one only the requests its budget pays;
+/// - a transaction it pushes unasked is malformed when it comes earlier
+///   than [`crate::consensus::POLICY_ACTIVATION_NOTICE`] blocks before the
+///   activation height, counted from our tip.
 pub fn policy_output_is_malformed(
     network: Network,
     tip: u64,
     peer_version: u32,
-    peer_height: u64,
+    asked: Asked,
     msg: &Message,
 ) -> bool {
     if !msg.carries_policy_output() {
@@ -345,41 +363,30 @@ pub fn policy_output_is_malformed(
     if !crate::policy::may_appear_on(network) {
         return true;
     }
-    let mined_at = match msg {
-        Message::Block(b) => b.header.height,
-        Message::CmpctBlock(c) => c.header.height,
-        _ if peer_version >= crate::wire::POLICY_ACTIVATION_VERSION => tip
-            .max(peer_height)
+    let follows = peer_version >= crate::wire::POLICY_ACTIVATION_VERSION;
+    let mined_at = match (msg, asked) {
+        (Message::Block(b), _) => b.header.height,
+        (Message::CmpctBlock(c), _) => c.header.height,
+        (Message::BlockTxn { .. }, Asked::BlockAt(h)) => h,
+        _ if !follows => tip.saturating_add(1),
+        (Message::Tx(_), Asked::Tx) => return false,
+        _ => tip
             .saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE)
             .saturating_add(1),
-        _ => tip.saturating_add(1),
     };
     !crate::policy::is_active(network, mined_at)
 }
 
 /// Is a channel message, received while channels are not open yet at our
-/// tip `tip` ([`crate::policy::reached`]), malformed?
+/// tip ([`crate::policy::reached`]), malformed?
 ///
 /// Yes, as 0.4.9 read an unknown command, where channels never open
-/// (mainnet), from a peer that predates the activation, and from one that
-/// follows it but sends it earlier than
-/// [`crate::consensus::POLICY_ACTIVATION_NOTICE`] blocks before the
-/// activation height, counted from our tip or the height it announced. A
-/// peer closer than that may just be ahead of us: its message is ignored.
-pub fn channel_message_is_malformed(
-    network: Network,
-    tip: u64,
-    peer_version: u32,
-    peer_height: u64,
-) -> bool {
-    !crate::policy::may_appear_on(network)
-        || peer_version < crate::wire::POLICY_ACTIVATION_VERSION
-        || !crate::policy::is_active(
-            network,
-            tip.max(peer_height)
-                .saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE)
-                .saturating_add(1),
-        )
+/// (mainnet) and from a peer that predates the activation. A peer that
+/// follows it may be ahead of us — we may be syncing from far behind, or not
+/// know its chain yet — and nothing tells us its height but its own word: its
+/// message is ignored, never charged.
+pub fn channel_message_is_malformed(network: Network, peer_version: u32) -> bool {
+    !crate::policy::may_appear_on(network) || peer_version < crate::wire::POLICY_ACTIVATION_VERSION
 }
 
 /// Is a peer a channel peer: does it advertise the channel capability
@@ -390,6 +397,46 @@ pub fn channel_message_is_malformed(
 /// build that speaks the channel protocol 3 announces protocol 5.
 pub fn channel_capable(network: Network, version: u32, user_agent: &str) -> bool {
     crate::wire::user_agent_advertises_channels(user_agent) && follows_activation(network, version)
+}
+
+/// Least time between two warnings about peers that predate the policy
+/// activation (see [`Node::warn_peers_predating_activation`]).
+pub const ACTIVATION_WARNING_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Most peers named in one such warning; the others are counted.
+pub const ACTIVATION_WARNING_NAMES: usize = 8;
+
+/// The warning about `peers` (address, protocol version, user agent), which
+/// predate an activation at height `h`, our tip being at `tip`. One line:
+/// each user agent is what the peer chose to send, so it is escaped — a
+/// newline or a terminal escape in it reaches the log as text, never as a
+/// line of its own or a command to the terminal.
+pub fn activation_warning(h: u64, tip: u64, peers: &[(SocketAddr, u32, String)]) -> String {
+    let when = if tip < h {
+        format!("at block {h}, {} blocks from now", h - tip)
+    } else {
+        format!("since block {h}")
+    };
+    let mut named: Vec<String> = peers
+        .iter()
+        .take(ACTIVATION_WARNING_NAMES)
+        .map(|(addr, version, agent)| {
+            format!("{addr} (\"{}\", protocol {version})", agent.escape_debug())
+        })
+        .collect();
+    if peers.len() > ACTIVATION_WARNING_NAMES {
+        named.push(format!(
+            "and {} more",
+            peers.len() - ACTIVATION_WARNING_NAMES
+        ));
+    }
+    format!(
+        "warning: {} peer(s) predate the activation of policy outputs {when}, and stop \
+         at the first block carrying one; their operators must upgrade them to 0.4.11 or \
+         later: {}",
+        peers.len(),
+        named.join(", ")
+    )
 }
 
 /// Does a peer that announced protocol `version` follow the policy
@@ -1433,6 +1480,9 @@ pub struct Node {
     /// The links already warned about as predating the policy activation:
     /// see [`Node::warn_peers_predating_activation`].
     activation_warned: Arc<Mutex<HashSet<u64>>>,
+    /// When the last of those warnings was logged: see
+    /// [`ACTIVATION_WARNING_INTERVAL`].
+    activation_warned_at: Arc<Mutex<Option<Instant>>>,
 }
 
 #[derive(Default, Debug)]
@@ -1539,6 +1589,7 @@ impl Node {
             channel_sink: Arc::new(std::sync::RwLock::new(None)),
             own_channel_id: Arc::new(std::sync::RwLock::new(None)),
             activation_warned: Arc::new(Mutex::new(HashSet::new())),
+            activation_warned_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2430,7 +2481,9 @@ impl Node {
 
     /// Logs a warning, once per link, for each established peer that predates
     /// the policy activation, from [`crate::consensus::POLICY_ACTIVATION_NOTICE`]
-    /// blocks before the activation height on. Such a node stops at the first
+    /// blocks before the activation height on: one line for all the peers
+    /// not yet named, at most every [`ACTIVATION_WARNING_INTERVAL`], their
+    /// user agents escaped ([`activation_warning`]). Such a node stops at the first
     /// block carrying a policy: its operator must upgrade it before then, and
     /// ours should know that this link will not last. Called at every
     /// maintenance round; returns how many peers were warned about now.
@@ -2455,23 +2508,31 @@ impl Node {
         if tip.saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE) < h {
             return 0;
         }
-        let mut count = 0;
-        for (id, addr, version, agent) in older {
-            if !warned.insert(id) {
-                continue;
-            }
-            let when = if tip < h {
-                format!("at block {h}, {} blocks from now", h - tip)
-            } else {
-                format!("since block {h}")
-            };
-            eprintln!(
-                "warning: peer {addr} ({agent}, protocol {version}) predates the activation \
-                 of policy outputs {when}: it stops at the first block carrying one. \
-                 Its operator must upgrade it to 0.4.11 or later."
-            );
-            count += 1;
+        let fresh: Vec<(u64, SocketAddr, u32, String)> = older
+            .into_iter()
+            .filter(|(id, ..)| !warned.contains(id))
+            .collect();
+        if fresh.is_empty() {
+            return 0;
         }
+        // One line for all of them, at most every interval: a peer that
+        // reconnects over and over, under a new link each time, must not
+        // flood the log. The peers of a round held back stay unmarked, and
+        // come in the next line.
+        let mut at = self.activation_warned_at.lock().unwrap();
+        if at.is_some_and(|t| t.elapsed() < ACTIVATION_WARNING_INTERVAL) {
+            return 0;
+        }
+        *at = Some(Instant::now());
+        let named: Vec<(SocketAddr, u32, String)> = fresh
+            .into_iter()
+            .map(|(id, addr, version, agent)| {
+                warned.insert(id);
+                (addr, version, agent)
+            })
+            .collect();
+        eprintln!("{}", activation_warning(h, tip, &named));
+        let count = named.len();
         self.stats
             .peers_predating_activation_warned
             .fetch_add(count as u64, Ordering::Relaxed);
@@ -2732,18 +2793,38 @@ impl Node {
     }
 
     /// [`policy_output_is_malformed`] for a message of peer `id`, against
-    /// our tip and what the peer announced at the handshake.
+    /// our tip and what we asked that peer for.
     fn policy_is_malformed_from(&self, id: u64, msg: &Message) -> bool {
-        let (network, tip, version, height) = {
+        // The identifier is hashed outside the lock, and only for a
+        // transaction that carries a policy output.
+        let txid = match msg {
+            Message::Tx(t) => Some(t.txid()),
+            _ => None,
+        };
+        let (network, tip, version, asked) = {
             let g = self.shared.lock().unwrap();
-            let (version, height) = g
+            let (version, asked) = g
                 .peers
                 .get(&id)
-                .map(|p| (p.version, p.start_height))
-                .unwrap_or((0, 0));
-            (g.network, g.chain.height(), version, height)
+                .map(|p| {
+                    let asked = match msg {
+                        Message::Tx(_)
+                            if txid.is_some_and(|t| p.requested_txs.contains_key(&t)) =>
+                        {
+                            Asked::Tx
+                        }
+                        Message::BlockTxn { block, .. } => p
+                            .pending
+                            .get(block)
+                            .map_or(Asked::No, |(c, _)| Asked::BlockAt(c.header.height)),
+                        _ => Asked::No,
+                    };
+                    (p.version, asked)
+                })
+                .unwrap_or((0, Asked::No));
+            (g.network, g.chain.height(), version, asked)
         };
-        policy_output_is_malformed(network, tip, version, height, msg)
+        policy_output_is_malformed(network, tip, version, asked, msg)
     }
 
     /// A transaction that only its author could have made invalid.
@@ -4079,12 +4160,11 @@ impl Node {
                 // testnet once the tip has reached the activation height,
                 // never on mainnet. Before that this message gets what 0.4.9
                 // gave it as an unknown command — malformed, and the link is
-                // cut — unless a peer that follows the activation may just
+                // cut — unless the peer follows the activation, and may just
                 // be ahead of us: then it is ignored.
                 Message::Channel(_) if !crate::policy::reached(network, g.chain.height()) => {
-                    let tip = g.chain.height();
                     if let Some(p) = g.peers.get_mut(&id) {
-                        if channel_message_is_malformed(network, tip, p.version, p.start_height) {
+                        if channel_message_is_malformed(network, p.version) {
                             p.ban_score = p.ban_score.saturating_add(MISCONDUCT_MALFORMED);
                             drop_peer = true;
                         }
@@ -4230,6 +4310,9 @@ impl Node {
         if g.mempool.contains(hash) || g.orphans.contains(hash) {
             return false;
         }
+        if Self::syncing_far_before_activation(g) {
+            return false;
+        }
         if g.rejected_at == g.chain.tip_id() && g.rejected.contains(hash) {
             return false;
         }
@@ -4240,6 +4323,26 @@ impl Node {
             }
         }
         true
+    }
+
+    /// Are we catching up a long way behind our peers while our next block
+    /// is still below the policy activation height?
+    ///
+    /// Then a transaction offered to us may be a policy transaction our next
+    /// block cannot carry, from a peer already past the activation: fetching
+    /// it would only be refused. None is requested until the blocks are in.
+    /// "A long way" is read from the bodies this node itself has queued —
+    /// headers chained onto its own chain — never from a height a peer
+    /// claims: a full batch of headers still to follow, or more bodies to
+    /// fetch than two rounds of requests.
+    fn syncing_far_before_activation(g: &Shared) -> bool {
+        crate::policy::has_transition(g.network)
+            && !crate::policy::is_active(g.network, g.chain.height().saturating_add(1))
+            && g.peers.values().any(|p| {
+                p.more_expected
+                    || p.bodies_to_request.len() + p.requested_bodies.len()
+                        > 2 * MAX_BODIES_IN_FLIGHT
+            })
     }
 
     /// Requests, from peer `id`, the announced transactions that waited for
@@ -6424,6 +6527,36 @@ mod tests_hardening {
         assert!(p.follows_activation, "regtest has no transition");
     }
 
+    /// Review (r11-int): the activation warning printed a peer's user agent
+    /// raw, so a peer could break the log into lines of its choosing or send
+    /// the terminal escape codes. It is escaped, and one line names at most
+    /// a few peers.
+    #[test]
+    fn the_activation_warning_escapes_user_agents_and_stays_one_line() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let evil = "q21:0.4\nwarning: forged line\x1b[31m\r".to_string();
+        let line = activation_warning(17_000, 16_000, &[(addr, 4, evil)]);
+        assert!(
+            !line.contains('\n') && !line.contains('\r') && !line.contains('\x1b'),
+            "{line}"
+        );
+        assert!(
+            line.contains(r"q21:0.4\nwarning: forged line\u{1b}[31m\r"),
+            "{line}"
+        );
+        assert!(
+            line.contains("at block 17000, 1000 blocks from now"),
+            "{line}"
+        );
+        let many: Vec<(SocketAddr, u32, String)> =
+            (0..20).map(|_| (addr, 4, "q21:0.4".to_string())).collect();
+        let line = activation_warning(17_000, 17_000, &many);
+        assert!(line.starts_with("warning: 20 peer(s)"));
+        assert!(line.contains("since block 17000"));
+        assert!(line.contains(&format!("and {} more", 20 - ACTIVATION_WARNING_NAMES)));
+        assert_eq!(line.matches("protocol 4").count(), ACTIVATION_WARNING_NAMES);
+    }
+
     /// Without a transition there is nothing to warn about, whatever the
     /// versions connected.
     #[test]
@@ -6442,16 +6575,113 @@ mod tests_hardening {
     fn a_channel_message_before_activation_is_malformed_unless_the_peer_may_be_ahead() {
         let new = crate::wire::POLICY_ACTIVATION_VERSION;
         for v in [0, 4, new] {
-            assert!(channel_message_is_malformed(Network::Mainnet, 0, v, 0));
-            assert!(channel_message_is_malformed(
-                Network::Mainnet,
-                1 << 40,
-                v,
-                1 << 40
-            ));
+            assert!(channel_message_is_malformed(Network::Mainnet, v));
         }
-        assert!(channel_message_is_malformed(Network::Regtest, 0, 4, 0));
-        assert!(!channel_message_is_malformed(Network::Regtest, 0, new, 0));
+        assert!(channel_message_is_malformed(Network::Testnet, 4));
+        assert!(!channel_message_is_malformed(Network::Testnet, new));
+    }
+
+    /// A testnet node at its genesis: far below the activation, as a node
+    /// syncing from scratch is.
+    fn testnet_node() -> Node {
+        let net = Network::Testnet;
+        Node::new(net, Chain::new(net, crate::chain::genesis_block(net)))
+    }
+
+    /// A transaction creating a policy output; nothing else about it
+    /// matters to the wire reading.
+    fn policy_tx(n: u8) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn::coinbase(vec![n])],
+            outputs: vec![crate::tx::TxOut {
+                value: crate::amount::Amount::from_units(1_000_000),
+                scheme: SchemeId::Policy,
+                pubkey_hash: Hash256([n; 32]),
+            }],
+            lock_time: 0,
+        }
+    }
+
+    /// Review (r11-int): we sync from far behind the activation while a
+    /// peer that follows it is already there and answers our requests with
+    /// policy transactions. They were malformed — the window was counted
+    /// from the height the peer announced at its handshake, long ago — and
+    /// the honest peer was cut. What we asked for is never malformed now.
+    #[test]
+    fn a_requested_policy_transaction_never_cuts_a_following_peer() {
+        let n = testnet_node();
+        let _e = established_peer(&n, 7);
+        let h = crate::policy::activation_height(Network::Testnet);
+        let tx = policy_tx(1);
+        {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.version = crate::wire::POLICY_ACTIVATION_VERSION;
+            p.start_height = h - 2_000;
+            p.requested_txs.insert(tx.txid(), Instant::now());
+        }
+        assert!(!n.policy_is_malformed_from(7, &Message::Tx(Box::new(tx))));
+    }
+
+    /// Review (r11-int): a peer that claims to be far ahead at its handshake
+    /// no longer earns a pass for policy transactions it pushes unasked.
+    #[test]
+    fn a_claimed_height_spares_no_unsolicited_policy_transaction() {
+        let n = testnet_node();
+        let _e = established_peer(&n, 7);
+        {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).unwrap();
+            p.version = crate::wire::POLICY_ACTIVATION_VERSION;
+            p.start_height = u64::MAX / 2;
+        }
+        assert!(n.policy_is_malformed_from(7, &Message::Tx(Box::new(policy_tx(2)))));
+    }
+
+    /// A channel message from a peer that follows the activation, far before
+    /// it: we cannot tell an honest peer ahead of us from a liar, so it is
+    /// ignored, and the link stays.
+    #[test]
+    fn a_following_peer_s_early_channel_message_is_ignored() {
+        let n = testnet_node();
+        let _e = established_peer(&n, 7);
+        n.shared.lock().unwrap().peers.get_mut(&7).unwrap().version =
+            crate::wire::POLICY_ACTIVATION_VERSION;
+        assert!(n.handle(7, Message::Channel(vec![0u8; 40])));
+        assert_eq!(n.shared.lock().unwrap().peers[&7].ban_score, 0);
+    }
+
+    /// Review (r11-int): while it catches up a long way behind and its next
+    /// block is below the activation, a node requests no transaction: any of
+    /// them may be a policy transaction it can only refuse. "A long way" is
+    /// what this node queued itself, not what a peer claims.
+    #[test]
+    fn no_transaction_is_requested_while_syncing_far_before_activation() {
+        let hash = Hash256([9; 32]);
+        let n = testnet_node();
+        let _e = established_peer(&n, 7);
+        {
+            let mut g = n.shared.lock().unwrap();
+            g.peers.get_mut(&7).unwrap().start_height = u64::MAX / 2;
+            assert!(
+                Node::should_request_tx(&g, &hash),
+                "a claim alone stops nothing"
+            );
+            g.peers.get_mut(&7).unwrap().more_expected = true;
+            assert!(!Node::should_request_tx(&g, &hash));
+            let p = g.peers.get_mut(&7).unwrap();
+            p.more_expected = false;
+            p.bodies_to_request
+                .extend((0..=2 * MAX_BODIES_IN_FLIGHT as u8).map(|i| Hash256([i; 32])));
+            assert!(!Node::should_request_tx(&g, &hash));
+        }
+        // Regtest has no transition: a syncing node requests as before.
+        let (a, _) = node_pair();
+        let _e = established_peer(&a, 7);
+        let mut g = a.shared.lock().unwrap();
+        g.peers.get_mut(&7).unwrap().more_expected = true;
+        assert!(Node::should_request_tx(&g, &hash));
     }
 
     /// Finding 14: off regtest, where channels do not exist, a channel
