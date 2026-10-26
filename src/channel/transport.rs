@@ -1123,7 +1123,7 @@ mod tests {
         let (_, init) = Initiator::start(&a, ctx()).unwrap();
         let (r, _) = Responder::accept(&b, ctx(), &init).unwrap();
         let at: *const [u8; 32] = &*r.ss_r;
-        let stored = vec![r];
-        assert_eq!(&*stored[0].ss_r as *const [u8; 32], at);
+        let stored = Box::new(r);
+        assert_eq!(&*stored.ss_r as *const [u8; 32], at);
     }
 }
