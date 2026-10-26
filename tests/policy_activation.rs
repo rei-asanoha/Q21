@@ -850,6 +850,15 @@ mod warnings {
         assert_eq!(node.peers_predating_activation(), 1);
         assert_eq!(node.warn_peers_predating_activation(), 1);
         assert_eq!(node.warn_peers_predating_activation(), 0, "once per link");
+        // Another old peer right after: held back, so that peers reconnecting
+        // under new links cannot flood the log; named in the next line.
+        let _old2 = hello(&node, addr, 4, 3);
+        assert_eq!(node.peers_predating_activation(), 2);
+        assert_eq!(
+            node.warn_peers_predating_activation(),
+            0,
+            "one line per interval"
+        );
         node.maintain_peers();
         assert_eq!(
             node.stats

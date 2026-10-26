@@ -399,6 +399,46 @@ pub fn channel_capable(network: Network, version: u32, user_agent: &str) -> bool
     crate::wire::user_agent_advertises_channels(user_agent) && follows_activation(network, version)
 }
 
+/// Least time between two warnings about peers that predate the policy
+/// activation (see [`Node::warn_peers_predating_activation`]).
+pub const ACTIVATION_WARNING_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Most peers named in one such warning; the others are counted.
+pub const ACTIVATION_WARNING_NAMES: usize = 8;
+
+/// The warning about `peers` (address, protocol version, user agent), which
+/// predate an activation at height `h`, our tip being at `tip`. One line:
+/// each user agent is what the peer chose to send, so it is escaped — a
+/// newline or a terminal escape in it reaches the log as text, never as a
+/// line of its own or a command to the terminal.
+pub fn activation_warning(h: u64, tip: u64, peers: &[(SocketAddr, u32, String)]) -> String {
+    let when = if tip < h {
+        format!("at block {h}, {} blocks from now", h - tip)
+    } else {
+        format!("since block {h}")
+    };
+    let mut named: Vec<String> = peers
+        .iter()
+        .take(ACTIVATION_WARNING_NAMES)
+        .map(|(addr, version, agent)| {
+            format!("{addr} (\"{}\", protocol {version})", agent.escape_debug())
+        })
+        .collect();
+    if peers.len() > ACTIVATION_WARNING_NAMES {
+        named.push(format!(
+            "and {} more",
+            peers.len() - ACTIVATION_WARNING_NAMES
+        ));
+    }
+    format!(
+        "warning: {} peer(s) predate the activation of policy outputs {when}, and stop \
+         at the first block carrying one; their operators must upgrade them to 0.4.11 or \
+         later: {}",
+        peers.len(),
+        named.join(", ")
+    )
+}
+
 /// Does a peer that announced protocol `version` follow the policy
 /// activation of `network`? Always, where the network has no transition
 /// ([`crate::policy::has_transition`]): there, every version reads policies
@@ -1440,6 +1480,9 @@ pub struct Node {
     /// The links already warned about as predating the policy activation:
     /// see [`Node::warn_peers_predating_activation`].
     activation_warned: Arc<Mutex<HashSet<u64>>>,
+    /// When the last of those warnings was logged: see
+    /// [`ACTIVATION_WARNING_INTERVAL`].
+    activation_warned_at: Arc<Mutex<Option<Instant>>>,
 }
 
 #[derive(Default, Debug)]
@@ -1546,6 +1589,7 @@ impl Node {
             channel_sink: Arc::new(std::sync::RwLock::new(None)),
             own_channel_id: Arc::new(std::sync::RwLock::new(None)),
             activation_warned: Arc::new(Mutex::new(HashSet::new())),
+            activation_warned_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2437,7 +2481,9 @@ impl Node {
 
     /// Logs a warning, once per link, for each established peer that predates
     /// the policy activation, from [`crate::consensus::POLICY_ACTIVATION_NOTICE`]
-    /// blocks before the activation height on. Such a node stops at the first
+    /// blocks before the activation height on: one line for all the peers
+    /// not yet named, at most every [`ACTIVATION_WARNING_INTERVAL`], their
+    /// user agents escaped ([`activation_warning`]). Such a node stops at the first
     /// block carrying a policy: its operator must upgrade it before then, and
     /// ours should know that this link will not last. Called at every
     /// maintenance round; returns how many peers were warned about now.
@@ -2462,23 +2508,31 @@ impl Node {
         if tip.saturating_add(crate::consensus::POLICY_ACTIVATION_NOTICE) < h {
             return 0;
         }
-        let mut count = 0;
-        for (id, addr, version, agent) in older {
-            if !warned.insert(id) {
-                continue;
-            }
-            let when = if tip < h {
-                format!("at block {h}, {} blocks from now", h - tip)
-            } else {
-                format!("since block {h}")
-            };
-            eprintln!(
-                "warning: peer {addr} ({agent}, protocol {version}) predates the activation \
-                 of policy outputs {when}: it stops at the first block carrying one. \
-                 Its operator must upgrade it to 0.4.11 or later."
-            );
-            count += 1;
+        let fresh: Vec<(u64, SocketAddr, u32, String)> = older
+            .into_iter()
+            .filter(|(id, ..)| !warned.contains(id))
+            .collect();
+        if fresh.is_empty() {
+            return 0;
         }
+        // One line for all of them, at most every interval: a peer that
+        // reconnects over and over, under a new link each time, must not
+        // flood the log. The peers of a round held back stay unmarked, and
+        // come in the next line.
+        let mut at = self.activation_warned_at.lock().unwrap();
+        if at.is_some_and(|t| t.elapsed() < ACTIVATION_WARNING_INTERVAL) {
+            return 0;
+        }
+        *at = Some(Instant::now());
+        let named: Vec<(SocketAddr, u32, String)> = fresh
+            .into_iter()
+            .map(|(id, addr, version, agent)| {
+                warned.insert(id);
+                (addr, version, agent)
+            })
+            .collect();
+        eprintln!("{}", activation_warning(h, tip, &named));
+        let count = named.len();
         self.stats
             .peers_predating_activation_warned
             .fetch_add(count as u64, Ordering::Relaxed);
@@ -6471,6 +6525,36 @@ mod tests_hardening {
         let p = a.peer_list().into_iter().find(|p| p.id == 7).unwrap();
         assert_eq!(p.version, 4);
         assert!(p.follows_activation, "regtest has no transition");
+    }
+
+    /// Review (r11-int): the activation warning printed a peer's user agent
+    /// raw, so a peer could break the log into lines of its choosing or send
+    /// the terminal escape codes. It is escaped, and one line names at most
+    /// a few peers.
+    #[test]
+    fn the_activation_warning_escapes_user_agents_and_stays_one_line() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let evil = "q21:0.4\nwarning: forged line\x1b[31m\r".to_string();
+        let line = activation_warning(17_000, 16_000, &[(addr, 4, evil)]);
+        assert!(
+            !line.contains('\n') && !line.contains('\r') && !line.contains('\x1b'),
+            "{line}"
+        );
+        assert!(
+            line.contains(r"q21:0.4\nwarning: forged line\u{1b}[31m\r"),
+            "{line}"
+        );
+        assert!(
+            line.contains("at block 17000, 1000 blocks from now"),
+            "{line}"
+        );
+        let many: Vec<(SocketAddr, u32, String)> =
+            (0..20).map(|_| (addr, 4, "q21:0.4".to_string())).collect();
+        let line = activation_warning(17_000, 17_000, &many);
+        assert!(line.starts_with("warning: 20 peer(s)"));
+        assert!(line.contains("since block 17000"));
+        assert!(line.contains(&format!("and {} more", 20 - ACTIVATION_WARNING_NAMES)));
+        assert_eq!(line.matches("protocol 4").count(), ACTIVATION_WARNING_NAMES);
     }
 
     /// Without a transition there is nothing to warn about, whatever the
