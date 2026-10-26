@@ -882,13 +882,13 @@ fn read_active_tip(d: &Path) -> Option<q21_core::hash::Hash256> {
     q21_core::hash::Hash256::from_hex(text.trim())
 }
 
-/// Written whole or not at all: a torn file reads as no record, and the start
-/// falls back to the deterministic rule.
+/// Written whole or not at all, and durable once it returns: the temporary
+/// file is synced before the rename and the directory after it, so a power
+/// cut leaves the old record or the new one, never an empty file that would
+/// send the start back to the deterministic rule. Two syncs of 64 bytes, once
+/// per tip change.
 fn write_active_tip(d: &Path, tip: &q21_core::hash::Hash256) {
-    let tmp = d.join("tip.dat.tmp");
-    if std::fs::write(&tmp, tip.to_hex()).is_ok() {
-        let _ = std::fs::rename(&tmp, active_tip_path(d));
-    }
+    let _ = q21_core::channel::journal::atomic_write(&active_tip_path(d), tip.to_hex().as_bytes());
 }
 
 fn serial_path(d: &Path) -> PathBuf {
@@ -7654,6 +7654,29 @@ fn dial_missing(
 #[cfg(test)]
 mod tests {
     use super::{MiningGate, MINING_WAIT_FOR_PEER, MINING_WAIT_FOR_PROGRESS};
+
+    /// The tip record goes through the synced atomic write: it reads back,
+    /// a newer record replaces the older one, and no temporary file is left
+    /// beside it.
+    #[test]
+    fn the_tip_record_is_replaced_whole() {
+        let d = std::env::temp_dir().join(format!("q21-tip-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(super::read_active_tip(&d), None);
+        let a = q21_core::hash::Hash256([7u8; 32]);
+        let b = q21_core::hash::Hash256([9u8; 32]);
+        super::write_active_tip(&d, &a);
+        assert_eq!(super::read_active_tip(&d), Some(a));
+        super::write_active_tip(&d, &b);
+        assert_eq!(super::read_active_tip(&d), Some(b));
+        let names: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["tip.dat".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// A fresh node does not mine on its own chain while a peer announces a
     /// longer one: the 2026-10-11 agent mined 240 blocks nobody wanted.
