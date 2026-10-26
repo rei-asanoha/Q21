@@ -871,6 +871,16 @@ impl ChannelManager {
         }
     }
 
+    /// Whether a channel not yet settled is held with the node `identity`
+    /// (hex node id): its handshakes draw on a budget of their own (see
+    /// [`crate::channel::link`]).
+    pub fn holds_channel_with(&self, identity: &str) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.channels
+            .values()
+            .any(|c| c.peer_identity == identity && c.machine.phase() != Phase::Closed)
+    }
+
     /// The connections with an established session, and the node id each
     /// authenticated.
     pub fn sessions(&self) -> Vec<(u64, String)> {
