@@ -589,17 +589,6 @@ impl ChannelManager {
             .collect()
     }
 
-    /// This node's node id as advertised in the P2P handshake: the first 16
-    /// bytes of [`NodeIdentity::id`], hex. A hint for an operator naming a
-    /// peer, never what a channel is bound to: that is the full id its
-    /// session authenticates.
-    pub fn node_id_hex(&self) -> String {
-        self.identity.id().0[..crate::wire::CHANNEL_NODE_ID_HEX / 2]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
-
     /// The authenticated node id (hex) of the session on connection `peer`.
     pub fn peer_node_id(&self, peer: u64) -> Option<String> {
         let g = self.inner.lock().unwrap();
@@ -879,6 +868,29 @@ impl ChannelManager {
             if c.peer == peer {
                 c.synced = false;
             }
+        }
+    }
+
+    /// Whether a channel not yet settled is held with the node `identity`
+    /// (hex node id): its handshakes draw on a budget of their own (see
+    /// [`crate::channel::link`]).
+    pub fn holds_channel_with(&self, identity: &str) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.channels
+            .values()
+            .any(|c| c.peer_identity == identity && c.machine.phase() != Phase::Closed)
+    }
+
+    /// Ends every session whose connection `keep` no longer holds, as
+    /// [`ChannelManager::on_session_closed`] does: a connection may close
+    /// while its handshake completes, before the link layer could say so.
+    pub fn retain_sessions(&self, keep: &dyn Fn(u64) -> bool) {
+        let gone: Vec<u64> = {
+            let g = self.inner.lock().unwrap();
+            g.links.keys().copied().filter(|p| !keep(*p)).collect()
+        };
+        for p in gone {
+            self.on_session_closed(p);
         }
     }
 

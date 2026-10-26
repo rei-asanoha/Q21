@@ -318,23 +318,9 @@ pub fn user_agent_advertises_legacy_channels(user_agent: &str) -> bool {
     user_agent.contains(LEGACY_CHANNELS_CAPABILITY) && !user_agent_advertises_channels(user_agent)
 }
 
-/// The hex characters a channel node advertises after [`CHANNELS_CAPABILITY`]:
-/// the first 16 bytes of its node id (32 hex), a hint by which an operator may
-/// name the peer. A channel is never bound to it: the node id a session
-/// authenticates is what counts. Empty when the peer advertises the capability
-/// without an id or does not advertise it at all.
-pub fn channel_node_id(user_agent: &str) -> Option<String> {
-    let at = user_agent.find(CHANNELS_CAPABILITY)?;
-    let rest = &user_agent[at + CHANNELS_CAPABILITY.len()..];
-    let id: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_hexdigit())
-        .take(CHANNEL_NODE_ID_HEX)
-        .collect();
-    (!id.is_empty()).then_some(id)
-}
-
-/// Length in hex characters of an advertised channel node id (16 bytes).
+/// Shortest prefix of a node id, in hex characters (16 bytes), by which an
+/// operator may name a channel peer: matched against the id its session
+/// authenticated, never against anything the peer announces.
 pub const CHANNEL_NODE_ID_HEX: usize = 32;
 
 /// Largest channel message accepted on the wire. The heaviest is the funding
@@ -936,11 +922,6 @@ mod tests {
         assert!(user_agent_advertises_channels(v3));
         assert!(!user_agent_advertises_legacy_channels(v3));
         assert!(!user_agent_advertises_legacy_channels("q21:0.4"));
-        assert_eq!(channel_node_id(v2), None);
-        assert_eq!(
-            channel_node_id(v3).as_deref(),
-            Some("0123456789abcdef0123456789abcdef")
-        );
         assert!(v3.len() <= MAX_USER_AGENT);
     }
 

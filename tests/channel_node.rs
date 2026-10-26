@@ -3125,3 +3125,49 @@ fn a_payment_counts_for_the_payee_only_once_it_is_irrevocable() {
     assert!(!a.in_flight);
     assert_eq!(a.local_balance + a.remote_balance, capacity);
 }
+
+/// A channel journaled by 0.4.10 names its peer, beside the journal, by the
+/// id that peer advertised then — a legacy id, which no user agent carries
+/// any more. Each side's session signs its legacy id: after the upgrade both
+/// ends find the channel by it, re-bind it once the reestablish proves the
+/// funding keys, and name the node id from then on.
+#[test]
+fn a_channel_journaled_by_0_4_10_rebinds_through_the_legacy_ids() {
+    let (funder_seed, acceptor_seed) = ([0xc5u8; 32], [0xc6u8; 32]);
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "legacy-rebind");
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let (fid, aid) = (p.funder.node_id(), p.acceptor.node_id());
+    let (fl, al) = (
+        hex(&p.funder.identity().legacy_id()),
+        hex(&p.acceptor.identity().legacy_id()),
+    );
+    let sidecar = |side: &str| dir.join(side).join(format!("{}.peer", cid.to_hex()));
+    // As 0.4.10 left them.
+    std::fs::write(sidecar("funder"), &al).unwrap();
+    std::fs::write(sidecar("acceptor"), &fl).unwrap();
+    p.reload_funder(funder_seed, wallet, chain.clone(), &dir);
+    p.acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("acceptor"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain, Hash256([0x5e; 32])),
+    );
+    let binding = next_binding();
+    for f in p.funder.on_session(A_PEER, &aid, &al, binding) {
+        p.queue.push_back((1, f));
+    }
+    for f in p.acceptor.on_session(F_PEER, &fid, &fl, binding) {
+        p.queue.push_back((0, f));
+    }
+    p.pump();
+    assert_eq!(std::fs::read_to_string(sidecar("funder")).unwrap(), aid);
+    assert_eq!(std::fs::read_to_string(sidecar("acceptor")).unwrap(), fid);
+    let m = p.funder.pay(cid, 1_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 1_000);
+}

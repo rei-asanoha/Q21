@@ -3,14 +3,15 @@
 //!
 //! The channel manager was installed only after the node had started listening
 //! and dialing. The `Version` of every startup connection therefore went out
-//! without the capability or the stable channel node id: the peer filed the
+//! without the capability: the peer filed the
 //! restarted node as not speaking channels and never sent it a channel message,
 //! and the restarted node, its handshake already complete, never offered the
 //! reestablish of its reloaded channels. Every reloaded channel stayed unbound —
 //! "peer is not connected" — until a later reconnection, if any.
 //!
 //! The test starts two real wallet nodes on regtest. The second dials the first
-//! at startup; the first must see it as channel-capable, with a node id.
+//! at startup; the first must see it as channel-capable, and hold a channel
+//! session with it, authenticated by its node id.
 
 #![cfg(feature = "mldsa")]
 
@@ -184,10 +185,9 @@ fn a_node_dialing_at_startup_announces_the_channel_capability() {
     let mut seen = Vec::new();
     while start.elapsed() < Duration::from_secs(60) {
         seen = peer_entries(rpc_x);
-        if seen
-            .iter()
-            .any(|p| p.contains("\"handshake_complete\":true"))
-        {
+        if seen.iter().any(|p| {
+            p.contains("\"handshake_complete\":true") && p.contains("\"channel_session\":\"")
+        }) {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -207,10 +207,13 @@ fn a_node_dialing_at_startup_announces_the_channel_capability() {
         "the dialing node did not announce the channel capability: {inbound:?}"
     );
     assert!(
-        inbound
-            .iter()
-            .any(|p| !p.contains("\"channel_id\":\"\"") && p.contains("\"channel_id\":\"")),
-        "the dialing node did not announce its channel node id: {inbound:?}"
+        inbound.iter().any(|p| p.contains("\"channel_session\":\"")),
+        "no channel session with the dialing node: {inbound:?}"
+    );
+    // The capability travels alone: no id a peer could link the wallet by.
+    assert!(
+        inbound.iter().all(|p| !p.contains("\"channel_id\"")),
+        "an announced node id is still reported: {inbound:?}"
     );
     let _ = std::fs::remove_dir_all(&base);
 }

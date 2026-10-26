@@ -533,3 +533,85 @@ fn a_frame_of_another_version_is_refused() {
     );
     assert!(ends[1].t.has_session(ends[1].conn), "nothing ended");
 }
+
+/// An `Init` from `who` on a new connection `conn` of `b`: how many answers.
+fn init_on(b: &End, wire: &Wire, conn: u64, who: &NodeIdentity) -> usize {
+    let link = ChannelLink {
+        remote_nonce: 0xe000 + conn,
+        ..b.link
+    };
+    let ctx = Context {
+        network: NET,
+        initiator_nonce: link.remote_nonce,
+        responder_nonce: link.local_nonce,
+    };
+    let (_, init) = Initiator::start(who, ctx).unwrap();
+    b.t.deliver(conn, &link, &init);
+    resps(wire)
+}
+
+/// Strangers that empty the shared handshake budget do not keep out a peer
+/// we hold a channel with: its key draws on a pool of its own, within a
+/// share per key, so a stranger claiming that key takes only that share.
+#[test]
+fn a_channel_peer_is_answered_while_strangers_hold_the_shared_budget() {
+    let (ends, wire) = link(31, 32, "known");
+    connect(&ends, &wire);
+    // The acceptor holds a channel with the dialer (its funding fails here,
+    // which leaves the acceptor's channel waiting for it).
+    assert!(ends[0].t.send(ends[0].conn, hello_from(&ends)));
+    pump(&ends, &wire, |_, b| Some(b));
+    let b = &ends[1];
+    assert_eq!(b.t.manager().list().len(), 1);
+    b.t.set_dos_limits(DosLimits {
+        global_burst: 3,
+        global_refill: Duration::from_secs(3600),
+        ..DosLimits::default()
+    });
+    let answered: usize = (0..6u64)
+        .map(|k| {
+            init_on(
+                b,
+                &wire,
+                300 + k,
+                &NodeIdentity::derive(&[0x70 + k as u8; 32]),
+            )
+        })
+        .sum();
+    assert_eq!(answered, 3, "the strangers' pool");
+    let peer = NodeIdentity::derive(&[31; 32]);
+    assert_eq!(peer.id().0, {
+        let id = ends[0].t.manager().identity().id();
+        id.0
+    });
+    assert_eq!(init_on(b, &wire, 400, &peer), 1, "the channel peer, first");
+    assert_eq!(init_on(b, &wire, 401, &peer), 1, "and again");
+    assert_eq!(
+        init_on(b, &wire, 402, &peer),
+        0,
+        "beyond its share, with the strangers' pool empty"
+    );
+}
+
+/// A connection can close while its handshake completes, before the link
+/// layer hears of it: what was kept for it is pruned at the next tick, and a
+/// frame from a connection that is gone makes no entry.
+#[test]
+fn what_a_connection_gone_unannounced_left_is_pruned() {
+    let (ends, wire) = link(33, 34, "prune");
+    let b = &ends[1];
+    let live = Arc::new(Mutex::new(vec![b.conn]));
+    let l = live.clone();
+    b.t.set_alive(Box::new(move |p| l.lock().unwrap().contains(&p)));
+    connect(&ends, &wire);
+    assert!(b.t.has_session(b.conn));
+    assert_eq!(b.t.manager().sessions().len(), 1);
+    // Gone, and nobody said so.
+    live.lock().unwrap().clear();
+    b.t.tick();
+    assert!(!b.t.has_session(b.conn));
+    assert!(b.t.manager().sessions().is_empty());
+    // An Init on a connection that is gone is not answered.
+    let who = NodeIdentity::derive(&[0x71; 32]);
+    assert_eq!(init_on(b, &wire, 500, &who), 0);
+}

@@ -28,7 +28,15 @@
 //!   [`HANDSHAKE_REFILL`] — as responder (an `Init` answered) and as initiator
 //!   (one started, a `Reset` answered or sent) alike;
 //! - all connections together get [`GLOBAL_HANDSHAKE_BURST`] answered `Init`s,
-//!   then [`GLOBAL_HANDSHAKES_PER_SEC`] a second;
+//!   then [`GLOBAL_HANDSHAKES_PER_SEC`] a second — strangers, first come first
+//!   served. An `Init` whose identity key is that of a peer we hold a channel
+//!   with draws first on a pool of its own, [`KNOWN_HANDSHAKE_BURST`] then
+//!   [`KNOWN_HANDSHAKES_PER_SEC`] a second, within [`KNOWN_PER_PEER_BURST`]
+//!   for any one such key: a flood of strangers cannot keep our channel peers
+//!   out. The key is the one the `Init` claims, unproven yet, so a claimed
+//!   key exhausts only its own share and then falls back on the strangers'
+//!   pool. Our own outbound handshakes draw on no shared pool at all: only on
+//!   their connection's budget;
 //! - at most [`MAX_PENDING_HANDSHAKES`] responders wait for a `Fin` at once,
 //!   one per connection, each for [`HANDSHAKE_TIMEOUT`];
 //! - a handshake frame nobody asked for (`Resp` or `Fin` with no handshake
@@ -64,6 +72,13 @@ pub const HANDSHAKE_REFILL: Duration = Duration::from_secs(15);
 pub const GLOBAL_HANDSHAKE_BURST: u32 = 32;
 /// Then this many a second, across all connections.
 pub const GLOBAL_HANDSHAKES_PER_SEC: u32 = 4;
+/// `Init`s answered at once, across all connections, for identity keys of
+/// peers we hold a channel with.
+pub const KNOWN_HANDSHAKE_BURST: u32 = 16;
+/// Then this many a second, for them.
+pub const KNOWN_HANDSHAKES_PER_SEC: u32 = 2;
+/// Of which any one such key gets at once; then one per [`HANDSHAKE_REFILL`].
+pub const KNOWN_PER_PEER_BURST: u32 = 2;
 /// Responders waiting for their `Fin`, across all connections.
 pub const MAX_PENDING_HANDSHAKES: usize = 64;
 /// How long a handshake may wait for its next frame.
@@ -93,6 +108,13 @@ impl Default for DosLimits {
             timeout: HANDSHAKE_TIMEOUT,
         }
     }
+}
+
+fn known_pool() -> Budget {
+    Budget::new(
+        KNOWN_HANDSHAKE_BURST,
+        Duration::from_millis(1000 / u64::from(KNOWN_HANDSHAKES_PER_SEC)),
+    )
 }
 
 /// A token bucket: `max` tokens, one more every `every`.
@@ -210,6 +232,7 @@ fn handshake_penalty(e: TransportError) -> u32 {
 
 type SendFrame = dyn Fn(u64, Vec<u8>) -> bool + Send + Sync;
 type Gate = dyn Fn() -> bool + Send + Sync;
+type Alive = dyn Fn(u64) -> bool + Send + Sync;
 
 /// The channel component a node installs: sessions over its connections,
 /// in front of the manager.
@@ -220,6 +243,10 @@ pub struct ChannelTransport {
     /// Responders waiting for a `Fin`, by connection.
     pending: Mutex<HashMap<u64, Instant>>,
     global: Mutex<Budget>,
+    /// The pool for channel peers' keys, and each key's share of it.
+    known: Mutex<(Budget, HashMap<String, Budget>)>,
+    /// Whether a connection is still there; absent, every one is.
+    alive: RwLock<Option<Box<Alive>>>,
     dos: RwLock<DosLimits>,
     rekey: RwLock<Limits>,
     /// Whether channels are open; absent, they always are.
@@ -240,6 +267,8 @@ impl ChannelTransport {
             conns: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             global: Mutex::new(Budget::new(dos.global_burst, dos.global_refill)),
+            known: Mutex::new((known_pool(), HashMap::new())),
+            alive: RwLock::new(None),
             dos: RwLock::new(dos),
             rekey: RwLock::new(Limits::default()),
             gate: RwLock::new(None),
@@ -287,6 +316,25 @@ impl ChannelTransport {
         }
     }
 
+    /// Installs the check of whether a connection is still there: the node's
+    /// [`ChannelSender::is_connected`] once attached. An entry for one that
+    /// is gone is never made, and is pruned at the next [`Self::tick`].
+    pub fn set_alive(&self, alive: Box<Alive>) {
+        if let Ok(mut g) = self.alive.write() {
+            *g = Some(alive);
+        }
+    }
+
+    fn is_alive(&self, peer: u64) -> bool {
+        match self.alive.read() {
+            Ok(g) => match g.as_ref() {
+                Some(f) => f(peer),
+                None => true,
+            },
+            Err(_) => true,
+        }
+    }
+
     /// Handshakes this transport started or answered.
     pub fn handshake_attempts(&self) -> u64 {
         self.attempts.load(Ordering::SeqCst)
@@ -296,6 +344,7 @@ impl ChannelTransport {
     #[doc(hidden)]
     pub fn set_dos_limits(&self, dos: DosLimits) {
         *self.global.lock().unwrap() = Budget::new(dos.global_burst, dos.global_refill);
+        *self.known.lock().unwrap() = (known_pool(), HashMap::new());
         *self.dos.write().unwrap() = dos;
     }
 
@@ -326,7 +375,7 @@ impl ChannelTransport {
         if let Some(c) = g.get(&peer) {
             return Some(c.clone());
         }
-        if g.len() >= MAX_CONNECTIONS {
+        if g.len() >= MAX_CONNECTIONS || !self.is_alive(peer) {
             return None;
         }
         let dos = self.dos();
@@ -460,10 +509,19 @@ impl ChannelTransport {
         if kind == transport::T_RECORD {
             return outcome(self.on_record(peer, &conn, bytes));
         }
+        // Whose key an `Init` claims, looked up before the connection's lock:
+        // the manager has a lock of its own.
+        let known = (kind == transport::T_INIT && bytes.len() == transport::INIT_LEN)
+            .then(|| {
+                let at = 2 + transport::EK_LEN;
+                let id = crate::channel::keys::node_id(&bytes[at..at + transport::PK_LEN]);
+                hex(&id.0)
+            })
+            .filter(|id| self.mgr.holds_channel_with(id));
         let after = {
             let mut c = conn.lock().unwrap();
             match kind {
-                transport::T_INIT => self.on_init(peer, &mut c, bytes),
+                transport::T_INIT => self.on_init(peer, &mut c, bytes, known),
                 transport::T_RESP => self.on_resp(peer, &mut c, bytes),
                 transport::T_FIN => self.on_fin(peer, &mut c, bytes),
                 transport::T_RESET => self.on_reset(peer, &mut c, bytes),
@@ -537,7 +595,28 @@ impl ChannelTransport {
         }
     }
 
-    fn on_init(&self, peer: u64, c: &mut Conn, bytes: &[u8]) -> After {
+    /// Whether an `Init` gets an answer from the shared budgets: from the
+    /// channel peers' pool for a `known` key, within its share, else from the
+    /// strangers' pool.
+    fn take_shared_budget(&self, known: Option<String>) -> bool {
+        if let Some(id) = known {
+            let mut g = self.known.lock().unwrap();
+            let (pool, shares) = &mut *g;
+            if shares.len() > MAX_CONNECTIONS {
+                shares.clear();
+            }
+            let share = shares
+                .entry(id)
+                .or_insert_with(|| Budget::new(KNOWN_PER_PEER_BURST, HANDSHAKE_REFILL));
+            if share.tokens > 0 && pool.take() {
+                share.take();
+                return true;
+            }
+        }
+        self.global.lock().unwrap().take()
+    }
+
+    fn on_init(&self, peer: u64, c: &mut Conn, bytes: &[u8], known: Option<String>) -> After {
         // Only the side that was dialed answers: both ends of a link agree on
         // who that is, a relay that dialed both does not get a session.
         if c.link.outbound || !self.open() {
@@ -557,7 +636,7 @@ impl ChannelTransport {
                 return After::default();
             }
         }
-        if !c.budget.take() || !self.global.lock().unwrap().take() {
+        if !c.budget.take() || !self.take_shared_budget(known) {
             return After::default();
         }
         // A new handshake replaces the session: the initiator starts one only
@@ -665,9 +744,34 @@ impl ChannelTransport {
         }
     }
 
+    /// Drops what is held for connections that are gone.
+    fn prune_gone(&self) {
+        // Entries of connections gone without a word: one that closed while
+        // its handshake completed, or before the manager heard of it.
+        let gone: Vec<u64> = {
+            let mut g = self.conns.lock().unwrap();
+            let gone: Vec<u64> = g.keys().copied().filter(|p| !self.is_alive(*p)).collect();
+            for p in &gone {
+                g.remove(p);
+            }
+            gone
+        };
+        if !gone.is_empty() {
+            let mut pending = self.pending.lock().unwrap();
+            for p in &gone {
+                pending.remove(p);
+            }
+        }
+        for p in gone {
+            self.mgr.on_session_closed(p);
+        }
+        self.mgr.retain_sessions(&|p| self.is_alive(p));
+    }
+
     /// Timed work: forgets handshakes that waited too long, and starts the
     /// ones due once the budget allows.
     pub fn tick(&self) {
+        self.prune_gone();
         // Nothing is due, and no timer runs, before channels open.
         let open = self.open();
         let opened = open && !self.was_open.swap(open, Ordering::SeqCst);
@@ -719,13 +823,11 @@ impl ChannelSink for ChannelTransport {
         ChannelTransport::deliver(self, peer, link, bytes)
     }
 
-    fn node_identity(&self) -> Option<String> {
-        Some(self.mgr.node_id_hex())
-    }
-
     fn attach(&self, sender: ChannelSender) {
         let gate = sender.clone();
         self.set_gate(Box::new(move || gate.channels_open()));
+        let alive = sender.clone();
+        self.set_alive(Box::new(move |peer| alive.is_connected(peer)));
         self.set_sender(Box::new(move |peer, bytes| sender.send(peer, bytes)));
     }
 

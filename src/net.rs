@@ -389,6 +389,21 @@ pub fn channel_message_is_malformed(network: Network, peer_version: u32) -> bool
     !crate::policy::may_appear_on(network) || peer_version < crate::wire::POLICY_ACTIVATION_VERSION
 }
 
+/// May channel frames cross the link to `p`? When the peer advertised the
+/// channel capability; or, on a network with a transition, when we dialed it
+/// after channels opened at our tip — and told it so — and it introduced
+/// itself below the activation height, as a node that follows the activation:
+/// it could not advertise then, and may run channels now. Whether it does,
+/// the transport learns: a node without them ignores the frames.
+fn channel_link(network: Network, p: &Peer) -> bool {
+    p.channels
+        || (p.outbound
+            && p.told_channels
+            && crate::policy::has_transition(network)
+            && p.start_height < crate::policy::activation_height(network)
+            && follows_activation(network, p.version))
+}
+
 /// Is a peer a channel peer: does it advertise the channel capability
 /// ([`crate::wire::CHANNELS_CAPABILITY`], channel protocol 3) and, where the
 /// network has a transition, follow the policy activation (protocol 5)?
@@ -861,10 +876,9 @@ struct Peer {
     /// True if the peer advertised the payment-channel capability in its
     /// `Version`. A peer that did not must never receive a channel message.
     channels: bool,
-    /// The peer's stable channel node id (hex), parsed from its `Version` user
-    /// agent. Empty if it advertised none. Used to re-bind channels to this
-    /// peer across reconnects, since the connection id and inbound port change.
-    channel_id: String,
+    /// True if the `Version` we sent this peer advertised the channel
+    /// capability: we do only once channels are open at our tip.
+    told_channels: bool,
     /// Per-peer budget for channel messages. See [`CHAN_BUCKET_MAX`].
     chan_bucket: TokenBucket,
     /// Height announced by the peer at the handshake.
@@ -1305,6 +1319,13 @@ pub struct ChannelSender {
 }
 
 impl ChannelSender {
+    /// Whether the connection `peer` is still in this node's peer table.
+    pub fn is_connected(&self, peer: u64) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.lock().unwrap().peers.contains_key(&peer))
+    }
+
     /// Whether channels are open on this node's network at its tip
     /// ([`crate::policy::reached`]): before that, [`ChannelSender::send`]
     /// sends nothing, so a channel component has no reason to work.
@@ -1329,7 +1350,9 @@ impl ChannelSender {
             let g = shared.lock().unwrap();
             let open = crate::policy::reached(g.network, g.chain.height());
             match g.peers.get(&peer) {
-                Some(p) if open && p.handshaked && p.channels => Some(p.writer.clone()),
+                Some(p) if open && p.handshaked && channel_link(g.network, p) => {
+                    Some(p.writer.clone())
+                }
                 _ => None,
             }
         };
@@ -1355,12 +1378,6 @@ impl ChannelSender {
 pub trait ChannelSink: Send + Sync {
     /// Handles one inbound channel frame from `peer`.
     fn deliver(&self, peer: u64, link: &ChannelLink, bytes: &[u8]) -> ChannelOutcome;
-
-    /// This node's channel node id (hex), advertised in the handshake as a hint
-    /// for an operator naming the peer. `None` means none is advertised.
-    fn node_identity(&self) -> Option<String> {
-        None
-    }
 
     /// Called once, when the component is installed, with the handle it may
     /// send through at any time. The default ignores it.
@@ -1440,9 +1457,6 @@ pub struct PeerInfo {
     pub supports_channels: bool,
     /// The height the peer announced at the handshake.
     pub height: u64,
-    /// The peer's stable channel node id (hex), empty if none advertised. A
-    /// `channelopen` may name a peer by this, surviving reconnects.
-    pub channel_id: String,
     /// The protocol version the peer announced (0 before its `Version`).
     pub version: u32,
     /// Whether that version follows the policy activation of this network
@@ -1474,9 +1488,6 @@ pub struct Node {
     /// accept channel messages; without it, channel frames are never sent and a
     /// received one is ignored.
     channel_sink: Arc<std::sync::RwLock<Option<Arc<dyn ChannelSink>>>>,
-    /// This node's stable channel identity (hex), advertised in the handshake
-    /// when channels are enabled. Set from the sink at [`Node::set_channel_sink`].
-    own_channel_id: Arc<std::sync::RwLock<Option<String>>>,
     /// The links already warned about as predating the policy activation:
     /// see [`Node::warn_peers_predating_activation`].
     activation_warned: Arc<Mutex<HashSet<u64>>>,
@@ -1587,7 +1598,6 @@ impl Node {
             own_onion: Arc::new(std::sync::RwLock::new(None)),
             configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
             channel_sink: Arc::new(std::sync::RwLock::new(None)),
-            own_channel_id: Arc::new(std::sync::RwLock::new(None)),
             activation_warned: Arc::new(Mutex::new(HashSet::new())),
             activation_warned_at: Arc::new(Mutex::new(None)),
         }
@@ -1598,9 +1608,6 @@ impl Node {
     /// channel messages to `sink`. Meant for regtest, where channels are
     /// active; the caller gates on the network.
     pub fn set_channel_sink(&self, sink: Arc<dyn ChannelSink>) {
-        if let Ok(mut g) = self.own_channel_id.write() {
-            *g = sink.node_identity();
-        }
         sink.attach(self.channel_sender());
         if let Ok(mut g) = self.channel_sink.write() {
             *g = Some(sink);
@@ -1616,22 +1623,54 @@ impl Node {
             .unwrap_or(false)
     }
 
-    /// Our user agent, carrying the channel capability token when enabled.
-    fn user_agent(&self) -> String {
-        if self.channels_enabled() {
-            // The channel capability, followed by the first half of this node's
-            // node id, a hint an operator may name the peer by (channels are
-            // bound to the id its session authenticates). The whole string
-            // stays within `MAX_USER_AGENT`: "q21:0.4" + "+chanv3" + 32 hex.
-            let id = self
-                .own_channel_id
-                .read()
-                .ok()
-                .and_then(|g| g.clone())
-                .unwrap_or_default();
-            format!("q21:0.4{}{}", crate::wire::CHANNELS_CAPABILITY, id)
+    /// Our user agent: with the channel capability token only where channels
+    /// are enabled and `open` at our tip ([`crate::policy::reached`]). Before
+    /// that, a wallet's node is not told apart from any other; and the token
+    /// never carries an id: the node id is what a channel session
+    /// authenticates, and a stable one in the user agent would link every
+    /// address the wallet connects from, through Tor or not.
+    fn user_agent(&self, open: bool) -> String {
+        if open && self.channels_enabled() {
+            format!("q21:0.4{}", crate::wire::CHANNELS_CAPABILITY)
         } else {
             "q21:0.4".into()
+        }
+    }
+
+    /// Channels are open at our tip: the links we dialed before, whose
+    /// `Version` did not advertise them, are dialed again, so that the peer
+    /// learns it and the channel transport may run over the new link (see
+    /// [`channel_link`]). A link the peer dialed is the peer's to redial.
+    /// Once per link: the new one advertises the capability.
+    fn redial_links_predating_channels(&self) {
+        if !self.channels_enabled() {
+            return;
+        }
+        let stale: Vec<(u64, SocketAddr)> = {
+            let g = self.shared.lock().unwrap();
+            // Where channels are open from the start, every link told it.
+            if !crate::policy::has_transition(g.network)
+                || !crate::policy::reached(g.network, g.chain.height())
+            {
+                return;
+            }
+            g.peers
+                .iter()
+                .filter(|(_, p)| {
+                    p.outbound
+                        && p.handshaked
+                        && !p.told_channels
+                        && follows_activation(g.network, p.version)
+                })
+                .map(|(id, p)| (*id, p.addr))
+                .collect()
+        };
+        for (id, addr) in stale {
+            self.disconnect(id);
+            let node = self.clone();
+            std::thread::spawn(move || {
+                let _ = node.connect(addr);
+            });
         }
     }
 
@@ -1687,6 +1726,11 @@ impl Node {
         }
         // Block by block, each at its own height: a commitment's height
         // starts its to-self delay and the penalty's deadline.
+        // A block that opens channels: the links dialed before learn it now,
+        // not at the next maintenance round.
+        if !txs.is_empty() {
+            self.redial_links_predating_channels();
+        }
         for (height, txs) in txs {
             self.drive_channels(&sink, &txs, height);
         }
@@ -1772,7 +1816,6 @@ impl Node {
                 handshake_complete: p.handshaked,
                 supports_channels: p.channels,
                 height: p.start_height,
-                channel_id: p.channel_id.clone(),
                 version: p.version,
                 follows_activation: follows_activation(g.network, p.version),
             })
@@ -1781,31 +1824,12 @@ impl Node {
         v
     }
 
-    /// A durable identifier for a peer, used to re-bind channels to a new
-    /// connection id after a reconnect. It is the peer's advertised channel node
-    /// id — stable on both the dialing and accepting sides, unlike the
-    /// connection's ephemeral port — falling back to the address only for a peer
-    /// that advertised no id. Empty for an unknown peer.
-    pub fn peer_identity(&self, id: u64) -> String {
-        let g = self.shared.lock().unwrap();
-        g.peers
-            .get(&id)
-            .map(|p| {
-                if p.channel_id.is_empty() {
-                    p.addr.to_string()
-                } else {
-                    p.channel_id.clone()
-                }
-            })
-            .unwrap_or_default()
-    }
-
-    /// The peers that advertised the channel capability, by id.
+    /// The peers channel frames may go to (see [`channel_link`]), by id.
     pub fn channel_peers(&self) -> Vec<u64> {
         let g = self.shared.lock().unwrap();
         g.peers
             .iter()
-            .filter(|(_, p)| p.handshaked && p.channels)
+            .filter(|(_, p)| p.handshaked && channel_link(g.network, p))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -2460,6 +2484,8 @@ impl Node {
             self.disconnect(id);
         }
         self.warn_peers_predating_activation();
+        // The links that predate the opening of channels, dialed again.
+        self.redial_links_predating_channels();
         // The channel component's timed work: a handshake to retry, one that
         // waited too long to forget.
         if let Some(sink) = self.channel_sink() {
@@ -2677,7 +2703,7 @@ impl Node {
                     ban_score: 0,
                     user_agent: String::new(),
                     channels: false,
-                    channel_id: String::new(),
+                    told_channels: false,
                     chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                     start_height: 0,
                     pending: HashMap::new(),
@@ -2699,15 +2725,20 @@ impl Node {
 
         // The connecting side speaks first.
         if outbound {
-            let (nonce, height) = {
-                let g = self.shared.lock().unwrap();
-                (g.nonce, g.chain.height())
+            let open = self.channels_enabled();
+            let (nonce, height, user_agent) = {
+                let mut g = self.shared.lock().unwrap();
+                let open = open && crate::policy::reached(g.network, g.chain.height());
+                if let Some(p) = g.peers.get_mut(&id) {
+                    p.told_channels = open;
+                }
+                (g.nonce, g.chain.height(), self.user_agent(open))
             };
             let v = Message::Version {
                 version: PROTOCOL_VERSION,
                 timestamp: unix_now(),
                 nonce,
-                user_agent: self.user_agent(),
+                user_agent,
                 start_height: height,
             };
             let _ = writer.push_force(frame_of(&v, self.magic));
@@ -2726,10 +2757,17 @@ impl Node {
         // Closing never waits — up to v0.4.8 it took the socket's mutex, held
         // by any write in progress, for up to WRITE_TIMEOUT, **while holding
         // the node's lock**: one stalled peer then froze the whole node.
-        let removed = self.shared.lock().unwrap().peers.remove(&id);
-        if let Some(p) = removed {
+        let removed = {
+            let mut g = self.shared.lock().unwrap();
+            let network = g.network;
+            g.peers.remove(&id).map(|p| {
+                let channel = channel_link(network, &p);
+                (p, channel)
+            })
+        };
+        if let Some((p, channel)) = removed {
             p.writer.close();
-            if p.channels {
+            if channel {
                 if let Some(sink) = self.channel_sink() {
                     sink.on_peer_disconnected(id);
                 }
@@ -2931,6 +2969,8 @@ impl Node {
 
     /// Handles a message. Returns `false` if the connection must be dropped.
     fn handle(&self, id: u64, msg: Message) -> bool {
+        // Read before the lock: whether our `Version` may advertise channels.
+        let channels_enabled = self.channels_enabled();
         let mut outgoing: Vec<Outgoing> = Vec::new();
         let mut drop_peer = false;
         // Set under the lock, acted on after it is released: a channel message
@@ -3022,6 +3062,8 @@ impl Node {
                         drop_peer = true;
                     } else {
                         let height = g.chain.height();
+                        let open_at_handshake =
+                            channels_enabled && crate::policy::reached(network, height);
                         if let Some(p) = g.peers.get_mut(&id) {
                             // --- One `Version` per peer, and only one in return.
                             //
@@ -3040,18 +3082,17 @@ impl Node {
                                 p.version = version;
                                 p.remote_nonce = Some(nonce);
                                 p.channels = channel_capable(network, version, user_agent);
-                                p.channel_id =
-                                    crate::wire::channel_node_id(user_agent).unwrap_or_default();
                                 p.user_agent = user_agent.clone();
                                 if !p.version_sent {
                                     p.version_sent = true;
+                                    p.told_channels = open_at_handshake;
                                     outgoing.push(Outgoing {
                                         peer: id,
                                         message: Message::Version {
                                             version: PROTOCOL_VERSION,
                                             timestamp: unix_now(),
                                             nonce: local_nonce,
-                                            user_agent: self.user_agent(),
+                                            user_agent: self.user_agent(open_at_handshake),
                                             start_height: height,
                                         },
                                     });
@@ -3076,7 +3117,7 @@ impl Node {
                             // (connection to oneself) is not bypassed.
                             Some(p) if p.version_received => {
                                 p.handshaked = true;
-                                if p.channels {
+                                if channel_link(network, p) {
                                     channel_peer_ready = Some(ChannelLink {
                                         outbound: p.outbound,
                                         local_nonce,
@@ -4177,7 +4218,7 @@ impl Node {
                         .map(|p| {
                             (
                                 p.handshaked,
-                                p.channels,
+                                channel_link(network, p),
                                 crate::wire::user_agent_advertises_legacy_channels(&p.user_agent),
                             )
                         })
@@ -5725,7 +5766,7 @@ mod tests {
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
                 user_agent: String::new(),
                 channels: false,
-                channel_id: String::new(),
+                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
@@ -6131,7 +6172,7 @@ mod tests_hardening {
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
                 user_agent: String::new(),
                 channels: false,
-                channel_id: String::new(),
+                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
@@ -7773,7 +7814,7 @@ mod tests_handler_fuzz {
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
                 user_agent: String::new(),
                 channels: false,
-                channel_id: String::new(),
+                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
@@ -8608,7 +8649,7 @@ mod tests_handler_review {
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
                 user_agent: String::new(),
                 channels: false,
-                channel_id: String::new(),
+                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
