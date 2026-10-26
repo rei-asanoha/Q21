@@ -2997,17 +2997,17 @@ mod dormant_tests {
             scheduled_activation(Network::Testnet),
             crate::consensus::POLICY_ACTIVATION_TESTNET
         );
-        assert_eq!(activation_height(Network::Testnet), 17_000);
+        assert_eq!(activation_height(Network::Testnet), 16_000);
         assert!(has_transition(Network::Testnet));
-        assert!(!is_active(Network::Testnet, 16_999));
-        assert!(is_active(Network::Testnet, 17_000));
+        assert!(!is_active(Network::Testnet, 15_999));
+        assert!(is_active(Network::Testnet, 16_000));
         let st = status(Network::Testnet, 4_440);
-        assert_eq!(st.activation_height, Some(17_000));
+        assert_eq!(st.activation_height, Some(16_000));
         assert!(!st.active);
-        assert_eq!(st.blocks_remaining, Some(12_560));
-        assert_eq!(st.eta_seconds(), Some(12_560 * 120));
-        assert!(!reached(Network::Testnet, 16_999));
-        assert!(reached(Network::Testnet, 17_000));
+        assert_eq!(st.blocks_remaining, Some(11_560));
+        assert_eq!(st.eta_seconds(), Some(11_560 * 120));
+        assert!(!reached(Network::Testnet, 15_999));
+        assert!(reached(Network::Testnet, 16_000));
         assert!(!may_appear_on(Network::Mainnet));
         assert!(!reached(Network::Mainnet, u64::MAX - 1));
     }
@@ -3023,7 +3023,7 @@ mod dormant_tests {
         let new = crate::wire::POLICY_ACTIVATION_VERSION;
         let tx = Message::Tx(Box::new(t.clone()));
         let notice = crate::consensus::POLICY_ACTIVATION_NOTICE;
-        let h = 17_000;
+        let h = crate::consensus::POLICY_ACTIVATION_TESTNET;
         let net = Network::Testnet;
         assert!(policy_output_is_malformed(net, h - 2, 4, Asked::No, &tx));
         assert!(policy_output_is_malformed(net, h - 2, 4, Asked::Tx, &tx));

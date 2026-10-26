@@ -67,15 +67,13 @@ file you do not install.
 
 # Upgrading from 0.4.10 to 0.4.11
 
-> **Draft.** The activation height below is provisional: it is fixed at
-> release, about two weeks of blocks after the day 0.4.11 is published.
-> `channelstatus` (or `getinfo`, under `policy_activation`) gives the height
-> the binary you run was built with.
+`channelstatus` (or `getinfo`, under `policy_activation`) gives the
+activation height and how many blocks remain.
 
 0.4.11 brings payment channels to **testnet**. Four things come together:
 
 - the pay-to-policy outputs channels are built from become valid on testnet
-  at a height announced in advance, **block 17,000** (provisional): a
+  at a height announced in advance, **block 16,000**: a
   **hard fork**, after which a 0.4.10 node no longer follows testnet;
 - channel peers talk through an **encrypted, authenticated transport**
   (ML-KEM-1024 and ML-DSA-87), not in clear;
@@ -83,7 +81,7 @@ file you do not install.
 - channels on testnet use **terms fit for a public network**: days, not
   minutes, to answer a cheat.
 
-Same chain until block 17,000, same data directory, same wallet file.
+Same chain until block 16,000, same data directory, same wallet file.
 Mainnet does not exist yet, and nothing in this release would open
 policies or channels there. Regtest keeps the rule it had in 0.4.10, open
 from its first block, and its short channel terms.
@@ -92,9 +90,9 @@ from its first block, and its short channel terms.
 
 | | 0.4.10 | 0.4.11 |
 |---|---|---|
-| A testnet block carrying a policy output, or spending one | Malformed: refused, and the peer that sent it cut | Below block 17,000, the same. From block 17,000 on, valid when its policies are satisfied |
-| A testnet payment creating or spending a policy output | Malformed | Refused by the pool until the next block is 17,000; from then on, accepted like any other |
-| Payment channels on testnet | None: no channel message sent or accepted | The channel manager runs on a node started with `--rpc-wallet` (the wallet included) from its start. `channellist` and `channelinfo` answer at once; `channelopen`, `channelpay` and `channelclose` refuse, saying how many blocks remain, until the tip reaches 17,000, so that every funding confirms at block 17,000 or later. No channel message, session handshake included, leaves before then |
+| A testnet block carrying a policy output, or spending one | Malformed: refused, and the peer that sent it cut | Below block 16,000, the same. From block 16,000 on, valid when its policies are satisfied |
+| A testnet payment creating or spending a policy output | Malformed | Refused by the pool until the next block is 16,000; from then on, accepted like any other |
+| Payment channels on testnet | None: no channel message sent or accepted | The channel manager runs on a node started with `--rpc-wallet` (the wallet included) from its start. `channellist` and `channelinfo` answer at once; `channelopen`, `channelpay` and `channelclose` refuse, saying how many blocks remain, until the tip reaches 16,000, so that every funding confirms at block 16,000 or later. No channel message, session handshake included, leaves before then |
 | How channel peers talk | Frames in clear over the P2P link, the peer named by an id it declared itself | Every frame inside a session: each side proves its ML-DSA-87 node identity over a transcript holding both ends' fresh ML-KEM-1024 keys, then records are encrypted and authenticated, with forward secrecy and rekeying. A party relaying the connection can delay or drop frames, nothing else. `channelopen` names a peer by address or by the node id its session authenticated; `getpeers` shows each peer's `channel_session` |
 | Versions announced | Protocol 4; channel capability `+chan` | Protocol 5, meaning "follows the activation", and channel capability `+chanv3`, channel protocol 3 (session frames). The capability is announced alone, with no id, and only once channels are open: on testnet from the activation height on, when each link a wallet dialed before is dialed again. A 0.4.10 node keeps a 0.4.11 peer and the reverse; on testnet a peer is a channel peer only if it announces both. A 0.4.10 channel node (`+chan`) is not one: its frames are refused without blame |
 | Channel terms | 12-block to-self delay, 2 confirmations, everywhere | Per network. Testnet: 1,440 blocks (about two days) proposed, 720 to 2,016 accepted from a peer, 6 confirmations before a channel opens. Regtest keeps 12 blocks (6 to 2,016 accepted) and 2 confirmations. `getinfo` reports them under `channel_terms` |
@@ -105,18 +103,18 @@ from its first block, and its short channel terms.
 
 ## Who must upgrade, and when
 
-**Every testnet node, before block 17,000** — entry points, miners, wallets,
-explorers. At two-minute blocks, 17,000 is about two weeks after the release.
-The order does not matter before the activation: until block 17,000 a 0.4.10
+**Every testnet node, before block 16,000** — entry points, miners, wallets,
+explorers. At two-minute blocks, 16,000 is about two weeks after the release.
+The order does not matter before the activation: until block 16,000 a 0.4.10
 node and a 0.4.11 node agree on every block, relay each other's payments, and
 stay connected.
 
-Miners first among them: a block of 17,000 or above that carries a policy is
+Miners first among them: a block of 16,000 or above that carries a policy is
 only built by a 0.4.11 miner, and only 0.4.11 nodes build on it.
 
 ## What happens to a node left on 0.4.10
 
-Nothing, until the first block at or above 17,000 that carries a policy
+Nothing, until the first block at or above 16,000 that carries a policy
 output — in practice the first channel funding. Then:
 
 1. It refuses that block as malformed and disconnects the peer that sent it;
@@ -137,7 +135,7 @@ output — in practice the first channel funding. Then:
    seconds to minutes; nothing is re-downloaded from the start and the
    wallet is untouched.
 
-Upgrade before block 17,000 and none of this happens.
+Upgrade before block 16,000 and none of this happens.
 
 ## Channels opened on regtest with 0.4.10
 
