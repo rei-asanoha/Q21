@@ -295,10 +295,13 @@ pub enum Message {
 
 /// Capability token a node appends to its user agent to advertise that it
 /// speaks the payment-channel protocol, in its version 3: every channel frame
-/// inside an authenticated session ([`crate::channel::transport`]). A peer that
-/// does not carry it in its `Version` never receives a [`Message::Channel`];
-/// an older node simply reads a slightly longer, still-bounded user-agent
-/// string and is untouched.
+/// inside an authenticated session ([`crate::channel::transport`]). A node that
+/// predates the policy activation (protocol 4) never receives a
+/// [`Message::Channel`], whatever it announces; on regtest, nor does one that
+/// does not carry this token. On a network with a transition, a protocol-5
+/// peer may receive one once channels are open, token or not (see
+/// `net::channel_link`). An older node simply reads a slightly longer,
+/// still-bounded user-agent string and is untouched.
 pub const CHANNELS_CAPABILITY: &str = "+chanv3";
 
 /// The token of the earlier channel protocol (0.4.10), whose frames went in

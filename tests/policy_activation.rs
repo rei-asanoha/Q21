@@ -1389,8 +1389,8 @@ mod sessions {
                 assert!(t.elapsed() < Duration::from_secs(10), "{tag}: link");
                 std::thread::sleep(Duration::from_millis(20));
             }
-            // Neither told the other it runs channels: not yet a channel peer.
-            assert!(a.node.channel_peers().is_empty() && d.node.channel_peers().is_empty());
+            // The link may carry channels once open, and carries nothing yet.
+            let links = (a.node.peer_list(), d.node.peer_list());
             // Maintenance rounds below `H`: no handshake, no retry.
             for _ in 0..15 {
                 a.node.maintain_peers();
@@ -1401,9 +1401,8 @@ mod sessions {
             assert_eq!(d.t.handshake_attempts(), 0, "{tag}: dialer below H");
             assert!(!up(&a, &d) && !up(&d, &a));
 
-            // One side reaches `H`, the other a moment later. The dialer, once
-            // there, dials again, to tell it runs channels; frames go out
-            // over the new link, and the other drops them until it gets
+            // One side reaches `H`, the other a moment later. Frames go out
+            // over the same link, and the other drops them until it gets
             // there too.
             let (first, second) = if dialer_first { (&d, &a) } else { (&a, &d) };
             reach_h(first, &at_h);
@@ -1417,8 +1416,79 @@ mod sessions {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // The very link that predates `H` carries the session: nothing
+            // was dropped or dialed again.
+            let ids = |l: &[q21_core::net::PeerInfo]| l.iter().map(|p| p.id).collect::<Vec<_>>();
+            assert_eq!(ids(&a.node.peer_list()), ids(&links.0), "{tag}: links of a");
+            assert_eq!(ids(&d.node.peer_list()), ids(&links.1), "{tag}: links of d");
             a.node.shutdown();
             d.node.shutdown();
+        }
+    }
+
+    /// Block `H` reaches every peer, mined by a wallet node as received by
+    /// one: no link of a wallet node is dropped when channels open, so none
+    /// takes its announcement away.
+    #[test]
+    fn block_h_reaches_every_peer_whether_mined_or_received() {
+        let (mut c, _) = at_h_minus_2();
+        let b = mine(&c, &[], MINER);
+        connect(&mut c, &b).unwrap();
+        let at_h = mine(&c, &[], MINER);
+        // m mines; w receives and passes it on; p, a plain node, gets it
+        // from w only. m dials w, w dials p.
+        let m = side(0x51, "propagation", &b);
+        let w = side(0x52, "propagation", &b);
+        let p = {
+            let (mut c, _) = at_h_minus_2();
+            connect(&mut c, &b).unwrap();
+            Node::new(NET, c)
+        };
+        let w_addr = w.node.listen("127.0.0.1:0").expect("listen");
+        let p_addr = p.listen("127.0.0.1:0").expect("listen");
+        m.node.connect(w_addr).expect("connect");
+        w.node.connect(p_addr).expect("connect");
+        let t = Instant::now();
+        while m.node.peer_count_established() == 0
+            || w.node.peer_count_established() < 2
+            || p.peer_count_established() == 0
+        {
+            assert!(t.elapsed() < Duration::from_secs(10), "links");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let before: Vec<Vec<u64>> = [&m.node, &w.node, &p]
+            .iter()
+            .map(|n| n.peer_list().iter().map(|x| x.id).collect())
+            .collect();
+        // Mined at m, as the miner does: connected, announced, then handed
+        // to the channel component.
+        m.node
+            .with_chain(|c| c.connect(&at_h, at_h.header.time + 1))
+            .unwrap();
+        m.node.announce_block(&at_h);
+        m.node.note_local_block_for_channels(&at_h);
+        m.node.scan_connected_blocks_for_channels();
+        let id = at_h.header.block_id();
+        let t = Instant::now();
+        while w.node.tip_id() != id || p.tip_id() != id {
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "block H did not reach every peer"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let after: Vec<Vec<u64>> = [&m.node, &w.node, &p]
+            .iter()
+            .map(|n| n.peer_list().iter().map(|x| x.id).collect())
+            .collect();
+        assert_eq!(after, before, "a link was dropped or dialed again");
+        let t = Instant::now();
+        while !(up(&m, &w) && up(&w, &m)) {
+            assert!(t.elapsed() < Duration::from_secs(5), "no session after H");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for n in [&m.node, &w.node, &p] {
+            n.shutdown();
         }
     }
 }
