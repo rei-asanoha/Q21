@@ -1265,11 +1265,15 @@ impl RpcContext {
             match params.get("peer") {
                 Some(v) if v.as_u64().is_some() => v.as_u64().unwrap(),
                 Some(Json::Str(key)) => {
+                    // A peer at that address with an established channel
+                    // session: that alone counts. A link opened before the
+                    // activation carries no capability flag, yet its session
+                    // comes up once channels open.
                     let by_address = self
                         .node
                         .peer_list()
                         .into_iter()
-                        .filter(|p| p.supports_channels && &p.address == key)
+                        .filter(|p| &p.address == key)
                         .map(|p| p.id)
                         .find(|id| mgr.peer_node_id(*id).is_some());
                     let by_node_id = || {

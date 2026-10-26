@@ -1426,6 +1426,61 @@ mod sessions {
         }
     }
 
+    /// A link opened below `H` carries no capability flag, its `Version`
+    /// having announced none; once channels open, its session comes up, and
+    /// `channelopen` finds the peer by that link's address as by its node id.
+    #[test]
+    fn a_peer_linked_before_h_is_opened_to_by_its_address() {
+        use q21_core::json::Json;
+        use q21_core::rpc::RpcContext;
+        let (mut c, _) = at_h_minus_2();
+        let b = mine(&c, &[], MINER);
+        connect(&mut c, &b).unwrap();
+        let at_h = mine(&c, &[], MINER);
+        let a = side(0x61, "open-by-address", &b);
+        let d = side(0x62, "open-by-address", &b);
+        let addr = a.node.listen("127.0.0.1:0").expect("listen");
+        d.node.connect(addr).expect("connect");
+        let t = Instant::now();
+        while a.node.peer_count_established() == 0 || d.node.peer_count_established() == 0 {
+            assert!(t.elapsed() < Duration::from_secs(10), "link");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reach_h(&d, &at_h);
+        reach_h(&a, &at_h);
+        let t = Instant::now();
+        while !(up(&a, &d) && up(&d, &a)) {
+            assert!(t.elapsed() < Duration::from_secs(5), "no session after H");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let listed = d.node.peer_list();
+        let link = listed
+            .iter()
+            .find(|p| p.address == addr.to_string())
+            .expect("the link to a");
+        assert!(
+            !link.supports_channels,
+            "a link opened before H announced channels"
+        );
+
+        let node = Arc::new(d.node.clone());
+        let mut ctx = RpcContext::read_only(node, NET);
+        ctx.channels = Some(d.mgr.clone());
+        let raw = ctx.handle(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"channelopen","params":{{"peer":"{addr}","capacity":4000000}}}}"#
+        ));
+        let r = q21_core::json::parse(&raw).unwrap();
+        let result = r.get("result").unwrap_or_else(|| panic!("refused: {raw}"));
+        assert_eq!(result.get("status").and_then(Json::as_str), Some("opening"));
+        assert_eq!(
+            result.get("peer").and_then(Json::as_u64),
+            Some(link.id),
+            "the link at that address"
+        );
+        a.node.shutdown();
+        d.node.shutdown();
+    }
+
     /// Block `H` reaches every peer, mined by a wallet node as received by
     /// one: no link of a wallet node is dropped when channels open, so none
     /// takes its announcement away.
