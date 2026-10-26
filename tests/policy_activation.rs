@@ -493,7 +493,7 @@ mod spends {
 /// while our next block is below `H`.
 mod wire {
     use super::*;
-    use q21_core::net::{magic_for, policy_output_is_malformed, Node};
+    use q21_core::net::{magic_for, policy_output_is_malformed, Asked, Node};
     use q21_core::wire::{Message, POLICY_ACTIVATION_VERSION};
     use std::io::Write;
     use std::time::{Duration, Instant};
@@ -515,10 +515,22 @@ mod wire {
             for tip in [0, H - 2, H + 10] {
                 b.header.height = H - 1;
                 let early = Message::Block(Box::new(b.clone()));
-                assert!(policy_output_is_malformed(NET, tip, version, tip, &early));
+                assert!(policy_output_is_malformed(
+                    NET,
+                    tip,
+                    version,
+                    Asked::No,
+                    &early
+                ));
                 b.header.height = H;
                 let due = Message::Block(Box::new(b.clone()));
-                assert!(!policy_output_is_malformed(NET, tip, version, tip, &due));
+                assert!(!policy_output_is_malformed(
+                    NET,
+                    tip,
+                    version,
+                    Asked::No,
+                    &due
+                ));
             }
         }
     }
@@ -528,17 +540,17 @@ mod wire {
         let m = Message::Tx(Box::new(creating_tx()));
         // A peer that predates the activation: exactly 0.4.10 until our next
         // block is at H.
-        assert!(policy_output_is_malformed(NET, H - 2, OLD, H + 50, &m));
-        assert!(!policy_output_is_malformed(NET, H - 1, OLD, 0, &m));
+        assert!(policy_output_is_malformed(NET, H - 2, OLD, Asked::Tx, &m));
+        assert!(!policy_output_is_malformed(NET, H - 1, OLD, Asked::No, &m));
         // A peer that follows it may be ahead of us: here H is within the
         // notice of any tip, so it is never malformed.
-        assert!(!policy_output_is_malformed(NET, 0, NEW, 0, &m));
+        assert!(!policy_output_is_malformed(NET, 0, NEW, Asked::No, &m));
         // Mainnet never opens the rule.
         assert!(policy_output_is_malformed(
             Network::Mainnet,
             H + 1,
             NEW,
-            H + 1,
+            Asked::Tx,
             &m
         ));
     }

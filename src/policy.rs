@@ -2827,7 +2827,7 @@ mod dormant_tests {
     use crate::block::{Block, BlockHeader};
     use crate::consensus::NETWORK_MAGIC_TESTNET;
     use crate::mempool::{Mempool, MempoolError};
-    use crate::net::policy_output_is_malformed;
+    use crate::net::{policy_output_is_malformed, Asked};
     use crate::tx::{OutPoint, TxIn};
     use crate::utxo::UtxoSet;
     use crate::wire::{Message, WireError};
@@ -2939,14 +2939,14 @@ mod dormant_tests {
                     Network::Testnet,
                     0,
                     version,
-                    0,
+                    Asked::No,
                     &read
                 ));
                 assert!(policy_output_is_malformed(
                     Network::Mainnet,
                     u64::MAX - 1,
                     version,
-                    u64::MAX - 1,
+                    Asked::Tx,
                     &read
                 ));
                 // Regtest, where the rule is active, reads it normally.
@@ -2954,7 +2954,7 @@ mod dormant_tests {
                     Network::Regtest,
                     0,
                     version,
-                    0,
+                    Asked::No,
                     &read
                 ));
             }
@@ -2967,14 +2967,14 @@ mod dormant_tests {
             Network::Testnet,
             0,
             4,
-            0,
+            Asked::No,
             &read
         ));
         assert!(!policy_output_is_malformed(
             Network::Mainnet,
             0,
             4,
-            0,
+            Asked::No,
             &read
         ));
 
@@ -3014,8 +3014,9 @@ mod dormant_tests {
 
     /// Around the testnet activation: a block is judged by its own height; a
     /// transaction from a peer that predates the activation by our next
-    /// block; one from a peer that follows it is tolerated from the notice
-    /// before the activation on, counted from our tip or its announced height.
+    /// block; one from a peer that follows it never when we asked for it,
+    /// and, pushed unasked, from the notice before the activation on, counted
+    /// from our tip alone — never from a height the peer claims.
     #[test]
     fn testnet_wire_reading_around_the_activation() {
         let (t, _) = creating();
@@ -3023,42 +3024,50 @@ mod dormant_tests {
         let tx = Message::Tx(Box::new(t.clone()));
         let notice = crate::consensus::POLICY_ACTIVATION_NOTICE;
         let h = 17_000;
-        assert!(policy_output_is_malformed(
-            Network::Testnet,
-            h - 2,
-            4,
-            h,
-            &tx
-        ));
-        assert!(!policy_output_is_malformed(
-            Network::Testnet,
-            h - 1,
-            4,
-            0,
-            &tx
-        ));
+        let net = Network::Testnet;
+        assert!(policy_output_is_malformed(net, h - 2, 4, Asked::No, &tx));
+        assert!(policy_output_is_malformed(net, h - 2, 4, Asked::Tx, &tx));
+        assert!(!policy_output_is_malformed(net, h - 1, 4, Asked::No, &tx));
         let edge = h - 1 - notice;
-        assert!(!policy_output_is_malformed(
-            Network::Testnet,
-            edge,
-            new,
-            0,
-            &tx
-        ));
+        assert!(!policy_output_is_malformed(net, edge, new, Asked::No, &tx));
         assert!(policy_output_is_malformed(
-            Network::Testnet,
+            net,
             edge - 1,
             new,
-            0,
+            Asked::No,
             &tx
         ));
+        // The reviewer's probe: our tip at H - 1500, syncing, and the peer
+        // already at H - 1 answering our request. Not malformed.
         assert!(!policy_output_is_malformed(
-            Network::Testnet,
-            0,
+            net,
+            h - 1500,
             new,
-            edge,
+            Asked::Tx,
             &tx
         ));
+        assert!(!policy_output_is_malformed(net, 0, new, Asked::Tx, &tx));
+        // The transactions of a compact block are judged by its height.
+        let txn = Message::BlockTxn {
+            block: Hash256::ZERO,
+            txs: vec![t.clone()],
+        };
+        for v in [4, new] {
+            assert!(policy_output_is_malformed(
+                net,
+                h + 5,
+                v,
+                Asked::BlockAt(h - 1),
+                &txn
+            ));
+            assert!(!policy_output_is_malformed(
+                net,
+                0,
+                v,
+                Asked::BlockAt(h),
+                &txn
+            ));
+        }
         let block = |height: u64| {
             let mut header = BlockHeader {
                 version: 1,
@@ -3083,14 +3092,14 @@ mod dormant_tests {
                 Network::Testnet,
                 h + 5,
                 v,
-                h + 5,
+                Asked::Tx,
                 &block(h - 1)
             ));
             assert!(!policy_output_is_malformed(
                 Network::Testnet,
                 0,
                 v,
-                0,
+                Asked::No,
                 &block(h)
             ));
         }
