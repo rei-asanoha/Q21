@@ -1272,6 +1272,13 @@ pub struct ChannelSender {
 }
 
 impl ChannelSender {
+    /// Whether the connection `peer` is still in this node's peer table.
+    pub fn is_connected(&self, peer: u64) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.lock().unwrap().peers.contains_key(&peer))
+    }
+
     /// Whether channels are open on this node's network at its tip
     /// ([`crate::policy::reached`]): before that, [`ChannelSender::send`]
     /// sends nothing, so a channel component has no reason to work.

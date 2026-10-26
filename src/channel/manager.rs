@@ -881,6 +881,19 @@ impl ChannelManager {
             .any(|c| c.peer_identity == identity && c.machine.phase() != Phase::Closed)
     }
 
+    /// Ends every session whose connection `keep` no longer holds, as
+    /// [`ChannelManager::on_session_closed`] does: a connection may close
+    /// while its handshake completes, before the link layer could say so.
+    pub fn retain_sessions(&self, keep: &dyn Fn(u64) -> bool) {
+        let gone: Vec<u64> = {
+            let g = self.inner.lock().unwrap();
+            g.links.keys().copied().filter(|p| !keep(*p)).collect()
+        };
+        for p in gone {
+            self.on_session_closed(p);
+        }
+    }
+
     /// The connections with an established session, and the node id each
     /// authenticated.
     pub fn sessions(&self) -> Vec<(u64, String)> {

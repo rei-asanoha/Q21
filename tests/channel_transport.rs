@@ -592,3 +592,26 @@ fn a_channel_peer_is_answered_while_strangers_hold_the_shared_budget() {
         "beyond its share, with the strangers' pool empty"
     );
 }
+
+/// A connection can close while its handshake completes, before the link
+/// layer hears of it: what was kept for it is pruned at the next tick, and a
+/// frame from a connection that is gone makes no entry.
+#[test]
+fn what_a_connection_gone_unannounced_left_is_pruned() {
+    let (ends, wire) = link(33, 34, "prune");
+    let b = &ends[1];
+    let live = Arc::new(Mutex::new(vec![b.conn]));
+    let l = live.clone();
+    b.t.set_alive(Box::new(move |p| l.lock().unwrap().contains(&p)));
+    connect(&ends, &wire);
+    assert!(b.t.has_session(b.conn));
+    assert_eq!(b.t.manager().sessions().len(), 1);
+    // Gone, and nobody said so.
+    live.lock().unwrap().clear();
+    b.t.tick();
+    assert!(!b.t.has_session(b.conn));
+    assert!(b.t.manager().sessions().is_empty());
+    // An Init on a connection that is gone is not answered.
+    let who = NodeIdentity::derive(&[0x71; 32]);
+    assert_eq!(init_on(b, &wire, 500, &who), 0);
+}

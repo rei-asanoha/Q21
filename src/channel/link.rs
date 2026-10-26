@@ -232,6 +232,7 @@ fn handshake_penalty(e: TransportError) -> u32 {
 
 type SendFrame = dyn Fn(u64, Vec<u8>) -> bool + Send + Sync;
 type Gate = dyn Fn() -> bool + Send + Sync;
+type Alive = dyn Fn(u64) -> bool + Send + Sync;
 
 /// The channel component a node installs: sessions over its connections,
 /// in front of the manager.
@@ -244,6 +245,8 @@ pub struct ChannelTransport {
     global: Mutex<Budget>,
     /// The pool for channel peers' keys, and each key's share of it.
     known: Mutex<(Budget, HashMap<String, Budget>)>,
+    /// Whether a connection is still there; absent, every one is.
+    alive: RwLock<Option<Box<Alive>>>,
     dos: RwLock<DosLimits>,
     rekey: RwLock<Limits>,
     /// Whether channels are open; absent, they always are.
@@ -265,6 +268,7 @@ impl ChannelTransport {
             pending: Mutex::new(HashMap::new()),
             global: Mutex::new(Budget::new(dos.global_burst, dos.global_refill)),
             known: Mutex::new((known_pool(), HashMap::new())),
+            alive: RwLock::new(None),
             dos: RwLock::new(dos),
             rekey: RwLock::new(Limits::default()),
             gate: RwLock::new(None),
@@ -312,6 +316,25 @@ impl ChannelTransport {
         }
     }
 
+    /// Installs the check of whether a connection is still there: the node's
+    /// [`ChannelSender::is_connected`] once attached. An entry for one that
+    /// is gone is never made, and is pruned at the next [`Self::tick`].
+    pub fn set_alive(&self, alive: Box<Alive>) {
+        if let Ok(mut g) = self.alive.write() {
+            *g = Some(alive);
+        }
+    }
+
+    fn is_alive(&self, peer: u64) -> bool {
+        match self.alive.read() {
+            Ok(g) => match g.as_ref() {
+                Some(f) => f(peer),
+                None => true,
+            },
+            Err(_) => true,
+        }
+    }
+
     /// Handshakes this transport started or answered.
     pub fn handshake_attempts(&self) -> u64 {
         self.attempts.load(Ordering::SeqCst)
@@ -352,7 +375,7 @@ impl ChannelTransport {
         if let Some(c) = g.get(&peer) {
             return Some(c.clone());
         }
-        if g.len() >= MAX_CONNECTIONS {
+        if g.len() >= MAX_CONNECTIONS || !self.is_alive(peer) {
             return None;
         }
         let dos = self.dos();
@@ -721,9 +744,34 @@ impl ChannelTransport {
         }
     }
 
+    /// Drops what is held for connections that are gone.
+    fn prune_gone(&self) {
+        // Entries of connections gone without a word: one that closed while
+        // its handshake completed, or before the manager heard of it.
+        let gone: Vec<u64> = {
+            let mut g = self.conns.lock().unwrap();
+            let gone: Vec<u64> = g.keys().copied().filter(|p| !self.is_alive(*p)).collect();
+            for p in &gone {
+                g.remove(p);
+            }
+            gone
+        };
+        if !gone.is_empty() {
+            let mut pending = self.pending.lock().unwrap();
+            for p in &gone {
+                pending.remove(p);
+            }
+        }
+        for p in gone {
+            self.mgr.on_session_closed(p);
+        }
+        self.mgr.retain_sessions(&|p| self.is_alive(p));
+    }
+
     /// Timed work: forgets handshakes that waited too long, and starts the
     /// ones due once the budget allows.
     pub fn tick(&self) {
+        self.prune_gone();
         // Nothing is due, and no timer runs, before channels open.
         let open = self.open();
         let opened = open && !self.was_open.swap(open, Ordering::SeqCst);
@@ -778,6 +826,8 @@ impl ChannelSink for ChannelTransport {
     fn attach(&self, sender: ChannelSender) {
         let gate = sender.clone();
         self.set_gate(Box::new(move || gate.channels_open()));
+        let alive = sender.clone();
+        self.set_alive(Box::new(move |peer| alive.is_connected(peer)));
         self.set_sender(Box::new(move |peer, bytes| sender.send(peer, bytes)));
     }
 
