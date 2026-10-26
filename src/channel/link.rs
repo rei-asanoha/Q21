@@ -719,10 +719,6 @@ impl ChannelSink for ChannelTransport {
         ChannelTransport::deliver(self, peer, link, bytes)
     }
 
-    fn node_identity(&self) -> Option<String> {
-        Some(self.mgr.node_id_hex())
-    }
-
     fn attach(&self, sender: ChannelSender) {
         let gate = sender.clone();
         self.set_gate(Box::new(move || gate.channels_open()));

@@ -1276,12 +1276,72 @@ mod sessions {
 
     /// The block at `H` connected, and handed to the channel component as
     /// the node's block hook does.
+    /// A node may already hold it: once a link carries channels again, its
+    /// peer at `H` hands it over.
     fn reach_h(s: &Side, at_h: &Block) {
+        if s.node.tip_id() == at_h.header.block_id() {
+            return;
+        }
         s.node
             .with_chain(|c| c.connect(at_h, at_h.header.time + 1))
             .unwrap();
         s.node.note_local_block_for_channels(at_h);
         s.node.scan_connected_blocks_for_channels();
+    }
+
+    /// The user agent `s` sends a peer that dials it now.
+    fn introduced_as(s: &Side) -> String {
+        use q21_core::net::magic_for;
+        use q21_core::wire::{Message, WireError, PROTOCOL_VERSION};
+        use std::io::{Read, Write};
+        let addr = s.node.listen("127.0.0.1:0").expect("listen");
+        let mut t = std::net::TcpStream::connect(addr).expect("connect");
+        let magic = magic_for(NET);
+        let hello = Message::Version {
+            version: PROTOCOL_VERSION,
+            timestamp: 0,
+            nonce: 0x7e57_0002,
+            user_agent: "q21:0.4".into(),
+            start_height: H - 1,
+        };
+        t.write_all(&hello.frame(magic)).unwrap();
+        let _ = t.set_read_timeout(Some(Duration::from_millis(200)));
+        let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if let Ok(n) = t.read(&mut chunk) {
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            match Message::parse(&buf, magic) {
+                Ok((Message::Version { user_agent, .. }, _)) => return user_agent,
+                Ok((_, used)) => {
+                    buf.drain(..used);
+                }
+                Err(WireError::Incomplete) => {}
+                Err(e) => panic!("unreadable frame: {e:?}"),
+            }
+        }
+        panic!("no Version");
+    }
+
+    /// Below `H` a wallet's node introduces itself as any node does: neither
+    /// the channel capability nor an id tells it apart. At `H` it advertises
+    /// the capability, alone.
+    #[test]
+    fn a_wallet_node_is_not_told_apart_before_h() {
+        let (mut c, _) = at_h_minus_2();
+        let b = mine(&c, &[], MINER);
+        connect(&mut c, &b).unwrap();
+        let at_h = mine(&c, &[], MINER);
+        let s = side(0x43, "user-agent", &b);
+        assert_eq!(introduced_as(&s), "q21:0.4", "below H");
+        reach_h(&s, &at_h);
+        assert_eq!(
+            introduced_as(&s),
+            format!("q21:0.4{}", q21_core::wire::CHANNELS_CAPABILITY),
+            "at H"
+        );
+        s.node.shutdown();
     }
 
     fn up(s: &Side, other: &Side) -> bool {
@@ -1304,10 +1364,12 @@ mod sessions {
             let addr = a.node.listen("127.0.0.1:0").expect("listen");
             d.node.connect(addr).expect("connect");
             let t = Instant::now();
-            while a.node.channel_peers().is_empty() || d.node.channel_peers().is_empty() {
+            while a.node.peer_count_established() == 0 || d.node.peer_count_established() == 0 {
                 assert!(t.elapsed() < Duration::from_secs(10), "{tag}: link");
                 std::thread::sleep(Duration::from_millis(20));
             }
+            // Neither told the other it runs channels: not yet a channel peer.
+            assert!(a.node.channel_peers().is_empty() && d.node.channel_peers().is_empty());
             // Maintenance rounds below `H`: no handshake, no retry.
             for _ in 0..15 {
                 a.node.maintain_peers();
@@ -1318,8 +1380,10 @@ mod sessions {
             assert_eq!(d.t.handshake_attempts(), 0, "{tag}: dialer below H");
             assert!(!up(&a, &d) && !up(&d, &a));
 
-            // One side reaches `H`, the other a moment later. Its frames go
-            // out; the other drops them until it gets there too.
+            // One side reaches `H`, the other a moment later. The dialer, once
+            // there, dials again, to tell it runs channels; frames go out
+            // over the new link, and the other drops them until it gets
+            // there too.
             let (first, second) = if dialer_first { (&d, &a) } else { (&a, &d) };
             reach_h(first, &at_h);
             std::thread::sleep(Duration::from_millis(300));

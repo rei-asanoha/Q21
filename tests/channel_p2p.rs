@@ -141,3 +141,58 @@ fn getpeers_lists_a_channel_capable_peer_with_a_usable_id() {
     // It matches what channel_peers reports, too.
     assert_eq!(a.channel_peers(), vec![b_entry.id]);
 }
+
+/// The user agent a node sends a peer that dials it.
+fn introduced_as(node: &Node, network: Network) -> String {
+    use q21_core::net::magic_for;
+    use q21_core::wire::{Message, WireError, PROTOCOL_VERSION};
+    use std::io::{Read, Write};
+    let addr = node.listen("127.0.0.1:0").expect("listen");
+    let mut s = std::net::TcpStream::connect(addr).expect("connect");
+    let magic = magic_for(network);
+    let hello = Message::Version {
+        version: PROTOCOL_VERSION,
+        timestamp: 0,
+        nonce: 0x7e57_0001,
+        user_agent: "q21:0.4".into(),
+        start_height: 0,
+    };
+    s.write_all(&hello.frame(magic)).unwrap();
+    let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+    let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if let Ok(n) = s.read(&mut chunk) {
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        match Message::parse(&buf, magic) {
+            Ok((Message::Version { user_agent, .. }, _)) => return user_agent,
+            Ok((_, used)) => {
+                buf.drain(..used);
+            }
+            Err(WireError::Incomplete) => {}
+            Err(e) => panic!("unreadable frame: {e:?}"),
+        }
+    }
+    panic!("no Version");
+}
+
+/// A node with channels advertises the capability, alone: no id rides with
+/// it. The node id is what a channel session authenticates; a stable one in
+/// the user agent linked every address the wallet connected from.
+#[test]
+fn the_channel_capability_travels_without_an_id() {
+    let a = node();
+    a.set_channel_sink(Arc::new(Recorder {
+        count: AtomicU64::new(0),
+        last: Default::default(),
+    }));
+    assert_eq!(
+        introduced_as(&a, NET),
+        format!("q21:0.4{}", q21_core::wire::CHANNELS_CAPABILITY)
+    );
+    a.shutdown();
+    let plain = node();
+    assert_eq!(introduced_as(&plain, NET), "q21:0.4");
+    plain.shutdown();
+}
