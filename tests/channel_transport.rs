@@ -585,11 +585,10 @@ fn a_channel_peer_is_answered_while_strangers_hold_the_shared_budget() {
         id.0
     });
     assert_eq!(init_on(b, &wire, 400, &peer), 1, "the channel peer, first");
-    assert_eq!(init_on(b, &wire, 401, &peer), 1, "and again");
     assert_eq!(
-        init_on(b, &wire, 402, &peer),
-        0,
-        "beyond its share, with the strangers' pool empty"
+        init_on(b, &wire, 401, &peer),
+        1,
+        "and on another connection"
     );
 }
 
@@ -614,4 +613,146 @@ fn what_a_connection_gone_unannounced_left_is_pruned() {
     // An Init on a connection that is gone is not answered.
     let who = NodeIdentity::derive(&[0x71; 32]);
     assert_eq!(init_on(b, &wire, 500, &who), 0);
+}
+
+/// `b` holding a channel with the dialer of a fresh link: the dialer's
+/// identity, and the acceptor's end.
+fn acceptor_with_a_channel(tag: &str) -> (Vec<End>, Wire, NodeIdentity) {
+    let (ends, wire) = link(41, 42, tag);
+    connect(&ends, &wire);
+    assert!(ends[0].t.send(ends[0].conn, hello_from(&ends)));
+    pump(&ends, &wire, |_, b| Some(b));
+    assert_eq!(ends[1].t.manager().list().len(), 1);
+    (ends, wire, NodeIdentity::derive(&[41; 32]))
+}
+
+fn link_for(b: &End, conn: u64) -> (ChannelLink, Context) {
+    let link = ChannelLink {
+        remote_nonce: 0xf000 + conn,
+        ..b.link
+    };
+    let ctx = Context {
+        network: NET,
+        initiator_nonce: link.remote_nonce,
+        responder_nonce: link.local_nonce,
+    };
+    (link, ctx)
+}
+
+/// A full handshake by `who` on a new connection `conn` of `b`: whether `b`
+/// answered it and holds the session.
+fn handshake_on(b: &End, wire: &Wire, conn: u64, who: &NodeIdentity) -> bool {
+    let (link, ctx) = link_for(b, conn);
+    let (ini, init) = Initiator::start(who, ctx).unwrap();
+    b.t.deliver(conn, &link, &init);
+    let resp = wire
+        .lock()
+        .unwrap()
+        .drain(..)
+        .map(|(_, f)| f)
+        .find(|f| transport::frame_type(f) == Some(transport::T_RESP));
+    let Some(resp) = resp else {
+        return false;
+    };
+    let (_, _, fin) = ini.finish(who, &resp).unwrap();
+    assert_eq!(b.t.deliver(conn, &link, &fin).penalize, 0);
+    wire.lock().unwrap().clear();
+    b.t.has_session(conn)
+}
+
+/// An `Init` claiming `whose` key, from a party that does not hold it, on
+/// connection `conn` of `b`; then, if `fin`, a `Fin` it cannot sign.
+/// Whether `b` answered, and the misconduct charged.
+fn claim_on(b: &End, wire: &Wire, conn: u64, whose: &NodeIdentity, fin: bool) -> (bool, u32) {
+    let (link, ctx) = link_for(b, conn);
+    let me = NodeIdentity::derive(&[0x66; 32]);
+    let (ini, mut init) = Initiator::start(&me, ctx).unwrap();
+    let at = 2 + transport::EK_LEN;
+    init[at..at + transport::PK_LEN].copy_from_slice(whose.pubkey());
+    b.t.deliver(conn, &link, &init);
+    let resp = wire
+        .lock()
+        .unwrap()
+        .drain(..)
+        .map(|(_, f)| f)
+        .find(|f| transport::frame_type(f) == Some(transport::T_RESP));
+    let Some(resp) = resp else {
+        return (false, 0);
+    };
+    let _ = (ini, resp);
+    let mut penalty = 0;
+    if fin {
+        // A Fin of the right length, whose signature proves nothing.
+        let mut forged = vec![0u8; transport::FIN_LEN];
+        forged[0] = transport::VERSION;
+        forged[1] = transport::T_FIN;
+        penalty = b.t.deliver(conn, &link, &forged).penalize;
+    }
+    wire.lock().unwrap().clear();
+    (true, penalty)
+}
+
+/// A channel peer's reserved share refills over time: its handshakes are
+/// not limited to the first few of the process.
+#[test]
+fn a_channel_peers_share_refills_over_time() {
+    let (ends, wire, peer) = acceptor_with_a_channel("share-refill");
+    let b = &ends[1];
+    b.t.set_dos_limits(DosLimits {
+        burst: 100,
+        refill: Duration::from_millis(300),
+        global_burst: 0,
+        global_refill: Duration::from_secs(3600),
+        known_burst: 100,
+        known_refill: Duration::from_millis(1),
+        ..DosLimits::default()
+    });
+    assert!(handshake_on(b, &wire, 400, &peer));
+    assert!(handshake_on(b, &wire, 400, &peer));
+    assert!(!handshake_on(b, &wire, 400, &peer), "its share is spent");
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(handshake_on(b, &wire, 400, &peer), "and refilled");
+}
+
+/// A party claiming a channel peer's key — public, it travels in every
+/// handshake — cannot lock that peer out: each of its connections is
+/// demoted once its claim goes unproven, a `Fin` that does not prove it is
+/// misconduct, and the real peer on its own connection keeps its share.
+#[test]
+fn a_party_claiming_a_peers_key_cannot_lock_the_peer_out() {
+    let (ends, wire, peer) = acceptor_with_a_channel("claimed-key");
+    let b = &ends[1];
+    b.t.set_dos_limits(DosLimits {
+        burst: 100,
+        refill: Duration::from_millis(1),
+        global_burst: 0,
+        global_refill: Duration::from_secs(3600),
+        known_burst: 4,
+        known_refill: Duration::from_millis(100),
+        timeout: Duration::from_millis(150),
+        ..DosLimits::default()
+    });
+    // A claim followed by a Fin that cannot prove it: misconduct.
+    let (answered, penalty) = claim_on(b, &wire, 299, &peer, true);
+    assert!(answered);
+    assert!(penalty > 0, "an unproven claim is misconduct");
+    // Three more connections claim the key: the reserved pool is spent, and
+    // the real peer finds none left for now.
+    for conn in 300..303u64 {
+        assert!(claim_on(b, &wire, conn, &peer, false).0);
+    }
+    assert!(!handshake_on(b, &wire, 400, &peer));
+    // Their claims go unproven; the pool refills.
+    std::thread::sleep(Duration::from_millis(500));
+    b.t.tick();
+    for conn in 299..303u64 {
+        assert!(
+            !claim_on(b, &wire, conn, &peer, false).0,
+            "a connection that never proved its claim draws on the pool again"
+        );
+    }
+    assert!(
+        handshake_on(b, &wire, 400, &peer),
+        "the real peer is locked out"
+    );
 }
