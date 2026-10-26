@@ -389,19 +389,19 @@ pub fn channel_message_is_malformed(network: Network, peer_version: u32) -> bool
     !crate::policy::may_appear_on(network) || peer_version < crate::wire::POLICY_ACTIVATION_VERSION
 }
 
-/// May channel frames cross the link to `p`? When the peer advertised the
-/// channel capability; or, on a network with a transition, when we dialed it
-/// after channels opened at our tip — and told it so — and it introduced
-/// itself below the activation height, as a node that follows the activation:
-/// it could not advertise then, and may run channels now. Whether it does,
-/// the transport learns: a node without them ignores the frames.
+/// May channel frames cross the link to `p` once channels are open? When the
+/// peer advertised the channel capability; and, on a network with a
+/// transition, whenever it follows the activation (protocol 5). A node
+/// announces the capability only once channels are open at its tip, and a
+/// link keeps the `Version` it began with: one opened before the activation
+/// height carries no capability either way, yet both ends may run channels
+/// after it. Every protocol-5 node reads a channel frame — a node without
+/// channels ignores it, and the transport stops asking one that never
+/// answers — so the link itself is the potential channel link, and no
+/// connection is dropped or dialed again at the activation height. A node
+/// that predates the activation (protocol 4) never sees one.
 fn channel_link(network: Network, p: &Peer) -> bool {
-    p.channels
-        || (p.outbound
-            && p.told_channels
-            && crate::policy::has_transition(network)
-            && p.start_height < crate::policy::activation_height(network)
-            && follows_activation(network, p.version))
+    p.channels || (crate::policy::has_transition(network) && follows_activation(network, p.version))
 }
 
 /// Is a peer a channel peer: does it advertise the channel capability
@@ -876,9 +876,6 @@ struct Peer {
     /// True if the peer advertised the payment-channel capability in its
     /// `Version`. A peer that did not must never receive a channel message.
     channels: bool,
-    /// True if the `Version` we sent this peer advertised the channel
-    /// capability: we do only once channels are open at our tip.
-    told_channels: bool,
     /// Per-peer budget for channel messages. See [`CHAN_BUCKET_MAX`].
     chan_bucket: TokenBucket,
     /// Height announced by the peer at the handshake.
@@ -1637,43 +1634,6 @@ impl Node {
         }
     }
 
-    /// Channels are open at our tip: the links we dialed before, whose
-    /// `Version` did not advertise them, are dialed again, so that the peer
-    /// learns it and the channel transport may run over the new link (see
-    /// [`channel_link`]). A link the peer dialed is the peer's to redial.
-    /// Once per link: the new one advertises the capability.
-    fn redial_links_predating_channels(&self) {
-        if !self.channels_enabled() {
-            return;
-        }
-        let stale: Vec<(u64, SocketAddr)> = {
-            let g = self.shared.lock().unwrap();
-            // Where channels are open from the start, every link told it.
-            if !crate::policy::has_transition(g.network)
-                || !crate::policy::reached(g.network, g.chain.height())
-            {
-                return;
-            }
-            g.peers
-                .iter()
-                .filter(|(_, p)| {
-                    p.outbound
-                        && p.handshaked
-                        && !p.told_channels
-                        && follows_activation(g.network, p.version)
-                })
-                .map(|(id, p)| (*id, p.addr))
-                .collect()
-        };
-        for (id, addr) in stale {
-            self.disconnect(id);
-            let node = self.clone();
-            std::thread::spawn(move || {
-                let _ = node.connect(addr);
-            });
-        }
-    }
-
     /// Sends a channel message to `peer`, but only if that peer advertised the
     /// channel capability. Returns false if the peer is unknown or did not
     /// advertise it — so a node that does not speak the protocol is never sent
@@ -1726,11 +1686,6 @@ impl Node {
         }
         // Block by block, each at its own height: a commitment's height
         // starts its to-self delay and the penalty's deadline.
-        // A block that opens channels: the links dialed before learn it now,
-        // not at the next maintenance round.
-        if !txs.is_empty() {
-            self.redial_links_predating_channels();
-        }
         for (height, txs) in txs {
             self.drive_channels(&sink, &txs, height);
         }
@@ -2484,8 +2439,6 @@ impl Node {
             self.disconnect(id);
         }
         self.warn_peers_predating_activation();
-        // The links that predate the opening of channels, dialed again.
-        self.redial_links_predating_channels();
         // The channel component's timed work: a handshake to retry, one that
         // waited too long to forget.
         if let Some(sink) = self.channel_sink() {
@@ -2703,7 +2656,6 @@ impl Node {
                     ban_score: 0,
                     user_agent: String::new(),
                     channels: false,
-                    told_channels: false,
                     chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                     start_height: 0,
                     pending: HashMap::new(),
@@ -2727,11 +2679,8 @@ impl Node {
         if outbound {
             let open = self.channels_enabled();
             let (nonce, height, user_agent) = {
-                let mut g = self.shared.lock().unwrap();
+                let g = self.shared.lock().unwrap();
                 let open = open && crate::policy::reached(g.network, g.chain.height());
-                if let Some(p) = g.peers.get_mut(&id) {
-                    p.told_channels = open;
-                }
                 (g.nonce, g.chain.height(), self.user_agent(open))
             };
             let v = Message::Version {
@@ -3085,7 +3034,6 @@ impl Node {
                                 p.user_agent = user_agent.clone();
                                 if !p.version_sent {
                                     p.version_sent = true;
-                                    p.told_channels = open_at_handshake;
                                     outgoing.push(Outgoing {
                                         peer: id,
                                         message: Message::Version {
@@ -5743,7 +5691,6 @@ mod tests {
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
                 user_agent: String::new(),
                 channels: false,
-                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
@@ -6149,7 +6096,6 @@ mod tests_hardening {
                 cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
                 user_agent: String::new(),
                 channels: false,
-                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
@@ -7812,7 +7758,6 @@ mod tests_handler_fuzz {
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
                 user_agent: String::new(),
                 channels: false,
-                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
@@ -8647,7 +8592,6 @@ mod tests_handler_review {
                 cmpct_bucket: TokenBucket::for_compact_announcements(now),
                 user_agent: String::new(),
                 channels: false,
-                told_channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
