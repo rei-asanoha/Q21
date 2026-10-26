@@ -756,3 +756,32 @@ fn a_party_claiming_a_peers_key_cannot_lock_the_peer_out() {
         "the real peer is locked out"
     );
 }
+
+/// A dialer whose Inits go unanswered — a peer that follows the activation
+/// but runs no channels — backs off instead of asking every few seconds
+/// forever; a frame of the transport from the peer ends the backoff.
+#[test]
+fn unanswered_inits_back_off() {
+    let (ends, wire) = link(43, 44, "backoff");
+    let a = &ends[0];
+    a.t.set_dos_limits(DosLimits {
+        burst: 1000,
+        refill: Duration::from_millis(1),
+        timeout: Duration::from_millis(30),
+        ..DosLimits::default()
+    });
+    a.t.connect(a.conn, &a.link);
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(1200) {
+        std::thread::sleep(Duration::from_millis(5));
+        a.t.tick();
+    }
+    wire.lock().unwrap().clear();
+    let attempts = a.t.handshake_attempts();
+    // Without the backoff: one every 30 ms, some forty.
+    assert!((4..=10).contains(&attempts), "{attempts} attempts");
+    // The peer speaks the transport after all: asked again at once.
+    let reset = vec![transport::VERSION, transport::T_RESET];
+    a.t.deliver(a.conn, &a.link, &reset);
+    assert_eq!(a.t.handshake_attempts(), attempts + 1);
+}

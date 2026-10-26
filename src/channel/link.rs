@@ -41,6 +41,11 @@
 //!   few answers, and the real peer, on its own connection, keeps its share.
 //!   Our own outbound handshakes draw on no shared pool at all: only on
 //!   their connection's budget;
+//! - a dialer whose `Init`s go unanswered — a node that follows the activation
+//!   but runs no channels ignores them — backs off: after
+//!   [`UNANSWERED_BEFORE_BACKOFF`] of them, each retry waits twice as long as
+//!   the last, up to [`MAX_BACKOFF`]. Any frame of the transport from the peer
+//!   ends the backoff;
 //! - at most [`MAX_PENDING_HANDSHAKES`] responders wait for a `Fin` at once,
 //!   one per connection, each for [`HANDSHAKE_TIMEOUT`];
 //! - a handshake frame nobody asked for (`Resp` or `Fin` with no handshake
@@ -83,6 +88,10 @@ pub const KNOWN_HANDSHAKE_BURST: u32 = 16;
 pub const KNOWN_HANDSHAKES_PER_SEC: u32 = 2;
 /// Of which any one such key gets at once; then one per [`HANDSHAKE_REFILL`].
 pub const KNOWN_PER_PEER_BURST: u32 = 2;
+/// `Init`s gone unanswered on a connection before its retries back off.
+pub const UNANSWERED_BEFORE_BACKOFF: u32 = 3;
+/// Longest wait between two `Init`s on one connection.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 /// Responders waiting for their `Fin`, across all connections.
 pub const MAX_PENDING_HANDSHAKES: usize = 64;
 /// How long a handshake may wait for its next frame.
@@ -196,6 +205,10 @@ struct Conn {
     /// Responder: this connection claimed a channel peer's key and never
     /// proved it. It draws on the strangers' pool only.
     demoted: bool,
+    /// Initiator: `Init`s that timed out unanswered in a row.
+    unanswered: u32,
+    /// Initiator: no retry before then (see [`UNANSWERED_BEFORE_BACKOFF`]).
+    next_try: Option<Instant>,
 }
 
 /// What a handshake frame left to do once the connection's lock is released.
@@ -412,6 +425,8 @@ impl ChannelTransport {
             reset_sent: None,
             claimed_known: false,
             demoted: false,
+            unanswered: 0,
+            next_try: None,
         }));
         g.insert(peer, c.clone());
         Some(c)
@@ -718,6 +733,9 @@ impl ChannelTransport {
         else {
             return After::default();
         };
+        // The peer runs the transport: no more backing off.
+        c.unanswered = 0;
+        c.next_try = None;
         match ini.finish(self.mgr.identity(), bytes) {
             Ok((mut session, peer_info, fin)) => {
                 session.set_limits(*self.rekey.read().unwrap());
@@ -785,6 +803,8 @@ impl ChannelTransport {
                 ..After::default()
             };
         }
+        c.unanswered = 0;
+        c.next_try = None;
         // Initiating already: the responder never saw that `Init`, dropped
         // while it had not reached the activation yet. Started again.
         if matches!(c.handshake, Handshake::Initiating(..)) {
@@ -862,6 +882,15 @@ impl ChannelTransport {
             };
             if expired {
                 match c.handshake {
+                    // Unanswered: past a few, the next waits longer each time.
+                    Handshake::Initiating(..) => {
+                        c.unanswered = c.unanswered.saturating_add(1);
+                        if c.unanswered >= UNANSWERED_BEFORE_BACKOFF {
+                            let doublings = (c.unanswered - UNANSWERED_BEFORE_BACKOFF + 1).min(20);
+                            let wait = timeout.saturating_mul(1 << doublings).min(MAX_BACKOFF);
+                            c.next_try = Some(Instant::now() + wait);
+                        }
+                    }
                     // A key claimed, never proved.
                     Handshake::Responding(..) if c.claimed_known => {
                         c.claimed_known = false;
@@ -880,7 +909,8 @@ impl ChannelTransport {
                 c.reset_sent = None;
                 self.send_reset(peer, &mut c);
             }
-            if c.wanted {
+            let backed_off = c.next_try.is_some_and(|t| Instant::now() < t);
+            if c.wanted && !backed_off {
                 self.start_handshake(peer, &mut c);
             }
         }
