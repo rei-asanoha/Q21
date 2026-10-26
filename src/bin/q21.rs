@@ -3242,6 +3242,8 @@ fn cmd_mine(datadir: &Path, n: Option<&str>) -> Result<(), String> {
         }
     }
     write_snapshot(&e.datadir, &e.chain);
+    // The tip moved here too: the node keeps it at its next start, on a tie.
+    write_active_tip(&e.datadir, &e.chain.tip_id());
 
     // What remains pending is written again; what was just confirmed
     // disappears. Leaving the file as is would bring back to life, at the
@@ -3334,6 +3336,7 @@ fn cmd_send(
     e.archive.append(&block).map_err(|x| x.to_string())?;
     write_wallet(&e.datadir, &e.wallet)?;
     write_snapshot(&e.datadir, &e.chain);
+    write_active_tip(&e.datadir, &e.chain.tip_id());
 
     println!(
         "block {} mined — fees collected by the miner: {} Q21",
