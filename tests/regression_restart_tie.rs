@@ -100,27 +100,54 @@ fn stopped_during_a_tie(name: &str) -> Stopped {
         .unwrap();
     let pay = w.sign_spend(&c.utxo, prepared).unwrap();
     let coin = pay.inputs[0].prev_out;
-    let left = mine(
-        &mut c,
-        BURN,
-        SchemeId::LamportOts,
-        std::slice::from_ref(&pay),
-    );
 
-    // The rival, at the same height and of the same work, with a smaller id:
-    // the rule without a record picks it.
-    let mut k = 3u8;
-    let rival = loop {
-        let t = rival_chain.tip().time + TARGET_BLOCK_SECS;
-        let b = rival_chain
-            .mine_block(Hash256([k; 32]), SchemeId::LamportOts, &[], t, TRIES)
-            .unwrap();
-        if b.header.block_id() < left.header.block_id() {
-            rival_chain.connect(&b, t + 1).unwrap();
-            break b;
+    // The block the node ends up on (`left`, holding `pay`) and a rival at the
+    // same height and of the same work, with a smaller id: the rule without a
+    // record picks it. Block ids are random below the target, so candidates
+    // for both are drawn in turn until a pair is in that order. Searching on
+    // one side only can take arbitrarily long when the other side's id
+    // happens to be very small; with both sides drawn, the chance of no such
+    // pair after 16 rounds is about one in a hundred million.
+    let base_time = c.tip().time + TARGET_BLOCK_SECS;
+    let mut lefts: Vec<Block> = Vec::new();
+    let mut rivals: Vec<Block> = Vec::new();
+    let mut chosen = None;
+    for round in 0..16u64 {
+        lefts.push(
+            c.mine_block(
+                BURN,
+                SchemeId::LamportOts,
+                std::slice::from_ref(&pay),
+                base_time + round,
+                TRIES,
+            )
+            .expect("mining"),
+        );
+        let mut payee = [3u8; 32];
+        payee[..8].copy_from_slice(&round.to_le_bytes());
+        rivals.push(
+            rival_chain
+                .mine_block(
+                    Hash256(payee),
+                    SchemeId::LamportOts,
+                    &[],
+                    base_time + round,
+                    TRIES,
+                )
+                .expect("mining"),
+        );
+        let top = lefts.iter().max_by_key(|b| b.header.block_id()).unwrap();
+        let low = rivals.iter().min_by_key(|b| b.header.block_id()).unwrap();
+        if low.header.block_id() < top.header.block_id() {
+            chosen = Some((top.clone(), low.clone()));
+            break;
         }
-        k = k.wrapping_add(1);
-    };
+    }
+    let (left, rival) = chosen.expect("no rival with a smaller id in 16 rounds");
+    c.connect(&left, left.header.time + 1).expect("connect");
+    rival_chain
+        .connect(&rival, rival.header.time + 1)
+        .expect("connect");
     archive.append(&left).unwrap();
     archive.append(&rival).unwrap();
 

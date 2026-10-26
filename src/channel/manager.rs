@@ -1123,11 +1123,12 @@ impl ChannelManager {
         // alone, so such a channel takes only a reestablish, and is bound to
         // the session's node id once that proof verifies.
         match &msg {
-            ChMsg::Reestablish { nonce, .. } => {
-                if *nonce != from.binding || !bound_to(chan, peer_identity, from.legacy) {
-                    return Ok(Vec::new());
-                }
+            ChMsg::Reestablish { nonce, .. }
+                if *nonce != from.binding || !bound_to(chan, peer_identity, from.legacy) =>
+            {
+                return Ok(Vec::new());
             }
+            ChMsg::Reestablish { .. } => {}
             _ if chan.peer_identity != peer_identity => return Ok(Vec::new()),
             _ => {}
         }
