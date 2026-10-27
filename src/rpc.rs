@@ -3779,6 +3779,21 @@ impl RpcContext {
             }
         };
 
+        // The wallet's identity address, read before the wallet lock is
+        // taken (deriving it takes that lock too): a payment to it is the
+        // price of a name, and a movement carrying name outputs is a
+        // registration. Both are marked `"purpose": "name"`.
+        #[cfg(feature = "mldsa")]
+        let identity_owner: Option<Hash256> = self.wallet_identity().ok().map(|(_, o)| o);
+        #[cfg(not(feature = "mldsa"))]
+        let identity_owner: Option<Hash256> = None;
+        let for_name = |tx: &Transaction| {
+            tx.outputs.iter().any(|o| {
+                o.scheme.is_name()
+                    || (o.scheme == SchemeId::MlDsa87 && Some(o.pubkey_hash) == identity_owner)
+            })
+        };
+
         let g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
@@ -3931,6 +3946,9 @@ impl RpcContext {
                         .set("net_out", amount_json(Amount::from_units(net_out)))
                         .set("amount_out_known", Json::Bool(committed_complete));
                 }
+                if for_name(tx) {
+                    row = row.set("purpose", Json::str("name"));
+                }
                 v.push(row.build());
             }
 
@@ -3952,6 +3970,7 @@ impl RpcContext {
                 received: u64,
                 coinbase: bool,
                 inputs: Vec<(Hash256, u32)>,
+                name: bool,
             }
             let mut drafts: Vec<Draft> = Vec::new();
             let mut wanted: std::collections::HashSet<(Hash256, u32)> =
@@ -4017,6 +4036,7 @@ impl RpcContext {
                         received,
                         coinbase,
                         inputs,
+                        name: for_name(tx),
                     });
                 }
                 // The coins a row waits for, found in this block - including a
@@ -4065,6 +4085,9 @@ impl RpcContext {
                         .set("committed", amount_json(Amount::from_units(committed)))
                         .set("net_out", amount_json(Amount::from_units(net_out)))
                         .set("amount_out_known", Json::Bool(committed_complete));
+                }
+                if d.name {
+                    row = row.set("purpose", Json::str("name"));
                 }
                 v.push(row.build());
             }
@@ -5182,8 +5205,26 @@ mod tests {
         let pending = call_ok(&c, "namelookup", r#"{"name":"delbu"}"#);
         assert_eq!(pending.get("pending"), Some(&Json::Bool(true)));
         assert_eq!(pending.get("registered"), Some(&Json::Bool(false)));
+        // The activity tells the price of a name from a payment, before and
+        // after the block.
+        let funding = r
+            .get("funding_txid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let purpose_of = |c: &RpcContext| -> Option<String> {
+            let l = call_ok(c, "listtransactions", r#"{"limit":200}"#);
+            let Some(Json::Array(rows)) = l.get("movements") else {
+                panic!("no movements");
+            };
+            rows.iter()
+                .find(|m| m.get("txid").and_then(|v| v.as_str()) == Some(funding.as_str()))
+                .and_then(|m| m.get("purpose").and_then(|v| v.as_str()).map(String::from))
+        };
+        assert_eq!(purpose_of(&c).as_deref(), Some("name"));
 
         mine_pool(&c);
+        assert_eq!(purpose_of(&c).as_deref(), Some("name"));
         let found = call_ok(&c, "namelookup", r#"{"name":"delbu"}"#);
         assert_eq!(found.get("registered"), Some(&Json::Bool(true)));
         assert_eq!(
