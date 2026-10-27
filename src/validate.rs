@@ -19,6 +19,7 @@ use crate::amount::Amount;
 use crate::block::{Block, BlockError};
 use crate::consensus::*;
 use crate::emission::block_subsidy;
+use crate::names::{self, NameError};
 use crate::policy::{self, PolicyError};
 use crate::pow::{PowEngine, PowError};
 use crate::sig::{self, SchemeId, VerifyError};
@@ -135,6 +136,11 @@ pub enum ValidationError {
     /// inside a policy are reported as [`ValidationError::Signature`], so that
     /// an unavailable scheme keeps excusing the sender the same way.
     Policy(PolicyError),
+
+    // --- Names ---
+    /// A name registration breaks a rule of [`crate::names`], or an input
+    /// spends a name output.
+    Name(NameError),
 }
 
 impl ValidationError {
@@ -355,11 +361,37 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
         if !policy::scheme_allowed(output.scheme, network, height) {
             return Err(ValidationError::SchemeForbiddenOnNetwork(output.scheme));
         }
+        // The owner output of a name is a record worth zero by rule: the
+        // price sits on its tag, and `names::registration` checks both
+        // amounts exactly.
+        if output.scheme == SchemeId::NameKey {
+            continue;
+        }
         if output.value.units() < MIN_OUTPUT_VALUE {
             return Err(ValidationError::DustOutput {
                 minimum: MIN_OUTPUT_VALUE,
                 received: output.value.units(),
             });
+        }
+    }
+
+    // --- Rule: a name registration is well formed, signed by the key that
+    //     will own it, free, and within its owner's quota. All of it is
+    //     cheap and comes before any signature is verified.
+    if let Some(reg) = names::registration(tx).map_err(ValidationError::Name)? {
+        let signed_by_owner = tx.inputs.iter().any(|i| {
+            utxo.lookup(&i.prev_out).is_some_and(|e| {
+                e.output.scheme == SchemeId::MlDsa87 && e.output.pubkey_hash == reg.owner
+            })
+        });
+        if !signed_by_owner {
+            return Err(ValidationError::Name(NameError::NoOwnerInput));
+        }
+        if utxo.name_by_skeleton(&names::skeleton(&reg.name)).is_some() {
+            return Err(ValidationError::Name(NameError::Taken));
+        }
+        if utxo.names_owned(&reg.owner) >= MAX_NAMES_PER_OWNER {
+            return Err(ValidationError::Name(NameError::OwnerFull));
         }
     }
 
@@ -389,6 +421,14 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
         let e = utxo
             .lookup(&input.prev_out)
             .ok_or(ValidationError::MissingInput(input.prev_out))?;
+
+        // --- Rule: a name output is never spent. Its value is destroyed,
+        //     and the record it carries stays for good.
+        if !e.output.scheme.is_spendable() {
+            return Err(ValidationError::Name(NameError::Unspendable(
+                input.prev_out,
+            )));
+        }
 
         // --- Rule: coinbase maturity.
         if e.is_coinbase && height < e.height + COINBASE_MATURITY {
@@ -456,6 +496,10 @@ struct BlockView<'a> {
     confirmed: &'a UtxoSet,
     created: HashMap<OutPoint, crate::utxo::UtxoEntry>,
     spent: HashSet<OutPoint>,
+    /// Names registered by the previous transactions of the block, by
+    /// skeleton, and how many each owner registered.
+    named: HashMap<Vec<u8>, String>,
+    owned: HashMap<crate::hash::Hash256, usize>,
 }
 
 impl BlockView<'_> {
@@ -464,6 +508,10 @@ impl BlockView<'_> {
     fn apply(&mut self, tx: &Transaction, height: u64) {
         for e in &tx.inputs {
             self.spent.insert(e.prev_out);
+        }
+        if let Ok(Some(reg)) = names::registration(tx) {
+            self.named.insert(names::skeleton(&reg.name), reg.name);
+            *self.owned.entry(reg.owner).or_default() += 1;
         }
         let id = tx.txid();
         for (i, o) in tx.outputs.iter().enumerate() {
@@ -492,6 +540,17 @@ impl UtxoView for BlockView<'_> {
             .copied()
             .or_else(|| self.confirmed.lookup(o))
     }
+
+    fn name_by_skeleton(&self, skeleton: &[u8]) -> Option<String> {
+        self.named
+            .get(skeleton)
+            .cloned()
+            .or_else(|| self.confirmed.name_by_skeleton(skeleton))
+    }
+
+    fn names_owned(&self, owner: &crate::hash::Hash256) -> usize {
+        self.confirmed.names_owned(owner) + self.owned.get(owner).copied().unwrap_or(0)
+    }
 }
 
 /// The first transaction of `block` (index in the block, never the
@@ -511,6 +570,8 @@ pub fn first_invalid_transaction(
         confirmed: utxo,
         created: HashMap::new(),
         spent: HashSet::new(),
+        named: HashMap::new(),
+        owned: HashMap::new(),
     };
     for (i, tx) in block.transactions.iter().enumerate().skip(1) {
         if let Err(e) = check_transaction(tx, &view, network, height, &mut already_seen) {
@@ -603,6 +664,8 @@ pub fn check_block<E: PowEngine>(
         confirmed: utxo,
         created: HashMap::new(),
         spent: HashSet::new(),
+        named: HashMap::new(),
+        owned: HashMap::new(),
     };
     for tx in &block.transactions[1..] {
         let f = check_transaction(tx, &view, ctx.network, ctx.height, &mut already_seen)?;
@@ -705,8 +768,13 @@ pub fn check_block<E: PowEngine>(
         });
     }
 
-    // --- Rule: the coinbase outputs respect the network.
+    // --- Rule: the coinbase outputs respect the network, and never register
+    //     a name: a registration must pass the rules of
+    //     `check_transaction`, which a coinbase does not go through.
     for output in &block.transactions[0].outputs {
+        if output.scheme.is_name() {
+            return Err(ValidationError::Name(NameError::InCoinbase));
+        }
         if !policy::scheme_allowed(output.scheme, ctx.network, ctx.height) {
             return Err(ValidationError::SchemeForbiddenOnNetwork(output.scheme));
         }

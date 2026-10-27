@@ -33,6 +33,7 @@ use crate::memhard;
 use crate::net::Node;
 use crate::sig::SchemeId;
 use crate::tx::Transaction;
+use crate::utxo::UtxoView;
 use crate::wallet::Wallet;
 use std::sync::{Arc, Mutex};
 
@@ -97,6 +98,7 @@ fn mempool_message(e: &crate::mempool::MempoolError) -> String {
              clearly more than the ones it would push out. Raise the fee, or send again \
              after the next block: each one makes room."
             .to_string(),
+        M::Validation(crate::validate::ValidationError::Name(n)) => format!("{n}"),
         M::Validation(v) => format!("rejected by validation: {v:?}"),
     }
 }
@@ -797,22 +799,40 @@ fn tx_json(t: &Transaction, network: Network) -> Json {
         .outputs
         .iter()
         .map(|o| {
-            Json::obj()
+            // A name output designates no address of its own: the tag holds
+            // the name, and the owner output the address of the identity key
+            // that owns it.
+            let address_scheme = match o.scheme {
+                SchemeId::NameKey => SchemeId::MlDsa87,
+                s => s,
+            };
+            let address = if o.scheme == SchemeId::NameTag {
+                String::new()
+            } else {
+                crate::address::Address {
+                    network,
+                    scheme: address_scheme,
+                    hash: o.pubkey_hash,
+                }
+                .to_string_bech32()
+            };
+            let mut j = Json::obj()
                 .set("value", amount_json(o.value))
                 .set("scheme", Json::str(o.scheme.name()))
                 .set("key_hash", Json::str(o.pubkey_hash.to_hex()))
-                .set(
-                    "address",
-                    Json::str(
-                        crate::address::Address {
-                            network,
-                            scheme: o.scheme,
-                            hash: o.pubkey_hash,
-                        }
-                        .to_string_bech32(),
-                    ),
-                )
-                .build()
+                .set("address", Json::str(address));
+            if o.scheme == SchemeId::NameTag {
+                j = j.set(
+                    "name",
+                    crate::names::decode(&o.pubkey_hash.0)
+                        .map(Json::str)
+                        .unwrap_or(Json::Null),
+                );
+            }
+            if !o.scheme.is_spendable() {
+                j = j.set("unspendable", Json::Bool(true));
+            }
+            j.build()
         })
         .collect();
 
@@ -1197,6 +1217,25 @@ impl RpcContext {
             ),
             ("channellist", "[wallet] Open channels"),
             ("channelinfo", "[wallet] One channel's state (channel_id)"),
+            (
+                "channelidentity",
+                "[wallet] This wallet's identity: node id, identity address, names",
+            ),
+            (
+                "nameregister",
+                "[wallet] Register a name for this wallet's identity, for 0.5 Q21 destroyed (name)",
+            ),
+            ("namelist", "[wallet] The names of this wallet's identity"),
+        ]);
+        m.extend([
+            (
+                "namecheck",
+                "Whether a name is valid and free, and what it costs (name)",
+            ),
+            (
+                "namelookup",
+                "The identity that owns a name, or the registered name it looks like (name)",
+            ),
         ]);
         m
     }
@@ -1423,6 +1462,414 @@ impl RpcContext {
             .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))
     }
 
+    // -----------------------------------------------------------------------
+    // Names (see `crate::names`)
+    // -----------------------------------------------------------------------
+
+    /// The `name` parameter, as the canonical name it designates.
+    fn name_param(params: &Json) -> Result<String, Json> {
+        let raw = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'name' expected"))?;
+        crate::names::normalize(raw).ok_or_else(|| {
+            rpc_error(
+                ERR_PARAMS,
+                &format!(
+                    "not a valid name: {NAME_MIN_LEN} to {NAME_MAX_LEN} characters, \
+                     lowercase letters a-z, digits and hyphens, the hyphen neither first nor last"
+                ),
+            )
+        })
+    }
+
+    /// Whether `name` is valid and free, what it costs, and when names open.
+    fn namecheck(&self, params: &Json) -> Result<Json, Json> {
+        let name = Self::name_param(params)?;
+        let tip = self.node.height();
+        let skeleton = crate::names::skeleton(&name);
+        let taken = self
+            .node
+            .with_chain_and_mempool(|c, m| m.view(&c.utxo).name_by_skeleton(&skeleton));
+        let h = crate::names::activation_height(self.network);
+        let opt = |v: u64| {
+            if v == u64::MAX {
+                Json::Null
+            } else {
+                Json::u64(v)
+            }
+        };
+        Ok(Json::obj()
+            .set("name", Json::str(name.clone()))
+            .set("available", Json::Bool(taken.is_none()))
+            .set("taken_by", taken.map(Json::str).unwrap_or(Json::Null))
+            .set("price", amount_json(Amount::from_units(NAME_PRICE)))
+            .set("activation_height", opt(h))
+            .set("tip", Json::u64(tip))
+            .set(
+                "active",
+                Json::Bool(crate::names::reached(self.network, tip)),
+            )
+            .build())
+    }
+
+    /// The identity that owns `name`, or the registered name it is a
+    /// look-alike of, or nothing.
+    fn namelookup(&self, params: &Json) -> Result<Json, Json> {
+        let name = Self::name_param(params)?;
+        let skeleton = crate::names::skeleton(&name);
+        let network = self.network;
+        self.node.with_chain_and_mempool(|c, m| {
+            let tip = c.height();
+            if let Some(r) = c.utxo.names().get(&name) {
+                return Ok(Json::obj()
+                    .set("name", Json::str(name.clone()))
+                    .set("registered", Json::Bool(true))
+                    .set("pending", Json::Bool(false))
+                    .set("owner", Json::str(r.owner.to_hex()))
+                    .set(
+                        "owner_address",
+                        Json::str(
+                            Address {
+                                network,
+                                scheme: SchemeId::MlDsa87,
+                                hash: r.owner,
+                            }
+                            .to_string_bech32(),
+                        ),
+                    )
+                    .set("height", Json::u64(r.height))
+                    .set("confirmations", Json::u64(tip + 1 - r.height.min(tip)))
+                    .set("txid", Json::str(r.tag.txid.to_hex()))
+                    .build());
+            }
+            let pending = m
+                .pending_registrations()
+                .into_iter()
+                .find(|(r, _)| r.name == name);
+            let similar = m
+                .view(&c.utxo)
+                .name_by_skeleton(&skeleton)
+                .filter(|n| *n != name);
+            Ok(Json::obj()
+                .set("name", Json::str(name.clone()))
+                .set("registered", Json::Bool(false))
+                .set("pending", Json::Bool(pending.is_some()))
+                .set(
+                    "txid",
+                    pending
+                        .map(|(_, t)| Json::str(t.to_hex()))
+                        .unwrap_or(Json::Null),
+                )
+                .set("similar", similar.map(Json::str).unwrap_or(Json::Null))
+                .build())
+        })
+    }
+
+    /// The identity key of the wallet, derived from its seed: the key its
+    /// channel sessions prove and its names belong to.
+    #[cfg(feature = "mldsa")]
+    fn wallet_identity(
+        &self,
+    ) -> Result<(crate::channel::keys::NodeIdentity, crate::hash::Hash256), Json> {
+        let w = self.require_wallet()?;
+        let seed = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?
+            .channel_seed();
+        let identity = crate::channel::keys::NodeIdentity::derive(&seed);
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, identity.pubkey());
+        Ok((identity, owner))
+    }
+
+    /// The names of `owner`, registered and pending.
+    #[cfg(feature = "mldsa")]
+    fn names_json(&self, owner: &crate::hash::Hash256) -> Json {
+        self.node.with_chain_and_mempool(|c, m| {
+            let tip = c.height();
+            let mut v: Vec<Json> = c
+                .utxo
+                .names()
+                .names_of(owner)
+                .into_iter()
+                .filter_map(|n| c.utxo.names().get(&n).map(|r| (n, r)))
+                .map(|(n, r)| {
+                    Json::obj()
+                        .set("name", Json::str(n))
+                        .set("pending", Json::Bool(false))
+                        .set("height", Json::u64(r.height))
+                        .set("confirmations", Json::u64(tip + 1 - r.height.min(tip)))
+                        .set("txid", Json::str(r.tag.txid.to_hex()))
+                        .build()
+                })
+                .collect();
+            for (r, txid) in m.pending_registrations() {
+                if r.owner == *owner {
+                    v.push(
+                        Json::obj()
+                            .set("name", Json::str(r.name))
+                            .set("pending", Json::Bool(true))
+                            .set("height", Json::Null)
+                            .set("confirmations", Json::u64(0))
+                            .set("txid", Json::str(txid.to_hex()))
+                            .build(),
+                    );
+                }
+            }
+            Json::array(v)
+        })
+    }
+
+    /// The wallet's identity: its node id (what its channel peers see), the
+    /// address of its identity key, and its names.
+    #[cfg(feature = "mldsa")]
+    fn channelidentity(&self) -> Result<Json, Json> {
+        let (identity, owner) = self.wallet_identity()?;
+        Ok(Json::obj()
+            .set("node_id", Json::str(identity.id().to_hex()))
+            .set(
+                "identity_address",
+                Json::str(
+                    Address {
+                        network: self.network,
+                        scheme: SchemeId::MlDsa87,
+                        hash: owner,
+                    }
+                    .to_string_bech32(),
+                ),
+            )
+            .set("names", self.names_json(&owner))
+            .set("max_names", Json::u64(MAX_NAMES_PER_OWNER as u64))
+            .build())
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn namelist(&self) -> Result<Json, Json> {
+        let (_, owner) = self.wallet_identity()?;
+        Ok(self.names_json(&owner))
+    }
+
+    /// The fee of a registration at `rate`: one ML-DSA-87 input, the tag,
+    /// the owner output and a change output, measured on the transaction
+    /// itself rather than estimated.
+    #[cfg(feature = "mldsa")]
+    fn registration_fee(rate: u64) -> u64 {
+        let out = |scheme| crate::tx::TxOut {
+            value: Amount::ZERO,
+            scheme,
+            pubkey_hash: crate::hash::Hash256::ZERO,
+        };
+        let probe = Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn {
+                prev_out: crate::tx::OutPoint {
+                    txid: crate::hash::Hash256::ZERO,
+                    index: 0,
+                },
+                witness: crate::tx::Witness {
+                    pubkey: vec![0; SchemeId::MlDsa87.pubkey_len()],
+                    signature: vec![0; SchemeId::MlDsa87.sig_len()],
+                },
+                sequence: 0,
+            }],
+            outputs: vec![
+                out(SchemeId::NameTag),
+                out(SchemeId::NameKey),
+                out(SchemeId::MlDsa87),
+            ],
+            lock_time: 0,
+        };
+        probe
+            .weight(WITNESS_DISCOUNT)
+            .saturating_mul(rate)
+            .div_ceil(1000)
+            .max(DEFAULT_FEE)
+    }
+
+    /// Registers `name` for the wallet's identity key.
+    ///
+    /// Two transactions, sent together: the wallet pays the price and the
+    /// fee of the registration to its identity address, then the identity
+    /// key spends that coin into the two name outputs. The second spends
+    /// the first before it is confirmed, so both enter the same block or
+    /// the next ones. An identity coin left by an earlier attempt is used
+    /// first, and nothing is paid twice.
+    #[cfg(feature = "mldsa")]
+    fn nameregister(&self, params: &Json) -> Result<Json, Json> {
+        let name = Self::name_param(params)?;
+        let w = self.require_wallet()?;
+        let tip = self.node.height();
+        if !crate::names::reached(self.network, tip) {
+            let h = crate::names::activation_height(self.network);
+            return Err(rpc_error(
+                ERR_REQUEST,
+                &if h == u64::MAX {
+                    "names are not available on this network".to_string()
+                } else {
+                    format!(
+                        "names open at block {h}; the tip is at {tip}: {} blocks to go",
+                        h.saturating_sub(tip + 1)
+                    )
+                },
+            ));
+        }
+        let (identity, owner) = self.wallet_identity()?;
+        let identity_address = Address {
+            network: self.network,
+            scheme: SchemeId::MlDsa87,
+            hash: owner,
+        };
+        let skeleton = crate::names::skeleton(&name);
+
+        // 1. Is the name free, the quota not reached, and is there already a
+        //    coin of the identity to spend?
+        let checked = self.node.with_chain_and_mempool(|c, m| {
+            let view = m.view(&c.utxo);
+            if let Some(taken) = view.name_by_skeleton(&skeleton) {
+                return Err(if taken == name {
+                    format!("the name {name} is already taken")
+                } else {
+                    format!("the name {name} is too close to {taken}, already taken")
+                });
+            }
+            if view.names_owned(&owner) >= MAX_NAMES_PER_OWNER {
+                return Err(format!(
+                    "this wallet already holds {MAX_NAMES_PER_OWNER} names, the most allowed"
+                ));
+            }
+            let rate = m
+                .median_fee_rate()
+                .unwrap_or(0)
+                .max(crate::mempool::MIN_FEE_RATE);
+            let fee = Self::registration_fee(rate);
+            let needed = NAME_PRICE + fee;
+            let identity_coin =
+                |o: &crate::tx::TxOut| o.scheme == SchemeId::MlDsa87 && o.pubkey_hash == owner;
+            let confirmed = c
+                .utxo
+                .spendable_for(&owner, c.height(), COINBASE_MATURITY)
+                .into_iter()
+                .filter(|(o, _)| !m.spends(o))
+                .map(|(o, e)| (o, e.output));
+            let coin = confirmed
+                .chain(m.unspent_created(&identity_coin))
+                .filter(|(_, o)| o.value.units() >= needed)
+                .min_by_key(|(_, o)| o.value.units());
+            Ok((fee, coin))
+        });
+        let (fee, coin) = checked.map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+
+        // 2. Fund the identity, unless an earlier attempt already did.
+        let (funding, coin) = match coin {
+            Some(c) => (None, c),
+            None => {
+                let (ftx, ftxid, _) = self.spend(
+                    w,
+                    &[(identity_address, Amount::from_units(NAME_PRICE + fee))],
+                    None,
+                )?;
+                self.node.announce_tx(ftxid);
+                let index = ftx
+                    .outputs
+                    .iter()
+                    .position(|o| o.scheme == SchemeId::MlDsa87 && o.pubkey_hash == owner)
+                    .ok_or_else(|| rpc_error(ERR_INTERNAL, "funding output not found"))?;
+                (
+                    Some(ftxid),
+                    (
+                        crate::tx::OutPoint {
+                            txid: ftxid,
+                            index: index as u32,
+                        },
+                        ftx.outputs[index],
+                    ),
+                )
+            }
+        };
+
+        // 3. The registration itself: the tag, the owner output, and the
+        //    change of a larger identity coin back to the wallet.
+        let mut outputs = vec![
+            crate::tx::TxOut {
+                value: Amount::from_units(NAME_PRICE),
+                scheme: SchemeId::NameTag,
+                pubkey_hash: crate::hash::Hash256(
+                    crate::names::encode(&name).expect("normalized above"),
+                ),
+            },
+            crate::tx::TxOut {
+                value: Amount::ZERO,
+                scheme: SchemeId::NameKey,
+                pubkey_hash: owner,
+            },
+        ];
+        let excess = coin.1.value.units().saturating_sub(NAME_PRICE + fee);
+        // Change below the dust floor goes to the fee, as in a send.
+        let paid_fee = if excess >= MIN_OUTPUT_VALUE {
+            fee
+        } else {
+            fee + excess
+        };
+        if excess >= MIN_OUTPUT_VALUE {
+            let mut g = w
+                .lock()
+                .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+            let change = g.new_address();
+            if self.save_wallet(&g).is_err() {
+                return Err(rpc_error(
+                    ERR_WALLET,
+                    wallet_message(&crate::wallet::WalletError::SaveFailed),
+                ));
+            }
+            outputs.push(crate::tx::TxOut {
+                value: Amount::from_units(excess),
+                scheme: change.scheme,
+                pubkey_hash: change.hash,
+            });
+        }
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn {
+                prev_out: coin.0,
+                witness: crate::tx::Witness {
+                    pubkey: identity.pubkey().to_vec(),
+                    signature: vec![],
+                },
+                sequence: 0,
+            }],
+            outputs,
+            lock_time: 0,
+        };
+        let message = tx.sighash(0, self.network, &coin.1);
+        tx.inputs[0].witness.signature = identity.sign(&message);
+
+        let accepted = self
+            .node
+            .with_chain_and_mempool(|c, m| m.accept_local(&tx, &c.utxo, self.network, c.height()));
+        let txid = accepted.map_err(|e| {
+            rpc_error(
+                ERR_WALLET,
+                &format!(
+                    "{}; the price stays on the identity address, and registering again \
+                     uses it without paying twice",
+                    mempool_message(&e)
+                ),
+            )
+        })?;
+        self.node.announce_tx(txid);
+        Ok(Json::obj()
+            .set("name", Json::str(name))
+            .set("txid", Json::str(txid.to_hex()))
+            .set(
+                "funding_txid",
+                funding.map(|t| Json::str(t.to_hex())).unwrap_or(Json::Null),
+            )
+            .set("price", amount_json(Amount::from_units(NAME_PRICE)))
+            .set("fee", amount_json(Amount::from_units(paid_fee)))
+            .set("owner", Json::str(owner.to_hex()))
+            .build())
+    }
+
     /// The methods that sign and send funds, on chain or in a channel.
     fn moves_funds(method: &str) -> bool {
         matches!(
@@ -1433,6 +1880,7 @@ impl RpcContext {
                 | "channelopen"
                 | "channelpay"
                 | "channelclose"
+                | "nameregister"
         )
     }
 
@@ -1511,6 +1959,14 @@ impl RpcContext {
             "channellist" => self.channellist(),
             #[cfg(feature = "mldsa")]
             "channelinfo" => self.channelinfo(params),
+            #[cfg(feature = "mldsa")]
+            "channelidentity" => self.channelidentity(),
+            #[cfg(feature = "mldsa")]
+            "nameregister" => self.nameregister(params),
+            #[cfg(feature = "mldsa")]
+            "namelist" => self.namelist(),
+            "namecheck" => self.namecheck(params),
+            "namelookup" => self.namelookup(params),
             other => Err(rpc_error(
                 ERR_METHOD,
                 &format!("unknown method: {other}. Try listmethods."),
@@ -1948,12 +2404,25 @@ impl RpcContext {
     }
 
     fn getsupply(&self) -> Json {
-        let (issued, utxo) = self
-            .node
-            .with_chain(|c| (c.total_issued(), c.utxo.total_value()));
+        let (issued, utxo, names, burned) = self.node.with_chain(|c| {
+            (
+                c.total_issued(),
+                c.utxo.total_value(),
+                c.utxo.names().len() as u64,
+                c.utxo.names().burned(),
+            )
+        });
         Json::obj()
             .set("issued", amount_json(issued))
             .set("in_utxo_set", amount_json(utxo))
+            // The prices of the names sit in outputs that can never be
+            // spent: counted in the set, out of circulation for good.
+            .set("burned_by_names", amount_json(Amount::from_units(burned)))
+            .set(
+                "spendable",
+                amount_json(Amount::from_units(utxo.units().saturating_sub(burned))),
+            )
+            .set("names", Json::u64(names))
             .set("cap", amount_json(Amount::from_units(MAX_SUPPLY)))
             .set("cap_q21", Json::u64(MAX_SUPPLY_COINS))
             .set("under_cap", Json::Bool(issued.units() <= MAX_SUPPLY))
@@ -4225,6 +4694,128 @@ mod tests {
         });
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
         jparse(&c.handle(&body)).expect("valid JSON response")
+    }
+
+    /// Mines the pool into one block on the context's chain, and lets the
+    /// pool see it, as a node does with a block it accepts.
+    #[cfg(feature = "mldsa")]
+    fn mine_pool(c: &RpcContext) {
+        c.node.with_chain_and_mempool(|ch, m| {
+            let txs = m.ordered_transactions();
+            let h = ch.height() + 1;
+            let t = crate::chain::GENESIS_TIME + h * TARGET_BLOCK_SECS;
+            let b = ch
+                .mine_block(Hash256([0x77; 32]), SchemeId::MlDsa87, &txs, t, 5_000_000)
+                .expect("mining");
+            ch.connect(&b, t + 1).expect("connect");
+            m.on_block_connected(&b);
+            m.revalidate(&ch.utxo, NETWORK, ch.height());
+        });
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn error_text(r: &Json) -> String {
+        r.get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// A wallet registers its name in one call: it pays its identity, its
+    /// identity registers, and one block confirms both. The name is then
+    /// taken for good, look-alikes too, and the quota holds.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_wallet_registers_its_name_end_to_end() {
+        let c = context_with_funds();
+        // Rewards start small: enough mature blocks to pay three names.
+        let w = c.wallet.clone().unwrap();
+        c.node.with_chain(|ch| {
+            for _ in 0..120 {
+                let a = w.lock().unwrap().new_address();
+                let h = ch.height() + 1;
+                let t = crate::chain::GENESIS_TIME + h * TARGET_BLOCK_SECS;
+                let b = ch
+                    .mine_block(a.hash, a.scheme, &[], t, 5_000_000)
+                    .expect("mining");
+                ch.connect(&b, t + 1).expect("connect");
+            }
+        });
+        let id = call_ok(&c, "channelidentity", "{}");
+        let address = id
+            .get("identity_address")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(id.get("names"), Some(&Json::array(vec![])));
+
+        let check = call_ok(&c, "namecheck", r#"{"name":"@Delbu"}"#);
+        assert_eq!(check.get("name").and_then(|v| v.as_str()), Some("delbu"));
+        assert_eq!(check.get("available"), Some(&Json::Bool(true)));
+        assert_eq!(check.get("active"), Some(&Json::Bool(true)));
+
+        let r = call_ok(&c, "nameregister", r#"{"name":"@Delbu"}"#);
+        assert_eq!(r.get("name").and_then(|v| v.as_str()), Some("delbu"));
+        assert!(r.get("funding_txid").and_then(|v| v.as_str()).is_some());
+        let pending = call_ok(&c, "namelookup", r#"{"name":"delbu"}"#);
+        assert_eq!(pending.get("pending"), Some(&Json::Bool(true)));
+        assert_eq!(pending.get("registered"), Some(&Json::Bool(false)));
+
+        mine_pool(&c);
+        let found = call_ok(&c, "namelookup", r#"{"name":"delbu"}"#);
+        assert_eq!(found.get("registered"), Some(&Json::Bool(true)));
+        assert_eq!(
+            found.get("owner_address").and_then(|v| v.as_str()),
+            Some(address.as_str())
+        );
+        let supply = call_ok(&c, "getsupply", "{}");
+        assert_eq!(supply.get("names").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            supply
+                .get("burned_by_names")
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64()),
+            Some(NAME_PRICE)
+        );
+
+        // Taken, and so are its look-alikes.
+        let again = call(&c, "nameregister", r#"{"name":"delbu"}"#);
+        assert!(
+            error_text(&again).contains("already taken"),
+            "{}",
+            again.encode()
+        );
+        let twin = call(&c, "nameregister", r#"{"name":"de1bu"}"#);
+        assert!(
+            error_text(&twin).contains("too close to delbu"),
+            "{}",
+            twin.encode()
+        );
+        let similar = call_ok(&c, "namelookup", r#"{"name":"del-bu"}"#);
+        assert_eq!(
+            similar.get("similar").and_then(|v| v.as_str()),
+            Some("delbu")
+        );
+
+        // Three names per identity.
+        call_ok(&c, "nameregister", r#"{"name":"second"}"#);
+        mine_pool(&c);
+        call_ok(&c, "nameregister", r#"{"name":"third"}"#);
+        let full = call(&c, "nameregister", r#"{"name":"fourth"}"#);
+        assert!(error_text(&full).contains("3 names"), "{}", full.encode());
+        mine_pool(&c);
+        let list = call_ok(&c, "namelist", "{}");
+        let names: Vec<&str> = match &list {
+            Json::Array(v) => v
+                .iter()
+                .filter_map(|j| j.get("name").and_then(|n| n.as_str()))
+                .collect(),
+            _ => panic!("not a list"),
+        };
+        assert_eq!(names, ["delbu", "second", "third"]);
+        let bad = call(&c, "namecheck", r#"{"name":"ab"}"#);
+        assert!(error_text(&bad).contains("not a valid name"));
     }
 
     /// `channelopen` rejects a delay or depth out of range instead of cutting it

@@ -108,6 +108,9 @@ pub struct MempoolEntry {
     /// transaction can enter a block only from the activation height on, and
     /// is offered only to the peers that follow the activation.
     pub policy: bool,
+    /// Registers a name ([`crate::names`]): offered only to the peers that
+    /// read name outputs ([`crate::wire::NAME_ACTIVATION_VERSION`]).
+    pub name: bool,
 }
 
 impl MempoolEntry {
@@ -277,6 +280,10 @@ pub struct MempoolView<'a> {
     /// Outputs already consumed by the mempool: invisible, even if they still
     /// exist in the confirmed set.
     spent: &'a HashMap<OutPoint, Hash256>,
+    /// Names the pool's transactions register, by skeleton.
+    names: &'a HashMap<Vec<u8>, (String, Hash256)>,
+    /// How many names each owner registers in the pool.
+    owned: &'a HashMap<Hash256, usize>,
 }
 
 impl UtxoView for MempoolView<'_> {
@@ -288,6 +295,20 @@ impl UtxoView for MempoolView<'_> {
             return None;
         }
         self.confirmed.lookup(o)
+    }
+
+    /// A name pending in the pool counts as taken: a second registration of
+    /// it, or of a look-alike, is refused at the door instead of building an
+    /// invalid block later.
+    fn name_by_skeleton(&self, skeleton: &[u8]) -> Option<String> {
+        self.names
+            .get(skeleton)
+            .map(|(n, _)| n.clone())
+            .or_else(|| self.confirmed.name_by_skeleton(skeleton))
+    }
+
+    fn names_owned(&self, owner: &Hash256) -> usize {
+        self.confirmed.names_owned(owner) + self.owned.get(owner).copied().unwrap_or(0)
     }
 }
 
@@ -323,6 +344,10 @@ pub struct Mempool {
     /// The latest such count per returned entry: a transaction returned
     /// twice keeps the later date, and its older record is stale.
     returned_at: HashMap<Hash256, u64>,
+    /// Names registered by pooled transactions: skeleton -> (name, txid).
+    pending_names: HashMap<Vec<u8>, (String, Hash256)>,
+    /// Names registered by pooled transactions, per owner.
+    pending_owned: HashMap<Hash256, usize>,
 }
 
 impl Mempool {
@@ -451,7 +476,32 @@ impl Mempool {
             confirmed,
             overlay: &self.created,
             spent: &self.committed,
+            names: &self.pending_names,
+            owned: &self.pending_owned,
         }
+    }
+
+    /// Does this pooled transaction register a name? See
+    /// [`MempoolEntry::name`].
+    pub fn touches_names(&self, txid: &Hash256) -> bool {
+        self.entries.get(txid).is_some_and(|e| e.name)
+    }
+
+    /// The registrations waiting in the pool, sorted by name.
+    pub fn pending_registrations(&self) -> Vec<(crate::names::Registration, Hash256)> {
+        let mut v: Vec<(crate::names::Registration, Hash256)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.name)
+            .filter_map(|(id, e)| {
+                crate::names::registration(&e.tx)
+                    .ok()
+                    .flatten()
+                    .map(|r| (r, *id))
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        v
     }
 
     /// Does this pooled transaction create or spend a policy output? See
@@ -684,6 +734,8 @@ impl Mempool {
             confirmed: utxo,
             overlay: &self.created,
             spent: &self.committed,
+            names: &self.pending_names,
+            owned: &self.pending_owned,
         };
         let announced_fees = apparent_fees(tx, &view)?;
         let announced_rate = announced_fees.saturating_mul(1000) / weight.max(1);
@@ -717,6 +769,7 @@ impl Mempool {
                 view.lookup(&i.prev_out)
                     .is_some_and(|e| e.output.scheme == SchemeId::Policy)
             });
+        let registered = crate::names::registration(tx).ok().flatten();
         let entry = MempoolEntry {
             tx: tx.clone(),
             fee,
@@ -726,6 +779,7 @@ impl Mempool {
             local,
             returned,
             policy,
+            name: registered.is_some(),
         };
 
         // --- Abuse: flooding for free.
@@ -745,6 +799,11 @@ impl Mempool {
 
         self.counter += 1;
         self.bytes += size;
+        if let Some(reg) = registered {
+            *self.pending_owned.entry(reg.owner).or_default() += 1;
+            self.pending_names
+                .insert(crate::names::skeleton(&reg.name), (reg.name, txid));
+        }
         for e in &tx.inputs {
             self.committed.insert(e.prev_out, txid);
         }
@@ -1012,6 +1071,20 @@ impl Mempool {
     fn remove_one(&mut self, txid: &Hash256) -> Option<MempoolEntry> {
         let e = self.entries.remove(txid)?;
         self.evictable.remove(&Self::eviction_key(txid, &e));
+        if e.name {
+            if let Ok(Some(reg)) = crate::names::registration(&e.tx) {
+                let sk = crate::names::skeleton(&reg.name);
+                if self.pending_names.get(&sk).is_some_and(|(_, t)| t == txid) {
+                    self.pending_names.remove(&sk);
+                }
+                if let Some(n) = self.pending_owned.get_mut(&reg.owner) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        self.pending_owned.remove(&reg.owner);
+                    }
+                }
+            }
+        }
         self.bytes = self.bytes.saturating_sub(e.size);
         for input in &e.tx.inputs {
             if self.committed.get(&input.prev_out) == Some(txid) {
@@ -1372,6 +1445,53 @@ impl Mempool {
                 // `remove` takes the descendants along.
                 self.remove(&id);
             }
+        }
+        // The same for names, which open at a height of their own.
+        if !crate::names::is_active(network, height + 1) {
+            let dormant: Vec<Hash256> = self
+                .entries
+                .iter()
+                .filter(|(_, e)| e.name)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in dormant {
+                self.remove(&id);
+            }
+        }
+        // A block may have registered, from another pool, a name this pool
+        // still holds a registration of, or a look-alike of it, or filled
+        // an owner's quota. What can no longer enter a block leaves.
+        let mut by_owner: HashMap<Hash256, Vec<(u64, Hash256)>> = HashMap::new();
+        let mut clashing: Vec<Hash256> = Vec::new();
+        for (id, e) in &self.entries {
+            if !e.name {
+                continue;
+            }
+            match crate::names::registration(&e.tx) {
+                Ok(Some(reg)) => {
+                    if utxo
+                        .name_by_skeleton(&crate::names::skeleton(&reg.name))
+                        .is_some()
+                    {
+                        clashing.push(*id);
+                    } else {
+                        by_owner
+                            .entry(reg.owner)
+                            .or_default()
+                            .push((e.arrival, *id));
+                    }
+                }
+                _ => clashing.push(*id),
+            }
+        }
+        for (owner, mut pending) in by_owner {
+            let room =
+                crate::consensus::MAX_NAMES_PER_OWNER.saturating_sub(utxo.names_owned(&owner));
+            pending.sort_unstable();
+            clashing.extend(pending.into_iter().skip(room).map(|(_, id)| id));
+        }
+        for id in clashing {
+            self.remove(&id);
         }
         loop {
             let mut orphans: Vec<Hash256> = Vec::new();
@@ -2120,11 +2240,7 @@ mod tests_chains {
         m.accept(&tx, &c.utxo, NETWORK, c.height())
             .expect("acceptance");
 
-        let view = MempoolView {
-            confirmed: &c.utxo,
-            overlay: &m.created,
-            spent: &m.committed,
-        };
+        let view = m.view(&c.utxo);
         assert!(c.utxo.contains(&consumed), "the output is still confirmed");
         assert!(
             view.lookup(&consumed).is_none(),

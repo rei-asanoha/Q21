@@ -21,11 +21,27 @@ use std::collections::{HashMap, HashSet};
 /// linear in the size of the chain for every acceptance.
 pub trait UtxoView {
     fn lookup(&self, o: &OutPoint) -> Option<UtxoEntry>;
+
+    /// The registered name whose skeleton is `skeleton`, if any
+    /// ([`crate::names::skeleton`]). No default on purpose: a view that
+    /// forgot the registry would let a name be taken twice.
+    fn name_by_skeleton(&self, skeleton: &[u8]) -> Option<String>;
+
+    /// How many names `owner` holds in this view.
+    fn names_owned(&self, owner: &crate::hash::Hash256) -> usize;
 }
 
 impl UtxoView for UtxoSet {
     fn lookup(&self, o: &OutPoint) -> Option<UtxoEntry> {
         self.get(o).copied()
+    }
+
+    fn name_by_skeleton(&self, skeleton: &[u8]) -> Option<String> {
+        self.names.by_skeleton(skeleton)
+    }
+
+    fn names_owned(&self, owner: &crate::hash::Hash256) -> usize {
+        self.names.owned(owner)
     }
 }
 
@@ -71,6 +87,10 @@ pub struct UtxoSet {
     /// index by public key hash, it is entirely derived from `map` and does
     /// not take part in equality.
     muhash: crate::muhash::MuHash,
+    /// Derived index: the registry of names ([`crate::names`]), built from
+    /// the name outputs as they enter and leave. Like the two above, it does
+    /// not take part in equality.
+    names: crate::names::NameIndex,
 }
 
 /// The derived index does not take part in equality: only the set of outputs
@@ -128,12 +148,75 @@ impl UtxoSet {
             // Replacement: the old element leaves the commitment, and the old
             // key no longer designates this output.
             self.muhash.remove(&serialized_element(&o, &previous));
-            if previous.output.pubkey_hash != key_hash {
+            if previous.output.scheme.is_name() {
+                self.unindex_name(&o, &previous);
+            } else if previous.output.pubkey_hash != key_hash || e.output.scheme.is_name() {
                 self.unindex(&previous.output.pubkey_hash, &o);
             }
         }
         self.muhash.insert(&serialized_element(&o, &e));
-        self.by_pubkey_hash.entry(key_hash).or_default().insert(o);
+        if e.output.scheme.is_name() {
+            // A name output is a record, never money: it stays out of the
+            // index by key hash, so that no balance counts it and no wallet
+            // tries to spend it, even the one whose key owns the name.
+            self.index_name(&o, &e);
+        } else {
+            self.by_pubkey_hash.entry(key_hash).or_default().insert(o);
+        }
+    }
+
+    /// The tag outpoint of the pair `o` belongs to, and whether both outputs
+    /// of that pair are in the set: a tag is followed by its owner output.
+    fn name_pair(&self, o: &OutPoint, e: &UtxoEntry) -> Option<(OutPoint, OutPoint)> {
+        let (tag, key) = match e.output.scheme {
+            crate::sig::SchemeId::NameTag => (
+                *o,
+                OutPoint {
+                    txid: o.txid,
+                    index: o.index.checked_add(1)?,
+                },
+            ),
+            crate::sig::SchemeId::NameKey => (
+                OutPoint {
+                    txid: o.txid,
+                    index: o.index.checked_sub(1)?,
+                },
+                *o,
+            ),
+            _ => return None,
+        };
+        Some((tag, key))
+    }
+
+    /// Indexes the pair of `o` once both of its outputs are present, in
+    /// whichever order they arrive (a block inserts the tag first, a
+    /// snapshot in any order).
+    fn index_name(&mut self, o: &OutPoint, e: &UtxoEntry) {
+        let Some((tag, key)) = self.name_pair(o, e) else {
+            return;
+        };
+        let (Some(t), Some(k)) = (self.map.get(&tag), self.map.get(&key)) else {
+            return;
+        };
+        if t.output.scheme != crate::sig::SchemeId::NameTag
+            || k.output.scheme != crate::sig::SchemeId::NameKey
+        {
+            return;
+        }
+        let (name, owner, height) = (t.output.pubkey_hash.0, k.output.pubkey_hash, t.height);
+        self.names.add(tag, name, owner, height);
+    }
+
+    /// Forgets the pair of `o`, as soon as either of its outputs leaves.
+    fn unindex_name(&mut self, o: &OutPoint, e: &UtxoEntry) {
+        if let Some((tag, _)) = self.name_pair(o, e) {
+            self.names.remove_tag(&tag);
+        }
+    }
+
+    /// The registry of names held by this set.
+    pub fn names(&self) -> &crate::names::NameIndex {
+        &self.names
     }
 
     fn unindex(&mut self, key_hash: &crate::hash::Hash256, o: &OutPoint) {
@@ -149,8 +232,12 @@ impl UtxoSet {
         let e = self.map.remove(o);
         if let Some(v) = &e {
             self.muhash.remove(&serialized_element(o, v));
-            let key_hash = v.output.pubkey_hash;
-            self.unindex(&key_hash, o);
+            if v.output.scheme.is_name() {
+                self.unindex_name(o, v);
+            } else {
+                let key_hash = v.output.pubkey_hash;
+                self.unindex(&key_hash, o);
+            }
         }
         e
     }

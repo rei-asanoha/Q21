@@ -67,6 +67,7 @@ pub mod mempool;
 pub mod merkle;
 pub mod mining;
 pub mod muhash;
+pub mod names;
 pub mod nat;
 pub mod net;
 pub mod outbox;

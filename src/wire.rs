@@ -46,6 +46,9 @@ use crate::tx::Transaction;
 /// before, and a version-5 node stays a peer of it. What changes is what the
 /// version-5 node sends it: never a transaction that creates or spends a
 /// policy output, which a version-4 node reads as malformed.
+/// 6: reads the two name outputs (0.5.0, [`crate::names`]). No new message
+/// for the chain: a version-6 node simply never offers a version-5 one a
+/// transaction that registers a name, which the older node cannot decode.
 ///
 /// The payment-channel protocol has versions of its own, carried inside
 /// [`Message::Channel`] and announced in the user agent rather than here:
@@ -54,7 +57,7 @@ use crate::tx::Transaction;
 /// [`crate::channel::messages::WIRE_VERSION`]). 0.4.11 ships both: protocol
 /// 5 and channels 3. A peer counts as a channel peer only if it announces
 /// both where the network has a transition ([`crate::net::channel_capable`]).
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// First version that understands `onionaddr`.
 pub const ONION_ADDR_VERSION: u32 = 4;
@@ -65,12 +68,17 @@ pub const ONION_ADDR_VERSION: u32 = 4;
 /// message. See [`crate::policy::has_transition`].
 pub const POLICY_ACTIVATION_VERSION: u32 = 5;
 
+/// First version that reads name outputs ([`crate::sig::SchemeId::NameTag`],
+/// [`crate::sig::SchemeId::NameKey`]).
+pub const NAME_ACTIVATION_VERSION: u32 = 6;
+
 // A version-5 node keeps the 0.4.10 nodes (version 4) as peers until the
 // activation, and the versions only grow.
 const _: () = {
     assert!(MIN_PROTOCOL_VERSION <= 4);
     assert!(ONION_ADDR_VERSION < POLICY_ACTIVATION_VERSION);
-    assert!(POLICY_ACTIVATION_VERSION <= PROTOCOL_VERSION);
+    assert!(POLICY_ACTIVATION_VERSION < NAME_ACTIVATION_VERSION);
+    assert!(NAME_ACTIVATION_VERSION <= PROTOCOL_VERSION);
 };
 
 /// Length of a Tor v3 onion name, without `.onion`: 56 base32 characters.
@@ -860,12 +868,13 @@ mod tests {
     use super::*;
     use crate::consensus::NETWORK_MAGIC_TESTNET as MAGIC;
 
-    /// 0.4.11 announces the version that follows the policy activation, and
-    /// still accepts the 0.4.10 nodes (version 4) it must keep talking to
-    /// before the activation height.
+    /// 0.5.0 announces the version that reads names, follows the policy
+    /// activation, and still accepts the older nodes it must keep talking to
+    /// before the name activation height.
     #[test]
-    fn this_version_follows_the_policy_activation_and_accepts_0_4_10() {
-        assert_eq!(PROTOCOL_VERSION, POLICY_ACTIVATION_VERSION);
+    fn this_version_reads_names_and_accepts_older_peers() {
+        assert_eq!(PROTOCOL_VERSION, NAME_ACTIVATION_VERSION);
+        assert_eq!(POLICY_ACTIVATION_VERSION, 5);
         assert_eq!(MIN_PROTOCOL_VERSION, 3);
     }
 

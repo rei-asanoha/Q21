@@ -462,6 +462,14 @@ pub fn follows_activation(network: Network, version: u32) -> bool {
     !crate::policy::has_transition(network) || version >= crate::wire::POLICY_ACTIVATION_VERSION
 }
 
+/// Can a peer that announced protocol `version` read a name output? Only
+/// from [`crate::wire::NAME_ACTIVATION_VERSION`] on, on every network: an
+/// older node does not know the two schemes at all, and drops the link of
+/// whoever sends one.
+pub fn reads_names(version: u32) -> bool {
+    version >= crate::wire::NAME_ACTIVATION_VERSION
+}
+
 /// What of a message a peer may receive: see [`for_peer`].
 enum ForPeer {
     /// All of it, as it is: the common case, which copies nothing.
@@ -478,19 +486,26 @@ enum ForPeer {
 /// as a malformed message and drops the link: it is never offered, nor
 /// sent, a transaction that creates or spends one.
 fn for_peer(g: &Shared, peer: u64, m: &Message) -> ForPeer {
-    let follows = g
-        .peers
-        .get(&peer)
-        .is_some_and(|p| follows_activation(g.network, p.version));
-    if follows {
+    let (follows, reads_names) = g.peers.get(&peer).map_or((false, false), |p| {
+        (
+            follows_activation(g.network, p.version),
+            reads_names(p.version),
+        )
+    });
+    if follows && reads_names {
         return ForPeer::Unchanged;
     }
-    let withheld = |hash: &Hash256| g.mempool.touches_policy(hash);
+    let withheld = |hash: &Hash256| {
+        (!follows && g.mempool.touches_policy(hash))
+            || (!reads_names && g.mempool.touches_names(hash))
+    };
     match m {
         Message::Tx(t)
-            if t.outputs
-                .iter()
-                .any(|o| o.scheme == crate::sig::SchemeId::Policy)
+            if (!follows
+                && t.outputs
+                    .iter()
+                    .any(|o| o.scheme == crate::sig::SchemeId::Policy))
+                || (!reads_names && t.outputs.iter().any(|o| o.scheme.is_name()))
                 || withheld(&t.txid()) =>
         {
             ForPeer::Withheld
@@ -2827,6 +2842,19 @@ impl Node {
             // the peer could not honestly be ahead, the message never got
             // this far (`policy_output_is_malformed`).
             M::Validation(V::SchemeForbiddenOnNetwork(crate::sig::SchemeId::Policy)) => false,
+            // The same for a name, which opens at a height of its own: a peer
+            // a block ahead of us relays registrations our next block cannot
+            // carry yet.
+            M::Validation(V::SchemeForbiddenOnNetwork(
+                crate::sig::SchemeId::NameTag | crate::sig::SchemeId::NameKey,
+            )) => false,
+            // A name taken, or an owner full, may be a race between two
+            // honest registrations: the other one reached us first. Every
+            // other broken name rule is its author's.
+            M::Validation(V::Name(n)) => !matches!(
+                n,
+                crate::names::NameError::Taken | crate::names::NameError::OwnerFull
+            ),
             M::Validation(
                 V::Signature(_)
                 | V::KeyDoesNotMatchLock

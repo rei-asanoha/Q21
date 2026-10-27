@@ -632,6 +632,34 @@ pub const POLICY_ACTIVATION_TESTNET: u64 = 4_980;
 /// penalty: it may be ahead of us, or we behind it.
 pub const POLICY_ACTIVATION_NOTICE: u64 = 1_440;
 
+// ---------------------------------------------------------------------------
+// Names (see `src/names.rs`)
+// ---------------------------------------------------------------------------
+
+/// First height at which a block may register a name, per network: a block
+/// at `height - 1` refuses a name output, a block at `height` accepts it.
+///
+/// Mainnet: never, until the registry has run on testnet. Regtest: block 1,
+/// as for policy outputs. Testnet: block 5,200, scheduled on 27 October 2026
+/// with the tip near 5,000. Every testnet node must run 0.5.0 before its
+/// first name is registered: a 0.4.12 node cannot even read a name output,
+/// and stops at the first block that carries one.
+pub const NAME_ACTIVATION_MAINNET: u64 = u64::MAX;
+pub const NAME_ACTIVATION_TESTNET: u64 = 5_200;
+pub const NAME_ACTIVATION_REGTEST: u64 = 1;
+
+/// What a name costs, in units: 0.5 Q21, destroyed. The output that carries
+/// it can never be spent, so the miner cannot collect it either: a miner who
+/// was paid the price could register names in its own blocks for nothing.
+pub const NAME_PRICE: u64 = 50_000_000;
+
+/// Shortest and longest name, in characters (`a-z`, `0-9`, `-`).
+pub const NAME_MIN_LEN: usize = 3;
+pub const NAME_MAX_LEN: usize = 30;
+
+/// Most names one identity key may hold. Each one is paid for.
+pub const MAX_NAMES_PER_OWNER: usize = 3;
+
 /// Deepest nesting of a policy, the root counting as level one and a leaf
 /// as a level of its own.
 ///
@@ -704,4 +732,18 @@ const _: () = {
     assert!(POLICY_ACTIVATION_TESTNET > 4_890);
     // Regtest opens it at its first block, as 0.4.10 did.
     assert!(POLICY_ACTIVATION_REGTEST == 1);
+
+    // Names: never on mainnet yet, at block 1 on regtest, and on testnet
+    // past the tip when they were scheduled and after the channels opened.
+    assert!(NAME_ACTIVATION_MAINNET == u64::MAX);
+    assert!(NAME_ACTIVATION_REGTEST == 1);
+    assert!(NAME_ACTIVATION_TESTNET > 4_980);
+    assert!(NAME_ACTIVATION_TESTNET >= POLICY_ACTIVATION_TESTNET);
+    // A name fits the thirty-two bytes of an output, with room to spare.
+    assert!(NAME_MIN_LEN >= 1 && NAME_MIN_LEN <= NAME_MAX_LEN);
+    assert!(NAME_MAX_LEN <= 32);
+    // The price is a real price: well above dust, well below the cap.
+    assert!(NAME_PRICE > MIN_OUTPUT_VALUE);
+    assert!(NAME_PRICE == UNITS_PER_COIN / 2);
+    assert!(MAX_NAMES_PER_OWNER >= 1);
 };

@@ -312,6 +312,9 @@ mod audit_activation {
 pub fn scheme_allowed(scheme: SchemeId, network: Network, height: u64) -> bool {
     match scheme {
         SchemeId::Policy => is_active(network, height),
+        // The two outputs of a name registration, from the name activation
+        // on; what a registration must hold is `crate::names::registration`.
+        SchemeId::NameTag | SchemeId::NameKey => crate::names::is_active(network, height),
         s => s.allowed_on(network),
     }
 }

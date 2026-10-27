@@ -95,6 +95,16 @@ pub enum SchemeId {
     /// is valid depends on the height as well as the network, and is decided
     /// by [`crate::policy::is_active`].
     Policy = 5,
+    /// Not a key: the thirty-two bytes hold a **name**, in clear, padded with
+    /// zeros (see [`crate::names`]). Created only by a name registration,
+    /// with exactly [`crate::consensus::NAME_PRICE`]; never spendable, so the
+    /// price is destroyed. Valid from the name activation height only.
+    NameTag = 6,
+    /// Not a key: the thirty-two bytes hold the hash of the identity key that
+    /// owns the name of the [`SchemeId::NameTag`] right before it, as an
+    /// address would ([`pubkey_hash`] under [`SchemeId::MlDsa87`]). Value
+    /// zero, never spendable.
+    NameKey = 7,
 }
 
 impl SchemeId {
@@ -105,6 +115,8 @@ impl SchemeId {
             3 => Some(SchemeId::SphincsPlus),
             4 => Some(SchemeId::LamportOts),
             5 => Some(SchemeId::Policy),
+            6 => Some(SchemeId::NameTag),
+            7 => Some(SchemeId::NameKey),
             _ => None,
         }
     }
@@ -120,6 +132,8 @@ impl SchemeId {
             SchemeId::SphincsPlus => "SPHINCS+-SHA2-192s",
             SchemeId::LamportOts => "Lamport-OTS (test only)",
             SchemeId::Policy => "policy",
+            SchemeId::NameTag => "name",
+            SchemeId::NameKey => "name-owner",
         }
     }
 
@@ -133,6 +147,8 @@ impl SchemeId {
             // No key, hence no fixed size: the revealed policy and its
             // satisfaction are bounded by `crate::policy`.
             SchemeId::Policy => 0,
+            // Never spent: no key is ever revealed for them.
+            SchemeId::NameTag | SchemeId::NameKey => 0,
         }
     }
 
@@ -147,6 +163,7 @@ impl SchemeId {
             SchemeId::SphincsPlus => 16224,
             SchemeId::LamportOts => crate::lamport::SIG_LEN,
             SchemeId::Policy => 0,
+            SchemeId::NameTag | SchemeId::NameKey => 0,
         }
     }
 
@@ -184,7 +201,24 @@ impl SchemeId {
             // wallet, a policy leaf). Policy outputs are admitted by
             // `crate::policy::is_active`, which also knows the height.
             SchemeId::Policy => false,
+            // Not keys either: admitted by `crate::names::is_active`, and
+            // only as the two outputs of a registration.
+            SchemeId::NameTag | SchemeId::NameKey => false,
         }
+    }
+
+    /// Can an output under this scheme ever be spent?
+    ///
+    /// False for the two name outputs alone: what they hold is a record, not
+    /// money. The price of a name is destroyed by this rule, and no input may
+    /// ever point at one of them.
+    pub const fn is_spendable(self) -> bool {
+        !matches!(self, SchemeId::NameTag | SchemeId::NameKey)
+    }
+
+    /// Is this one of the two outputs of a name registration?
+    pub const fn is_name(self) -> bool {
+        matches!(self, SchemeId::NameTag | SchemeId::NameKey)
     }
 
     /// A key of this scheme can be used only once.
@@ -210,6 +244,8 @@ impl SchemeId {
             // Evaluated by `crate::policy`, which needs nothing optional; the
             // keys inside a policy are checked against their own scheme.
             SchemeId::Policy => true,
+            // Nothing to verify: they are never spent.
+            SchemeId::NameTag | SchemeId::NameKey => true,
         }
     }
 }
@@ -360,7 +396,9 @@ mod mldsa_backend {
             // SPHINCS+ is still to be wired in: see the roadmap.
             SchemeId::SphincsPlus => None,
             SchemeId::LamportOts => None,
-            SchemeId::Policy => None,
+            // Never verified: a policy goes through `crate::policy`, and a
+            // name output is never spent.
+            SchemeId::Policy | SchemeId::NameTag | SchemeId::NameKey => None,
         }
     }
 }
@@ -590,7 +628,9 @@ mod tests {
         }
         assert_eq!(SchemeId::from_u8(0), None);
         assert_eq!(SchemeId::from_u8(5), Some(SchemeId::Policy));
-        assert_eq!(SchemeId::from_u8(6), None);
+        assert_eq!(SchemeId::from_u8(6), Some(SchemeId::NameTag));
+        assert_eq!(SchemeId::from_u8(7), Some(SchemeId::NameKey));
+        assert_eq!(SchemeId::from_u8(8), None);
         assert_eq!(SchemeId::from_u8(255), None);
     }
 
