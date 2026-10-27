@@ -501,13 +501,14 @@ fn upgrading_md_announces_the_compiled_testnet_activation() {
         grouped.push(c);
     }
     let text = read("UPGRADING.md");
+    // The newest section is the one operators follow.
     let start = text
-        .find("# Upgrading from 0.4.10 to 0.4.11")
-        .expect("UPGRADING.md has no 0.4.10 to 0.4.11 section");
+        .find("# Upgrading from ")
+        .expect("UPGRADING.md has no upgrade section");
     let section = &text[start..];
     let section = &section[..section[1..].find("\n# ").map_or(section.len(), |e| e + 1)];
     assert!(
         section.contains(&format!("block {grouped}")),
-        "the 0.4.11 notes do not announce block {grouped}, the compiled testnet activation"
+        "the newest upgrade notes do not announce block {grouped}, the compiled testnet activation"
     );
 }

@@ -2997,17 +2997,17 @@ mod dormant_tests {
             scheduled_activation(Network::Testnet),
             crate::consensus::POLICY_ACTIVATION_TESTNET
         );
-        assert_eq!(activation_height(Network::Testnet), 16_000);
+        assert_eq!(activation_height(Network::Testnet), 6_000);
         assert!(has_transition(Network::Testnet));
-        assert!(!is_active(Network::Testnet, 15_999));
-        assert!(is_active(Network::Testnet, 16_000));
+        assert!(!is_active(Network::Testnet, 5_999));
+        assert!(is_active(Network::Testnet, 6_000));
         let st = status(Network::Testnet, 4_440);
-        assert_eq!(st.activation_height, Some(16_000));
+        assert_eq!(st.activation_height, Some(6_000));
         assert!(!st.active);
-        assert_eq!(st.blocks_remaining, Some(11_560));
-        assert_eq!(st.eta_seconds(), Some(11_560 * 120));
-        assert!(!reached(Network::Testnet, 15_999));
-        assert!(reached(Network::Testnet, 16_000));
+        assert_eq!(st.blocks_remaining, Some(1_560));
+        assert_eq!(st.eta_seconds(), Some(1_560 * 120));
+        assert!(!reached(Network::Testnet, 5_999));
+        assert!(reached(Network::Testnet, 6_000));
         assert!(!may_appear_on(Network::Mainnet));
         assert!(!reached(Network::Mainnet, u64::MAX - 1));
     }

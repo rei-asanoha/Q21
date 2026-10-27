@@ -612,13 +612,15 @@ pub const POLICY_ACTIVATION_REGTEST: u64 = 1;
 
 /// Testnet activation height of policy outputs, and so of payment channels.
 ///
-/// Set at release, about two weeks of blocks after the day 0.4.11 is
-/// published, so that every testnet node has time to upgrade: the tip was
-/// near 4,900 on 26 October 2026, with blocks mined continuously at the
-/// two-minute target spacing (about 720 a day). It is a hard
+/// 0.4.11 scheduled it at 16,000. 0.4.12 brings it forward to 6,000, about a
+/// day of blocks after its release (the tip was near 5,000 on 27 October 2026,
+/// mined continuously at the two-minute target spacing, about 720 a day): the
+/// testnet nodes are few, all already on 0.4.11, and upgrade within the day.
+/// Every testnet node must run 0.4.12 before block 6,000: a 0.4.11 node
+/// refuses a policy below 16,000, and stops at the first one. It is a hard
 /// fork: a 0.4.10 node refuses the first block that carries a policy and
 /// stops there. The one place to change it; nothing else repeats it.
-pub const POLICY_ACTIVATION_TESTNET: u64 = 16_000;
+pub const POLICY_ACTIVATION_TESTNET: u64 = 6_000;
 
 /// How long before the activation height a node prepares its peers for it,
 /// in blocks: two days at the target spacing.
