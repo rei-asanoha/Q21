@@ -5868,6 +5868,54 @@ mod tests {
         assert_eq!(kept, 2);
     }
 
+    /// An owner's current announcement that comes too soon after an older
+    /// one — replayed first, or its own previous one — is held back, not
+    /// dropped: it is kept and relayed once the ten minutes have passed
+    /// (fourth re-check of R1).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_current_announcement_too_soon_is_kept_once_the_spacing_passes() {
+        use crate::net::{ReachVerdict, REACH_MIN_INTERVAL};
+        use crate::wire::ReachTarget;
+        let (c, _, owner_key) = two_named_owners();
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, owner_key.pubkey());
+        let old = ReachTarget::Onion {
+            name: format!("{}d", "b".repeat(55)),
+            port: 21121,
+        };
+        let new = ReachTarget::Onion {
+            name: format!("{}d", "c".repeat(55)),
+            port: 21121,
+        };
+        let now = crate::net::unix_now();
+        assert_eq!(
+            c.node
+                .accept_reach(reach_signed(&owner_key, &old, now - 3 * 3600), Some(1)),
+            ReachVerdict::Kept
+        );
+        assert_eq!(
+            c.node
+                .accept_reach(reach_signed(&owner_key, &new, now - 60), Some(2)),
+            ReachVerdict::Deferred
+        );
+        // An older one does not replace what waits; a forged one is caught.
+        assert_eq!(
+            c.node
+                .accept_reach(reach_signed(&owner_key, &old, now - 120), Some(3)),
+            ReachVerdict::Ignored
+        );
+        let mut forged = reach_signed(&owner_key, &new, now);
+        forged.signature[0] ^= 1;
+        assert_eq!(c.node.accept_reach(forged, Some(4)), ReachVerdict::Forged);
+        assert_eq!(c.node.reach_of(&owner), Some(old.clone()));
+        c.node
+            .promote_deferred_reach_for_tests(now + REACH_MIN_INTERVAL / 2);
+        assert_eq!(c.node.reach_of(&owner), Some(old), "not before its time");
+        c.node
+            .promote_deferred_reach_for_tests(now + REACH_MIN_INTERVAL + 1);
+        assert_eq!(c.node.reach_of(&owner), Some(new));
+    }
+
     /// The wallet's own pending payments to its identity count: the next
     /// registration spends them and pays nothing more.
     #[cfg(feature = "mldsa")]
@@ -6064,13 +6112,13 @@ mod tests {
                 .accept_reach(signed(&identity, now + 3 * 3600), Some(1)),
             ReachVerdict::Ignored
         );
-        // Fresher, but relayed within ten minutes of this node's clock and
-        // not ten minutes newer: ignored. The owner chooses its dates, not
-        // this clock (red-team re-check of R1; see also
+        // Fresher, but relayed within ten minutes of this node's clock: held
+        // back, neither kept nor relayed yet. The owner chooses its dates,
+        // not this clock (red-team re-check of R1; see also
         // `a_ladder_of_back_dated_announcements_holds_nothing`).
         assert_eq!(
             c.node.accept_reach(signed(&identity, now + 60), Some(3)),
-            ReachVerdict::Ignored
+            ReachVerdict::Deferred
         );
         // The wallet's own announcement is not held back.
         assert_eq!(

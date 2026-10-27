@@ -518,6 +518,43 @@ fn reach_too_soon(g: &Shared, owner: &Hash256, r: &crate::wire::Reach, now: u64)
     !(recent(r.time) && !recent(signed) && r.time > signed)
 }
 
+/// Keeps the verified announcement `r` of `owner`, evicting the oldest held
+/// one from a full table, and returns the peers to relay it to: every
+/// handshaked protocol 6 peer but `from`.
+fn keep_reach(
+    g: &mut Shared,
+    owner: Hash256,
+    r: &crate::wire::Reach,
+    now: u64,
+    from: Option<u64>,
+) -> Vec<Arc<Outbox>> {
+    if g.reach.len() >= MAX_REACH && !g.reach.contains_key(&owner) {
+        // The oldest goes: it is the likeliest to be stale. Its keep time
+        // stays: an owner evicted on purpose, to come back at once, is still
+        // held to the spacing.
+        if let Some(oldest) = g.reach.iter().min_by_key(|(_, k)| k.time).map(|(o, _)| *o) {
+            g.reach.remove(&oldest);
+        }
+    }
+    g.reach.insert(owner, r.clone());
+    g.reach_kept_at.insert(owner, (now, r.time));
+    if g.reach_deferred
+        .get(&owner)
+        .is_some_and(|d| d.time <= r.time)
+    {
+        g.reach_deferred.remove(&owner);
+    }
+    if g.reach_kept_at.len() > 2 * MAX_REACH {
+        g.reach_kept_at
+            .retain(|_, (at, _)| now < at.saturating_add(REACH_MIN_INTERVAL));
+    }
+    g.peers
+        .iter()
+        .filter(|(pid, p)| Some(**pid) != from && p.handshaked && reads_names(p.version))
+        .map(|(_, p)| p.writer.clone())
+        .collect()
+}
+
 /// Whether peer `id` may send one more reach message — announcement or
 /// request — now: it speaks protocol 6, is handshaked, and its own budget
 /// ([`PEER_REACH_BUCKET_MAX`]) is not spent. A message over budget is
@@ -612,6 +649,10 @@ pub enum ReachVerdict {
     Ignored,
     /// Its signature does not verify: whoever sent it forged it.
     Forged,
+    /// Verified and fresher, but it came less than [`REACH_MIN_INTERVAL`]
+    /// after the owner's last one: held back, kept and relayed once the
+    /// spacing has passed ([`Node::promote_deferred_reach`]).
+    Deferred,
 }
 
 /// See [`crate::validate::ValidationError::locally_unverifiable_scheme`].
@@ -1354,6 +1395,10 @@ struct Shared {
     /// kept, and the date it was signed with; kept past the eviction of the
     /// announcement itself. See [`REACH_MIN_INTERVAL`].
     reach_kept_at: HashMap<Hash256, (u64, u64)>,
+    /// The newest genuine announcement of each owner that came too soon
+    /// after its last one, waiting for the spacing to pass. Bounded by
+    /// [`MAX_REACH`].
+    reach_deferred: HashMap<Hash256, crate::wire::Reach>,
     /// The announcements this node will still verify: a signature costs a
     /// post-quantum verification. See [`REACH_RATE_PER_SEC`].
     reach_bucket: TokenBucket,
@@ -1713,6 +1758,7 @@ impl Node {
                 channel_unscan: Vec::new(),
                 reach: HashMap::new(),
                 reach_kept_at: HashMap::new(),
+                reach_deferred: HashMap::new(),
                 reach_bucket: TokenBucket {
                     tokens: REACH_BUCKET_MAX,
                     last: Instant::now(),
@@ -1964,8 +2010,16 @@ impl Node {
             if g.chain.utxo.names().owned(&owner) == 0 {
                 return ReachVerdict::Ignored;
             }
-            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time)
-                || (from.is_some() && reach_too_soon(&g, &owner, &r, now))
+            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time) {
+                return ReachVerdict::Ignored;
+            }
+            // Too soon, and no newer than the one already waiting: nothing
+            // to verify.
+            if from.is_some()
+                && reach_too_soon(&g, &owner, &r, now)
+                && g.reach_deferred
+                    .get(&owner)
+                    .is_some_and(|d| d.time >= r.time)
             {
                 return ReachVerdict::Ignored;
             }
@@ -1987,10 +2041,32 @@ impl Node {
             let mut g = self.shared.lock().unwrap();
             // Checked again: another peer's copy may have been kept while
             // this one was being verified.
-            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time)
-                || (from.is_some() && reach_too_soon(&g, &owner, &r, now))
-            {
+            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time) {
                 return ReachVerdict::Ignored;
+            }
+            // Genuine but too soon: held back rather than dropped, so that a
+            // copy kept a moment earlier — a stale one replayed first, or the
+            // owner's own previous one — does not hold the current one back
+            // until its next announcement, six hours later.
+            if from.is_some() && reach_too_soon(&g, &owner, &r, now) {
+                if g.reach_deferred
+                    .get(&owner)
+                    .is_some_and(|d| d.time >= r.time)
+                {
+                    return ReachVerdict::Ignored;
+                }
+                if g.reach_deferred.len() >= MAX_REACH && !g.reach_deferred.contains_key(&owner) {
+                    if let Some(oldest) = g
+                        .reach_deferred
+                        .iter()
+                        .min_by_key(|(_, d)| d.time)
+                        .map(|(o, _)| *o)
+                    {
+                        g.reach_deferred.remove(&oldest);
+                    }
+                }
+                g.reach_deferred.insert(owner, r);
+                return ReachVerdict::Deferred;
             }
             // The relay budget, shared by all peers, is spent only on
             // genuine announcements.
@@ -2004,28 +2080,53 @@ impl Node {
             {
                 return ReachVerdict::Ignored;
             }
-            if g.reach.len() >= MAX_REACH && !g.reach.contains_key(&owner) {
-                // The oldest goes: it is the likeliest to be stale.
-                if let Some(oldest) = g.reach.iter().min_by_key(|(_, k)| k.time).map(|(o, _)| *o) {
-                    g.reach.remove(&oldest);
-                    // Its keep time stays: an owner evicted on purpose, to
-                    // come back at once, is still held to the spacing.
-                }
-            }
-            g.reach.insert(owner, r.clone());
-            g.reach_kept_at.insert(owner, (now, r.time));
-            if g.reach_kept_at.len() > 2 * MAX_REACH {
-                g.reach_kept_at
-                    .retain(|_, (at, _)| now < at.saturating_add(REACH_MIN_INTERVAL));
-            }
-            g.peers
-                .iter()
-                .filter(|(pid, p)| Some(**pid) != from && p.handshaked && reads_names(p.version))
-                .map(|(_, p)| p.writer.clone())
-                .collect()
+            keep_reach(&mut g, owner, &r, now, from)
         };
         self.broadcast(&targets, &Message::Reach(Box::new(r)));
         ReachVerdict::Kept
+    }
+
+    /// Keeps and relays the announcements held back by the spacing whose
+    /// time has come ([`ReachVerdict::Deferred`]): their signatures were
+    /// checked on arrival. Called with the other periodic announcements.
+    pub fn promote_deferred_reach(&self) {
+        self.promote_deferred_reach_at(unix_now());
+    }
+
+    fn promote_deferred_reach_at(&self, now: u64) {
+        let ready: Vec<(Vec<Arc<Outbox>>, crate::wire::Reach)> = {
+            let mut g = self.shared.lock().unwrap();
+            let due: Vec<Hash256> = g
+                .reach_deferred
+                .iter()
+                .filter(|(o, d)| !reach_too_soon(&g, o, d, now))
+                .map(|(o, _)| *o)
+                .collect();
+            let mut ready = Vec::new();
+            for owner in due {
+                let Some(r) = g.reach_deferred.remove(&owner) else {
+                    continue;
+                };
+                let stale = r.time.saturating_add(REACH_MAX_AGE) < now;
+                let superseded = g.reach.get(&owner).is_some_and(|k| k.time >= r.time);
+                let named = g.chain.utxo.names().owned(&owner) > 0;
+                if stale || superseded || !named {
+                    continue;
+                }
+                let targets = keep_reach(&mut g, owner, &r, now, None);
+                ready.push((targets, r));
+            }
+            ready
+        };
+        for (targets, r) in ready {
+            self.broadcast(&targets, &Message::Reach(Box::new(r)));
+        }
+    }
+
+    /// Test hook: promotes as if the clock read `now`.
+    #[cfg(all(test, feature = "mldsa"))]
+    pub(crate) fn promote_deferred_reach_for_tests(&self, now: u64) {
+        self.promote_deferred_reach_at(now);
     }
 
     /// Fills the reach table with `n` stand-in owners, kept now: for the
@@ -2082,6 +2183,7 @@ impl Node {
     /// `force`. Its own onion service is the only target it announces: a
     /// home wallet is reached through Tor. Returns whether it announced.
     pub fn announce_reach(&self, force: bool) -> bool {
+        self.promote_deferred_reach();
         let Some(signer) = self.reach_signer.read().ok().and_then(|g| g.clone()) else {
             return false;
         };
@@ -4625,7 +4727,7 @@ impl Node {
                         drop_peer = true;
                     }
                 }
-                ReachVerdict::Kept | ReachVerdict::Ignored => {}
+                ReachVerdict::Kept | ReachVerdict::Ignored | ReachVerdict::Deferred => {}
             }
         }
 
