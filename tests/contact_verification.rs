@@ -232,6 +232,14 @@ fn two_wallets_read_the_same_words_and_verify_each_other() {
     assert_eq!(added.get("verified"), Some(&Json::Bool(false)));
     assert_eq!(added.get("connected"), Some(&Json::Bool(true)));
     let owner = str_of(&added, "owner");
+    // The peer list names the same identity, for the page to show the
+    // contact behind the peer.
+    let peers = result(rpc_x, "getpeers", "{}");
+    let p = list(peers.get("peers").unwrap())
+        .into_iter()
+        .find(|p| p.get("id").and_then(|v| v.as_u64()) == Some(peer_on_x))
+        .expect("the peer");
+    assert_eq!(str_of(&p, "channel_owner"), owner);
     result(
         rpc_x,
         "contactverify",

@@ -132,6 +132,15 @@ pub struct ChannelSummary {
     /// An update is still settling: proposed, acknowledged, or a revocation
     /// still owed either way.
     pub in_flight: bool,
+    /// The last transaction that ends the channel, once confirmed, and the
+    /// height it confirmed at: the funds it pays are back in the wallets as
+    /// soon as it is [`Self::funding_depth`] deep, long before the channel is
+    /// marked closed at the settle depth ([`settle_depth`]).
+    pub close_txid: Option<Hash256>,
+    pub close_height: Option<u64>,
+    /// The confirmations a funding waits for, also the depth a close is
+    /// shown done at.
+    pub funding_depth: u16,
 }
 
 struct Chan {
@@ -2484,6 +2493,15 @@ fn summary(c: &Chan) -> ChannelSummary {
         state_number: c.machine.local_commit_number().unwrap_or(0),
         funding: c.machine.funding_outpoint(),
         in_flight: c.machine.update_in_flight(),
+        close_txid: match &c.close {
+            Some(CloseTracker::Settling { by, .. }) => by.last().copied(),
+            _ => None,
+        },
+        close_height: match &c.close {
+            Some(CloseTracker::Settling { height, .. }) => Some(*height),
+            _ => None,
+        },
+        funding_depth: c.machine.funding_depth(),
     }
 }
 

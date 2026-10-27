@@ -699,6 +699,21 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
                 None => Json::Null,
             },
         )
+        .set(
+            "close_txid",
+            match s.close_txid {
+                Some(t) => Json::str(t.to_hex()),
+                None => Json::Null,
+            },
+        )
+        .set(
+            "close_height",
+            match s.close_height {
+                Some(h) => Json::u64(h),
+                None => Json::Null,
+            },
+        )
+        .set("funding_depth", Json::u64(u64::from(s.funding_depth)))
         .build()
 }
 
@@ -878,6 +893,14 @@ pub const HISTORY_NOTES: [&str; 4] = [
     NOTE_FULL_SCAN,
     NOTE_PARTIAL,
 ];
+
+/// The notes of `getsyncstatus`, which the wallet page translates.
+pub const SYNC_NO_PEER: &str = "No peer connected: this node cannot know whether it is up to date.";
+pub const SYNC_UP_TO_DATE: &str = "Up to date with the known peers.";
+pub const SYNC_IN_PROGRESS: &str =
+    "Synchronization in progress. The balances shown are incomplete.";
+/// All of them, for the checks.
+pub const SYNC_NOTES: [&str; 3] = [SYNC_NO_PEER, SYNC_UP_TO_DATE, SYNC_IN_PROGRESS];
 
 /// Shortest identifier prefix the search completes. See `search`.
 const MIN_ID_PREFIX: usize = 8;
@@ -2706,6 +2729,15 @@ impl RpcContext {
             }
             Json::Null
         };
+        // The identity address that session proved: what a contact is
+        // pinned to (see `crate::contacts`).
+        let owner_of = |_id: u64| -> Json {
+            #[cfg(feature = "mldsa")]
+            if let Some(o) = self.channels.as_ref().and_then(|m| m.peer_owner(_id)) {
+                return Json::str(o.to_hex());
+            }
+            Json::Null
+        };
         Json::obj()
             .set("peer_count", Json::u64(self.node.peer_count() as u64))
             .set("maximum", Json::u64(crate::net::MAX_PEERS as u64))
@@ -2727,6 +2759,7 @@ impl RpcContext {
                                 .set("protocol_version", Json::u64(u64::from(p.version)))
                                 .set("follows_activation", Json::Bool(p.follows_activation))
                                 .set("channel_session", session_of(p.id))
+                                .set("channel_owner", owner_of(p.id))
                                 .build()
                         })
                         .collect(),
@@ -4241,11 +4274,11 @@ impl RpcContext {
             .set(
                 "note",
                 Json::str(if peers == 0 {
-                    "No peer connected: this node cannot know whether it is up to date."
+                    SYNC_NO_PEER
                 } else if remaining == 0 {
-                    "Up to date with the known peers."
+                    SYNC_UP_TO_DATE
                 } else {
-                    "Synchronization in progress. The balances shown are incomplete."
+                    SYNC_IN_PROGRESS
                 }),
             )
             .build()

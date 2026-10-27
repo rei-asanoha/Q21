@@ -1128,9 +1128,19 @@ fn a_close_asked_during_a_payment_follows_it_and_both_sides_settle() {
     // Both learn of the close from the block that confirms it: the closer
     // stays closing until then, holding the close to broadcast again.
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closing);
+    assert_eq!(p.funder.info(cid).unwrap().close_txid, None);
     drive(&p.funder, &chain);
     drive(&p.acceptor, &chain);
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closing);
+    // Both name the close and its height, for the wallet to count its
+    // confirmations; the same transaction on both sides.
+    let fi = p.funder.info(cid).unwrap();
+    let ai = p.acceptor.info(cid).unwrap();
+    assert!(fi.close_txid.is_some() && fi.close_height.is_some());
+    assert_eq!(fi.close_txid, ai.close_txid);
+    assert_eq!(fi.close_height, ai.close_height);
+    assert!(fi.close_height.unwrap() <= chain.lock().unwrap().height());
+    assert_eq!(fi.funding_depth, ai.funding_depth);
     bury(&[&p.funder, &p.acceptor], &chain);
     assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
     assert_eq!(
