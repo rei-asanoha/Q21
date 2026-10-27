@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "q21-core"
-version = "0.4.12"
+version = "0.5.0"
 dependencies = [
  "keccak",
  "libc",

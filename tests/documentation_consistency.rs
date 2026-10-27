@@ -511,4 +511,11 @@ fn upgrading_md_announces_the_compiled_testnet_activation() {
         section.contains(&format!("block {grouped}")),
         "the newest upgrade notes do not announce block {grouped}, the compiled testnet activation"
     );
+    // And the names, from 0.5.0 on.
+    let names = q21_core::consensus::NAME_ACTIVATION_TESTNET;
+    let names = format!("block {},{:03}", names / 1000, names % 1000);
+    assert!(
+        section.contains(&names),
+        "the newest upgrade notes do not announce {names}, the compiled name activation"
+    );
 }
