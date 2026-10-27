@@ -498,13 +498,30 @@ pub fn follows_activation(network: Network, version: u32) -> bool {
     !crate::policy::has_transition(network) || version >= crate::wire::POLICY_ACTIVATION_VERSION
 }
 
-/// Whether an announcement of `owner` relayed by a peer comes less than
-/// [`REACH_MIN_INTERVAL`] after the last one this node kept, by its own
+/// Whether an announcement `r` of `owner`, relayed by a peer, comes less
+/// than [`REACH_MIN_INTERVAL`] after the last one this node kept, by its own
 /// clock: the dates inside are the owner's to choose, the clock is not.
-fn reach_too_soon(g: &Shared, owner: &Hash256, now: u64) -> bool {
-    g.reach_kept_at
-        .get(owner)
-        .is_some_and(|&at| now < at.saturating_add(REACH_MIN_INTERVAL))
+///
+/// One exception: an announcement signed recently — within the six hours a
+/// wallet waits between two of its own ([`REACH_REANNOUNCE`]) — and ten
+/// minutes newer than the one held always gets through, so that a stale
+/// copy replayed first cannot hold the owner's current one back. A ladder
+/// of dates stays bounded: its rungs must lie between six hours ago and two
+/// hours ahead, some fifty per identity, once.
+fn reach_too_soon(g: &Shared, owner: &Hash256, r: &crate::wire::Reach, now: u64) -> bool {
+    let spaced = match g.reach_kept_at.get(owner) {
+        Some(&at) => now >= at.saturating_add(REACH_MIN_INTERVAL),
+        None => true,
+    };
+    if spaced {
+        return false;
+    }
+    let recent = r.time.saturating_add(REACH_REANNOUNCE.as_secs()) >= now;
+    let newer = match g.reach.get(owner) {
+        Some(k) => r.time >= k.time.saturating_add(REACH_MIN_INTERVAL),
+        None => true,
+    };
+    !(recent && newer)
 }
 
 /// Whether peer `id` may send one more reach message — announcement or
@@ -1953,7 +1970,7 @@ impl Node {
                 return ReachVerdict::Ignored;
             }
             if g.reach.get(&owner).is_some_and(|k| k.time >= r.time)
-                || (from.is_some() && reach_too_soon(&g, &owner, now))
+                || (from.is_some() && reach_too_soon(&g, &owner, &r, now))
             {
                 return ReachVerdict::Ignored;
             }
@@ -1976,7 +1993,7 @@ impl Node {
             // Checked again: another peer's copy may have been kept while
             // this one was being verified.
             if g.reach.get(&owner).is_some_and(|k| k.time >= r.time)
-                || (from.is_some() && reach_too_soon(&g, &owner, now))
+                || (from.is_some() && reach_too_soon(&g, &owner, &r, now))
             {
                 return ReachVerdict::Ignored;
             }
@@ -1996,11 +2013,16 @@ impl Node {
                 // The oldest goes: it is the likeliest to be stale.
                 if let Some(oldest) = g.reach.iter().min_by_key(|(_, k)| k.time).map(|(o, _)| *o) {
                     g.reach.remove(&oldest);
-                    g.reach_kept_at.remove(&oldest);
+                    // Its keep time stays: an owner evicted on purpose, to
+                    // come back at once, is still held to the spacing.
                 }
             }
             g.reach.insert(owner, r.clone());
             g.reach_kept_at.insert(owner, now);
+            if g.reach_kept_at.len() > 2 * MAX_REACH {
+                g.reach_kept_at
+                    .retain(|_, at| now < at.saturating_add(REACH_MIN_INTERVAL));
+            }
             g.peers
                 .iter()
                 .filter(|(pid, p)| Some(**pid) != from && p.handshaked && reads_names(p.version))
@@ -2009,6 +2031,20 @@ impl Node {
         };
         self.broadcast(&targets, &Message::Reach(Box::new(r)));
         ReachVerdict::Kept
+    }
+
+    /// Fills the reach table with `n` stand-in owners, kept now: for the
+    /// tests of a full table.
+    #[cfg(all(test, feature = "mldsa"))]
+    pub(crate) fn fill_reach_for_tests(&self, n: usize, template: &crate::wire::Reach) {
+        let mut g = self.shared.lock().unwrap();
+        let now = unix_now();
+        for i in 0..n {
+            let mut b = [0xeeu8; 32];
+            b[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            g.reach.insert(Hash256(b), template.clone());
+            g.reach_kept_at.insert(Hash256(b), now);
+        }
     }
 
     /// Where the owner `owner` said it can be reached, if this node knows.

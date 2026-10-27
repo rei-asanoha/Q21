@@ -5719,6 +5719,127 @@ mod tests {
         );
     }
 
+    /// Two named owners: the wallet's identity, and another key.
+    #[cfg(feature = "mldsa")]
+    fn two_named_owners() -> (
+        RpcContext,
+        crate::channel::keys::NodeIdentity,
+        crate::channel::keys::NodeIdentity,
+    ) {
+        let c = context_with_more_funds();
+        let w = c.wallet.clone().unwrap();
+        let a = crate::channel::keys::NodeIdentity::derive(&w.lock().unwrap().channel_seed());
+        call_ok(&c, "nameregister", r#"{"name":"mallory"}"#);
+        mine_pool(&c);
+        let b = crate::channel::keys::NodeIdentity::derive(&[0x44; 32]);
+        register_by_hand(&c, &b, "honest");
+        (c, a, b)
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn reach_signed(
+        id: &crate::channel::keys::NodeIdentity,
+        target: &crate::wire::ReachTarget,
+        time: u64,
+    ) -> crate::wire::Reach {
+        let m = crate::names::reach_message(NETWORK, id.pubkey(), target, time);
+        crate::wire::Reach {
+            pubkey: id.pubkey().to_vec(),
+            target: target.clone(),
+            time,
+            signature: id.sign(&m),
+        }
+    }
+
+    /// A stale but genuine announcement replayed first does not hold the
+    /// owner's current one back: a recent one, ten minutes newer, always
+    /// gets through (second re-check of R1).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_stale_announcement_does_not_hold_back_the_current_one() {
+        use crate::net::ReachVerdict;
+        use crate::wire::ReachTarget;
+        let (c, _, owner_key) = two_named_owners();
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, owner_key.pubkey());
+        let old = ReachTarget::Onion {
+            name: format!("{}d", "b".repeat(55)),
+            port: 21121,
+        };
+        let new = ReachTarget::Onion {
+            name: format!("{}d", "c".repeat(55)),
+            port: 21121,
+        };
+        let now = crate::net::unix_now();
+        assert_eq!(
+            c.node
+                .accept_reach(reach_signed(&owner_key, &old, now - 3 * 86_400), Some(1)),
+            ReachVerdict::Kept
+        );
+        assert_eq!(
+            c.node
+                .accept_reach(reach_signed(&owner_key, &new, now), Some(2)),
+            ReachVerdict::Kept
+        );
+        assert_eq!(c.node.reach_of(&owner), Some(new));
+    }
+
+    /// A full table does not free an evicted owner from the spacing: two
+    /// owners taking turns to evict each other still get one announcement
+    /// each per ten minutes (second re-check of R1).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn eviction_does_not_reset_the_spacing() {
+        use crate::net::{ReachVerdict, MAX_REACH, REACH_MAX_AGE};
+        use crate::wire::ReachTarget;
+        let (c, a, b) = two_named_owners();
+        let t = ReachTarget::Onion {
+            name: format!("{}d", "a".repeat(55)),
+            port: 21121,
+        };
+        let now = crate::net::unix_now();
+        c.node
+            .fill_reach_for_tests(MAX_REACH - 1, &reach_signed(&a, &t, now - 3600));
+        let base = now - REACH_MAX_AGE + 60;
+        let kept = (0..40u64)
+            .filter(|k| {
+                let id = if k % 2 == 0 { &a } else { &b };
+                c.node
+                    .accept_reach(reach_signed(id, &t, base + k), Some(1 + k % 6))
+                    == ReachVerdict::Kept
+            })
+            .count();
+        assert_eq!(kept, 2);
+    }
+
+    /// The wallet's own pending payments to its identity count: the next
+    /// registration spends them and pays nothing more.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn own_pending_payments_to_the_identity_are_used() {
+        let c = context_with_more_funds();
+        let addr = call_ok(&c, "channelidentity", "{}")
+            .get("identity_address")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        for _ in 0..2 {
+            call_ok(
+                &c,
+                "sendtoaddress",
+                &format!(r#"{{"address":"{addr}","units":30000000}}"#),
+            );
+        }
+        let balance = call_ok(&c, "channelidentity", "{}")
+            .get("identity_balance")
+            .and_then(|v| v.get("units"))
+            .and_then(|v| v.as_u64());
+        assert_eq!(balance, Some(60_000_000));
+        let r = call_ok(&c, "nameregister", r#"{"name":"pending"}"#);
+        assert_eq!(r.get("funding_txid"), Some(&Json::Null), "no top-up");
+        mine_pool(&c);
+        assert!(call_ok(&c, "namelist", "{}").encode().contains("pending"));
+    }
+
     /// A stranger's pending payment to the identity address is not spent by
     /// a registration: when its sender double-spends it, the registration
     /// stands (re-check of R5).
@@ -5886,15 +6007,12 @@ mod tests {
                 .accept_reach(signed(&identity, now + 3 * 3600), Some(1)),
             ReachVerdict::Ignored
         );
-        // Dated ten minutes later, but relayed within ten minutes of this
-        // node's clock: ignored. The owner chooses its dates, not this
-        // clock, so a ladder of back-dated announcements cannot hold the
-        // relay budget (red-team re-check of R1).
+        // Fresher, but relayed within ten minutes of this node's clock and
+        // not ten minutes newer: ignored. The owner chooses its dates, not
+        // this clock (red-team re-check of R1; see also
+        // `a_ladder_of_back_dated_announcements_holds_nothing`).
         assert_eq!(
-            c.node.accept_reach(
-                signed(&identity, now + crate::net::REACH_MIN_INTERVAL),
-                Some(3)
-            ),
+            c.node.accept_reach(signed(&identity, now + 60), Some(3)),
             ReachVerdict::Ignored
         );
         // The wallet's own announcement is not held back.
