@@ -261,6 +261,37 @@ impl Snapshot {
             ));
         }
 
+        // 5. The names: every name output belongs to a complete pair that a
+        //    valid chain could hold — the price on the tag, nothing on the
+        //    owner output, one name per skeleton, three per owner. A name
+        //    output outside any pair would sit in the set without being in
+        //    the registry, and a node loading it would judge registrations
+        //    differently from one that replayed the chain.
+        let (mut tags, mut keys) = (0usize, 0usize);
+        for (_, e) in self.utxo.iter() {
+            match e.output.scheme {
+                crate::sig::SchemeId::NameTag => {
+                    if e.output.value.units() != crate::consensus::NAME_PRICE {
+                        return Err(StateError::Inconsistent("a name output without its price"));
+                    }
+                    tags += 1;
+                }
+                crate::sig::SchemeId::NameKey => {
+                    if e.output.value.units() != 0 {
+                        return Err(StateError::Inconsistent("a name owner output with value"));
+                    }
+                    keys += 1;
+                }
+                _ => {}
+            }
+        }
+        let names = self.utxo.names();
+        if tags != names.len() || keys != names.len() || !names.is_well_formed() {
+            return Err(StateError::Inconsistent(
+                "name outputs that no valid chain could hold",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -991,6 +1022,75 @@ mod tests {
             utxo,
             muhash,
         }
+    }
+
+    /// A snapshot whose name outputs no valid chain could hold is refused:
+    /// a lone tag, an owner output with value, two look-alikes, a fourth
+    /// name for one owner. Two genuine pairs pass (red-team hardening).
+    #[test]
+    fn a_snapshot_with_impossible_names_is_refused() {
+        use crate::consensus::NAME_PRICE;
+        let pair =
+            |s: &mut Snapshot, n: u8, name: &str, owner: u8, tag_value: u64, key_value: u64| {
+                let txid = Hash256([0xa0 + n; 32]);
+                s.utxo.insert(
+                    OutPoint { txid, index: 0 },
+                    UtxoEntry {
+                        output: TxOut {
+                            value: Amount::from_units(tag_value),
+                            scheme: SchemeId::NameTag,
+                            pubkey_hash: Hash256(crate::names::encode(name).unwrap()),
+                        },
+                        height: 10,
+                        is_coinbase: false,
+                    },
+                );
+                s.utxo.insert(
+                    OutPoint { txid, index: 1 },
+                    UtxoEntry {
+                        output: TxOut {
+                            value: Amount::from_units(key_value),
+                            scheme: SchemeId::NameKey,
+                            pubkey_hash: Hash256([owner; 32]),
+                        },
+                        height: 10,
+                        is_coinbase: false,
+                    },
+                );
+            };
+        let check = |s: &Snapshot| s.check_consistency();
+
+        let mut good = sample_snapshot(5);
+        pair(&mut good, 1, "delbu", 1, NAME_PRICE, 0);
+        pair(&mut good, 2, "alice", 2, NAME_PRICE, 0);
+        assert!(check(&good).is_ok(), "{:?}", check(&good).err());
+
+        let mut twins = sample_snapshot(5);
+        pair(&mut twins, 1, "delbu", 1, NAME_PRICE, 0);
+        pair(&mut twins, 2, "de1bu", 2, NAME_PRICE, 0);
+        assert!(check(&twins).is_err(), "two look-alikes");
+
+        let mut greedy = sample_snapshot(5);
+        for (n, name) in ["aaa", "bbb", "ccc", "ddd"].iter().enumerate() {
+            pair(&mut greedy, n as u8, name, 1, NAME_PRICE, 0);
+        }
+        assert!(check(&greedy).is_err(), "a fourth name");
+
+        let mut cheap = sample_snapshot(5);
+        pair(&mut cheap, 1, "delbu", 1, NAME_PRICE - 1, 0);
+        assert!(check(&cheap).is_err(), "the price not paid");
+
+        let mut valued = sample_snapshot(5);
+        pair(&mut valued, 1, "delbu", 1, NAME_PRICE, 7);
+        assert!(check(&valued).is_err(), "value on the owner output");
+
+        let mut lone = sample_snapshot(5);
+        pair(&mut lone, 1, "delbu", 1, NAME_PRICE, 0);
+        lone.utxo.remove(&OutPoint {
+            txid: Hash256([0xa1; 32]),
+            index: 1,
+        });
+        assert!(check(&lone).is_err(), "a tag without its owner");
     }
 
     #[test]

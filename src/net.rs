@@ -420,9 +420,22 @@ pub const ACTIVATION_WARNING_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Most reach announcements a node keeps: one per name owner it heard of.
 pub const MAX_REACH: usize = 4096;
-/// Reach announcements verified per second, at most, and in one burst.
+/// Genuine reach announcements kept and relayed per second, at most, and in
+/// one burst, from all peers together. Debited only once a signature has
+/// checked out: a forged announcement never spends what honest ones need.
 pub const REACH_RATE_PER_SEC: u64 = 5;
 pub const REACH_BUCKET_MAX: u64 = 50;
+/// Reach messages — announcements and requests — one peer may send per
+/// second, and in one burst. An announcement costs a post-quantum
+/// verification and a request a reply some hundred times its size: each peer
+/// pays for its own, and none can spend the budget of the others.
+pub const PEER_REACH_RATE_PER_SEC: u64 = 1;
+pub const PEER_REACH_BUCKET_MAX: u64 = 8;
+/// Least time between two announcements of one owner that a node keeps and
+/// relays. A wallet announces itself every six hours
+/// ([`REACH_REANNOUNCE`]); an owner re-signing every second to hold the
+/// relay budget is held to one announcement per ten minutes.
+pub const REACH_MIN_INTERVAL: u64 = 600;
 /// An announcement dated further ahead than this is refused, and one older
 /// than [`REACH_MAX_AGE`] forgotten.
 pub const REACH_MAX_SKEW: u64 = 2 * 3600;
@@ -482,6 +495,20 @@ pub fn activation_warning(h: u64, tip: u64, peers: &[(SocketAddr, u32, String)])
 /// as this node does.
 pub fn follows_activation(network: Network, version: u32) -> bool {
     !crate::policy::has_transition(network) || version >= crate::wire::POLICY_ACTIVATION_VERSION
+}
+
+/// Whether peer `id` may send one more reach message — announcement or
+/// request — now: it speaks protocol 6, is handshaked, and its own budget
+/// ([`PEER_REACH_BUCKET_MAX`]) is not spent. A message over budget is
+/// dropped without penalty: an honest peer may relay a burst.
+fn reach_budget(g: &mut Shared, id: u64) -> bool {
+    let now = Instant::now();
+    g.peers.get_mut(&id).is_some_and(|p| {
+        p.handshaked
+            && reads_names(p.version)
+            && p.reach_bucket
+                .allow_with(1, now, PEER_REACH_BUCKET_MAX, PEER_REACH_RATE_PER_SEC)
+    })
 }
 
 /// Can a peer that announced protocol `version` read a name output? Only
@@ -798,6 +825,15 @@ impl TokenBucket {
         }
     }
 
+    /// A reach-message bucket: same rule, one unit per announcement or
+    /// request. See [`PEER_REACH_BUCKET_MAX`].
+    pub fn for_reach_messages(now: Instant) -> TokenBucket {
+        TokenBucket {
+            tokens: PEER_REACH_BUCKET_MAX,
+            last: now,
+        }
+    }
+
     /// Empties the bucket: what was granted beyond it is paid by waiting for
     /// it to refill.
     pub fn drain(&mut self, now: Instant) {
@@ -929,6 +965,8 @@ struct Peer {
     channels: bool,
     /// Per-peer budget for channel messages. See [`CHAN_BUCKET_MAX`].
     chan_bucket: TokenBucket,
+    /// Per-peer budget for reach messages. See [`PEER_REACH_BUCKET_MAX`].
+    reach_bucket: TokenBucket,
     /// Height announced by the peer at the handshake.
     start_height: u64,
     /// Compact block reconstructions waiting for transactions.
@@ -1896,21 +1934,14 @@ impl Node {
             return ReachVerdict::Ignored;
         }
         let network = {
-            let mut g = self.shared.lock().unwrap();
+            let g = self.shared.lock().unwrap();
             if g.chain.utxo.names().owned(&owner) == 0 {
                 return ReachVerdict::Ignored;
             }
-            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time) {
-                return ReachVerdict::Ignored;
-            }
-            if from.is_some()
-                && !g.reach_bucket.allow_with(
-                    1,
-                    Instant::now(),
-                    REACH_BUCKET_MAX,
-                    REACH_RATE_PER_SEC,
-                )
-            {
+            if g.reach.get(&owner).is_some_and(|k| {
+                k.time >= r.time
+                    || (from.is_some() && r.time < k.time.saturating_add(REACH_MIN_INTERVAL))
+            }) {
                 return ReachVerdict::Ignored;
             }
             g.network
@@ -1930,6 +1961,18 @@ impl Node {
         let targets: Vec<Arc<Outbox>> = {
             let mut g = self.shared.lock().unwrap();
             if g.reach.get(&owner).is_some_and(|k| k.time >= r.time) {
+                return ReachVerdict::Ignored;
+            }
+            // The relay budget, shared by all peers, is spent only on
+            // genuine announcements.
+            if from.is_some()
+                && !g.reach_bucket.allow_with(
+                    1,
+                    Instant::now(),
+                    REACH_BUCKET_MAX,
+                    REACH_RATE_PER_SEC,
+                )
+            {
                 return ReachVerdict::Ignored;
             }
             if g.reach.len() >= MAX_REACH && !g.reach.contains_key(&owner) {
@@ -2880,6 +2923,7 @@ impl Node {
                     user_agent: String::new(),
                     channels: false,
                     chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
+                    reach_bucket: TokenBucket::for_reach_messages(Instant::now()),
                     start_height: 0,
                     pending: HashMap::new(),
                     consecutive_orphans: 0,
@@ -4340,20 +4384,12 @@ impl Node {
                 // Checked off the lock: the signature costs a post-quantum
                 // verification. Only from a handshaked peer that speaks it.
                 Message::Reach(r) => {
-                    let speaks = g
-                        .peers
-                        .get(&id)
-                        .is_some_and(|p| p.handshaked && reads_names(p.version));
-                    if speaks {
+                    if reach_budget(&mut g, id) {
                         reach_in = Some(r);
                     }
                 }
                 Message::GetReach(owner) => {
-                    let speaks = g
-                        .peers
-                        .get(&id)
-                        .is_some_and(|p| p.handshaked && reads_names(p.version));
-                    if speaks {
+                    if reach_budget(&mut g, id) {
                         if let Some(r) = g.reach.get(&owner) {
                             outgoing.push(Outgoing {
                                 peer: id,
@@ -6002,6 +6038,7 @@ mod tests {
                 user_agent: String::new(),
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
+                reach_bucket: TokenBucket::for_reach_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 expected_headers: 0,
@@ -6407,6 +6444,7 @@ mod tests_hardening {
                 user_agent: String::new(),
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
+                reach_bucket: TokenBucket::for_reach_messages(Instant::now()),
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 expected_headers: 0,
@@ -8069,6 +8107,7 @@ mod tests_handler_fuzz {
                 user_agent: String::new(),
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
+                reach_bucket: TokenBucket::for_reach_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 expected_headers: 0,
@@ -8095,6 +8134,31 @@ mod tests_handler_fuzz {
                 connected_at: now,
             },
         );
+    }
+
+    /// Each peer pays for its own reach messages: one that spends its budget
+    /// is cut off, and another peer still has all of its own (red-team
+    /// findings R1 and R2). A peer below protocol 6 has none at all.
+    #[test]
+    fn each_peer_has_its_own_reach_budget() {
+        let n = Node::new(NETWORK, Chain::new(NETWORK, genesis_block(NETWORK)));
+        for id in 1..=3u64 {
+            plug_in(&n, id, true, false);
+        }
+        let mut g = n.shared.lock().unwrap();
+        for id in 1..=2u64 {
+            g.peers.get_mut(&id).unwrap().version = crate::wire::NAME_ACTIVATION_VERSION;
+        }
+        g.peers.get_mut(&3).unwrap().version = crate::wire::NAME_ACTIVATION_VERSION - 1;
+        for _ in 0..PEER_REACH_BUCKET_MAX {
+            assert!(reach_budget(&mut g, 1));
+        }
+        assert!(!reach_budget(&mut g, 1), "the burst is spent");
+        for _ in 0..PEER_REACH_BUCKET_MAX {
+            assert!(reach_budget(&mut g, 2), "another peer keeps its own");
+        }
+        assert!(!reach_budget(&mut g, 3), "an older peer sends none");
+        assert!(!reach_budget(&mut g, 99), "nor an unknown one");
     }
 
     /// Mines a header as is: the work is real, the content is whatever the
@@ -8903,6 +8967,7 @@ mod tests_handler_review {
                 user_agent: String::new(),
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
+                reach_bucket: TokenBucket::for_reach_messages(now),
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 expected_headers: 0,

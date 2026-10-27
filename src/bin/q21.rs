@@ -1033,7 +1033,7 @@ fn write_wallet(d: &Path, w: &Wallet) -> Result<(), String> {
     // read under either, and this write converts it. The conversion cannot
     // happen at startup, since the file is sealed by the passphrase.
     let content = Secret(format!(
-        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserial={}\nverified_up_to={}\nconsumed={}\nlabels={}\nrequested={}\nreserved={}\ncontacts={}\n",
+        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserial={}\nverified_up_to={}\nconsumed={}\nlabels={}\nrequested={}\nreserved={}\ncontacts={}\nname_txs={}\n",
         w.seed_hex(),
         w.next_index(),
         network,
@@ -1044,7 +1044,8 @@ fn write_wallet(d: &Path, w: &Wallet) -> Result<(), String> {
         labels,
         requested.join(","),
         reserved.join(","),
-        w.contacts().to_line()
+        w.contacts().to_line(),
+        w.name_txs_line()
     ));
     // The wallet is sealed if a passphrase is known to this session. The seed
     // must never touch the disk in plaintext when the user asked otherwise.
@@ -1426,6 +1427,7 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
     let mut reserved: Vec<(u32, u64)> = Vec::new();
     let mut labels: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     let mut contacts = q21_core::contacts::ContactBook::default();
+    let mut name_txs = String::new();
     let mut requested: Vec<u32> = Vec::new();
     let mut verified_up_to = 0u64;
     let mut network = Network::Regtest;
@@ -1476,6 +1478,8 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
             // Absent from wallets written before 0.5.0: an empty book. The
             // texts are in hexadecimal, as the labels are.
             "contacts" => contacts = q21_core::contacts::ContactBook::from_line(value),
+            // Absent before 0.5.0, and only a label of the history.
+            "name_txs" => name_txs = value.to_string(),
             // Absent from earlier wallets: their addresses all count as
             // derived by mining, which is only a display order.
             "requested" => {
@@ -1574,6 +1578,7 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
     w.load_reservations(&reserved);
     w.load_labels(labels);
     w.load_contacts(contacts);
+    w.load_name_txs(&name_txs);
     w.load_requested(&requested);
     w.record_verification(verified_up_to);
     if !adopted {

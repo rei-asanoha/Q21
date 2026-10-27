@@ -200,9 +200,17 @@ pub fn decode(bytes: &NameBytes) -> Option<String> {
 
 /// The skeleton of a canonical name: what two look-alike names share.
 ///
-/// Hyphens are dropped; `0` reads as `o`; `1` and `i` as `l`; `5` as `s`;
-/// then `rn` reads as `m` and `vv` as `w`. Two names with the same skeleton
-/// cannot both be registered. Frozen: consensus depends on every byte of it.
+/// Hyphens are dropped; the digits that pass for letters read as them —
+/// `0` as `o`, `1` as `l`, `2` as `z`, `4` as `a`, `5` as `s`, `6` and `8` as
+/// `b`, `9` as `g` — and `i` reads as `l`; then `rn` reads as `m`, `vv` as
+/// `w` and `cl` as `d`. Two names with the same skeleton cannot both be
+/// registered. Frozen from the activation on: consensus depends on every
+/// byte of it.
+///
+/// The cost is known and accepted: some distinct words share a skeleton
+/// (`modern` and `modem`, `clone` and `done`), and the first registered
+/// keeps both. A look-alike that slips through is the attack the rule
+/// exists for; a word taken twice is an inconvenience.
 pub fn skeleton(name: &str) -> Vec<u8> {
     let mapped: Vec<u8> = name
         .bytes()
@@ -210,7 +218,11 @@ pub fn skeleton(name: &str) -> Vec<u8> {
         .map(|c| match c {
             b'0' => b'o',
             b'1' | b'i' => b'l',
+            b'2' => b'z',
+            b'4' => b'a',
             b'5' => b's',
+            b'6' | b'8' => b'b',
+            b'9' => b'g',
             other => other,
         })
         .collect();
@@ -225,6 +237,10 @@ pub fn skeleton(name: &str) -> Vec<u8> {
             }
             (b'v', Some(b'v')) => {
                 out.push(b'w');
+                i += 2;
+            }
+            (b'c', Some(b'l')) => {
+                out.push(b'd');
                 i += 2;
             }
             (c, _) => {
@@ -462,6 +478,18 @@ impl NameIndex {
         v
     }
 
+    /// Whether the index could come from a valid chain: every indexed pair
+    /// holds its own name and its own skeleton, and no owner holds more than
+    /// [`MAX_NAMES_PER_OWNER`]. A set built by connecting blocks always
+    /// passes; a forged snapshot that slips two look-alikes, or a fourth
+    /// name, past the rules does not ([`crate::state::Snapshot::check_consistency`]).
+    pub fn is_well_formed(&self) -> bool {
+        self.by_tag.len() == self.by_name.len()
+            && self.by_name.len() == self.by_skeleton.len()
+            && self.per_owner.values().all(|&n| n <= MAX_NAMES_PER_OWNER)
+            && self.per_owner.values().sum::<usize>() == self.by_name.len()
+    }
+
     /// Number of registered names.
     pub fn len(&self) -> usize {
         self.by_name.len()
@@ -594,6 +622,21 @@ mod tests {
         assert_eq!(skeleton("5am"), skeleton("sam"));
         assert_ne!(skeleton("delbu"), skeleton("delbo"));
         assert_ne!(skeleton("alice"), skeleton("alise"));
+        // The digits and the pair the 0.5.0 red-team slipped through.
+        assert_eq!(skeleton("2ebra"), skeleton("zebra"));
+        assert_eq!(skeleton("4lice"), skeleton("alice"));
+        assert_eq!(skeleton("6ob"), skeleton("bob"));
+        assert_eq!(skeleton("8ob"), skeleton("bob"));
+        assert_eq!(skeleton("9ary"), skeleton("gary"));
+        assert_eq!(skeleton("clave"), skeleton("dave"));
+        assert_eq!(skeleton("c1ave"), skeleton("dave"));
+        // Pinned whole: a change to any byte of the rule is a change of
+        // consensus, and fails here first.
+        assert_eq!(skeleton("a-0123456789-z"), b"aolz3asb7bgz".to_vec());
+        assert_eq!(skeleton("rnclvvi"), b"mdwl".to_vec());
+        // What the rule leaves apart.
+        assert_ne!(skeleton("valid"), skeleton("ualid"));
+        assert_ne!(skeleton("three"), skeleton("7hree"));
     }
 
     #[test]

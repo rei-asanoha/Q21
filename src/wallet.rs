@@ -214,7 +214,15 @@ pub struct Wallet {
     /// identity address ([`crate::contacts`]). Strictly local, sealed with
     /// the rest of the wallet.
     contacts: crate::contacts::ContactBook,
+    /// The transactions this wallet sent to register a name: the payment of
+    /// the price to its identity address, and the registration itself. Only
+    /// to tell them apart in the history from an ordinary payment to that
+    /// address; the most recent [`MAX_NAME_TXS`] are kept.
+    name_txs: Vec<Hash256>,
 }
+
+/// Most name transactions a wallet remembers ([`Wallet::record_name_tx`]).
+pub const MAX_NAME_TXS: usize = 64;
 
 /// Wipes the seed when the wallet is dropped.
 ///
@@ -243,6 +251,7 @@ impl Wallet {
             requested: BTreeSet::new(),
             locked: BTreeSet::new(),
             contacts: crate::contacts::ContactBook::default(),
+            name_txs: Vec::new(),
         }
     }
 
@@ -277,6 +286,7 @@ impl Wallet {
             requested: BTreeSet::new(),
             locked: BTreeSet::new(),
             contacts: crate::contacts::ContactBook::default(),
+            name_txs: Vec::new(),
         })
     }
 
@@ -997,6 +1007,42 @@ impl Wallet {
     /// Restores the contact book read from the file.
     pub fn load_contacts(&mut self, book: crate::contacts::ContactBook) {
         self.contacts = book;
+    }
+
+    /// Whether `txid` is one this wallet sent to register a name.
+    pub fn is_name_tx(&self, txid: &Hash256) -> bool {
+        self.name_txs.contains(txid)
+    }
+
+    /// Records a transaction sent to register a name; the caller saves the
+    /// wallet. The oldest is forgotten beyond [`MAX_NAME_TXS`].
+    pub fn record_name_tx(&mut self, txid: Hash256) {
+        if self.name_txs.contains(&txid) {
+            return;
+        }
+        self.name_txs.push(txid);
+        if self.name_txs.len() > MAX_NAME_TXS {
+            self.name_txs.remove(0);
+        }
+    }
+
+    /// The `name_txs=` line of the wallet file: hexadecimal identifiers,
+    /// oldest first, separated by commas.
+    pub fn name_txs_line(&self) -> String {
+        self.name_txs
+            .iter()
+            .map(|t| t.to_hex())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Restores the `name_txs=` line read from the file. A malformed entry
+    /// is skipped on its own.
+    pub fn load_name_txs(&mut self, line: &str) {
+        self.name_txs.clear();
+        for t in line.split(',').filter_map(Hash256::from_hex) {
+            self.record_name_tx(t);
+        }
     }
 
     /// Records that a scan covered the chain up to this height.
@@ -2023,6 +2069,25 @@ mod mldsa_wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name transactions survive the wallet file, bounded, and a damaged
+    /// entry is dropped alone.
+    #[test]
+    fn name_transactions_survive_the_wallet_file() {
+        let mut w = Wallet::from_seed([7u8; 32], Network::Regtest);
+        for n in 0..(MAX_NAME_TXS as u8 + 5) {
+            w.record_name_tx(Hash256([n; 32]));
+        }
+        w.record_name_tx(Hash256([10; 32]));
+        assert!(!w.is_name_tx(&Hash256([0; 32])), "the oldest is forgotten");
+        assert!(w.is_name_tx(&Hash256([MAX_NAME_TXS as u8 + 4; 32])));
+        let line = w.name_txs_line();
+        let mut back = Wallet::from_seed([7u8; 32], Network::Regtest);
+        back.load_name_txs(&format!("{line},zz,"));
+        assert_eq!(back.name_txs_line(), line);
+        back.load_name_txs("");
+        assert!(!back.is_name_tx(&Hash256([10; 32])));
+    }
 
     /// Mining derives addresses; only those the holder requests are recorded
     /// as such, and the record survives a reload.

@@ -59,16 +59,34 @@ pub struct ContactBook {
     by_owner: BTreeMap<Hash256, Contact>,
 }
 
-/// A local name as it is kept: control characters turned to spaces, trimmed,
-/// cut at [`MAX_LABEL_LEN`] characters, never in the middle of one.
+/// A local name as it is kept: control characters turned to spaces, the
+/// invisible characters that reorder or hide text dropped, trimmed, cut at
+/// [`MAX_LABEL_LEN`] characters, never in the middle of one.
 pub fn clean_label(text: &str) -> String {
     let s: String = text
         .trim()
         .chars()
+        .filter(|c| !is_invisible(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(MAX_LABEL_LEN)
         .collect();
     s.trim().to_string()
+}
+
+/// The characters that show nothing yet change what is shown: the
+/// direction overrides and isolates, which can make "Alice" read backward
+/// or a label run into the text after it, and the zero-width ones, which
+/// make two labels that look the same differ.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 impl ContactBook {
@@ -264,6 +282,10 @@ mod tests {
     #[test]
     fn labels_are_cleaned_and_bounded() {
         assert_eq!(clean_label("  a\tb  "), "a b");
+        // Direction overrides and zero-width characters are dropped.
+        assert_eq!(clean_label("\u{202E}ecila\u{202C}"), "ecila");
+        assert_eq!(clean_label("Ma\u{200B}c\u{2066}"), "Mac");
+        assert_eq!(clean_label("\u{FEFF}\u{200D}"), "");
         assert_eq!(
             clean_label(&"\u{e9}".repeat(100)).chars().count(),
             MAX_LABEL_LEN

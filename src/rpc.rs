@@ -894,6 +894,10 @@ pub const HISTORY_NOTES: [&str; 4] = [
     NOTE_PARTIAL,
 ];
 
+/// Most identity coins one registration or one sweep spends.
+#[cfg(feature = "mldsa")]
+const MAX_IDENTITY_INPUTS: usize = 8;
+
 /// The notes of `getsyncstatus`, which the wallet page translates.
 pub const SYNC_NO_PEER: &str = "No peer connected: this node cannot know whether it is up to date.";
 pub const SYNC_UP_TO_DATE: &str = "Up to date with the known peers.";
@@ -1247,6 +1251,10 @@ impl RpcContext {
             (
                 "nameregister",
                 "[wallet] Register a name for this wallet's identity, for 0.5 Q21 destroyed (name)",
+            ),
+            (
+                "identitysweep",
+                "[wallet] Bring what sits on the identity address back to the wallet",
             ),
             ("namelist", "[wallet] The names of this wallet's identity"),
             ("contactlist", "[wallet] The contact book"),
@@ -1685,6 +1693,10 @@ impl RpcContext {
             )
             .set("names", self.names_json(&owner))
             .set("max_names", Json::u64(MAX_NAMES_PER_OWNER as u64))
+            .set(
+                "identity_balance",
+                amount_json(Amount::from_units(self.identity_balance(&owner))),
+            )
             .build())
     }
 
@@ -1694,34 +1706,38 @@ impl RpcContext {
         Ok(self.names_json(&owner))
     }
 
-    /// The fee of a registration at `rate`: one ML-DSA-87 input, the tag,
-    /// the owner output and a change output, measured on the transaction
+    /// The fee, at `rate`, of a transaction of the identity key spending
+    /// `inputs` identity coins into a change output, with the two name
+    /// outputs first when it `registers`: measured on the transaction
     /// itself rather than estimated.
     #[cfg(feature = "mldsa")]
-    fn registration_fee(rate: u64) -> u64 {
+    fn identity_tx_fee(rate: u64, inputs: usize, registers: bool) -> u64 {
         let out = |scheme| crate::tx::TxOut {
             value: Amount::ZERO,
             scheme,
             pubkey_hash: crate::hash::Hash256::ZERO,
         };
+        let input = crate::tx::TxIn {
+            prev_out: crate::tx::OutPoint {
+                txid: crate::hash::Hash256::ZERO,
+                index: 0,
+            },
+            witness: crate::tx::Witness {
+                pubkey: vec![0; SchemeId::MlDsa87.pubkey_len()],
+                signature: vec![0; SchemeId::MlDsa87.sig_len()],
+            },
+            sequence: 0,
+        };
+        let mut outputs = Vec::new();
+        if registers {
+            outputs.push(out(SchemeId::NameTag));
+            outputs.push(out(SchemeId::NameKey));
+        }
+        outputs.push(out(SchemeId::MlDsa87));
         let probe = Transaction {
             version: 1,
-            inputs: vec![crate::tx::TxIn {
-                prev_out: crate::tx::OutPoint {
-                    txid: crate::hash::Hash256::ZERO,
-                    index: 0,
-                },
-                witness: crate::tx::Witness {
-                    pubkey: vec![0; SchemeId::MlDsa87.pubkey_len()],
-                    signature: vec![0; SchemeId::MlDsa87.sig_len()],
-                },
-                sequence: 0,
-            }],
-            outputs: vec![
-                out(SchemeId::NameTag),
-                out(SchemeId::NameKey),
-                out(SchemeId::MlDsa87),
-            ],
+            inputs: vec![input; inputs.max(1)],
+            outputs,
             lock_time: 0,
         };
         probe
@@ -1731,14 +1747,89 @@ impl RpcContext {
             .max(DEFAULT_FEE)
     }
 
+    /// The coins on the identity address `owner` that nothing spends yet,
+    /// confirmed or waiting in the mempool, the largest first and at most
+    /// [`MAX_IDENTITY_INPUTS`]; and the fee rate of the moment.
+    #[cfg(feature = "mldsa")]
+    fn identity_coins(
+        c: &crate::chain::Chain,
+        m: &crate::mempool::Mempool,
+        owner: &crate::hash::Hash256,
+    ) -> Vec<(crate::tx::OutPoint, crate::tx::TxOut)> {
+        let identity_coin =
+            |o: &crate::tx::TxOut| o.scheme == SchemeId::MlDsa87 && o.pubkey_hash == *owner;
+        let mut coins: Vec<(crate::tx::OutPoint, crate::tx::TxOut)> = c
+            .utxo
+            .spendable_for(owner, c.height(), COINBASE_MATURITY)
+            .into_iter()
+            .filter(|(o, _)| !m.spends(o))
+            .map(|(o, e)| (o, e.output))
+            .chain(m.unspent_created(&identity_coin))
+            .collect();
+        coins.sort_by(|a, b| {
+            b.1.value
+                .units()
+                .cmp(&a.1.value.units())
+                .then(a.0.cmp(&b.0))
+        });
+        coins.truncate(MAX_IDENTITY_INPUTS);
+        coins
+    }
+
+    /// Signs every input of `tx`, all identity coins, with the identity key.
+    #[cfg(feature = "mldsa")]
+    fn sign_identity_inputs(
+        &self,
+        identity: &crate::channel::keys::NodeIdentity,
+        tx: &mut Transaction,
+        spent: &[crate::tx::TxOut],
+    ) {
+        for (i, prev) in spent.iter().enumerate() {
+            let message = tx.sighash(i as u32, self.network, prev);
+            tx.inputs[i].witness.signature = identity.sign(&message);
+        }
+    }
+
+    /// A fresh address of the wallet, saved before it is used.
+    #[cfg(feature = "mldsa")]
+    fn fresh_wallet_address(
+        &self,
+        w: &Arc<Mutex<Wallet>>,
+    ) -> Result<crate::address::Address, Json> {
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let a = g.new_address();
+        if self.save_wallet(&g).is_err() {
+            return Err(rpc_error(
+                ERR_WALLET,
+                wallet_message(&crate::wallet::WalletError::SaveFailed),
+            ));
+        }
+        Ok(a)
+    }
+
+    /// Remembers `txids` as sent for a name, for the history to say so.
+    #[cfg(feature = "mldsa")]
+    fn record_name_txs(&self, w: &Arc<Mutex<Wallet>>, txids: &[crate::hash::Hash256]) {
+        if let Ok(mut g) = w.lock() {
+            for t in txids {
+                g.record_name_tx(*t);
+            }
+            // Only a label of the history: a failed save loses nothing else.
+            let _ = self.save_wallet(&g);
+        }
+    }
+
     /// Registers `name` for the wallet's identity key.
     ///
-    /// Two transactions, sent together: the wallet pays the price and the
-    /// fee of the registration to its identity address, then the identity
-    /// key spends that coin into the two name outputs. The second spends
-    /// the first before it is confirmed, so both enter the same block or
-    /// the next ones. An identity coin left by an earlier attempt is used
-    /// first, and nothing is paid twice.
+    /// The identity key spends coins of its own address into the two name
+    /// outputs and the change. Every coin already there is used first — one
+    /// left by an earlier attempt, or sent there by mistake — and the wallet
+    /// pays to the identity only what they lack, in a transaction sent just
+    /// before the registration that spends it unconfirmed. Whatever the fee
+    /// rate does between two attempts, nothing is paid twice and nothing
+    /// stays stranded: the change goes back to the wallet.
     #[cfg(feature = "mldsa")]
     fn nameregister(&self, params: &Json) -> Result<Json, Json> {
         let name = Self::name_param(params)?;
@@ -1766,8 +1857,8 @@ impl RpcContext {
         };
         let skeleton = crate::names::skeleton(&name);
 
-        // 1. Is the name free, the quota not reached, and is there already a
-        //    coin of the identity to spend?
+        // 1. Is the name free, the quota not reached; what is already on the
+        //    identity address, and the fee rate.
         let checked = self.node.with_chain_and_mempool(|c, m| {
             let view = m.view(&c.utxo);
             if let Some(taken) = view.name_by_skeleton(&skeleton) {
@@ -1786,54 +1877,40 @@ impl RpcContext {
                 .median_fee_rate()
                 .unwrap_or(0)
                 .max(crate::mempool::MIN_FEE_RATE);
-            let fee = Self::registration_fee(rate);
-            let needed = NAME_PRICE + fee;
-            let identity_coin =
-                |o: &crate::tx::TxOut| o.scheme == SchemeId::MlDsa87 && o.pubkey_hash == owner;
-            let confirmed = c
-                .utxo
-                .spendable_for(&owner, c.height(), COINBASE_MATURITY)
-                .into_iter()
-                .filter(|(o, _)| !m.spends(o))
-                .map(|(o, e)| (o, e.output));
-            let coin = confirmed
-                .chain(m.unspent_created(&identity_coin))
-                .filter(|(_, o)| o.value.units() >= needed)
-                .min_by_key(|(_, o)| o.value.units());
-            Ok((fee, coin))
+            Ok((rate, Self::identity_coins(c, m, &owner)))
         });
-        let (fee, coin) = checked.map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+        let (rate, mut coins) = checked.map_err(|e| rpc_error(ERR_REQUEST, &e))?;
 
-        // 2. Fund the identity, unless an earlier attempt already did.
-        let (funding, coin) = match coin {
-            Some(c) => (None, c),
-            None => {
-                let (ftx, ftxid, _) = self.spend(
-                    w,
-                    &[(identity_address, Amount::from_units(NAME_PRICE + fee))],
-                    None,
-                )?;
-                self.node.announce_tx(ftxid);
-                let index = ftx
-                    .outputs
-                    .iter()
-                    .position(|o| o.scheme == SchemeId::MlDsa87 && o.pubkey_hash == owner)
-                    .ok_or_else(|| rpc_error(ERR_INTERNAL, "funding output not found"))?;
-                (
-                    Some(ftxid),
-                    (
-                        crate::tx::OutPoint {
-                            txid: ftxid,
-                            index: index as u32,
-                        },
-                        ftx.outputs[index],
-                    ),
-                )
-            }
-        };
+        // 2. Pay the identity what it lacks, if anything.
+        let have: u64 = coins.iter().map(|(_, o)| o.value.units()).sum();
+        let mut funding = None;
+        if have < NAME_PRICE + Self::identity_tx_fee(rate, coins.len(), true) {
+            let lack = (NAME_PRICE + Self::identity_tx_fee(rate, coins.len() + 1, true))
+                .saturating_sub(have)
+                .max(MIN_OUTPUT_VALUE);
+            let (ftx, ftxid, _) =
+                self.spend(w, &[(identity_address, Amount::from_units(lack))], None)?;
+            self.node.announce_tx(ftxid);
+            self.record_name_txs(w, &[ftxid]);
+            let index = ftx
+                .outputs
+                .iter()
+                .position(|o| o.scheme == SchemeId::MlDsa87 && o.pubkey_hash == owner)
+                .ok_or_else(|| rpc_error(ERR_INTERNAL, "funding output not found"))?;
+            coins.push((
+                crate::tx::OutPoint {
+                    txid: ftxid,
+                    index: index as u32,
+                },
+                ftx.outputs[index],
+            ));
+            funding = Some(ftxid);
+        }
 
-        // 3. The registration itself: the tag, the owner output, and the
-        //    change of a larger identity coin back to the wallet.
+        // 3. The registration: the tag, the owner output, and the change of
+        //    the identity coins back to the wallet.
+        let fee = Self::identity_tx_fee(rate, coins.len(), true);
+        let total: u64 = coins.iter().map(|(_, o)| o.value.units()).sum();
         let mut outputs = vec![
             crate::tx::TxOut {
                 value: Amount::from_units(NAME_PRICE),
@@ -1848,7 +1925,7 @@ impl RpcContext {
                 pubkey_hash: owner,
             },
         ];
-        let excess = coin.1.value.units().saturating_sub(NAME_PRICE + fee);
+        let excess = total.saturating_sub(NAME_PRICE + fee);
         // Change below the dust floor goes to the fee, as in a send.
         let paid_fee = if excess >= MIN_OUTPUT_VALUE {
             fee
@@ -1856,16 +1933,7 @@ impl RpcContext {
             fee + excess
         };
         if excess >= MIN_OUTPUT_VALUE {
-            let mut g = w
-                .lock()
-                .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
-            let change = g.new_address();
-            if self.save_wallet(&g).is_err() {
-                return Err(rpc_error(
-                    ERR_WALLET,
-                    wallet_message(&crate::wallet::WalletError::SaveFailed),
-                ));
-            }
+            let change = self.fresh_wallet_address(w)?;
             outputs.push(crate::tx::TxOut {
                 value: Amount::from_units(excess),
                 scheme: change.scheme,
@@ -1874,19 +1942,22 @@ impl RpcContext {
         }
         let mut tx = Transaction {
             version: 1,
-            inputs: vec![crate::tx::TxIn {
-                prev_out: coin.0,
-                witness: crate::tx::Witness {
-                    pubkey: identity.pubkey().to_vec(),
-                    signature: vec![],
-                },
-                sequence: 0,
-            }],
+            inputs: coins
+                .iter()
+                .map(|(op, _)| crate::tx::TxIn {
+                    prev_out: *op,
+                    witness: crate::tx::Witness {
+                        pubkey: identity.pubkey().to_vec(),
+                        signature: vec![],
+                    },
+                    sequence: 0,
+                })
+                .collect(),
             outputs,
             lock_time: 0,
         };
-        let message = tx.sighash(0, self.network, &coin.1);
-        tx.inputs[0].witness.signature = identity.sign(&message);
+        let spent: Vec<crate::tx::TxOut> = coins.iter().map(|(_, o)| *o).collect();
+        self.sign_identity_inputs(&identity, &mut tx, &spent);
 
         let accepted = self
             .node
@@ -1895,13 +1966,14 @@ impl RpcContext {
             rpc_error(
                 ERR_WALLET,
                 &format!(
-                    "{}; the price stays on the identity address, and registering again \
-                     uses it without paying twice",
+                    "{}; what was paid stays on the identity address: registering again \
+                     uses it first, and identitysweep brings it back to the wallet",
                     mempool_message(&e)
                 ),
             )
         })?;
         self.node.announce_tx(txid);
+        self.record_name_txs(w, &[txid]);
         Ok(Json::obj()
             .set("name", Json::str(name))
             .set("txid", Json::str(txid.to_hex()))
@@ -1912,6 +1984,82 @@ impl RpcContext {
             .set("price", amount_json(Amount::from_units(NAME_PRICE)))
             .set("fee", amount_json(Amount::from_units(paid_fee)))
             .set("owner", Json::str(owner.to_hex()))
+            .build())
+    }
+
+    /// What sits on the identity address, confirmed or not.
+    #[cfg(feature = "mldsa")]
+    fn identity_balance(&self, owner: &crate::hash::Hash256) -> u64 {
+        self.node.with_chain_and_mempool(|c, m| {
+            Self::identity_coins(c, m, owner)
+                .iter()
+                .map(|(_, o)| o.value.units())
+                .sum()
+        })
+    }
+
+    /// Brings what sits on the identity address back to the wallet: a coin
+    /// sent there by mistake, or left by a registration that did not go
+    /// through. At most [`MAX_IDENTITY_INPUTS`] coins per call.
+    #[cfg(feature = "mldsa")]
+    fn identitysweep(&self) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let (identity, owner) = self.wallet_identity()?;
+        let (rate, coins) = self.node.with_chain_and_mempool(|c, m| {
+            let rate = m
+                .median_fee_rate()
+                .unwrap_or(0)
+                .max(crate::mempool::MIN_FEE_RATE);
+            (rate, Self::identity_coins(c, m, &owner))
+        });
+        if coins.is_empty() {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "nothing sits on the identity address",
+            ));
+        }
+        let fee = Self::identity_tx_fee(rate, coins.len(), false);
+        let total: u64 = coins.iter().map(|(_, o)| o.value.units()).sum();
+        let back = total.saturating_sub(fee);
+        if back < MIN_OUTPUT_VALUE {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "what sits on the identity address is smaller than the fee to bring it back",
+            ));
+        }
+        let to = self.fresh_wallet_address(w)?;
+        let mut tx = Transaction {
+            version: 1,
+            inputs: coins
+                .iter()
+                .map(|(op, _)| crate::tx::TxIn {
+                    prev_out: *op,
+                    witness: crate::tx::Witness {
+                        pubkey: identity.pubkey().to_vec(),
+                        signature: vec![],
+                    },
+                    sequence: 0,
+                })
+                .collect(),
+            outputs: vec![crate::tx::TxOut {
+                value: Amount::from_units(back),
+                scheme: to.scheme,
+                pubkey_hash: to.hash,
+            }],
+            lock_time: 0,
+        };
+        let spent: Vec<crate::tx::TxOut> = coins.iter().map(|(_, o)| *o).collect();
+        self.sign_identity_inputs(&identity, &mut tx, &spent);
+        let txid = self
+            .node
+            .with_chain_and_mempool(|c, m| m.accept_local(&tx, &c.utxo, self.network, c.height()))
+            .map_err(|e| rpc_error(ERR_WALLET, &mempool_message(&e)))?;
+        self.node.announce_tx(txid);
+        Ok(Json::obj()
+            .set("txid", Json::str(txid.to_hex()))
+            .set("amount", amount_json(Amount::from_units(back)))
+            .set("fee", amount_json(Amount::from_units(fee)))
+            .set("coins", Json::u64(coins.len() as u64))
             .build())
     }
 
@@ -2278,6 +2426,7 @@ impl RpcContext {
                 | "channelpay"
                 | "channelclose"
                 | "nameregister"
+                | "identitysweep"
         )
     }
 
@@ -2360,6 +2509,8 @@ impl RpcContext {
             "channelidentity" => self.channelidentity(),
             #[cfg(feature = "mldsa")]
             "nameregister" => self.nameregister(params),
+            #[cfg(feature = "mldsa")]
+            "identitysweep" => self.identitysweep(),
             #[cfg(feature = "mldsa")]
             "namelist" => self.namelist(),
             #[cfg(feature = "mldsa")]
@@ -3780,24 +3931,33 @@ impl RpcContext {
         };
 
         // The wallet's identity address, read before the wallet lock is
-        // taken (deriving it takes that lock too): a payment to it is the
-        // price of a name, and a movement carrying name outputs is a
-        // registration. Both are marked `"purpose": "name"`.
+        // taken (deriving it takes that lock too). A movement the wallet sent
+        // to register a name, or carrying name outputs, is marked
+        // `"purpose": "name"`; any other payment to the identity address
+        // `"purpose": "identity"`, so that the history never calls an
+        // ordinary transfer a registration.
         #[cfg(feature = "mldsa")]
         let identity_owner: Option<Hash256> = self.wallet_identity().ok().map(|(_, o)| o);
         #[cfg(not(feature = "mldsa"))]
         let identity_owner: Option<Hash256> = None;
-        let for_name = |tx: &Transaction| {
-            tx.outputs.iter().any(|o| {
-                o.scheme.is_name()
-                    || (o.scheme == SchemeId::MlDsa87 && Some(o.pubkey_hash) == identity_owner)
-            })
-        };
 
         let g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
         let scheme = g.scheme();
+        let purpose_of = |tx: &Transaction| -> Option<&'static str> {
+            if g.is_name_tx(&tx.txid()) || tx.outputs.iter().any(|o| o.scheme.is_name()) {
+                Some("name")
+            } else if tx
+                .outputs
+                .iter()
+                .any(|o| o.scheme == SchemeId::MlDsa87 && Some(o.pubkey_hash) == identity_owner)
+            {
+                Some("identity")
+            } else {
+                None
+            }
+        };
 
         // --- With the address index, the whole history and nothing else.
         //
@@ -3946,8 +4106,8 @@ impl RpcContext {
                         .set("net_out", amount_json(Amount::from_units(net_out)))
                         .set("amount_out_known", Json::Bool(committed_complete));
                 }
-                if for_name(tx) {
-                    row = row.set("purpose", Json::str("name"));
+                if let Some(p) = purpose_of(tx) {
+                    row = row.set("purpose", Json::str(p));
                 }
                 v.push(row.build());
             }
@@ -3970,7 +4130,7 @@ impl RpcContext {
                 received: u64,
                 coinbase: bool,
                 inputs: Vec<(Hash256, u32)>,
-                name: bool,
+                purpose: Option<&'static str>,
             }
             let mut drafts: Vec<Draft> = Vec::new();
             let mut wanted: std::collections::HashSet<(Hash256, u32)> =
@@ -4036,7 +4196,7 @@ impl RpcContext {
                         received,
                         coinbase,
                         inputs,
-                        name: for_name(tx),
+                        purpose: purpose_of(tx),
                     });
                 }
                 // The coins a row waits for, found in this block - including a
@@ -4086,8 +4246,8 @@ impl RpcContext {
                         .set("net_out", amount_json(Amount::from_units(net_out)))
                         .set("amount_out_known", Json::Bool(committed_complete));
                 }
-                if d.name {
-                    row = row.set("purpose", Json::str("name"));
+                if let Some(p) = d.purpose {
+                    row = row.set("purpose", Json::str(p));
                 }
                 v.push(row.build());
             }
@@ -5260,9 +5420,113 @@ mod tests {
             Some("delbu")
         );
 
-        // Three names per identity.
-        call_ok(&c, "nameregister", r#"{"name":"second"}"#);
+        // A coin left on the identity address — here sent by hand, smaller
+        // than the price — is spent by the next registration, which pays
+        // only what it lacks: nothing stays stranded (red-team finding R5).
+        let identity_balance = |c: &RpcContext| -> u64 {
+            call_ok(c, "channelidentity", "{}")
+                .get("identity_balance")
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+                .unwrap()
+        };
+        let stray = NAME_PRICE * 3 / 5;
+        call_ok(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{address}","units":{stray}}}"#),
+        );
         mine_pool(&c);
+        assert_eq!(identity_balance(&c), stray);
+        let second = call_ok(&c, "nameregister", r#"{"name":"second"}"#);
+        let topped = second
+            .get("funding_txid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let reg = call_ok(
+            &c,
+            "gettransaction",
+            &format!(
+                r#"{{"txid":"{}"}}"#,
+                second.get("txid").and_then(|v| v.as_str()).unwrap()
+            ),
+        );
+        let inputs = match reg.get("transaction").and_then(|t| t.get("inputs")) {
+            Some(Json::Array(v)) => v.len(),
+            other => panic!("no inputs: {other:?}"),
+        };
+        assert_eq!(inputs, 2, "the stray coin and the top-up");
+        mine_pool(&c);
+        assert_eq!(identity_balance(&c), 0, "nothing stranded");
+        let topped_units = {
+            let l = call_ok(&c, "listtransactions", r#"{"limit":200}"#);
+            let Some(Json::Array(rows)) = l.get("movements") else {
+                panic!("no movements");
+            };
+            let row = rows
+                .iter()
+                .find(|m| m.get("txid").and_then(|v| v.as_str()) == Some(topped.as_str()))
+                .expect("the top-up in the history");
+            assert_eq!(row.get("purpose").and_then(|v| v.as_str()), Some("name"));
+            row.get("net_out")
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+                .unwrap()
+        };
+        assert!(
+            topped_units < NAME_PRICE,
+            "only what was lacking was paid: {topped_units}"
+        );
+
+        // An ordinary payment to the identity address is not called a
+        // registration (red-team finding R4), and it can be brought back.
+        let sent = call_ok(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{address}","units":40000000}}"#),
+        );
+        let sent_txid = sent
+            .get("txid")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        mine_pool(&c);
+        let l = call_ok(&c, "listtransactions", r#"{"limit":200}"#);
+        let Some(Json::Array(rows)) = l.get("movements") else {
+            panic!("no movements");
+        };
+        let row = rows
+            .iter()
+            .find(|m| m.get("txid").and_then(|v| v.as_str()) == Some(sent_txid.as_str()))
+            .expect("the payment in the history");
+        assert_eq!(
+            row.get("purpose").and_then(|v| v.as_str()),
+            Some("identity")
+        );
+        assert_eq!(identity_balance(&c), 40_000_000);
+        let swept = call_ok(&c, "identitysweep", "{}");
+        let back = swept
+            .get("amount")
+            .and_then(|v| v.get("units"))
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        let fee = swept
+            .get("fee")
+            .and_then(|v| v.get("units"))
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert_eq!(back + fee, 40_000_000);
+        mine_pool(&c);
+        assert_eq!(identity_balance(&c), 0);
+        let none = call(&c, "identitysweep", "{}");
+        assert!(
+            error_text(&none).contains("nothing sits"),
+            "{}",
+            none.encode()
+        );
+
+        // Three names per identity.
         call_ok(&c, "nameregister", r#"{"name":"third"}"#);
         let full = call(&c, "nameregister", r#"{"name":"fourth"}"#);
         assert!(error_text(&full).contains("3 names"), "{}", full.encode());
@@ -5342,6 +5606,25 @@ mod tests {
             c.node
                 .accept_reach(signed(&identity, now + 3 * 3600), Some(1)),
             ReachVerdict::Ignored
+        );
+        // Fresher, but re-signed within ten minutes: ignored, so that one
+        // owner cannot hold the relay budget by re-signing every second.
+        assert_eq!(
+            c.node.accept_reach(signed(&identity, now + 60), Some(1)),
+            ReachVerdict::Ignored
+        );
+        // A flood of forgeries spends nothing of what genuine announcements
+        // need: the shared budget is debited only after the signature checks
+        // out (red-team finding R1).
+        let later = now + crate::net::REACH_MIN_INTERVAL;
+        for _ in 0..(3 * crate::net::REACH_BUCKET_MAX) {
+            let mut f = signed(&identity, later);
+            f.signature[0] ^= 1;
+            assert_eq!(c.node.accept_reach(f, Some(2)), ReachVerdict::Forged);
+        }
+        assert_eq!(
+            c.node.accept_reach(signed(&identity, later), Some(3)),
+            ReachVerdict::Kept
         );
         // Another key, without a name: ignored, even well signed.
         let stranger = crate::channel::keys::NodeIdentity::derive(&[0x33; 32]);
