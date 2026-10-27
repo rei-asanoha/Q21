@@ -2096,11 +2096,14 @@ impl Node {
     fn promote_deferred_reach_at(&self, now: u64) {
         let ready: Vec<(Vec<Arc<Outbox>>, crate::wire::Reach)> = {
             let mut g = self.shared.lock().unwrap();
+            // At most one burst of the shared budget per round: the rest
+            // waits for the next one, two minutes later.
             let due: Vec<Hash256> = g
                 .reach_deferred
                 .iter()
                 .filter(|(o, d)| !reach_too_soon(&g, o, d, now))
                 .map(|(o, _)| *o)
+                .take(REACH_BUCKET_MAX as usize)
                 .collect();
             let mut ready = Vec::new();
             for owner in due {
