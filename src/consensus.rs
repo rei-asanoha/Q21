@@ -612,15 +612,15 @@ pub const POLICY_ACTIVATION_REGTEST: u64 = 1;
 
 /// Testnet activation height of policy outputs, and so of payment channels.
 ///
-/// 0.4.11 scheduled it at 16,000. 0.4.12 brings it forward to 6,000, about a
-/// day of blocks after its release (the tip was near 5,000 on 27 October 2026,
-/// mined continuously at the two-minute target spacing, about 720 a day): the
-/// testnet nodes are few, all already on 0.4.11, and upgrade within the day.
-/// Every testnet node must run 0.4.12 before block 6,000: a 0.4.11 node
-/// refuses a policy below 16,000, and stops at the first one. It is a hard
-/// fork: a 0.4.10 node refuses the first block that carries a policy and
-/// stops there. The one place to change it; nothing else repeats it.
-pub const POLICY_ACTIVATION_TESTNET: u64 = 6_000;
+/// 0.4.11 scheduled it at 16,000. 0.4.12 brings it forward to 4,980, a few
+/// hours of blocks after its release (the tip was 4,890 on the morning of 27
+/// October 2026, at about thirty blocks an hour): the testnet nodes are few,
+/// all already on 0.4.11, and upgrade within the morning. Every testnet node
+/// must run 0.4.12 before its first channel opens: a 0.4.11 node refuses a
+/// policy below 16,000, and stops at the first block that carries one. It is
+/// a hard fork: a 0.4.10 node refuses that block too and stops there. The one
+/// place to change it; nothing else repeats it.
+pub const POLICY_ACTIVATION_TESTNET: u64 = 4_980;
 
 /// How long before the activation height a node prepares its peers for it,
 /// in blocks: two days at the target spacing.
@@ -699,10 +699,9 @@ const _: () = {
     assert!(MAX_POLICY_OLDER == u16::MAX as u64);
     // Mainnet never opens the rule.
     assert!(POLICY_ACTIVATION_MAINNET == u64::MAX);
-    // Testnet opens it at a real height, past its tip when it was scheduled
-    // and far enough beyond the notice for every node to be warned in time.
+    // Testnet opens it at a real height, past its tip when it was scheduled.
     assert!(POLICY_ACTIVATION_TESTNET != u64::MAX);
-    assert!(POLICY_ACTIVATION_TESTNET > 4_440 + POLICY_ACTIVATION_NOTICE);
+    assert!(POLICY_ACTIVATION_TESTNET > 4_890);
     // Regtest opens it at its first block, as 0.4.10 did.
     assert!(POLICY_ACTIVATION_REGTEST == 1);
 };

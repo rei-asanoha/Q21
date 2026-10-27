@@ -2989,25 +2989,24 @@ mod dormant_tests {
     }
 
     /// The testnet activation is the one compiled in: a real height, with a
-    /// transition, between today's tip and anything that would leave too
-    /// little notice.
+    /// transition, past the tip when it was scheduled.
     #[test]
     fn testnet_schedules_the_activation_at_a_real_height() {
         assert_eq!(
             scheduled_activation(Network::Testnet),
             crate::consensus::POLICY_ACTIVATION_TESTNET
         );
-        assert_eq!(activation_height(Network::Testnet), 6_000);
+        assert_eq!(activation_height(Network::Testnet), 4_980);
         assert!(has_transition(Network::Testnet));
-        assert!(!is_active(Network::Testnet, 5_999));
-        assert!(is_active(Network::Testnet, 6_000));
-        let st = status(Network::Testnet, 4_440);
-        assert_eq!(st.activation_height, Some(6_000));
+        assert!(!is_active(Network::Testnet, 4_979));
+        assert!(is_active(Network::Testnet, 4_980));
+        let st = status(Network::Testnet, 4_890);
+        assert_eq!(st.activation_height, Some(4_980));
         assert!(!st.active);
-        assert_eq!(st.blocks_remaining, Some(1_560));
-        assert_eq!(st.eta_seconds(), Some(1_560 * 120));
-        assert!(!reached(Network::Testnet, 5_999));
-        assert!(reached(Network::Testnet, 6_000));
+        assert_eq!(st.blocks_remaining, Some(90));
+        assert_eq!(st.eta_seconds(), Some(90 * 120));
+        assert!(!reached(Network::Testnet, 4_979));
+        assert!(reached(Network::Testnet, 4_980));
         assert!(!may_appear_on(Network::Mainnet));
         assert!(!reached(Network::Mainnet, u64::MAX - 1));
     }

@@ -67,29 +67,31 @@ file you do not install.
 
 # Upgrading from 0.4.11 to 0.4.12
 
-0.4.12 changes one thing: payment channels open on testnet at **block 6,000**
+0.4.12 changes one thing: payment channels open on testnet at **block 4,980**
 instead of block 16,000. Same protocol (5), same chain, same data directory,
 same wallet file. `channelstatus` (or `getinfo`, under `policy_activation`)
 gives the activation height and how many blocks remain.
 
 ## Who needs it
 
-**Every testnet node, before block 6,000** — entry points, miners, wallets,
-explorers. Until block 6,000 a 0.4.11 node and a 0.4.12 node agree on every
-block. From block 6,000 on they do not: a 0.4.11 node still waits for block
-16,000, refuses the first block of 6,000 or above that carries a policy, and
-stops there, as a 0.4.10 node would. Nothing on disk is damaged: installed
-over the same folder, 0.4.12 resumes from that height.
+**Every testnet node, before the first channel opens** — entry points,
+miners, wallets, explorers. A 0.4.11 node and a 0.4.12 node agree on every
+block that carries no policy, below block 4,980 and above it. They part at
+the first block that carries one, that is at the first channel funding: a
+0.4.11 node still waits for block 16,000, refuses that block, and stops
+there, as a 0.4.10 node would. Nothing on disk is damaged: installed over the
+same folder, 0.4.12 resumes from that height.
 
-Miners first: a block of 6,000 or above that carries a policy is only built
-by a 0.4.12 miner, and only 0.4.12 nodes build on it.
+Upgrade every node before block 4,980, and open no channel before every node
+runs 0.4.12. Miners first: a block that carries a policy is only built by a
+0.4.12 miner, and only 0.4.12 nodes build on it.
 
 ---
 
 # Upgrading from 0.4.10 to 0.4.11
 
-> 0.4.12 moved the testnet activation to block 6,000. Wherever this section
-> says 16,000, read 6,000. A 0.4.10 node can go straight to 0.4.12.
+> 0.4.12 moved the testnet activation to block 4,980. Wherever this section
+> says 16,000, read 4,980. A 0.4.10 node can go straight to 0.4.12.
 
 `channelstatus` (or `getinfo`, under `policy_activation`) gives the
 activation height and how many blocks remain.
