@@ -5811,6 +5811,63 @@ mod tests {
         assert_eq!(kept, 2);
     }
 
+    /// Within the six hours of a recent announcement, a ladder of dates
+    /// gains nothing: one kept, then one per ten minutes; another owner is
+    /// not held back (third re-check of R1).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_ladder_of_recent_dates_gains_one_rung() {
+        use crate::net::{ReachVerdict, REACH_MIN_INTERVAL, REACH_REANNOUNCE};
+        use crate::wire::ReachTarget;
+        let (c, a, b) = two_named_owners();
+        let t = ReachTarget::Onion {
+            name: format!("{}d", "a".repeat(55)),
+            port: 21121,
+        };
+        let now = crate::net::unix_now();
+        let start = now - REACH_REANNOUNCE.as_secs() + 5;
+        let kept = (0..60u64)
+            .filter(|k| {
+                c.node.accept_reach(
+                    reach_signed(&a, &t, start + k * REACH_MIN_INTERVAL),
+                    Some(1 + k % 6),
+                ) == ReachVerdict::Kept
+            })
+            .count();
+        assert_eq!(kept, 1);
+        assert_eq!(
+            c.node.accept_reach(reach_signed(&b, &t, now), Some(9)),
+            ReachVerdict::Kept
+        );
+    }
+
+    /// The same with a full table, owners evicting each other: one each
+    /// (third re-check of R1).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn eviction_with_recent_dates_does_not_reset_the_spacing() {
+        use crate::net::{ReachVerdict, MAX_REACH, REACH_REANNOUNCE};
+        use crate::wire::ReachTarget;
+        let (c, a, b) = two_named_owners();
+        let t = ReachTarget::Onion {
+            name: format!("{}d", "a".repeat(55)),
+            port: 21121,
+        };
+        let now = crate::net::unix_now();
+        c.node
+            .fill_reach_for_tests(MAX_REACH - 1, &reach_signed(&a, &t, now));
+        let base = now - REACH_REANNOUNCE.as_secs() + 5;
+        let kept = (0..40u64)
+            .filter(|k| {
+                let id = if k % 2 == 0 { &a } else { &b };
+                c.node
+                    .accept_reach(reach_signed(id, &t, base + k), Some(1 + k % 6))
+                    == ReachVerdict::Kept
+            })
+            .count();
+        assert_eq!(kept, 2);
+    }
+
     /// The wallet's own pending payments to its identity count: the next
     /// registration spends them and pays nothing more.
     #[cfg(feature = "mldsa")]

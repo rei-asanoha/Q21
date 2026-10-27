@@ -502,26 +502,20 @@ pub fn follows_activation(network: Network, version: u32) -> bool {
 /// than [`REACH_MIN_INTERVAL`] after the last one this node kept, by its own
 /// clock: the dates inside are the owner's to choose, the clock is not.
 ///
-/// One exception: an announcement signed recently — within the six hours a
-/// wallet waits between two of its own ([`REACH_REANNOUNCE`]) — and ten
-/// minutes newer than the one held always gets through, so that a stale
-/// copy replayed first cannot hold the owner's current one back. A ladder
-/// of dates stays bounded: its rungs must lie between six hours ago and two
-/// hours ahead, some fifty per identity, once.
+/// One exception: when the last one kept was stale — signed more than the
+/// six hours a wallet waits between two of its own ([`REACH_REANNOUNCE`]) —
+/// a recent one always gets through, so that a stale copy replayed first
+/// cannot hold the owner's current one back. Once a recent one is held, the
+/// spacing applies again: a ladder of dates gains one rung, not fifty.
 fn reach_too_soon(g: &Shared, owner: &Hash256, r: &crate::wire::Reach, now: u64) -> bool {
-    let spaced = match g.reach_kept_at.get(owner) {
-        Some(&at) => now >= at.saturating_add(REACH_MIN_INTERVAL),
-        None => true,
+    let Some(&(at, signed)) = g.reach_kept_at.get(owner) else {
+        return false;
     };
-    if spaced {
+    if now >= at.saturating_add(REACH_MIN_INTERVAL) {
         return false;
     }
-    let recent = r.time.saturating_add(REACH_REANNOUNCE.as_secs()) >= now;
-    let newer = match g.reach.get(owner) {
-        Some(k) => r.time >= k.time.saturating_add(REACH_MIN_INTERVAL),
-        None => true,
-    };
-    !(recent && newer)
+    let recent = |time: u64| time.saturating_add(REACH_REANNOUNCE.as_secs()) >= now;
+    !(recent(r.time) && !recent(signed) && r.time > signed)
 }
 
 /// Whether peer `id` may send one more reach message — announcement or
@@ -1356,9 +1350,10 @@ struct Shared {
     /// by identity address: only announcements whose signature checked and
     /// whose key owns a name. Bounded by [`MAX_REACH`].
     reach: HashMap<Hash256, crate::wire::Reach>,
-    /// When, by this node's clock, the announcement held for each owner was
-    /// kept. See [`REACH_MIN_INTERVAL`].
-    reach_kept_at: HashMap<Hash256, u64>,
+    /// When, by this node's clock, the last announcement of each owner was
+    /// kept, and the date it was signed with; kept past the eviction of the
+    /// announcement itself. See [`REACH_MIN_INTERVAL`].
+    reach_kept_at: HashMap<Hash256, (u64, u64)>,
     /// The announcements this node will still verify: a signature costs a
     /// post-quantum verification. See [`REACH_RATE_PER_SEC`].
     reach_bucket: TokenBucket,
@@ -2018,10 +2013,10 @@ impl Node {
                 }
             }
             g.reach.insert(owner, r.clone());
-            g.reach_kept_at.insert(owner, now);
+            g.reach_kept_at.insert(owner, (now, r.time));
             if g.reach_kept_at.len() > 2 * MAX_REACH {
                 g.reach_kept_at
-                    .retain(|_, at| now < at.saturating_add(REACH_MIN_INTERVAL));
+                    .retain(|_, (at, _)| now < at.saturating_add(REACH_MIN_INTERVAL));
             }
             g.peers
                 .iter()
@@ -2043,7 +2038,7 @@ impl Node {
             let mut b = [0xeeu8; 32];
             b[..8].copy_from_slice(&(i as u64).to_le_bytes());
             g.reach.insert(Hash256(b), template.clone());
-            g.reach_kept_at.insert(Hash256(b), now);
+            g.reach_kept_at.insert(Hash256(b), (now, template.time));
         }
     }
 
