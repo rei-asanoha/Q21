@@ -1695,7 +1695,7 @@ impl RpcContext {
             .set("max_names", Json::u64(MAX_NAMES_PER_OWNER as u64))
             .set(
                 "identity_balance",
-                amount_json(Amount::from_units(self.identity_balance(&owner))),
+                amount_json(Amount::from_units(self.identity_balance(&owner)?)),
             )
             .build())
     }
@@ -1748,23 +1748,35 @@ impl RpcContext {
     }
 
     /// The coins on the identity address `owner` that nothing spends yet,
-    /// confirmed or waiting in the mempool, the largest first and at most
-    /// [`MAX_IDENTITY_INPUTS`]; and the fee rate of the moment.
+    /// the largest first: the confirmed ones, and those the wallet `w` itself
+    /// is paying there, still waiting in the mempool. A stranger's pending
+    /// payment is left out, as in a send ([`own_pending_coins`]): its sender
+    /// can still replace it, and a registration built on it would vanish
+    /// with it. Callers spend at most [`MAX_IDENTITY_INPUTS`] of them.
+    ///
+    /// The wallet is locked by the caller before the chain, in the order
+    /// every send takes them.
     #[cfg(feature = "mldsa")]
     fn identity_coins(
+        w: &Wallet,
         c: &crate::chain::Chain,
         m: &crate::mempool::Mempool,
         owner: &crate::hash::Hash256,
     ) -> Vec<(crate::tx::OutPoint, crate::tx::TxOut)> {
         let identity_coin =
             |o: &crate::tx::TxOut| o.scheme == SchemeId::MlDsa87 && o.pubkey_hash == *owner;
+        let ours = |o: &crate::tx::TxOut| w.owns_output(o);
         let mut coins: Vec<(crate::tx::OutPoint, crate::tx::TxOut)> = c
             .utxo
             .spendable_for(owner, c.height(), COINBASE_MATURITY)
             .into_iter()
             .filter(|(o, _)| !m.spends(o))
             .map(|(o, e)| (o, e.output))
-            .chain(m.unspent_created(&identity_coin))
+            .chain(
+                m.unspent_created(&identity_coin)
+                    .into_iter()
+                    .filter(|(o, _)| m.spends_only(&o.txid, &c.utxo, &ours)),
+            )
             .collect();
         coins.sort_by(|a, b| {
             b.1.value
@@ -1772,7 +1784,6 @@ impl RpcContext {
                 .cmp(&a.1.value.units())
                 .then(a.0.cmp(&b.0))
         });
-        coins.truncate(MAX_IDENTITY_INPUTS);
         coins
     }
 
@@ -1859,6 +1870,9 @@ impl RpcContext {
 
         // 1. Is the name free, the quota not reached; what is already on the
         //    identity address, and the fee rate.
+        let g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
         let checked = self.node.with_chain_and_mempool(|c, m| {
             let view = m.view(&c.utxo);
             if let Some(taken) = view.name_by_skeleton(&skeleton) {
@@ -1877,8 +1891,11 @@ impl RpcContext {
                 .median_fee_rate()
                 .unwrap_or(0)
                 .max(crate::mempool::MIN_FEE_RATE);
-            Ok((rate, Self::identity_coins(c, m, &owner)))
+            let mut coins = Self::identity_coins(&g, c, m, &owner);
+            coins.truncate(MAX_IDENTITY_INPUTS);
+            Ok((rate, coins))
         });
+        drop(g);
         let (rate, mut coins) = checked.map_err(|e| rpc_error(ERR_REQUEST, &e))?;
 
         // 2. Pay the identity what it lacks, if anything.
@@ -1987,15 +2004,20 @@ impl RpcContext {
             .build())
     }
 
-    /// What sits on the identity address, confirmed or not.
+    /// What sits on the identity address: all of it, confirmed or paid
+    /// there by the wallet itself.
     #[cfg(feature = "mldsa")]
-    fn identity_balance(&self, owner: &crate::hash::Hash256) -> u64 {
-        self.node.with_chain_and_mempool(|c, m| {
-            Self::identity_coins(c, m, owner)
+    fn identity_balance(&self, owner: &crate::hash::Hash256) -> Result<u64, Json> {
+        let w = self.require_wallet()?;
+        let g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        Ok(self.node.with_chain_and_mempool(|c, m| {
+            Self::identity_coins(&g, c, m, owner)
                 .iter()
                 .map(|(_, o)| o.value.units())
                 .sum()
-        })
+        }))
     }
 
     /// Brings what sits on the identity address back to the wallet: a coin
@@ -2005,13 +2027,19 @@ impl RpcContext {
     fn identitysweep(&self) -> Result<Json, Json> {
         let w = self.require_wallet()?;
         let (identity, owner) = self.wallet_identity()?;
+        let g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
         let (rate, coins) = self.node.with_chain_and_mempool(|c, m| {
             let rate = m
                 .median_fee_rate()
                 .unwrap_or(0)
                 .max(crate::mempool::MIN_FEE_RATE);
-            (rate, Self::identity_coins(c, m, &owner))
+            let mut coins = Self::identity_coins(&g, c, m, &owner);
+            coins.truncate(MAX_IDENTITY_INPUTS);
+            (rate, coins)
         });
+        drop(g);
         if coins.is_empty() {
             return Err(rpc_error(
                 ERR_REQUEST,
@@ -5544,6 +5572,252 @@ mod tests {
         assert!(error_text(&bad).contains("not a valid name"));
     }
 
+    /// A context whose wallet holds enough mature coins for several names.
+    #[cfg(feature = "mldsa")]
+    fn context_with_more_funds() -> RpcContext {
+        let c = context_with_funds();
+        let w = c.wallet.clone().unwrap();
+        c.node.with_chain(|ch| {
+            for _ in 0..150 {
+                let a = w.lock().unwrap().new_address();
+                let h = ch.height() + 1;
+                let t = crate::chain::GENESIS_TIME + h * TARGET_BLOCK_SECS;
+                let b = ch
+                    .mine_block(a.hash, a.scheme, &[], t, 5_000_000)
+                    .expect("mining");
+                ch.connect(&b, t + 1).expect("connect");
+            }
+        });
+        c
+    }
+
+    /// Pays `units` to the ML-DSA-87 address of `id`, mines it, and returns
+    /// the coin.
+    #[cfg(feature = "mldsa")]
+    fn fund_key(
+        c: &RpcContext,
+        id: &crate::channel::keys::NodeIdentity,
+        units: u64,
+    ) -> (crate::tx::OutPoint, crate::tx::TxOut) {
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, id.pubkey());
+        let addr = c.identity_address(&owner);
+        call_ok(
+            c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{addr}","units":{units}}}"#),
+        );
+        mine_pool(c);
+        c.node.with_chain(|ch| {
+            ch.utxo
+                .spendable_for(&owner, ch.height(), COINBASE_MATURITY)
+                .into_iter()
+                .find(|(_, e)| e.output.value.units() == units)
+                .map(|(o, e)| (o, e.output))
+                .expect("the coin")
+        })
+    }
+
+    /// A transaction of `id` spending `prev` into `outputs`, signed.
+    #[cfg(feature = "mldsa")]
+    fn signed_by(
+        id: &crate::channel::keys::NodeIdentity,
+        prev: (crate::tx::OutPoint, crate::tx::TxOut),
+        outputs: Vec<crate::tx::TxOut>,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn {
+                prev_out: prev.0,
+                witness: crate::tx::Witness {
+                    pubkey: id.pubkey().to_vec(),
+                    signature: vec![],
+                },
+                sequence: 0,
+            }],
+            outputs,
+            lock_time: 0,
+        };
+        let m = tx.sighash(0, NETWORK, &prev.1);
+        tx.inputs[0].witness.signature = id.sign(&m);
+        tx
+    }
+
+    /// Registers `name` for another identity key than the wallet's, by hand.
+    #[cfg(feature = "mldsa")]
+    fn register_by_hand(c: &RpcContext, id: &crate::channel::keys::NodeIdentity, name: &str) {
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, id.pubkey());
+        let coin = fund_key(c, id, NAME_PRICE + 2_000_000);
+        let out = |value, scheme, pubkey_hash| crate::tx::TxOut {
+            value: Amount::from_units(value),
+            scheme,
+            pubkey_hash,
+        };
+        let tx = signed_by(
+            id,
+            coin,
+            vec![
+                out(
+                    NAME_PRICE,
+                    SchemeId::NameTag,
+                    Hash256(crate::names::encode(name).unwrap()),
+                ),
+                out(0, SchemeId::NameKey, owner),
+                out(1_000_000, SchemeId::MlDsa87, owner),
+            ],
+        );
+        c.node
+            .with_chain_and_mempool(|ch, m| m.accept_local(&tx, &ch.utxo, NETWORK, ch.height()))
+            .expect("registration accepted");
+        mine_pool(c);
+        assert_eq!(c.node.with_chain(|ch| ch.utxo.names().owned(&owner)), 1);
+    }
+
+    /// One owner cannot hold the shared relay budget with a ladder of
+    /// back-dated announcements, each ten minutes "newer" than the last: a
+    /// node keeps one per owner per ten minutes of its own clock, and an
+    /// honest owner's announcement still gets through (re-check of R1).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_ladder_of_back_dated_announcements_holds_nothing() {
+        use crate::net::{ReachVerdict, REACH_MAX_AGE, REACH_MIN_INTERVAL};
+        use crate::wire::{Reach, ReachTarget};
+        let c = context_with_more_funds();
+        let w = c.wallet.clone().unwrap();
+        let laddering =
+            crate::channel::keys::NodeIdentity::derive(&w.lock().unwrap().channel_seed());
+        call_ok(&c, "nameregister", r#"{"name":"mallory"}"#);
+        mine_pool(&c);
+        let honest = crate::channel::keys::NodeIdentity::derive(&[0x44; 32]);
+        register_by_hand(&c, &honest, "honest");
+        let target = ReachTarget::Onion {
+            name: format!("{}d", "a".repeat(55)),
+            port: 21121,
+        };
+        let signed = |id: &crate::channel::keys::NodeIdentity, time: u64| {
+            let m = crate::names::reach_message(NETWORK, id.pubkey(), &target, time);
+            Reach {
+                pubkey: id.pubkey().to_vec(),
+                target: target.clone(),
+                time,
+                signature: id.sign(&m),
+            }
+        };
+        let now = crate::net::unix_now();
+        let start = now - REACH_MAX_AGE + 60;
+        let kept = (0..60u64)
+            .filter(|k| {
+                c.node.accept_reach(
+                    signed(&laddering, start + k * REACH_MIN_INTERVAL),
+                    Some(1 + k % 6),
+                ) == ReachVerdict::Kept
+            })
+            .count();
+        assert_eq!(kept, 1, "one per owner per ten minutes");
+        assert_eq!(
+            c.node.accept_reach(signed(&honest, now), Some(9)),
+            ReachVerdict::Kept
+        );
+    }
+
+    /// A stranger's pending payment to the identity address is not spent by
+    /// a registration: when its sender double-spends it, the registration
+    /// stands (re-check of R5).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_registration_never_rides_on_a_stranger_s_pending_coin() {
+        let c = context_with_more_funds();
+        let w = c.wallet.clone().unwrap();
+        let ours = crate::channel::keys::NodeIdentity::derive(&w.lock().unwrap().channel_seed());
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, ours.pubkey());
+        let stranger = crate::channel::keys::NodeIdentity::derive(&[0x55; 32]);
+        let s_owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, stranger.pubkey());
+        let coin = fund_key(&c, &stranger, 3_000_000);
+        let out = |value, pubkey_hash| crate::tx::TxOut {
+            value: Amount::from_units(value),
+            scheme: SchemeId::MlDsa87,
+            pubkey_hash,
+        };
+        let gift = signed_by(
+            &stranger,
+            coin,
+            vec![out(20_000, owner), out(2_900_000, s_owner)],
+        );
+        let gift_txid = c
+            .node
+            .with_chain_and_mempool(|ch, m| m.accept_local(&gift, &ch.utxo, NETWORK, ch.height()))
+            .expect("the gift pending");
+        // The pending gift is not counted either.
+        let balance = call_ok(&c, "channelidentity", "{}")
+            .get("identity_balance")
+            .and_then(|v| v.get("units"))
+            .and_then(|v| v.as_u64());
+        assert_eq!(balance, Some(0));
+        call_ok(&c, "nameregister", r#"{"name":"victim"}"#);
+        let gift_spent = c.node.with_chain_and_mempool(|_, m| {
+            m.spends(&crate::tx::OutPoint {
+                txid: gift_txid,
+                index: 0,
+            })
+        });
+        assert!(!gift_spent, "the registration spends the stranger's coin");
+        // The stranger takes its gift back in a block.
+        let back = signed_by(&stranger, coin, vec![out(2_990_000, s_owner)]);
+        c.node.with_chain_and_mempool(|ch, m| {
+            let h = ch.height() + 1;
+            let t = crate::chain::GENESIS_TIME + h * TARGET_BLOCK_SECS;
+            let b = ch
+                .mine_block(
+                    Hash256([0x77; 32]),
+                    SchemeId::MlDsa87,
+                    std::slice::from_ref(&back),
+                    t,
+                    5_000_000,
+                )
+                .unwrap();
+            ch.connect(&b, t + 1).unwrap();
+            m.on_block_connected(&b);
+            m.revalidate(&ch.utxo, NETWORK, ch.height());
+        });
+        mine_pool(&c);
+        assert_eq!(c.node.with_chain(|ch| ch.utxo.names().owned(&owner)), 1);
+    }
+
+    /// The identity balance counts every coin, not only those one sweep
+    /// spends; sweeps bring all of it back (re-check of R5).
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn the_identity_balance_counts_every_coin() {
+        let c = context_with_more_funds();
+        let id = call_ok(&c, "channelidentity", "{}");
+        let addr = id
+            .get("identity_address")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        for _ in 0..10 {
+            call_ok(
+                &c,
+                "sendtoaddress",
+                &format!(r#"{{"address":"{addr}","units":100000}}"#),
+            );
+        }
+        mine_pool(&c);
+        let balance = |c: &RpcContext| {
+            call_ok(c, "channelidentity", "{}")
+                .get("identity_balance")
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+                .unwrap()
+        };
+        assert_eq!(balance(&c), 1_000_000);
+        call_ok(&c, "identitysweep", "{}");
+        mine_pool(&c);
+        assert_eq!(balance(&c), 200_000, "eight coins per sweep");
+        call_ok(&c, "identitysweep", "{}");
+        mine_pool(&c);
+        assert_eq!(balance(&c), 0);
+    }
+
     /// A wallet that owns a name says where it can be reached: its
     /// announcement is kept; a forged one, one from a key without a name, an
     /// older one or one dated far ahead are not.
@@ -5589,9 +5863,14 @@ mod tests {
         );
         call_ok(&c, "nameregister", r#"{"name":"delbu"}"#);
         mine_pool(&c);
-        let mut forged = signed(&identity, now);
-        forged.time += 1;
-        assert_eq!(c.node.accept_reach(forged, Some(1)), ReachVerdict::Forged);
+        // A flood of forgeries spends nothing of what genuine announcements
+        // need: the shared budget is debited only after the signature checks
+        // out (red-team finding R1).
+        for _ in 0..(3 * crate::net::REACH_BUCKET_MAX) {
+            let mut f = signed(&identity, now);
+            f.signature[0] ^= 1;
+            assert_eq!(c.node.accept_reach(f, Some(2)), ReachVerdict::Forged);
+        }
         assert_eq!(
             c.node.accept_reach(signed(&identity, now), Some(1)),
             ReachVerdict::Kept
@@ -5607,23 +5886,20 @@ mod tests {
                 .accept_reach(signed(&identity, now + 3 * 3600), Some(1)),
             ReachVerdict::Ignored
         );
-        // Fresher, but re-signed within ten minutes: ignored, so that one
-        // owner cannot hold the relay budget by re-signing every second.
+        // Dated ten minutes later, but relayed within ten minutes of this
+        // node's clock: ignored. The owner chooses its dates, not this
+        // clock, so a ladder of back-dated announcements cannot hold the
+        // relay budget (red-team re-check of R1).
         assert_eq!(
-            c.node.accept_reach(signed(&identity, now + 60), Some(1)),
+            c.node.accept_reach(
+                signed(&identity, now + crate::net::REACH_MIN_INTERVAL),
+                Some(3)
+            ),
             ReachVerdict::Ignored
         );
-        // A flood of forgeries spends nothing of what genuine announcements
-        // need: the shared budget is debited only after the signature checks
-        // out (red-team finding R1).
-        let later = now + crate::net::REACH_MIN_INTERVAL;
-        for _ in 0..(3 * crate::net::REACH_BUCKET_MAX) {
-            let mut f = signed(&identity, later);
-            f.signature[0] ^= 1;
-            assert_eq!(c.node.accept_reach(f, Some(2)), ReachVerdict::Forged);
-        }
+        // The wallet's own announcement is not held back.
         assert_eq!(
-            c.node.accept_reach(signed(&identity, later), Some(3)),
+            c.node.accept_reach(signed(&identity, now + 1), None),
             ReachVerdict::Kept
         );
         // Another key, without a name: ignored, even well signed.

@@ -75,17 +75,24 @@ pub fn clean_label(text: &str) -> String {
 
 /// The characters that show nothing yet change what is shown: the
 /// direction overrides and isolates, which can make "Alice" read backward
-/// or a label run into the text after it, and the zero-width ones, which
-/// make two labels that look the same differ.
+/// or a label run into the text after it; the zero-width and blank fillers,
+/// soft hyphens, variation selectors and line or paragraph separators,
+/// which make two labels that look the same differ.
 fn is_invisible(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
+            | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
     )
 }
 
@@ -286,6 +293,10 @@ mod tests {
         assert_eq!(clean_label("\u{202E}ecila\u{202C}"), "ecila");
         assert_eq!(clean_label("Ma\u{200B}c\u{2066}"), "Mac");
         assert_eq!(clean_label("\u{FEFF}\u{200D}"), "");
+        assert_eq!(
+            clean_label("De\u{00AD}lbu\u{3164}\u{FE0F}\u{2028}"),
+            "Delbu"
+        );
         assert_eq!(
             clean_label(&"\u{e9}".repeat(100)).chars().count(),
             MAX_LABEL_LEN

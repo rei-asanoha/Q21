@@ -431,10 +431,11 @@ pub const REACH_BUCKET_MAX: u64 = 50;
 /// pays for its own, and none can spend the budget of the others.
 pub const PEER_REACH_RATE_PER_SEC: u64 = 1;
 pub const PEER_REACH_BUCKET_MAX: u64 = 8;
-/// Least time between two announcements of one owner that a node keeps and
-/// relays. A wallet announces itself every six hours
-/// ([`REACH_REANNOUNCE`]); an owner re-signing every second to hold the
-/// relay budget is held to one announcement per ten minutes.
+/// Least time, by this node's own clock, between two announcements of one
+/// owner that it keeps and relays. A wallet announces itself every six hours
+/// ([`REACH_REANNOUNCE`]); an owner re-signing in a loop to hold the relay
+/// budget — even with dates it chose itself, stepped ten minutes apart in
+/// the past — is held to one announcement per ten minutes on every node.
 pub const REACH_MIN_INTERVAL: u64 = 600;
 /// An announcement dated further ahead than this is refused, and one older
 /// than [`REACH_MAX_AGE`] forgotten.
@@ -495,6 +496,15 @@ pub fn activation_warning(h: u64, tip: u64, peers: &[(SocketAddr, u32, String)])
 /// as this node does.
 pub fn follows_activation(network: Network, version: u32) -> bool {
     !crate::policy::has_transition(network) || version >= crate::wire::POLICY_ACTIVATION_VERSION
+}
+
+/// Whether an announcement of `owner` relayed by a peer comes less than
+/// [`REACH_MIN_INTERVAL`] after the last one this node kept, by its own
+/// clock: the dates inside are the owner's to choose, the clock is not.
+fn reach_too_soon(g: &Shared, owner: &Hash256, now: u64) -> bool {
+    g.reach_kept_at
+        .get(owner)
+        .is_some_and(|&at| now < at.saturating_add(REACH_MIN_INTERVAL))
 }
 
 /// Whether peer `id` may send one more reach message — announcement or
@@ -1329,6 +1339,9 @@ struct Shared {
     /// by identity address: only announcements whose signature checked and
     /// whose key owns a name. Bounded by [`MAX_REACH`].
     reach: HashMap<Hash256, crate::wire::Reach>,
+    /// When, by this node's clock, the announcement held for each owner was
+    /// kept. See [`REACH_MIN_INTERVAL`].
+    reach_kept_at: HashMap<Hash256, u64>,
     /// The announcements this node will still verify: a signature costs a
     /// post-quantum verification. See [`REACH_RATE_PER_SEC`].
     reach_bucket: TokenBucket,
@@ -1687,6 +1700,7 @@ impl Node {
                 channel_scan: Vec::new(),
                 channel_unscan: Vec::new(),
                 reach: HashMap::new(),
+                reach_kept_at: HashMap::new(),
                 reach_bucket: TokenBucket {
                     tokens: REACH_BUCKET_MAX,
                     last: Instant::now(),
@@ -1938,10 +1952,9 @@ impl Node {
             if g.chain.utxo.names().owned(&owner) == 0 {
                 return ReachVerdict::Ignored;
             }
-            if g.reach.get(&owner).is_some_and(|k| {
-                k.time >= r.time
-                    || (from.is_some() && r.time < k.time.saturating_add(REACH_MIN_INTERVAL))
-            }) {
+            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time)
+                || (from.is_some() && reach_too_soon(&g, &owner, now))
+            {
                 return ReachVerdict::Ignored;
             }
             g.network
@@ -1960,7 +1973,11 @@ impl Node {
         }
         let targets: Vec<Arc<Outbox>> = {
             let mut g = self.shared.lock().unwrap();
-            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time) {
+            // Checked again: another peer's copy may have been kept while
+            // this one was being verified.
+            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time)
+                || (from.is_some() && reach_too_soon(&g, &owner, now))
+            {
                 return ReachVerdict::Ignored;
             }
             // The relay budget, shared by all peers, is spent only on
@@ -1979,9 +1996,11 @@ impl Node {
                 // The oldest goes: it is the likeliest to be stale.
                 if let Some(oldest) = g.reach.iter().min_by_key(|(_, k)| k.time).map(|(o, _)| *o) {
                     g.reach.remove(&oldest);
+                    g.reach_kept_at.remove(&oldest);
                 }
             }
             g.reach.insert(owner, r.clone());
+            g.reach_kept_at.insert(owner, now);
             g.peers
                 .iter()
                 .filter(|(pid, p)| Some(**pid) != from && p.handshaked && reads_names(p.version))
