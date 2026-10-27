@@ -39,6 +39,7 @@ use crate::channel::keys::{ChannelKey, NodeIdentity, Signer, CHANNEL_SCHEME};
 use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
 use crate::channel::messages::Message as ChMsg;
 use crate::channel::txbuild;
+use crate::channel::verify;
 use crate::channel::watcher::{OutputRef, Watch};
 use crate::hash::Hash256;
 use crate::ser::{Reader, Writer};
@@ -52,6 +53,10 @@ use std::sync::Mutex;
 const KIND_ENGINE: u8 = 0;
 const KIND_HELLO: u8 = 1;
 const KIND_HELLO_BACK: u8 = 2;
+/// A contact verification message ([`crate::channel::verify`]). Sent only to
+/// peers of protocol 6 or later: an older one counts an unknown kind against
+/// the sender.
+const KIND_VERIFY: u8 = 3;
 
 /// Fee reserved for a cooperative close, a penalty, or a sweep, in units. The
 /// sweep builders cap it so a swept output never falls below the dust floor
@@ -272,6 +277,10 @@ struct Link {
     legacy: String,
     /// The session's binding value: the nonce its reestablish proofs sign.
     binding: [u8; 32],
+    /// The hash of the key the session proved, as an ML-DSA-87 address: what
+    /// owns the peer's names, and what a contact pins. Set right after the
+    /// session is recorded ([`ChannelManager::set_session_owner`]).
+    owner: Option<Hash256>,
 }
 
 /// Sessions established at once. A connection holds at most one, and the
@@ -295,6 +304,9 @@ struct Inner {
     /// used by a channel: offered again until one is, so opens that never
     /// complete do not grow the wallet by an address each.
     spare_payout: Option<Hash256>,
+    /// Contact verifications, by connection: where each stands, and when its
+    /// last commitment arrived.
+    verifications: HashMap<u64, (verify::State, Option<std::time::Instant>)>,
 }
 
 impl Inner {
@@ -421,6 +433,7 @@ impl ChannelManager {
                 spare_payout: None,
                 unfunded_ttl: UNFUNDED_TTL,
                 inbound_funding_ttl: INBOUND_FUNDING_TTL,
+                verifications: HashMap::new(),
             }),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
@@ -593,6 +606,149 @@ impl ChannelManager {
     pub fn peer_node_id(&self, peer: u64) -> Option<String> {
         let g = self.inner.lock().unwrap();
         g.links.get(&peer).map(|l| l.identity.clone())
+    }
+
+    /// Records the identity address the session on `peer` proved.
+    pub fn set_session_owner(&self, peer: u64, owner: Hash256) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(l) = g.links.get_mut(&peer) {
+            l.owner = Some(owner);
+        }
+    }
+
+    /// The identity address the session on connection `peer` proved: the
+    /// hash of its key, as the owner of its names.
+    pub fn peer_owner(&self, peer: u64) -> Option<Hash256> {
+        let g = self.inner.lock().unwrap();
+        g.links.get(&peer).and_then(|l| l.owner)
+    }
+
+    /// The binding value of the session on connection `peer`.
+    pub fn session_binding(&self, peer: u64) -> Option<[u8; 32]> {
+        let g = self.inner.lock().unwrap();
+        g.links.get(&peer).map(|l| l.binding)
+    }
+
+    /// A connection whose session proved `owner`, if any (the lowest id).
+    pub fn connection_of_owner(&self, owner: &Hash256) -> Option<u64> {
+        let g = self.inner.lock().unwrap();
+        g.links
+            .iter()
+            .filter(|(_, l)| l.owner.as_ref() == Some(owner))
+            .map(|(id, _)| *id)
+            .min()
+    }
+
+    /// This node's identity address: the hash of its identity key, as the
+    /// owner of its names.
+    pub fn own_owner(&self) -> Hash256 {
+        crate::sig::pubkey_hash(CHANNEL_SCHEME, self.identity.pubkey())
+    }
+
+    // --- Contact verification ----------------------------------------------
+
+    /// Starts verifying the peer on connection `peer` with `count` words.
+    /// The caller checked that the peer speaks protocol 6.
+    pub fn start_verification(&self, peer: u64, count: u8) -> Result<(), String> {
+        if count != verify::WORDS_DEFAULT && count != verify::WORDS_STRONG {
+            return Err("4 or 6 words".into());
+        }
+        let id = crate::rng::bytes::<{ verify::ID_LEN }>().map_err(|e| format!("{e:?}"))?;
+        let nonce = crate::rng::bytes::<32>().map_err(|e| format!("{e:?}"))?;
+        let frame = {
+            let mut g = self.inner.lock().unwrap();
+            if !g.links.get(&peer).is_some_and(|l| l.owner.is_some()) {
+                return Err("no session with this peer".into());
+            }
+            if matches!(g.verifications.get(&peer), Some((verify::State::Failed, _))) {
+                return Err(
+                    "the words did not match on this connection: reconnect to verify again".into(),
+                );
+            }
+            let (state, msg) = verify::start(count, id, nonce);
+            g.verifications.insert(peer, (state, None));
+            write_frame(Hash256::ZERO, KIND_VERIFY, &msg.encode())
+        };
+        if self.send(peer, frame) {
+            Ok(())
+        } else {
+            Err("the peer is not connected".into())
+        }
+    }
+
+    fn on_verify(&self, peer: u64, binding: [u8; 32], body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        let msg = verify::VerifyMsg::decode(body).ok_or("bad verification message")?;
+        let fresh = crate::rng::bytes::<32>().map_err(|e| format!("{e:?}"))?;
+        let us = self.own_owner();
+        let mut g = self.inner.lock().unwrap();
+        let Some(them) = g.links.get(&peer).and_then(|l| l.owner) else {
+            return Ok(Vec::new());
+        };
+        let now = std::time::Instant::now();
+        let entry = g.verifications.get(&peer);
+        // A commitment per second at most: each one asks the other holder to
+        // read words, and a flood of them is an annoyance, not a protocol.
+        if matches!(msg, verify::VerifyMsg::Commit { .. })
+            && entry
+                .and_then(|(_, at)| *at)
+                .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(1))
+        {
+            return Err("verification requests too fast".into());
+        }
+        let parties = verify::Parties {
+            binding,
+            us,
+            peer: them,
+        };
+        let is_commit = matches!(msg, verify::VerifyMsg::Commit { .. });
+        let last = entry.and_then(|(_, at)| *at);
+        match verify::receive(entry.map(|(s, _)| s), msg, &parties, fresh) {
+            Ok((state, reply)) => {
+                g.verifications
+                    .insert(peer, (state, if is_commit { Some(now) } else { last }));
+                Ok(reply
+                    .map(|m| vec![write_frame(Hash256::ZERO, KIND_VERIFY, &m.encode())])
+                    .unwrap_or_default())
+            }
+            // Out of order, or refused after a mismatch: dropped, not
+            // charged. A crossing or a late message is not misconduct.
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Where the verification on connection `peer` stands.
+    pub fn verification(&self, peer: u64) -> Option<verify::State> {
+        let g = self.inner.lock().unwrap();
+        g.verifications.get(&peer).map(|(s, _)| s.clone())
+    }
+
+    /// Every verification under way or ready, by connection, with the
+    /// identity address its session proved.
+    pub fn verifications(&self) -> Vec<(u64, Hash256, verify::State)> {
+        let g = self.inner.lock().unwrap();
+        let mut v: Vec<(u64, Hash256, verify::State)> = g
+            .verifications
+            .iter()
+            .filter_map(|(p, (s, _))| {
+                g.links
+                    .get(p)
+                    .and_then(|l| l.owner)
+                    .map(|o| (*p, o, s.clone()))
+            })
+            .collect();
+        v.sort_by_key(|(p, _, _)| *p);
+        v
+    }
+
+    /// The holder read the words: `matched` or not. A match ends the
+    /// verification; a mismatch refuses any other on this connection.
+    pub fn conclude_verification(&self, peer: u64, matched: bool) {
+        let mut g = self.inner.lock().unwrap();
+        if matched {
+            g.verifications.remove(&peer);
+        } else {
+            g.verifications.insert(peer, (verify::State::Failed, None));
+        }
     }
 
     /// Installs where [`ChannelManager::send`] goes.
@@ -833,6 +989,7 @@ impl ChannelManager {
                 identity: identity.to_string(),
                 legacy: legacy.to_string(),
                 binding,
+                owner: None,
             },
         );
         let mut out = Vec::new();
@@ -862,6 +1019,7 @@ impl ChannelManager {
     pub fn on_session_closed(&self, peer: u64) {
         let mut g = self.inner.lock().unwrap();
         g.links.remove(&peer);
+        g.verifications.remove(&peer);
         g.pending_funder.remove(&peer);
         g.pending_acceptor.remove(&peer);
         for c in g.channels.values_mut() {
@@ -951,6 +1109,7 @@ impl ChannelManager {
         match kind {
             KIND_HELLO => self.on_hello(peer, peer_identity, body),
             KIND_HELLO_BACK => self.on_hello_back(peer, peer_identity, body),
+            KIND_VERIFY => self.on_verify(peer, from.binding, body),
             KIND_ENGINE => {
                 let msg = ChMsg::decode(body).map_err(|_| "bad engine message")?;
                 self.on_engine(from, cid, msg)

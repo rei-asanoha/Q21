@@ -222,6 +222,15 @@ impl OnionAddr {
     }
 }
 
+/// A port as `addr` carries it: four bytes, canonical, never zero.
+fn reach_port(r: &mut Reader<'_>) -> Result<u16, WireError> {
+    let raw = r.u32()?;
+    if raw == 0 || raw > u32::from(u16::MAX) {
+        return Err(WireError::InvalidContent("reach port"));
+    }
+    Ok(raw as u16)
+}
+
 /// 56 characters of the base32 alphabet Tor uses (a-z, 2-7), ending in `d`:
 /// the version byte 3 always encodes to a final `d`.
 pub fn valid_onion_name(name: &str) -> bool {
@@ -230,6 +239,31 @@ pub fn valid_onion_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
         && name.ends_with('d')
+}
+
+/// Where a wallet that owns a name can be reached ([`Message::Reach`]).
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum ReachTarget {
+    /// A Tor onion service: its 56-character name and its port.
+    Onion { name: String, port: u16 },
+    /// A public IPv4 address and port.
+    Ipv4 { ip: [u8; 4], port: u16 },
+}
+
+/// "How to reach me" (protocol 6): the identity key of a wallet that owns a
+/// name ([`crate::names`]), where it listens, when it said so, and its
+/// signature over all of it ([`crate::names::reach_message`]). Accepted only
+/// for a key that owns a name on the chain: a key that burned nothing cannot
+/// fill the network with announcements.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Reach {
+    /// ML-DSA-87 identity public key.
+    pub pubkey: Vec<u8>,
+    pub target: ReachTarget,
+    /// Unix seconds.
+    pub time: u64,
+    /// ML-DSA-87 signature by `pubkey`.
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -299,6 +333,11 @@ pub enum Message {
     /// channel capability (see [`user_agent_advertises_channels`]), so a node
     /// that does not understand it never receives one.
     Channel(Vec<u8>),
+    /// Where a name's owner can be reached (protocol 6). See [`Reach`].
+    Reach(Box<Reach>),
+    /// Asks for the [`Message::Reach`] of an identity address, if the peer
+    /// holds one (protocol 6).
+    GetReach(Hash256),
 }
 
 /// Capability token a node appends to its user agent to advertise that it
@@ -363,6 +402,8 @@ impl Message {
             Message::GetSnapshotChunk { .. } => "getsnapchunk",
             Message::SnapshotChunk { .. } => "snapchunk",
             Message::Channel(_) => "channel",
+            Message::Reach(_) => "reach",
+            Message::GetReach(_) => "getreach",
         }
     }
 
@@ -474,6 +515,26 @@ impl Message {
             // frame length already bounds it.
             Message::Channel(bytes) => {
                 w.bytes(bytes);
+            }
+            Message::Reach(r) => {
+                w.var_bytes(&r.pubkey);
+                match &r.target {
+                    ReachTarget::Onion { name, port } => {
+                        w.u8(1);
+                        w.bytes(name.as_bytes());
+                        w.u32(u32::from(*port));
+                    }
+                    ReachTarget::Ipv4 { ip, port } => {
+                        w.u8(2);
+                        w.bytes(ip);
+                        w.u32(u32::from(*port));
+                    }
+                }
+                w.u64(r.time);
+                w.var_bytes(&r.signature);
+            }
+            Message::GetReach(owner) => {
+                w.bytes(owner.as_bytes());
             }
         }
         w.finish()
@@ -767,6 +828,59 @@ impl Message {
                 }
                 Message::Channel(data.to_vec())
             }
+            "reach" => {
+                let pubkey = r.var_bytes()?;
+                if pubkey.len() != crate::sig::SchemeId::MlDsa87.pubkey_len() {
+                    return Err(WireError::InvalidContent("reach key length"));
+                }
+                let pubkey = pubkey.to_vec();
+                let target = match r.u8()? {
+                    1 => {
+                        let mut raw = [0u8; ONION_NAME_LEN];
+                        for o in raw.iter_mut() {
+                            *o = r.u8()?;
+                        }
+                        let name = std::str::from_utf8(&raw)
+                            .ok()
+                            .filter(|n| valid_onion_name(n))
+                            .ok_or(WireError::InvalidContent("reach onion"))?
+                            .to_string();
+                        ReachTarget::Onion {
+                            name,
+                            port: reach_port(&mut r)?,
+                        }
+                    }
+                    2 => {
+                        let mut ip = [0u8; 4];
+                        for o in ip.iter_mut() {
+                            *o = r.u8()?;
+                        }
+                        ReachTarget::Ipv4 {
+                            ip,
+                            port: reach_port(&mut r)?,
+                        }
+                    }
+                    _ => return Err(WireError::InvalidContent("reach target")),
+                };
+                let time = r.u64()?;
+                let signature = r.var_bytes()?;
+                if signature.len() != crate::sig::SchemeId::MlDsa87.sig_len() {
+                    return Err(WireError::InvalidContent("reach signature length"));
+                }
+                let signature = signature.to_vec();
+                r.expect_end()?;
+                Message::Reach(Box::new(Reach {
+                    pubkey,
+                    target,
+                    time,
+                    signature,
+                }))
+            }
+            "getreach" => {
+                let owner = Hash256(r.array32()?);
+                r.expect_end()?;
+                Message::GetReach(owner)
+            }
             other => return Err(WireError::UnknownCommand(other.to_string())),
         };
         Ok(m)
@@ -876,6 +990,60 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, NAME_ACTIVATION_VERSION);
         assert_eq!(POLICY_ACTIVATION_VERSION, 5);
         assert_eq!(MIN_PROTOCOL_VERSION, 3);
+    }
+
+    /// The reach announcement of a name owner and its request travel
+    /// intact, and a wrong key or signature length, an invalid onion name or
+    /// a zero port is refused at decoding.
+    #[test]
+    fn reach_messages_round_trip_and_refuse_bad_shapes() {
+        let onion = Reach {
+            pubkey: vec![1; 2592],
+            target: ReachTarget::Onion {
+                name: format!("{}d", "b".repeat(55)),
+                port: 21121,
+            },
+            time: 1_793_100_000,
+            signature: vec![2; 4627],
+        };
+        let ipv4 = Reach {
+            target: ReachTarget::Ipv4 {
+                ip: [92, 0, 2, 1],
+                port: 21121,
+            },
+            ..onion.clone()
+        };
+        round_trip(Message::Reach(Box::new(onion.clone())));
+        round_trip(Message::Reach(Box::new(ipv4)));
+        round_trip(Message::GetReach(Hash256([9; 32])));
+        let bad = [
+            Reach {
+                pubkey: vec![1; 2591],
+                ..onion.clone()
+            },
+            Reach {
+                signature: vec![2; 4626],
+                ..onion.clone()
+            },
+            Reach {
+                target: ReachTarget::Onion {
+                    name: "x".repeat(56),
+                    port: 1,
+                },
+                ..onion.clone()
+            },
+            Reach {
+                target: ReachTarget::Ipv4 {
+                    ip: [1, 2, 3, 4],
+                    port: 0,
+                },
+                ..onion.clone()
+            },
+        ];
+        for r in bad {
+            let frame = Message::Reach(Box::new(r)).frame(MAGIC);
+            assert!(Message::parse(&frame, MAGIC).is_err());
+        }
     }
 
     fn round_trip(m: Message) {

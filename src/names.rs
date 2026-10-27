@@ -237,6 +237,41 @@ pub fn skeleton(name: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Reaching a name's owner
+// ---------------------------------------------------------------------------
+
+/// Tag of the hash a [`crate::wire::Reach`] signs.
+const TAG_REACH: &str = "Q21/name/reach";
+
+/// The hash a reach announcement signs: the network, the identity key, where
+/// it listens and when, so that none of them can be changed or replayed on
+/// another network.
+pub fn reach_message(
+    network: Network,
+    pubkey: &[u8],
+    target: &crate::wire::ReachTarget,
+    time: u64,
+) -> Hash256 {
+    let mut t = Vec::with_capacity(64);
+    match target {
+        crate::wire::ReachTarget::Onion { name, port } => {
+            t.push(1);
+            t.extend_from_slice(name.as_bytes());
+            t.extend_from_slice(&port.to_le_bytes());
+        }
+        crate::wire::ReachTarget::Ipv4 { ip, port } => {
+            t.push(2);
+            t.extend_from_slice(ip);
+            t.extend_from_slice(&port.to_le_bytes());
+        }
+    }
+    crate::hash::tagged_hash_parts(
+        TAG_REACH,
+        &[network.hrp().as_bytes(), pubkey, &t, &time.to_le_bytes()],
+    )
+}
+
+// ---------------------------------------------------------------------------
 // The registration
 // ---------------------------------------------------------------------------
 

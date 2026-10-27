@@ -1033,7 +1033,7 @@ fn write_wallet(d: &Path, w: &Wallet) -> Result<(), String> {
     // read under either, and this write converts it. The conversion cannot
     // happen at startup, since the file is sealed by the passphrase.
     let content = Secret(format!(
-        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserial={}\nverified_up_to={}\nconsumed={}\nlabels={}\nrequested={}\nreserved={}\n",
+        "seed={}\nnext_index={}\nnetwork={}\nscheme={}\nserial={}\nverified_up_to={}\nconsumed={}\nlabels={}\nrequested={}\nreserved={}\ncontacts={}\n",
         w.seed_hex(),
         w.next_index(),
         network,
@@ -1043,7 +1043,8 @@ fn write_wallet(d: &Path, w: &Wallet) -> Result<(), String> {
         consumed.join(","),
         labels,
         requested.join(","),
-        reserved.join(",")
+        reserved.join(","),
+        w.contacts().to_line()
     ));
     // The wallet is sealed if a passphrase is known to this session. The seed
     // must never touch the disk in plaintext when the user asked otherwise.
@@ -1424,6 +1425,7 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
     let mut consumed: Vec<u32> = Vec::new();
     let mut reserved: Vec<(u32, u64)> = Vec::new();
     let mut labels: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut contacts = q21_core::contacts::ContactBook::default();
     let mut requested: Vec<u32> = Vec::new();
     let mut verified_up_to = 0u64;
     let mut network = Network::Regtest;
@@ -1471,6 +1473,9 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
             // with it — losing a name is annoying, losing the wallet is far
             // worse.
             "labels" => labels = text_to_labels(value),
+            // Absent from wallets written before 0.5.0: an empty book. The
+            // texts are in hexadecimal, as the labels are.
+            "contacts" => contacts = q21_core::contacts::ContactBook::from_line(value),
             // Absent from earlier wallets: their addresses all count as
             // derived by mining, which is only a display order.
             "requested" => {
@@ -1568,6 +1573,7 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
     w.mark_consumed(&consumed);
     w.load_reservations(&reserved);
     w.load_labels(labels);
+    w.load_contacts(contacts);
     w.load_requested(&requested);
     w.record_verification(verified_up_to);
     if !adopted {
@@ -4886,6 +4892,15 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // Every channel frame travels in an authenticated session: the
             // transport is what the node talks to, the manager behind it.
             node.set_channel_sink(q21_core::channel::link::ChannelTransport::new(mgr.clone()));
+            // The same identity signs where this wallet can be reached, once
+            // it owns a name: see `Node::announce_reach`.
+            let signer = mgr.clone();
+            node.set_reach_signer(q21_core::net::ReachSigner {
+                pubkey: mgr.identity().pubkey().to_vec(),
+                sign: std::sync::Arc::new(move |m: &q21_core::hash::Hash256| {
+                    signer.identity().sign(m)
+                }),
+            });
             // Channels reloaded from the journal may already be funded to depth
             // (the funding confirmed while this node was down): confirm them now
             // so they open without waiting for the next block.
@@ -5829,6 +5844,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             last_rebroadcast = std::time::Instant::now();
             node.announce_mempool();
             node.ask_addresses();
+            node.announce_reach(false);
         }
         // Ctrl-C: we leave the loop rather than being killed on the spot.
         // Everything this node must write — mempool, snapshot, address book,

@@ -210,6 +210,10 @@ pub struct Wallet {
     /// signed and not yet confirmed (see [`Wallet::lock_coins`]). In memory
     /// only; the channel manager holds them again after a restart.
     locked: BTreeSet<OutPoint>,
+    /// The people this wallet pays, by a name of its own, each pinned to an
+    /// identity address ([`crate::contacts`]). Strictly local, sealed with
+    /// the rest of the wallet.
+    contacts: crate::contacts::ContactBook,
 }
 
 /// Wipes the seed when the wallet is dropped.
@@ -238,6 +242,7 @@ impl Wallet {
             labels: HashMap::new(),
             requested: BTreeSet::new(),
             locked: BTreeSet::new(),
+            contacts: crate::contacts::ContactBook::default(),
         }
     }
 
@@ -271,6 +276,7 @@ impl Wallet {
             labels: HashMap::new(),
             requested: BTreeSet::new(),
             locked: BTreeSet::new(),
+            contacts: crate::contacts::ContactBook::default(),
         })
     }
 
@@ -976,6 +982,21 @@ impl Wallet {
     /// Restores the labels read from the file.
     pub fn load_labels(&mut self, e: HashMap<u32, String>) {
         self.labels = e;
+    }
+
+    /// The contact book.
+    pub fn contacts(&self) -> &crate::contacts::ContactBook {
+        &self.contacts
+    }
+
+    /// The contact book, to change it; the caller saves the wallet.
+    pub fn contacts_mut(&mut self) -> &mut crate::contacts::ContactBook {
+        &mut self.contacts
+    }
+
+    /// Restores the contact book read from the file.
+    pub fn load_contacts(&mut self, book: crate::contacts::ContactBook) {
+        self.contacts = book;
     }
 
     /// Records that a scan covered the chain up to this height.

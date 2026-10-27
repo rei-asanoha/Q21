@@ -1226,6 +1226,28 @@ impl RpcContext {
                 "[wallet] Register a name for this wallet's identity, for 0.5 Q21 destroyed (name)",
             ),
             ("namelist", "[wallet] The names of this wallet's identity"),
+            ("contactlist", "[wallet] The contact book"),
+            (
+                "contactadd",
+                "[wallet] Add a contact (label, and name, peer or owner)",
+            ),
+            ("contactremove", "[wallet] Remove a contact (owner)"),
+            (
+                "contactconnect",
+                "[wallet] Connect to a contact where it listens (owner)",
+            ),
+            (
+                "contactverify",
+                "[wallet] Start reading words with a connected contact (owner, [words] 4 or 6)",
+            ),
+            (
+                "verifications",
+                "[wallet] Word verifications under way, their words ([lang] en, fr or ja)",
+            ),
+            (
+                "contactconfirm",
+                "[wallet] The words matched, or not (connection, matched, [label])",
+            ),
         ]);
         m.extend([
             (
@@ -1870,6 +1892,358 @@ impl RpcContext {
             .build())
     }
 
+    // -----------------------------------------------------------------------
+    // Contacts (see `crate::contacts`) and their verification
+    // -----------------------------------------------------------------------
+
+    /// The `owner` parameter: an identity address, as hex or as an address.
+    #[cfg(feature = "mldsa")]
+    fn owner_param(&self, params: &Json) -> Result<crate::hash::Hash256, Json> {
+        let raw = params
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'owner' expected"))?;
+        crate::hash::Hash256::from_hex(raw)
+            .or_else(|| {
+                Address::parse_on(raw, self.network)
+                    .ok()
+                    .filter(|a| a.scheme == SchemeId::MlDsa87)
+                    .map(|a| a.hash)
+            })
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "owner: an identity address, or its 64-hex hash"))
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn identity_address(&self, owner: &crate::hash::Hash256) -> String {
+        Address {
+            network: self.network,
+            scheme: SchemeId::MlDsa87,
+            hash: *owner,
+        }
+        .to_string_bech32()
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn contact_json(
+        &self,
+        c: &crate::contacts::Contact,
+        mgr: Option<&Arc<crate::channel::manager::ChannelManager>>,
+    ) -> Json {
+        let conn = mgr.and_then(|m| m.connection_of_owner(&c.owner));
+        let node_id = conn.and_then(|p| mgr.and_then(|m| m.peer_node_id(p)));
+        Json::obj()
+            .set("label", Json::str(c.label.clone()))
+            .set("owner", Json::str(c.owner.to_hex()))
+            .set("owner_address", Json::str(self.identity_address(&c.owner)))
+            .set("name", c.name.clone().map(Json::str).unwrap_or(Json::Null))
+            .set("verified", Json::Bool(c.is_verified()))
+            .set("verified_words", Json::u64(u64::from(c.verified_words)))
+            .set("connected", Json::Bool(conn.is_some()))
+            .set("connection", conn.map(Json::u64).unwrap_or(Json::Null))
+            .set("node_id", node_id.map(Json::str).unwrap_or(Json::Null))
+            .build()
+    }
+
+    /// The contact book, with whether each contact is connected right now.
+    #[cfg(feature = "mldsa")]
+    fn contactlist(&self) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let mgr = self.channels.as_ref();
+        Ok(Json::array(
+            g.contacts()
+                .list()
+                .into_iter()
+                .map(|c| self.contact_json(c, mgr))
+                .collect(),
+        ))
+    }
+
+    /// Adds a contact under `label`, pinned to the identity of a registered
+    /// `name`, of a connected `peer` (its session's proved key), or of an
+    /// identity `owner` address.
+    #[cfg(feature = "mldsa")]
+    fn contactadd(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let label = params
+            .get("label")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'label' expected"))?
+            .to_string();
+        let (owner, name) = if params.get("name").is_some() {
+            let name = Self::name_param(params)?;
+            let r = self
+                .node
+                .with_chain(|c| c.utxo.names().get(&name))
+                .ok_or_else(|| {
+                    rpc_error(ERR_NOT_FOUND, &format!("no name {name} is registered"))
+                })?;
+            (r.owner, Some(name))
+        } else if let Some(peer) = params.get("peer").and_then(|v| v.as_u64()) {
+            let mgr = self.channels()?;
+            let owner = mgr
+                .peer_owner(peer)
+                .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "no channel session with this peer"))?;
+            (owner, None)
+        } else {
+            (self.owner_param(params)?, None)
+        };
+        let (_, us) = self.wallet_identity()?;
+        if owner == us {
+            return Err(rpc_error(ERR_PARAMS, "this is this wallet's own identity"));
+        }
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let added = g
+            .contacts_mut()
+            .add(&label, owner, name)
+            .cloned()
+            .map_err(|e| {
+                rpc_error(
+                    ERR_PARAMS,
+                    match e {
+                        crate::contacts::ContactError::EmptyLabel => "the name is empty",
+                        crate::contacts::ContactError::LabelTaken => {
+                            "another contact already has this name"
+                        }
+                        crate::contacts::ContactError::Full => "the contact book is full",
+                        crate::contacts::ContactError::Unknown => "unknown contact",
+                    },
+                )
+            })?;
+        if self.save_wallet(&g).is_err() {
+            return Err(rpc_error(
+                ERR_WALLET,
+                wallet_message(&crate::wallet::WalletError::SaveFailed),
+            ));
+        }
+        Ok(self.contact_json(&added, self.channels.as_ref()))
+    }
+
+    #[cfg(feature = "mldsa")]
+    fn contactremove(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let owner = self.owner_param(params)?;
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        g.contacts_mut()
+            .remove(&owner)
+            .map_err(|_| rpc_error(ERR_NOT_FOUND, "unknown contact"))?;
+        if self.save_wallet(&g).is_err() {
+            return Err(rpc_error(
+                ERR_WALLET,
+                wallet_message(&crate::wallet::WalletError::SaveFailed),
+            ));
+        }
+        Ok(Json::obj().set("removed", Json::Bool(true)).build())
+    }
+
+    /// Gets a contact connected: `connected` if a session with its key is up,
+    /// `dialing` if this node knows where it listens and is calling it,
+    /// `searching` if it asked its peers where it listens. Called again until
+    /// `connected`.
+    #[cfg(feature = "mldsa")]
+    fn contactconnect(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels_open()?;
+        let owner = self.owner_param(params)?;
+        let status = |s: &str| Ok(Json::obj().set("status", Json::str(s)).build());
+        if mgr.connection_of_owner(&owner).is_some() {
+            return status("connected");
+        }
+        match self.node.reach_of(&owner) {
+            Some(target) => {
+                let node = self.node.clone();
+                std::thread::spawn(move || {
+                    let _ = node.dial_reach(&target);
+                });
+                status("dialing")
+            }
+            None => {
+                let asked = self.node.request_reach(owner);
+                if asked == 0 {
+                    return Err(rpc_error(
+                        ERR_REQUEST,
+                        "no connected peer can say where this contact listens",
+                    ));
+                }
+                status("searching")
+            }
+        }
+    }
+
+    /// The protocol version of connection `peer`.
+    #[cfg(feature = "mldsa")]
+    fn peer_version(&self, peer: u64) -> u32 {
+        self.node
+            .peer_list()
+            .into_iter()
+            .find(|p| p.id == peer)
+            .map(|p| p.version)
+            .unwrap_or(0)
+    }
+
+    /// Starts the word verification of a connected contact (or peer):
+    /// `words` 4 (default) or 6.
+    #[cfg(feature = "mldsa")]
+    fn contactverify(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels_open()?;
+        let owner = self.owner_param(params)?;
+        let count = match params.get("words") {
+            None | Some(Json::Null) => crate::channel::verify::WORDS_DEFAULT,
+            Some(v) => {
+                v.as_u64()
+                    .filter(|n| *n == 4 || *n == 6)
+                    .ok_or_else(|| rpc_error(ERR_PARAMS, "words: 4 or 6"))? as u8
+            }
+        };
+        let peer = mgr.connection_of_owner(&owner).ok_or_else(|| {
+            rpc_error(
+                ERR_REQUEST,
+                "this contact is not connected: connect it first (contactconnect)",
+            )
+        })?;
+        if !crate::net::reads_names(self.peer_version(peer)) {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "this peer runs a version that cannot verify contacts",
+            ));
+        }
+        mgr.start_verification(peer, count)
+            .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+        Ok(Json::obj()
+            .set("status", Json::str("started"))
+            .set("connection", Json::u64(peer))
+            .build())
+    }
+
+    /// The verifications under way or ready, with their words in `lang`
+    /// (`en`, `fr` or `ja`; English by default).
+    #[cfg(feature = "mldsa")]
+    fn verifications(&self, params: &Json) -> Result<Json, Json> {
+        use crate::channel::verify::{self, State};
+        let mgr = self.channels()?;
+        let lang = params
+            .get("lang")
+            .and_then(|v| v.as_str())
+            .and_then(verify::Language::from_code)
+            .unwrap_or(verify::Language::English);
+        let book = self
+            .wallet
+            .as_ref()
+            .and_then(|w| w.lock().ok().map(|g| g.contacts().clone()))
+            .unwrap_or_default();
+        let v: Vec<Json> = mgr
+            .verifications()
+            .into_iter()
+            .map(|(peer, owner, state)| {
+                let (status, count, initiator, words) = match &state {
+                    State::Committed { count, .. } => ("waiting", *count, Some(true), None),
+                    State::Answered { count, .. } => ("waiting", *count, Some(false), None),
+                    State::Ready {
+                        count,
+                        initiator,
+                        indices,
+                        ..
+                    } => (
+                        "ready",
+                        *count,
+                        Some(*initiator),
+                        Some(verify::words(indices, lang)),
+                    ),
+                    State::Failed => ("failed", 0, None, None),
+                };
+                let contact = book.get(&owner);
+                Json::obj()
+                    .set("connection", Json::u64(peer))
+                    .set("owner", Json::str(owner.to_hex()))
+                    .set("owner_address", Json::str(self.identity_address(&owner)))
+                    .set(
+                        "label",
+                        contact
+                            .map(|c| Json::str(c.label.clone()))
+                            .unwrap_or(Json::Null),
+                    )
+                    .set("status", Json::str(status))
+                    .set("words_count", Json::u64(u64::from(count)))
+                    .set("initiator", initiator.map(Json::Bool).unwrap_or(Json::Null))
+                    .set(
+                        "words",
+                        words
+                            .map(|w| Json::array(w.into_iter().map(Json::str).collect()))
+                            .unwrap_or(Json::Null),
+                    )
+                    .set("lang", Json::str(lang.code()))
+                    .build()
+            })
+            .collect();
+        Ok(Json::array(v))
+    }
+
+    /// The holder read the words of the verification on `connection`:
+    /// `matched` or not. A match marks the contact verified, adding it under
+    /// `label` first if it was not in the book; a mismatch refuses any other
+    /// verification on that connection.
+    #[cfg(feature = "mldsa")]
+    fn contactconfirm(&self, params: &Json) -> Result<Json, Json> {
+        use crate::channel::verify::State;
+        let mgr = self.channels()?;
+        let w = self.require_wallet()?;
+        let peer = params
+            .get("connection")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'connection' expected"))?;
+        let matched = match params.get("matched") {
+            Some(Json::Bool(b)) => *b,
+            _ => return Err(rpc_error(ERR_PARAMS, "parameter 'matched': true or false")),
+        };
+        let Some(State::Ready { count, .. }) = mgr.verification(peer) else {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "no words to confirm on this connection",
+            ));
+        };
+        let owner = mgr
+            .peer_owner(peer)
+            .ok_or_else(|| rpc_error(ERR_REQUEST, "the session ended"))?;
+        if !matched {
+            mgr.conclude_verification(peer, false);
+            return Ok(Json::obj().set("verified", Json::Bool(false)).build());
+        }
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        if g.contacts().get(&owner).is_none() {
+            let label = params
+                .get("label")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    rpc_error(
+                        ERR_PARAMS,
+                        "this peer is not a contact yet: give it a 'label'",
+                    )
+                })?;
+            g.contacts_mut()
+                .add(label, owner, None)
+                .map_err(|_| rpc_error(ERR_PARAMS, "this name cannot be used"))?;
+        }
+        g.contacts_mut()
+            .mark_verified(&owner, count)
+            .map_err(|_| rpc_error(ERR_INTERNAL, "contact vanished"))?;
+        if self.save_wallet(&g).is_err() {
+            return Err(rpc_error(
+                ERR_WALLET,
+                wallet_message(&crate::wallet::WalletError::SaveFailed),
+            ));
+        }
+        mgr.conclude_verification(peer, true);
+        let c = g.contacts().get(&owner).cloned().expect("just added");
+        Ok(self.contact_json(&c, Some(mgr)))
+    }
+
     /// The methods that sign and send funds, on chain or in a channel.
     fn moves_funds(method: &str) -> bool {
         matches!(
@@ -1965,6 +2339,20 @@ impl RpcContext {
             "nameregister" => self.nameregister(params),
             #[cfg(feature = "mldsa")]
             "namelist" => self.namelist(),
+            #[cfg(feature = "mldsa")]
+            "contactlist" => self.contactlist(),
+            #[cfg(feature = "mldsa")]
+            "contactadd" => self.contactadd(params),
+            #[cfg(feature = "mldsa")]
+            "contactremove" => self.contactremove(params),
+            #[cfg(feature = "mldsa")]
+            "contactconnect" => self.contactconnect(params),
+            #[cfg(feature = "mldsa")]
+            "contactverify" => self.contactverify(params),
+            #[cfg(feature = "mldsa")]
+            "verifications" => self.verifications(params),
+            #[cfg(feature = "mldsa")]
+            "contactconfirm" => self.contactconfirm(params),
             "namecheck" => self.namecheck(params),
             "namelookup" => self.namelookup(params),
             other => Err(rpc_error(
@@ -4816,6 +5204,77 @@ mod tests {
         assert_eq!(names, ["delbu", "second", "third"]);
         let bad = call(&c, "namecheck", r#"{"name":"ab"}"#);
         assert!(error_text(&bad).contains("not a valid name"));
+    }
+
+    /// A wallet that owns a name says where it can be reached: its
+    /// announcement is kept; a forged one, one from a key without a name, an
+    /// older one or one dated far ahead are not.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn only_a_name_owner_announces_where_it_listens() {
+        use crate::net::ReachVerdict;
+        use crate::wire::{Reach, ReachTarget};
+        let c = context_with_funds();
+        let w = c.wallet.clone().unwrap();
+        c.node.with_chain(|ch| {
+            for _ in 0..60 {
+                let a = w.lock().unwrap().new_address();
+                let h = ch.height() + 1;
+                let t = crate::chain::GENESIS_TIME + h * TARGET_BLOCK_SECS;
+                let b = ch
+                    .mine_block(a.hash, a.scheme, &[], t, 5_000_000)
+                    .expect("mining");
+                ch.connect(&b, t + 1).expect("connect");
+            }
+        });
+        let identity =
+            crate::channel::keys::NodeIdentity::derive(&w.lock().unwrap().channel_seed());
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, identity.pubkey());
+        let target = ReachTarget::Onion {
+            name: format!("{}d", "a".repeat(55)),
+            port: 21121,
+        };
+        let now = crate::net::unix_now();
+        let signed = |id: &crate::channel::keys::NodeIdentity, time: u64| {
+            let m = crate::names::reach_message(NETWORK, id.pubkey(), &target, time);
+            Reach {
+                pubkey: id.pubkey().to_vec(),
+                target: target.clone(),
+                time,
+                signature: id.sign(&m),
+            }
+        };
+        // No name yet: ignored.
+        assert_eq!(
+            c.node.accept_reach(signed(&identity, now), Some(1)),
+            ReachVerdict::Ignored
+        );
+        call_ok(&c, "nameregister", r#"{"name":"delbu"}"#);
+        mine_pool(&c);
+        let mut forged = signed(&identity, now);
+        forged.time += 1;
+        assert_eq!(c.node.accept_reach(forged, Some(1)), ReachVerdict::Forged);
+        assert_eq!(
+            c.node.accept_reach(signed(&identity, now), Some(1)),
+            ReachVerdict::Kept
+        );
+        assert_eq!(c.node.reach_of(&owner), Some(target.clone()));
+        // Not fresher than what is held, or from the future: ignored.
+        assert_eq!(
+            c.node.accept_reach(signed(&identity, now), Some(1)),
+            ReachVerdict::Ignored
+        );
+        assert_eq!(
+            c.node
+                .accept_reach(signed(&identity, now + 3 * 3600), Some(1)),
+            ReachVerdict::Ignored
+        );
+        // Another key, without a name: ignored, even well signed.
+        let stranger = crate::channel::keys::NodeIdentity::derive(&[0x33; 32]);
+        assert_eq!(
+            c.node.accept_reach(signed(&stranger, now), Some(1)),
+            ReachVerdict::Ignored
+        );
     }
 
     /// `channelopen` rejects a delay or depth out of range instead of cutting it

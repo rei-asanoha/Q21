@@ -67,6 +67,7 @@ use crate::channel::manager::ChannelManager;
 use crate::channel::transport::{
     self, Context, Initiator, Limits, Responder, Session, TransportError,
 };
+use crate::hash::Hash256;
 use crate::net::{ChannelLink, ChannelOutcome, ChannelSender, ChannelSink, MISCONDUCT_CHANNEL};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -224,8 +225,9 @@ struct Conn {
 struct After {
     /// The previous session ended: the manager forgets it.
     closed: bool,
-    /// A session was established, with this node id, legacy id and binding.
-    established: Option<(String, String, [u8; 32])>,
+    /// A session was established, with this node id, legacy id, binding and
+    /// identity address (the hash of its key, as a name owner).
+    established: Option<(String, String, [u8; 32], Hash256)>,
     /// How long its handshake took from this side, and in which role.
     took: Option<(Duration, &'static str)>,
     penalize: u32,
@@ -239,8 +241,13 @@ fn hex(bytes: &[u8]) -> String {
 /// The node id of a session's peer, as the manager names it: [`is_node_id`].
 ///
 /// [`is_node_id`]: crate::channel::manager::is_node_id
-fn identity_of(peer: &transport::Peer) -> (String, String, [u8; 32]) {
-    (hex(&peer.id.0), hex(&peer.legacy_id), peer.binding)
+fn identity_of(peer: &transport::Peer) -> (String, String, [u8; 32], Hash256) {
+    (
+        hex(&peer.id.0),
+        hex(&peer.legacy_id),
+        peer.binding,
+        crate::sig::pubkey_hash(crate::channel::keys::CHANNEL_SCHEME, &peer.pubkey),
+    )
 }
 
 /// The transport context of a connection, by role.
@@ -590,7 +597,7 @@ impl ChannelTransport {
         if after.closed {
             self.mgr.on_session_closed(peer);
         }
-        if let Some((identity, legacy, binding)) = after.established {
+        if let Some((identity, legacy, binding, owner)) = after.established {
             if let Some((took, role)) = after.took {
                 eprintln!(
                     "channel session with node {} on peer {peer}: up as {role}, handshake {} ms",
@@ -601,6 +608,7 @@ impl ChannelTransport {
             for frame in self.mgr.on_session(peer, &identity, &legacy, binding) {
                 self.send(peer, frame);
             }
+            self.mgr.set_session_owner(peer, owner);
         }
         outcome(after.penalize)
     }

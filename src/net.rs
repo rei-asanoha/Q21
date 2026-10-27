@@ -418,6 +418,28 @@ pub fn channel_capable(network: Network, version: u32, user_agent: &str) -> bool
 /// activation (see [`Node::warn_peers_predating_activation`]).
 pub const ACTIVATION_WARNING_INTERVAL: Duration = Duration::from_secs(600);
 
+/// Most reach announcements a node keeps: one per name owner it heard of.
+pub const MAX_REACH: usize = 4096;
+/// Reach announcements verified per second, at most, and in one burst.
+pub const REACH_RATE_PER_SEC: u64 = 5;
+pub const REACH_BUCKET_MAX: u64 = 50;
+/// An announcement dated further ahead than this is refused, and one older
+/// than [`REACH_MAX_AGE`] forgotten.
+pub const REACH_MAX_SKEW: u64 = 2 * 3600;
+pub const REACH_MAX_AGE: u64 = 14 * 24 * 3600;
+/// How often a wallet announces where it can be reached again.
+pub const REACH_REANNOUNCE: Duration = Duration::from_secs(6 * 3600);
+
+/// Signs a 32-byte message with the wallet's identity key.
+pub type SignFn = dyn Fn(&Hash256) -> Vec<u8> + Send + Sync;
+
+/// Signs this node's own reach announcement with the wallet's identity key.
+#[derive(Clone)]
+pub struct ReachSigner {
+    pub pubkey: Vec<u8>,
+    pub sign: Arc<SignFn>,
+}
+
 /// Most peers named in one such warning; the others are counted.
 pub const ACTIVATION_WARNING_NAMES: usize = 8;
 
@@ -526,8 +548,22 @@ fn for_peer(g: &Shared, peer: u64, m: &Message) -> ForPeer {
                 ForPeer::Part(Message::Inv(kept))
             }
         }
+        // Unknown commands to an older node, which would drop the link.
+        Message::Reach(_) | Message::GetReach(_) if !reads_names => ForPeer::Withheld,
         _ => ForPeer::Unchanged,
     }
+}
+
+/// What became of a reach announcement ([`Node::accept_reach`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReachVerdict {
+    /// Verified, fresher than what was known: kept and relayed.
+    Kept,
+    /// Not checked or not kept, without blame: its key owns no name here
+    /// (yet), it is not fresher, its date is off, or the budget is spent.
+    Ignored,
+    /// Its signature does not verify: whoever sent it forged it.
+    Forged,
 }
 
 /// See [`crate::validate::ValidationError::locally_unverifiable_scheme`].
@@ -841,7 +877,7 @@ pub fn magic_for(network: Network) -> [u8; 4] {
     }
 }
 
-fn unix_now() -> u64 {
+pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1251,6 +1287,13 @@ struct Shared {
     /// Transactions of blocks a reorganization took off the active chain since
     /// the last drain, handed to the channel watcher before `channel_scan`.
     channel_unscan: Vec<Hash256>,
+    /// Where the owners of names can be reached ([`crate::wire::Reach`]),
+    /// by identity address: only announcements whose signature checked and
+    /// whose key owns a name. Bounded by [`MAX_REACH`].
+    reach: HashMap<Hash256, crate::wire::Reach>,
+    /// The announcements this node will still verify: a signature costs a
+    /// post-quantum verification. See [`REACH_RATE_PER_SEC`].
+    reach_bucket: TokenBucket,
 }
 
 /// How many requested compact blocks may wait for their parent. Two batches
@@ -1490,6 +1533,10 @@ pub struct Node {
     proxy: Arc<std::sync::RwLock<Option<SocketAddr>>>,
     /// This node's own onion service, announced to protocol-4 peers.
     own_onion: Arc<std::sync::RwLock<Option<crate::wire::OnionAddr>>>,
+    /// The wallet identity that signs this node's own reach announcement,
+    /// when a wallet runs here; and when it last did.
+    reach_signer: Arc<std::sync::RwLock<Option<ReachSigner>>>,
+    reach_announced: Arc<Mutex<Option<Instant>>>,
     /// The labels of the bootstrap addresses the operator configured. Only a
     /// link to one of them can make a later link to the same node redundant:
     /// see the `Version` arm.
@@ -1601,6 +1648,11 @@ impl Node {
                 channels_active: false,
                 channel_scan: Vec::new(),
                 channel_unscan: Vec::new(),
+                reach: HashMap::new(),
+                reach_bucket: TokenBucket {
+                    tokens: REACH_BUCKET_MAX,
+                    last: Instant::now(),
+                },
             })),
             magic: magic_for(network),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -1608,6 +1660,8 @@ impl Node {
             stats: Arc::new(Stats::default()),
             proxy: Arc::new(std::sync::RwLock::new(None)),
             own_onion: Arc::new(std::sync::RwLock::new(None)),
+            reach_signer: Arc::new(std::sync::RwLock::new(None)),
+            reach_announced: Arc::new(Mutex::new(None)),
             configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
             channel_sink: Arc::new(std::sync::RwLock::new(None)),
             activation_warned: Arc::new(Mutex::new(HashSet::new())),
@@ -1818,6 +1872,160 @@ impl Node {
         if let Ok(mut g) = self.own_onion.write() {
             *g = a;
         }
+    }
+
+    // --- Reaching name owners --------------------------------------------
+
+    /// Installs the wallet identity that signs this node's reach
+    /// announcement.
+    pub fn set_reach_signer(&self, signer: ReachSigner) {
+        if let Ok(mut g) = self.reach_signer.write() {
+            *g = Some(signer);
+        }
+    }
+
+    /// Checks a reach announcement and keeps it if it is genuine, fresher
+    /// than the one known, and its key owns a name on this node's chain;
+    /// relays it then to every other peer that speaks protocol 6. `from` is
+    /// the peer it came from, `None` for this node's own.
+    pub fn accept_reach(&self, r: crate::wire::Reach, from: Option<u64>) -> ReachVerdict {
+        let owner = crate::sig::pubkey_hash(crate::sig::SchemeId::MlDsa87, &r.pubkey);
+        let now = unix_now();
+        if r.time > now.saturating_add(REACH_MAX_SKEW) || r.time.saturating_add(REACH_MAX_AGE) < now
+        {
+            return ReachVerdict::Ignored;
+        }
+        let network = {
+            let mut g = self.shared.lock().unwrap();
+            if g.chain.utxo.names().owned(&owner) == 0 {
+                return ReachVerdict::Ignored;
+            }
+            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time) {
+                return ReachVerdict::Ignored;
+            }
+            if from.is_some()
+                && !g.reach_bucket.allow_with(
+                    1,
+                    Instant::now(),
+                    REACH_BUCKET_MAX,
+                    REACH_RATE_PER_SEC,
+                )
+            {
+                return ReachVerdict::Ignored;
+            }
+            g.network
+        };
+        let message = crate::names::reach_message(network, &r.pubkey, &r.target, r.time);
+        match crate::sig::verify(
+            crate::sig::SchemeId::MlDsa87,
+            &r.pubkey,
+            &message,
+            &r.signature,
+        ) {
+            Ok(()) => {}
+            // This build cannot verify: nobody lied, nothing is kept.
+            Err(crate::sig::VerifyError::SchemeUnavailable(_)) => return ReachVerdict::Ignored,
+            Err(_) => return ReachVerdict::Forged,
+        }
+        let targets: Vec<Arc<Outbox>> = {
+            let mut g = self.shared.lock().unwrap();
+            if g.reach.get(&owner).is_some_and(|k| k.time >= r.time) {
+                return ReachVerdict::Ignored;
+            }
+            if g.reach.len() >= MAX_REACH && !g.reach.contains_key(&owner) {
+                // The oldest goes: it is the likeliest to be stale.
+                if let Some(oldest) = g.reach.iter().min_by_key(|(_, k)| k.time).map(|(o, _)| *o) {
+                    g.reach.remove(&oldest);
+                }
+            }
+            g.reach.insert(owner, r.clone());
+            g.peers
+                .iter()
+                .filter(|(pid, p)| Some(**pid) != from && p.handshaked && reads_names(p.version))
+                .map(|(_, p)| p.writer.clone())
+                .collect()
+        };
+        self.broadcast(&targets, &Message::Reach(Box::new(r)));
+        ReachVerdict::Kept
+    }
+
+    /// Where the owner `owner` said it can be reached, if this node knows.
+    pub fn reach_of(&self, owner: &Hash256) -> Option<crate::wire::ReachTarget> {
+        let g = self.shared.lock().unwrap();
+        g.reach.get(owner).map(|r| r.target.clone())
+    }
+
+    /// Asks every peer that speaks protocol 6 where `owner` can be reached.
+    /// Returns how many were asked.
+    pub fn request_reach(&self, owner: Hash256) -> usize {
+        let targets: Vec<Arc<Outbox>> = {
+            let g = self.shared.lock().unwrap();
+            g.peers
+                .values()
+                .filter(|p| p.handshaked && reads_names(p.version))
+                .map(|p| p.writer.clone())
+                .collect()
+        };
+        self.broadcast(&targets, &Message::GetReach(owner));
+        targets.len()
+    }
+
+    /// Dials a reach target: an onion service through the proxy, an IPv4
+    /// address as any peer. Blocks for the connection only; the handshake
+    /// and the channel session follow on their own.
+    pub fn dial_reach(&self, target: &crate::wire::ReachTarget) -> std::io::Result<u64> {
+        match target {
+            crate::wire::ReachTarget::Onion { name, port } => {
+                self.connect_target(&crate::socks::Target::Name(format!("{name}.onion"), *port))
+            }
+            crate::wire::ReachTarget::Ipv4 { ip, port } => {
+                self.connect(SocketAddr::from((*ip, *port)))
+            }
+        }
+    }
+
+    /// Announces where this node's wallet can be reached, when it can be and
+    /// its identity owns a name: at most every [`REACH_REANNOUNCE`], unless
+    /// `force`. Its own onion service is the only target it announces: a
+    /// home wallet is reached through Tor. Returns whether it announced.
+    pub fn announce_reach(&self, force: bool) -> bool {
+        let Some(signer) = self.reach_signer.read().ok().and_then(|g| g.clone()) else {
+            return false;
+        };
+        let Some(onion) = self.own_onion() else {
+            return false;
+        };
+        {
+            let last = self.reach_announced.lock().unwrap();
+            if !force && last.is_some_and(|t| t.elapsed() < REACH_REANNOUNCE) {
+                return false;
+            }
+        }
+        let owner = crate::sig::pubkey_hash(crate::sig::SchemeId::MlDsa87, &signer.pubkey);
+        let network = {
+            let g = self.shared.lock().unwrap();
+            if g.chain.utxo.names().owned(&owner) == 0 {
+                return false;
+            }
+            g.network
+        };
+        let target = crate::wire::ReachTarget::Onion {
+            name: onion.name.clone(),
+            port: onion.port,
+        };
+        let time = unix_now();
+        let message = crate::names::reach_message(network, &signer.pubkey, &target, time);
+        let r = crate::wire::Reach {
+            pubkey: signer.pubkey.clone(),
+            target,
+            time,
+            signature: (signer.sign)(&message),
+        };
+        let kept = self.accept_reach(r, None) == ReachVerdict::Kept;
+        if kept {
+            *self.reach_announced.lock().unwrap() = Some(Instant::now());
+        }
+        kept
     }
 
     fn own_onion(&self) -> Option<crate::wire::OnionAddr> {
@@ -2959,6 +3167,8 @@ impl Node {
         // peer: once the lock is released, the channel component is told, so
         // it can start its session with that peer.
         let mut channel_peer_ready: Option<ChannelLink> = None;
+        // A reach announcement to check off the lock.
+        let mut reach_in: Option<Box<crate::wire::Reach>> = None;
 
         // The work of a block or of an announcement is checked before the lock.
         match &msg {
@@ -3157,6 +3367,24 @@ impl Node {
                             outgoing.push(Outgoing {
                                 peer: id,
                                 message: Message::OnionAddr(vec![own]),
+                            });
+                        }
+                    }
+                    // Where our own wallet can be reached, to a peer that
+                    // reads names: it spreads from there.
+                    let reads = g.peers.get(&id).is_some_and(|p| reads_names(p.version));
+                    if reads {
+                        let own = self
+                            .reach_signer
+                            .read()
+                            .ok()
+                            .and_then(|s| s.as_ref().map(|s| s.pubkey.clone()))
+                            .map(|pk| crate::sig::pubkey_hash(crate::sig::SchemeId::MlDsa87, &pk))
+                            .and_then(|o| g.reach.get(&o).cloned());
+                        if let Some(r) = own {
+                            outgoing.push(Outgoing {
+                                peer: id,
+                                message: Message::Reach(Box::new(r)),
                             });
                         }
                     }
@@ -4107,6 +4335,34 @@ impl Node {
                 }
                 Message::Reject { .. } => {}
 
+                // --- Where name owners can be reached (protocol 6).
+                //
+                // Checked off the lock: the signature costs a post-quantum
+                // verification. Only from a handshaked peer that speaks it.
+                Message::Reach(r) => {
+                    let speaks = g
+                        .peers
+                        .get(&id)
+                        .is_some_and(|p| p.handshaked && reads_names(p.version));
+                    if speaks {
+                        reach_in = Some(r);
+                    }
+                }
+                Message::GetReach(owner) => {
+                    let speaks = g
+                        .peers
+                        .get(&id)
+                        .is_some_and(|p| p.handshaked && reads_names(p.version));
+                    if speaks {
+                        if let Some(r) = g.reach.get(&owner) {
+                            outgoing.push(Outgoing {
+                                peer: id,
+                                message: Message::Reach(Box::new(r.clone())),
+                            });
+                        }
+                    }
+                }
+
                 // --- Fast sync: serving a snapshot.
                 //
                 // Like any expensive message, these replies require the
@@ -4275,6 +4531,17 @@ impl Node {
         // watcher here, off the chain lock, so a penalty or sweep may be built
         // and broadcast without holding it.
         self.scan_connected_blocks_for_channels();
+
+        if let Some(r) = reach_in {
+            match self.accept_reach(*r, Some(id)) {
+                ReachVerdict::Forged => {
+                    if !self.penalize(id, MISCONDUCT_MALFORMED) {
+                        drop_peer = true;
+                    }
+                }
+                ReachVerdict::Kept | ReachVerdict::Ignored => {}
+            }
+        }
 
         for mut e in outgoing {
             let writer = {
@@ -4868,34 +5135,43 @@ impl Node {
     }
 
     pub fn announce_mempool(&self) -> usize {
-        let (targets, pending, older, without_policies) = {
+        // Peers grouped by what they can read: whether they follow the
+        // policy activation, and whether they read names. Each group gets the
+        // pool without what it cannot read (see `for_peer`).
+        let (groups, pending) = {
             let g = self.shared.lock().unwrap();
             // The whole pool, not just its top: a peer behind by thousands
             // reconciles the rest here, bounding its own intake. See
             // `Mempool::announcement_window`.
             let pending = g.mempool.announcement_window(MEMPOOL_REOFFER_MAX_TXS);
-            let (follow, older): (Vec<&Peer>, Vec<&Peer>) = g
-                .peers
-                .values()
-                .filter(|p| p.handshaked)
-                .partition(|p| follows_activation(g.network, p.version));
-            // The peers that predate the policy activation get the pool
-            // without its policy transactions: see `for_peer`.
-            let without_policies: Vec<Hash256> = if older.is_empty() {
-                Vec::new()
-            } else {
-                pending
-                    .iter()
-                    .filter(|h| !g.mempool.touches_policy(h))
-                    .copied()
-                    .collect()
-            };
-            (
-                follow.iter().map(|p| p.writer.clone()).collect::<Vec<_>>(),
-                pending,
-                older.iter().map(|p| p.writer.clone()).collect::<Vec<_>>(),
-                without_policies,
-            )
+            let mut groups: Vec<(Vec<Arc<Outbox>>, Vec<Hash256>)> = Vec::new();
+            for follows in [true, false] {
+                for reads in [true, false] {
+                    let writers: Vec<Arc<Outbox>> = g
+                        .peers
+                        .values()
+                        .filter(|p| {
+                            p.handshaked
+                                && follows_activation(g.network, p.version) == follows
+                                && reads_names(p.version) == reads
+                        })
+                        .map(|p| p.writer.clone())
+                        .collect();
+                    if writers.is_empty() {
+                        continue;
+                    }
+                    let readable: Vec<Hash256> = pending
+                        .iter()
+                        .filter(|h| {
+                            (follows || !g.mempool.touches_policy(h))
+                                && (reads || !g.mempool.touches_names(h))
+                        })
+                        .copied()
+                        .collect();
+                    groups.push((writers, readable));
+                }
+            }
+            (groups, pending)
         };
         if pending.is_empty() {
             return 0;
@@ -4911,9 +5187,10 @@ impl Node {
                     .collect(),
             )
         };
-        self.broadcast(&targets, &inv(&pending));
-        if !without_policies.is_empty() {
-            self.broadcast(&older, &inv(&without_policies));
+        for (writers, readable) in groups {
+            if !readable.is_empty() {
+                self.broadcast(&writers, &inv(&readable));
+            }
         }
         pending.len()
     }
@@ -4922,9 +5199,14 @@ impl Node {
         let targets: Vec<Arc<Outbox>> = {
             let g = self.shared.lock().unwrap();
             let policy = g.mempool.touches_policy(&txid);
+            let name = g.mempool.touches_names(&txid);
             g.peers
                 .values()
-                .filter(|p| p.handshaked && (!policy || follows_activation(g.network, p.version)))
+                .filter(|p| {
+                    p.handshaked
+                        && (!policy || follows_activation(g.network, p.version))
+                        && (!name || reads_names(p.version))
+                })
                 .map(|p| p.writer.clone())
                 .collect()
         };

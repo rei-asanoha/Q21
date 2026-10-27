@@ -32,6 +32,9 @@ pub mod messages;
 #[cfg(feature = "mldsa")]
 pub mod transport;
 pub mod txbuild;
+/// Verifying a contact by words read aloud from both screens.
+#[cfg(feature = "mldsa")]
+pub mod verify;
 pub mod watcher;
 
 #[cfg(feature = "mldsa")]

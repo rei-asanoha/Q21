@@ -50,6 +50,7 @@ pub mod chain;
 pub mod channel;
 pub mod compact;
 pub mod consensus;
+pub mod contacts;
 pub mod dialog;
 pub mod emission;
 pub mod explorer;

@@ -39,6 +39,10 @@ const ALLOWED: &[(&str, &str)] = &[
         "tests/english_only.rs",
         "this file: the list of marker words",
     ),
+    (
+        "src/channel/words/french.txt",
+        "the BIP 39 French word list, read aloud by a channel verification",
+    ),
 ];
 
 /// Words that are common in French and rare in English. A line containing two
