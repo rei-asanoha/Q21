@@ -4230,6 +4230,10 @@ document.getElementById("name-form").addEventListener("submit", async ev => {
       : `<div class="note"><h3>Names are not open yet</h3><p>No opening block has been set for this network yet.</p></div>`;
     return;
   }
+  if (c.wallet_full === true){
+    out.innerHTML = `<div class="warn"><h3>Name not checked</h3><p>This wallet already holds three names, the most allowed.</p></div>`;
+    return;
+  }
   if (c.available !== true){
     out.innerHTML = String(c.taken_by) === String(c.name)
       ? `<div class="warn"><h3>Name taken</h3><p>This name is already taken.</p></div>`

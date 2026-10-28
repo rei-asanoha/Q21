@@ -78,7 +78,7 @@ block 4,980.
 |---|---|---|
 | Names | — | A wallet registers up to three names, 3 to 30 characters from `a`–`z`, `0`–`9` and `-`. Each costs 0.5 Q21, **destroyed**: the price sits in an output no key can ever spend, and no miner collects it. A name belongs for good to the identity key derived from the recovery phrase: restoring the phrase restores the name. It does not expire and cannot be transferred |
 | Look-alikes | — | Refused by the chain, not by a warning: two names cannot share a skeleton, where hyphens are dropped, `0`, `1`, `2`, `4`, `5`, `6`, `8`, `9` and `i` read as `o`, `l`, `z`, `a`, `s`, `b`, `b`, `g` and `l`, and `rn`, `vv`, `cl` read as `m`, `w`, `d`. `de1bu` cannot stand next to `delbu` |
-| Protocol | 5 | 6. Name transactions and reach announcements go to protocol 6 peers only. A 0.4.12 peer keeps its link and everything else |
+| Protocol | 5 | 6. Name transactions and reach announcements go to protocol 6 peers only. A 0.4.12 peer keeps its link and everything else until the first block that carries a name |
 | Contacts | — | A local book in the wallet file, sealed with it: a name of your own for each person, pinned to the identity their channel session proves |
 | Verification | — | Two people read four words aloud — six for a large amount or a stranger — from the BIP 39 lists (English, French or Japanese). The words match only if no one stands between the two wallets. Opening or paying a channel toward a peer that is not a verified contact asks for a tick first. Both ends need 0.5.0 |
 | Reach | — | A wallet that owns a name signs where it can be reached — its onion service — and its peers relay it, so a contact is found by name. Each peer has its own budget, and an owner is relayed at most once per ten minutes |
@@ -92,8 +92,9 @@ block 4,980.
 explorers. A 0.4.12 node and a 0.5.0 node agree on every block that carries
 no name, below block 5,200 and above it. They part at the first block that
 carries one: a 0.4.12 node cannot read a name output, refuses that block and
-stops there. Nothing on disk is damaged: installed over the same folder,
-0.5.0 resumes from that height.
+stops there. Its log names no culprit: it simply ends up with no peer, and
+reports itself not synced. Nothing on disk is damaged: installed over the
+same folder, 0.5.0 resumes from that height.
 
 Miners first, then everyone else, and no name registered before every node
 runs 0.5.0. Mainnet schedules no name.
@@ -102,7 +103,10 @@ runs 0.5.0. Mainnet schedules no name.
 
 0.5.0 adds two lines to the wallet file: `contacts=` and `name_txs=`. A
 0.4.12 wallet opened by 0.5.0 starts with an empty book. Going back to 0.4.12
-loses nothing but the contact book: it ignores both lines.
+keeps the keys, the addresses, the balance and the names, which live on the
+chain; it drops both lines when it saves the file. Back on 0.5.0, the contact
+book is then empty, and the history reads the earlier payments of a name's
+price as payments to the identity address.
 
 ---
 

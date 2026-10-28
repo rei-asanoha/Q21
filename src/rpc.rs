@@ -1552,9 +1552,22 @@ impl RpcContext {
                 Json::u64(v)
             }
         };
+        // With a wallet: whether it can still register one, pending
+        // registrations counted. The name itself may be free while the
+        // wallet holds its three already.
+        #[cfg(feature = "mldsa")]
+        let wallet_full = match self.wallet_identity() {
+            Ok((_, owner)) => Json::Bool(self.node.with_chain_and_mempool(|c, m| {
+                m.view(&c.utxo).names_owned(&owner) >= MAX_NAMES_PER_OWNER
+            })),
+            Err(_) => Json::Null,
+        };
+        #[cfg(not(feature = "mldsa"))]
+        let wallet_full = Json::Null;
         Ok(Json::obj()
             .set("name", Json::str(name.clone()))
             .set("available", Json::Bool(taken.is_none()))
+            .set("wallet_full", wallet_full)
             .set("taken_by", taken.map(Json::str).unwrap_or(Json::Null))
             .set("price", amount_json(Amount::from_units(NAME_PRICE)))
             .set("activation_height", opt(h))
@@ -5385,6 +5398,7 @@ mod tests {
         let check = call_ok(&c, "namecheck", r#"{"name":"@Delbu"}"#);
         assert_eq!(check.get("name").and_then(|v| v.as_str()), Some("delbu"));
         assert_eq!(check.get("available"), Some(&Json::Bool(true)));
+        assert_eq!(check.get("wallet_full"), Some(&Json::Bool(false)));
         assert_eq!(check.get("active"), Some(&Json::Bool(true)));
 
         let r = call_ok(&c, "nameregister", r#"{"name":"@Delbu"}"#);
@@ -5558,6 +5572,10 @@ mod tests {
         call_ok(&c, "nameregister", r#"{"name":"third"}"#);
         let full = call(&c, "nameregister", r#"{"name":"fourth"}"#);
         assert!(error_text(&full).contains("3 names"), "{}", full.encode());
+        // The check says so before any attempt, even with the name free.
+        let check = call_ok(&c, "namecheck", r#"{"name":"fourth"}"#);
+        assert_eq!(check.get("available"), Some(&Json::Bool(true)));
+        assert_eq!(check.get("wallet_full"), Some(&Json::Bool(true)));
         mine_pool(&c);
         let list = call_ok(&c, "namelist", "{}");
         let names: Vec<&str> = match &list {

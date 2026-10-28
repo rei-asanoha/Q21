@@ -57,6 +57,60 @@ const KIND_HELLO_BACK: u8 = 2;
 /// peers of protocol 6 or later: an older one counts an unknown kind against
 /// the sender.
 const KIND_VERIFY: u8 = 3;
+/// How long a verification may wait for the other wallet before it is
+/// dropped: the other holder declared a mismatch, closed its wallet, or never
+/// answered. The words of a ready verification do not expire: the holder
+/// reads them when the other person is on the phone.
+pub const VERIFY_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Records whether the verification on `peer` now waits for the other
+/// wallet, and drops those that waited too long.
+fn track_waiting(inner: &mut Inner, peer: u64, now: std::time::Instant) {
+    let waiting = matches!(
+        inner.verifications.get(&peer),
+        Some((
+            verify::State::Committed { .. } | verify::State::Answered { .. },
+            _
+        ))
+    );
+    if waiting {
+        inner.verify_waiting.entry(peer).or_insert(now);
+    } else {
+        inner.verify_waiting.remove(&peer);
+    }
+}
+
+/// Drops the verifications that have waited longer than
+/// [`VERIFY_WAIT_TIMEOUT`] for the other wallet.
+fn expire_waiting(inner: &mut Inner, now: std::time::Instant) {
+    expire_waiting_in(&mut inner.verifications, &mut inner.verify_waiting, now);
+}
+
+type Verifications = HashMap<u64, (verify::State, Option<std::time::Instant>)>;
+
+fn expire_waiting_in(
+    verifications: &mut Verifications,
+    waiting: &mut HashMap<u64, std::time::Instant>,
+    now: std::time::Instant,
+) {
+    let stale: Vec<u64> = waiting
+        .iter()
+        .filter(|(_, at)| now.saturating_duration_since(**at) >= VERIFY_WAIT_TIMEOUT)
+        .map(|(p, _)| *p)
+        .collect();
+    for p in stale {
+        waiting.remove(&p);
+        if matches!(
+            verifications.get(&p),
+            Some((
+                verify::State::Committed { .. } | verify::State::Answered { .. },
+                _
+            ))
+        ) {
+            verifications.remove(&p);
+        }
+    }
+}
 
 /// Fee reserved for a cooperative close, a penalty, or a sweep, in units. The
 /// sweep builders cap it so a swept output never falls below the dust floor
@@ -315,7 +369,11 @@ struct Inner {
     spare_payout: Option<Hash256>,
     /// Contact verifications, by connection: where each stands, and when its
     /// last commitment arrived.
-    verifications: HashMap<u64, (verify::State, Option<std::time::Instant>)>,
+    verifications: Verifications,
+    /// Since when each verification has been waiting for the other wallet
+    /// (committed or answered, words not drawn yet). See
+    /// [`VERIFY_WAIT_TIMEOUT`].
+    verify_waiting: HashMap<u64, std::time::Instant>,
 }
 
 impl Inner {
@@ -443,6 +501,7 @@ impl ChannelManager {
                 unfunded_ttl: UNFUNDED_TTL,
                 inbound_funding_ttl: INBOUND_FUNDING_TTL,
                 verifications: HashMap::new(),
+                verify_waiting: HashMap::new(),
             }),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
@@ -666,6 +725,7 @@ impl ChannelManager {
         let nonce = crate::rng::bytes::<32>().map_err(|e| format!("{e:?}"))?;
         let frame = {
             let mut g = self.inner.lock().unwrap();
+            expire_waiting(&mut g, std::time::Instant::now());
             if !g.links.get(&peer).is_some_and(|l| l.owner.is_some()) {
                 return Err("no session with this peer".into());
             }
@@ -676,6 +736,8 @@ impl ChannelManager {
             }
             let (state, msg) = verify::start(count, id, nonce);
             g.verifications.insert(peer, (state, None));
+            g.verify_waiting.remove(&peer);
+            track_waiting(&mut g, peer, std::time::Instant::now());
             write_frame(Hash256::ZERO, KIND_VERIFY, &msg.encode())
         };
         if self.send(peer, frame) {
@@ -715,6 +777,10 @@ impl ChannelManager {
             Ok((state, reply)) => {
                 g.verifications
                     .insert(peer, (state, if is_commit { Some(now) } else { last }));
+                if is_commit {
+                    g.verify_waiting.remove(&peer);
+                }
+                track_waiting(&mut g, peer, now);
                 Ok(reply
                     .map(|m| vec![write_frame(Hash256::ZERO, KIND_VERIFY, &m.encode())])
                     .unwrap_or_default())
@@ -727,14 +793,16 @@ impl ChannelManager {
 
     /// Where the verification on connection `peer` stands.
     pub fn verification(&self, peer: u64) -> Option<verify::State> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
+        expire_waiting(&mut g, std::time::Instant::now());
         g.verifications.get(&peer).map(|(s, _)| s.clone())
     }
 
     /// Every verification under way or ready, by connection, with the
     /// identity address its session proved.
     pub fn verifications(&self) -> Vec<(u64, Hash256, verify::State)> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
+        expire_waiting(&mut g, std::time::Instant::now());
         let mut v: Vec<(u64, Hash256, verify::State)> = g
             .verifications
             .iter()
@@ -758,6 +826,7 @@ impl ChannelManager {
         } else {
             g.verifications.insert(peer, (verify::State::Failed, None));
         }
+        g.verify_waiting.remove(&peer);
     }
 
     /// Installs where [`ChannelManager::send`] goes.
@@ -1029,6 +1098,7 @@ impl ChannelManager {
         let mut g = self.inner.lock().unwrap();
         g.links.remove(&peer);
         g.verifications.remove(&peer);
+        g.verify_waiting.remove(&peer);
         g.pending_funder.remove(&peer);
         g.pending_acceptor.remove(&peer);
         for c in g.channels.values_mut() {
@@ -2548,6 +2618,34 @@ fn bound_to(chan: &Chan, identity: &str, legacy: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A verification left waiting by the other wallet — it declared a
+    /// mismatch, closed, or never answered — is dropped after
+    /// [`VERIFY_WAIT_TIMEOUT`], so that the screen stops showing it and a new
+    /// one can start; words already drawn, and a failure, are kept.
+    #[test]
+    fn a_verification_waiting_for_nothing_expires() {
+        let t0 = std::time::Instant::now();
+        let mut v: Verifications = HashMap::new();
+        let mut w: HashMap<u64, std::time::Instant> = HashMap::new();
+        let (waiting, _) = verify::start(verify::WORDS_STRONG, [1; verify::ID_LEN], [2; 32]);
+        v.insert(1, (waiting.clone(), None));
+        w.insert(1, t0);
+        v.insert(2, (verify::State::Failed, None));
+        w.insert(2, t0);
+        v.insert(3, (waiting, None));
+        w.insert(3, t0 + VERIFY_WAIT_TIMEOUT / 2);
+        expire_waiting_in(&mut v, &mut w, t0 + VERIFY_WAIT_TIMEOUT / 2);
+        assert_eq!(v.len(), 3, "nothing before its time");
+        expire_waiting_in(&mut v, &mut w, t0 + VERIFY_WAIT_TIMEOUT);
+        assert!(!v.contains_key(&1), "the one waiting too long is dropped");
+        assert!(
+            matches!(v.get(&2), Some((verify::State::Failed, _))),
+            "a failure stays"
+        );
+        assert!(v.contains_key(&3), "a later one waits on");
+        assert!(!w.contains_key(&1) && !w.contains_key(&2));
+    }
 
     /// The channel seed a manager holds is wiped when it is dropped.
     #[test]
