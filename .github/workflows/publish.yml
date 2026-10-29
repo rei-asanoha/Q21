@@ -56,6 +56,8 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -eu
+          # Spaces around a tag typed by hand are not part of it.
+          TAG=$(printf '%s' "$TAG" | tr -d '[:space:]')
           printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' \
             || { echo "::error::\"$TAG\" is not a version tag like v0.5.1"; exit 1; }
           for _ in 1 2 3; do
@@ -85,7 +87,7 @@ jobs:
           ls -la rel
           # What was checked: kept, to make sure it is still what gets
           # published.
-          jq -c '[.assets[] | {id, name, size, label}] | sort_by(.name)' release.json > "$RUNNER_TEMP/checked.json"
+          jq -c '[.assets[] | {id, name, size, label: (.label // "")}] | sort_by(.name)' release.json > "$RUNNER_TEMP/checked.json"
           ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub attestations
           echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
           echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
@@ -99,7 +101,7 @@ jobs:
           set -eu
           assets() {
             gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-              --jq '[.assets[] | {id, name, size, label}] | sort_by(.name)'
+              --jq '[.assets[] | {id, name, size, label: (.label // "")}] | sort_by(.name)'
           }
           # Unchanged since it was checked?
           if [ "$(assets | jq -c .)" != "$(jq -c . "$RUNNER_TEMP/checked.json")" ]; then
