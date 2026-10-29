@@ -1,8 +1,10 @@
 # Release: builds the wallet for macOS, Windows and Linux.
 #
 # Triggered by a version tag (`v0.2.0`, for example) or on demand. Each
-# platform builds on its own machine: nothing is cross-compiled, so nothing
-# is assumed.
+# system builds on its own machine. One exception: the macOS Intel binary is
+# built on an Apple Silicon machine (`--target x86_64-apple-darwin`), since
+# GitHub's macOS machines are now all Apple Silicon; its tests run there,
+# not on an Intel Mac.
 #
 # # What these files are not
 #
@@ -135,8 +137,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -166,8 +166,8 @@ jobs:
             archive: q21-linux-x86_64.tar.gz
             tor: linux-x86_64
           # 64-bit ARM Linux: Raspberry Pi 5, Ampere machines, Hetzner CAX
-          # servers. Built on an ARM machine and not cross-compiled, like the
-          # other four, so the tests run on the architecture they check.
+          # servers. Built on an ARM machine and not cross-compiled, so the
+          # tests run on the architecture they check.
           # These machines have been available since August 2025 for public
           # repositories, January 2026 for the others.
           - name: Linux (ARM 64)
@@ -529,24 +529,17 @@ jobs:
 
           printf '%s  %s\n' "$(checksum "$ARCHIVE")" "$ARCHIVE" > "$ARCHIVE.sha256"
           printf '%s  %s\n' "$(checksum "$BIN")"     "$NAME"    > "$NAME.bin.sha256"
+          # The Windows launcher too: it is the file people double-click,
+          # copied into the archive unchanged, and rebuilt by the same
+          # command. (The macOS one is re-signed inside its .app bundle, so
+          # the archived file is not the built one; see REPRODUCING.md.)
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            printf '%s  %s\n' "$(checksum "target/${{ matrix.target }}/release/q21-wallet.exe")" \
+              "q21-wallet-${NAME#q21-}" >> "$NAME.bin.sha256"
+          fi
 
           echo "--- archive (transport) ---"; cat "$ARCHIVE.sha256"
           echo "--- binary (to reproduce) ---"; cat "$NAME.bin.sha256"
-
-      # The attestation ties the archive to this commit and this run, signed
-      # by GitHub. Anyone who verifies it knows that the file was built here,
-      # from these sources, and not uploaded by hand.
-      #
-      # GitHub does not offer it to private repositories of a personal
-      # account: it therefore only runs if the repository is public, and
-      # never blocks the release; the hash and the signature are there in
-      # every case.
-      - name: Build provenance attestation
-        if: ${{ !github.event.repository.private }}
-        continue-on-error: true
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-path: ${{ matrix.archive }}
 
       - name: Upload the result
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -556,6 +549,35 @@ jobs:
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
             *.bin.sha256
+
+  # --- Build provenance, signed by GitHub: ties each archive to this commit
+  # and this run. Only for a version tag, and in a job of its own, so that
+  # the build jobs — which run the tests, every build script and the Tor
+  # download — never hold the right to sign anything.
+  #
+  # GitHub does not offer it to private repositories of a personal account:
+  # it therefore only runs if the repository is public, and never blocks the
+  # release; the hashes and the offline signature are there in every case.
+  provenance:
+    name: Build provenance
+    needs: build
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            artifacts/q21-*.tar.gz
+            artifacts/q21-*.zip
 
   # --- The hashes of every archive and every binary, in one file.
   #
@@ -607,8 +629,9 @@ jobs:
           echo
           echo "  minisign -S -s q21-release.key -m SHA256SUMS -t \"Q21 ${GITHUB_REF_NAME} ${GITHUB_SHA} -- Rei Asanoha\""
           echo
-          echo "Then attach SHA256SUMS.minisig to the draft release, and publish it once"
-          echo "attestations/threshold independent attestations are on main (attestations/README.md)."
+          echo "Then attach SHA256SUMS.minisig to the draft release, and run the workflow"
+          echo "\"Publish a signed release\" (Actions tab) with the tag: it checks everything,"
+          echo "then makes the release public. See SIGNING.md, section 3."
 
       - name: Upload the hashes
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -625,7 +648,26 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
+      # A run of the same tag again — "Re-run all jobs" — must never touch a
+      # release already published: it would put it back to draft with new,
+      # unsigned archives next to the old signature.
+      - name: The release is not published yet
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if DRAFT=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$DRAFT" != "true" ]; then
+              echo "::error::$GITHUB_REF_NAME is already published: nothing is rebuilt over it. Tag a new version."
+              exit 1
+            fi
+          fi
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
@@ -739,135 +781,72 @@ jobs:
             cryptanalysis, and the audit was carried out by its own authors.
             Do not trust this software with anything of real value.
 
-  # --- A release published by hand: is it signed, for the right commit,
-  # confirmed by enough independent rebuilds, and does every archive match?
+  # --- A release published by hand from the website, instead of with the
+  # "Publish" workflow (publish.yml), which checks a draft **before** it
+  # becomes public. This is the safety net: the same checks, right after
+  # publication, and back to draft if anything fails.
   #
-  # This job signs nothing and builds nothing. It catches the mistakes of an
-  # offline signature — a forgotten .minisig, the wrong file signed, the
-  # wrong key, a comment naming another commit — before anyone installs. A
-  # release that fails goes back to draft at once. What it cannot catch is a
-  # takeover of this repository, key file included: that is what the public
-  # key published elsewhere than here is for (SIGNING.md).
+  # It catches mistakes — a forgotten signature, the wrong file signed, an
+  # extra asset, a comment naming another commit. It is not an access
+  # control: whoever has write access to this repository controls this file
+  # too. The guarantee that does not depend on the repository is the one a
+  # user checks at home, with tools/verify-release.sh and the public key
+  # obtained elsewhere (SIGNING.md).
   verify:
-    name: Verify the signature
+    name: Verify the published release
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      # Two questions, kept apart.
-      #
-      # 1. Who released it: `SHA256SUMS.minisig`, made offline with the key
-      #    of `q21-release.pub`, its trusted comment naming this tag and this
-      #    commit. One person's statement, no more.
-      # 2. Does it come from the sources: the attestations filed on `main`
-      #    under `attestations/<tag>/` by people who rebuilt the binaries
-      #    themselves, each signed by its own key in `builder-keys/` (see
-      #    attestations/README.md — the mechanism of bitcoin-core/guix.sigs).
-      #    Every binary hash an attestation states must be the release's.
-      #    `attestations/threshold` says how many are required before a
-      #    release may stand: 0 as long as nobody else rebuilds, more as
-      #    independent builders join. No single key, the maintainer's
-      #    included, can then publish alone.
-      - name: Signature, attestations and archives
-        id: check
+      - name: Every check of tools/verify-release.sh
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -eu
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          for _ in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y -qq minisign unzip && break
+            sleep 10
+          done
+          command -v minisign >/dev/null
           COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          # Labels: the page shows an asset's label, the download its name.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | select(.label != "" and .label != .name) | .name' > mislabeled.txt
+          if [ -s mislabeled.txt ]; then
+            echo "::error::assets shown under another name: $(tr '\n' ' ' < mislabeled.txt)"
+            exit 1
+          fi
           mkdir rel
-          gh release download "$TAG" --dir rel
-          ls -la rel
-          [ -f rel/SHA256SUMS ] || { echo "::error::SHA256SUMS is missing from the release"; exit 1; }
-
-          # 1. The release signature.
-          [ -f rel/SHA256SUMS.minisig ] || { echo "::error::SHA256SUMS.minisig is missing: the release is not signed"; exit 1; }
-          [ -f q21-release.pub ] || { echo "::error::q21-release.pub is missing from the repository"; exit 1; }
-          OUT=$(minisign -Vm rel/SHA256SUMS -x rel/SHA256SUMS.minisig -p q21-release.pub) || {
-            echo "::error::the signature does NOT verify with the repository public key"; exit 1; }
-          printf '%s\n' "$OUT"
-          EXPECTED="Q21 ${TAG} ${COMMIT} -- Rei Asanoha"
-          COMMENT=$(printf '%s\n' "$OUT" | sed -n 's/^Trusted comment: //p')
-          if [ "$COMMENT" != "$EXPECTED" ]; then
-            echo "::error::trusted comment \"$COMMENT\", expected \"$EXPECTED\""
-            exit 1
-          fi
-
-          # 2. The attestations, as `main` holds them now: they are filed
-          #    after the tag, by pull request.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
+          # The key of the tagged commit, the attestations as main holds them.
           git fetch --no-tags origin main
-          rm -rf att && mkdir att
+          mkdir att
           git archive origin/main attestations | tar -x -C att
-          THRESHOLD=0
-          if [ -f att/attestations/threshold ]; then
-            THRESHOLD=$(tr -dc '0-9' < att/attestations/threshold)
-            THRESHOLD=${THRESHOLD:-0}
-          fi
-          AGREE=0
-          for D in att/attestations/"$TAG"/*/; do
-            [ -d "$D" ] || continue
-            WHO=$(basename "$D")
-            KEY="att/attestations/builder-keys/$WHO.pub"
-            if [ ! -f "$KEY" ] || [ ! -f "$D/SHA256SUMS" ] || [ ! -f "$D/SHA256SUMS.minisig" ]; then
-              echo "::warning::attestation of $WHO incomplete (key, SHA256SUMS or signature missing): not counted"
-              continue
-            fi
-            AOUT=$(minisign -Vm "$D/SHA256SUMS" -p "$KEY" 2>/dev/null) || {
-              echo "::warning::attestation of $WHO: signature invalid, not counted"; continue; }
-            ACOMMENT=$(printf '%s\n' "$AOUT" | sed -n 's/^Trusted comment: //p')
-            case "$ACOMMENT" in
-              *"$TAG"*"$COMMIT"*) ;;
-              *) echo "::warning::attestation of $WHO names another version or commit (\"$ACOMMENT\"): not counted"; continue ;;
-            esac
-            LINES=0
-            MISMATCH=0
-            while read -r H NAME; do
-              [ -n "$H" ] || continue
-              case "$H" in \#*) continue ;; esac
-              LINES=$((LINES + 1))
-              if [ "$(awk -v n="$NAME" '$2 == n {print $1}' rel/SHA256SUMS)" != "$H" ]; then
-                echo "::error::$WHO rebuilt $NAME as $H, which is NOT the released binary"
-                MISMATCH=1
-              fi
-            done < "$D/SHA256SUMS"
-            [ "$MISMATCH" -eq 0 ] || exit 1
-            [ "$LINES" -ge 1 ] || { echo "::warning::attestation of $WHO states no hash: not counted"; continue; }
-            echo "agrees: $WHO ($LINES binaries)"
-            AGREE=$((AGREE + 1))
-          done
-          echo "$AGREE independent attestation(s) agree; $THRESHOLD required"
-          if [ "$AGREE" -lt "$THRESHOLD" ]; then
-            echo "::error::$AGREE attestation(s) for $TAG, $THRESHOLD required: wait for the builders (attestations/README.md)"
-            exit 1
-          fi
+          ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub att/attestations
 
-          # 3. Every archive of the release is listed, and matches.
-          cd rel
-          N=0
-          for A in q21-*.tar.gz q21-*.zip; do
-            [ -f "$A" ] || continue
-            LINE=$(awk -v a="$A" '$2 == a' SHA256SUMS)
-            [ -n "$LINE" ] || { echo "::error::$A is not in SHA256SUMS"; exit 1; }
-            printf '%s\n' "$LINE" | sha256sum -c -
-            N=$((N + 1))
-          done
-          [ "$N" -ge 5 ] || { echo "::error::$N archives in the release, 5 expected"; exit 1; }
-          echo "signature, $AGREE attestation(s) and $N archives verified for $TAG ($COMMIT)"
-
+  # Back to draft, whatever stopped the check — a failure, a cancellation, a
+  # lost runner. Only this job may write.
+  revert:
+    name: Back to draft
+    needs: verify
+    if: ${{ always() && github.event_name == 'release' && needs.verify.result != 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: Back to draft
-        if: failure()
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           gh release edit "$TAG" --draft=true --repo "$GITHUB_REPOSITORY"
-          echo "::error::$TAG is back to draft: nobody can download it. Fix the signature (SIGNING.md), then publish again."
+          echo "::error::$TAG is back to draft: nobody can download it. See the 'Verify' job, fix (SIGNING.md), then publish again."

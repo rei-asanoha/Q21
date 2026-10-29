@@ -1,0 +1,92 @@
+# Publish a signed release: the last step of SIGNING.md, section 3.
+#
+# The release workflow leaves a **draft**: the archives and SHA256SUMS, which
+# nobody outside the maintainers can see. Once SHA256SUMS.minisig, made
+# offline, is attached to it, this workflow checks the draft — every check of
+# tools/verify-release.sh — and only then makes it public. Nothing is public
+# for a single second before it has been checked.
+#
+# Started by hand: Actions tab → "Publish a signed release" → Run workflow →
+# the tag (`v0.5.1`). Only from `main`: the checking script, the public key
+# and the attestations are those `main` holds.
+
+name: Publish a signed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag of the draft to publish (v0.5.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Check, then publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Drafts are only visible with write access; this job also makes the
+    # release public. It runs nothing but the checks below.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::\"$TAG\" is not a version tag like v0.5.1"; exit 1; }
+          for _ in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y -qq minisign unzip && break
+            sleep 10
+          done
+          command -v minisign >/dev/null
+          git fetch --tags --force origin
+          COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          git merge-base --is-ancestor "$COMMIT" HEAD \
+            || { echo "::error::$TAG ($COMMIT) is not on main"; exit 1; }
+          # Drafts have no public URL: found through the API, by tag.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\")" > release.json
+          [ -s release.json ] || { echo "::error::no release for $TAG"; exit 1; }
+          [ "$(jq -s length release.json)" = 1 ] || { echo "::error::several releases for $TAG"; exit 1; }
+          [ "$(jq -r .draft release.json)" = true ] || { echo "::error::$TAG is already published"; exit 1; }
+          RELEASE_ID=$(jq -r .id release.json)
+          # Labels: the page shows an asset's label, the download its name.
+          MISLABELED=$(jq -r '.assets[] | select(.label != null and .label != "" and .label != .name) | .name' release.json)
+          [ -z "$MISLABELED" ] || { echo "::error::assets shown under another name: $MISLABELED"; exit 1; }
+          mkdir rel
+          jq -r '.assets[] | "\(.id) \(.name)"' release.json | while read -r ID NAME; do
+            case "$NAME" in */*|.*|'') echo "::error::asset name refused: \"$NAME\""; exit 1 ;; esac
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$ID" > "rel/$NAME"
+          done
+          ls -la rel
+          ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub attestations
+          echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
+          echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest=true > /dev/null
+          echo "$TAG ($COMMIT) is public: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"

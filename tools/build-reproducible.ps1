@@ -27,11 +27,16 @@ Set-Location $Root
 # Both forms of the directory, as the release passes them: rustc may see
 # backslashes or forward slashes, and a form that matches nothing costs nothing.
 $RootSlash = $Root -replace '\\', '/'
-$Flags = "--remap-path-prefix=$Root=/q21 --remap-path-prefix=$RootSlash=/q21"
+# Passed as CARGO_ENCODED_RUSTFLAGS, one flag per field: a folder name with a
+# space in it (`C:\Users\First Last\...`) would split RUSTFLAGS in two.
+$Flags = "--remap-path-prefix=$Root=/q21" + [char]0x1f + "--remap-path-prefix=$RootSlash=/q21"
 # The target is always explicit, as in the release (`--target`).
 $Target = ((rustc -vV) | Select-String '^host: ').ToString().Substring(6).Trim()
+# The release ships the MSVC build: a GNU toolchain would build a binary the
+# release never publishes, with nothing to compare it to.
+if ($Target -eq 'x86_64-pc-windows-gnu') { $Target = 'x86_64-pc-windows-msvc' }
 
-if ($env:RUSTFLAGS) {
+if ($env:RUSTFLAGS -or $env:CARGO_ENCODED_RUSTFLAGS) {
   Write-Error @"
 RUSTFLAGS is already set in the environment:
   $($env:RUSTFLAGS)
@@ -48,15 +53,25 @@ Write-Host "Toolchain:    $(rustc --version)"
 Write-Host "Target:       $Target"
 Write-Host ""
 
-$env:RUSTFLAGS = $Flags
+$env:CARGO_ENCODED_RUSTFLAGS = $Flags
 try {
   cargo build --locked --release --features mldsa --target $Target
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
-  Remove-Item Env:\RUSTFLAGS
+  Remove-Item Env:\CARGO_ENCODED_RUSTFLAGS
 }
 
 $Binary = Join-Path $Root "target\$Target\release\q21.exe"
 Write-Host ""
 Write-Host "Binary: $Binary"
 (Get-FileHash -Algorithm SHA256 $Binary).Hash.ToLower() + "  q21.exe"
+
+# The same hashes, under the names the release and the attestations use
+# (attestations/README.md), ready to copy into an attestation.
+if ($Target -eq 'x86_64-pc-windows-msvc') {
+  $Launcher = Join-Path $Root "target\$Target\release\q21-wallet.exe"
+  Write-Host ""
+  Write-Host "For an attestation (attestations/README.md):"
+  (Get-FileHash -Algorithm SHA256 $Binary).Hash.ToLower() + "  q21-windows-x86_64"
+  (Get-FileHash -Algorithm SHA256 $Launcher).Hash.ToLower() + "  q21-wallet-windows-x86_64"
+}

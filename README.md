@@ -251,11 +251,12 @@ minisign -Vm SHA256SUMS -p q21-release.pub
 sha256sum --ignore-missing -c SHA256SUMS
 ```
 
-A release is created as a draft; when it is published, the pipeline checks
-its signature against this file, the commit its trusted comment names, the
-independent attestations required (`attestations/`), and every archive. A
-release that fails any of them goes back to draft. The trusted comment of
-each signature is covered by the signature:
+A release is created as a draft, and made public only after
+`tools/verify-release.sh` has checked it: the signature against this file,
+the commit its trusted comment names, every archive and the program inside
+it, and the independent attestations required (`attestations/`). The same
+script runs at home, against keys you obtained elsewhere. The trusted comment
+of each signature is covered by the signature:
 
 ```
 Trusted comment: Q21 v<version> <commit hash> -- Rei Asanoha

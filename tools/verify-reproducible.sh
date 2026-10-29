@@ -75,7 +75,7 @@ checksum() {
 }
 
 # The script builds for the current machine's target, passed explicitly.
-HOST=$(rustc -vV | sed -n 's/^host: //p')
+HOST=$(cd "$A" && rustc -vV | sed -n 's/^host: //p')
 SA=$(checksum "$A/target/$HOST/release/q21")
 SB=$(checksum "$B/target/$HOST/release/q21")
 

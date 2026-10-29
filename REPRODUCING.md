@@ -295,10 +295,26 @@ Guix does for Bitcoin Core — would require an infrastructure this project
 does not have. The tradeoff is explicit: the compiler is pinned and
 verifiable by its hash, but it is trusted.
 
-**Cross-compilation is not used.** Each platform is built on its own machine
-(`release.yml`), which avoids assumptions, but means that a Windows binary
-cannot be checked from Linux. To check the binary for your system, you need
-that system.
+**Each system is built on its own machine** (`release.yml`), which avoids
+assumptions, but means that a Windows binary cannot be checked from Linux:
+to check the binary for your system, you need that system. One exception:
+the macOS Intel binary is built on an Apple Silicon Mac, with
+`--target x86_64-apple-darwin`; rebuild it the same way, on either kind of
+Mac, with `./tools/build-reproducible.sh x86_64-apple-darwin`.
+
+**What is attested, and what is not.** The programs are: `q21` on every
+system, and the Windows launcher. The rest of an archive is not compared by
+anyone: the documents, `bootstrap.txt` (the entry-point addresses, plain
+text you can read), and Tor (the Tor Project's own build, whose signature
+the pipeline checks before packing it; see `tor/README.txt`). Archives
+themselves are not reproducible yet: they record dates and owners.
+
+**The macOS launcher is not attested.** `Q21 Wallet.app` is signed ad hoc
+when the archive is assembled, which changes the bytes of the launcher
+inside it: the archived file is not the one the build produced. The program
+itself (`q21`) is shipped unchanged, on every system, and so is the Windows
+launcher; those are what `SHA256SUMS` lists and what an attestation
+compares.
 
 **Determinism is only measured on this project.** A dependency update can
 introduce a `build.rs` that writes a date, a path, a machine name. The
@@ -344,4 +360,4 @@ assurance — that the published binary comes from these sources.
 And if you rebuild every release this way, you can become one of its
 signers: your signature then says "I rebuilt it, and it is these bytes",
 and a release can require several such signatures from independent people.
-See SIGNING.md, "More than one signer".
+See SIGNING.md, section 5, "More than one person: independent rebuilds".

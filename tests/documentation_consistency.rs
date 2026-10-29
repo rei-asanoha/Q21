@@ -475,7 +475,11 @@ fn the_release_drafts_archives_and_sums_only() {
 /// attestations, archives — and sent back to draft if anything fails.
 #[test]
 fn the_release_is_signed_offline_and_checked_when_published() {
-    for w in [".github/workflows/release.yml", ".github/workflows/ci.yml"] {
+    for w in [
+        ".github/workflows/release.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/publish.yml",
+    ] {
         let text = read(w);
         assert!(
             !text.contains("secrets.MINISIGN")
@@ -485,19 +489,33 @@ fn the_release_is_signed_offline_and_checked_when_published() {
             "{w} signs, or reads a signing key: the key must stay offline (SIGNING.md)"
         );
     }
-    let workflow = read(".github/workflows/release.yml");
-    let verify = &workflow[workflow.find("  verify:").expect("verify job")..];
+    // One script checks a release, before it is public (publish.yml) and
+    // after a publication by hand (release.yml); it is the one users run.
+    let script = read("tools/verify-release.sh");
     for wanted in [
         "SHA256SUMS.minisig",
-        "q21-release.pub",
-        "attestations/threshold",
-        "--draft=true",
+        "Trusted comment",
+        "threshold",
+        "is NOT the binary",
+        "unexpected file in the release",
     ] {
         assert!(
-            verify.contains(wanted),
-            "the verification of a published release no longer handles {wanted}"
+            script.contains(wanted),
+            "tools/verify-release.sh no longer handles {wanted}"
         );
     }
+    let publish = read(".github/workflows/publish.yml");
+    assert!(
+        publish.contains("./tools/verify-release.sh")
+            && publish.find("./tools/verify-release.sh") < publish.find("draft=false"),
+        "publish.yml makes a release public without checking it first"
+    );
+    let workflow = read(".github/workflows/release.yml");
+    let verify = &workflow[workflow.find("  verify:").expect("verify job")..];
+    assert!(
+        verify.contains("./tools/verify-release.sh") && verify.contains("--draft=true"),
+        "a release published by hand is no longer checked, or no longer sent back to draft"
+    );
 }
 
 /// Nothing is released before the whole CI has passed on the released commit,
@@ -520,7 +538,11 @@ fn the_release_is_gated_and_its_actions_pinned() {
         !build.contains("rust-cache"),
         "the release builds from a cache again"
     );
-    for w in [".github/workflows/release.yml", ".github/workflows/ci.yml"] {
+    for w in [
+        ".github/workflows/release.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/publish.yml",
+    ] {
         for line in read(w).lines() {
             let Some(rest) = line
                 .trim_start()

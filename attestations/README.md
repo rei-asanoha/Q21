@@ -82,6 +82,13 @@ line per binary, the name without a path, sorted by name.
 d3f1...                                                            q21-linux-arm64
 ```
 
+The names are those the release uses: `q21-linux-x86_64`, `q21-linux-arm64`,
+`q21-macos-arm64`, `q21-macos-x86_64`, `q21-windows-x86_64`, and
+`q21-wallet-windows-x86_64` for the Windows launcher.
+`tools/build-reproducible.sh` (and `.ps1`) print the lines for your platform
+ready to copy. A line under any other name is ignored; a line whose hash
+differs from the release's stops the release, so check before signing.
+
 Only attest platforms you have **actually** built. A Linux x86-64 binary has
 no reason to equal a macOS ARM binary: the comparison is made per platform,
 never across platforms.
@@ -225,8 +232,11 @@ cannot disagree, so the difference must be explained first.
 
 It is `0` today: nobody else rebuilds yet, and pretending otherwise would
 be decoration. When two or three people rebuild regularly, raising it to `2`
-is a one-line pull request — and from then on no single person, the
-maintainer included, can publish a version alone.
+is a one-line pull request. From then on, a release whose programs differ
+from what independent people rebuilt cannot be made public through the
+pipeline — what a stolen key or a compromised build machine would need. It
+does not bind whoever administers the repository; SIGNING.md, section 5,
+says plainly what it covers and what it does not.
 
 Attestations arrive by pull request, after the tag and before the release is
 published: the tag is public as soon as it is pushed, so anyone can rebuild

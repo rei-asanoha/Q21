@@ -66,11 +66,11 @@ FLAGS="--remap-path-prefix=$ROOT=/q21"
 # A `RUSTFLAGS` already set in the environment would silently replace ours:
 # cargo does not combine them, it takes one OR the other. We refuse rather
 # than produce a binary we believe is reproducible and is not.
-if [ -n "${RUSTFLAGS:-}" ]; then
+if [ -n "${RUSTFLAGS:-}" ] || [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
   echo "error: RUSTFLAGS is already set in the environment:" >&2
-  echo "  RUSTFLAGS=$RUSTFLAGS" >&2
+  echo "  RUSTFLAGS=${RUSTFLAGS:-}${CARGO_ENCODED_RUSTFLAGS:-}" >&2
   echo "It would replace the reproducibility flags. Clear it:" >&2
-  echo "  unset RUSTFLAGS" >&2
+  echo "  unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS" >&2
   exit 1
 fi
 
@@ -97,4 +97,31 @@ if command -v sha256sum >/dev/null 2>&1; then
   sha256sum "$BINARY"
 else
   shasum -a 256 "$BINARY"
+fi
+
+# The same hash, under the name the release and the attestations use
+# (attestations/README.md), ready to copy into an attestation.
+case "$TARGET" in
+  x86_64-unknown-linux-gnu)  PLATFORM=linux-x86_64 ;;
+  aarch64-unknown-linux-gnu) PLATFORM=linux-arm64 ;;
+  aarch64-apple-darwin)      PLATFORM=macos-arm64 ;;
+  x86_64-apple-darwin)       PLATFORM=macos-x86_64 ;;
+  x86_64-pc-windows-msvc)    PLATFORM=windows-x86_64 ;;
+  *)                         PLATFORM="" ;;
+esac
+if [ -n "$PLATFORM" ]; then
+  checksum() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+    else shasum -a 256 "$1" | cut -d' ' -f1; fi
+  }
+  echo
+  echo "For an attestation (attestations/README.md):"
+  echo "$(checksum "$BINARY")  q21-$PLATFORM"
+  # Under Windows (git bash), the launcher shipped next to it, unchanged.
+  if [ "$PLATFORM" = windows-x86_64 ]; then
+    echo "$(checksum "target/$TARGET/release/q21-wallet.exe")  q21-wallet-$PLATFORM"
+  fi
+else
+  echo
+  echo "($TARGET is not a platform the release ships: nothing to attest.)"
 fi
