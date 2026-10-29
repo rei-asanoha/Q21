@@ -65,6 +65,33 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.5.1 to 0.5.2
+
+0.5.2 changes the wallet page only: no rule of the chain, no message of the
+protocol, nothing in the data folder. A 0.5.1 node and a 0.5.2 node agree on
+every block and talk to each other as before.
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200.
+
+## What changes
+
+| | 0.5.1 | 0.5.2 |
+|---|---|---|
+| The Channels tab | Called Channels; forms side by side, with the contacts as a table | Called **Links**, in three steps: find someone by their name, check together with words read aloud, pay. Each contact is a card with its one next step: connect, check with words, create a quick link, pay |
+| Finding someone | A name typed in the "add a contact" form, without seeing first who it belongs to | A search box: the name is looked up on the chain first, then added in one click. Your own names are shown with a copy button, to give them to others |
+| Closed links | Stayed in the list with the open ones | Move to a folded **Archives** section once their funds are back. A link whose penalty is not yet confirmed stays in the list until it is |
+| Verification words | A second verification on the same connection showed nothing; the words were at the top of a page often scrolled away | Every verification shows, the second one too. The words sit in a panel that stays in view, on every tab; "Later" puts it aside without concluding anything |
+| Activity: change | On a payment, the change coming back read as money received (`+ 9.62` after a name registration) | The change is grey, labelled "change back", under Received. Sent is what really left the wallet, fees included |
+| Activity: reference | The hash broken over a dozen lines | Its beginning and end on one line; the whole hash in the tooltip and in the copy button |
+
+## Who should upgrade, and when
+
+Anyone who uses the wallet page, whenever convenient. A node that only runs
+as a server (entry point, explorer) gains nothing and can stay on 0.5.1.
+
+---
+
 # Upgrading from 0.5.0 to 0.5.1
 
 0.5.1 changes no rule of the chain and no message of the protocol: a 0.5.0
