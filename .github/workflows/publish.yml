@@ -85,7 +85,7 @@ jobs:
           ls -la rel
           # What was checked: kept, to make sure it is still what gets
           # published.
-          jq -c '[.assets[] | {id, name, size, updated_at}] | sort_by(.name)' release.json > "$RUNNER_TEMP/checked.json"
+          jq -c '[.assets[] | {id, name, size, label}] | sort_by(.name)' release.json > "$RUNNER_TEMP/checked.json"
           ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub attestations
           echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
           echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
@@ -99,7 +99,7 @@ jobs:
           set -eu
           assets() {
             gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-              --jq '[.assets[] | {id, name, size, updated_at}] | sort_by(.name)'
+              --jq '[.assets[] | {id, name, size, label}] | sort_by(.name)'
           }
           # Unchanged since it was checked?
           if [ "$(assets | jq -c .)" != "$(jq -c . "$RUNNER_TEMP/checked.json")" ]; then

@@ -485,7 +485,13 @@ fn the_release_is_signed_offline_and_checked_when_published() {
             !text.contains("secrets.MINISIGN")
                 && !text
                     .lines()
-                    .any(|l| l.contains("minisign -S") && !l.trim_start().starts_with("echo")),
+                    // The dry run signs with a key made on the spot, then thrown
+                    // away; nothing else signs.
+                    .any(|l| {
+                        l.contains("minisign -S")
+                            && !l.trim_start().starts_with("echo")
+                            && !l.contains("dry.key")
+                    }),
             "{w} signs, or reads a signing key: the key must stay offline (SIGNING.md)"
         );
     }

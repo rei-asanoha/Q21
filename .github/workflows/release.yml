@@ -639,11 +639,47 @@ jobs:
           name: SHA256SUMS
           path: artifacts/SHA256SUMS
 
+  # --- The very checks the release will face, on what was just built, with
+  # a throwaway key: if the archives a runner produces ever stop matching
+  # what tools/verify-release.sh expects — a new file, a different layout —,
+  # it shows here, before a draft exists, and not on publication day.
+  self-check:
+    name: Release check, dry run
+    needs: sums
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: tools/verify-release.sh, throwaway key
+        shell: bash
+        run: |
+          set -eu
+          for _ in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y -qq minisign unzip && break
+            sleep 10
+          done
+          command -v minisign >/dev/null
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          TAG="v$VERSION"
+          mkdir -p "$RUNNER_TEMP/rel" "$RUNNER_TEMP/att"
+          cp artifacts/q21-*.tar.gz artifacts/q21-*.zip artifacts/SHA256SUMS "$RUNNER_TEMP/rel/"
+          echo 0 > "$RUNNER_TEMP/att/threshold"
+          minisign -G -W -f -p "$RUNNER_TEMP/dry.pub" -s "$RUNNER_TEMP/dry.key" > /dev/null
+          minisign -S -W -s "$RUNNER_TEMP/dry.key" -m "$RUNNER_TEMP/rel/SHA256SUMS" \
+            -t "Q21 ${TAG} ${GITHUB_SHA} -- Rei Asanoha"
+          ./tools/verify-release.sh "$RUNNER_TEMP/rel" "$TAG" "$GITHUB_SHA" "$RUNNER_TEMP/dry.pub" "$RUNNER_TEMP/att"
+
   # --- A version tag: the release page, as a draft. Nobody sees it, nobody
   # can download it, until it is signed and published by hand.
   publish:
     name: Draft release
-    needs: sums
+    needs: [sums, self-check]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:

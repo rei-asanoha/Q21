@@ -34,7 +34,8 @@
 # release signature only. See REPRODUCING.md, section 6.
 #
 # Run it from a clone of the repository that holds the tagged commit: the
-# files that come from the repository are compared with `git show`.
+# files that come from the repository are compared with what a checkout of
+# the tagged commit holds (`git cat-file --filters`).
 #
 # Needs bash, git, minisign, tar, unzip, zipinfo, and sha256sum or shasum.
 set -euo pipefail
@@ -103,25 +104,32 @@ for P in $PLATFORMS; do
   case "$A" in
     *.zip)
       NAMES=$(zipinfo -1 "$REL/$A")
-      if zipinfo "$REL/$A" | grep -q '^l'; then fail "$A holds a symbolic link"; fi
+      LONG=$(zipinfo "$REL/$A")
+      if grep -q '^l' <<<"$LONG"; then fail "$A holds a symbolic link"; fi
       ;;
     *)
       NAMES=$(tar -tzf "$REL/$A")
-      if tar -tvzf "$REL/$A" | grep -q '^[lh]'; then fail "$A holds a link"; fi
+      LONG=$(tar -tvzf "$REL/$A")
+      if grep -q '^[lh]' <<<"$LONG"; then fail "$A holds a link"; fi
       ;;
   esac
   # A zip made on Windows may separate folders with backslashes: read as
   # slashes, as unzip does.
   # shellcheck disable=SC1003  # tr reads '\\' as one backslash
   NAMES=$(printf '%s\n' "$NAMES" | tr '\\' '/')
-  if printf '%s\n' "$NAMES" | grep -qE '(^/|^[A-Za-z]:|(^|/)\.\.(/|$))'; then
+  # Never `producer | grep -q` under pipefail: grep leaves at the first
+  # match, the producer dies of SIGPIPE, and the check reads as passed.
+  if grep -qE '(^/|^[A-Za-z]:|(^|/)\.\.(/|$))' <<<"$NAMES"; then
     fail "$A holds an absolute path or a .."
   fi
   DUP=$(printf '%s\n' "$NAMES" | sed -e 's#^\./##' -e 's#/$##' | grep -v '^\.\{0,1\}$' \
     | tr '[:upper:]' '[:lower:]' | sort | uniq -d)
   [ -z "$DUP" ] || fail "$A holds entries that differ only by case, or twice: $DUP"
   case "$A" in
-    *.zip) unzip -q "$REL/$A" -d "$D"; PROGRAM="$D/q21.exe" ;;
+    # unzip says 1 for a warning — backslashes read as slashes —, more for
+    # an error.
+    *.zip) unzip -q "$REL/$A" -d "$D" || [ "$?" -eq 1 ] || fail "$A cannot be unpacked"
+           PROGRAM="$D/q21.exe" ;;
     *) tar -xzf "$REL/$A" -C "$D"; PROGRAM="$D/q21" ;;
   esac
   [ -z "$(find "$D" -type l | head -n 1)" ] || fail "$A holds a symbolic link"
@@ -137,7 +145,9 @@ for P in $PLATFORMS; do
   fi
   # Every other file: from the repository, byte for byte; or Tor; or the
   # macOS bundle's own signature. Nothing else.
-  ( cd "$D" && find . -type f ) | sed 's#^\./##' | while IFS= read -r R; do
+  # NUL-separated: a name holding a newline cannot pass for two allowed ones.
+  ( cd "$D" && find . -type f -print0 ) | while IFS= read -r -d '' R; do
+    R=${R#./}
     SOURCE=""
     case "$R" in
       q21|q21.exe|"Q21 Wallet.exe") continue ;;
@@ -146,13 +156,13 @@ for P in $PLATFORMS; do
       "Q21 Wallet.command"|"Troubleshooting/Q21 Wallet - Terminal.command") SOURCE="Q21 Wallet.command" ;;
       "Troubleshooting/Q21 Wallet - console.bat") SOURCE="Q21 Wallet.bat" ;;
       "Q21 Wallet.app/Contents/Info.plist")
-        git -C "$REPO" show "$COMMIT:packaging/macos/Info.plist" | sed "s/@VERSION@/$VERSION/g" > "$WORK/expected"
+        git -C "$REPO" cat-file --filters "$COMMIT:packaging/macos/Info.plist" | sed "s/@VERSION@/$VERSION/g" > "$WORK/expected"
         cmp -s "$WORK/expected" "$D/$R" || fail "$A: $R differs from the repository's"
         continue ;;
       "Q21 Wallet.app/Contents/MacOS/q21-wallet"|"Q21 Wallet.app/Contents/_CodeSignature/CodeResources")
         case "$P" in macos-*) continue ;; esac ;;
       tor/README.txt)
-        git -C "$REPO" show "$COMMIT:tools/TOR-IN-THIS-ARCHIVE.txt" > "$WORK/expected"
+        git -C "$REPO" cat-file --filters "$COMMIT:tools/TOR-IN-THIS-ARCHIVE.txt" > "$WORK/expected"
         head -c "$(wc -c < "$WORK/expected")" "$D/$R" | cmp -s - "$WORK/expected" \
           || fail "$A: tor/README.txt does not start with the repository's text"
         continue ;;
@@ -160,7 +170,8 @@ for P in $PLATFORMS; do
         [ "$P" != linux-arm64 ] && continue ;;
     esac
     [ -n "$SOURCE" ] || fail "$A holds a file that belongs to no part of a release: $R"
-    git -C "$REPO" show "$COMMIT:$SOURCE" > "$WORK/expected" \
+    # As a checkout writes it: `.gitattributes` gives the .bat file CRLF.
+    git -C "$REPO" cat-file --filters "$COMMIT:$SOURCE" > "$WORK/expected" \
       || fail "$A: $SOURCE is not in commit $COMMIT"
     cmp -s "$WORK/expected" "$D/$R" || fail "$A: $R differs from $SOURCE at $COMMIT"
   done
@@ -173,7 +184,7 @@ BINARY_NAMES=$(tr -d '\r' < "$REL/SHA256SUMS" | awk '$2 ~ /^q21-(wallet-)?[a-z]+
 THRESHOLD=0
 if [ -f "$ATT/threshold" ]; then
   T=$(tr -d ' \t\r\n' < "$ATT/threshold")
-  printf '%s' "$T" | grep -qE '^[0-9]+$' || fail "$ATT/threshold must hold a single number, not \"$T\""
+  grep -qE '^[0-9]+$' <<<"$T" || fail "$ATT/threshold must hold a single number, not \"$T\""
   THRESHOLD=$T
 fi
 if [ -n "$(find "$ATT" -type l 2>/dev/null | head -n 1)" ]; then
@@ -207,7 +218,7 @@ for D in "$ATT/$TAG"/*/; do
     case "$LINE" in ''|\#*) continue ;; esac
     H=$(printf '%s\n' "$LINE" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
     NAME=$(printf '%s\n' "$LINE" | awk '{print $2}' | sed 's/^\*//')
-    if ! printf '%s\n' "$BINARY_NAMES" | grep -qxF -- "$NAME"; then
+    if ! grep -qxF -- "$NAME" <<<"$BINARY_NAMES"; then
       warn "attestation of $WHO: line for \"$NAME\", not a binary of this release: ignored"
       continue
     fi
