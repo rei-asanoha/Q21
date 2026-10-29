@@ -279,8 +279,9 @@ that source.
 1. create your `minisign` key (SIGNING.md, section 1);
 2. publish the public key in the README, and its fingerprint through a second
    channel you control;
-3. create the GitHub environment `release` with the two secrets (SIGNING.md,
-   section 2);
+3. replace `q21-release.pub`, and the key printed in the README and JOIN.md,
+   in one commit; keep the secret key on your own machine, never in GitHub,
+   and sign each release offline (SIGNING.md, sections 2 and 3);
 4. file your builder key in `attestations/builder-keys/` and attest your
    first version (`attestations/README.md`, section 3);
 5. **do not reuse the previous maintainer's key**, even if you inherited it.

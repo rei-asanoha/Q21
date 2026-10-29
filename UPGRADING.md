@@ -65,6 +65,63 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.5.0 to 0.5.1
+
+0.5.1 changes no rule of the chain and no message of the protocol: a 0.5.0
+node and a 0.5.1 node agree on every block and talk to each other as before.
+It hardens what a stranger could do to a node, how a new node finds the real
+chain, and how a release reaches you.
+
+## What changes
+
+| | 0.5.0 | 0.5.1 |
+|---|---|---|
+| Ping | Answered at once, always, even before the handshake, past the reply queue's cap: one connection sending pings and reading slowly took a node's memory from a few megabytes to gigabytes | Answered only after the handshake, eight at once then one per second, as an ordinary reply |
+| Inbound slots | Full meant full: whoever held the 24 inbound slots kept them, and newcomers were refused | A full node lets its most recent inbound peer go to make room. The four peers that most recently brought a block or a transaction the node kept, and the eight connected longest, are never chosen. Connections through Tor, which all arrive from `127.0.0.1`, hold at most 12 of the 24 slots |
+| A new node's first hour | Rolling finality (720 blocks) bound a node from its first block: a first peer handing it a cheap chain of its own could lock it there for good | A new node follows the chain with the most work until its tip has been recent for an hour; then finality binds it for good, recorded in `finality.dat`. While it catches up, a block forking that deep is taken only from a peer it dialed itself, a limited number from each. See NETWORK.md, "A new node's first hour" |
+| Penalties | A block refused for the node's own state — its finality, its undo window, its clock, its pruned history — cost the sender half its score: honest peers were banned | Such refusals cost nothing |
+| Serving blocks | Each request bounded, not their rate | Every peer has a budget across requests: 32 MiB at once, then 4 MiB per second. A request beyond it waits, it is not dropped |
+| Public explorer | `getpeers` listed every peer's address | With `--rpc-public`, `getpeers` gives `null` for the address and the channel identities |
+| Counters | — | `getinfo` → `network_stats` gives `inbound_evicted`, `getdata_throttled` and `deep_forks_ignored` |
+| Releases | Signed by a key kept in GitHub | Signed offline; a release is created as a draft and made public only once `tools/verify-release.sh` has checked it: signature, every archive, the program inside each, every other file against the tagged commit, and the independent attestations required (`attestations/threshold`). You can run the same script at home. See SIGNING.md |
+| Service files | No memory or task ceiling | The examples in SERVER.md, NETWORK.md and HARDENING.md set `MemoryHigh=1536M`, `MemoryMax=2G`, `TasksMax=512`, `LimitNOFILE=4096` |
+
+## Who should upgrade, and when
+
+Everyone, in any order: entry points and public explorers first, since they
+are the ones strangers reach. Nothing breaks while some nodes still run
+0.5.0.
+
+## The data folder
+
+0.5.1 writes one small file, `finality.dat`, with one word: `bound` or
+`catching-up`. A data folder that already followed the chain — more than 720
+blocks — is `bound` at the first start of 0.5.1, so an existing node keeps
+its finality exactly as before. A new folder starts `catching-up` and becomes
+`bound` after its first hour at a recent tip. Going back to 0.5.0 ignores the
+file.
+
+## For operators: the service file
+
+On a server started by systemd, add the ceilings to the existing service
+without editing it:
+
+```bash
+sudo mkdir -p /etc/systemd/system/q21.service.d
+sudo tee /etc/systemd/system/q21.service.d/limits.conf > /dev/null <<'EOF'
+[Service]
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=512
+LimitNOFILE=4096
+EOF
+sudo systemctl daemon-reload
+systemctl show q21 -p MemoryMax -p TasksMax
+```
+
+→ `MemoryMax=2147483648` and `TasksMax=512`. They apply at the next restart
+of the service. See SERVER.md, "Memory and thread ceilings".
+
 # Upgrading from 0.4.12 to 0.5.0
 
 0.5.0 gives wallets names, a contact book and a way to know who is on the
