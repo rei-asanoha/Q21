@@ -204,8 +204,8 @@ release pages still do. In *Settings*:
 | Where | What |
 |---|---|
 | your account → *Password and authentication* | two-factor authentication with a **security key or passkey**, not SMS; recovery codes on paper |
-| *Rules → Rulesets → New tag ruleset* | target **all tags**; restrict creation, update and deletion to the maintainers |
-| *Rules → Rulesets → New branch ruleset* | target `main`; block force pushes and deletion; require the CI checks |
+| *Rules → Rulesets → New tag ruleset* | target **all tags**; restrict creations, updates and deletions; add the maintainers' role (*Repository admin*) to the bypass list, so that only they can tag |
+| *Rules → Rulesets → New branch ruleset* | target `main`; block force pushes and deletion. Requiring the CI checks as well is right once changes reach `main` through pull requests; with direct pushes it would refuse every push |
 | *Security → Private vulnerability reporting* | **Enable**: this is the channel `SECURITY.md` points to |
 | *General → Releases → release immutability*, if your repository offers it | **Enable**: a published release's files can then no longer be replaced. Releases are checked before they become public, so nothing is lost; the after-the-fact safety net for a release published by hand may then be unable to send it back to draft |
 
