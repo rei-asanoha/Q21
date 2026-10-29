@@ -421,6 +421,88 @@ fn a_branch_beyond_finality_reach_is_refused() {
     );
 }
 
+/// Blocks of a chain mined from genesis with its own miner key, so that two
+/// such chains share nothing past genesis.
+fn branch(n: u64, miner: u8) -> Vec<Block> {
+    let mut c = Chain::new(NETWORK, genesis_block(NETWORK));
+    let mut out = Vec::new();
+    for i in 1..=n {
+        let t = timestamp(i);
+        let b = c
+            .mine_block(Hash256([miner; 32]), SchemeId::LamportOts, &[], t, ATTEMPTS)
+            .expect("mining");
+        c.connect(&b, t + 1).expect("connect");
+        out.push(b);
+    }
+    out
+}
+
+/// A new node handed a cheap chain of its own leaves it for the real one.
+///
+/// # The defect this pins down
+///
+/// Finality was measured from the node's own tip from its first block. A
+/// first peer feeding a new node 721 blocks of its own put the real chain,
+/// forking near genesis, beyond that node's finality for ever, whatever its
+/// work. Finality now binds a new node only once it has held a recent tip
+/// for `FINALITY_HOLD_SECS`: until then, the most work wins.
+#[test]
+fn a_new_node_leaves_a_cheap_chain_for_the_real_one() {
+    use q21_core::chain::FINALITY_HOLD_SECS;
+    let fake = branch(MAX_REORG_DEPTH + 30, 0x0f);
+    let real = branch(MAX_REORG_DEPTH + 31, 0x2e);
+    let now = timestamp(MAX_REORG_DEPTH + 31) + 1;
+
+    let feed = |hold: Option<u64>, bound: bool| -> Chain {
+        let mut c = Chain::new(NETWORK, genesis_block(NETWORK));
+        c.set_finality_hold(hold);
+        // The block file: older bodies leave memory, not the disk.
+        let bodies: HashMap<Hash256, Block> = fake
+            .iter()
+            .chain(real.iter())
+            .map(|b| (b.header.block_id(), b.clone()))
+            .collect();
+        c.set_body_source(std::sync::Arc::new(ChainBodies(bodies)));
+        for b in &fake {
+            c.submit(b, now).expect("the cheap chain is valid");
+        }
+        assert_eq!(c.tip_id(), fake.last().unwrap().header.block_id());
+        if bound {
+            c.bind_finality();
+        }
+        for b in &real {
+            if c.submit(b, now).is_err() {
+                break;
+            }
+        }
+        c
+    };
+
+    // Catching up: the real chain, with more work, wins.
+    let c = feed(Some(FINALITY_HOLD_SECS), false);
+    assert_eq!(
+        c.tip_id(),
+        real.last().unwrap().header.block_id(),
+        "a node catching up follows the most work"
+    );
+
+    // A node bound to its chain keeps its finality, as before.
+    let mut c = feed(Some(FINALITY_HOLD_SECS), true);
+    assert_eq!(
+        c.tip_id(),
+        fake.last().unwrap().header.block_id(),
+        "a node that has followed its chain keeps its finality"
+    );
+    assert!(matches!(
+        c.submit(&real[0], now),
+        Err(ChainError::BeyondFinality { .. })
+    ));
+
+    // A network without a hold (regtest's default): finality always binds.
+    let c = feed(None, false);
+    assert_eq!(c.tip_id(), fake.last().unwrap().header.block_id());
+}
+
 // ---------------------------------------------------------------------------
 // 6. `disconnect` corrupts nothing when it refuses
 // ---------------------------------------------------------------------------

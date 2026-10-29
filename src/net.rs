@@ -204,6 +204,179 @@ pub fn inbound_group(address: SocketAddr) -> Option<NetGroup> {
     }
 }
 
+/// Is this address the machine itself?
+///
+/// What a Tor onion service delivers: every connection through it arrives
+/// from loopback, whoever is behind it.
+fn is_loopback(address: SocketAddr) -> bool {
+    match address {
+        SocketAddr::V4(a) => a.ip().is_loopback(),
+        SocketAddr::V6(a) => match a.ip().to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => a.ip().is_loopback(),
+        },
+    }
+}
+
+/// Inbound connections from loopback a public node keeps at most: half of
+/// the inbound slots.
+///
+/// # The defect this closes
+///
+/// Loopback is not an address group (see [`inbound_group`]), so
+/// [`INBOUND_PER_GROUP`] never applied to it. On a node with an onion
+/// service, every connection through Tor arrives from loopback: anyone could
+/// open twenty-four circuits and hold every inbound slot. Regtest keeps no
+/// such bound: several nodes on one machine are its normal use.
+pub const INBOUND_LOOPBACK_MAX: usize = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) / 2;
+
+/// Inbound peers kept out of reach of eviction for having delivered, most
+/// recently, something we asked for.
+pub const EVICTION_PROTECT_DELIVERING: usize = 4;
+
+/// Inbound peers kept out of reach of eviction for having been connected
+/// longest, once [`EVICTION_PROTECT_DELIVERING`] are set aside.
+pub const EVICTION_PROTECT_OLDEST: usize = 8;
+
+/// What becomes of an inbound connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundDecision {
+    /// There is room.
+    Admit,
+    /// There is room once this inbound peer is gone.
+    Evict(u64),
+    /// No room, and none to make; the reason goes to the log.
+    Refuse(&'static str),
+}
+
+/// The inbound peer to let go to make room, among those `eligible` selects.
+///
+/// # The defect this closes
+///
+/// A full node refused every newcomer: whoever filled the inbound slots
+/// first, from enough address groups, kept them, and honest newcomers found
+/// the door shut for as long as the occupant liked. Now a full node makes
+/// room, but never at the expense of the peers that matter most:
+///
+/// - the [`EVICTION_PROTECT_DELIVERING`] that were most recently first to
+///   bring a block we took or a transaction we admitted — work or fees an
+///   occupant cannot fake for free;
+/// - then the [`EVICTION_PROTECT_OLDEST`] connected longest.
+///
+/// Among the rest, the most recent connection goes. An occupant that keeps
+/// arriving therefore only ever evicts itself or another newcomer: the
+/// peers already settled — a household's wallets behind one router among
+/// them — keep their seats.
+fn eviction_candidate(peers: &HashMap<u64, Peer>, eligible: impl Fn(&Peer) -> bool) -> Option<u64> {
+    let mut cands: Vec<(u64, &Peer)> = peers
+        .iter()
+        .filter(|(_, p)| !p.outbound && eligible(p))
+        .map(|(id, p)| (*id, p))
+        .collect();
+    // Deterministic order: oldest first, then by id.
+    cands.sort_by(|a, b| a.1.connected_at.cmp(&b.1.connected_at).then(a.0.cmp(&b.0)));
+    let mut protected: Vec<u64> = Vec::new();
+    let mut useful: Vec<(u64, Instant)> = cands
+        .iter()
+        .filter(|(_, p)| p.handshaked)
+        .filter_map(|(id, p)| p.last_useful.map(|t| (*id, t)))
+        .collect();
+    useful.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    protected.extend(
+        useful
+            .iter()
+            .take(EVICTION_PROTECT_DELIVERING)
+            .map(|(id, _)| *id),
+    );
+    let oldest: Vec<u64> = cands
+        .iter()
+        .filter(|(id, p)| p.handshaked && !protected.contains(id))
+        .take(EVICTION_PROTECT_OLDEST)
+        .map(|(id, _)| *id)
+        .collect();
+    protected.extend(oldest);
+    cands
+        .iter()
+        .rev()
+        .find(|(id, _)| !protected.contains(id))
+        .map(|(id, _)| *id)
+}
+
+/// Tells the operator, at most every ten minutes, that blocks are refused
+/// for forking beyond this node's finality: harmless from a stray peer, but
+/// the one sign of a node bound to the wrong chain (see NETWORK.md, "A new
+/// node's first hour").
+fn report_beyond_finality(e: &crate::chain::ChainError) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let crate::chain::ChainError::BeyondFinality { depth, max } = e else {
+        return;
+    };
+    let now = unix_now();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 600
+        || LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    eprintln!(
+        "note: a block forking {depth} blocks below the tip was refused (finality: {max}). \
+         If this node's chain differs from the network's, see NETWORK.md, \
+         \"A new node's first hour\"."
+    );
+}
+
+/// Is `header` a fork below our finality depth, while we catch up?
+fn is_deep_fork(chain: &Chain, header: &crate::block::BlockHeader) -> bool {
+    !chain.finality_binds()
+        && chain.header_of(&header.prev_block).is_some_and(|ph| {
+            ph.height.saturating_add(crate::consensus::MAX_REORG_DEPTH) < chain.height()
+        })
+}
+
+/// Is a deep fork from peer `source` to be left aside? See
+/// [`DEEP_FORK_BUDGET`]. Asked before its proof of work is checked too: a
+/// block that will be left aside costs nothing to look at.
+fn deep_fork_refused(g: &Shared, header: &crate::block::BlockHeader, source: u64) -> bool {
+    is_deep_fork(&g.chain, header)
+        && !g
+            .peers
+            .get(&source)
+            .is_some_and(|p| p.outbound && p.deep_forks < DEEP_FORK_BUDGET)
+}
+
+/// Is a refusal of the chain about our own state rather than the block?
+///
+/// # The defect this closes
+///
+/// Every refusal cost the sender the price of an invalid block, half its
+/// score. But some say nothing against the block: it forks deeper than our
+/// finality, or than our undo window, or its fork point lies beyond what we
+/// search; it is dated past **our** clock; or a body we would need is gone
+/// from **our** history. A new node on a wrong chain thus banned, one after
+/// the other, the honest peers that showed it the real one; a node whose
+/// clock ran slow banned the peers relaying the newest block.
+///
+/// These refusals now cost the peer nothing. The block is still refused, at
+/// the price of its header checks: finality and the clock are checked before
+/// the proof of work. A peer that sends such blocks on purpose spends its own
+/// bandwidth for as much of ours, without amplification; what it can make us
+/// request stays bounded by the in-flight slots.
+fn refusal_is_contextual(e: &crate::chain::ChainError) -> bool {
+    use crate::chain::ChainError;
+    use crate::validate::ValidationError;
+    matches!(
+        e,
+        ChainError::BeyondFinality { .. }
+            | ChainError::InsufficientWorkForDepth { .. }
+            | ChainError::UndoWindowTooShort { .. }
+            | ChainError::ForkPointNotFound { .. }
+            | ChainError::Validation(ValidationError::TimestampInFuture { .. })
+            | ChainError::Validation(ValidationError::IncompleteHistory)
+    )
+}
+
 /// Header requests a peer can send us right away.
 ///
 /// # The defect this closes
@@ -430,6 +603,42 @@ pub const REACH_BUCKET_MAX: u64 = 50;
 /// verification and a request a reply some hundred times its size: each peer
 /// pays for its own, and none can spend the budget of the others.
 pub const PEER_REACH_RATE_PER_SEC: u64 = 1;
+/// Pings one peer may send per second, and in one burst. An honest peer pings
+/// after forty-five seconds of silence ([`PING_AFTER`]); each ping answered
+/// queues a Pong, and a flood of them used to grow the peer's queue without
+/// bound. Pings beyond the budget, or before the handshake, go unanswered.
+pub const PING_RATE_PER_SEC: u64 = 1;
+pub const PING_BUCKET_MAX: u64 = 8;
+
+/// Bytes of blocks and transactions a peer can have us serve right away.
+///
+/// # The defect this closes
+///
+/// Each `getdata` was bounded — 512 items, 4 MiB of replies — but not their
+/// rate: a request of a few dozen bytes, repeated, had us read blocks from
+/// disk and encode them under the global lock as fast as the peer could
+/// send, and the outbox only dropped the replies after that work was done.
+/// The budget now spans requests. A node catching up from us takes 1.7 MiB
+/// full blocks sixteen at a time: the burst covers a batch, the rate two
+/// blocks a second, far above what the chain produces.
+pub const GETDATA_BUCKET_MAX: u64 = 32 * 1024 * 1024;
+
+/// Sustained rate of the `getdata` budget, in bytes per second.
+pub const GETDATA_RATE_PER_SEC: u64 = 4 * 1024 * 1024;
+
+/// Blocks forking below a node's finality depth that it admits from one
+/// peer while still catching up, at most.
+///
+/// While a new node catches up, finality does not bind it yet (see
+/// `chain::FINALITY_HOLD_SECS`): a branch forking deep below its tip is
+/// admitted, so that the real chain can replace a cheap one it was handed.
+/// Such a block is cheap to make — a sibling of an early block, at the floor
+/// difficulty — so it is taken only from a peer **we** dialed, never from one
+/// that dialed us, and only this many from each: one peer that spends its
+/// budget on junk leaves the others theirs. The real chain needs far fewer:
+/// only its blocks whose parent lies below the finality depth count, a few
+/// dozen when a chain of 721 cheap blocks has to be replaced.
+pub const DEEP_FORK_BUDGET: usize = 2 * crate::consensus::BODY_WINDOW;
 pub const PEER_REACH_BUCKET_MAX: u64 = 8;
 /// Least time, by this node's own clock, between two announcements of one
 /// owner that it keeps and relays. A wallet announces itself every six hours
@@ -887,6 +1096,15 @@ impl TokenBucket {
         }
     }
 
+    /// A ping bucket: same rule, one unit per ping answered. See
+    /// [`PING_BUCKET_MAX`].
+    pub fn for_pings(now: Instant) -> TokenBucket {
+        TokenBucket {
+            tokens: PING_BUCKET_MAX,
+            last: now,
+        }
+    }
+
     /// A reach-message bucket: same rule, one unit per announcement or
     /// request. See [`PEER_REACH_BUCKET_MAX`].
     pub fn for_reach_messages(now: Instant) -> TokenBucket {
@@ -920,6 +1138,45 @@ impl TokenBucket {
     pub fn available(&self, cost: u64, now: Instant, max: u64, rate: u64) -> bool {
         let mut copy = *self;
         copy.allow_with(cost, now, max, rate)
+    }
+
+    /// A `getdata` budget, in bytes served.
+    pub fn for_getdata(now: Instant) -> TokenBucket {
+        TokenBucket {
+            tokens: GETDATA_BUCKET_MAX,
+            last: now,
+        }
+    }
+
+    /// Removes `cost` units, for a cost known only once the work is done,
+    /// the work having been granted on a level above zero. What the level
+    /// cannot cover is a debt: the refill starts again only once the rate has
+    /// paid it, so the sustained rate holds whatever the size of each item.
+    pub fn spend(&mut self, cost: u64, now: Instant, max: u64, rate: u64) {
+        let level = self.level(now, max, rate);
+        if level >= cost {
+            self.tokens = level - cost;
+            self.last = now;
+        } else {
+            let debt = cost - level;
+            self.tokens = 0;
+            self.last = now + Duration::from_millis(debt.saturating_mul(1000) / rate.max(1));
+        }
+    }
+
+    /// How long until the bucket holds at least `need` units (capped at
+    /// `max`): zero if it does now.
+    pub fn ready_in(&self, now: Instant, max: u64, rate: u64, need: u64) -> Duration {
+        let need = need.clamp(1, max);
+        let level = self.level(now, max, rate);
+        if level >= need {
+            return Duration::ZERO;
+        }
+        // From when the refill runs again (now, or once a debt is paid), the
+        // time to gain what is missing.
+        let owed = self.last.saturating_duration_since(now);
+        let missing = need - level;
+        owed + Duration::from_millis(missing.saturating_mul(1000) / rate.max(1) + 1)
     }
 
     /// A bucket of received addresses: same rule, in addresses.
@@ -1029,6 +1286,18 @@ struct Peer {
     chan_bucket: TokenBucket,
     /// Per-peer budget for reach messages. See [`PEER_REACH_BUCKET_MAX`].
     reach_bucket: TokenBucket,
+    /// Per-peer budget for the pings it sends. See [`PING_BUCKET_MAX`].
+    ping_bucket: TokenBucket,
+    /// Bytes this peer can have us serve; see [`GETDATA_BUCKET_MAX`].
+    getdata_bucket: TokenBucket,
+    /// Last time this peer was first to bring us something we kept: a block
+    /// that extended or switched our chain, or a transaction admitted to the
+    /// pool. Both cost work or fees to fake; what keeps a peer out of reach of
+    /// eviction (see [`eviction_candidate`]).
+    last_useful: Option<Instant>,
+    /// Blocks forking below our finality depth taken from this peer while we
+    /// catch up; see [`DEEP_FORK_BUDGET`].
+    deep_forks: usize,
     /// Height announced by the peer at the handshake.
     start_height: u64,
     /// Compact block reconstructions waiting for transactions.
@@ -1686,6 +1955,15 @@ pub struct Stats {
     /// was searched or allocated for them; see [`Chain::check_header`].
     pub compacts_header_rejected: AtomicU64,
     pub peers_banned: AtomicU64,
+    /// Inbound peers let go to make room for a newcomer; see
+    /// [`eviction_candidate`].
+    pub inbound_evicted: AtomicU64,
+    /// `getdata` requests cut short by the peer's byte budget; see
+    /// [`GETDATA_BUCKET_MAX`].
+    pub getdata_throttled: AtomicU64,
+    /// Blocks forking below the finality depth left aside while catching up:
+    /// from a peer that dialed us, or past [`DEEP_FORK_BUDGET`].
+    pub deep_forks_ignored: AtomicU64,
     /// Blocks whose parent was unknown at the time they arrived.
     ///
     /// Must stay close to zero: strict header-based synchronization only
@@ -2502,16 +2780,22 @@ impl Node {
     /// devices occupied the four slots of its group saw its fifth device
     /// "waiting" endlessly, and nothing, neither on the server side nor on the
     /// wallet side, said why.
+    #[cfg(test)]
     fn inbound_rejection(&self, address: Option<SocketAddr>) -> Option<&'static str> {
+        match self.inbound_decision(address) {
+            InboundDecision::Refuse(reason) => Some(reason),
+            InboundDecision::Admit | InboundDecision::Evict(_) => None,
+        }
+    }
+
+    /// Room for an inbound connection: admitted, admitted once an inbound
+    /// peer is let go (see [`eviction_candidate`]), or refused.
+    ///
+    /// A group at its [`INBOUND_PER_GROUP`] is refused outright: it makes no
+    /// room for itself. Loopback, on a public network, is held to
+    /// [`INBOUND_LOOPBACK_MAX`] and makes room only among loopback peers.
+    fn inbound_decision(&self, address: Option<SocketAddr>) -> InboundDecision {
         let g = self.shared.lock().unwrap();
-        let total = g.peers.len();
-        if total >= MAX_PEERS {
-            return Some("all slots are taken");
-        }
-        let inbound = g.peers.values().filter(|p| !p.outbound).count();
-        if inbound + RESERVED_OUTBOUND_SLOTS >= MAX_PEERS {
-            return Some("all inbound slots are taken");
-        }
         if let Some(gr) = address.and_then(inbound_group) {
             let same = g
                 .peers
@@ -2520,10 +2804,32 @@ impl Node {
                 .filter(|p| inbound_group(p.addr) == Some(gr))
                 .count();
             if same >= INBOUND_PER_GROUP {
-                return Some("its address group already has all its slots");
+                return InboundDecision::Refuse("its address group already has all its slots");
             }
         }
-        None
+        let inbound = g.peers.values().filter(|p| !p.outbound).count();
+        let full = g.peers.len() >= MAX_PEERS || inbound + RESERVED_OUTBOUND_SLOTS >= MAX_PEERS;
+        let from_loopback = address.is_some_and(is_loopback);
+        if from_loopback && g.network != Network::Regtest {
+            let loopback = g
+                .peers
+                .values()
+                .filter(|p| !p.outbound && is_loopback(p.addr))
+                .count();
+            if loopback >= INBOUND_LOOPBACK_MAX {
+                return match eviction_candidate(&g.peers, |p| is_loopback(p.addr)) {
+                    Some(id) => InboundDecision::Evict(id),
+                    None => InboundDecision::Refuse("all loopback inbound slots are taken"),
+                };
+            }
+        }
+        if !full {
+            return InboundDecision::Admit;
+        }
+        match eviction_candidate(&g.peers, |_| true) {
+            Some(id) => InboundDecision::Evict(id),
+            None => InboundDecision::Refuse("all inbound slots are taken"),
+        }
     }
 
     pub fn peer_count_outbound(&self) -> usize {
@@ -2671,6 +2977,10 @@ impl Node {
         let mut to_rerequest: Vec<Outgoing> = Vec::new();
         let nonce = {
             let mut g = self.shared.lock().unwrap();
+            // Whether the tip is recent, at the node's clock: what binds
+            // rolling finality once the node has caught up. See
+            // `chain::FINALITY_HOLD_SECS`.
+            g.chain.note_live(unix_now());
             let Shared {
                 ref chain,
                 ref mempool,
@@ -2990,9 +3300,16 @@ impl Node {
                 match stream {
                     Ok(s) => {
                         let address = s.peer_addr().ok();
-                        if let Some(reason) = node.inbound_rejection(address) {
-                            report_rejection(address, reason);
-                            continue;
+                        match node.inbound_decision(address) {
+                            InboundDecision::Refuse(reason) => {
+                                report_rejection(address, reason);
+                                continue;
+                            }
+                            InboundDecision::Evict(id) => {
+                                node.stats.inbound_evicted.fetch_add(1, Ordering::Relaxed);
+                                node.disconnect(id);
+                            }
+                            InboundDecision::Admit => {}
                         }
                         node.start_peer(s, false);
                     }
@@ -3079,6 +3396,10 @@ impl Node {
                     channels: false,
                     chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                     reach_bucket: TokenBucket::for_reach_messages(Instant::now()),
+                    ping_bucket: TokenBucket::for_pings(Instant::now()),
+                    getdata_bucket: TokenBucket::for_getdata(Instant::now()),
+                    last_useful: None,
+                    deep_forks: 0,
                     start_height: 0,
                     pending: HashMap::new(),
                     consecutive_orphans: 0,
@@ -3331,6 +3652,10 @@ impl Node {
             if !p.handshaked {
                 return;
             }
+            // A deep fork that would be left aside: no work to check.
+            if deep_fork_refused(&g, header, id) {
+                return;
+            }
             if announcement
                 && !p.requested_bodies.contains_key(&header.block_id())
                 && !p.cmpct_bucket.available(
@@ -3351,6 +3676,34 @@ impl Node {
         }
     }
 
+    /// Waits until peer `id` may be served blocks again: see
+    /// [`GETDATA_BUCKET_MAX`]. Only that peer's read loop waits — what it sends
+    /// meanwhile stays in its socket — and the wait ends with the node or the
+    /// connection.
+    ///
+    /// `need`: what the request will likely cost, so that a batch is served
+    /// whole rather than cut short by an empty budget halfway.
+    fn wait_for_serving_budget(&self, id: u64, need: u64) {
+        loop {
+            let wait = {
+                let g = self.shared.lock().unwrap();
+                match g.peers.get(&id) {
+                    Some(p) => p.getdata_bucket.ready_in(
+                        Instant::now(),
+                        GETDATA_BUCKET_MAX,
+                        GETDATA_RATE_PER_SEC,
+                        need,
+                    ),
+                    None => return,
+                }
+            };
+            if wait.is_zero() || self.is_stopped() {
+                return;
+            }
+            std::thread::sleep(wait.min(Duration::from_millis(500)));
+        }
+    }
+
     /// Handles a message. Returns `false` if the connection must be dropped.
     fn handle(&self, id: u64, msg: Message) -> bool {
         // Read before the lock: whether our `Version` may advertise channels.
@@ -3368,6 +3721,23 @@ impl Node {
         let mut channel_peer_ready: Option<ChannelLink> = None;
         // A reach announcement to check off the lock.
         let mut reach_in: Option<Box<crate::wire::Reach>> = None;
+
+        // A request to serve blocks waits, here in the peer's own read loop
+        // and off the lock, until its budget allows it.
+        // A batch of several blocks waits for half the burst, so that it is
+        // served whole; anything else, for the budget to be above zero.
+        let need = match &msg {
+            Message::GetData(v)
+                if v.iter().filter(|i| !matches!(i.kind, InvKind::Tx)).count() > 1 =>
+            {
+                Some(GETDATA_BUCKET_MAX / 2)
+            }
+            Message::GetData(_) | Message::GetBlockTxn { .. } => Some(1),
+            _ => None,
+        };
+        if let Some(need) = need {
+            self.wait_for_serving_budget(id, need);
+        }
 
         // The work of a block or of an announcement is checked before the lock.
         match &msg {
@@ -3596,10 +3966,24 @@ impl Node {
                     });
                 }
 
-                Message::Ping(n) => outgoing.push(Outgoing {
-                    peer: id,
-                    message: Message::Pong(n),
-                }),
+                // Answered only after the handshake and within the peer's
+                // budget. The Pong is an ordinary reply, no longer forced past
+                // the queue's cap: a peer that does not read it only holds up
+                // its own read loop.
+                Message::Ping(n) => {
+                    let now = Instant::now();
+                    let answer = g.peers.get_mut(&id).is_some_and(|p| {
+                        p.handshaked
+                            && p.ping_bucket
+                                .allow_with(1, now, PING_BUCKET_MAX, PING_RATE_PER_SEC)
+                    });
+                    if answer {
+                        outgoing.push(Outgoing {
+                            peer: id,
+                            message: Message::Pong(n),
+                        });
+                    }
+                }
                 Message::Pong(_) => {}
 
                 Message::GetHeaders { locator, stop } => {
@@ -3845,40 +4229,68 @@ impl Node {
                     // network partition on oneself. That is what happened on the
                     // first real trial: two honest nodes disconnected each other
                     // immediately, height stuck at zero.
+                    //
+                    // And a fourth: the peer's budget across requests, see
+                    // `GETDATA_BUCKET_MAX`. An item is served while the budget
+                    // is above zero, and what it cost us to read is then
+                    // taken from it. The peer's read loop waits for the
+                    // budget before the request is handled at all (see
+                    // `wait_for_serving_budget`): an honest peer is slowed
+                    // down, not left waiting for bodies that never come.
                     let mut seen: HashSet<Hash256> = HashSet::new();
                     let mut budget = if handshaked { REPLY_BYTE_BUDGET } else { 0 };
+                    let now = Instant::now();
                     for i in v.into_iter().take(MAX_SERVED_ITEMS) {
                         if !seen.insert(i.hash) || budget == 0 {
                             continue;
                         }
-                        match i.kind {
-                            InvKind::Block => {
-                                if let Some(b) = g.chain.block_by_id(&i.hash) {
-                                    budget = budget.saturating_sub(b.encode().len());
-                                    outgoing.push(Outgoing {
-                                        peer: id,
-                                        message: Message::Block(Box::new(b)),
-                                    });
-                                }
-                            }
-                            InvKind::CompactBlock => {
-                                if let Some(b) = g.chain.block_by_id(&i.hash) {
-                                    let c = CompactBlock::from_block(&b, unix_now());
-                                    budget = budget.saturating_sub(c.encode().len());
-                                    outgoing.push(Outgoing {
-                                        peer: id,
-                                        message: Message::CmpctBlock(Box::new(c)),
-                                    });
-                                }
-                            }
-                            InvKind::Tx => {
-                                if let Some(t) = g.mempool.get(&i.hash) {
-                                    budget = budget.saturating_sub(t.encode().len());
-                                    outgoing.push(Outgoing {
-                                        peer: id,
-                                        message: Message::Tx(Box::new(t.clone())),
-                                    });
-                                }
+                        let room = g.peers.get(&id).map_or(0, |p| {
+                            p.getdata_bucket
+                                .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
+                        });
+                        if room == 0 {
+                            self.stats.getdata_throttled.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        // (bytes sent, bytes charged): a compact block is
+                        // charged the whole block it was read from.
+                        let served = match i.kind {
+                            InvKind::Block => g.chain.block_by_id(&i.hash).map(|b| {
+                                let size = b.encode().len();
+                                outgoing.push(Outgoing {
+                                    peer: id,
+                                    message: Message::Block(Box::new(b)),
+                                });
+                                (size, size)
+                            }),
+                            InvKind::CompactBlock => g.chain.block_by_id(&i.hash).map(|b| {
+                                let whole = b.encode().len();
+                                let c = CompactBlock::from_block(&b, unix_now());
+                                let size = c.encode().len();
+                                outgoing.push(Outgoing {
+                                    peer: id,
+                                    message: Message::CmpctBlock(Box::new(c)),
+                                });
+                                (size, whole)
+                            }),
+                            InvKind::Tx => g.mempool.get(&i.hash).map(|t| {
+                                let size = t.encode().len();
+                                outgoing.push(Outgoing {
+                                    peer: id,
+                                    message: Message::Tx(Box::new(t.clone())),
+                                });
+                                (size, size)
+                            }),
+                        };
+                        if let Some((size, cost)) = served {
+                            budget = budget.saturating_sub(size);
+                            if let Some(p) = g.peers.get_mut(&id) {
+                                p.getdata_bucket.spend(
+                                    cost as u64,
+                                    now,
+                                    GETDATA_BUCKET_MAX,
+                                    GETDATA_RATE_PER_SEC,
+                                );
                             }
                         }
                     }
@@ -4034,8 +4446,32 @@ impl Node {
                     // came before the handshake: an anonymous peer made the
                     // node do a disk read under the global lock for zero bytes
                     // served. We require it first.
-                    if handshaked {
+                    //
+                    // And the peer's budget across requests, shared with
+                    // `getdata`: the block is read only while it is above
+                    // zero, and its whole size is taken from it.
+                    let now = Instant::now();
+                    let room = g.peers.get(&id).map_or(0, |p| {
+                        p.getdata_bucket
+                            .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
+                    });
+                    if handshaked && room == 0 {
+                        self.stats.getdata_throttled.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if handshaked && room > 0 {
                         if let Some(b) = g.chain.block_by_id(&block) {
+                            // Charged the whole block it read, whatever it
+                            // then sends: an empty or wrong request still
+                            // made us read it.
+                            let whole = b.encode().len() as u64;
+                            if let Some(p) = g.peers.get_mut(&id) {
+                                p.getdata_bucket.spend(
+                                    whole,
+                                    now,
+                                    GETDATA_BUCKET_MAX,
+                                    GETDATA_RATE_PER_SEC,
+                                );
+                            }
                             let mut txs = Vec::new();
                             let mut budget = if handshaked { REPLY_BYTE_BUDGET } else { 0 };
                             let mut valid = true;
@@ -4237,6 +4673,9 @@ impl Node {
                                 // It is in the pool now: forget any earlier
                                 // full-pool refusal of it.
                                 g.full_pool_rejected.remove(&txid);
+                                if let Some(p) = g.peers.get_mut(&id) {
+                                    p.last_useful = Some(Instant::now());
+                                }
                                 // To established peers only, like every
                                 // announcement: see `announce_tx`.
                                 let others: Vec<u64> = g
@@ -4948,6 +5387,15 @@ impl Node {
                 {
                     report_unverifiable_scheme(locally_unverifiable_scheme(&v).expect("guarded"));
                 }
+                // Refused for where we stand, not for what it is: no
+                // penalty, and the slot of a body we asked for is free. See
+                // `refusal_is_contextual`.
+                e if refusal_is_contextual(&e) => {
+                    report_beyond_finality(&e);
+                    if let Some(p) = g.peers.get_mut(&id) {
+                        p.requested_bodies.remove(&bid);
+                    }
+                }
                 _ => {
                     stats.invalid_blocks.fetch_add(1, Ordering::Relaxed);
                     if let Some(p) = g.peers.get_mut(&id) {
@@ -5072,9 +5520,33 @@ impl Node {
             return true;
         }
         let before = g.chain.height();
-        match g.chain.submit(b, unix_now()) {
+        // --- While catching up, a deep fork only from a peer we dialed, and
+        // within its budget: see `DEEP_FORK_BUDGET`.
+        let deep = is_deep_fork(&g.chain, &b.header);
+        if deep && deep_fork_refused(g, &b.header, source) {
+            stats.deep_forks_ignored.fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = g.peers.get_mut(&source) {
+                if p.requested_bodies.remove(&bid).is_some() {
+                    p.bodies_to_request.clear();
+                }
+            }
+            return true;
+        }
+        let result = g.chain.submit(b, unix_now());
+        if deep && matches!(result, Ok(Accept::SideBranch | Accept::Reorganized { .. })) {
+            if let Some(p) = g.peers.get_mut(&source) {
+                p.deep_forks += 1;
+            }
+        }
+        // A live block: the moment to note whether the tip is now recent.
+        // See `chain::FINALITY_HOLD_SECS`.
+        g.chain.note_live(unix_now());
+        match result {
             Ok(accepted @ (Accept::Extended | Accept::Reorganized { .. })) => {
                 stats.blocks_accepted.fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = g.peers.get_mut(&source) {
+                    p.last_useful = Some(Instant::now());
+                }
                 // An accepted block is a stored block. Before, only the blocks
                 // this node mined itself reached the disk.
                 if let Some(j) = &g.journal {
@@ -5169,6 +5641,19 @@ impl Node {
                 // the operator once, and we do not count the block as invalid
                 // — it may well not be.
                 report_unverifiable_scheme(locally_unverifiable_scheme(&v).expect("guarded"));
+                true
+            }
+            // Refused for where we stand, not for what it is: the peer is not
+            // to blame, see `refusal_is_contextual`. If we asked it for that
+            // body, its slot is free, and the rest of that batch, which builds
+            // on a block we did not take, is not asked for.
+            Err(e) if refusal_is_contextual(&e) => {
+                report_beyond_finality(&e);
+                if let Some(p) = g.peers.get_mut(&source) {
+                    if p.requested_bodies.remove(&bid).is_some() {
+                        p.bodies_to_request.clear();
+                    }
+                }
                 true
             }
             Err(_) => {
@@ -5446,7 +5931,6 @@ fn must_deliver(m: &Message) -> bool {
         Message::GetData(_)
             | Message::GetHeaders { .. }
             | Message::Ping(_)
-            | Message::Pong(_)
             | Message::Version { .. }
             | Message::VerAck
     )
@@ -6194,6 +6678,10 @@ mod tests {
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 reach_bucket: TokenBucket::for_reach_messages(Instant::now()),
+                ping_bucket: TokenBucket::for_pings(Instant::now()),
+                getdata_bucket: TokenBucket::for_getdata(Instant::now()),
+                last_useful: None,
+                deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 expected_headers: 0,
@@ -6271,6 +6759,141 @@ mod tests {
         // And loopback stays outside any group, in v6 as in v4.
         assert_eq!(inbound_group("[::1]:1".parse().unwrap()), None);
         a.shutdown();
+    }
+
+    /// What our own state refuses costs the sender nothing; what the block
+    /// itself gets wrong still does.
+    #[test]
+    fn contextual_refusals_are_told_apart() {
+        use crate::chain::ChainError as E;
+        use crate::validate::ValidationError as V;
+        for e in [
+            E::BeyondFinality {
+                depth: 900,
+                max: 720,
+            },
+            E::InsufficientWorkForDepth { depth: 30 },
+            E::UndoWindowTooShort {
+                depth: 30,
+                available: 2,
+            },
+            E::ForkPointNotFound { reach: 720 },
+            E::Validation(V::IncompleteHistory),
+        ] {
+            assert!(refusal_is_contextual(&e), "{e:?}");
+        }
+        let future = E::Validation(V::TimestampInFuture {
+            limit: 1,
+            received: 2,
+        });
+        assert!(refusal_is_contextual(&future));
+        assert!(!refusal_is_contextual(&E::Validation(V::BadParent)));
+        assert!(!refusal_is_contextual(&E::UnknownParent(Hash256::ZERO)));
+    }
+
+    /// Completes a fake peer's handshake, sets when it connected and, if
+    /// given, when it last brought something we kept. Instants are built
+    /// forward from `base`: never before the machine started.
+    fn settle_peer(n: &Node, id: u64, connected: Instant, useful: Option<Instant>) {
+        let mut g = n.shared.lock().unwrap();
+        let p = g.peers.get_mut(&id).expect("peer");
+        p.handshaked = true;
+        p.connected_at = connected;
+        p.last_useful = useful;
+    }
+
+    /// A full node makes room for a newcomer at the expense of the most
+    /// recent connection — never of a peer that brought something we kept,
+    /// nor of the longest connected.
+    #[test]
+    fn a_full_node_makes_room_but_keeps_its_best_peers() {
+        let a = node();
+        let inbound = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) as u64;
+        let base = Instant::now();
+        let at = |k: u64| base + Duration::from_millis(k);
+        for id in 1..=inbound {
+            // Peers 13 to 16 share a group: a household behind one router.
+            let addr: SocketAddr = if (13..=16).contains(&id) {
+                format!("203.0.113.{id}:21021").parse().unwrap()
+            } else {
+                format!("10.{id}.0.1:21021").parse().unwrap()
+            };
+            fake_peer(&a, id, addr, false);
+            // Peer 1 connected first, peer 24 last.
+            settle_peer(&a, id, at(id), None);
+        }
+        let newcomer: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        assert_eq!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Evict(inbound),
+            "the most recent connection goes"
+        );
+        // The most recent one brought a block we took: the next one goes.
+        settle_peer(&a, inbound, at(inbound), Some(at(10_000)));
+        assert_eq!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Evict(inbound - 1)
+        );
+        // The household is never singled out for sharing a group: with the
+        // younger peers useful, the youngest unprotected is still chosen by
+        // age alone.
+        for id in 17..=inbound {
+            settle_peer(&a, id, at(id), Some(at(10_000 + id)));
+        }
+        // Protected: four useful (21 to 24), the eight oldest (1 to 8).
+        assert_eq!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Evict(20)
+        );
+        // A newcomer from a group at its share makes no room for itself.
+        let same: SocketAddr = "203.0.113.200:40000".parse().unwrap();
+        assert!(matches!(
+            a.inbound_decision(Some(same)),
+            InboundDecision::Refuse(_)
+        ));
+        a.shutdown();
+    }
+
+    /// Loopback, where every Tor connection arrives, holds at most half the
+    /// inbound slots on a public network, and makes room only among itself.
+    #[test]
+    fn loopback_inbound_is_held_to_its_share() {
+        let net = Network::Testnet;
+        let a = Node::new(net, Chain::new(net, genesis_block(net)));
+        let lo = |k: u64| -> SocketAddr { format!("127.0.0.1:{}", 40000 + k).parse().unwrap() };
+        let base = Instant::now();
+        let at = |k: u64| base + Duration::from_millis(k);
+        let share = INBOUND_LOOPBACK_MAX as u64;
+        for id in 1..=share {
+            fake_peer(&a, id, lo(id), false);
+            settle_peer(&a, id, at(id), None);
+        }
+        // A clearnet newcomer still has room.
+        let clear: SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        assert_eq!(a.inbound_decision(Some(clear)), InboundDecision::Admit);
+        // A further loopback one replaces the most recent loopback peer.
+        assert_eq!(
+            a.inbound_decision(Some(lo(99))),
+            InboundDecision::Evict(share),
+            "loopback makes room among loopback, youngest first"
+        );
+        // The four youngest useful, the eight oldest protected: no room.
+        for id in (EVICTION_PROTECT_OLDEST as u64 + 1)..=share {
+            settle_peer(&a, id, at(id), Some(at(10_000 + id)));
+        }
+        assert!(matches!(
+            a.inbound_decision(Some(lo(99))),
+            InboundDecision::Refuse(r) if r.contains("loopback")
+        ));
+        a.shutdown();
+
+        // Regtest: several nodes on one machine, no such bound.
+        let r = node();
+        for id in 1..=share + 4 {
+            fake_peer(&r, id, lo(id), false);
+        }
+        assert_eq!(r.inbound_decision(Some(lo(99))), InboundDecision::Admit);
+        r.shutdown();
     }
 
     /// A household that has filled its group's slots learns why.
@@ -6600,6 +7223,10 @@ mod tests_hardening {
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(Instant::now()),
                 reach_bucket: TokenBucket::for_reach_messages(Instant::now()),
+                ping_bucket: TokenBucket::for_pings(Instant::now()),
+                getdata_bucket: TokenBucket::for_getdata(Instant::now()),
+                last_useful: None,
+                deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 expected_headers: 0,
@@ -8263,6 +8890,10 @@ mod tests_handler_fuzz {
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 reach_bucket: TokenBucket::for_reach_messages(now),
+                ping_bucket: TokenBucket::for_pings(now),
+                getdata_bucket: TokenBucket::for_getdata(now),
+                last_useful: None,
+                deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 expected_headers: 0,
@@ -9123,6 +9754,10 @@ mod tests_handler_review {
                 channels: false,
                 chan_bucket: TokenBucket::for_channel_messages(now),
                 reach_bucket: TokenBucket::for_reach_messages(now),
+                ping_bucket: TokenBucket::for_pings(now),
+                getdata_bucket: TokenBucket::for_getdata(now),
+                last_useful: None,
+                deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 expected_headers: 0,
@@ -9367,6 +10002,238 @@ mod tests_handler_review {
             .unwrap()
             .handshaked = false;
         assert_eq!(n.onion_status().inbound, 0, "established peers only");
+    }
+
+    /// Reads every frame the node sent to a peer plugged in with
+    /// `anonymous_peer`, until the socket stays quiet.
+    fn frames_sent(listener: &TcpListener, net: Network) -> Vec<Message> {
+        let (mut other, _) = listener.accept().expect("accept");
+        other
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(k) = other.read(&mut chunk) {
+            if k == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..k]);
+        }
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < buf.len() {
+            match Message::parse(&buf[at..], magic_for(net)) {
+                Ok((m, used)) => {
+                    out.push(m);
+                    at += used;
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// While a node catches up, a block forking below its finality depth is
+    /// taken from a peer it dialed, not from one that dialed it; once bound,
+    /// from nobody — and in no case does it cost the sender anything.
+    #[test]
+    fn deep_forks_while_catching_up_come_from_peers_we_dialed() {
+        use crate::sig::SchemeId;
+        let n = node();
+        n.with_chain(|c| c.set_finality_hold(Some(crate::chain::FINALITY_HOLD_SECS)));
+        let at = |h: u64| crate::chain::GENESIS_TIME + h * crate::consensus::TARGET_BLOCK_SECS;
+        let mut own = Chain::new(NETWORK, genesis_block(NETWORK));
+        for h in 1..=crate::consensus::MAX_REORG_DEPTH + 5 {
+            let b = own
+                .mine_block(
+                    Hash256([2u8; 32]),
+                    SchemeId::LamportOts,
+                    &[],
+                    at(h),
+                    50_000_000,
+                )
+                .expect("mining");
+            own.connect(&b, at(h) + 1).expect("connect");
+            n.with_chain(|c| c.connect(&b, at(h) + 1)).expect("connect");
+        }
+        let other = Chain::new(NETWORK, genesis_block(NETWORK));
+        let sibling = |miner: u8| {
+            other
+                .mine_block(
+                    Hash256([miner; 32]),
+                    SchemeId::LamportOts,
+                    &[],
+                    at(1),
+                    50_000_000,
+                )
+                .expect("mining a sibling of block 1")
+        };
+        let (s1, s2, s3) = (sibling(7), sibling(8), sibling(9));
+        let known = |b: &Block| n.with_chain(|c| c.has_block(&b.header.block_id()));
+        let score = |id: u64| n.shared.lock().unwrap().peers[&id].ban_score;
+        let shake = |id: u64, outbound: bool| {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&id).expect("peer");
+            p.version_received = true;
+            p.version_sent = true;
+            p.handshaked = true;
+            p.outbound = outbound;
+        };
+        let _in = anonymous_peer(&n, 1);
+        shake(1, false);
+        let _out = anonymous_peer(&n, 2);
+        shake(2, true);
+        assert!(!n.with_chain(|c| c.finality_binds()), "catching up");
+
+        assert!(n.handle(1, Message::Block(Box::new(s1.clone()))));
+        assert!(!known(&s1), "not from a peer that dialed us");
+        assert_eq!(n.stats.deep_forks_ignored.load(Ordering::Relaxed), 1);
+        assert!(n.handle(2, Message::Block(Box::new(s2.clone()))));
+        assert!(known(&s2), "from a peer we dialed");
+
+        n.with_chain(|c| c.bind_finality());
+        assert!(n.handle(2, Message::Block(Box::new(s3.clone()))));
+        assert!(!known(&s3), "once bound, from nobody");
+        assert_eq!(
+            (score(1), score(2)),
+            (0, 0),
+            "and never at the sender's cost"
+        );
+    }
+
+    /// A peer's `getdata` budget spans its requests: once spent, its next
+    /// request waits until the budget refills, then is served. Slowed down,
+    /// never left without an answer.
+    #[test]
+    fn getdata_waits_for_the_budget_across_requests() {
+        let net = Network::Testnet;
+        let n = Node::new(net, Chain::new(net, genesis_block(net)));
+        let genesis = n.with_chain(|c| c.tip_id());
+        let ask = Message::GetData(vec![InvItem {
+            kind: InvKind::Block,
+            hash: genesis,
+        }]);
+        let shake = |id: u64| {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&id).expect("peer");
+            p.version_received = true;
+            p.version_sent = true;
+            p.handshaked = true;
+        };
+        let blocks_to = |l: &TcpListener| {
+            frames_sent(l, net)
+                .into_iter()
+                .filter(|m| matches!(m, Message::Block(_)))
+                .count()
+        };
+        let served = anonymous_peer(&n, 7);
+        shake(7);
+        let t0 = Instant::now();
+        assert!(n.handle(7, ask.clone()));
+        assert!(t0.elapsed() < Duration::from_millis(200), "no wait");
+        assert_eq!(blocks_to(&served), 1, "within its budget, a peer is served");
+
+        // A budget spent, and a quarter of a second owed.
+        let spent = anonymous_peer(&n, 8);
+        shake(8);
+        n.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&8)
+            .unwrap()
+            .getdata_bucket
+            .spend(
+                GETDATA_BUCKET_MAX + GETDATA_RATE_PER_SEC / 4,
+                Instant::now(),
+                GETDATA_BUCKET_MAX,
+                GETDATA_RATE_PER_SEC,
+            );
+        let t0 = Instant::now();
+        assert!(n.handle(8, ask), "a spent budget is no misconduct");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(240),
+            "the request waited for the debt: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(blocks_to(&spent), 1, "then it is served");
+    }
+
+    #[test]
+    fn a_bucket_says_when_it_holds_something_again() {
+        let (max, rate) = (GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC);
+        let t0 = Instant::now();
+        let mut b = TokenBucket::for_getdata(t0);
+        assert_eq!(b.ready_in(t0, max, rate, 1), Duration::ZERO);
+        b.spend(max + rate, t0, max, rate);
+        let w = b.ready_in(t0, max, rate, 1);
+        assert!(
+            w > Duration::from_millis(990) && w < Duration::from_millis(1_010),
+            "{w:?}"
+        );
+        let later = t0 + Duration::from_secs(2);
+        assert_eq!(b.ready_in(later, max, rate, 1), Duration::ZERO);
+        // Waiting for half the burst: the debt, then four seconds of refill.
+        let w = b.ready_in(t0, max, rate, max / 2);
+        assert!(
+            w > Duration::from_millis(4_990) && w < Duration::from_millis(5_010),
+            "{w:?}"
+        );
+    }
+
+    /// What the level cannot cover is owed: the budget refills only once the
+    /// debt is paid, at the sustained rate.
+    #[test]
+    fn a_getdata_budget_carries_its_debt() {
+        let (max, rate) = (GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC);
+        let t0 = Instant::now();
+        let mut b = TokenBucket::for_getdata(t0);
+        // The burst, then two seconds' worth more.
+        b.spend(max + 2 * rate, t0, max, rate);
+        assert_eq!(b.level(t0, max, rate), 0);
+        assert_eq!(b.level(t0 + Duration::from_millis(1_999), max, rate), 0);
+        assert_eq!(b.level(t0 + Duration::from_secs(3), max, rate), rate);
+        // Without debt, the level is simply lowered.
+        let mut c = TokenBucket::for_getdata(t0);
+        c.spend(rate, t0, max, rate);
+        assert_eq!(c.level(t0, max, rate), max - rate);
+    }
+
+    /// A ping is answered only after the handshake, and only within the
+    /// peer's budget: a stream of pings no longer queues a stream of pongs
+    /// that bypass the outbox cap.
+    #[test]
+    fn pings_are_answered_within_a_budget_after_the_handshake() {
+        let net = Network::Testnet;
+        let n = Node::new(net, Chain::new(net, genesis_block(net)));
+        let early = anonymous_peer(&n, 6);
+        assert!(n.handle(6, Message::Ping(1)));
+        let pongs = frames_sent(&early, net)
+            .into_iter()
+            .filter(|m| matches!(m, Message::Pong(_)))
+            .count();
+        assert_eq!(pongs, 0, "no pong before the handshake");
+
+        let listener = anonymous_peer(&n, 7);
+        {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&7).expect("peer");
+            p.version_received = true;
+            p.version_sent = true;
+            p.handshaked = true;
+        }
+        for k in 0..200u64 {
+            assert!(n.handle(7, Message::Ping(k)), "a ping is never misbehavior");
+        }
+        let pongs = frames_sent(&listener, net)
+            .into_iter()
+            .filter(|m| matches!(m, Message::Pong(_)))
+            .count();
+        assert!(pongs >= PING_BUCKET_MAX as usize, "the burst is answered");
+        assert!(
+            pongs <= PING_BUCKET_MAX as usize + 2,
+            "the rest is not: {pongs} pongs for 200 pings"
+        );
     }
 
     /// An outbound peer on a private or loopback address is never handed out

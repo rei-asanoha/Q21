@@ -2754,6 +2754,18 @@ impl RpcContext {
                         "peers_banned",
                         Json::u64(s.peers_banned.load(Ordering::Relaxed)),
                     )
+                    .set(
+                        "inbound_evicted",
+                        Json::u64(s.inbound_evicted.load(Ordering::Relaxed)),
+                    )
+                    .set(
+                        "getdata_throttled",
+                        Json::u64(s.getdata_throttled.load(Ordering::Relaxed)),
+                    )
+                    .set(
+                        "deep_forks_ignored",
+                        Json::u64(s.deep_forks_ignored.load(Ordering::Relaxed)),
+                    )
                     .build(),
             )
             .build()
@@ -2910,7 +2922,16 @@ impl RpcContext {
             .build()
     }
 
+    ///
+    /// # What a public explorer withholds
+    ///
+    /// Served to anyone, the list gave every peer's IP address: the home
+    /// address of each wallet linked to a public node, and the map an
+    /// attacker needs to surround one. A public service (`--rpc-public`)
+    /// now returns `null` for the address and for the identities proved by
+    /// channel sessions; the rest — counts, heights, versions — stays.
     fn getpeers(&self) -> Json {
+        let public = self.scans.is_some();
         let peers = self.node.peer_list();
         // The node id a peer's channel session authenticated, unlike the
         // `channel_id` it advertises.
@@ -2943,15 +2964,28 @@ impl RpcContext {
                             // reaches send_channel unchanged.
                             Json::obj()
                                 .set("id", Json::u64(p.id))
-                                .set("address", Json::str(p.address))
+                                .set(
+                                    "address",
+                                    if public {
+                                        Json::Null
+                                    } else {
+                                        Json::str(p.address)
+                                    },
+                                )
                                 .set("outbound", Json::Bool(p.outbound))
                                 .set("handshake_complete", Json::Bool(p.handshake_complete))
                                 .set("supports_channels", Json::Bool(p.supports_channels))
                                 .set("height", Json::u64(p.height))
                                 .set("protocol_version", Json::u64(u64::from(p.version)))
                                 .set("follows_activation", Json::Bool(p.follows_activation))
-                                .set("channel_session", session_of(p.id))
-                                .set("channel_owner", owner_of(p.id))
+                                .set(
+                                    "channel_session",
+                                    if public { Json::Null } else { session_of(p.id) },
+                                )
+                                .set(
+                                    "channel_owner",
+                                    if public { Json::Null } else { owner_of(p.id) },
+                                )
                                 .build()
                         })
                         .collect(),
@@ -6610,6 +6644,30 @@ mod tests {
     fn scan_refused(c: &RpcContext, client: Option<std::net::IpAddr>) -> bool {
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"getamount","params":{"amount":"1.0"}}"#;
         c.handle_from(body, client).contains("too many searches")
+    }
+
+    /// A public explorer lists its peers without their addresses.
+    #[test]
+    fn a_public_explorer_hides_peer_addresses() {
+        let c = public_context();
+        let peer = crate::net::Node::new(
+            c.network,
+            crate::chain::Chain::new(c.network, crate::chain::genesis_block(c.network)),
+        );
+        let addr = peer.listen("127.0.0.1:0").expect("listen");
+        c.node.connect(addr).expect("connect");
+        for _ in 0..100 {
+            if c.node.peer_count() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getpeers","params":{}}"#;
+        let out = c.handle_from(body, ip("198.51.100.9"));
+        assert!(out.contains("\"peers\""), "{out}");
+        assert!(out.contains("\"address\":null"), "{out}");
+        assert!(!out.contains("127.0.0.1"), "{out}");
+        peer.shutdown();
     }
 
     /// A client that empties its budget does not empty the others'.

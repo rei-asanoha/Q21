@@ -895,6 +895,44 @@ fn serial_path(d: &Path) -> PathBuf {
     d.join("wallet.seq")
 }
 
+/// Whether rolling finality binds this node, for good, or the node is still
+/// catching up: see `q21_core::chain::FINALITY_HOLD_SECS`. A word, written
+/// once at the first start and again when the node becomes bound.
+fn finality_path(d: &Path) -> PathBuf {
+    d.join("finality.dat")
+}
+
+/// Whether the record reached the disk.
+fn write_finality(d: &Path, bound: bool) -> bool {
+    let word: &[u8] = if bound { b"bound" } else { b"catching-up" };
+    q21_core::channel::journal::atomic_write(&finality_path(d), word).is_ok()
+}
+
+/// Applies what the directory recorded about finality.
+///
+/// A directory without the record was used by an earlier version: if its
+/// chain is past the finality depth, it has been following a network, and
+/// finality binds at once — as it always did for it, however long it was
+/// stopped. A new directory gets the record at its first start, so a node
+/// stopped while catching up is still catching up when it starts again,
+/// whatever the dates of the chain it was handed. Anything but a clear
+/// "catching-up" — an unreadable record, unknown content — binds: the rule
+/// that held before is the safe side.
+fn apply_finality_record(d: &Path, chain: &q21_core::chain::Chain) {
+    match std::fs::read_to_string(finality_path(d)) {
+        Ok(text) if text.trim() == "catching-up" => {}
+        Ok(_) => chain.bind_finality(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let followed = chain.height() > q21_core::consensus::MAX_REORG_DEPTH;
+            if followed {
+                chain.bind_finality();
+            }
+            write_finality(d, followed);
+        }
+        Err(_) => chain.bind_finality(),
+    }
+}
+
 /// Name of a network as it is written on the command line.
 fn network_name(n: Network) -> &'static str {
     match n {
@@ -2238,6 +2276,7 @@ fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<Di
         eprintln!("[timing] chain ready {:.2} s", t0.elapsed().as_secs_f64());
     }
     chain.set_body_source(archive.clone());
+    apply_finality_record(datadir, &chain);
 
     // --- A restore finds its addresses again, or it restores nothing.
     //
@@ -5798,6 +5837,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut waiting_for_clock = false;
 
     let mut recorded_tip = node.with_chain(|c| c.tip_id());
+    // Recorded once, when the node becomes bound: see `finality_path`.
+    let mut finality_recorded = node.with_chain(|c| c.finality_binds());
     loop {
         if duration > 0 && start.elapsed().as_secs() >= duration {
             break;
@@ -5808,6 +5849,11 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         if tip_now != recorded_tip {
             write_active_tip(datadir, &tip_now);
             recorded_tip = tip_now;
+        }
+        // Tried again at every round until it reaches the disk: a node
+        // bound must not start again as one catching up.
+        if !finality_recorded && node.with_chain(|c| c.finality_binds()) {
+            finality_recorded = write_finality(datadir, true);
         }
         if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
             // Holes first: a body of the active chain that never reached the
@@ -7675,6 +7721,38 @@ fn dial_missing(
 #[cfg(test)]
 mod tests {
     use super::{MiningGate, MINING_WAIT_FOR_PEER, MINING_WAIT_FOR_PROGRESS};
+
+    /// A new directory records that it is catching up, and a restart keeps
+    /// it so; a bound one stays bound.
+    #[test]
+    fn the_finality_record_survives_a_restart() {
+        use q21_core::address::Network;
+        use q21_core::chain::{genesis_block, Chain};
+        let d = std::env::temp_dir().join(format!("q21-finality-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let net = Network::Testnet;
+        let fresh = Chain::new(net, genesis_block(net));
+        super::apply_finality_record(&d, &fresh);
+        assert!(!fresh.finality_binds(), "a new directory catches up first");
+        let text = std::fs::read_to_string(super::finality_path(&d)).unwrap();
+        assert_eq!(text.trim(), "catching-up");
+        // Started again: still catching up.
+        let again = Chain::new(net, genesis_block(net));
+        super::apply_finality_record(&d, &again);
+        assert!(!again.finality_binds());
+        // Unknown content: the safe side, bound.
+        std::fs::write(super::finality_path(&d), b"?").unwrap();
+        let odd = Chain::new(net, genesis_block(net));
+        super::apply_finality_record(&d, &odd);
+        assert!(odd.finality_binds());
+        // Once bound, bound at every start.
+        assert!(super::write_finality(&d, true));
+        let later = Chain::new(net, genesis_block(net));
+        super::apply_finality_record(&d, &later);
+        assert!(later.finality_binds());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// The tip record goes through the synced atomic write: it reads back,
     /// a newer record replaces the older one, and no temporary file is left

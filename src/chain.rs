@@ -41,7 +41,7 @@ use crate::tx::{Transaction, TxIn, TxOut};
 use crate::uint::U256;
 use crate::utxo::{UndoRecord, UtxoSet};
 use crate::validate::{self, BlockContext, ValidationError};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ---------------------------------------------------------------------------
@@ -548,6 +548,16 @@ pub struct Chain {
     /// active chain, however deep it went. See
     /// [`Chain::take_disconnected_txids`].
     disconnected_txids: Vec<Hash256>,
+    /// How long the tip must have been recent before finality binds; `None`:
+    /// it always binds. See [`FINALITY_HOLD_SECS`].
+    finality_hold: Option<u64>,
+    /// Since when, on this process's monotonic clock, the tip has been
+    /// recent without interruption; `None`: it is not. See
+    /// [`Chain::note_live`].
+    recent_since: Cell<Option<std::time::Instant>>,
+    /// Finality binds this node, for good: set once the hold has passed, or
+    /// at startup from what the data directory recorded. Never unset.
+    bound: Cell<bool>,
 }
 
 /// Blocks of an abandoned branch whose transactions are offered back to the
@@ -564,6 +574,55 @@ pub const RETURNED_BLOCKS: usize = 12;
 /// Blocks a startup tip change gives back to the pool at most, as a live
 /// reorganization does: see [`Chain::abandoned_since`].
 pub const MAX_STARTUP_ABANDONED: usize = RETURNED_BLOCKS;
+
+/// Time a new node must have held a recent tip, without interruption, before
+/// rolling finality binds it.
+///
+/// # The defect this closes
+///
+/// Rolling finality ([`MAX_REORG_DEPTH`]) was measured from the node's own
+/// tip, from its very first block. A new node whose first peer fed it a
+/// chain of its own — 721 blocks at the floor difficulty, a few seconds of
+/// work — was then on the wrong side of its own finality: the real chain,
+/// forking near genesis, was refused for ever, however much more work it
+/// carried, and the peers presenting it were penalized.
+///
+/// Finality protects what a node has **followed**, not what it was handed
+/// while catching up. So a new node is bound only once its tip has been
+/// within [`RECENT_TIP_SECS`] of its clock for this long, measured on the
+/// monotonic clock of the process — time enough for its other peers to show
+/// their headers. Until then it follows the most work, as Bitcoin does,
+/// without depth limit or surcharge.
+///
+/// Once bound, it stays bound: the binary records it in the data directory,
+/// and a restart, a quiet network or a clock set back changes nothing. A
+/// data directory that already followed a chain before this rule existed is
+/// bound at its first start (see the binary's `finality.dat`).
+///
+/// Local: which blocks are valid does not change, only which valid chain a
+/// node is willing to switch to, and only before its first hour at a recent
+/// tip. What a node catching up admits that a bound one would refuse — side
+/// branches forking below its finality — is what any first peer can already
+/// feed it as its active chain.
+///
+/// What remains, until checkpoints ship with each release: a chain longer
+/// than the undo window ([`BODY_WINDOW`]) stays out of reach of a
+/// reorganization, and a new node kept from every honest peer for its first
+/// hour binds to whatever it was given.
+pub const FINALITY_HOLD_SECS: u64 = 3_600;
+
+/// Age past which a tip is not recent: the node is catching up. One finality
+/// window, twenty-four hours.
+pub const RECENT_TIP_SECS: u64 = MAX_REORG_DEPTH * TARGET_BLOCK_SECS;
+
+/// The hold a network starts with: none on regtest, whose chains are built
+/// by tests in an instant and whose finality is tested as such.
+fn default_finality_hold(network: Network) -> Option<u64> {
+    match network {
+        Network::Regtest => None,
+        _ => Some(FINALITY_HOLD_SECS),
+    }
+}
 
 impl Chain {
     pub fn new(network: Network, genesis: Block) -> Chain {
@@ -607,6 +666,9 @@ impl Chain {
             miner_threads: default_threads(),
             disconnected: Vec::new(),
             disconnected_txids: Vec::new(),
+            finality_hold: default_finality_hold(network),
+            recent_since: Cell::new(None),
+            bound: Cell::new(false),
         }
     }
 
@@ -1104,6 +1166,9 @@ impl Chain {
                 miner_threads: default_threads(),
                 disconnected: Vec::new(),
                 disconnected_txids: Vec::new(),
+                finality_hold: default_finality_hold(network),
+                recent_since: Cell::new(None),
+                bound: Cell::new(false),
             },
             to_replay,
         })
@@ -1647,6 +1712,60 @@ impl Chain {
         self.index.get(id).map(|b| b.header)
     }
 
+    /// Does rolling finality bind this node? Always on a network without a
+    /// hold; otherwise once bound. See [`FINALITY_HOLD_SECS`].
+    pub fn finality_binds(&self) -> bool {
+        self.finality_hold.is_none() || self.bound.get()
+    }
+
+    /// Binds finality for good: at startup, from what the data directory
+    /// recorded.
+    pub fn bind_finality(&self) {
+        self.bound.set(true);
+    }
+
+    /// Notes, at the node's clock `now` (Unix seconds), whether the tip is
+    /// recent, and binds finality once it has been for [`FINALITY_HOLD_SECS`]
+    /// without interruption. Returns whether finality binds.
+    ///
+    /// Called by the network layer, on live blocks and on its maintenance
+    /// round — never by the replay at startup, which runs at each block's own
+    /// date. The hold is measured on the monotonic clock: setting the system
+    /// clock back or forth neither shortens nor resets it.
+    pub fn note_live(&self, now: u64) -> bool {
+        self.note_live_at(now, std::time::Instant::now())
+    }
+
+    /// [`Self::note_live`], with the monotonic instant given: for tests.
+    pub fn note_live_at(&self, now: u64, at: std::time::Instant) -> bool {
+        if self.finality_binds() {
+            return true;
+        }
+        let hold = self.finality_hold.unwrap_or(0);
+        if now.saturating_sub(self.tip().time) > RECENT_TIP_SECS {
+            self.recent_since.set(None);
+            return false;
+        }
+        let since = match self.recent_since.get() {
+            Some(t) => t,
+            None => {
+                self.recent_since.set(Some(at));
+                at
+            }
+        };
+        if at.saturating_duration_since(since).as_secs() >= hold {
+            self.bound.set(true);
+        }
+        self.bound.get()
+    }
+
+    /// Sets how long the tip must have been recent before finality binds;
+    /// `None`: it always binds. For tests and tools: a network starts with
+    /// its own.
+    pub fn set_finality_hold(&mut self, hold: Option<u64>) {
+        self.finality_hold = hold;
+    }
+
     /// Number of undo records available.
     ///
     /// It is the maximum depth of a reorg this node can still perform. Useful
@@ -1769,10 +1888,12 @@ impl Chain {
     ///
     /// Returns the index of the fork point in `active` and the blocks to
     /// connect, from oldest to most recent.
-    fn path_to_active(&self, tip: Hash256) -> Option<(usize, Vec<Hash256>)> {
+    ///
+    /// Walks back at most `reach` + 1 blocks.
+    fn path_to_active(&self, tip: Hash256, reach: u64) -> Option<(usize, Vec<Hash256>)> {
         let mut branch = Vec::new();
         let mut current = tip;
-        for _ in 0..=MAX_REORG_DEPTH + 1 {
+        for _ in 0..=reach.saturating_add(1) {
             let idx = self.index.get(&current)?;
             // `active[h]` is the active block of height `h`: knowing whether
             // `current` is part of it is an indexed read, not a scan. The
@@ -1882,10 +2003,13 @@ impl Chain {
         //    bought a permanent entry in memory and a record on disk.
         //
         //    This refusal changes no consensus rule: it rejects earlier exactly
-        //    what `try_reorg` already rejected later. A peer that insists sees
-        //    its misbehavior score rise.
+        //    what `try_reorg` already rejected later. It says nothing against
+        //    the sender, which is not penalized for it (see the network
+        //    layer's `refusal_is_contextual`).
+        //
+        //    Only once finality binds: see [`FINALITY_HOLD_SECS`].
         let fork_depth = self.height().saturating_sub(parent_height);
-        if fork_depth > MAX_REORG_DEPTH {
+        if fork_depth > MAX_REORG_DEPTH && self.finality_binds() {
             return Err(ChainError::BeyondFinality {
                 depth: fork_depth,
                 max: MAX_REORG_DEPTH,
@@ -2098,16 +2222,28 @@ impl Chain {
         // value: the old version returned `BeyondFinality { depth: u64::MAX }`
         // here, and an operator reading "depth 18446744073709551615" could do
         // nothing with it.
-        let (fork, branch) = self
-            .path_to_active(new_tip)
-            .ok_or(ChainError::ForkPointNotFound {
-                reach: MAX_REORG_DEPTH,
-            })?;
+        //
+        // While catching up, finality does not bind yet (see
+        // [`FINALITY_HOLD_SECS`]): the fork point is searched further back,
+        // and the most work wins, without depth limit or surcharge.
+        let binds = self.finality_binds();
+        // Bounded even then: every body of the branch is loaded before it is
+        // connected, and the undo window bounds the depth anyway.
+        let reach = if binds {
+            MAX_REORG_DEPTH + 1
+        } else {
+            BODY_WINDOW as u64 + 1
+        };
+        let (fork, branch) =
+            self.path_to_active(new_tip, reach)
+                .ok_or(ChainError::ForkPointNotFound {
+                    reach: MAX_REORG_DEPTH,
+                })?;
 
         let depth = (self.active.len() - 1 - fork) as u64;
 
         // --- Defense: rolling finality.
-        if depth > MAX_REORG_DEPTH {
+        if binds && depth > MAX_REORG_DEPTH {
             return Err(ChainError::BeyondFinality {
                 depth,
                 max: MAX_REORG_DEPTH,
@@ -2115,7 +2251,11 @@ impl Chain {
         }
 
         // --- Defense: depth has a price.
-        let required = self.reorg_threshold(fork, depth);
+        let required = if binds {
+            self.reorg_threshold(fork, depth)
+        } else {
+            self.total_work()
+        };
         if self.index[&new_tip].total_work <= required {
             return Err(ChainError::InsufficientWorkForDepth { depth });
         }
@@ -2521,6 +2661,36 @@ mod tests {
             rc.utxo, rival.utxo,
             "the state matches that of the winning branch"
         );
+    }
+
+    /// Finality binds a new node once its tip has been recent for the hold,
+    /// measured on the monotonic clock, without interruption; then for good.
+    #[test]
+    fn finality_binds_after_a_recent_tip_is_held() {
+        let mut c = new_chain();
+        mine(&mut c, 3);
+        c.set_finality_hold(Some(FINALITY_HOLD_SECS));
+        let tip = c.tip().time;
+        let t0 = std::time::Instant::now();
+        let after = |s: u64| t0 + std::time::Duration::from_secs(s);
+        assert!(!c.finality_binds());
+        // An old tip: catching up, nothing starts.
+        assert!(!c.note_live_at(tip + RECENT_TIP_SECS + 1, t0));
+        // Recent: the hold starts.
+        assert!(!c.note_live_at(tip + 10, after(0)));
+        assert!(!c.note_live_at(tip + 10, after(FINALITY_HOLD_SECS - 1)));
+        // The tip goes stale for a moment: the hold starts again.
+        assert!(!c.note_live_at(tip + RECENT_TIP_SECS + 1, after(FINALITY_HOLD_SECS)));
+        assert!(!c.note_live_at(tip + 10, after(FINALITY_HOLD_SECS + 1)));
+        assert!(!c.note_live_at(tip + 10, after(2 * FINALITY_HOLD_SECS)));
+        // A wall clock set back changes nothing: the hold is monotonic.
+        assert!(c.note_live_at(tip, after(2 * FINALITY_HOLD_SECS + 1)));
+        assert!(c.finality_binds());
+        // Bound for good: a stale tip, a quiet network, change nothing.
+        assert!(c.note_live_at(tip + 10 * RECENT_TIP_SECS, after(0)));
+        assert!(c.finality_binds());
+        // Regtest: no hold, always bound.
+        assert!(new_chain().finality_binds());
     }
 
     /// A branch with no common ancestor is called what it is.
