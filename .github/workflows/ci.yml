@@ -11,6 +11,18 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # Called by the release (release.yml): no version is built before every
+  # check below has passed on the very commit being released.
+  workflow_call:
+    inputs:
+      no-cache:
+        description: "Build without any cache (releases)"
+        type: boolean
+        default: false
+
+# Read access only: nothing here writes to the repository.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,8 +40,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The version comes from `rust-toolchain.toml`: the same as the release.
       # Installed by `rustup` directly, and not by a third-party action
       # tracked on a moving branch: the program that compiles the wallet
@@ -43,9 +54,11 @@ jobs:
           rustup default 1.95.0
           rustc --version
 
+      # Never for a release: a cache is state left by earlier runs, and what
+      # is published must come from the sources alone.
       - name: Cache
-        uses: Swatinem/rust-cache@v2
-
+        if: ${{ !inputs.no-cache }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The `ml-dsa` sources are in `vendor/`, and `.cargo/config.toml`
       # redirects crates.io there. The build therefore depends on no network,
       # and two builds two months apart use exactly the same signature code.
@@ -89,8 +102,8 @@ jobs:
     name: Dependencies (RustSec, licenses, sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories bans licenses sources
           arguments: --all-features
@@ -109,7 +122,7 @@ jobs:
     name: Vendor identical to crates.io
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         shell: bash
         run: |
@@ -209,7 +222,7 @@ jobs:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Toolchain
         shell: bash
         run: |

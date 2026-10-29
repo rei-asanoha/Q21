@@ -16,7 +16,7 @@ Three checks are possible on a published binary, from weakest to strongest.
 | Check | What it proves | What it does not prove |
 |---|---|---|
 | the attached SHA-256 hash | the file arrived intact | nothing about its origin — it is produced and published by the same person as the file |
-| the `minisign` signature of `SHA256SUMS` | **who** built the file | that the file matches the published sources: a stolen key signs a booby-trapped binary just as well as an honest one |
+| the `minisign` signature of `SHA256SUMS` | **who** released the file | that the file matches the published sources: a stolen key signs a booby-trapped binary just as well as an honest one |
 | **several matching attestations** | the file really does come from these sources, and all of those machines would have to be compromised at once to publish a different one | nothing about the quality of the code itself |
 
 The third is the only one that does not require trusting anyone in
@@ -43,6 +43,7 @@ the other.
 ```
 attestations/
 ├── README.md                     ← this file
+├── threshold                     ← attestations a release waits for (section 5)
 ├── builder-keys/
 │   ├── README.md                 ← how to file your key
 │   └── <pseudonym>.pub           ← one minisign public key per builder
@@ -94,8 +95,8 @@ never across platforms.
 Follow REPRODUCING.md, sections 3.1 to 3.3. At the end, you have:
 
 ```
-Binary: target/release/q21
-85092844ddfe376d049f7a997437e58324704e798e50452e30f10d5d2dcfb8d5  target/release/q21
+Binary: target/x86_64-unknown-linux-gnu/release/q21
+85092844ddfe376d049f7a997437e58324704e798e50452e30f10d5d2dcfb8d5  target/x86_64-unknown-linux-gnu/release/q21
 ```
 
 ### Step 2 · Create your key, once
@@ -137,8 +138,9 @@ minisign -S -s <pseudonym>.key -m SHA256SUMS \
 success. A `SHA256SUMS.minisig` file appears next to it.
 
 The `-t` text is a trusted comment, written into the signature and signed
-with it. Put the version and the commit hash in it: this prevents a
-signature from being replayed for another version.
+with it. Put the version and the **full** 40-character commit hash in it:
+this prevents a signature from being replayed for another version, and the
+release pipeline only counts an attestation whose comment names both.
 
 ### Step 5 · Check your own signature before publishing it
 
@@ -211,10 +213,31 @@ with the two files side by side.
 
 ---
 
-## 5 · The rule on keys, declared in advance
+## 5 · How many attestations a release waits for
+
+`threshold`, in this folder, holds one number: how many attestations,
+agreeing with the release's binary hashes, a published release requires.
+When a release is published, the pipeline checks the attestations filed
+under `attestations/<version>/` on `main`; with fewer than `threshold`, the
+release goes back to draft until more arrive. One attestation that
+**disagrees** stops it outright: two honest rebuilds of the same commit
+cannot disagree, so the difference must be explained first.
+
+It is `0` today: nobody else rebuilds yet, and pretending otherwise would
+be decoration. When two or three people rebuild regularly, raising it to `2`
+is a one-line pull request — and from then on no single person, the
+maintainer included, can publish a version alone.
+
+Attestations arrive by pull request, after the tag and before the release is
+published: the tag is public as soon as it is pushed, so anyone can rebuild
+it while the release waits as a draft.
+
+## 6 · The rule on keys, declared in advance
 
 A key filed in `builder-keys/` **authorizes nothing**. It allows neither
-publishing, nor merging, nor deciding. Its only use is to link an
+publishing, nor merging, nor deciding. Counted towards `threshold`, it can
+only **hold back** a release page until enough people agree; it can never
+push a release, and it touches nothing on the network. Its only use is to link an
 attestation to a stable identity, so that one can see that the same person
 attests several versions in a row.
 

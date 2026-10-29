@@ -42,13 +42,34 @@ computer:
 | Linux, regular PC | `q21-linux-x86_64.tar.gz` |
 | Raspberry Pi 5, ARM Linux | `q21-linux-arm64.tar.gz` |
 
-Also download the small `SHA256SUMS` file that comes with them.
+Also download the two small files that come with them: `SHA256SUMS` and
+`SHA256SUMS.minisig`.
 
 ### 2. Check what you downloaded
 
 Software that holds keys should never be installed without checking it first.
-Open a command window in your downloads folder — PowerShell on Windows,
-Terminal on Mac and Linux — and type the line for your computer:
+Two checks, both needed: the first says the list of hashes really comes from
+the project, the second that your file is the one on that list. A hash alone
+proves nothing — whoever could replace the archive could replace the hash
+next to it.
+
+**a. The signature of the list.** Install `minisign` once: `brew install
+minisign` on a Mac, `sudo apt install minisign` on Linux, and on Windows the
+`minisign-…-win64.zip` file from its author's page,
+`github.com/jedisct1/minisign/releases`, unzipped into your downloads folder.
+Then, in a command window opened in that folder — PowerShell on Windows
+(`.\minisign.exe` instead of `minisign`), Terminal on Mac and Linux:
+
+```
+minisign -Vm SHA256SUMS -P RWQmIDC+1su+FM2i/NVEC2Fqba+3nhWzpTk02LM11NYhpnuts6gW/7zr
+```
+
+It must say `Signature and comment signature verified`, then a line
+`Trusted comment: Q21 v<version> …` naming the version you downloaded. The
+key above is the project's; compare it with the one in `README.md` and in
+`SIGNING.md`. Anything else — an error, another version — stop here.
+
+**b. Your file against the list.** Type the line for your computer:
 
 ```
 Windows      Get-FileHash q21-windows-x86_64.zip
@@ -57,12 +78,9 @@ Linux        sha256sum q21-linux-x86_64.tar.gz
 ```
 
 The string of letters and numbers it displays must be **identical** to the one
-listed for that file in `SHA256SUMS`. If it differs, stop here: the file is not
-the one that was published.
-
-`SIGNING.md` explains how to also check that `SHA256SUMS` itself really was
-signed by the project. It is an extra level of confidence, and it is worth
-going through once.
+listed for that file in `SHA256SUMS` (on Windows, in capitals: compare the
+characters, not the case). If it differs, stop here: the file is not the one
+that was published.
 
 ### 3. Unzip — and know where the program will knock
 

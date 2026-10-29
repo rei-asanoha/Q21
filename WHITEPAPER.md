@@ -107,7 +107,11 @@ finalist — was broken over a weekend on a laptop. A few months later, **SIKE**
 fell in an hour on a single core. Both schemes had survived five years of
 public scrutiny by professional cryptographers.
 
-Q21 defines the interface and plugs in an audited implementation.
+Q21 defines the interface and plugs in an existing, widely used
+implementation (RustCrypto's `ml-dsa`) instead of writing its own. That
+implementation passes the reference test vectors but has not yet had a formal
+third-party audit; an external audit is a prerequisite for any mainnet (see
+the README, "Known limitations").
 
 ### On 512-bit keys
 

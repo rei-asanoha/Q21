@@ -236,9 +236,9 @@ curl -sX POST localhost:21080/rpc -d '{"jsonrpc":"2.0","id":1,"method":"listmeth
 
 ## Verifying a release
 
-Every release is signed with `minisign` (see [SIGNING.md](SIGNING.md)). The
-public key — compare it with a copy obtained through a second
-channel before trusting it:
+Every release is signed with `minisign`, **offline**: the signing key never
+comes to GitHub (see [SIGNING.md](SIGNING.md)). The public key — compare it
+with a copy obtained through a second channel before trusting it:
 
 ```
 RWQmIDC+1su+FM2i/NVEC2Fqba+3nhWzpTk02LM11NYhpnuts6gW/7zr
@@ -251,13 +251,14 @@ minisign -Vm SHA256SUMS -p q21-release.pub
 sha256sum --ignore-missing -c SHA256SUMS
 ```
 
-The release pipeline checks its own signature against this file before
-publishing anything, so a key rotated in the secrets without this file
-following would fail the release instead of shipping an unverifiable
-signature. The trusted comment of each signature is covered by the signature:
+A release is created as a draft; when it is published, the pipeline checks
+its signature against this file, the commit its trusted comment names, the
+independent attestations required (`attestations/`), and every archive. A
+release that fails any of them goes back to draft. The trusted comment of
+each signature is covered by the signature:
 
 ```
-Trusted comment: Q21 main <commit hash> -- Rei Asanoha
+Trusted comment: Q21 v<version> <commit hash> -- Rei Asanoha
 ```
 
 That name guarantees one thing only: a consistent origin from one release to
@@ -318,6 +319,7 @@ RED-TEAM-2026*.md    Four red-team campaigns (the fourth: network hardening,
                      handler fuzzing, ML-DSA library review)
 HARDENING.md         Hardening the machine that holds coins
 SIGNING.md           Release signing
+SECURITY.md          Reporting a flaw privately
 REPRODUCING.md       Reproducible builds
 SUCCESSION.md        What happens to Q21 without its maintainer
 CONTRIBUTING.md      Language policy (American English) and checks to run
@@ -327,12 +329,13 @@ CONTRIBUTING.md      Language policy (American English) and checks to run
 
 ## Reporting a flaw
 
-A flaw — in the proof of work, consensus, or the wallet — goes to the
-repository's [Issues](https://github.com/rei-asanoha/Q21/issues), ideally
-before it is made public elsewhere. This is the project's only contact channel;
-there is no email address. There is no bounty, no contract and no imposed
-deadline: only an answer, a fix, and a regression test that will carry your
-finding. Please write issues in English.
+A flaw — in the proof of work, consensus, the network, the wallet or the
+release process — is reported **privately**, through GitHub's private
+vulnerability reporting: see [SECURITY.md](SECURITY.md). Please do not open a
+public issue for it. There is no email address. There is no bounty and no
+contract: only an answer, a fix, and a regression test that will carry your
+finding. Other questions and bugs go to the repository's
+[Issues](https://github.com/rei-asanoha/Q21/issues), in English.
 
 Research code. Not audited externally. License: MIT OR Apache-2.0.
 

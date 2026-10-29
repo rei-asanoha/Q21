@@ -35,7 +35,10 @@
 #   ./tools/build-reproducible.sh
 #   ./tools/build-reproducible.sh x86_64-unknown-linux-gnu
 #
-# The optional second argument is a target; without it, the current machine.
+# The optional argument is a target; without it, the current machine's. The
+# target is always passed explicitly, as the release does (`--target`): with
+# and without it, cargo lays out the build differently, and the release's
+# hashes are those of a build with it.
 #
 # # Checking that it works
 #
@@ -76,13 +79,15 @@ echo "Remapping:    $ROOT -> /q21"
 echo "Toolchain:    $(rustc --version)"
 echo
 
-if [ -n "$TARGET" ]; then
-  RUSTFLAGS="$FLAGS" cargo build --locked --release --target "$TARGET"
-  BINARY="target/$TARGET/release/q21"
-else
-  RUSTFLAGS="$FLAGS" cargo build --locked --release
-  BINARY="target/release/q21"
+if [ -z "$TARGET" ]; then
+  TARGET=$(rustc -vV | sed -n 's/^host: //p')
 fi
+echo "Target:       $TARGET"
+echo
+
+# The same command as the release (.github/workflows/release.yml).
+RUSTFLAGS="$FLAGS" cargo build --locked --release --features mldsa --target "$TARGET"
+BINARY="target/$TARGET/release/q21"
 
 [ -f "$BINARY" ] || BINARY="$BINARY.exe"
 

@@ -1,25 +1,34 @@
 # Signing releases, and checking what you install
 
 A SHA-256 hash proves that a file arrived intact. It does not prove **who**
-built it: produced on the same machine as the archive and published in the
+released it: produced on the same machine as the archive and published in the
 same place, it is replaced along with it by anyone who takes control of the
 repository or of an action in the build pipeline. Before installing a binary
 that holds keys, you need a proof that no one else can forge: a
-**signature** made with a key that never leaves the operator.
+**signature** made with a key that never leaves its holder.
 
 Q21 uses [minisign](https://jedisct1.github.io/minisign/): a single file, no
-infrastructure, a 56-character public key that fits in a README. The release
-**fails** if the key is not configured: an unsigned release is not a release.
+infrastructure, a 56-character public key that fits in a README.
+
+Two proofs, kept apart:
+
+| Proof | Says | Made by |
+|---|---|---|
+| `SHA256SUMS.minisig` | **who** released these files | the maintainer, offline, with the key of `q21-release.pub` |
+| `attestations/<version>/` | these binaries **come from these sources** | anyone who rebuilt them, each with their own key (`attestations/README.md`) |
+
+The first is one person's statement. The second needs no trust in anyone in
+particular, and it is what a release can be made to wait for: see section 5.
 
 ---
 
 ## 1 · Create the key, once, offline
 
-On a trusted machine — the Raspberry Pi will do, or a Mac:
+On a machine you trust — a Mac or a Linux PC will do:
 
 ```bash
-sudo apt install -y minisign        # Debian, Raspberry Pi OS
-# brew install minisign             # macOS
+brew install minisign               # macOS
+# sudo apt install -y minisign      # Debian, Ubuntu, Raspberry Pi OS
 minisign -G -p q21-release.pub -s q21-release.key
 ```
 
@@ -28,57 +37,70 @@ it down on paper. Two files come out:
 
 | File | What it is | Where it goes |
 |---|---|---|
-| `q21-release.pub` | the **public** key | in the README, in the `q21-release.pub` file at the root of the repository, and through a second channel — a message, a page you control |
-| `q21-release.key` | the **secret** key, encrypted by the password | in the repository's secrets, then nowhere else but an offline copy |
+| `q21-release.pub` | the **public** key | at the root of the repository, in the README, in JOIN.md, and through at least one channel that does not depend on GitHub — a page on a domain you control, a signed message elsewhere |
+| `q21-release.key` | the **secret** key, encrypted by the password | on the signing machine, and on one offline copy (a USB key in a drawer). **Never** in GitHub, never in a cloud folder, never in a message |
 
-## 2 · Entrust the key to the release — in a protected environment
+The second channel matters: if the repository were ever taken over, the
+copy of the public key inside it would be replaced too. A copy elsewhere is
+what lets people notice.
 
-A **repository** secret is readable by any run started from the repository,
-on any branch: anyone who can push a branch and click "Run workflow" — a
-collaborator, a leaked token, a taken-over account — gets whatever they want
-signed, or replaces the signing step with one that sends the key elsewhere.
-This is why the key does not live in the repository secrets, but in a GitHub
-**environment** that only the `sign` job uses, and that accepts only `main`
-and `v*` tags.
+## 2 · Where the key lives: not in GitHub
 
-In the GitHub repository: *Settings → Environments → New environment*, name
-**`release`**, then:
+Up to 0.5.0, the key was stored in GitHub (`MINISIGN_KEY`,
+`MINISIGN_PASSWORD`) and signed on a shared build machine. Whoever took over
+the GitHub account, or any third-party action in the pipeline, could then
+have published a booby-trapped wallet with a valid signature. Since 0.5.1 the
+pipeline never signs; it prepares a **draft** release, and the signature is
+made on your own machine.
 
-| Setting | Value |
-|---|---|
-| *Required reviewers* | yourself — every release waits for your click |
-| *Deployment branches and tags* | *Selected branches and tags*: `main`, and the pattern `v*` |
-| *Environment secrets* → *Add secret* | `MINISIGN_KEY`: the full content of `q21-release.key` (two lines) |
-| *Environment secrets* → *Add secret* | `MINISIGN_PASSWORD`: the password chosen at creation |
+If those two secrets still exist — *Settings → Environments → release*, or
+*Settings → Secrets and variables → Actions* — **delete them**. Nothing reads
+them any more, and a secret that exists can leak.
 
-If both secrets already existed **at the repository level**, delete them
-there once copied into the environment: as long as they remain there, the
-protection is only apparent.
+## 3 · Releasing a version, step by step
 
-Then erase `q21-release.key` from the machine, or store it on offline media.
-The public key, on the other hand, is meant to be seen: paste its second line
-into the README.
+1. **Tag** the version on `main` and push the tag. The pipeline refuses a tag
+   that is not on `main`, or that disagrees with the version in `Cargo.toml`;
+   it then runs the whole CI on that commit — tests on three systems,
+   vendored sources, dependency policy, reproducibility — without cache, and
+   only then builds.
+2. The run ends with a **draft** release: the five archives and `SHA256SUMS`.
+   Nobody but the repository's maintainers can see or download a draft. The
+   log of its `SHA256SUMS` job prints the exact signing command.
+3. On the draft's page, **download `SHA256SUMS`**.
+4. **Recommended:** rebuild the binary of your platform yourself
+   (`REPRODUCING.md`) and check that its hash is the line of `SHA256SUMS`
+   that names your platform. You then sign what you have checked, not what a
+   build machine told you.
+5. **Sign**, in the folder holding `SHA256SUMS` and your key:
 
-The GitHub account that holds this environment must have **two-factor
-authentication** enabled: in the last resort, it is what controls the
-signature. An account recovery address is one more signing key.
+   ```bash
+   minisign -S -s q21-release.key -m SHA256SUMS \
+     -t "Q21 v<version> <full commit hash> -- Rei Asanoha"
+   ```
 
-## 3 · What the release produces
+   On Windows, in PowerShell, the same with `.\minisign.exe` and the command
+   on one line. The trusted comment must be exactly this: the tag, the full
+   40-character hash of the tagged commit, and the name. The pipeline refuses
+   any other.
+6. **Check your own signature:**
 
-On every release, the **Signing** job gathers the hashes of all the archives
-into `SHA256SUMS` and signs it: `SHA256SUMS.minisig`. Both are uploaded
-together, in the `SHA256SUMS-signed` artifact.
+   ```bash
+   minisign -Vm SHA256SUMS -p q21-release.pub
+   ```
 
-Then it **cross-checks its own signature** with `q21-release.pub`, the public
-key file versioned in the repository — the one people copy from the README.
-This check closes two silent failures: a key changed in the secrets without
-the repository following, and a subtly wrong secret. In both cases the
-release would go out signed with a key that nobody can verify, and we would
-only find out from a user's complaint. The release now fails instead.
+   → `Signature and comment signature verified`, then your comment.
+7. **Attach** `SHA256SUMS.minisig` to the draft (*Edit* → drop the file), and
+   **publish** it — once the attestations required by section 5 are on
+   `main`.
+8. The **Verify** job runs at once: signature against `q21-release.pub`,
+   trusted comment naming this tag and its commit, attestations, and the hash
+   of every archive. If anything fails, the release goes **back to draft**
+   within a minute, before anyone installs it: fix, attach again, publish
+   again.
 
-If you ever rotate the key, the two therefore go together: the secret in the
-GitHub environment, **and** `q21-release.pub` plus the README in the same
-commit. The release pipeline will refuse any other combination.
+A run started by hand (*Actions → Release → Run workflow*) builds the same
+files, unsigned, on the run's page only: for testing, never for installing.
 
 ## 4 · Check before installing
 
@@ -91,11 +113,11 @@ sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 The first command must say `Signature and comment signature verified`, and
-its trusted comment carries the tag, the commit of the build and the name
-that signs the project:
+its trusted comment carries the tag, the commit and the name that signs the
+project:
 
 ```
-Trusted comment: Q21 main <commit hash> -- Rei Asanoha
+Trusted comment: Q21 v0.5.1 <commit hash> -- Rei Asanoha
 ```
 
 This comment is **covered by the signature**: it can be neither rewritten nor
@@ -103,29 +125,72 @@ spoofed without the secret key. The name confers no authority — Q21 has no
 governance — it only attests a constant origin from one release to the next.
 
 **Read it, and refuse anything that does not look like it.** The second word
-must be `main` or a `v…` tag; the third, the hash of the commit you expected
-(the one shown at the top of the run in the Actions tab). A comment that
-names another branch, or a commit you have not reviewed, is a valid
-signature of something you did not want: **do not install**. And never
-install from a red run, even if the archives are there — a red run is a run
-whose signature failed. The second command must say `OK` for the archive you
+must be the version you meant to download; the third, the commit that version
+was tagged on. The second command must say `OK` for the archive you
 downloaded. **If either one fails, do not install**: this is not your
 release.
 
-On Windows, `minisign` can be downloaded from its author's releases page;
-the check is the same in PowerShell.
+On Windows, `minisign` can be downloaded from its author's releases page
+(`minisign-…-win64.zip`); the check is the same in PowerShell, with
+`.\minisign.exe`.
 
 Once installed, `q21 version` says what the program is. The trusted comment
 carries the version, but it is attached to the hash file, not to the binary:
 six months later, faced with a `q21` found in some folder, this command is
 what answers. It needs neither a data directory nor the network.
 
-## 5 · The actions of the build pipeline
+## 5 · More than one person: independent rebuilds
+
+As long as one person signs, a stolen key or a coerced maintainer can still
+publish something else. Bitcoin Core closed this by having **several
+independent people** rebuild every release and sign what they got
+(`bitcoin-core/guix.sigs`); no release is trusted on one signature.
+
+Q21 has the same mechanism: `attestations/`. Anyone can rebuild a tagged
+version (`REPRODUCING.md`), sign the binary hashes they obtained with their
+own key, and file them by pull request (`attestations/README.md`). Their key
+gives them no right over anything: it only links their attestations together.
+
+The file `attestations/threshold` says how many such attestations, agreeing
+with the release's binary hashes, the **Verify** job requires before a
+release may stand. It is `0` while nobody else rebuilds — the honest state,
+said plainly. Raising it is a one-line pull request: at `2`, no single
+person, the maintainer included, can publish a version alone any more.
+
+An attestation is counted when its signature verifies with
+`attestations/builder-keys/<name>.pub`, its trusted comment names the tag and
+the commit, and every hash it states is the release's. A single hash that
+differs stops the release: two honest rebuilds of the same commit cannot
+disagree.
+
+## 6 · The account that holds the repository
+
+The signature no longer depends on GitHub; the code, the tags and the
+release pages still do. In *Settings*:
+
+| Where | What |
+|---|---|
+| your account → *Password and authentication* | two-factor authentication with a **security key or passkey**, not SMS; recovery codes on paper |
+| *Rules → Rulesets → New tag ruleset* | target `v*`; restrict creation, update and deletion to the maintainers |
+| *Rules → Rulesets → New branch ruleset* | target `main`; block force pushes and deletion; require the CI checks |
+| *Security → Private vulnerability reporting* | **Enable**: this is the channel `SECURITY.md` points to |
+
+## 7 · If the key is lost or exposed
+
+See `SECURITY.md`, the section on a compromised signing key. In short: say so
+publicly at once, create a new key offline, publish its public half in the
+repository **and** through the second channel of section 1, and change
+`q21-release.pub`, the README and JOIN.md in the same commit (a test refuses
+a key printed in one place and not the others).
+
+## 8 · The actions of the build pipeline
 
 The workflows call third-party actions (`actions/checkout`,
-`Swatinem/rust-cache`…). Followed by a tag (`@v4`), they can be rewritten;
-pinned to a commit hash, they cannot. The script `tools/pin-actions.sh`, run
-from a machine that has access to `api.github.com`, rewrites every `uses:`
-with the hash of its tag. Review the diff, publish. The Rust toolchain, for
-its part, is installed by `rustup` at the version in `rust-toolchain.toml`,
-without any third-party action.
+`Swatinem/rust-cache`…). Followed by a tag (`@v4`), they can be rewritten by
+whoever controls that tag; pinned to a commit hash, they cannot. Every
+`uses:` is pinned, with its version in a comment, and a test refuses one that
+is not. To follow a newer version, change the version in the comment and run
+`tools/pin-actions.sh` from a machine that reaches `api.github.com`; review
+the diff before publishing. The Rust toolchain, for its part, is installed by
+`rustup` at the version in `rust-toolchain.toml`, without any third-party
+action.

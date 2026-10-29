@@ -2,11 +2,11 @@
 
 ## The method
 
-Two independent auditors received a single instruction: **break Q21**. Not
-proofread, not comment on style — find what makes it possible to create money,
-spend twice, make two honest nodes diverge, or freeze a node remotely. And
-demonstrate each finding with an executable test, because a flaw you cannot
-reproduce is a hypothesis.
+Two separate review passes, run by the project itself, received a single
+instruction: **break Q21**. Not proofread, not comment on style — find what
+makes it possible to create money, spend twice, make two honest nodes
+diverge, or freeze a node remotely. And demonstrate each finding with an
+executable test, because a flaw you cannot reproduce is a hypothesis.
 
 They found **eleven real flaws**, two of them critical. All are fixed, and each
 exploit became a non-regression test: the test that proved the attack now

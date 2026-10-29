@@ -437,22 +437,22 @@ fn the_monitoring_does_not_restart_a_node_that_refuses_it() {
 }
 
 /// A release page lists what a user downloads and what proves it, nothing
-/// else: the archives, `SHA256SUMS` and its signature. The per-file `.sha256`
-/// that the build jobs produce are already inside `SHA256SUMS`, which is the
-/// signed one; publishing them separately invited checking an unsigned file.
+/// else: the archives and `SHA256SUMS`, to which the offline signature is
+/// added by hand. The per-file `.sha256` that the build jobs produce are
+/// already inside `SHA256SUMS`, which is the signed one; publishing them
+/// separately invited checking an unsigned file.
 #[test]
-fn the_release_publishes_archives_and_signed_sums_only() {
+fn the_release_drafts_archives_and_sums_only() {
     let workflow = read(".github/workflows/release.yml");
     let publish = &workflow[workflow
-        .find("- name: Publish the release")
-        .expect("publish step")..];
-    let files =
-        &publish[publish.find("files:").expect("files list")..publish.find("body:").expect("body")];
+        .find("- name: Create the draft release")
+        .expect("draft release step")..];
+    let files = &publish
+        [publish.find("files: |").expect("files list")..publish.find("body:").expect("body")];
     for wanted in [
         "artifacts/q21-*.tar.gz",
         "artifacts/q21-*.zip",
         "artifacts/SHA256SUMS",
-        "artifacts/SHA256SUMS.minisig",
     ] {
         assert!(
             files.contains(wanted),
@@ -462,6 +462,136 @@ fn the_release_publishes_archives_and_signed_sums_only() {
     assert!(
         !files.contains("artifacts/*\n") && !files.contains(".sha256"),
         "the release publishes the unsigned per-file hashes again"
+    );
+    assert!(
+        publish.contains("draft: true"),
+        "the release is no longer created as a draft: it would be public \
+         before its offline signature exists"
+    );
+}
+
+/// The signing key never comes to GitHub: no workflow reads a signing secret
+/// or signs, and a published release is checked — signature, trusted comment,
+/// attestations, archives — and sent back to draft if anything fails.
+#[test]
+fn the_release_is_signed_offline_and_checked_when_published() {
+    for w in [".github/workflows/release.yml", ".github/workflows/ci.yml"] {
+        let text = read(w);
+        assert!(
+            !text.contains("secrets.MINISIGN")
+                && !text
+                    .lines()
+                    .any(|l| l.contains("minisign -S") && !l.trim_start().starts_with("echo")),
+            "{w} signs, or reads a signing key: the key must stay offline (SIGNING.md)"
+        );
+    }
+    let workflow = read(".github/workflows/release.yml");
+    let verify = &workflow[workflow.find("  verify:").expect("verify job")..];
+    for wanted in [
+        "SHA256SUMS.minisig",
+        "q21-release.pub",
+        "attestations/threshold",
+        "--draft=true",
+    ] {
+        assert!(
+            verify.contains(wanted),
+            "the verification of a published release no longer handles {wanted}"
+        );
+    }
+}
+
+/// Nothing is released before the whole CI has passed on the released commit,
+/// from `main`, without cache; and every third-party action is pinned to a
+/// commit hash, which nobody can move.
+#[test]
+fn the_release_is_gated_and_its_actions_pinned() {
+    let workflow = read(".github/workflows/release.yml");
+    assert!(
+        workflow.contains("uses: ./.github/workflows/ci.yml"),
+        "the release no longer runs the CI on the commit it publishes"
+    );
+    assert!(
+        workflow.contains("git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main"),
+        "a tag outside main could be released"
+    );
+    let build = &workflow[workflow.find("  build:").expect("build job")
+        ..workflow.find("  sums:").expect("sums job")];
+    assert!(
+        !build.contains("rust-cache"),
+        "the release builds from a cache again"
+    );
+    for w in [".github/workflows/release.yml", ".github/workflows/ci.yml"] {
+        for line in read(w).lines() {
+            let Some(rest) = line
+                .trim_start()
+                .trim_start_matches("- ")
+                .strip_prefix("uses:")
+            else {
+                continue;
+            };
+            let target = rest.trim();
+            if target.starts_with("./") {
+                continue;
+            }
+            let reference = target
+                .split('@')
+                .nth(1)
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            assert!(
+                reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit()),
+                "{w}: `{}` is not pinned to a commit hash (tools/pin-actions.sh)",
+                line.trim()
+            );
+        }
+    }
+}
+
+/// The public key printed in the documents is the one in `q21-release.pub`:
+/// a copy left behind after a key change would send people to check against
+/// a key that signs nothing any more.
+#[test]
+fn every_printed_release_key_is_the_current_one() {
+    let file = read("q21-release.pub");
+    let key = file
+        .lines()
+        .nth(1)
+        .expect("second line: the key")
+        .trim()
+        .to_string();
+    assert_eq!(
+        key.len(),
+        56,
+        "q21-release.pub does not hold a minisign key"
+    );
+    for doc in ["README.md", "JOIN.md"] {
+        let text = read(doc);
+        assert!(
+            text.contains(&key),
+            "{doc} does not print the current release key"
+        );
+        for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '/') {
+            if word.len() == 56 && word.starts_with("RW") {
+                assert_eq!(word, key, "{doc} prints an old release key");
+            }
+        }
+    }
+}
+
+/// A flaw is reported privately, and the way to do it is written down.
+#[test]
+fn security_reports_have_a_private_channel() {
+    let policy = read("SECURITY.md");
+    assert!(
+        policy.contains("security/advisories/new"),
+        "SECURITY.md no longer says where to report privately"
+    );
+    let readme = read("README.md");
+    assert!(
+        readme.contains("SECURITY.md"),
+        "the README no longer points to SECURITY.md"
     );
 }
 

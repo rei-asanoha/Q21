@@ -24,7 +24,12 @@ Set-Location $Root
 # The destination name, `/q21`, must be the same on every platform: it is
 # what ends up in the binary. Windows gives backslash paths (`C:\Users\...`);
 # rustc receives them as they are, so that is the form to remap.
-$Flags = "--remap-path-prefix=$Root=/q21"
+# Both forms of the directory, as the release passes them: rustc may see
+# backslashes or forward slashes, and a form that matches nothing costs nothing.
+$RootSlash = $Root -replace '\\', '/'
+$Flags = "--remap-path-prefix=$Root=/q21 --remap-path-prefix=$RootSlash=/q21"
+# The target is always explicit, as in the release (`--target`).
+$Target = ((rustc -vV) | Select-String '^host: ').ToString().Substring(6).Trim()
 
 if ($env:RUSTFLAGS) {
   Write-Error @"
@@ -40,17 +45,18 @@ it does not combine them. Clear it:
 Write-Host "Project root: $Root"
 Write-Host "Remapping:    $Root -> /q21"
 Write-Host "Toolchain:    $(rustc --version)"
+Write-Host "Target:       $Target"
 Write-Host ""
 
 $env:RUSTFLAGS = $Flags
 try {
-  cargo build --locked --release
+  cargo build --locked --release --features mldsa --target $Target
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
   Remove-Item Env:\RUSTFLAGS
 }
 
-$Binary = Join-Path $Root 'target\release\q21.exe'
+$Binary = Join-Path $Root "target\$Target\release\q21.exe"
 Write-Host ""
 Write-Host "Binary: $Binary"
 (Get-FileHash -Algorithm SHA256 $Binary).Hash.ToLower() + "  q21.exe"

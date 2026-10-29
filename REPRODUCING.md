@@ -148,6 +148,7 @@ script is going to do:
 Project root: /home/you/q21
 Remapping:    /home/you/q21 -> /q21
 Toolchain:    rustc 1.95.0 (59807616e 2026-04-14)
+Target:       x86_64-unknown-linux-gnu
 
    Compiling zeroize v1.9.0
    Compiling hybrid-array v0.4.44
@@ -156,11 +157,16 @@ Toolchain:    rustc 1.95.0 (59807616e 2026-04-14)
    Compiling q21-core v0.5.0 (/home/you/q21)
     Finished `release` profile [optimized] target(s) in 37.49s
 
-Binary: target/release/q21
-85092844ddfe376d049f7a997437e58324704e798e50452e30f10d5d2dcfb8d5  target/release/q21
+Binary: target/x86_64-unknown-linux-gnu/release/q21
+85092844ddfe376d049f7a997437e58324704e798e50452e30f10d5d2dcfb8d5  target/x86_64-unknown-linux-gnu/release/q21
 ```
 
 The last line is the result. This is the hash to compare.
+
+The script passes the target explicitly (`--target`), with the same features
+as the release: the command is the release's, character for character. The
+binary therefore lands in `target/<target>/release/`, not in
+`target/release/`.
 
 The 64 characters shown here are those of a specific version; **they change
 with every commit**, since the binary changes. Never compare them with this
@@ -184,10 +190,12 @@ other: in the release's `SHA256SUMS` file, signed by `SHA256SUMS.minisig`,
 and in the attestations repository (`attestations/`, section 5 below).
 
 ```bash
-sha256sum target/release/q21
+sha256sum target/*/release/q21
 ```
 
-**What you should see**: the same 64-character string as the published one.
+**What you should see**: the same 64-character string as the published one,
+on the line of `SHA256SUMS` that names your platform (`q21-linux-x86_64`,
+`q21-macos-arm64`…).
 Character for character — a hash that differs by a single sign designates an
 entirely different file.
 
@@ -199,7 +207,7 @@ entirely different file.
    must remain in the binary:
 
 ```bash
-strings -a target/release/q21 | grep "$(pwd -P)" | head
+strings -a target/*/release/q21 | grep "$(pwd -P)" | head
 ```
 
 **What you should see**: nothing at all. The command returns no line.
@@ -207,7 +215,7 @@ strings -a target/release/q21 | grep "$(pwd -P)" | head
 And what replaces them:
 
 ```bash
-strings -a target/release/q21 | grep '^/q21' | sort -u
+strings -a target/*/release/q21 | grep '^/q21' | sort -u
 ```
 
 **What you should see**: eight or nine lines starting with `/q21/vendor/`,
@@ -327,8 +335,13 @@ make here.
 git clone https://github.com/<account>/q21.git && cd q21
 git checkout <published tag or hash>
 ./tools/build-reproducible.sh
-sha256sum target/release/q21        # compare with the published hash
+sha256sum target/*/release/q21      # compare with the published hash
 ```
 
 If the 64-character string matches, you have the proof — and not just the
 assurance — that the published binary comes from these sources.
+
+And if you rebuild every release this way, you can become one of its
+signers: your signature then says "I rebuilt it, and it is these bytes",
+and a release can require several such signatures from independent people.
+See SIGNING.md, "More than one signer".

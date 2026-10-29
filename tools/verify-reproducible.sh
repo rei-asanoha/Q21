@@ -74,8 +74,10 @@ checksum() {
   fi
 }
 
-SA=$(checksum "$A/target/release/q21")
-SB=$(checksum "$B/target/release/q21")
+# The script builds for the current machine's target, passed explicitly.
+HOST=$(rustc -vV | sed -n 's/^host: //p')
+SA=$(checksum "$A/target/$HOST/release/q21")
+SB=$(checksum "$B/target/$HOST/release/q21")
 
 echo "=== Result ==="
 echo "A: $SA"
@@ -92,6 +94,6 @@ else
   echo "DIFFERENT: the build is NOT reproducible."
   echo
   echo "To see where the difference comes from, look for the remaining absolute paths:"
-  echo "  strings -n 12 \"$A/target/release/q21\" | grep '$A'"
+  echo "  strings -n 12 \"$A/target/$HOST/release/q21\" | grep '$A'"
   exit 1
 fi
