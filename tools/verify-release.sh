@@ -110,8 +110,12 @@ for P in $PLATFORMS; do
       if tar -tvzf "$REL/$A" | grep -q '^[lh]'; then fail "$A holds a link"; fi
       ;;
   esac
-  if printf '%s\n' "$NAMES" | grep -qE '(^/|(^|/)\.\.(/|$)|\\)'; then
-    fail "$A holds an absolute path, a .. or a backslash"
+  # A zip made on Windows may separate folders with backslashes: read as
+  # slashes, as unzip does.
+  # shellcheck disable=SC1003  # tr reads '\\' as one backslash
+  NAMES=$(printf '%s\n' "$NAMES" | tr '\\' '/')
+  if printf '%s\n' "$NAMES" | grep -qE '(^/|^[A-Za-z]:|(^|/)\.\.(/|$))'; then
+    fail "$A holds an absolute path or a .."
   fi
   DUP=$(printf '%s\n' "$NAMES" | sed -e 's#^\./##' -e 's#/$##' | grep -v '^\.\{0,1\}$' \
     | tr '[:upper:]' '[:lower:]' | sort | uniq -d)
