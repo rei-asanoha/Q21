@@ -162,6 +162,13 @@ ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
 
+# Ceilings: a node that runs away is restarted, the machine stays up.
+# Testnet needs well under 1 GiB; see SERVER.md, "Memory and thread ceilings".
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=512
+LimitNOFILE=4096
+
 [Install]
 WantedBy=multi-user.target
 ```
@@ -209,6 +216,26 @@ ssh -L 21080:127.0.0.1:21080 q21@your-server
 - **It keeps no key.** There is nothing to steal on this machine.
 - **It decides nothing.** It provides a first contact; what you believe comes
   from the proof of work and from the genesis you wrote yourself.
+
+## A new node's first hour
+
+A node refuses to switch to a chain that forks more than 720 blocks below
+its tip — its rolling finality. A new node is not held to it yet: until its
+tip has been recent for an hour, it follows the chain with the most work,
+whatever the depth, so that a first peer handing it a chain of its own cannot
+lock it there. Blocks forking that deep are then taken only from peers the
+node dialed itself, a limited number from each.
+
+Once that hour has passed, the node writes `bound` in `finality.dat`, in its
+data directory, and stays bound from then on. A directory used by an earlier
+version is bound at its first start if its chain is longer than 720 blocks.
+
+If a new node was nonetheless kept away from every honest peer for its
+whole first hour, it ends up bound to whatever chain it was handed: its
+height and tip differ from the explorer's, and the logs show blocks of the
+real chain refused as beyond finality. Stop the node, write `catching-up` in
+place of `bound` in `finality.dat`, connect it to a peer you trust
+(`--bootstrap`), and start it again.
 
 ## The testnet entry points, today
 

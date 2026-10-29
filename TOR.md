@@ -161,6 +161,14 @@ keeps the matching key in `/var/lib/tor/q21/`: as long as that folder is
 kept, the address stays the same. Back it up with the node if you want to
 keep the address after a reinstall.
 
+Every connection through the onion address reaches the node from
+`127.0.0.1`, whoever opened it. The node therefore keeps at most half of its
+inbound slots — twelve — for loopback, so that circuits opened by one
+person can never take the slots of peers reaching it by IP; when the twelve
+are taken, a newcomer replaces the most recent loopback peer, unless every
+one of them has recently brought a block or a transaction the node kept, or
+has been connected longest.
+
 ### 4.2 · Start the node behind it
 
 ```bash

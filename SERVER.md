@@ -462,11 +462,44 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 
+# Ceilings: a node that runs away is restarted, the machine stays up.
+# Testnet needs well under 1 GiB; see "Memory and thread ceilings" below.
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=512
+LimitNOFILE=4096
+
 [Install]
 WantedBy=multi-user.target
 ```
 
 **Ctrl + O**, Return, **Ctrl + X**.
+
+#### Memory and thread ceilings
+
+`MemoryHigh`, `MemoryMax` and `TasksMax` are a last line of defense, not the
+first: the node bounds its own queues, per peer and in total. But a defect
+found in 0.5.0 — a stream of pings that filled reply queues without limit —
+took a node from 6 MB to 3 GB in about a minute, and the whole machine with
+it. Under a ceiling, the kernel stops the node instead, and `Restart=always`
+brings it back ten seconds later; SSH, the mail ports and the rest of the
+machine are never touched.
+
+What a testnet node uses: the proof-of-work table (32 MiB, growing to
+128 MiB), the transaction pool (64 MiB at most), recent block bodies, and
+4 MiB of reply queue per peer. A few hundred megabytes in practice; 2 GiB
+leaves a wide margin. `MemoryHigh` slows the node down before `MemoryMax`
+stops it. On a machine with less than 2 GiB of RAM, lower both, keeping
+`MemoryMax` above 1 GiB. A mainnet **miner** needs the full table — 2 GiB,
+growing to 4 GiB — and must raise both by that much.
+
+Check that the ceilings are applied:
+
+```bash
+systemctl show q21 -p MemoryMax -p TasksMax
+```
+
+→ `MemoryMax=2147483648` and `TasksMax=512`.
 
 Create the data directory and start:
 

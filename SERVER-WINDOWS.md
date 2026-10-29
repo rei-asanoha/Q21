@@ -585,6 +585,13 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 
+# Ceilings: a node that runs away is restarted, the machine stays up.
+# Testnet needs well under 1 GiB; see SERVER.md, "Memory and thread ceilings".
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=512
+LimitNOFILE=4096
+
 [Install]
 WantedBy=multi-user.target
 ```
