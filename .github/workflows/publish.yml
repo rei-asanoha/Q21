@@ -30,7 +30,6 @@ concurrency:
 jobs:
   publish:
     name: Check, then publish
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Drafts are only visible with write access; this job also makes the
     # release public. It runs nothing but the checks below.
@@ -41,6 +40,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      # Started from another branch, it would check with that branch's
+      # script and key: refused, in red.
+      - name: Only from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::run this workflow from main (Use workflow from: main)"
+          exit 1
 
       - name: Check the draft
         shell: bash
@@ -56,7 +63,7 @@ jobs:
             sleep 10
           done
           command -v minisign >/dev/null
-          git fetch --tags --force origin
+          # `fetch-depth: 0` brought every branch and tag.
           COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
           git merge-base --is-ancestor "$COMMIT" HEAD \
             || { echo "::error::$TAG ($COMMIT) is not on main"; exit 1; }
@@ -76,6 +83,9 @@ jobs:
             gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$ID" > "rel/$NAME"
           done
           ls -la rel
+          # What was checked: kept, to make sure it is still what gets
+          # published.
+          jq -c '[.assets[] | {id, name, size, updated_at}] | sort_by(.name)' release.json > "$RUNNER_TEMP/checked.json"
           ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub attestations
           echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
           echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
@@ -87,6 +97,21 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -eu
+          assets() {
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              --jq '[.assets[] | {id, name, size, updated_at}] | sort_by(.name)'
+          }
+          # Unchanged since it was checked?
+          if [ "$(assets | jq -c .)" != "$(jq -c . "$RUNNER_TEMP/checked.json")" ]; then
+            echo "::error::the draft's files changed while it was being checked: run this workflow again"
+            exit 1
+          fi
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             -F draft=false -f make_latest=true > /dev/null
+          # And still unchanged once public; otherwise, back to draft.
+          if [ "$(assets | jq -c .)" != "$(jq -c . "$RUNNER_TEMP/checked.json")" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=true > /dev/null
+            echo "::error::the release's files changed as it was published: it is back to draft"
+            exit 1
+          fi
           echo "$TAG ($COMMIT) is public: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"

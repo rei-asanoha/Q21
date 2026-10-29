@@ -661,11 +661,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          if DRAFT=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
-            if [ "$DRAFT" != "true" ]; then
-              echo "::error::$GITHUB_REF_NAME is already published: nothing is rebuilt over it. Tag a new version."
-              exit 1
-            fi
+          # Every release, drafts included, with this tag. An error of the
+          # API stops here: it must not read as "no release yet".
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .draft" > existing.txt
+          if grep -qx false existing.txt; then
+            echo "::error::$GITHUB_REF_NAME is already published: nothing is rebuilt over it. Tag a new version."
+            exit 1
           fi
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -826,8 +828,8 @@ jobs:
           fi
           mkdir rel
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
-          # The key of the tagged commit, the attestations as main holds them.
-          git fetch --no-tags origin main
+          # The key of the tagged commit, the attestations as main holds them
+          # (`fetch-depth: 0` brought every branch).
           mkdir att
           git archive origin/main attestations | tar -x -C att
           ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub att/attestations

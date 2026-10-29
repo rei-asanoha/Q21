@@ -97,8 +97,10 @@ them any more, and a secret that exists can leak.
    the draft — exactly the seven expected files, the signature against
    `q21-release.pub`, the trusted comment naming this tag and its commit,
    every archive, the program inside every archive against its binary hash,
-   and the attestations required by section 5 — and makes the release public
-   only if everything holds. Nothing is public before it has been checked.
+   every other file of every archive against the tagged commit (nothing
+   extra, no link, no duplicate name), and the attestations required by
+   section 5 — and makes the release public only if everything holds, and
+   if the draft has not changed in the meantime. Nothing is public before it has been checked.
    If it stops, the release stays a draft: read the red line, fix, run again.
 
 If a release is ever published with the website's *Publish* button instead,
@@ -179,8 +181,11 @@ What a threshold of `2` does, and does not: it stops a release whose
 programs differ from what independent people rebuilt — a stolen release key,
 a compromised build machine, a coerced signer using the normal path. It does
 not bind whoever administers this repository, who controls the pipeline,
-the threshold and which builder keys are merged; nor does it cover what the
-attestations do not list (REPRODUCING.md, section 6, says which files).
+the threshold and which builder keys are merged. And it covers the programs
+only: the files of Tor, and the macOS launcher re-signed inside its bundle,
+are vouched for by the release signature alone (REPRODUCING.md, section 6).
+The threshold applies to every program separately: two attestations of the
+Linux binary say nothing about the Windows one.
 The check that binds nobody's word is the one a user runs at home, with
 `tools/verify-release.sh` and keys obtained elsewhere — and, best of all, by
 rebuilding.
@@ -202,6 +207,7 @@ release pages still do. In *Settings*:
 | *Rules → Rulesets → New tag ruleset* | target **all tags**; restrict creation, update and deletion to the maintainers |
 | *Rules → Rulesets → New branch ruleset* | target `main`; block force pushes and deletion; require the CI checks |
 | *Security → Private vulnerability reporting* | **Enable**: this is the channel `SECURITY.md` points to |
+| *General → Releases → release immutability*, if your repository offers it | **Enable**: a published release's files can then no longer be replaced. Releases are checked before they become public, so nothing is lost; the after-the-fact safety net for a release published by hand may then be unable to send it back to draft |
 
 ## 7 · If the key is lost or exposed
 
