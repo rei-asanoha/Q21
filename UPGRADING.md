@@ -72,6 +72,9 @@ node and a 0.5.1 node agree on every block and talk to each other as before.
 It hardens what a stranger could do to a node, how a new node finds the real
 chain, and how a release reaches you.
 
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200.
+
 ## What changes
 
 | | 0.5.0 | 0.5.1 |
