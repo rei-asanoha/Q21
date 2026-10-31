@@ -351,9 +351,11 @@ struct Chan {
     /// only: nothing the channel accepts depends on it.
     peer_owner: Option<Hash256>,
     /// A reestablish that showed the peer's copy older than ours: its
-    /// counters, ours then, and the session it came over. A second session
-    /// showing the same, with nothing moved in between, closes the channel.
-    peer_behind: Option<([u64; 4], [u64; 4], [u8; 32])>,
+    /// counters, ours then, and the last session established by then. A
+    /// session established after it showing the same, with nothing moved in
+    /// between, closes the channel: two opened at the same moment could
+    /// both carry a reestablish held up in transit.
+    peer_behind: Option<([u64; 4], [u64; 4], u64)>,
     /// The height the transaction that ends the channel confirmed at, and
     /// when this node first saw it there: the date the archives give the
     /// close. Persisted beside the journal.
@@ -534,6 +536,9 @@ struct Link {
     /// owns the peer's names, and what a contact pins. Set right after the
     /// session is recorded ([`ChannelManager::set_session_owner`]).
     owner: Option<Hash256>,
+    /// When the session was established, in the order of all sessions: a
+    /// later one is told apart from one opened at the same moment.
+    seq: u64,
 }
 
 /// Sessions established at once. A connection holds at most one, and the
@@ -544,6 +549,8 @@ struct Inner {
     channels: HashMap<Hash256, Chan>,
     /// Connections with an established session, by connection id.
     links: HashMap<u64, Link>,
+    /// Sessions established so far ([`Link::seq`]).
+    session_seq: u64,
     pending_funder: HashMap<u64, PendingFunder>,
     pending_acceptor: HashMap<u64, PendingAcceptor>,
     next_index: u32,
@@ -719,6 +726,7 @@ impl ChannelManager {
             inner: Mutex::new(Inner {
                 channels: HashMap::new(),
                 links: HashMap::new(),
+                session_seq: 0,
                 pending_funder: HashMap::new(),
                 pending_acceptor: HashMap::new(),
                 next_index: 0,
@@ -1556,6 +1564,8 @@ impl ChannelManager {
         if g.links.len() >= MAX_LINKS && !g.links.contains_key(&peer) {
             return Vec::new();
         }
+        g.session_seq += 1;
+        let seq = g.session_seq;
         g.links.insert(
             peer,
             Link {
@@ -1563,6 +1573,7 @@ impl ChannelManager {
                 legacy: legacy.to_string(),
                 binding,
                 owner: None,
+                seq,
             },
         );
         let mut out = Vec::new();
@@ -1872,6 +1883,7 @@ impl ChannelManager {
         } else {
             Vec::new()
         };
+        let (from_seq, seq_now) = (g.links.get(&peer).map_or(0, |l| l.seq), g.session_seq);
         let Some(chan) = g.channels.get_mut(&cid) else {
             // A peer that still tracks a channel we have settled and forgotten
             // (closed on our side, still closing on theirs) offers its
@@ -2082,9 +2094,9 @@ impl ChannelManager {
                     // delay.
                     SyncVerdict::PeerIsBehind => {
                         let ours = chan.machine.sync_counters();
-                        let confirmed = chan
-                            .peer_behind
-                            .is_some_and(|(t, o, b)| t == theirs && o == ours && b != from.binding);
+                        let confirmed = chan.peer_behind.is_some_and(|(t, o, mark)| {
+                            t == theirs && o == ours && from_seq > mark
+                        });
                         if !confirmed {
                             if chan
                                 .peer_behind
@@ -2097,7 +2109,7 @@ impl ChannelManager {
                                     cid.to_hex()
                                 );
                             }
-                            chan.peer_behind = Some((theirs, ours, from.binding));
+                            chan.peer_behind = Some((theirs, ours, seq_now));
                         } else if chan.machine.phase() == Phase::Open
                             || chan.machine.phase() == Phase::Closing
                         {

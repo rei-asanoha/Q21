@@ -595,6 +595,18 @@ impl Wallet {
         }
     }
 
+    /// Gives back the addresses derived from index `from` on: a spend
+    /// prepared only to read its fee, then cancelled under the same lock,
+    /// derived its change address for nothing. Left counted, each preview
+    /// would widen the gap a restore has to search across.
+    pub fn rewind_addresses(&mut self, from: u32) {
+        if from >= self.next_index {
+            return;
+        }
+        self.known.retain(|_, i| *i < from);
+        self.next_index = from;
+    }
+
     /// Produces a fresh address **at the holder's request**, and remembers
     /// it.
     ///

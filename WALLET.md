@@ -59,7 +59,8 @@ journal, beside the wallet in the data folder, and the code does not hold it:
   it had already revoked, and lost the whole channel to the penalty. The
   copy's refusal is not lifted by the other side's word alone: a peer that
   claims we are behind when we are not can hold the channel until it closes,
-  its own funds held with ours.
+  its own funds held with ours. Either way, the funds of an older copy come
+  back only through the other side: it must be online to close.
 
 `checkbackup` (the wallet page: Info → Check my backup) checks the sheet
 against the wallet at any time, long before the day it is needed.

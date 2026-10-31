@@ -3426,6 +3426,66 @@ fn a_reestablish_held_up_on_a_second_session_closes_nothing() {
     assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 600_000);
 }
 
+/// 0.5.3: two sessions opened at the same moment both carry what the peer's
+/// copy was then: they are one sighting, not two. Only a session opened after
+/// the first sighting confirms an older copy and closes the channel.
+#[test]
+fn two_sessions_opened_together_are_one_sighting() {
+    let funder_seed = [0xc3u8; 32];
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, [0xd4u8; 32], "older-copy-twin-sessions");
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    let backup = dir.join("funder-backup");
+    restore_dir(&dir.join("funder"), &backup);
+    for amount in [2_000_000u64, 500_000] {
+        let pay = p.funder.pay(cid, amount).unwrap();
+        p.queue.push_back((1, pay));
+        p.pump();
+    }
+    restore_dir(&backup, &dir.join("funder"));
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+    p.acceptor.on_session_closed(F_PEER);
+    let h0 = chain.lock().unwrap().height();
+    // Two sessions, both established before either reestablish is read.
+    const F2: u64 = 93;
+    const F3: u64 = 94;
+    let (b2, b3) = (next_binding(), next_binding());
+    let _ = p.acceptor.on_session(F2, &p.funder.node_id(), "", b2);
+    let _ = p.acceptor.on_session(F3, &p.funder.node_id(), "", b3);
+    let r2 = p.funder.on_session(A_PEER, &p.acceptor.node_id(), "", b2);
+    let r3 = p
+        .funder
+        .on_session(A_PEER + 100, &p.acceptor.node_id(), "", b3);
+    for f in r2 {
+        assert_eq!(p.acceptor.deliver(F2, &f).penalize, 0);
+    }
+    for f in r3 {
+        assert_eq!(p.acceptor.deliver(F3, &f).penalize, 0);
+    }
+    assert!(p.acceptor.info(cid).unwrap().peer_behind, "seen");
+    assert_eq!(
+        chain.lock().unwrap().height(),
+        h0,
+        "one sighting, nothing broadcast"
+    );
+    // A session opened afterwards shows the same: now it is closed.
+    const F4: u64 = 95;
+    let b4 = next_binding();
+    let _ = p.acceptor.on_session(F4, &p.funder.node_id(), "", b4);
+    for f in p
+        .funder
+        .on_session(A_PEER + 200, &p.acceptor.node_id(), "", b4)
+    {
+        assert_eq!(p.acceptor.deliver(F4, &f).penalize, 0);
+    }
+    assert!(
+        chain.lock().unwrap().height() > h0,
+        "closed with the latest state"
+    );
+}
+
 /// B4, the loss the 0.5.0 review reproduced: a data folder restored from a
 /// copy taken two payments ago, then "close without the peer", broadcast a
 /// revoked state and lost the whole channel to the penalty. Now the restored

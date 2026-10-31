@@ -5265,9 +5265,16 @@ impl RpcContext {
         let mut g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let before = g.next_index();
         let prepare = self.prepare_spend(&mut g, destinations, None)?;
         let fee = prepare.fee_paid();
         g.cancel_spend(prepare);
+        // The change address derived for the preview, and only it, is given
+        // back: the lock was held throughout, so nothing else took an index
+        // meanwhile.
+        if g.next_index() == before.saturating_add(1) {
+            g.rewind_addresses(before);
+        }
         Ok(fee)
     }
 

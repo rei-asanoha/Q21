@@ -1440,6 +1440,7 @@ const I18N_PATTERNS = {
     [/^(.+) unreadable block\(s\) — history incomplete$/, "$1 bloc(s) illisible(s) — historique incomplet"],
     [/^Searched from height (.+) to (.+)\. Anything earlier is not shown, but it is not lost either\.$/, "Recherche effectuée de la hauteur $1 à $2. Ce qui est antérieur n'est pas affiché, et n'est pas perdu pour autant."],
     [/^usable at block (.+)$/, "utilisable au bloc $1"],
+    [/^(.*) What would come back as change is too small to keep, and would go to the fee on top of the one you confirmed\. Raise the fee to the amount shown, or change the amount slightly\.$/, "$1 Ce qui reviendrait en monnaie est trop petit pour être gardé, et irait aux frais en plus de ceux que vous avez confirmés. Montez les frais au montant indiqué, ou modifiez légèrement le montant."],
     [/^(.*) The fee is rarely enough when the transaction consumes more inputs than expected: increase the number of expected inputs, recalculate, and try again\.$/, "$1 Les frais suffisent rarement quand la transaction consomme plus d'entrées que prévu : augmentez le nombre d'entrées supposées, recalculez, et recommencez."],
     [/^(.*) A previous payment is still pending and ties up the same coins\. Wait for a block to confirm it before sending another\.$/, "$1 Un envoi précédent est encore en attente et immobilise les mêmes pièces. Attendez qu'un bloc le confirme avant d'en émettre un autre."],
     [/^(.+) MiB$/, "$1 Mio"],
@@ -1447,6 +1448,7 @@ const I18N_PATTERNS = {
     [/^(\d+) B$/, "$1 o"]
   ],
   "ja": [
+    [/^(.*) What would come back as change is too small to keep, and would go to the fee on top of the one you confirmed\. Raise the fee to the amount shown, or change the amount slightly\.$/, "$1 おつりとして戻る額が小さすぎて残せず、確定した手数料に上乗せされてしまいます。手数料を表示の額まで上げるか、金額を少し変えてください。"],
     [/^Names open at block (.+)\.$/, "名前はブロック $1 で利用可能になります。"],
     [/^Channels activate at block (.+)\.$/, "チャネルはブロック $1 で有効になります。"],
     [/^(.+) block\(s\) remain, about (.+) days\.$/, "残り $1 ブロック、約 $2 日です。"],
@@ -2289,13 +2291,17 @@ document.getElementById("send-button").addEventListener("click", async () => {
       '{"address":' + JSON.stringify(d.address) + ',"units":' + d.amount.toString() + '}'
     ).join(",");
     method = "sendmany";
-    params = '{"destinations":[' + items + '],"fee":' + p.fee.toString() + '}';
+    params = '{"destinations":[' + items + '],"fee":' + p.fee.toString() +
+             ',"max_fee":' + p.fee.toString() + '}';
   } else {
     method = "sendtoaddress";
     params = '{"address":' + JSON.stringify(p.address) +
              ',"units":' + p.amount.toString() +
-             ',"fee":' + p.fee.toString() + '}';
+             ',"fee":' + p.fee.toString() +
+             ',"max_fee":' + p.fee.toString() + '}';
   }
+  // The fee confirmed is the most the node may take: change too small to
+  // keep, which would otherwise go to the fee on top, is refused instead.
   try{
     const r = await call(method, params);
     preparedSend = null;
@@ -2333,7 +2339,11 @@ document.getElementById("send-button").addEventListener("click", async () => {
     setTimeout(() => show("activity"), 1200);
   }catch(e){
     let hint = "";
-    if (/FeeRateTooLow|fee/i.test(e.message)){
+    if (/the fee is now/i.test(e.message)){
+      hint = " What would come back as change is too small to keep, and would " +
+             "go to the fee on top of the one you confirmed. Raise the fee to " +
+             "the amount shown, or change the amount slightly.";
+    } else if (/FeeRateTooLow|fee/i.test(e.message)){
       hint = " The fee is rarely enough when the transaction consumes more " +
              "inputs than expected: increase the number of expected inputs, " +
              "recalculate, and try again.";
