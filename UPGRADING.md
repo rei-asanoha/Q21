@@ -65,6 +65,52 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.5.3 to 0.5.4
+
+0.5.4 schedules one new rule of the chain on the testnet: from **block
+7,600**, a block's timestamp must be strictly later than its parent's. It is
+a stricter rule (a soft fork): an older node keeps following the chain, but
+a miner still on an older release may produce blocks every 0.5.4 node
+refuses. **Every node that mines must run 0.5.4 before block 7,600**; run it
+everywhere, servers included.
+
+The rest of the testnet schedule is unchanged: payment channels open since
+block 4,980, names since block 5,200.
+
+## What changes
+
+| | 0.5.3 | 0.5.4 |
+|---|---|---|
+| Block timestamps | After the median of the eleven blocks before: a minority miner could date its blocks back and slow the chain (a third of the hashrate: more than eighteen minutes per block) | From block 7,600, also strictly after the parent's: the same miner keeps the chain within about a tenth of two minutes. The node's own blocks follow the rule even when its clock lags behind the tip |
+| A new node | A peer alone with a new node for its first hour could bind it to a chain of its own | The release carries anchors, blocks of the real chain: no chain without them can pass their heights, and finality never binds below the last one |
+| `getinfo` | — | `block_time_rule`: the activation height, whether the next block is under the rule, and the last anchored height |
+| Peers | — | A block refused only by the new rule costs the peer that relayed it nothing: it may still run 0.5.3 |
+| Private channel | The opening explained twice; an unreachable other side read "peer is not connected" next to a Pay button | Explained once; an unreachable other side is said plainly, with a **Connect again** button and no Pay button until it is back |
+
+## Who should upgrade, and when
+
+Everyone, before block 7,600: entry points, explorers, servers, wallets.
+Mining nodes first. A node that never mines and stays on 0.5.3 keeps
+following the chain, but should upgrade too.
+
+## How to check a node
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getinfo","params":{}}' \
+  http://127.0.0.1:21080/rpc | grep -o '"block_time_rule":{[^}]*}'
+```
+
+A 0.5.4 node answers with `"activation_height":7600`; a 0.5.3 node prints
+nothing.
+
+## The data folder
+
+Nothing changes in it. Going back to 0.5.3 is possible before block 7,600;
+after it, a 0.5.3 node that mines may build blocks the others refuse.
+
+---
+
 # Upgrading from 0.5.1 or 0.5.2 to 0.5.3
 
 0.5.3 changes no rule of the chain and no message of the protocol: a 0.5.3
