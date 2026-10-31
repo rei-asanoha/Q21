@@ -306,6 +306,49 @@ fn eviction_candidate(peers: &HashMap<u64, Peer>, eligible: impl Fn(&Peer) -> bo
 /// for forking beyond this node's finality: harmless from a stray peer, but
 /// the one sign of a node bound to the wrong chain (see NETWORK.md, "A new
 /// node's first hour").
+/// Blocks refused because their time lies beyond our clock's tolerance, by
+/// peer: when it was seen and by how many seconds it was ahead. Two peers
+/// within the last hour, and the likeliest explanation is our own clock.
+static CLOCK_SIGNS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// How long a sign of a slow clock is remembered.
+const CLOCK_SIGN_TTL: u64 = 3600;
+
+/// Notes a block refused for lying in our future, from `peer`.
+fn note_future_block(e: &crate::chain::ChainError, peer: u64) {
+    let crate::chain::ChainError::Validation(crate::validate::ValidationError::TimestampInFuture {
+        limit,
+        received,
+    }) = e
+    else {
+        return;
+    };
+    let now = unix_now();
+    let ahead = received.saturating_sub(*limit);
+    if let Ok(mut v) = CLOCK_SIGNS.lock() {
+        v.retain(|(p, at, _)| *p != peer && now.saturating_sub(*at) < CLOCK_SIGN_TTL);
+        v.push((peer, now, ahead));
+        if v.len() > 64 {
+            v.remove(0);
+        }
+    }
+}
+
+/// How far behind this computer's clock seems to be, in seconds, when blocks
+/// from at least two peers in the last hour were refused for lying in its
+/// future: a clock running late isolates a node, and nothing else told the
+/// holder. `None` while there is no such sign.
+pub fn clock_behind() -> Option<u64> {
+    let now = unix_now();
+    let v = CLOCK_SIGNS.lock().ok()?;
+    let recent: Vec<u64> = v
+        .iter()
+        .filter(|(_, at, _)| now.saturating_sub(*at) < CLOCK_SIGN_TTL)
+        .map(|(_, _, ahead)| *ahead)
+        .collect();
+    (recent.len() >= 2).then(|| recent.iter().copied().min().unwrap_or(0))
+}
+
 fn report_beyond_finality(e: &crate::chain::ChainError) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let crate::chain::ChainError::BeyondFinality { depth, max } = e else {
@@ -5419,6 +5462,7 @@ impl Node {
                 // `refusal_is_contextual`.
                 e if refusal_is_contextual(&e) => {
                     report_beyond_finality(&e);
+                    note_future_block(&e, id);
                     if let Some(p) = g.peers.get_mut(&id) {
                         p.requested_bodies.remove(&bid);
                     }
@@ -5676,6 +5720,7 @@ impl Node {
             // on a block we did not take, is not asked for.
             Err(e) if refusal_is_contextual(&e) => {
                 report_beyond_finality(&e);
+                note_future_block(&e, source);
                 if let Some(p) = g.peers.get_mut(&source) {
                     if p.requested_bodies.remove(&bid).is_some() {
                         p.bodies_to_request.clear();
@@ -6829,6 +6874,22 @@ mod tests {
             received: 2,
         });
         assert!(refusal_is_contextual(&future));
+        // One peer is no sign; two within the hour are, and the clock is late
+        // by at least the smaller lead.
+        let ahead = |secs: u64| {
+            E::Validation(V::TimestampInFuture {
+                limit: 1_000,
+                received: 1_000 + secs,
+            })
+        };
+        note_future_block(&ahead(400), 900_001);
+        note_future_block(&ahead(500), 900_001);
+        assert_eq!(clock_behind(), None, "the same peer twice is one sign");
+        note_future_block(&ahead(300), 900_002);
+        assert_eq!(clock_behind(), Some(300));
+        note_future_block(&E::Validation(V::BadParent), 900_003);
+        assert_eq!(clock_behind(), Some(300), "other refusals are no sign");
+        CLOCK_SIGNS.lock().unwrap().clear();
         assert!(!refusal_is_contextual(&E::Validation(V::BadParent)));
         assert!(!refusal_is_contextual(&E::UnknownParent(Hash256::ZERO)));
     }

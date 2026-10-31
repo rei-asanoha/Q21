@@ -2911,6 +2911,15 @@ impl RpcContext {
                     )
                     .build(),
             )
+            // Blocks from two peers or more refused for lying in this
+            // computer's future, within the hour: its clock is probably late,
+            // by at least this many seconds. Null without such a sign.
+            .set(
+                "clock_behind_seconds",
+                crate::net::clock_behind()
+                    .map(Json::u64)
+                    .unwrap_or(Json::Null),
+            )
             .build()
     }
 
