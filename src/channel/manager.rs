@@ -210,6 +210,9 @@ pub struct ChannelSummary {
     /// When the transaction that ends the channel was first seen confirmed,
     /// in seconds since 1970, alongside [`Self::close_height`].
     pub close_time: Option<u64>,
+    /// After our own commitment confirmed: the height from which our side,
+    /// held by the delay, can be swept back to the wallet.
+    pub release_height: Option<u64>,
     /// The node id the channel is bound to, as its session authenticated it.
     pub peer_identity: String,
     /// The identity address (hex) the peer's session proved, as a contact
@@ -3322,6 +3325,14 @@ fn summary(c: &Chan) -> ChannelSummary {
         we_funded: us == crate::channel::txbuild::FUNDER,
         force_close_fee: c.machine.commit_fee(FORCE_CLOSE_TIER),
         synced: c.synced,
+        release_height: match &c.close {
+            Some(CloseTracker::DelayedSweep {
+                commit_height,
+                delay,
+                ..
+            }) => Some(commit_height.saturating_add(u64::from(*delay))),
+            _ => None,
+        },
         close_time: match (&c.close, c.closing) {
             (Some(CloseTracker::Settling { height, .. }), Some((h, t))) if *height == h => Some(t),
             _ => None,

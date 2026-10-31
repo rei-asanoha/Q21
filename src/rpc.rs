@@ -711,6 +711,13 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
             },
         )
         .set(
+            "release_height",
+            match s.release_height {
+                Some(h) => Json::u64(h),
+                None => Json::Null,
+            },
+        )
+        .set(
             "close_time",
             match s.close_time {
                 Some(t) => Json::u64(t),
@@ -725,6 +732,7 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("peer_identity", Json::str(s.peer_identity))
         .set("peer_owner", Json::str(s.peer_owner))
         .set("behind", Json::Bool(s.behind))
+        .set("peer_behind", Json::Bool(s.peer_behind))
         .build()
 }
 
@@ -5936,6 +5944,70 @@ mod tests {
     /// identity address — show their fee first, spending nothing, and a fee
     /// above the one confirmed is refused rather than paid. A plain send
     /// holds to `max_fee` the same way.
+    /// Every field of a channel the wallet page reads is in `channellist`:
+    /// a field missing there reads as `undefined` in the page, and a state
+    /// such as an older copy would go unsaid.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_channel_carries_every_field_the_page_reads() {
+        use crate::channel::manager::ChannelSummary;
+        let s = ChannelSummary {
+            channel_id: crate::hash::Hash256([7; 32]),
+            peer: 3,
+            phase: crate::channel::machine::Phase::Open,
+            capacity: 300,
+            local_balance: 200,
+            pending_incoming: 0,
+            remote_balance: 100,
+            state_number: 4,
+            funding: None,
+            in_flight: false,
+            close_txid: None,
+            close_height: Some(12),
+            funding_depth: 6,
+            delay: 144,
+            we_funded: true,
+            force_close_fee: 2_538,
+            synced: true,
+            close_time: Some(1_700_000_000),
+            release_height: None,
+            peer_identity: "ab".repeat(32),
+            peer_owner: "cd".repeat(32),
+            behind: false,
+            peer_behind: true,
+        };
+        let j = channel_json(s);
+        for field in [
+            "channel_id",
+            "peer",
+            "phase",
+            "capacity",
+            "local_balance",
+            "pending_incoming",
+            "remote_balance",
+            "state",
+            "in_flight",
+            "close_height",
+            "close_time",
+            "release_height",
+            "funding_depth",
+            "delay",
+            "we_funded",
+            "force_close_fee",
+            "synced",
+            "peer_owner",
+            "behind",
+            "peer_behind",
+        ] {
+            assert!(j.get(field).is_some(), "channellist lacks {field}");
+        }
+        assert_eq!(j.get("peer_behind"), Some(&Json::Bool(true)));
+        assert_eq!(
+            j.get("close_time").and_then(|v| v.as_u64()),
+            Some(1_700_000_000)
+        );
+    }
+
     #[cfg(feature = "mldsa")]
     #[test]
     fn spends_show_their_fee_first_and_hold_to_it() {
