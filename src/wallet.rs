@@ -373,6 +373,60 @@ impl Wallet {
         Ok(seed)
     }
 
+    /// The one-character slip that would make an unreadable backup code
+    /// readable: its position (1 = the first character of the code as
+    /// typed, spaces left out), the character typed and the one that fits.
+    ///
+    /// Bech32m detects a slip, it does not say where. Trying the 32
+    /// characters of its alphabet at each position finds the code a single
+    /// substitution away, if there is exactly one: the holder is then told
+    /// where to look on the sheet, never handed a code to accept blindly.
+    /// Several candidates, or none: no suggestion.
+    pub fn backup_slip(code: &str, network: Network) -> Option<(usize, char, char)> {
+        const ALPHABET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        let cleaned: Vec<char> = code
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if cleaned.len() > 200
+            || Wallet::seed_from_backup(&cleaned.iter().collect::<String>(), network).is_ok()
+        {
+            return None;
+        }
+        let separator = cleaned.iter().rposition(|c| *c == '1')?;
+        let mut found = None;
+        for i in separator + 1..cleaned.len() {
+            for &a in ALPHABET {
+                let a = a as char;
+                if a == cleaned[i] {
+                    continue;
+                }
+                let mut attempt = cleaned.clone();
+                attempt[i] = a;
+                let text: String = attempt.iter().collect();
+                if Wallet::seed_from_backup(&text, network).is_ok() {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some((i + 1, cleaned[i], a));
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether `code` is the backup code of this wallet: what the holder
+    /// wrote down still restores it. Compared on the seed, in constant time.
+    pub fn backup_matches(&self, code: &str) -> Result<bool, WalletError> {
+        let seed = Wallet::seed_from_backup(code, self.network)?;
+        let mut diff = 0u8;
+        for (a, b) in seed.iter().zip(self.seed.iter()) {
+            diff |= a ^ b;
+        }
+        Ok(diff == 0)
+    }
+
     pub fn seed_hex(&self) -> String {
         self.seed.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -3048,6 +3102,62 @@ mod tests {
             Wallet::seed_from_backup("just anything", Network::Testnet),
             Err(WalletError::InvalidBackup)
         );
+    }
+
+    /// A single slip in a backup code is located, never applied: the holder
+    /// is told which character to check. Two or more slips, or a code that
+    /// reads already: no suggestion. And the wallet recognises its own code,
+    /// not another's.
+    #[test]
+    fn a_single_slip_in_a_backup_code_is_located() {
+        let w = Wallet::from_seed([0x4b; 32], Network::Regtest);
+        let code = w.backup_code();
+        assert_eq!(Wallet::backup_slip(&code, Network::Regtest), None);
+        let sep = code.rfind('1').unwrap();
+        for pos in [sep + 1, sep + 10, code.len() - 1] {
+            let wrong = if code.as_bytes()[pos] == b'q' {
+                'p'
+            } else {
+                'q'
+            };
+            let mut typo: Vec<char> = code.chars().collect();
+            typo[pos] = wrong;
+            let typo: String = typo.into_iter().collect();
+            assert_eq!(
+                Wallet::backup_slip(&typo, Network::Regtest),
+                Some((pos + 1, wrong, code.as_bytes()[pos] as char)),
+                "slip at {pos}"
+            );
+            // Spaced in groups, as written on paper: positions count the
+            // characters, not the spaces.
+            let spaced: String = typo
+                .chars()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    if i > 0 && i % 4 == 0 {
+                        vec![' ', c]
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            assert_eq!(
+                Wallet::backup_slip(&spaced, Network::Regtest).map(|s| s.0),
+                Some(pos + 1)
+            );
+        }
+        let mut two: Vec<char> = code.chars().collect();
+        for pos in [sep + 2, sep + 20] {
+            two[pos] = if two[pos] == 'q' { 'p' } else { 'q' };
+        }
+        assert_eq!(
+            Wallet::backup_slip(&two.into_iter().collect::<String>(), Network::Regtest),
+            None
+        );
+        assert_eq!(w.backup_matches(&code), Ok(true));
+        let other = Wallet::from_seed([0x4c; 32], Network::Regtest).backup_code();
+        assert_eq!(w.backup_matches(&other), Ok(false));
+        assert!(w.backup_matches("anything").is_err());
     }
 
     /// A clumsy copy-paste must not make a restore fail.

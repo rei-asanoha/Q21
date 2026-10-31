@@ -178,6 +178,15 @@ button:focus-visible{outline:3px solid var(--accent-bg);outline-offset:1px}
   padding:1.1rem;margin:1rem 0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   font-size:1.02rem;line-height:1.75;word-break:break-all;letter-spacing:.02em}
 .code b{color:var(--accent);font-weight:600}
+/* The code in numbered groups of four: what is copied by hand, and what the
+   check asks for. */
+.groups{display:grid;grid-template-columns:repeat(auto-fill,minmax(4.6rem,1fr));gap:.45rem;
+  margin:1rem 0;padding:0;list-style:none}
+.groups li{background:var(--bg);border:1.5px dashed var(--border-strong);border-radius:9px;
+  padding:.35rem .4rem;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:1.02rem;letter-spacing:.06em}
+.groups li small{display:block;font-family:inherit;font-size:.68rem;color:var(--soft);letter-spacing:0}
+.trio{display:grid;grid-template-columns:repeat(auto-fit,minmax(7rem,1fr));gap:.6rem}
 
 /* --- Miscellaneous ------------------------------------------------------- */
 .check{display:flex;gap:.6rem;align-items:flex-start;margin:1.1rem 0;
@@ -444,19 +453,31 @@ function create(){
 }
 
 // --- Screen: the backup code ---------------------------------------------
+// The code in groups of four, numbered: the eye copies short groups more
+// accurately than one long line, the numbers keep the order on paper, and the
+// check asks for groups by number. The spaces are not part of the code.
+function groupsOf(code){
+  var g = [];
+  for (var i = 0; i < code.length; i += 4) g.push(code.slice(i, i + 4));
+  return g;
+}
+
+function groupsHtml(code){
+  return '<ol class="groups" id="the-code">' + groupsOf(code).map(function(g, i){
+    return '<li><small>' + (i + 1) + '</small>' + esc(g) + '</li>';
+  }).join("") + '</ol>';
+}
+
 function showCode(code, address){
   drawSteps(stepNames(false), 1);
   footer("");
-  // The code is shown in two halves: the eye copies split text more
-  // accurately, and the split is not part of the code.
-  var m = Math.ceil(code.length / 2);
   $("card").innerHTML =
     '<div class="eyebrow">Step 2 of 3</div>'
   + '<h1>Write this down on paper</h1>'
   + '<p>It is the <strong>only</strong> way to recover your funds if this disk '
-  + 'is lost. It will never be shown again.</p>'
-  + '<div class="code" id="the-code">' + esc(code.slice(0, m)) + '<br>'
-  + esc(code.slice(m)) + '</div>'
+  + 'is lost. It will never be shown again. Copy the groups in order, with '
+  + 'their numbers.</p>'
+  + groupsHtml(code)
   + '<div class="note warn"><p><b>On paper, by hand, and nowhere else.</b> '
   + 'A file on this machine is lost with it, a file in the cloud can be read '
   + 'remotely, and the clipboard keeps a history — sometimes synced across '
@@ -473,13 +494,12 @@ function showCode(code, address){
 function showRestored(code, address){
   drawSteps(stepNames(true), 2);
   footer("");
-  var m = Math.ceil(code.length / 2);
   $("card").innerHTML =
     '<div class="eyebrow">Step 3 of 3</div>'
   + '<h1>Wallet restored</h1>'
   + '<p>The code was accepted and your seed is loaded. Check that this is '
   + 'yours:</p>'
-  + '<div class="code">' + esc(code.slice(0, m)) + '<br>' + esc(code.slice(m)) + '</div>'
+  + groupsHtml(code)
   + '<div class="note"><p><b>Your funds will reappear as the chain comes '
   + 'in.</b> The wallet derives your addresses again and finds what belongs to '
   + 'them — nothing is lost, but syncing has to finish first. On a long chain, '
@@ -492,34 +512,61 @@ function showRestored(code, address){
 //
 // Asking for the whole code to be typed again would be safer, and nobody would
 // do it: they would select it on screen, paste it, and the check would have
-// checked nothing. The last eight characters are enough to prove the sheet is
-// in front of them, and can be typed again without weariness.
+// checked nothing. Until 0.5.2 the check asked for the last eight characters
+// only — six of them the checksum — so a slip anywhere else went unnoticed
+// until the day the code was needed. It now asks for three groups, drawn at
+// random: one from the start, one from the middle, the last one. A slip in
+// any of them is caught now, and the holder cannot guess which in advance.
+function pickGroups(n){
+  var r = new Uint32Array(2);
+  crypto.getRandomValues(r);
+  var third = Math.max(1, Math.floor((n - 1) / 3));
+  var first = r[0] % third;
+  var middle = third + (r[1] % third);
+  return [first, Math.min(middle, n - 2), n - 1];
+}
+
 function showVerify(code, address){
   drawSteps(stepNames(false), 1);
-  var n = 8, tail = code.slice(-n);
+  var groups = groupsOf(code);
+  var asked = pickGroups(groups.length);
   $("card").innerHTML =
     '<div class="eyebrow">Step 2 of 3</div>'
   + '<h1>Let\'s check your copy</h1>'
-  + '<p>Without looking at the screen: what are the <strong>last ' + n + ' '
-  + 'characters</strong> of the code you just wrote down?</p>'
-  + '<label for="v">The last ' + n + ' characters</label>'
-  + '<div class="field"><input type="text" id="v" class="mono" autocomplete="off" '
-  + 'autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="' + n + '"></div>'
+  + '<p>Without looking at the screen: what does your sheet say for these '
+  + '<strong>three groups</strong>?</p>'
+  + '<div class="trio">' + asked.map(function(g, i){
+      return '<div><label for="v' + i + '">Group ' + (g + 1) + '</label>'
+      + '<div class="field"><input type="text" id="v' + i + '" class="mono" autocomplete="off" '
+      + 'autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="4"></div></div>';
+    }).join("") + '</div>'
   + '<div class="verdict" id="said"></div>'
   + '<div class="actions">'
   + '<button class="s" id="again">Show the code again</button>'
   + '<button class="p" id="next" disabled>Finish</button></div>';
-  var v = $("v");
-  v.oninput = function(){
-    var s = v.value.trim().toLowerCase();
-    $("next").disabled = s !== tail.toLowerCase();
-    $("said").textContent = s.length >= n && s !== tail.toLowerCase()
-      ? "That is not the end of the code. Check it again." : "";
+  var fields = asked.map(function(_, i){ return $("v" + i); });
+  var check = function(){
+    var typed = fields.map(function(f){ return f.value.trim().toLowerCase(); });
+    var right = typed.map(function(t, i){ return t === groups[asked[i]].toLowerCase(); });
+    $("next").disabled = !right.every(Boolean);
+    var wrong = typed.map(function(t, i){
+      return t.length >= groups[asked[i]].length && !right[i] ? asked[i] + 1 : 0;
+    }).filter(Boolean);
+    $("said").textContent = wrong.length
+      ? "Group " + wrong.join(", ") + " does not match the code. Correct it on your sheet."
+      : "";
   };
-  v.onkeydown = function(e){ if(e.key === "Enter" && !$("next").disabled) $("next").click(); };
+  fields.forEach(function(f, i){
+    f.oninput = check;
+    f.onkeydown = function(e){
+      if (e.key !== "Enter") return;
+      if (!$("next").disabled) $("next").click();
+      else if (fields[i + 1]) fields[i + 1].focus();
+    };
+  });
   $("again").onclick = function(){ showCode(code, address); };
   $("next").onclick = function(){ finish(address); };
-  v.focus();
+  fields[0].focus();
 }
 
 // --- Screen: opening an existing wallet ----------------------------------
@@ -760,7 +807,13 @@ mod tests {
         // Showing the code and then moving on with one click proves nothing. A
         // check exists, and the final button depends on it.
         assert!(script().contains("function showVerify"));
-        assert!(script().contains("code.slice(-n)"));
+        // Three groups, drawn at random — the start, the middle, the end —
+        // not the last eight characters, six of which are the checksum.
+        assert!(!script().contains("code.slice(-n)"));
+        assert!(script().contains("var asked = pickGroups(groups.length);"));
+        assert!(script().contains("crypto.getRandomValues(r);"));
+        assert!(script().contains("return [first, Math.min(middle, n - 2), n - 1];"));
+        assert!(script().contains("$(\"next\").disabled = !right.every(Boolean);"));
     }
 
     /// The backup code never goes to the clipboard.
@@ -821,7 +874,7 @@ mod tests {
         // Error messages, the code and the address go through `esc`.
         for raw in [
             "esc(message)",
-            "esc(code.slice",
+            "'</small>' + esc(g) + '</li>'",
             "esc(address)",
             "esc(error)",
         ] {

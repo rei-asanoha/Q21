@@ -2661,11 +2661,31 @@ fn cmd_restore(
         q21_core::wallet::WalletError::BackupForOtherNetwork => {
             "this backup code belongs to another network".to_string()
         }
-        q21_core::wallet::WalletError::BackupIsAnAddress => address_instead_of_code_message(chosen_network),
-        _ => "backup code unreadable: the checksum does not match.\n                Check the copy — the Bech32 alphabet contains no 1, b, i or o."
-            .to_string(),
+        q21_core::wallet::WalletError::BackupIsAnAddress => {
+            address_instead_of_code_message(chosen_network)
+        }
+        _ => unreadable_code_message(code.as_str(), chosen_network),
     })?;
     cmd_init_with(datadir, network, scheme, passphrase_file, Some(seed))
+}
+
+/// Why a backup code does not read, and — when a single character is wrong —
+/// which one: by its group of four, as the code is written down, so the
+/// holder checks that place on the sheet. The correction is never applied
+/// for them.
+fn unreadable_code_message(code: &str, network: Network) -> String {
+    let base = "backup code unreadable: the checksum does not match. Check the copy — \
+                the alphabet used contains no 1, b, i or o.";
+    match Wallet::backup_slip(code, network) {
+        Some((pos, typed, fits)) => format!(
+            "{base} One character looks wrong: group {}, character {} of the group \
+             (character {pos} of the code) reads \"{typed}\"; \"{fits}\" would make the \
+             code readable. Check that place on your sheet.",
+            (pos - 1) / 4 + 1,
+            (pos - 1) % 4 + 1
+        ),
+        None => base.to_string(),
+    }
 }
 
 /// `q21 diagnostic` — why this node does not connect.
@@ -7098,13 +7118,7 @@ fn handle_setup(
                         Err(q21_core::wallet::WalletError::BackupIsAnAddress) => {
                             return error(&address_instead_of_code_message(network))
                         }
-                        Err(_) => {
-                            return error(
-                                "backup code unreadable: the checksum does not \
-                                 match. Check the copy — the alphabet used \
-                                 contains no 1, b, i or o.",
-                            )
-                        }
+                        Err(_) => return error(&unreadable_code_message(code.trim(), network)),
                     }
                 }
                 _ => None,

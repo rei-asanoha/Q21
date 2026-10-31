@@ -1205,6 +1205,10 @@ impl RpcContext {
                 "getwalletinfo",
                 "[wallet] Scheme, network, addresses, keys consumed",
             ),
+            (
+                "checkbackup",
+                "[wallet] Whether a backup code restores this wallet (code); where a single slip is",
+            ),
             ("listaddresses", "[wallet] Addresses known to the wallet"),
             (
                 "setaddresslabel",
@@ -2654,6 +2658,7 @@ impl RpcContext {
             "sendmany" => self.sendmany(params),
             "consolidate" => self.consolidate(params),
             "getwalletinfo" => self.getwalletinfo(),
+            "checkbackup" => self.checkbackup(params),
             "listaddresses" => self.listaddresses(),
             "setaddresslabel" => self.setaddresslabel(params),
             "listtransactions" => self.listtransactions(params),
@@ -3990,6 +3995,44 @@ impl RpcContext {
     /// Everything an owner needs to see when opening their application: which
     /// signature scheme, which network, how many addresses handed out, how many
     /// one-time keys already burned.
+    /// Whether the backup code the holder typed restores this wallet: the
+    /// sheet of paper is checked long after the wallet was created, before
+    /// the day it is needed. A code that does not read says where a single
+    /// slip is, if there is one. The code is compared, never stored, and the
+    /// answer says nothing of the seed.
+    fn checkbackup(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let code = params
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'code' expected"))?;
+        let g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let (status, slip) = match g.backup_matches(code) {
+            Ok(true) => ("matches", None),
+            Ok(false) => ("another_wallet", None),
+            Err(crate::wallet::WalletError::BackupForOtherNetwork) => ("other_network", None),
+            Err(crate::wallet::WalletError::BackupIsAnAddress) => ("an_address", None),
+            Err(_) => ("unreadable", Wallet::backup_slip(code, self.network)),
+        };
+        let slip = match slip {
+            Some((pos, typed, fits)) => Json::obj()
+                .set("position", Json::u64(pos as u64))
+                .set("group", Json::u64(((pos - 1) / 4 + 1) as u64))
+                .set("in_group", Json::u64(((pos - 1) % 4 + 1) as u64))
+                .set("typed", Json::str(typed.to_string()))
+                .set("fits", Json::str(fits.to_string()))
+                .build(),
+            None => Json::Null,
+        };
+        Ok(Json::obj()
+            .set("status", Json::str(status))
+            .set("matches", Json::Bool(status == "matches"))
+            .set("slip", slip)
+            .build())
+    }
+
     fn getwalletinfo(&self) -> Result<Json, Json> {
         let w = self.require_wallet()?;
         let g = w
@@ -5872,6 +5915,43 @@ mod tests {
             error_text(&refused).contains("nothing was sent"),
             "{}",
             refused.encode()
+        );
+    }
+
+    /// The holder checks the sheet of paper against the wallet: its own code
+    /// matches, another's does not, and a single slip is located by its
+    /// group of four.
+    #[test]
+    fn the_backup_code_is_checked_against_the_wallet() {
+        let c = context_with_funds();
+        let code = c.wallet.as_ref().unwrap().lock().unwrap().backup_code();
+        let r = call_ok(&c, "checkbackup", &format!(r#"{{"code":"{code}"}}"#));
+        assert_eq!(r.get("status").and_then(|v| v.as_str()), Some("matches"));
+        assert_eq!(r.get("matches"), Some(&Json::Bool(true)));
+        let other = Wallet::from_seed([0x5d; 32], Network::Regtest).backup_code();
+        let r = call_ok(&c, "checkbackup", &format!(r#"{{"code":"{other}"}}"#));
+        assert_eq!(
+            r.get("status").and_then(|v| v.as_str()),
+            Some("another_wallet")
+        );
+        let pos = code.len() - 3;
+        let mut typo: Vec<char> = code.chars().collect();
+        typo[pos] = if typo[pos] == 'q' { 'p' } else { 'q' };
+        let typo: String = typo.into_iter().collect();
+        let r = call_ok(&c, "checkbackup", &format!(r#"{{"code":"{typo}"}}"#));
+        assert_eq!(r.get("status").and_then(|v| v.as_str()), Some("unreadable"));
+        let slip = r.get("slip").expect("a slip");
+        assert_eq!(
+            slip.get("position").and_then(|v| v.as_u64()),
+            Some(pos as u64 + 1)
+        );
+        assert_eq!(
+            slip.get("group").and_then(|v| v.as_u64()),
+            Some((pos / 4 + 1) as u64)
+        );
+        assert_eq!(
+            slip.get("in_group").and_then(|v| v.as_u64()),
+            Some((pos % 4 + 1) as u64)
         );
     }
 
