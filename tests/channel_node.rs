@@ -3253,9 +3253,10 @@ fn history_and_archives_survive_a_restart() {
 
 /// 0.5.3: a channel remembers the identity address its peer's session
 /// proved, so that the wallet names the contact it is with while the peer is
-/// offline, after a restart and in the archives.
+/// offline, after a restart and in the archives; and the archives date a
+/// close by the first confirmation of its transaction.
 #[test]
-fn a_channel_remembers_whom_it_is_with() {
+fn a_channel_remembers_whom_it_is_with_and_when_it_closed() {
     let (mut p, wallet, chain, dir, cid, _capacity) =
         open_channel([0xa7u8; 32], [0xb8u8; 32], "peer-owner");
     let owner = p.acceptor.own_owner();
@@ -3274,8 +3275,28 @@ fn a_channel_remembers_whom_it_is_with() {
     p.pump();
     drive(&p.funder, &chain);
     drive(&p.acceptor, &chain);
+    // The close is dated when its transaction is first seen confirmed, and
+    // the archives keep that date, not the later one it is marked closed at.
+    let seen = p.funder.info(cid).unwrap();
+    let (at, when) = (
+        seen.close_height.expect("confirmed"),
+        seen.close_time.expect("dated"),
+    );
+    let dated =
+        std::fs::read_to_string(dir.join("funder").join(format!("{}.closing", cid.to_hex())))
+            .unwrap();
+    assert_eq!(dated.trim(), format!("{at} {when}"));
+    // Back-date the sidecar, as for a close seen long before it settles: the
+    // archive's date must come from it.
+    std::fs::write(
+        dir.join("funder").join(format!("{}.closing", cid.to_hex())),
+        format!("{at} 1700000000\n"),
+    )
+    .unwrap();
     bury(&[&p.funder, &p.acceptor], &chain);
     assert_eq!(p.funder.archived()[0].peer_owner, owner.to_hex());
+    assert_eq!(p.funder.archived()[0].closed_time, 1_700_000_000);
+    assert_eq!(p.funder.archived()[0].closed_height, Some(at));
     drop(p);
     let reloaded = one_manager([0xa7u8; 32], wallet, chain, &dir.join("funder"));
     assert_eq!(

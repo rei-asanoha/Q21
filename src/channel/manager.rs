@@ -207,6 +207,9 @@ pub struct ChannelSummary {
     /// Whether the peer's reestablish was answered on the current
     /// connection: until it is, no payment or close can start.
     pub synced: bool,
+    /// When the transaction that ends the channel was first seen confirmed,
+    /// in seconds since 1970, alongside [`Self::close_height`].
+    pub close_time: Option<u64>,
     /// The node id the channel is bound to, as its session authenticated it.
     pub peer_identity: String,
     /// The identity address (hex) the peer's session proved, as a contact
@@ -340,6 +343,10 @@ struct Chan {
     /// while the peer is offline and once the channel is archived. Display
     /// only: nothing the channel accepts depends on it.
     peer_owner: Option<Hash256>,
+    /// The height the transaction that ends the channel confirmed at, and
+    /// when this node first saw it there: the date the archives give the
+    /// close. Persisted beside the journal.
+    closing: Option<(u64, u64)>,
     capacity: u64,
     /// Whether the peer's reestablish has been received and answered on the
     /// current connection. Until it has, a message one side lost may still be
@@ -833,6 +840,7 @@ impl ChannelManager {
                 let peer_identity = self.read_peer_identity(cid);
                 let behind = self.behind_path(cid).exists();
                 let peer_owner = self.read_owner(cid);
+                let closing = self.read_closing(cid);
                 g.channels.insert(
                     cid,
                     Chan {
@@ -840,6 +848,7 @@ impl ChannelManager {
                         peer: u64::MAX,
                         peer_identity,
                         peer_owner,
+                        closing,
                         capacity,
                         synced: false,
                         close: None,
@@ -1212,10 +1221,48 @@ impl ChannelManager {
     }
 
     /// Records how a channel ended, once its last transaction confirmed at
-    /// `height`. Best effort: the archives fall back on the journal's date.
+    /// `height`, dated when that confirmation was first seen. Best effort:
+    /// the archives fall back on the journal's date.
     fn write_end(&self, cid: Hash256, height: u64, how: ClosedHow) {
-        let line = format!("{height} {} {}\n", unix_now(), how.as_str());
+        let time = self
+            .read_closing(cid)
+            .filter(|(h, _)| *h == height)
+            .map_or_else(unix_now, |(_, t)| t);
+        let line = format!("{height} {time} {}\n", how.as_str());
         let _ = crate::channel::journal::atomic_write(&self.end_path(cid), line.as_bytes());
+    }
+
+    /// The sidecar dating the confirmation of the transaction that ends a
+    /// channel: `height time`.
+    fn closing_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.closing", cid.to_hex()))
+    }
+
+    fn read_closing(&self, cid: Hash256) -> Option<(u64, u64)> {
+        let text = std::fs::read_to_string(self.closing_path(cid)).ok()?;
+        let mut it = text.split_ascii_whitespace();
+        let height = it.next()?.parse().ok()?;
+        let time = it.next()?.parse().ok()?;
+        Some((height, time))
+    }
+
+    /// Dates the confirmation of the transaction that ends a channel, the
+    /// first time it is seen at its height (again after a reorganization
+    /// moved it).
+    fn note_closing(&self, chan: &mut Chan) {
+        let Some(CloseTracker::Settling { height, .. }) = &chan.close else {
+            return;
+        };
+        let height = *height;
+        if chan.closing.is_some_and(|(h, _)| h == height) {
+            return;
+        }
+        let seen = (height, unix_now());
+        let _ = crate::channel::journal::atomic_write(
+            &self.closing_path(chan.machine.channel_id()),
+            format!("{} {}\n", seen.0, seen.1).as_bytes(),
+        );
+        chan.closing = Some(seen);
     }
 
     /// Appends the channel's latest state to its history once it has
@@ -1777,6 +1824,7 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 peer_owner,
+                closing: None,
                 capacity: pending.capacity,
                 synced: true,
                 close: None,
@@ -2078,6 +2126,7 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 peer_owner,
+                closing: None,
                 capacity: pending.capacity,
                 synced: true,
                 close: None,
@@ -2735,6 +2784,7 @@ impl ChannelManager {
                             cid.to_hex()
                         );
                         settle(chan, by, height);
+                        self.note_closing(chan);
                         if let Some((at, how)) = finish_settling(chan, height, self.network) {
                             self.write_end(cid, at, how);
                         }
@@ -2770,6 +2820,7 @@ impl ChannelManager {
                 Some(CloseTracker::Penalty { .. }) => self.advance_penalty(chan, txs, height),
                 Some(CloseTracker::Settling { .. }) | None => {}
             }
+            self.note_closing(chan);
             if let Some((at, how)) = finish_settling(chan, height, self.network) {
                 self.write_end(cid, at, how);
             }
@@ -3193,6 +3244,10 @@ fn summary(c: &Chan) -> ChannelSummary {
         we_funded: us == crate::channel::txbuild::FUNDER,
         force_close_fee: c.machine.commit_fee(FORCE_CLOSE_TIER),
         synced: c.synced,
+        close_time: match (&c.close, c.closing) {
+            (Some(CloseTracker::Settling { height, .. }), Some((h, t))) if *height == h => Some(t),
+            _ => None,
+        },
         peer_identity: c.peer_identity.clone(),
         peer_owner: c.peer_owner.map(|o| o.to_hex()).unwrap_or_default(),
         behind: c.behind,

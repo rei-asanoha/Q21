@@ -710,6 +710,13 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
                 None => Json::Null,
             },
         )
+        .set(
+            "close_time",
+            match s.close_time {
+                Some(t) => Json::u64(t),
+                None => Json::Null,
+            },
+        )
         .set("funding_depth", Json::u64(u64::from(s.funding_depth)))
         .set("delay", Json::u64(u64::from(s.delay)))
         .set("we_funded", Json::Bool(s.we_funded))
