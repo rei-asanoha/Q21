@@ -87,7 +87,7 @@ jobs:
           ls -la rel
           # What was checked: kept, to make sure it is still what gets
           # published.
-          jq -c '[.assets[] | {id, name, size, label: (.label // "")}] | sort_by(.name)' release.json > "$RUNNER_TEMP/checked.json"
+          jq -S -c '[.assets[] | {id, name, size, label: (.label // "")}] | sort_by(.name)' release.json > "$RUNNER_TEMP/checked.json"
           ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub attestations
           echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
           echo "RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
@@ -99,19 +99,22 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -eu
+          # `gh --jq` prints an object's keys in alphabetical order, jq in
+          # the order written: both sides go through `jq -S` before they
+          # are compared.
           assets() {
             gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-              --jq '[.assets[] | {id, name, size, label: (.label // "")}] | sort_by(.name)'
+              --jq '[.assets[] | {id, name, size, label: (.label // "")}] | sort_by(.name)' | jq -S -c .
           }
           # Unchanged since it was checked?
-          if [ "$(assets | jq -c .)" != "$(jq -c . "$RUNNER_TEMP/checked.json")" ]; then
+          if [ "$(assets)" != "$(jq -S -c . "$RUNNER_TEMP/checked.json")" ]; then
             echo "::error::the draft's files changed while it was being checked: run this workflow again"
             exit 1
           fi
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             -F draft=false -f make_latest=true > /dev/null
           # And still unchanged once public; otherwise, back to draft.
-          if [ "$(assets | jq -c .)" != "$(jq -c . "$RUNNER_TEMP/checked.json")" ]; then
+          if [ "$(assets)" != "$(jq -S -c . "$RUNNER_TEMP/checked.json")" ]; then
             gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=true > /dev/null
             echo "::error::the release's files changed as it was published: it is back to draft"
             exit 1
