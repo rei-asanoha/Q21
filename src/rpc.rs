@@ -246,10 +246,7 @@ fn automatic_fee(
     pending: &[(crate::tx::OutPoint, crate::tx::TxOut)],
 ) -> Result<FeeEstimate, crate::wallet::WalletError> {
     let scheme = g.scheme();
-    let rate = m
-        .median_fee_rate()
-        .unwrap_or(0)
-        .max(crate::mempool::MIN_FEE_RATE);
+    let rate = m.automatic_fee_rate();
     let mut fee = DEFAULT_FEE;
     for _ in 0..4 {
         let needed = total_out
@@ -714,6 +711,11 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
             },
         )
         .set("funding_depth", Json::u64(u64::from(s.funding_depth)))
+        .set("delay", Json::u64(u64::from(s.delay)))
+        .set("we_funded", Json::Bool(s.we_funded))
+        .set("force_close_fee", Json::u64(s.force_close_fee))
+        .set("synced", Json::Bool(s.synced))
+        .set("peer_identity", Json::str(s.peer_identity))
         .build()
 }
 
@@ -748,6 +750,12 @@ fn channel_terms(network: Network) -> Json {
             .set("close_fee", amount_json(Amount::from_units(CLOSE_FEE)))
             .set("delay_blocks", Json::u64(u64::from(t.default_delay)))
             .set("min_delay_blocks", Json::u64(u64::from(t.min_delay)))
+            // What this node accepts from a funder: its own default delay
+            // (see `ChannelManager::acceptor_min_delay`).
+            .set(
+                "accepted_min_delay_blocks",
+                Json::u64(u64::from(t.default_delay.max(t.min_delay))),
+            )
             .set("max_delay_blocks", Json::u64(u64::from(t.max_delay)))
             .set("funding_depth", Json::u64(u64::from(t.funding_depth)))
             .build()
@@ -757,6 +765,30 @@ fn channel_terms(network: Network) -> Json {
         let _ = network;
         Json::Null
     }
+}
+
+/// The optional `max_fee` of a call that spends: the fee, in units, the holder
+/// saw and confirmed. A fee above it is refused, never paid.
+fn max_fee_param(params: &Json) -> Result<Option<u64>, Json> {
+    match params.get("max_fee") {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'max_fee': an integer, in units")),
+    }
+}
+
+/// The refusal of a spend whose fee rose above what the holder confirmed.
+fn fee_rose(fee: u64, limit: u64) -> Json {
+    rpc_error(
+        ERR_REQUEST,
+        &format!(
+            "the fee is now {} Q21, more than the {} Q21 you confirmed: nothing was sent. Check it again",
+            Amount::from_units(fee),
+            Amount::from_units(limit)
+        ),
+    )
 }
 
 fn rpc_error(code: i64, message: &str) -> Json {
@@ -1245,6 +1277,14 @@ impl RpcContext {
             ("channellist", "[wallet] Open channels"),
             ("channelinfo", "[wallet] One channel's state (channel_id)"),
             (
+                "channelhistory",
+                "[wallet] The payments made in a channel, oldest first (channel_id)",
+            ),
+            (
+                "channelarchive",
+                "[wallet] Closed channels: what was put in, what came back, when",
+            ),
+            (
                 "channelidentity",
                 "[wallet] This wallet's identity: node id, identity address, names",
             ),
@@ -1513,6 +1553,59 @@ impl RpcContext {
         mgr.info(cid)
             .map(channel_json)
             .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))
+    }
+
+    /// The payments made in a channel, oldest first: when each settled and
+    /// how much our balance moved.
+    #[cfg(feature = "mldsa")]
+    fn channelhistory(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels()?;
+        let cid = self.channel_id_param(params)?;
+        Ok(Json::array(
+            mgr.history(cid)
+                .into_iter()
+                .map(|e| {
+                    let units = u64::try_from(e.delta.unsigned_abs()).unwrap_or(u64::MAX);
+                    Json::obj()
+                        .set("state", Json::u64(e.state))
+                        .set("time", Json::u64(e.time))
+                        .set(
+                            "direction",
+                            Json::str(if e.delta < 0 { "sent" } else { "received" }),
+                        )
+                        .set("amount", amount_json(Amount::from_units(units)))
+                        .build()
+                })
+                .collect(),
+        ))
+    }
+
+    /// Every closed channel, most recent first.
+    #[cfg(feature = "mldsa")]
+    fn channelarchive(&self) -> Result<Json, Json> {
+        let mgr = self.channels()?;
+        Ok(Json::array(
+            mgr.archived()
+                .into_iter()
+                .map(|a| {
+                    Json::obj()
+                        .set("channel_id", Json::str(a.channel_id.to_hex()))
+                        .set("peer_identity", Json::str(a.peer_identity))
+                        .set("capacity", Json::u64(a.capacity))
+                        .set("we_funded", Json::Bool(a.we_funded))
+                        .set("final_local", Json::u64(a.final_local))
+                        .set("final_remote", Json::u64(a.final_remote))
+                        .set("closed_time", Json::u64(a.closed_time))
+                        .set(
+                            "closed_height",
+                            a.closed_height.map(Json::u64).unwrap_or(Json::Null),
+                        )
+                        .set("how", Json::str(a.how.as_str()))
+                        .set("payments", Json::u64(a.payments as u64))
+                        .build()
+                })
+                .collect(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1900,26 +1993,58 @@ impl RpcContext {
                     "this wallet already holds {MAX_NAMES_PER_OWNER} names, the most allowed"
                 ));
             }
-            let rate = m
-                .median_fee_rate()
-                .unwrap_or(0)
-                .max(crate::mempool::MIN_FEE_RATE);
+            let rate = m.automatic_fee_rate();
             let mut coins = Self::identity_coins(&g, c, m, &owner);
             coins.truncate(MAX_IDENTITY_INPUTS);
             Ok((rate, coins))
         });
+        let (rate, mut coins) = match checked {
+            Ok(v) => v,
+            Err(e) => return Err(rpc_error(ERR_REQUEST, &e)),
+        };
+
+        // What it costs, before anything is spent: the price, destroyed; the
+        // fee of paying the identity what it lacks, if it lacks anything; the
+        // fee of the registration. Shown by a preview; held to by `max_fee`.
+        let have: u64 = coins.iter().map(|(_, o)| o.value.units()).sum();
+        let needs_funding = have < NAME_PRICE + Self::identity_tx_fee(rate, coins.len(), true);
+        let lack = (NAME_PRICE + Self::identity_tx_fee(rate, coins.len() + 1, true))
+            .saturating_sub(have)
+            .max(MIN_OUTPUT_VALUE);
+        let funding_fee = if needs_funding {
+            self.node
+                .with_chain_and_mempool(|c, m| automatic_fee(&g, c, m, lack, 1, &[]))
+                .map(|e| e.fee)
+                .map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?
+        } else {
+            0
+        };
         drop(g);
-        let (rate, mut coins) = checked.map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+        let registration_fee =
+            Self::identity_tx_fee(rate, coins.len() + usize::from(needs_funding), true);
+        let fees = funding_fee + registration_fee;
+        if matches!(params.get("preview"), Some(Json::Bool(true))) {
+            return Ok(Json::obj()
+                .set("preview", Json::Bool(true))
+                .set("name", Json::str(name))
+                .set("price", amount_json(Amount::from_units(NAME_PRICE)))
+                .set("fee", amount_json(Amount::from_units(fees)))
+                .set("total", amount_json(Amount::from_units(NAME_PRICE + fees)))
+                .build());
+        }
+        if let Some(limit) = max_fee_param(params)?.filter(|l| fees > *l) {
+            return Err(fee_rose(fees, limit));
+        }
 
         // 2. Pay the identity what it lacks, if anything.
-        let have: u64 = coins.iter().map(|(_, o)| o.value.units()).sum();
         let mut funding = None;
-        if have < NAME_PRICE + Self::identity_tx_fee(rate, coins.len(), true) {
-            let lack = (NAME_PRICE + Self::identity_tx_fee(rate, coins.len() + 1, true))
-                .saturating_sub(have)
-                .max(MIN_OUTPUT_VALUE);
-            let (ftx, ftxid, _) =
-                self.spend(w, &[(identity_address, Amount::from_units(lack))], None)?;
+        if needs_funding {
+            let (ftx, ftxid, _) = self.spend(
+                w,
+                &[(identity_address, Amount::from_units(lack))],
+                None,
+                None,
+            )?;
             self.node.announce_tx(ftxid);
             self.record_name_txs(w, &[ftxid]);
             let index = ftx
@@ -2037,17 +2162,14 @@ impl RpcContext {
     /// sent there by mistake, or left by a registration that did not go
     /// through. At most [`MAX_IDENTITY_INPUTS`] coins per call.
     #[cfg(feature = "mldsa")]
-    fn identitysweep(&self) -> Result<Json, Json> {
+    fn identitysweep(&self, params: &Json) -> Result<Json, Json> {
         let w = self.require_wallet()?;
         let (identity, owner) = self.wallet_identity()?;
         let g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
         let (rate, coins) = self.node.with_chain_and_mempool(|c, m| {
-            let rate = m
-                .median_fee_rate()
-                .unwrap_or(0)
-                .max(crate::mempool::MIN_FEE_RATE);
+            let rate = m.automatic_fee_rate();
             let mut coins = Self::identity_coins(&g, c, m, &owner);
             coins.truncate(MAX_IDENTITY_INPUTS);
             (rate, coins)
@@ -2067,6 +2189,17 @@ impl RpcContext {
                 ERR_REQUEST,
                 "what sits on the identity address is smaller than the fee to bring it back",
             ));
+        }
+        if matches!(params.get("preview"), Some(Json::Bool(true))) {
+            return Ok(Json::obj()
+                .set("preview", Json::Bool(true))
+                .set("amount", amount_json(Amount::from_units(back)))
+                .set("fee", amount_json(Amount::from_units(fee)))
+                .set("coins", Json::u64(coins.len() as u64))
+                .build());
+        }
+        if let Some(limit) = max_fee_param(params)?.filter(|l| fee > *l) {
+            return Err(fee_rose(fee, limit));
         }
         let to = self.fresh_wallet_address(w)?;
         let mut tx = Transaction {
@@ -2547,11 +2680,15 @@ impl RpcContext {
             #[cfg(feature = "mldsa")]
             "channelinfo" => self.channelinfo(params),
             #[cfg(feature = "mldsa")]
+            "channelhistory" => self.channelhistory(params),
+            #[cfg(feature = "mldsa")]
+            "channelarchive" => self.channelarchive(),
+            #[cfg(feature = "mldsa")]
             "channelidentity" => self.channelidentity(),
             #[cfg(feature = "mldsa")]
             "nameregister" => self.nameregister(params),
             #[cfg(feature = "mldsa")]
-            "identitysweep" => self.identitysweep(),
+            "identitysweep" => self.identitysweep(params),
             #[cfg(feature = "mldsa")]
             "namelist" => self.namelist(),
             #[cfg(feature = "mldsa")]
@@ -4493,7 +4630,7 @@ impl RpcContext {
 
         let (mempool_rate, pending_count) = self.node.with_mempool(|m| {
             let n = m.len() as u64;
-            let rate = m.median_fee_rate().unwrap_or(0);
+            let rate = m.automatic_fee_rate();
             (rate, n)
         });
         // The network floor, or the observed rate if it is higher.
@@ -4936,7 +5073,8 @@ impl RpcContext {
         let dest = Address::parse_on(address, self.network)
             .map_err(|e| rpc_error(ERR_PARAMS, &format!("invalid address: {e:?}")))?;
 
-        let (tx, txid, fee) = self.spend(w, &[(dest, Amount::from_units(units))], fee)?;
+        let max_fee = max_fee_param(params)?;
+        let (tx, txid, fee) = self.spend(w, &[(dest, Amount::from_units(units))], fee, max_fee)?;
 
         self.node.announce_tx(txid);
 
@@ -4983,6 +5121,7 @@ impl RpcContext {
         w: &Arc<Mutex<Wallet>>,
         destinations: &[(crate::address::Address, Amount)],
         fee: Option<u64>,
+        max_fee: Option<u64>,
     ) -> Result<(crate::tx::Transaction, crate::hash::Hash256, u64), Json> {
         let mut g = w
             .lock()
@@ -5071,6 +5210,12 @@ impl RpcContext {
             Some(e) => rpc_error(ERR_WALLET, wallet_message(&e)),
             None => rpc_error(ERR_WALLET, PENDING_FUNDS),
         })?;
+        // A fee above what the holder confirmed on the preview is refused,
+        // never paid: nothing is signed yet.
+        if let Some(limit) = max_fee.filter(|l| fee > *l) {
+            g.cancel_spend(prepare);
+            return Err(fee_rose(fee, limit));
+        }
 
         // 2. Write-ahead, outside the chain lock: the reserved indices reach
         //    the disk before the slightest signature exists. A failure signs
@@ -5120,25 +5265,49 @@ impl RpcContext {
                 )
             })? as usize,
         };
+        let preview = matches!(params.get("preview"), Some(Json::Bool(true)));
+        let max_fee = max_fee_param(params)?;
         let mut g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
         let scheme = g.scheme();
-        let prepared = self.node.with_chain_and_mempool(|c, m| {
-            let rate = m
-                .median_fee_rate()
-                .unwrap_or(0)
-                .max(crate::mempool::MIN_FEE_RATE);
-            let fee_for = |n: usize| {
+        let fee_for = |rate: u64| {
+            move |n: usize| {
                 let n = n as u64;
                 let base_size = 8 + n * 48 + 41;
                 let witness = n * (scheme.pubkey_len() as u64 + scheme.sig_len() as u64);
                 let weight = base_size * WITNESS_DISCOUNT + witness + WEIGHT_PER_OUTPUT;
                 weight.saturating_mul(rate).div_ceil(1000).max(DEFAULT_FEE)
-            };
-            g.prepare_consolidation(&c.utxo, c.height(), max_inputs, &|o| m.spends(o), &fee_for)
+            }
+        };
+        // The preview: what would be gathered and what it costs, nothing
+        // reserved, no address derived. The page shows it before the holder
+        // confirms; the confirmation then sends `max_fee`, so a fee that rose
+        // in between is refused rather than paid.
+        if preview {
+            let estimate = self.node.with_chain_and_mempool(|c, m| {
+                let f = fee_for(m.automatic_fee_rate());
+                g.consolidation_estimate(&c.utxo, c.height(), max_inputs, &|o| m.spends(o), &f)
+            });
+            let (coins, total, fee) =
+                estimate.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
+            return Ok(Json::obj()
+                .set("preview", Json::Bool(true))
+                .set("coins_gathered", Json::u64(coins as u64))
+                .set("total", amount_json(Amount::from_units(total)))
+                .set("amount", amount_json(Amount::from_units(total - fee)))
+                .set("fee", amount_json(Amount::from_units(fee)))
+                .build());
+        }
+        let prepared = self.node.with_chain_and_mempool(|c, m| {
+            let f = fee_for(m.automatic_fee_rate());
+            g.prepare_consolidation(&c.utxo, c.height(), max_inputs, &|o| m.spends(o), &f)
         });
         let (prepare, fee) = prepared.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
+        if let Some(limit) = max_fee.filter(|l| fee > *l) {
+            g.cancel_spend(prepare);
+            return Err(fee_rose(fee, limit));
+        }
         let inputs = prepare.indices().len() as u64;
         if self.save_wallet(&g).is_err() {
             g.cancel_spend(prepare);
@@ -5219,7 +5388,8 @@ impl RpcContext {
         // The same path as `sendtoaddress`. Before 0.4.5, a batch took coins
         // already spent by a pending send (refused as a double spend), and
         // sealed the wallet under the chain lock.
-        let (tx, txid, fee) = self.spend(w, &destinations, fee)?;
+        let max_fee = max_fee_param(params)?;
+        let (tx, txid, fee) = self.spend(w, &destinations, fee, max_fee)?;
 
         self.node.announce_tx(txid);
 
@@ -5622,6 +5792,87 @@ mod tests {
         assert_eq!(names, ["delbu", "second", "third"]);
         let bad = call(&c, "namecheck", r#"{"name":"ab"}"#);
         assert!(error_text(&bad).contains("not a valid name"));
+    }
+
+    /// The three actions that spend without an amount typed by the holder —
+    /// gathering coins, registering a name, bringing back what sits on the
+    /// identity address — show their fee first, spending nothing, and a fee
+    /// above the one confirmed is refused rather than paid. A plain send
+    /// holds to `max_fee` the same way.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn spends_show_their_fee_first_and_hold_to_it() {
+        let c = context_with_more_funds();
+        let units = |j: &Json, k: &str| {
+            j.get(k)
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| panic!("{k} in {}", j.encode()))
+        };
+        let pool = || c.node.with_mempool(|m| m.len());
+
+        // Gathering: the preview reserves nothing and sends nothing.
+        let before = pool();
+        let p = call_ok(&c, "consolidate", r#"{"preview":true}"#);
+        assert_eq!(p.get("preview"), Some(&Json::Bool(true)));
+        let fee = units(&p, "fee");
+        assert!(fee > 0);
+        assert_eq!(units(&p, "amount") + fee, units(&p, "total"));
+        assert_eq!(pool(), before, "a preview sends nothing");
+        let refused = call(&c, "consolidate", &format!(r#"{{"max_fee":{}}}"#, fee - 1));
+        assert!(
+            error_text(&refused).contains("nothing was sent"),
+            "{}",
+            refused.encode()
+        );
+        assert_eq!(pool(), before);
+        let done = call_ok(&c, "consolidate", &format!(r#"{{"max_fee":{fee}}}"#));
+        assert_eq!(units(&done, "fee"), fee, "what was shown is what was paid");
+        mine_pool(&c);
+
+        // A name: the price, destroyed, and the fees, before anything moves.
+        let before = pool();
+        let p = call_ok(&c, "nameregister", r#"{"name":"apercu","preview":true}"#);
+        assert_eq!(units(&p, "price"), NAME_PRICE);
+        let fees = units(&p, "fee");
+        assert_eq!(units(&p, "total"), NAME_PRICE + fees);
+        assert_eq!(pool(), before, "a preview funds nothing");
+        let refused = call(&c, "nameregister", r#"{"name":"apercu","max_fee":1}"#);
+        assert!(
+            error_text(&refused).contains("nothing was sent"),
+            "{}",
+            refused.encode()
+        );
+        assert_eq!(
+            pool(),
+            before,
+            "a refused registration funds nothing either"
+        );
+        call_ok(
+            &c,
+            "nameregister",
+            &format!(r#"{{"name":"apercu","max_fee":{fees}}}"#),
+        );
+
+        // A plain send holds to the fee it was shown.
+        let to = c
+            .wallet
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .new_address()
+            .to_string();
+        let refused = call(
+            &c,
+            "sendtoaddress",
+            &format!(r#"{{"address":"{to}","units":100000,"max_fee":1}}"#),
+        );
+        assert!(
+            error_text(&refused).contains("nothing was sent"),
+            "{}",
+            refused.encode()
+        );
     }
 
     /// A context whose wallet holds enough mature coins for several names.
@@ -6220,6 +6471,8 @@ mod tests {
             "channelclose",
             "channellist",
             "channelinfo",
+            "channelhistory",
+            "channelarchive",
         ] {
             assert!(names.contains(&m), "{m} must be listed");
         }
@@ -6402,6 +6655,8 @@ mod tests {
         for (m, p) in [
             ("channellist", "{}"),
             ("channelinfo", r#"{"channel_id":"00"}"#),
+            ("channelhistory", r#"{"channel_id":"00"}"#),
+            ("channelarchive", "{}"),
             ("channelopen", r#"{"peer":1,"capacity":1}"#),
             ("channelpay", r#"{"channel_id":"00","amount":1}"#),
             ("channelclose", r#"{"channel_id":"00"}"#),

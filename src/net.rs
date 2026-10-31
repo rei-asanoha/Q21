@@ -583,6 +583,13 @@ fn channel_link(network: Network, p: &Peer) -> bool {
 /// Channels are built from policy outputs: a peer that would read their
 /// funding as malformed cannot be one, whatever its user agent says. Every
 /// build that speaks the channel protocol 3 announces protocol 5.
+/// The user agent without the channel token: the program and its release, as
+/// the package names it. It stayed at `q21:0.4` from 0.4 to 0.5.2, which told
+/// an operator nothing about what a peer really runs.
+pub fn user_agent_base() -> String {
+    format!("q21:{}", env!("CARGO_PKG_VERSION"))
+}
+
 pub fn channel_capable(network: Network, version: u32, user_agent: &str) -> bool {
     crate::wire::user_agent_advertises_channels(user_agent) && follows_activation(network, version)
 }
@@ -2085,9 +2092,9 @@ impl Node {
     /// address the wallet connects from, through Tor or not.
     fn user_agent(&self, open: bool) -> String {
         if open && self.channels_enabled() {
-            format!("q21:0.4{}", crate::wire::CHANNELS_CAPABILITY)
+            format!("{}{}", user_agent_base(), crate::wire::CHANNELS_CAPABILITY)
         } else {
-            "q21:0.4".into()
+            user_agent_base()
         }
     }
 
@@ -6322,6 +6329,21 @@ mod tests {
             "and never marked handshaked"
         );
         a.shutdown();
+    }
+
+    /// The user agent names the release that runs, and a peer of an older
+    /// release that announced `q21:0.4` is still recognised by its token.
+    #[test]
+    fn the_user_agent_names_the_running_release() {
+        let base = user_agent_base();
+        assert_eq!(base, format!("q21:{}", env!("CARGO_PKG_VERSION")));
+        assert!(!base.contains('+'));
+        let ua = format!("{base}{}", crate::wire::CHANNELS_CAPABILITY);
+        assert!(crate::wire::user_agent_advertises_channels(&ua));
+        let v = crate::wire::POLICY_ACTIVATION_VERSION;
+        assert!(channel_capable(Network::Testnet, v, &ua));
+        let older = format!("q21:0.4{}", crate::wire::CHANNELS_CAPABILITY);
+        assert!(channel_capable(Network::Testnet, v, &older));
     }
 
     /// A channel peer advertises the channel protocol 3 and, on testnet,

@@ -67,6 +67,37 @@ pub const MIN_FEE_RATE: u64 = 10;
 /// more for it. Bitcoin Core calls this the incremental relay fee.
 pub const INCREMENTAL_FEE_RATE: u64 = MIN_FEE_RATE;
 
+/// The highest rate the wallet pays on its own, per thousand weight units:
+/// a hundred times the relay floor. Above it, only a rate the holder types
+/// himself.
+pub const MAX_AUTOMATIC_FEE_RATE: u64 = 100 * MIN_FEE_RATE;
+
+/// The weight [`Mempool::automatic_fee_rate`] reserves for the transaction
+/// being priced: an ordinary ML-DSA-87 payment, two inputs and two outputs.
+pub const TYPICAL_TX_WEIGHT: u64 = 20_000;
+
+/// The weight left aside in a block for its coinbase when estimating what
+/// still fits.
+pub const COINBASE_WEIGHT_RESERVE: u64 = 10_000;
+
+/// [`Mempool::next_block_fee_rate`] over `(rate, weight)` pairs: the relay
+/// floor while they all fit in a block beside `weight`, otherwise
+/// [`INCREMENTAL_FEE_RATE`] above the rate of the first that no longer fits.
+pub fn next_block_rate(mut rates: Vec<(u64, u64)>, weight: u64) -> u64 {
+    let room = crate::consensus::TARGET_BLOCK_WEIGHT
+        .saturating_sub(COINBASE_WEIGHT_RESERVE)
+        .saturating_sub(weight);
+    rates.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
+    let mut used = 0u64;
+    for (rate, w) in rates {
+        used = used.saturating_add(w);
+        if used > room {
+            return rate.saturating_add(INCREMENTAL_FEE_RATE).max(MIN_FEE_RATE);
+        }
+    }
+    MIN_FEE_RATE
+}
+
 /// Packages a full pool examines at most for one newcomer, cheapest first.
 /// See `Mempool::room_for`.
 pub const PACKAGE_CANDIDATES: usize = 256;
@@ -387,6 +418,39 @@ impl Mempool {
         let mut rates: Vec<u64> = self.entries.values().map(|e| e.fee_rate()).collect();
         rates.sort_unstable();
         Some(rates[rates.len() / 2])
+    }
+
+    /// The fee rate a transaction of `weight` needs to be in the next block:
+    /// the relay floor while the pool holds less than a block, otherwise just
+    /// above the cheapest transaction that would still fit beside it.
+    ///
+    /// # Why not the median (0.5.3)
+    ///
+    /// The automatic fee followed the median of the pending transactions.
+    /// On a quiet network, where the pool holds a few transactions, a single
+    /// one paying an enormous rate moved that median — and a consolidation of
+    /// a hundred coins then paid away much of what it gathered. What the
+    /// pool really asks of a newcomer is what it takes to get into the next
+    /// block, which a few expensive transactions do not change while there
+    /// is room.
+    pub fn next_block_fee_rate(&self, weight: u64) -> u64 {
+        next_block_rate(
+            self.entries
+                .values()
+                .map(|e| (e.fee_rate(), e.weight))
+                .collect(),
+            weight,
+        )
+    }
+
+    /// The rate the wallet pays when the holder does not choose one: what the
+    /// next block asks for an ordinary transaction, never below the relay
+    /// floor nor above [`MAX_AUTOMATIC_FEE_RATE`]. Past the cap, a
+    /// transaction waits for the congestion to pass rather than pay a rate
+    /// that anyone filling the pool could dictate.
+    pub fn automatic_fee_rate(&self) -> u64 {
+        self.next_block_fee_rate(TYPICAL_TX_WEIGHT)
+            .clamp(MIN_FEE_RATE, MAX_AUTOMATIC_FEE_RATE)
     }
 
     pub fn len(&self) -> usize {
@@ -1725,6 +1789,35 @@ mod tests {
         let mut plain = spent;
         plain.output.scheme = s;
         assert!(policy_locks_met(&plain, &w, 0));
+    }
+
+    /// A few expensive transactions on a quiet network no longer set the
+    /// automatic fee: while everything fits in the next block, the floor is
+    /// enough. Only a pool fuller than a block asks for more, and the
+    /// automatic rate never goes past its cap.
+    #[test]
+    fn the_automatic_fee_follows_the_next_block_not_the_median() {
+        let room = crate::consensus::TARGET_BLOCK_WEIGHT - COINBASE_WEIGHT_RESERVE;
+        // Quiet: three transactions, two at an enormous rate. The median of
+        // these is 1_000_000; the next block asks for the floor.
+        let quiet = vec![(1_000_000, 20_000), (1_000_000, 20_000), (10, 20_000)];
+        assert_eq!(next_block_rate(quiet, TYPICAL_TX_WEIGHT), MIN_FEE_RATE);
+        assert_eq!(next_block_rate(Vec::new(), TYPICAL_TX_WEIGHT), MIN_FEE_RATE);
+        // Full: a block's worth at 50, then more at 30. Getting in means
+        // beating the first that no longer fits.
+        let n = room / 20_000;
+        let mut full: Vec<(u64, u64)> = (0..n).map(|_| (50, 20_000)).collect();
+        full.extend((0..10).map(|_| (30, 20_000)));
+        assert_eq!(
+            next_block_rate(full.clone(), TYPICAL_TX_WEIGHT),
+            50 + INCREMENTAL_FEE_RATE
+        );
+        // Capped: a pool full of enormous rates does not drag the wallet
+        // along past the cap.
+        let costly: Vec<(u64, u64)> = (0..n + 5).map(|_| (5_000_000, 20_000)).collect();
+        assert!(next_block_rate(costly, TYPICAL_TX_WEIGHT) > MAX_AUTOMATIC_FEE_RATE);
+        assert_eq!(Mempool::new().automatic_fee_rate(), MIN_FEE_RATE);
+        assert_eq!(MAX_AUTOMATIC_FEE_RATE, 100 * MIN_FEE_RATE);
     }
 
     pub fn funded_chain(w: &mut Wallet, n: u64) -> Chain {

@@ -187,12 +187,13 @@ fn the_channel_capability_travels_without_an_id() {
         count: AtomicU64::new(0),
         last: Default::default(),
     }));
+    let base = format!("q21:{}", env!("CARGO_PKG_VERSION"));
     assert_eq!(
         introduced_as(&a, NET),
-        format!("q21:0.4{}", q21_core::wire::CHANNELS_CAPABILITY)
+        format!("{base}{}", q21_core::wire::CHANNELS_CAPABILITY)
     );
     a.shutdown();
     let plain = node();
-    assert_eq!(introduced_as(&plain, NET), "q21:0.4");
+    assert_eq!(introduced_as(&plain, NET), base);
     plain.shutdown();
 }

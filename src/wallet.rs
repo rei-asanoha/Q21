@@ -1826,6 +1826,49 @@ impl Wallet {
         avoid: &dyn Fn(&OutPoint) -> bool,
         fee_for: &dyn Fn(usize) -> u64,
     ) -> Result<(PreparedSpend, u64), WalletError> {
+        let (chosen, total) = self.consolidation_selection(utxo, height, max_inputs, avoid)?;
+        let fee = fee_for(chosen.len());
+        let value = total.saturating_sub(fee);
+        if value < crate::consensus::MIN_OUTPUT_VALUE {
+            return Err(WalletError::NothingToConsolidate);
+        }
+        let to = self.new_address();
+        let outputs = vec![TxOut {
+            value: Amount::from_units(value),
+            scheme: to.scheme,
+            pubkey_hash: to.hash,
+        }];
+        Ok((self.finish_prepare(chosen, outputs, height)?, fee))
+    }
+
+    /// What [`Self::prepare_consolidation`] would gather, with nothing
+    /// reserved and no address derived: the number of coins, their total and
+    /// the fee. For a preview shown before the holder confirms.
+    pub fn consolidation_estimate(
+        &self,
+        utxo: &UtxoSet,
+        height: u64,
+        max_inputs: usize,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+        fee_for: &dyn Fn(usize) -> u64,
+    ) -> Result<(usize, u64, u64), WalletError> {
+        let (chosen, total) = self.consolidation_selection(utxo, height, max_inputs, avoid)?;
+        let fee = fee_for(chosen.len());
+        if total.saturating_sub(fee) < crate::consensus::MIN_OUTPUT_VALUE {
+            return Err(WalletError::NothingToConsolidate);
+        }
+        Ok((chosen.len(), total, fee))
+    }
+
+    /// The coins a consolidation takes, smallest first, and their total.
+    #[allow(clippy::type_complexity)]
+    fn consolidation_selection(
+        &self,
+        utxo: &UtxoSet,
+        height: u64,
+        max_inputs: usize,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+    ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
         if !self.scheme.is_available() {
             return Err(WalletError::UnsupportedScheme(self.scheme));
         }
@@ -1861,18 +1904,7 @@ impl Wallet {
             .iter()
             .try_fold(0u64, |a, (_, o, _)| a.checked_add(o.value.units()))
             .ok_or(WalletError::AmountOutOfRange)?;
-        let fee = fee_for(chosen.len());
-        let value = total.saturating_sub(fee);
-        if value < crate::consensus::MIN_OUTPUT_VALUE {
-            return Err(WalletError::NothingToConsolidate);
-        }
-        let to = self.new_address();
-        let outputs = vec![TxOut {
-            value: Amount::from_units(value),
-            scheme: to.scheme,
-            pubkey_hash: to.hash,
-        }];
-        Ok((self.finish_prepare(chosen, outputs, height)?, fee))
+        Ok((chosen, total))
     }
 
     /// Gives up a prepared spend: the reserved indices become free again. To

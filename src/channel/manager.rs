@@ -195,6 +195,124 @@ pub struct ChannelSummary {
     /// The confirmations a funding waits for, also the depth a close is
     /// shown done at.
     pub funding_depth: u16,
+    /// The to-self delay of a forced close, in blocks: how long the side
+    /// that closes alone waits for its own funds, and how long the other side
+    /// has to come back online and punish a revoked state.
+    pub delay: u16,
+    /// Whether we funded the channel: the capacity came from our wallet.
+    pub we_funded: bool,
+    /// The fee a close without the peer pays ([`FORCE_CLOSE_TIER`]), from the
+    /// funder's side.
+    pub force_close_fee: u64,
+    /// Whether the peer's reestablish was answered on the current
+    /// connection: until it is, no payment or close can start.
+    pub synced: bool,
+    /// The node id the channel is bound to, as its session authenticated it.
+    pub peer_identity: String,
+}
+
+/// How a channel ended, as its last phase before it was marked closed tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClosedHow {
+    /// Both sides signed the final balances.
+    Cooperative,
+    /// A commitment was broadcast, by either side, and settled after its delay.
+    Forced,
+    /// A revoked commitment was broadcast and punished.
+    Penalty,
+    /// Closed before this was recorded (a journal from 0.5.2 or earlier).
+    Unknown,
+}
+
+impl ClosedHow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClosedHow::Cooperative => "cooperative",
+            ClosedHow::Forced => "forced",
+            ClosedHow::Penalty => "penalty",
+            ClosedHow::Unknown => "unknown",
+        }
+    }
+
+    fn parse(s: &str) -> ClosedHow {
+        match s {
+            "cooperative" => ClosedHow::Cooperative,
+            "forced" => ClosedHow::Forced,
+            "penalty" => ClosedHow::Penalty,
+            _ => ClosedHow::Unknown,
+        }
+    }
+}
+
+/// A closed channel, for the archives: what was put in, what came back, when.
+#[derive(Clone, Debug)]
+pub struct ArchivedChannel {
+    pub channel_id: Hash256,
+    pub peer_identity: String,
+    pub capacity: u64,
+    pub we_funded: bool,
+    /// Our balance in the last state, before any on-chain fee.
+    pub final_local: u64,
+    /// The counterparty's balance in the last state.
+    pub final_remote: u64,
+    /// When the channel was closed, in seconds since 1970: when the
+    /// transaction that ended it was seen confirmed; for a channel closed
+    /// before this was recorded, when its journal was last written.
+    pub closed_time: u64,
+    /// The height that transaction confirmed at, when recorded.
+    pub closed_height: Option<u64>,
+    pub how: ClosedHow,
+    /// Payments made in the channel, from its history.
+    pub payments: usize,
+}
+
+/// One payment in a channel's history: the state it settled in, when, and
+/// how much our balance moved (negative: we paid; positive: we were paid).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub state: u64,
+    pub time: u64,
+    pub delta: i128,
+}
+
+/// The time now, in seconds since 1970; 0 on a clock set before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parses a channel history: lines `state time balance`, in the order they
+/// were appended. A state appears once (the first line wins: a payment is
+/// dated when it settled), states are taken in order, and each entry is the
+/// move of our balance from the state before. `initial` is our balance in
+/// the first commitment. A malformed line is skipped: the history is a
+/// courtesy, never what the channel's funds depend on.
+pub fn parse_history(text: &str, initial: u64) -> Vec<HistoryEntry> {
+    let mut by_state: std::collections::BTreeMap<u64, (u64, u64)> = Default::default();
+    for line in text.lines() {
+        let mut it = line.split_ascii_whitespace();
+        let (Some(a), Some(b), Some(c), None) = (it.next(), it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(state), Ok(time), Ok(balance)) =
+            (a.parse::<u64>(), b.parse::<u64>(), c.parse::<u64>())
+        else {
+            continue;
+        };
+        by_state.entry(state).or_insert((time, balance));
+    }
+    let mut out = Vec::new();
+    let mut previous = initial;
+    for (state, (time, balance)) in by_state {
+        let delta = i128::from(balance) - i128::from(previous);
+        previous = balance;
+        if delta != 0 {
+            out.push(HistoryEntry { state, time, delta });
+        }
+    }
+    out
 }
 
 struct Chan {
@@ -232,6 +350,9 @@ struct Chan {
     /// its coins, with its height: once that is buried, the funding can never
     /// confirm and the channel is given up.
     conflict: Option<(Hash256, u64)>,
+    /// The last state written to the channel's history (see
+    /// [`ChannelManager::note_history`]).
+    logged: Option<u64>,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -299,6 +420,16 @@ pub const MAX_PENDING_PER_IDENTITY: usize = 2;
 /// [`ChannelManager::acceptor_index`]); below it they count the channels we
 /// open.
 const ACCEPTOR_INDEX_BASE: u32 = 0x8000_0000;
+
+/// The fee tier of every commitment we broadcast to close without the peer.
+/// The highest one: there is neither replacement nor child-pays-for-parent,
+/// so the version broadcast is the one that must get through a congested
+/// pool; the medium tier left funds frozen for as long as a congestion
+/// lasted. The funder's balance always covers it (the state machine refuses
+/// any state where it would not), and at the relay floor it costs a few
+/// thousand units.
+pub const FORCE_CLOSE_TIER: crate::channel::txbuild::FeeTier =
+    crate::channel::txbuild::FeeTier::High;
 
 /// Channels one peer may hold with this node at once, settled ones aside.
 pub const MAX_CHANNELS_PER_PEER: usize = 8;
@@ -374,6 +505,9 @@ struct Inner {
     /// (committed or answered, words not drawn yet). See
     /// [`VERIFY_WAIT_TIMEOUT`].
     verify_waiting: HashMap<u64, std::time::Instant>,
+    /// Channels found closed in their journals at start: no longer operated,
+    /// still shown, so a restart does not erase what the holder did.
+    archived: Vec<ArchivedChannel>,
 }
 
 impl Inner {
@@ -502,6 +636,7 @@ impl ChannelManager {
                 inbound_funding_ttl: INBOUND_FUNDING_TTL,
                 verifications: HashMap::new(),
                 verify_waiting: HashMap::new(),
+                archived: Vec::new(),
             }),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
@@ -605,6 +740,13 @@ impl ChannelManager {
             Ok(mut machine) => {
                 let _ = machine.note_key_index(index);
                 if matches!(machine.phase(), Phase::Closed) {
+                    // Not operated any more; kept for the archives, unless it
+                    // never reached the chain (an abandoned open moved no
+                    // funds and is no history).
+                    if self.reached_chain(&machine) {
+                        let entry = self.archived_entry(&machine, path);
+                        g.archived.push(entry);
+                    }
                     return;
                 }
                 let cid = machine.channel_id();
@@ -624,6 +766,7 @@ impl ChannelManager {
                         spend: None,
                         reserved: false,
                         conflict: None,
+                        logged: None,
                     },
                 );
             }
@@ -856,6 +999,13 @@ impl ChannelManager {
         *self.inner.lock().unwrap().spare_payout.get_or_insert(fresh)
     }
 
+    /// The shortest to-self delay we accept from a funder: our own default
+    /// delay, never below the network's floor.
+    pub fn acceptor_min_delay(&self) -> u16 {
+        let terms = crate::channel::terms(self.network);
+        self.default_delay.max(terms.min_delay).min(terms.max_delay)
+    }
+
     /// The key index of a channel we accept from a funder whose channel key
     /// is `funder_pubkey`: derived, not counted, so a Hello that never leads
     /// to a channel spends nothing. Keyed by our seed, so a funder cannot aim
@@ -906,6 +1056,140 @@ impl ChannelManager {
             &self.peer_identity_path(cid),
             identity.as_bytes(),
         );
+    }
+
+    /// The sidecar recording how and when a channel ended: `height time how`.
+    fn end_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.end", cid.to_hex()))
+    }
+
+    /// The sidecar listing the channel's settled states, one line each:
+    /// `state time our_balance`. Kept out of the journal, whose records the
+    /// channel's safety depends on; this one only tells the holder what
+    /// happened.
+    fn history_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.history", cid.to_hex()))
+    }
+
+    /// Records how a channel ended, once its last transaction confirmed at
+    /// `height`. Best effort: the archives fall back on the journal's date.
+    fn write_end(&self, cid: Hash256, height: u64, how: ClosedHow) {
+        let line = format!("{height} {} {}\n", unix_now(), how.as_str());
+        let _ = crate::channel::journal::atomic_write(&self.end_path(cid), line.as_bytes());
+    }
+
+    /// Appends the channel's latest state to its history once it has
+    /// settled: no update in flight, and a state not written yet.
+    fn note_history(&self, chan: &mut Chan) {
+        if chan.machine.update_in_flight() {
+            return;
+        }
+        let Some(state) = chan.machine.local_commit_number() else {
+            return;
+        };
+        if chan.logged.is_some_and(|l| l >= state) {
+            return;
+        }
+        let us = chan.machine.our_index();
+        let balance = chan.machine.latest_balances()[us];
+        let line = format!("{state} {} {balance}\n", unix_now());
+        let path = self.history_path(chan.machine.channel_id());
+        use std::io::Write;
+        let ok = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .is_ok();
+        if ok {
+            chan.logged = Some(state);
+        }
+    }
+
+    /// Our balance when the channel opened: the whole capacity for the
+    /// funder, nothing for the acceptor.
+    fn initial_balance(machine: &Machine) -> u64 {
+        if machine.our_index() == crate::channel::txbuild::FUNDER {
+            machine.params().capacity.units()
+        } else {
+            0
+        }
+    }
+
+    /// The payments made in a channel, oldest first.
+    pub fn history(&self, cid: Hash256) -> Vec<HistoryEntry> {
+        let initial = {
+            let g = self.inner.lock().unwrap();
+            match g.channels.get(&cid) {
+                Some(c) => Self::initial_balance(&c.machine),
+                None => match g.archived.iter().find(|a| a.channel_id == cid) {
+                    Some(a) if a.we_funded => a.capacity,
+                    Some(_) => 0,
+                    None => return Vec::new(),
+                },
+            }
+        };
+        let text = std::fs::read_to_string(self.history_path(cid)).unwrap_or_default();
+        parse_history(&text, initial)
+    }
+
+    /// The archive entry of a closed channel reopened from `path`.
+    fn archived_entry(&self, machine: &Machine, path: &std::path::Path) -> ArchivedChannel {
+        let cid = machine.channel_id();
+        let us = machine.our_index();
+        let bal = machine.latest_balances();
+        let end = std::fs::read_to_string(self.end_path(cid)).ok();
+        let mut fields = end.as_deref().unwrap_or("").split_ascii_whitespace();
+        let height = fields.next().and_then(|v| v.parse::<u64>().ok());
+        let time = fields.next().and_then(|v| v.parse::<u64>().ok());
+        let how = fields
+            .next()
+            .map(ClosedHow::parse)
+            .unwrap_or(ClosedHow::Unknown);
+        let time = time.unwrap_or_else(|| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+        let history = std::fs::read_to_string(self.history_path(cid)).unwrap_or_default();
+        ArchivedChannel {
+            channel_id: cid,
+            peer_identity: self.read_peer_identity(cid),
+            capacity: machine.params().capacity.units(),
+            we_funded: us == crate::channel::txbuild::FUNDER,
+            final_local: bal[us],
+            final_remote: bal[1 - us],
+            closed_time: time,
+            closed_height: height,
+            how,
+            payments: parse_history(&history, Self::initial_balance(machine)).len(),
+        }
+    }
+
+    /// Whether a closed channel ever held funds on chain: its funding was seen
+    /// confirmed, or its end was recorded. An open given up before its
+    /// funding confirmed moved nothing, and has no place in the archives.
+    fn reached_chain(&self, machine: &Machine) -> bool {
+        machine.funding_height().is_some() || self.end_path(machine.channel_id()).exists()
+    }
+
+    /// Every closed channel: those found closed at start, and those closed
+    /// since, most recent first.
+    pub fn archived(&self) -> Vec<ArchivedChannel> {
+        let g = self.inner.lock().unwrap();
+        let mut out = g.archived.clone();
+        for c in g.channels.values() {
+            if c.machine.phase() == Phase::Closed && self.reached_chain(&c.machine) {
+                out.push(
+                    self.archived_entry(&c.machine, &self.journal_path(c.machine.channel_id())),
+                );
+            }
+        }
+        out.sort_by_key(|a| std::cmp::Reverse(a.closed_time));
+        out
     }
 
     fn read_peer_identity(&self, cid: Hash256) -> String {
@@ -1191,7 +1475,13 @@ impl ChannelManager {
             KIND_VERIFY => self.on_verify(peer, from.binding, body),
             KIND_ENGINE => {
                 let msg = ChMsg::decode(body).map_err(|_| "bad engine message")?;
-                self.on_engine(from, cid, msg)
+                let out = self.on_engine(from, cid, msg);
+                // A payment settles on a message from the peer: whatever this
+                // one completed goes into the channel's history.
+                if let Some(chan) = self.inner.lock().unwrap().channels.get_mut(&cid) {
+                    self.note_history(chan);
+                }
+                out
             }
             _ => Err("unknown frame kind".into()),
         }
@@ -1212,6 +1502,14 @@ impl ChannelManager {
         let delay = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
         let depth = u16::from_le_bytes([r.u8().map_err(|_| "d")?, r.u8().map_err(|_| "d")?]);
         let funder_payout = Hash256(r.array32().map_err(|_| "payout")?);
+        // The funder chooses the to-self delay, and the delay is how long we
+        // may stay offline before a revoked state of theirs can no longer be
+        // punished. We accept no less than what we would ask ourselves: the
+        // network's floor (720 blocks on testnet, about a day) left whoever
+        // accepted a channel a single day offline, and nothing told them.
+        if delay < self.acceptor_min_delay() {
+            return Ok(Vec::new());
+        }
         // Bounded: opens in progress across all peers and per announced
         // identity (one per connection, by construction), and channels per
         // peer. Beyond any of them the Hello is not answered — the funder's
@@ -1325,6 +1623,7 @@ impl ChannelManager {
                 spend: None,
                 reserved: false,
                 conflict: None,
+                logged: None,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
@@ -1572,6 +1871,7 @@ impl ChannelManager {
                 spend: None,
                 reserved: false,
                 conflict: None,
+                logged: None,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
@@ -1941,12 +2241,7 @@ impl ChannelManager {
                             }
                             Phase::Forcing => {
                                 let latest = c.machine.local_commit_number().and_then(|n| {
-                                    c.machine
-                                        .signed_commitment_at(
-                                            n,
-                                            crate::channel::txbuild::FeeTier::Medium,
-                                        )
-                                        .ok()
+                                    c.machine.signed_commitment_at(n, FORCE_CLOSE_TIER).ok()
                                 });
                                 if let Some(tx) = latest {
                                     pending.push((tx, "commitment"));
@@ -2226,7 +2521,9 @@ impl ChannelManager {
                             cid.to_hex()
                         );
                         settle(chan, by, height);
-                        finish_settling(chan, height, self.network);
+                        if let Some((at, how)) = finish_settling(chan, height, self.network) {
+                            self.write_end(cid, at, how);
+                        }
                         continue;
                     }
                     // `Older(D)` is satisfied once the chain is `D` blocks past
@@ -2259,7 +2556,9 @@ impl ChannelManager {
                 Some(CloseTracker::Penalty { .. }) => self.advance_penalty(chan, txs, height),
                 Some(CloseTracker::Settling { .. }) | None => {}
             }
-            finish_settling(chan, height, self.network);
+            if let Some((at, how)) = finish_settling(chan, height, self.network) {
+                self.write_end(cid, at, how);
+            }
         }
     }
 
@@ -2424,10 +2723,7 @@ impl ChannelManager {
     pub fn force_close(&self, cid: Hash256) -> Result<Transaction, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
-        let tx = chan
-            .machine
-            .force_close(crate::channel::txbuild::FeeTier::Medium)
-            .map_err(err)?;
+        let tx = chan.machine.force_close(FORCE_CLOSE_TIER).map_err(err)?;
         drop(g);
         (self.hooks.broadcast)(&tx)?;
         Ok(tx)
@@ -2538,14 +2834,26 @@ pub fn settle_depth(network: Network, funding_depth: u16) -> u64 {
 
 /// Marks a settling channel closed once its last transaction is buried to
 /// [`settle_depth`] at chain height `height`.
-fn finish_settling(chan: &mut Chan, height: u64, network: Network) {
+///
+/// Returns the height the channel's last transaction confirmed at and how
+/// the channel ended, when it is marked closed now.
+fn finish_settling(chan: &mut Chan, height: u64, network: Network) -> Option<(u64, ClosedHow)> {
     if let Some(CloseTracker::Settling { height: at, .. }) = &chan.close {
-        let depth = height.saturating_add(1).saturating_sub(*at);
+        let at = *at;
+        let depth = height.saturating_add(1).saturating_sub(at);
         if depth >= settle_depth(network, chan.machine.funding_depth()) {
+            let how = match chan.machine.phase() {
+                Phase::Closing => ClosedHow::Cooperative,
+                Phase::Penalised => ClosedHow::Penalty,
+                Phase::Forcing => ClosedHow::Forced,
+                _ => ClosedHow::Unknown,
+            };
             let _ = chan.machine.mark_closed();
             chan.close = None;
+            return Some((at, how));
         }
     }
+    None
 }
 
 fn summary(c: &Chan) -> ChannelSummary {
@@ -2572,6 +2880,11 @@ fn summary(c: &Chan) -> ChannelSummary {
             _ => None,
         },
         funding_depth: c.machine.funding_depth(),
+        delay: c.machine.params().delay,
+        we_funded: us == crate::channel::txbuild::FUNDER,
+        force_close_fee: c.machine.commit_fee(FORCE_CLOSE_TIER),
+        synced: c.synced,
+        peer_identity: c.peer_identity.clone(),
     }
 }
 

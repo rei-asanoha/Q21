@@ -3181,3 +3181,135 @@ fn a_channel_journaled_by_0_4_10_rebinds_through_the_legacy_ids() {
     p.pump();
     assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 1_000);
 }
+
+/// 0.5.3: the payments of a channel are kept as they settle, both sides see
+/// them, and a closed channel stays in the archives — with what was put in,
+/// what came back and how it ended — after a restart, when it is no longer
+/// operated.
+#[test]
+fn history_and_archives_survive_a_restart() {
+    use q21_core::channel::manager::ClosedHow;
+    let (mut p, wallet, chain, dir, cid, capacity) =
+        open_channel([0xa3u8; 32], [0xb4u8; 32], "history-archive");
+    for (from_funder, amount) in [(true, 1_000_000u64), (true, 500_000), (false, 400_000)] {
+        let (frame, to) = if from_funder {
+            (p.funder.pay(cid, amount).unwrap(), 1)
+        } else {
+            (p.acceptor.pay(cid, amount).unwrap(), 0)
+        };
+        p.queue.push_back((to, frame));
+        p.pump();
+    }
+    let deltas =
+        |m: &ChannelManager| -> Vec<i128> { m.history(cid).iter().map(|e| e.delta).collect() };
+    assert_eq!(deltas(&p.funder), [-1_000_000, -500_000, 400_000]);
+    assert_eq!(deltas(&p.acceptor), [1_000_000, 500_000, -400_000]);
+    assert!(p
+        .funder
+        .history(cid)
+        .windows(2)
+        .all(|w| w[0].state < w[1].state));
+    assert!(
+        p.funder.archived().is_empty(),
+        "an open channel is not archived"
+    );
+
+    let close = p.funder.close(cid).unwrap().expect("a close frame");
+    p.queue.push_back((1, close));
+    p.pump();
+    drive(&p.funder, &chain);
+    drive(&p.acceptor, &chain);
+    bury(&[&p.funder, &p.acceptor], &chain);
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
+    let check = |a: &q21_core::channel::manager::ArchivedChannel, funder: bool| {
+        assert_eq!(a.channel_id, cid);
+        assert_eq!(a.capacity, capacity);
+        assert_eq!(a.we_funded, funder);
+        let (mine, theirs) = (capacity - 1_100_000, 1_100_000);
+        assert_eq!(a.final_local, if funder { mine } else { theirs });
+        assert_eq!(a.final_remote, if funder { theirs } else { mine });
+        assert_eq!(a.how, ClosedHow::Cooperative);
+        assert!(a.closed_height.is_some());
+        assert!(a.closed_time > 1_700_000_000, "dated by the clock");
+        assert_eq!(a.payments, 3);
+    };
+    let live = p.funder.archived();
+    assert_eq!(live.len(), 1);
+    check(&live[0], true);
+    check(&p.acceptor.archived()[0], false);
+
+    // A restart no longer loads the channel, and the archives still have it.
+    drop(p);
+    let reloaded = one_manager([0xa3u8; 32], wallet, chain, &dir.join("funder"));
+    assert!(
+        reloaded.info(cid).is_none(),
+        "a closed channel is not reloaded"
+    );
+    let archived = reloaded.archived();
+    assert_eq!(archived.len(), 1);
+    check(&archived[0], true);
+    assert_eq!(reloaded.history(cid).len(), 3, "its history is kept too");
+}
+
+/// 0.5.3: a close without the peer broadcasts the highest fee tier, so that
+/// it gets through a congested pool (there is no way to bump it later), and
+/// the summary says what it costs before the holder decides.
+#[test]
+fn a_close_without_the_peer_pays_the_high_tier() {
+    use q21_core::channel::txbuild::FeeTier;
+    let (mut p, _wallet, chain, _dir, cid, capacity) =
+        open_channel([0xa5u8; 32], [0xb6u8; 32], "force-high");
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    let shown = p.funder.info(cid).unwrap().force_close_fee;
+    assert_eq!(
+        shown,
+        p.acceptor.info(cid).unwrap().force_close_fee,
+        "both sides agree"
+    );
+    let tx = p.funder.force_close(cid).unwrap();
+    let out: u64 = tx.outputs.iter().map(|o| o.value.units()).sum();
+    assert_eq!(capacity - out, shown, "the fee paid is the fee shown");
+    let low = q21_core::channel::txbuild::tier_rate(RATE, FeeTier::Low);
+    let high = q21_core::channel::txbuild::tier_rate(RATE, FeeTier::High);
+    assert_eq!(high, 16 * low);
+    assert_eq!(
+        q21_core::channel::manager::FORCE_CLOSE_TIER as u8,
+        FeeTier::High as u8
+    );
+    drive(&p.funder, &chain);
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Forcing);
+}
+
+/// 0.5.3: the funder chooses the to-self delay, and it is how long the
+/// acceptor may stay offline before a revoked state can no longer be
+/// punished. An acceptor takes no less than its own default: a shorter one is
+/// not answered, and no channel exists on either side.
+#[test]
+fn an_acceptor_refuses_a_delay_shorter_than_its_own() {
+    let funder_seed = [0xa7u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("acceptor-delay");
+    let mut p = managers(
+        funder_seed,
+        [0xb8u8; 32],
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    assert_eq!(p.acceptor.acceptor_min_delay(), DELAY);
+    let short = q21_core::channel::terms(NET).min_delay;
+    assert!(short < DELAY);
+    let hello = p.funder.open(A_PEER, 3_000_000, Some(short), None).unwrap();
+    let r = p.acceptor.deliver(F_PEER, &hello);
+    assert!(r.frames.is_empty(), "not answered");
+    assert_eq!(r.penalize, 0, "a short delay is a choice, not misconduct");
+    assert!(p.acceptor.list().is_empty() && p.funder.list().is_empty());
+    let hello = p.funder.open(A_PEER, 3_000_000, Some(DELAY), None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    assert_eq!(p.acceptor.list().len(), 1, "its own delay is accepted");
+    assert_eq!(p.acceptor.list()[0].delay, DELAY);
+}

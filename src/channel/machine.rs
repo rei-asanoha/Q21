@@ -487,7 +487,8 @@ impl Machine {
 
     // --- Fees ----------------------------------------------------------------
 
-    fn commit_fee(&self, tier: FeeTier) -> u64 {
+    /// The fee a commitment at `tier` pays, from the funder's side.
+    pub fn commit_fee(&self, tier: FeeTier) -> u64 {
         txbuild::commitment_fee(&self.params, txbuild::tier_rate(self.base_fee_rate, tier))
     }
 
