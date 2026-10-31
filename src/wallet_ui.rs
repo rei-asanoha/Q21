@@ -4045,9 +4045,11 @@ function panelChannelBody(ch, c){
         <p>When the other side reconnects, or when its holder closes it, the channel closes with its latest balances, and your share comes back to your balance by itself. Leave this wallet open until then.</p>
       </div>`;
   }
+  // While the note of the opening says it, the panel does not say it a
+  // second time; the other side, which has no note, reads it here.
   if (phase === "opening" || phase === "funded"){
-    return panelHead("Private channel", "", who, mark) +
-      `<p>${esc(channelDepthText())}</p>`;
+    const why = openNoted ? "" : `<p>${esc(channelDepthText())}</p>`;
+    return panelHead("Private channel", "", who, mark) + html(why);
   }
   if (phase === "open"){
     const can = channelSendable(ch);
@@ -4129,7 +4131,8 @@ function paintPanel(){
   paintSteps(c || (ch ? contactOfChannel(ch) : null));
   const tip = lastHeight !== null ? String(lastHeight) : "";
   const key = JSON.stringify([LANG, c, ch, ch ? channelPeers.some(p => String(p.id) === String(ch.peer)) : null,
-                              c ? !!contactPeer(c) : null, removeAsked, ch && String(ch.phase) !== "open" ? tip : ""]);
+                              c ? !!contactPeer(c) : null, removeAsked, ch && String(ch.phase) !== "open" ? tip : "",
+                              openNoted !== 0]);
   const canOpen = !!(c && !ch && c.connected && c.verified && contactPeer(c));
   document.getElementById("channel-open-card").hidden = !canOpen || !!preparedOpen;
   if (!canOpen && preparedOpen) showOpenForm();
@@ -7904,6 +7907,13 @@ mod tests {
         assert!(channel_function("function paintContacts(")
             .contains("if (key === contactsKey) return;"));
         assert!(paint.contains("if (key === panelKey) return;"));
+        // An opening is explained once: in the note for the side that asked,
+        // in the panel for the other.
+        let body = channel_function("function panelChannelBody(");
+        assert!(
+            body.contains(r#"const why = openNoted ? "" : `<p>${esc(channelDepthText())}</p>`;"#)
+        );
+        assert!(paint.contains("openNoted !== 0]);"));
         // One message at a time, and a success leaves by itself.
         let note = channel_function("function channelNote(");
         assert!(note.contains("clearTimeout(noteTimer);"));
