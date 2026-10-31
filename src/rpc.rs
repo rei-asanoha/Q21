@@ -2965,6 +2965,31 @@ impl RpcContext {
             // Blocks from two peers or more refused for lying in this
             // computer's future, within the hour: its clock is probably late,
             // by at least this many seconds. Null without such a sign.
+            // The rule that a block comes strictly after its parent: from which
+            // height, and whether the next block is under it. Lets an operator
+            // check, before the height, that every node runs a release that
+            // knows it.
+            .set("block_time_rule", {
+                let from = crate::validate::strict_time_activation(self.network);
+                Json::obj()
+                    .set(
+                        "activation_height",
+                        if from == u64::MAX {
+                            Json::Null
+                        } else {
+                            Json::u64(from)
+                        },
+                    )
+                    .set(
+                        "active",
+                        Json::Bool(crate::validate::strict_time_at(self.network, height + 1)),
+                    )
+                    .set(
+                        "last_anchor_height",
+                        Json::u64(crate::validate::last_anchor_height(self.network)),
+                    )
+                    .build()
+            })
             .set(
                 "clock_behind_seconds",
                 crate::net::clock_behind()
@@ -6774,6 +6799,28 @@ mod tests {
         assert_eq!(n("min_delay_blocks"), Some(720));
         assert_eq!(n("max_delay_blocks"), Some(2_016));
         assert_eq!(n("funding_depth"), Some(6));
+    }
+
+    /// `getinfo` says from which height a block must come after its parent,
+    /// and whether the next one does: what an operator checks on every node
+    /// before that height.
+    #[test]
+    fn getinfo_states_the_block_time_rule() {
+        let r = call_ok(&context_on(Network::Testnet), "getinfo", "{}");
+        let rule = r.get("block_time_rule").cloned().expect("the rule");
+        assert_eq!(
+            rule.get("activation_height").and_then(|v| v.as_u64()),
+            Some(crate::consensus::STRICT_TIME_ACTIVATION_TESTNET)
+        );
+        assert_eq!(
+            rule.get("active"),
+            Some(&Json::Bool(false)),
+            "a new chain is below it"
+        );
+        assert!(rule
+            .get("last_anchor_height")
+            .and_then(|v| v.as_u64())
+            .is_some());
     }
 
     /// `getinfo` states the terms of a channel, so that the wallet page checks

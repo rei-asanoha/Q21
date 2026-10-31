@@ -224,6 +224,7 @@ fn no_block_crosses_the_absolute_cap() {
         height,
         prev_id: c.tip_id(),
         recent_times: &times,
+        parent_time: Some(t - 1),
         expected_bits: INITIAL_BITS,
         now: t + 1,
         ancestors: &anc,

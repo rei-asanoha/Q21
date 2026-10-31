@@ -53,6 +53,17 @@ pub enum ValidationError {
         limit: u64,
         received: u64,
     },
+    /// Not strictly after its parent, where [`strict_time_at`] requires it.
+    TimestampNotAfterParent {
+        parent: u64,
+        received: u64,
+    },
+
+    // --- Anchors ---
+    /// At a height the release anchors, a block other than the anchored one.
+    NotTheAnchor {
+        height: u64,
+    },
 
     // --- Size ---
     BlockTooLarge {
@@ -178,6 +189,170 @@ impl From<PowError> for ValidationError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Block time strictly after the parent
+// ---------------------------------------------------------------------------
+
+/// The height from which a block's timestamp must be strictly greater than
+/// its parent's on `network` ([`STRICT_TIME_ACTIVATION_TESTNET`] and the
+/// others). `u64::MAX`: never. An audit build's tests may move it on regtest.
+pub fn strict_time_activation(network: Network) -> u64 {
+    #[cfg(feature = "audit")]
+    if let Some(h) = audit_rules::strict_time(network) {
+        return h;
+    }
+    match network {
+        Network::Mainnet => STRICT_TIME_ACTIVATION_MAINNET,
+        Network::Testnet => STRICT_TIME_ACTIVATION_TESTNET,
+        Network::Regtest => STRICT_TIME_ACTIVATION_REGTEST,
+    }
+}
+
+/// Must a block at `height` on `network` be dated strictly after its parent?
+pub fn strict_time_at(network: Network, height: u64) -> bool {
+    height >= strict_time_activation(network)
+}
+
+/// The rule itself, shared by a block's validation and a header's check.
+pub fn check_after_parent(
+    network: Network,
+    height: u64,
+    parent_time: Option<u64>,
+    time: u64,
+) -> Result<(), ValidationError> {
+    match parent_time {
+        Some(parent) if strict_time_at(network, height) && time <= parent => {
+            Err(ValidationError::TimestampNotAfterParent {
+                parent,
+                received: time,
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anchors
+// ---------------------------------------------------------------------------
+
+/// Blocks of the real chain this release vouches for: at each height, the
+/// one block id a chain may carry there.
+///
+/// # Why
+///
+/// A node that starts for the first time knows nothing of the chain, and
+/// trusts the one with the most work its peers show it. A peer alone with it
+/// for its first hour could hand it a cheap chain of its own, which finality
+/// then bound for good; and a false branch deeper than the undo window could
+/// never be left. An anchored height closes both: no chain without the
+/// anchored block there can pass it, and finality never binds below the last
+/// anchor (see [`crate::chain::Chain::finality_binds`]).
+///
+/// The ids are those of the testnet's own blocks, read on its explorer when
+/// the release was prepared, each buried far below the undo window.
+pub const ANCHORS_TESTNET: &[(u64, &str)] = &[];
+
+/// The anchors of `network`, as heights and block ids, lowest first.
+pub fn anchors(network: Network) -> Vec<(u64, crate::hash::Hash256)> {
+    #[cfg(feature = "audit")]
+    if let Some(v) = audit_rules::anchors(network) {
+        return v;
+    }
+    let table: &[(u64, &str)] = match network {
+        Network::Testnet => ANCHORS_TESTNET,
+        Network::Mainnet | Network::Regtest => &[],
+    };
+    table
+        .iter()
+        .map(|(h, id)| {
+            (
+                *h,
+                crate::hash::Hash256::from_hex(id).expect("an anchor is a block id"),
+            )
+        })
+        .collect()
+}
+
+/// The highest anchored height of `network`, 0 without anchors.
+pub fn last_anchor_height(network: Network) -> u64 {
+    anchors(network).last().map_or(0, |(h, _)| *h)
+}
+
+/// A block at an anchored height must be the anchored block.
+pub fn check_anchor(
+    network: Network,
+    height: u64,
+    id: &crate::hash::Hash256,
+) -> Result<(), ValidationError> {
+    match anchors(network).iter().find(|(h, _)| *h == height) {
+        Some((_, expected)) if expected != id => Err(ValidationError::NotTheAnchor { height }),
+        _ => Ok(()),
+    }
+}
+
+/// Moves the strict block time activation of regtest or testnet for this
+/// process. Audit builds only, never mainnet; set once per process and
+/// network.
+#[cfg(feature = "audit")]
+pub fn audit_set_strict_time_activation(network: Network, height: u64) {
+    audit_rules::set_strict_time(network, height);
+}
+
+/// Replaces the anchors of regtest for this process. Audit builds only.
+#[cfg(feature = "audit")]
+pub fn audit_set_anchors(network: Network, anchors: Vec<(u64, crate::hash::Hash256)>) {
+    audit_rules::set_anchors(network, anchors);
+}
+
+#[cfg(feature = "audit")]
+mod audit_rules {
+    use crate::address::Network;
+    use crate::hash::Hash256;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static STRICT_TESTNET: AtomicU64 = AtomicU64::new(0);
+    static STRICT_REGTEST: AtomicU64 = AtomicU64::new(0);
+    static ANCHORS_REGTEST: Mutex<Option<Vec<(u64, Hash256)>>> = Mutex::new(None);
+
+    fn slot(network: Network) -> Option<&'static AtomicU64> {
+        match network {
+            Network::Mainnet => None,
+            Network::Testnet => Some(&STRICT_TESTNET),
+            Network::Regtest => Some(&STRICT_REGTEST),
+        }
+    }
+
+    pub fn strict_time(network: Network) -> Option<u64> {
+        match slot(network)?.load(Ordering::SeqCst) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    pub fn set_strict_time(network: Network, height: u64) {
+        assert!(height >= 1, "the genesis has no parent");
+        let slot = slot(network).expect("mainnet keeps its rule");
+        match slot.compare_exchange(0, height, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {}
+            Err(h) if h == height => {}
+            Err(h) => panic!("{network:?} strict time already moved to {h}, not {height}"),
+        }
+    }
+
+    pub fn anchors(network: Network) -> Option<Vec<(u64, Hash256)>> {
+        match network {
+            Network::Regtest => ANCHORS_REGTEST.lock().unwrap().clone(),
+            _ => None,
+        }
+    }
+
+    pub fn set_anchors(network: Network, anchors: Vec<(u64, Hash256)>) {
+        assert!(network == Network::Regtest, "only regtest's anchors move");
+        *ANCHORS_REGTEST.lock().unwrap() = Some(anchors);
+    }
+}
+
 /// Context needed to validate a block: what the chain already knows.
 pub struct BlockContext<'a> {
     pub network: Network,
@@ -185,6 +360,9 @@ pub struct BlockContext<'a> {
     pub prev_id: crate::hash::Hash256,
     /// Timestamps of the last `MEDIAN_TIME_SPAN` blocks, in any order.
     pub recent_times: &'a [u64],
+    /// The parent's timestamp: a block must come strictly after it from the
+    /// height [`strict_time_at`] says. `None` for the genesis.
+    pub parent_time: Option<u64>,
     pub expected_bits: u32,
     /// Current time, injected rather than read: a consensus that calls the
     /// system clock cannot be tested deterministically.
@@ -631,6 +809,12 @@ pub fn check_block<E: PowEngine>(
             received: block.header.time,
         });
     }
+
+    // --- Rule: timestamp strictly after the parent's, once in force.
+    check_after_parent(ctx.network, ctx.height, ctx.parent_time, block.header.time)?;
+
+    // --- Rule: the anchored block at an anchored height.
+    check_anchor(ctx.network, ctx.height, &block.header.block_id())?;
 
     // --- Rule: timestamp not too far in the future.
     let limit = ctx.now + MAX_FUTURE_TIME;

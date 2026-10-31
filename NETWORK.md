@@ -230,12 +230,38 @@ Once that hour has passed, the node writes `bound` in `finality.dat`, in its
 data directory, and stays bound from then on. A directory used by an earlier
 version is bound at its first start if its chain is longer than 720 blocks.
 
-If a new node was nonetheless kept away from every honest peer for its
-whole first hour, it ends up bound to whatever chain it was handed: its
-height and tip differ from the explorer's, and the logs show blocks of the
-real chain refused as beyond finality. Stop the node, write `catching-up` in
-place of `bound` in `finality.dat`, connect it to a peer you trust
-(`--bootstrap`), and start it again.
+Since 0.5.4, each release also carries **anchors**: a few blocks of the
+real chain, by height and id, buried far below the undo window
+(`validate::ANCHORS_TESTNET`). At an anchored height a chain may carry only
+the anchored block, and finality never binds a node whose tip is below the
+last anchor. A first peer handing a new node a chain of its own can no
+longer bind it there, however long it keeps it alone, and a branch forking
+below an anchor can never pass it. `getinfo` → `block_time_rule` →
+`last_anchor_height` gives the last one.
+
+A node already past the last anchor and kept away from every honest peer for
+its whole first hour may still end up bound to a branch forking above the
+last anchor: its height and tip differ from the explorer's, and the logs show
+blocks of the real chain refused as beyond finality. Stop the node, write
+`catching-up` in place of `bound` in `finality.dat`, connect it to a peer you
+trust (`--bootstrap`), and start it again.
+
+## A block comes after its parent
+
+From testnet block 7,600 (0.5.4), a block's timestamp must be strictly later
+than its parent's, on top of the older rule: later than the median of the
+eleven blocks before it. The median alone let a miner with a minority of the
+hashrate date its blocks back, block after block, and slow the chain down:
+measured on the difficulty rule itself (`tests/strict_block_time.rs`), a
+tenth of the hashrate brought the average block from two minutes to three, a
+third to more than eighteen. With the rule, the same miner leaves it within
+about a tenth of two minutes.
+
+It is a stricter rule: every block it accepts, an older node accepts too,
+and an older node follows the chain it builds. Only a miner still on an
+older release may produce a block the others refuse; mining nodes must run
+0.5.4 before block 7,600. `getinfo` → `block_time_rule` says from which
+height the rule holds and whether the next block is under it.
 
 ## The testnet entry points, today
 

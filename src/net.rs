@@ -401,6 +401,11 @@ fn deep_fork_refused(g: &Shared, header: &crate::block::BlockHeader, source: u64
 /// the other, the honest peers that showed it the real one; a node whose
 /// clock ran slow banned the peers relaying the newest block.
 ///
+/// A block dated not after its parent, once that rule is in force
+/// (`validate::strict_time_at`), joins them: a peer still running an older
+/// release takes it in good faith and relays it, and banning it would cut
+/// the network in two at the activation instead of letting it upgrade.
+///
 /// These refusals now cost the peer nothing. The block is still refused, at
 /// the price of its header checks: finality and the clock are checked before
 /// the proof of work. A peer that sends such blocks on purpose spends its own
@@ -416,6 +421,7 @@ fn refusal_is_contextual(e: &crate::chain::ChainError) -> bool {
             | ChainError::UndoWindowTooShort { .. }
             | ChainError::ForkPointNotFound { .. }
             | ChainError::Validation(ValidationError::TimestampInFuture { .. })
+            | ChainError::Validation(ValidationError::TimestampNotAfterParent { .. })
             | ChainError::Validation(ValidationError::IncompleteHistory)
     )
 }
@@ -6874,6 +6880,18 @@ mod tests {
             received: 2,
         });
         assert!(refusal_is_contextual(&future));
+        // A block dated with its parent's second, refused only by the rule
+        // 0.5.4 brings in: a peer on 0.5.3 relays it in good faith.
+        assert!(refusal_is_contextual(&E::Validation(
+            V::TimestampNotAfterParent {
+                parent: 5,
+                received: 5,
+            }
+        )));
+        // A block other than an anchored one is no honest peer's.
+        assert!(!refusal_is_contextual(&E::Validation(V::NotTheAnchor {
+            height: 9
+        })));
         // One peer is no sign; two within the hour are, and the clock is late
         // by at least the smaller lead.
         let ahead = |secs: u64| {

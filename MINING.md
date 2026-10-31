@@ -294,6 +294,31 @@ In order of real effectiveness:
 | **A second machine** | An old laptop lying around counts as much as half of a new one |
 | **Running longer** | Mining 24 h earns 24 times more than mining 1 h |
 
+### Is it fair between an old machine and a new one?
+
+What Q21 makes equal, and what it does not, said plainly:
+
+- **The amount of memory beyond what the dictionary needs gives nothing.**
+  A machine with 64 GB uses the same 2 to 4 GiB as a machine with 8 GB, and
+  has exactly the same chance per attempt. 8 GB is enough for the whole life
+  of the network.
+- **Specialized chips and graphics cards gain no decisive edge.** Each
+  attempt reads 32 places at random in the dictionary; a chip cannot fetch
+  them faster than ordinary memory does.
+- **More cores and faster memory do give more attempts per second.** A
+  recent desktop with many cores and fast memory makes a few times more
+  attempts than a modest laptop — a few times, not the millions of times a
+  specialized machine gains on Bitcoin. Your chance is proportional to your
+  attempts per second.
+- **Two machines make twice the attempts of one.** No proof of work can
+  give each person a single ticket: anyone could then pretend to be a
+  thousand people.
+
+On the **testnet**, the dictionary is small (32 to 128 MiB): on some recent
+processors it fits largely in the processor's own cache, which is much
+faster than memory, and the gap between machines is wider there than it
+will be on the main chain, whose 2 to 4 GiB fit in no cache.
+
 ### Memory: how much, and how fast?
 
 This is the question that always comes up, so let us answer in order.

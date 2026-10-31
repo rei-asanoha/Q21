@@ -926,6 +926,15 @@ impl Chain {
         //    the truth comes from the software reviewed by everyone, not from a
         //    transmitted value.
         Self::check_anchors(&path, &snapshot, crate::fast_sync::builtin_anchors(network))?;
+        // And the block ids the consensus anchors (`validate::anchors`): a
+        // snapshot cannot carry a node past them on another chain either.
+        for (h, id) in validate::anchors(network) {
+            if let Some(header) = usize::try_from(h).ok().and_then(|i| path.get(i)) {
+                if header.block_id() != id {
+                    return Err(AdoptionError::AnchorContradicted { height: h });
+                }
+            }
+        }
 
         // 5. The construction: positioning, index, window to replay.
         Chain::from_snapshot(network, snapshot, headers).map_err(AdoptionError::Resume)
@@ -1715,6 +1724,12 @@ impl Chain {
     /// Does rolling finality bind this node? Always on a network without a
     /// hold; otherwise once bound. See [`FINALITY_HOLD_SECS`].
     pub fn finality_binds(&self) -> bool {
+        // Never below the last anchor: a chain that has not reached it may
+        // still be a false one handed to a node alone with its first peer,
+        // and finality must not bind it there.
+        if self.height() < validate::last_anchor_height(self.network) {
+            return false;
+        }
         self.finality_hold.is_none() || self.bound.get()
     }
 
@@ -1806,11 +1821,13 @@ impl Chain {
         let uncle_bits = self.uncle_expected_bits();
         let height = self.height() + 1;
 
+        let parent_time = self.index.get(&self.tip_id()).map(|b| b.header.time);
         let ctx = BlockContext {
             network: self.network,
             height,
             prev_id: self.tip_id(),
             recent_times: &times,
+            parent_time,
             expected_bits: self.next_bits(),
             now,
             ancestors: &anc,
@@ -2049,6 +2066,14 @@ impl Chain {
                 received: header.time,
             }));
         }
+        // 2b. Strictly after the parent, once that rule is in force; and at an
+        //     anchored height, the anchored block. Both cost nothing: the
+        //     parent is in the index, the anchors in the binary.
+        let parent_time = self.index.get(&header.prev_block).map(|b| b.header.time);
+        validate::check_after_parent(self.network, header.height, parent_time, header.time)
+            .map_err(ChainError::Validation)?;
+        validate::check_anchor(self.network, header.height, &header.block_id())
+            .map_err(ChainError::Validation)?;
         let limit = now + MAX_FUTURE_TIME;
         if header.time > limit {
             return Err(ChainError::Validation(ValidationError::TimestampInFuture {
@@ -2475,7 +2500,12 @@ impl Chain {
         transactions.extend_from_slice(mempool);
 
         let median = validate::median_time(&self.recent_times());
-        let time = timestamp.max(median + 1);
+        let mut time = timestamp.max(median + 1);
+        // Strictly after the parent where that rule is in force: a clock a
+        // second behind the tip's must not build a block every node refuses.
+        if validate::strict_time_at(self.network, height) {
+            time = time.max(self.tip().time + 1);
+        }
 
         let mut b = Block {
             header: BlockHeader {

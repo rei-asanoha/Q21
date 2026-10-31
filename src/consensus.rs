@@ -648,6 +648,36 @@ pub const NAME_ACTIVATION_MAINNET: u64 = u64::MAX;
 pub const NAME_ACTIVATION_TESTNET: u64 = 5_200;
 pub const NAME_ACTIVATION_REGTEST: u64 = 1;
 
+// ---------------------------------------------------------------------------
+// Block time: strictly after the parent (see `validate::strict_time_at`)
+// ---------------------------------------------------------------------------
+
+/// First height at which a block's timestamp must be strictly greater than
+/// its parent's, per network; below it, after the median of the eleven
+/// before is enough.
+///
+/// # Why
+///
+/// The median alone let a minority miner date its blocks back, block after
+/// block: the difficulty, which reads the timestamps, then came down too
+/// little for the honest blocks and too much for its own, and the chain
+/// slowed. Simulated before this rule: a tenth of the hashrate brought the
+/// average block from two minutes to three, a third to sixteen, about two
+/// fifths to a halt. A block that must come after its parent leaves no
+/// backward step to take.
+///
+/// It is a stricter rule, a soft fork: every block it accepts, an older node
+/// accepts too, and an older node follows the chain it builds. Only a miner
+/// that has not upgraded may produce a block it refuses.
+///
+/// Mainnet: from its first block. Regtest: never, so that tests and
+/// sandboxes may mine many blocks a second; an audit build moves it there.
+/// Testnet: block 7,600, scheduled on 31 October 2026 with the tip near
+/// 5,900 — about two days after the release, at the target spacing.
+pub const STRICT_TIME_ACTIVATION_MAINNET: u64 = 1;
+pub const STRICT_TIME_ACTIVATION_TESTNET: u64 = 7_600;
+pub const STRICT_TIME_ACTIVATION_REGTEST: u64 = u64::MAX;
+
 /// What a name costs, in units: 0.5 Q21, destroyed. The output that carries
 /// it can never be spent, so the miner cannot collect it either: a miner who
 /// was paid the price could register names in its own blocks for nothing.
@@ -732,6 +762,13 @@ const _: () = {
     assert!(POLICY_ACTIVATION_TESTNET > 4_890);
     // Regtest opens it at its first block, as 0.4.10 did.
     assert!(POLICY_ACTIVATION_REGTEST == 1);
+
+    // Strict block time: from the first block of mainnet, never on regtest,
+    // and on testnet past the tip it was scheduled at and after the names.
+    assert!(STRICT_TIME_ACTIVATION_MAINNET == 1);
+    assert!(STRICT_TIME_ACTIVATION_REGTEST == u64::MAX);
+    assert!(STRICT_TIME_ACTIVATION_TESTNET > 5_900);
+    assert!(STRICT_TIME_ACTIVATION_TESTNET > NAME_ACTIVATION_TESTNET);
 
     // Names: never on mainnet yet, at block 1 on regtest, and on testnet
     // past the tip when they were scheduled and after the channels opened.
