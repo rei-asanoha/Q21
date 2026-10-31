@@ -350,6 +350,9 @@ pub enum AdoptionError {
     /// A header does not satisfy its own target: the announced work was not
     /// provided.
     InvalidWork { height: u64 },
+    /// A header is dated where the rules forbid: not after the median of the
+    /// eleven before it, or, where that rule holds, not after its parent.
+    InvalidTimestamp { height: u64 },
     /// The proposed chain contradicts an anchor built into the binary. This is
     /// the case where the operator copied a poisoned trusted value: the
     /// software knows better, and refuses.
@@ -383,6 +386,11 @@ impl std::fmt::Display for AdoptionError {
                 f,
                 "the header at height {height} does not satisfy its target: the \
                  announced work was not provided"
+            ),
+            AdoptionError::InvalidTimestamp { height } => write!(
+                f,
+                "the header at height {height} is dated where the rules forbid: \
+                 this header chain is not the one full nodes accept"
             ),
             AdoptionError::AnchorContradicted { height } => write!(
                 f,
@@ -1094,6 +1102,24 @@ impl Chain {
                     height: header.height,
                 });
             }
+            // 1a. The timestamp, by the rules a full node applies: after the
+            //     median of the eleven before, and after the parent where
+            //     that rule holds. A snapshot must not carry a node onto a
+            //     chain the full nodes refuse.
+            let recent: Vec<u64> = active[i.saturating_sub(MEDIAN_TIME_SPAN)..i]
+                .iter()
+                .map(|h| h.time)
+                .collect();
+            let median = validate::median_time(&recent);
+            let parent = active[i - 1].time;
+            if (!recent.is_empty() && header.time <= median)
+                || validate::check_after_parent(network, header.height, Some(parent), header.time)
+                    .is_err()
+            {
+                return Err(AdoptionError::InvalidTimestamp {
+                    height: header.height,
+                });
+            }
             // 2. The work itself. The comparison to the target remains the
             //    trait's: there is only one work validity rule.
             engine
@@ -1733,6 +1759,12 @@ impl Chain {
         self.finality_hold.is_none() || self.bound.get()
     }
 
+    /// Whether finality is bound by the hold or the data directory's record,
+    /// leaving the anchors aside: what `finality.dat` says.
+    pub fn finality_bound_on_record(&self) -> bool {
+        self.finality_hold.is_none() || self.bound.get()
+    }
+
     /// Binds finality for good: at startup, from what the data directory
     /// recorded.
     pub fn bind_finality(&self) {
@@ -1771,7 +1803,9 @@ impl Chain {
         if at.saturating_duration_since(since).as_secs() >= hold {
             self.bound.set(true);
         }
-        self.bound.get()
+        // Held long enough, but below the last anchor finality still waits:
+        // say what `finality_binds` says.
+        self.finality_binds()
     }
 
     /// Sets how long the tip must have been recent before finality binds;

@@ -236,3 +236,37 @@ fn a_block_not_after_its_parent_is_refused_from_the_activation_on() {
     assert!(b6.header.time > tip, "{} after {tip}", b6.header.time);
     c.submit(&b6, now).expect("the node's own candidate");
 }
+
+/// On a side branch too: the parent is the block's own, not the active tip.
+#[test]
+fn a_side_branch_is_held_to_its_own_parent() {
+    validate::audit_set_strict_time_activation(NET, ACTIVATION);
+    let mut c = Chain::new(NET, genesis_block(NET));
+    let now = GENESIS_TIME + 1_000_000;
+    for h in 1..=6u64 {
+        let b = block_at(&c, GENESIS_TIME + h * TARGET_BLOCK_SECS * 10);
+        c.submit(&b, now).expect("the active chain");
+    }
+    // A sibling of block 5, on block 4, dated with block 4's second: it
+    // passes the median, not the parent rule of its own branch.
+    let mut side = Chain::new(NET, genesis_block(NET));
+    for h in 1..=4u64 {
+        side.submit(&c.block_at(h).expect("shared block"), now)
+            .expect("shared");
+    }
+    let parent = side.tip().time;
+    let sibling = block_at(&side, parent);
+    assert_eq!(sibling.header.height, ACTIVATION);
+    match c.submit(&sibling, now) {
+        Err(ChainError::Validation(ValidationError::TimestampNotAfterParent {
+            parent: p, ..
+        })) => {
+            assert_eq!(p, parent)
+        }
+        other => panic!("side block: {other:?}"),
+    }
+    // One second later, the same sibling is a valid side block.
+    let sibling = block_at(&side, parent + 1);
+    c.submit(&sibling, now).expect("a valid side block");
+    assert_eq!(c.height(), 6, "the active chain is unchanged");
+}

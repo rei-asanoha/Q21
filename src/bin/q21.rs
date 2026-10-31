@@ -7737,7 +7737,9 @@ mod tests {
     use super::{MiningGate, MINING_WAIT_FOR_PEER, MINING_WAIT_FOR_PROGRESS};
 
     /// A new directory records that it is catching up, and a restart keeps
-    /// it so; a bound one stays bound.
+    /// it so; a bound one stays bound. On testnet a chain below the last
+    /// anchor never binds, whatever its record says: the record is checked
+    /// through what the node writes and reads, and the binding at the anchor.
     #[test]
     fn the_finality_record_survives_a_restart() {
         use q21_core::address::Network;
@@ -7745,6 +7747,9 @@ mod tests {
         let d = std::env::temp_dir().join(format!("q21-finality-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
+        let below = Chain::new(Network::Testnet, genesis_block(Network::Testnet));
+        below.bind_finality();
+        assert!(!below.finality_binds(), "below the last testnet anchor");
         let net = Network::Testnet;
         let fresh = Chain::new(net, genesis_block(net));
         super::apply_finality_record(&d, &fresh);
@@ -7755,16 +7760,17 @@ mod tests {
         let again = Chain::new(net, genesis_block(net));
         super::apply_finality_record(&d, &again);
         assert!(!again.finality_binds());
-        // Unknown content: the safe side, bound.
+        // Unknown content: the safe side, bound — once past the last anchor.
         std::fs::write(super::finality_path(&d), b"?").unwrap();
         let odd = Chain::new(net, genesis_block(net));
         super::apply_finality_record(&d, &odd);
-        assert!(odd.finality_binds());
+        assert!(odd.finality_bound_on_record());
+        assert!(!odd.finality_binds(), "below the last anchor");
         // Once bound, bound at every start.
         assert!(super::write_finality(&d, true));
         let later = Chain::new(net, genesis_block(net));
         super::apply_finality_record(&d, &later);
-        assert!(later.finality_binds());
+        assert!(later.finality_bound_on_record());
         let _ = std::fs::remove_dir_all(&d);
     }
 

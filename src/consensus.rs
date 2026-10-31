@@ -672,8 +672,9 @@ pub const NAME_ACTIVATION_REGTEST: u64 = 1;
 ///
 /// Mainnet: from its first block. Regtest: never, so that tests and
 /// sandboxes may mine many blocks a second; an audit build moves it there.
-/// Testnet: block 7,600, scheduled on 31 October 2026 with the tip near
-/// 5,900 — about two days after the release, at the target spacing.
+/// Testnet: block 7,600, scheduled on 31 October 2026 with the tip at 5,789
+/// — about two and a half days later at the target spacing, two days or so
+/// after the release.
 pub const STRICT_TIME_ACTIVATION_MAINNET: u64 = 1;
 pub const STRICT_TIME_ACTIVATION_TESTNET: u64 = 7_600;
 pub const STRICT_TIME_ACTIVATION_REGTEST: u64 = u64::MAX;
@@ -767,7 +768,7 @@ const _: () = {
     // and on testnet past the tip it was scheduled at and after the names.
     assert!(STRICT_TIME_ACTIVATION_MAINNET == 1);
     assert!(STRICT_TIME_ACTIVATION_REGTEST == u64::MAX);
-    assert!(STRICT_TIME_ACTIVATION_TESTNET > 5_900);
+    assert!(STRICT_TIME_ACTIVATION_TESTNET > 5_789 + 1_440);
     assert!(STRICT_TIME_ACTIVATION_TESTNET > NAME_ACTIVATION_TESTNET);
 
     // Names: never on mainnet yet, at block 1 on regtest, and on testnet

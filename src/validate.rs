@@ -248,9 +248,20 @@ pub fn check_after_parent(
 /// anchored block there can pass it, and finality never binds below the last
 /// anchor (see [`crate::chain::Chain::finality_binds`]).
 ///
-/// The ids are those of the testnet's own blocks, read on its explorer when
-/// the release was prepared, each buried far below the undo window.
-pub const ANCHORS_TESTNET: &[(u64, &str)] = &[];
+/// The ids are those of the testnet's own blocks, read on a node's explorer
+/// when the release was prepared (tip at 5,789), each buried far below the
+/// undo window; `tests/testnet_anchors.rs` rebuilds each id from its header
+/// and checks its work.
+pub const ANCHORS_TESTNET: &[(u64, &str)] = &[
+    (
+        2_500,
+        "104b317dfbad96fbe0ba616b708c519faeade0dd13b3520fd69e3ba9f593ac26",
+    ),
+    (
+        5_000,
+        "e5f33ab0bc15f5d7b159cceda8b50526e46cf52983c4f08b868fa6e037fcd5db",
+    ),
+];
 
 /// The anchors of `network`, as heights and block ids, lowest first.
 pub fn anchors(network: Network) -> Vec<(u64, crate::hash::Hash256)> {
@@ -258,19 +269,25 @@ pub fn anchors(network: Network) -> Vec<(u64, crate::hash::Hash256)> {
     if let Some(v) = audit_rules::anchors(network) {
         return v;
     }
-    let table: &[(u64, &str)] = match network {
-        Network::Testnet => ANCHORS_TESTNET,
-        Network::Mainnet | Network::Regtest => &[],
-    };
-    table
-        .iter()
-        .map(|(h, id)| {
-            (
-                *h,
-                crate::hash::Hash256::from_hex(id).expect("an anchor is a block id"),
-            )
-        })
-        .collect()
+    // Parsed once: the table is read at every header checked.
+    static TESTNET: std::sync::OnceLock<Vec<(u64, crate::hash::Hash256)>> =
+        std::sync::OnceLock::new();
+    match network {
+        Network::Testnet => TESTNET
+            .get_or_init(|| {
+                ANCHORS_TESTNET
+                    .iter()
+                    .map(|(h, id)| {
+                        (
+                            *h,
+                            crate::hash::Hash256::from_hex(id).expect("an anchor is a block id"),
+                        )
+                    })
+                    .collect()
+            })
+            .clone(),
+        Network::Mainnet | Network::Regtest => Vec::new(),
+    }
 }
 
 /// The highest anchored height of `network`, 0 without anchors.
