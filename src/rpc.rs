@@ -4009,11 +4009,6 @@ impl RpcContext {
     // Wallet: what a desktop application must be able to ask for
     // -----------------------------------------------------------------------
 
-    /// Wallet status, without revealing anything secret.
-    ///
-    /// Everything an owner needs to see when opening their application: which
-    /// signature scheme, which network, how many addresses handed out, how many
-    /// one-time keys already burned.
     /// Whether the backup code the holder typed restores this wallet: the
     /// sheet of paper is checked long after the wallet was created, before
     /// the day it is needed. A code that does not read says where a single
@@ -4052,6 +4047,11 @@ impl RpcContext {
             .build())
     }
 
+    /// Wallet status, without revealing anything secret.
+    ///
+    /// Everything an owner needs to see when opening their application: which
+    /// signature scheme, which network, how many addresses handed out, how many
+    /// one-time keys already burned.
     fn getwalletinfo(&self) -> Result<Json, Json> {
         let w = self.require_wallet()?;
         let g = w
