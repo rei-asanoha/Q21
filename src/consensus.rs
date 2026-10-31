@@ -670,8 +670,9 @@ pub const NAME_ACTIVATION_REGTEST: u64 = 1;
 /// accepts too, and an older node follows the chain it builds. Only a miner
 /// that has not upgraded may produce a block it refuses.
 ///
-/// Mainnet: from its first block. Regtest: never, so that tests and
-/// sandboxes may mine many blocks a second; an audit build moves it there.
+/// Mainnet: from its first block. Regtest: never, so that tests and local
+/// test networks may mine many blocks a second; an audit build moves it
+/// there.
 /// Testnet: block 7,600, scheduled on 31 October 2026 with the tip at 5,789
 /// — about two and a half days later at the target spacing, two days or so
 /// after the release.

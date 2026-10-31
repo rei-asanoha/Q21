@@ -248,14 +248,32 @@ pub fn check_after_parent(
 /// anchored block there can pass it, and finality never binds below the last
 /// anchor (see [`crate::chain::Chain::finality_binds`]).
 ///
-/// The ids are those of the testnet's own blocks, read on a node's explorer
-/// when the release was prepared (tip at 5,789), each buried far below the
-/// undo window; `tests/testnet_anchors.rs` rebuilds each id from its header
-/// and checks its work.
+/// One every thousand blocks, closer than the undo window (1,008 blocks): a
+/// node misled between two anchors can always come back to the real chain.
+/// The ids are those of the testnet's own blocks, read on two nodes when the
+/// release was prepared (tip at 5,789), each buried far below the undo
+/// window; `tests/testnet_anchors.rs` rebuilds each id from its header and
+/// checks its work.
 pub const ANCHORS_TESTNET: &[(u64, &str)] = &[
+    (
+        1_000,
+        "ff33881b6fb3a68cb5e1b8eef37eb995a492bcf94ca3a85b703cd964aed027ca",
+    ),
+    (
+        2_000,
+        "627b819a12bc8351b9139b28cb4b0f9a59596e86f1bc9da4f2c460022325c7f4",
+    ),
     (
         2_500,
         "104b317dfbad96fbe0ba616b708c519faeade0dd13b3520fd69e3ba9f593ac26",
+    ),
+    (
+        3_000,
+        "7a12e78633c437972381f307cb2e063d5cc119b90157afdb79f2a926636fa2c4",
+    ),
+    (
+        4_000,
+        "fa7f43c5e9124bd4a0ab4ae8aa93d6547800f5de82e3efcd99f81ff2331c79b4",
     ),
     (
         5_000,

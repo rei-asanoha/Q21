@@ -95,6 +95,17 @@ fn the_testnet_anchors_are_well_formed() {
     let anchors = validate::anchors(Network::Testnet);
     // Lowest first, below the strict time activation, and each a block id.
     assert!(anchors.windows(2).all(|w| w[0].0 < w[1].0));
+    // Closer than the undo window, from the genesis on: a node misled between
+    // two anchors can always come back.
+    let mut previous = 0;
+    for (h, _) in &anchors {
+        assert!(
+            h - previous < q21_core::consensus::BODY_WINDOW as u64,
+            "gap below {h}"
+        );
+        previous = *h;
+    }
+    assert!(!anchors.is_empty(), "the testnet has anchors");
     for (h, id) in &anchors {
         assert!(*h > 0 && *h < q21_core::consensus::STRICT_TIME_ACTIVATION_TESTNET);
         assert_ne!(*id, Hash256::ZERO);
