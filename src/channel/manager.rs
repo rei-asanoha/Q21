@@ -36,7 +36,7 @@
 
 use crate::address::Network;
 use crate::channel::keys::{ChannelKey, NodeIdentity, Signer, CHANNEL_SCHEME};
-use crate::channel::machine::{channel_id, ChannelError, Machine, Phase};
+use crate::channel::machine::{channel_id, ChannelError, Machine, Phase, SyncVerdict};
 use crate::channel::messages::Message as ChMsg;
 use crate::channel::txbuild;
 use crate::channel::verify;
@@ -209,6 +209,9 @@ pub struct ChannelSummary {
     pub synced: bool,
     /// The node id the channel is bound to, as its session authenticated it.
     pub peer_identity: String,
+    /// Our copy of the channel is older than the peer's: it can no longer be
+    /// operated, the peer is to close it (see [`SyncVerdict::WeAreBehind`]).
+    pub behind: bool,
 }
 
 /// How a channel ended, as its last phase before it was marked closed tells.
@@ -353,6 +356,10 @@ struct Chan {
     /// The last state written to the channel's history (see
     /// [`ChannelManager::note_history`]).
     logged: Option<u64>,
+    /// Our copy of the channel is older than the peer's (see
+    /// [`SyncVerdict::WeAreBehind`]): nothing may be signed or broadcast on
+    /// it. Persisted beside the journal, so a restart keeps it.
+    behind: bool,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -420,6 +427,25 @@ pub const MAX_PENDING_PER_IDENTITY: usize = 2;
 /// [`ChannelManager::acceptor_index`]); below it they count the channels we
 /// open.
 const ACCEPTOR_INDEX_BASE: u32 = 0x8000_0000;
+
+/// Key indices from this one up to [`ACCEPTOR_INDEX_BASE`] are counted for
+/// the channels we accept, from 0.5.3 on: counted, so that a wallet restored
+/// from its backup code can derive them again and find what a peer's close
+/// paid to them. Below it they count the channels we open; from
+/// [`ACCEPTOR_INDEX_BASE`] up, the indices derived from the funder's key that
+/// 0.5.2 and earlier gave the channels they accepted.
+pub const ACCEPTOR_COUNTER_BASE: u32 = 0x4000_0000;
+
+/// Indices of each kind derived beyond the last one used when looking for
+/// funds a close paid to a channel key: a wallet restored from its backup
+/// code knows none of its channels.
+pub const KEY_SCAN_WINDOW: u32 = 200;
+
+/// Why a channel whose copy is older than the peer's refuses everything.
+const BEHIND: &str =
+    "this copy of the channel is older than your contact's (restored from a backup?): \
+     it can no longer be operated from here. Ask your contact to close it: your side \
+     comes back to your wallet";
 
 /// The fee tier of every commitment we broadcast to close without the peer.
 /// The highest one: there is neither replacement nor child-pays-for-parent,
@@ -508,6 +534,17 @@ struct Inner {
     /// Channels found closed in their journals at start: no longer operated,
     /// still shown, so a restart does not erase what the holder did.
     archived: Vec<ArchivedChannel>,
+    /// The next counted acceptor index, past [`ACCEPTOR_COUNTER_BASE`].
+    next_acceptor: u32,
+    /// Acceptor indices offered in a HelloBack whose open never came:
+    /// offered again first, so Hellos that lead nowhere spend no index.
+    free_acceptor: Vec<u32>,
+    /// The channel keys looked at for funds a close paid them, by the hash
+    /// an output names: derived once (see [`ChannelManager::recover_key_outputs`]).
+    key_hashes: Option<(u32, u32, HashMap<Hash256, u32>)>,
+    /// Outputs paying a channel key already claimed, with the height of the
+    /// claim: claimed again only if still unspent a few blocks later.
+    claimed: HashMap<OutPoint, u64>,
 }
 
 impl Inner {
@@ -515,7 +552,26 @@ impl Inner {
     fn expire_pending(&mut self) {
         let ttl = self.pending_ttl;
         self.pending_funder.retain(|_, p| p.since.elapsed() < ttl);
-        self.pending_acceptor.retain(|_, p| p.since.elapsed() < ttl);
+        let mut freed = Vec::new();
+        self.pending_acceptor.retain(|_, p| {
+            let keep = p.since.elapsed() < ttl;
+            if !keep {
+                freed.push(p.index);
+            }
+            keep
+        });
+        self.free_counted(freed);
+    }
+
+    /// Gives counted acceptor indices back, for the next Hello.
+    fn free_counted(&mut self, indices: Vec<u32>) {
+        for i in indices {
+            if (ACCEPTOR_COUNTER_BASE..ACCEPTOR_INDEX_BASE).contains(&i)
+                && !self.free_acceptor.contains(&i)
+            {
+                self.free_acceptor.push(i);
+            }
+        }
     }
 
     /// Channels whose funding is not on chain yet: those we accepted
@@ -592,6 +648,9 @@ pub struct ChannelManager {
     /// Set while [`ChannelManager::rescan`] replays past blocks: reactions are
     /// computed but nothing is broadcast until the replay reaches the tip.
     replaying: AtomicBool,
+    /// Transactions decided while the channel lock was held, broadcast once
+    /// it is released (the broadcast hook takes the chain lock).
+    to_broadcast: Mutex<Vec<(Transaction, &'static str)>>,
 }
 
 fn write_frame(cid: Hash256, kind: u8, body: &[u8]) -> Vec<u8> {
@@ -637,7 +696,12 @@ impl ChannelManager {
                 verifications: HashMap::new(),
                 verify_waiting: HashMap::new(),
                 archived: Vec::new(),
+                next_acceptor: 0,
+                free_acceptor: Vec::new(),
+                key_hashes: None,
+                claimed: HashMap::new(),
             }),
+            to_broadcast: Mutex::new(Vec::new()),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
         // clean or after a crash — finds its channels again, with the watcher
@@ -694,6 +758,7 @@ impl ChannelManager {
         }
         let mut g = self.inner.lock().unwrap();
         g.next_index = self.read_next_index();
+        g.next_acceptor = self.read_next_acceptor();
         let mut legacy = Vec::new();
         for (path, pubkey, index) in found {
             // The journaled index, checked against the key it must give.
@@ -733,8 +798,10 @@ impl ChannelManager {
     /// Reopens one channel journal with the key at `index` and adds it, unless
     /// settled.
     fn load_channel(&self, g: &mut Inner, path: &std::path::Path, index: u32) {
-        if index < ACCEPTOR_INDEX_BASE {
+        if index < ACCEPTOR_COUNTER_BASE {
             g.next_index = g.next_index.max(index + 1);
+        } else if index < ACCEPTOR_INDEX_BASE {
+            g.next_acceptor = g.next_acceptor.max(index - ACCEPTOR_COUNTER_BASE + 1);
         }
         match Machine::reopen(path, self.network, self.signer(index), self.base_fee_rate) {
             Ok(mut machine) => {
@@ -754,6 +821,7 @@ impl ChannelManager {
                 // The peer's connection is transient; its node id, persisted
                 // in a sidecar, tells which session the channel is with.
                 let peer_identity = self.read_peer_identity(cid);
+                let behind = self.behind_path(cid).exists();
                 g.channels.insert(
                     cid,
                     Chan {
@@ -767,6 +835,7 @@ impl ChannelManager {
                         reserved: false,
                         conflict: None,
                         logged: None,
+                        behind,
                     },
                 );
             }
@@ -1006,18 +1075,34 @@ impl ChannelManager {
         self.default_delay.max(terms.min_delay).min(terms.max_delay)
     }
 
-    /// The key index of a channel we accept from a funder whose channel key
-    /// is `funder_pubkey`: derived, not counted, so a Hello that never leads
-    /// to a channel spends nothing. Keyed by our seed, so a funder cannot aim
-    /// at the index of another channel; the same funder key twice gives the
-    /// same channel id, which the journal refuses.
-    fn acceptor_index(&self, funder_pubkey: &[u8]) -> u32 {
-        let h = crate::hash::tagged_hash_parts(
-            "Q21/channel/acceptor-index",
-            &[&self.wallet_seed, funder_pubkey],
+    /// The key index of a channel we accept: counted from
+    /// [`ACCEPTOR_COUNTER_BASE`], so that a wallet restored from its backup
+    /// code derives it again (see [`Self::recover_key_outputs`]). An index
+    /// offered to a Hello that led nowhere is offered again first, so Hellos
+    /// that never become channels spend none. Until 0.5.2 the index derived
+    /// from the funder's key, which nothing but the channel's journal could
+    /// find again.
+    fn acceptor_index(&self, g: &mut Inner) -> u32 {
+        if let Some(i) = g.free_acceptor.pop() {
+            return i;
+        }
+        let i = ACCEPTOR_COUNTER_BASE + g.next_acceptor;
+        g.next_acceptor += 1;
+        let _ = crate::channel::journal::atomic_write(
+            &self.journal_dir.join("next_acceptor_index"),
+            &g.next_acceptor.to_le_bytes(),
         );
-        let v = u32::from_le_bytes(h.0[..4].try_into().expect("four bytes"));
-        ACCEPTOR_INDEX_BASE | v
+        i
+    }
+
+    fn read_next_acceptor(&self) -> u32 {
+        std::fs::read(self.journal_dir.join("next_acceptor_index"))
+            .ok()
+            .and_then(|b| {
+                b.get(..4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            })
+            .unwrap_or(0)
     }
 
     fn next_index_path(&self) -> PathBuf {
@@ -1056,6 +1141,15 @@ impl ChannelManager {
             &self.peer_identity_path(cid),
             identity.as_bytes(),
         );
+    }
+
+    /// The sidecar marking a channel whose copy is older than the peer's.
+    fn behind_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.behind", cid.to_hex()))
+    }
+
+    fn write_behind(&self, cid: Hash256) {
+        let _ = crate::channel::journal::atomic_write(&self.behind_path(cid), b"behind\n");
     }
 
     /// The sidecar recording how and when a channel ended: `height time how`.
@@ -1269,6 +1363,9 @@ impl ChannelManager {
     pub fn pay(&self, cid: Hash256, amount: u64) -> Result<Vec<u8>, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        if chan.behind {
+            return Err(BEHIND.into());
+        }
         if chan.machine.phase() != Phase::Open {
             return Err("channel not open".into());
         }
@@ -1300,6 +1397,9 @@ impl ChannelManager {
     pub fn close(&self, cid: Hash256) -> Result<Option<Vec<u8>>, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        if chan.behind {
+            return Err(BEHIND.into());
+        }
         if !chan.synced {
             return Err("channel is not yet resynchronized with its peer".into());
         }
@@ -1448,7 +1548,12 @@ impl ChannelManager {
             legacy: &legacy,
             binding,
         };
-        match self.deliver_inner(&from, bytes) {
+        let reaction = self.deliver_inner(&from, bytes);
+        let decided = std::mem::take(&mut *self.to_broadcast.lock().unwrap());
+        for (tx, what) in decided {
+            self.broadcast_or_warn(&tx, what);
+        }
+        match reaction {
             Ok(frames) => Reaction {
                 frames,
                 penalize: 0,
@@ -1539,9 +1644,9 @@ impl ChannelManager {
         if !admitted(&mut g) {
             return Ok(Vec::new());
         }
-        let index = self.acceptor_index(&funder_pubkey);
+        let index = self.acceptor_index(&mut g);
         let our_pubkey = self.signer(index).pubkey().to_vec();
-        g.pending_acceptor.insert(
+        let replaced = g.pending_acceptor.insert(
             peer,
             PendingAcceptor {
                 since: std::time::Instant::now(),
@@ -1555,6 +1660,9 @@ impl ChannelManager {
                 peer_identity: peer_identity.to_string(),
             },
         );
+        if let Some(old) = replaced {
+            g.free_counted(vec![old.index]);
+        }
         // HelloBack body: our funding pubkey and our payout.
         let mut w = Writer::new();
         w.var_bytes(&our_pubkey);
@@ -1624,6 +1732,7 @@ impl ChannelManager {
                 reserved: false,
                 conflict: None,
                 logged: None,
+                behind: false,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
@@ -1790,10 +1899,57 @@ impl ChannelManager {
                     chan.peer_identity = peer_identity.to_string();
                     self.write_peer_identity(cid, peer_identity);
                 }
-                for f in frames {
-                    out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
+                match chan.machine.sync() {
+                    SyncVerdict::InStep => {
+                        for f in frames {
+                            out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
+                        }
+                        chan.synced = true;
+                    }
+                    // Our copy is older: our latest commitment may be one we
+                    // revoked. Never signed nor broadcast from now on; the
+                    // peer holds the latest state and closes with it, which
+                    // pays our side to our channel key, claimed as usual.
+                    SyncVerdict::WeAreBehind => {
+                        if !chan.behind {
+                            chan.behind = true;
+                            self.write_behind(cid);
+                            eprintln!(
+                                "ALERT: channel {}: this copy of the channel is older than \
+                                 the peer's (a data folder restored from a backup?). Do not \
+                                 close it from here: the peer closes it with the latest state, \
+                                 and our side comes back to the wallet",
+                                cid.to_hex()
+                            );
+                        }
+                    }
+                    // The peer's copy is older: its latest commitment may be
+                    // revoked, and broadcasting it would lose it the whole
+                    // channel. We close with the latest state instead: its
+                    // side comes back to it at once, ours after the delay.
+                    SyncVerdict::PeerIsBehind => {
+                        if chan.machine.phase() == Phase::Open
+                            || chan.machine.phase() == Phase::Closing
+                        {
+                            match chan.machine.force_close(FORCE_CLOSE_TIER) {
+                                Ok(tx) => {
+                                    eprintln!(
+                                        "ALERT: channel {}: the peer runs an older copy of the \
+                                         channel; closed with the latest state so that it \
+                                         gets its funds back",
+                                        cid.to_hex()
+                                    );
+                                    self.to_broadcast.lock().unwrap().push((tx, "commitment"));
+                                }
+                                Err(e) => eprintln!(
+                                    "ALERT: channel {}: the peer runs an older copy of the \
+                                     channel, and the close failed: {e:?}",
+                                    cid.to_hex()
+                                ),
+                            }
+                        }
+                    }
                 }
-                chan.synced = true;
             }
             ChMsg::Error { .. } | ChMsg::Open { .. } => {}
         }
@@ -1872,6 +2028,7 @@ impl ChannelManager {
                 reserved: false,
                 conflict: None,
                 logged: None,
+                behind: false,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
@@ -2680,6 +2837,95 @@ impl ChannelManager {
         }
     }
 
+    /// Claims what a close paid to one of our channel keys, for a channel
+    /// this node no longer operates — above all after a wallet was restored
+    /// from its backup code, which knows no channel: when the peer closes
+    /// alone, our side of its commitment pays our channel key, and nothing
+    /// else would ever spend it. `find` lists the unspent outputs paying a
+    /// key hash. The claims pay a fresh wallet address and are broadcast.
+    ///
+    /// Every key output paying a channel key is ours to take at once: the
+    /// `to_remote` of a commitment carries no delay, and a funding is a
+    /// two-key policy, never a key output. Live channels claim theirs
+    /// themselves and are skipped. Returns how many claims went out.
+    pub fn recover_key_outputs(
+        &self,
+        height: u64,
+        find: &dyn Fn(&Hash256) -> Vec<(OutPoint, TxOut)>,
+    ) -> usize {
+        let mut claims = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap();
+            let funder_upto = g.next_index.saturating_add(KEY_SCAN_WINDOW);
+            let acceptor_upto = g.next_acceptor.saturating_add(KEY_SCAN_WINDOW);
+            // Derived once, then extended as channels use further indices.
+            let (f0, a0, mut map) = g.key_hashes.take().unwrap_or((0, 0, HashMap::new()));
+            let indices = (f0..funder_upto)
+                .chain((a0..acceptor_upto).map(|i| ACCEPTOR_COUNTER_BASE.saturating_add(i)));
+            for i in indices {
+                map.insert(self.signer(i).pubkey_hash(), i);
+            }
+            g.key_hashes = Some((funder_upto.max(f0), acceptor_upto.max(a0), map));
+            let live: std::collections::HashSet<u32> = g
+                .channels
+                .values()
+                .filter(|c| c.machine.phase() != Phase::Closed)
+                .filter_map(|c| c.machine.key_index())
+                .collect();
+            let hashes: Vec<(Hash256, u32)> = g
+                .key_hashes
+                .as_ref()
+                .map(|(_, _, m)| m.iter().map(|(h, i)| (*h, *i)).collect())
+                .unwrap_or_default();
+            for (hash, index) in hashes {
+                if live.contains(&index) {
+                    continue;
+                }
+                for (op, out) in find(&hash) {
+                    if out.scheme != CHANNEL_SCHEME || out.pubkey_hash != hash {
+                        continue;
+                    }
+                    // Claimed already, and not yet long enough ago to try again.
+                    if g.claimed
+                        .get(&op)
+                        .is_some_and(|at| height < at.saturating_add(6))
+                    {
+                        continue;
+                    }
+                    let value = out.value.units();
+                    let fee = crate::channel::txbuild::capped_fee(
+                        value,
+                        crate::channel::txbuild::SWEEP_FEE,
+                    );
+                    if value.saturating_sub(fee) < crate::consensus::MIN_OUTPUT_VALUE {
+                        continue;
+                    }
+                    g.claimed.insert(op, height);
+                    claims.push((op, out, index, fee));
+                }
+            }
+        }
+        let n = claims.len();
+        for (op, out, index, fee) in claims {
+            let sweep_to = (self.hooks.sweep_address)();
+            let signer = self.signer(index);
+            let tx = crate::channel::txbuild::to_remote_claim_tx(
+                op,
+                &out,
+                sweep_to,
+                fee,
+                self.network,
+                signer.as_ref(),
+            );
+            eprintln!(
+                "channel key {index}: claiming {} paid to it by a close, back to the wallet",
+                out.value
+            );
+            self.broadcast_or_warn(&tx, "claim of a channel key output");
+        }
+        n
+    }
+
     /// The funding outpoints this manager is watching, with their channel ids.
     pub fn watched_funding(&self) -> Vec<(Hash256, OutPoint)> {
         let g = self.inner.lock().unwrap();
@@ -2723,6 +2969,11 @@ impl ChannelManager {
     pub fn force_close(&self, cid: Hash256) -> Result<Transaction, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        // An older copy's latest commitment may be revoked: broadcasting it
+        // would lose the whole channel to a penalty.
+        if chan.behind {
+            return Err(BEHIND.into());
+        }
         let tx = chan.machine.force_close(FORCE_CLOSE_TIER).map_err(err)?;
         drop(g);
         (self.hooks.broadcast)(&tx)?;
@@ -2885,6 +3136,7 @@ fn summary(c: &Chan) -> ChannelSummary {
         force_close_fee: c.machine.commit_fee(FORCE_CLOSE_TIER),
         synced: c.synced,
         peer_identity: c.peer_identity.clone(),
+        behind: c.behind,
     }
 }
 

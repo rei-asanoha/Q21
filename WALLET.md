@@ -38,7 +38,26 @@ rm code.txt
 
 The setup page (`q21 wallet` in an empty folder) offers the same restore: the
 code goes through the body of a local request, never through an address or a
-command line.
+command line. A code with a single wrong character is not accepted, and the
+message says which group of four to check on the sheet.
+
+**What the code restores, and what it does not.** The balance, every address
+and the names come back from the code alone. A payment channel lives in its
+journal, beside the wallet in the data folder, and the code does not hold it:
+
+- a channel still open when the disk was lost comes back once the other side
+  closes it. Its close pays our side to a channel key derived from the seed,
+  and the node claims it back to the wallet on its own (`recover_key_outputs`;
+  the 200 first keys of each kind are looked at, more if channels went
+  further). Ask the other person to close the channel;
+- a data folder restored from an **older copy** is recognised the first time
+  the channel reconnects: the copy refuses to pay or to close, the other side
+  closes with the latest state, and our side comes back to the wallet. Closing
+  such a copy alone would have broadcast a state it had already revoked, and
+  lost the whole channel to the penalty.
+
+`checkbackup` (the wallet page: Info → Check my backup) checks the sheet
+against the wallet at any time, long before the day it is needed.
 
 ## What the data directory remembers
 

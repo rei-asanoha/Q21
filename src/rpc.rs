@@ -716,6 +716,7 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("force_close_fee", Json::u64(s.force_close_fee))
         .set("synced", Json::Bool(s.synced))
         .set("peer_identity", Json::str(s.peer_identity))
+        .set("behind", Json::Bool(s.behind))
         .build()
 }
 

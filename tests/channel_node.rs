@@ -3313,3 +3313,286 @@ fn an_acceptor_refuses_a_delay_shorter_than_its_own() {
     assert_eq!(p.acceptor.list().len(), 1, "its own delay is accepted");
     assert_eq!(p.acceptor.list()[0].delay, DELAY);
 }
+
+/// Copies every file of `from` into `to`, replacing what is there: a data
+/// folder restored from a backup.
+fn restore_dir(from: &std::path::Path, to: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+    }
+}
+
+/// B4, the loss the 0.5.0 review reproduced: a data folder restored from a
+/// copy taken two payments ago, then "close without the peer", broadcast a
+/// revoked state and lost the whole channel to the penalty. Now the restored
+/// side learns at the reestablish that its copy is older, refuses to pay, to
+/// close and to close alone; the peer, which holds the latest state, closes
+/// with it; and the restored side gets exactly its latest balance back, less
+/// the claim fee. Nobody is penalised.
+#[test]
+fn a_channel_restored_from_an_older_copy_is_closed_by_the_peer_and_loses_nothing() {
+    let funder_seed = [0xc1u8; 32];
+    let (mut p, wallet, chain, dir, cid, capacity) =
+        open_channel(funder_seed, [0xd2u8; 32], "restored-copy");
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    // The copy: two payments ago.
+    let backup = dir.join("funder-backup");
+    restore_dir(&dir.join("funder"), &backup);
+    for amount in [2_000_000u64, 500_000] {
+        let pay = p.funder.pay(cid, amount).unwrap();
+        p.queue.push_back((1, pay));
+        p.pump();
+    }
+    let latest = p.funder.info(cid).unwrap().local_balance;
+    assert_eq!(latest, capacity - 3_500_000);
+    // The funder pays the commitment fee: the peer's commitment pays it its
+    // balance less that fee.
+    let commit_fee = p.funder.info(cid).unwrap().force_close_fee;
+
+    // The funder's folder is restored from the copy, and the node restarts.
+    restore_dir(&backup, &dir.join("funder"));
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+    assert_eq!(
+        p.funder.info(cid).unwrap().local_balance,
+        capacity - 1_000_000,
+        "the copy believes the older balance"
+    );
+    let h0 = chain.lock().unwrap().height();
+    reconnect(&mut p);
+
+    // The restored side knows, and refuses everything that signs or
+    // broadcasts.
+    let info = p.funder.info(cid).unwrap();
+    assert!(info.behind, "the older copy is recognised");
+    assert!(p.funder.pay(cid, 1).is_err());
+    assert!(p.funder.close(cid).is_err());
+    let refused = p.funder.force_close(cid).unwrap_err();
+    assert!(refused.contains("older"), "{refused}");
+
+    // The peer closed with the latest state at once.
+    assert!(
+        chain.lock().unwrap().height() > h0,
+        "the peer's commitment is on chain"
+    );
+    drive(&p.acceptor, &chain);
+    drive(&p.funder, &chain);
+    assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Forcing);
+    for _ in 0..(DELAY as u64 + DEPTH as u64 + 2) {
+        chain.lock().unwrap().mine(&[]);
+        drive(&p.acceptor, &chain);
+        drive(&p.funder, &chain);
+    }
+    // The restored side claimed its latest balance, to the unit, less the
+    // commitment's fee (the funder's to pay) and the claim's; the peer swept
+    // its own after the delay. No penalty.
+    let funder_got = held(&chain, FUNDER_PAYOUT);
+    let claim_fee = q21_core::channel::txbuild::SWEEP_FEE;
+    assert_eq!(
+        funder_got,
+        latest - commit_fee - claim_fee,
+        "the restored side lost nothing"
+    );
+    assert!(
+        held(&chain, Hash256([0x5e; 32])) > 0,
+        "the peer swept its side"
+    );
+    assert!(p
+        .funder
+        .info(cid)
+        .is_none_or(|i| i.phase != Phase::Penalised));
+    assert!(p
+        .acceptor
+        .info(cid)
+        .is_none_or(|i| i.phase != Phase::Penalised));
+
+    // A restart keeps the restored side refusing.
+    p.reload_funder(funder_seed, wallet, chain.clone(), &dir);
+    if let Some(i) = p.funder.info(cid) {
+        assert!(i.behind || i.phase == Phase::Closed);
+    }
+}
+
+/// The verdict over every pair of counters an honest channel can show:
+/// the two copies differ by at most the state in flight, and then nothing
+/// is suspected. Any copy two states older is recognised, from both sides.
+#[test]
+fn the_sync_verdict_suspects_no_honest_pair_of_counters() {
+    use q21_core::channel::machine::{sync_verdict, SyncVerdict};
+    // An honest history, step by step: [local, remote, sent, recv] as next
+    // counters, both sides, through updates proposed by either side.
+    let mut a = [1u64, 1, 0, 0];
+    let mut b = [1u64, 1, 0, 0];
+    let mut seen = vec![(a, b)];
+    for round in 0..6 {
+        let (p, q) = if round % 2 == 0 {
+            (&mut a, &mut b)
+        } else {
+            (&mut b, &mut a)
+        };
+        // p proposes state n: it signs q's commitment n.
+        p[1] += 1;
+        seen.push((*p, *q));
+        // q receives it, signs p's n, revokes its n-1.
+        q[0] += 1;
+        q[1] += 1;
+        q[2] += 1;
+        seen.push((*p, *q));
+        // p receives the ack: holds n, receives q's revocation, revokes n-1.
+        p[0] += 1;
+        p[3] += 1;
+        p[2] += 1;
+        seen.push((*p, *q));
+        // q receives p's revocation.
+        q[3] += 1;
+        seen.push((*p, *q));
+    }
+    for (x, y) in &seen {
+        assert_eq!(sync_verdict(*x, *y), SyncVerdict::InStep, "{x:?} {y:?}");
+        assert_eq!(sync_verdict(*y, *x), SyncVerdict::InStep, "{y:?} {x:?}");
+    }
+    // A copy taken two settled states before: recognised by both.
+    let (old, _) = seen[0];
+    let (_, now_b) = *seen.last().unwrap();
+    assert_eq!(sync_verdict(old, now_b), SyncVerdict::WeAreBehind);
+    assert_eq!(sync_verdict(now_b, old), SyncVerdict::PeerIsBehind);
+}
+
+/// The unspent outputs paying `hash`, as the node's block hook looks them up.
+fn outputs_paying(chain: &Arc<Mutex<SharedChain>>, hash: &Hash256) -> Vec<(OutPoint, TxOut)> {
+    let c = chain.lock().unwrap();
+    let h = c.chain.height();
+    c.chain
+        .utxo
+        .spendable_for(hash, h, COINBASE_MATURITY)
+        .into_iter()
+        .map(|(o, e)| (o, e.output))
+        .collect()
+}
+
+/// B4, the other half: a wallet restored from its backup code knows none of
+/// its channels. When the peer closes alone, our side of its commitment pays
+/// our channel key, which nothing used to spend again. The node now derives
+/// its channel keys from the seed and claims such outputs back to the
+/// wallet — for a channel it accepted and for one it opened.
+#[test]
+fn a_wallet_restored_from_its_seed_recovers_what_a_peer_close_paid_it() {
+    let acceptor_seed = [0xe4u8; 32];
+    let funder_seed = [0xe3u8; 32];
+    let (mut p, wallet, chain, dir, cid, capacity) =
+        open_channel(funder_seed, acceptor_seed, "seed-restore");
+    let pay = p.funder.pay(cid, 2_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    let commit_fee = p.funder.info(cid).unwrap().force_close_fee;
+
+    // The acceptor's disk is lost: a node restored from the seed alone, on an
+    // empty folder, knows nothing of the channel.
+    let restored_sweep = Hash256([0x77; 32]);
+    let fresh = dir.join("acceptor-restored");
+    std::fs::create_dir_all(&fresh).unwrap();
+    let restored = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        fresh,
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), restored_sweep),
+    );
+    assert!(restored.list().is_empty());
+    let h = chain.lock().unwrap().height();
+    let find = |hash: &Hash256| outputs_paying(&chain, hash);
+    assert_eq!(
+        restored.recover_key_outputs(h, &find),
+        0,
+        "nothing to claim yet"
+    );
+
+    // The funder closes alone: the acceptor's 2 Q21 go to its channel key.
+    p.funder.force_close(cid).unwrap();
+    let h = chain.lock().unwrap().height();
+    assert_eq!(restored.recover_key_outputs(h, &find), 1);
+    assert_eq!(
+        held(&chain, restored_sweep),
+        2_000_000 - q21_core::channel::txbuild::SWEEP_FEE,
+        "the restored wallet got its side back"
+    );
+    let h = chain.lock().unwrap().height();
+    assert_eq!(restored.recover_key_outputs(h, &find), 0, "claimed once");
+
+    // And the side that opened the channel: a second channel, which the
+    // acceptor closes alone this time; the funder's folder is lost.
+    drop(restored);
+    let mut p2 = {
+        let funder = ChannelManager::new(
+            NET,
+            RATE,
+            funder_seed,
+            dir.join("funder"),
+            DELAY,
+            DEPTH,
+            funder_hooks(wallet.clone(), chain.clone()),
+        );
+        let acceptor = ChannelManager::new(
+            NET,
+            RATE,
+            acceptor_seed,
+            dir.join("acceptor2"),
+            DELAY,
+            DEPTH,
+            acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+        );
+        std::fs::create_dir_all(dir.join("acceptor2")).unwrap();
+        let mut q = Pair {
+            funder,
+            acceptor,
+            queue: VecDeque::new(),
+        };
+        q.reconnect();
+        q.reconnect();
+        q
+    };
+    drop(p);
+    let hello = p2.funder.open(A_PEER, capacity / 2, None, None).unwrap();
+    p2.queue.push_back((1, hello));
+    p2.pump();
+    let cid2 = p2
+        .funder
+        .list()
+        .into_iter()
+        .find(|c| c.channel_id != cid)
+        .expect("a second channel")
+        .channel_id;
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p2.funder.funding_confirmed(cid2).unwrap();
+    let ra = p2.acceptor.funding_confirmed(cid2).unwrap();
+    p2.queue.push_back((1, rf));
+    p2.queue.push_back((0, ra));
+    p2.pump();
+    let pay = p2.funder.pay(cid2, 1_000_000).unwrap();
+    p2.queue.push_back((1, pay));
+    p2.pump();
+    let funder_side = p2.funder.info(cid2).unwrap().local_balance;
+    let fee2 = p2.funder.info(cid2).unwrap().force_close_fee;
+    let gone = dir.join("funder-restored");
+    std::fs::create_dir_all(&gone).unwrap();
+    let funder_sweep = Hash256([0x78; 32]);
+    let mut hooks = funder_hooks(wallet, chain.clone());
+    hooks.sweep_address = Box::new(move || funder_sweep);
+    let restored_funder = ChannelManager::new(NET, RATE, funder_seed, gone, DELAY, DEPTH, hooks);
+    p2.acceptor.force_close(cid2).unwrap();
+    let h = chain.lock().unwrap().height();
+    assert_eq!(restored_funder.recover_key_outputs(h, &find), 1);
+    assert_eq!(
+        held(&chain, funder_sweep),
+        funder_side - fee2 - q21_core::channel::txbuild::SWEEP_FEE,
+        "the funder's side, less the commitment fee it pays and the claim's"
+    );
+    assert!(commit_fee > 0);
+}

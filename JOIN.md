@@ -157,8 +157,10 @@ what the wallet prints, for whoever wants to see it. Use one or the other,
 not both at once.
 
 **Copy the backup code onto paper.** It is the only way to recover your funds
-if this disk is lost — and it is all you need: on a brand-new computer, that
-code alone restores your entire wallet.
+if this disk is lost: on a brand-new computer, that code alone restores your
+balance, your addresses and your names. What sits in an open private channel
+comes back once the other person closes it — ask them to, and the wallet finds
+it on its own.
 
 Two warnings are normal the first time you launch, and both say the same thing:
 no commercial certificate was bought for this program. That is true, and the

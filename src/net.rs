@@ -1838,6 +1838,16 @@ pub trait ChannelSink: Send + Sync {
         Vec::new()
     }
 
+    /// Called after each connected block, off the chain lock, with a lookup of
+    /// the unspent outputs paying a key hash: claims what a close paid to a
+    /// channel key of a channel no longer operated. The default does nothing.
+    fn recover_key_outputs(
+        &self,
+        _height: u64,
+        _find: &dyn Fn(&crate::hash::Hash256) -> Vec<(crate::tx::OutPoint, crate::tx::TxOut)>,
+    ) {
+    }
+
     /// Called when a channel-capable peer completes the handshake, off the chain
     /// lock, with its live connection id and the connection's [`ChannelLink`].
     /// Returns frames to send it. The default does nothing.
@@ -2218,6 +2228,16 @@ impl Node {
         for (peer, frame) in frames {
             self.send_channel(peer, frame);
         }
+        let find = |hash: &crate::hash::Hash256| {
+            let g = self.shared.lock().unwrap();
+            g.chain
+                .utxo
+                .spendable_for(hash, tip, crate::consensus::COINBASE_MATURITY)
+                .into_iter()
+                .map(|(o, e)| (o, e.output))
+                .collect::<Vec<_>>()
+        };
+        sink.recover_key_outputs(tip, &find);
     }
 
     /// A stable, sorted view of every connected peer, for the RPC. The `id` is

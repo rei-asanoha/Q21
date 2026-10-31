@@ -968,6 +968,14 @@ impl ChannelSink for ChannelTransport {
         Vec::new()
     }
 
+    fn recover_key_outputs(
+        &self,
+        height: u64,
+        find: &dyn Fn(&crate::hash::Hash256) -> Vec<(crate::tx::OutPoint, crate::tx::TxOut)>,
+    ) {
+        self.mgr.recover_key_outputs(height, find);
+    }
+
     fn on_peer_connected(&self, peer: u64, link: &ChannelLink) -> Vec<Vec<u8>> {
         self.connect(peer, link);
         Vec::new()

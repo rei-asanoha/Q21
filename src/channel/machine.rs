@@ -256,6 +256,67 @@ pub struct Machine {
     /// A state both sides proposed at once (see "Crossed proposals" in the
     /// module documentation). Set until the merged state above it settles.
     crossed: Option<u64>,
+    /// What the last reestablish showed: both sides at the same point, or
+    /// one of them behind by more than a message lost in flight (see
+    /// [`SyncVerdict`]). Not journaled: every reestablish decides anew.
+    sync: SyncVerdict,
+}
+
+/// What a reestablish shows of the two sides' copies of the channel.
+///
+/// The protocol is strictly sequential: at most one state is in flight, so
+/// two honest copies differ by at most that one state, which the reestablish
+/// resends. A wider gap means one side runs an older copy of the channel —
+/// a data folder restored from a backup, a disk that lost its last writes.
+/// That side's latest commitment may be one it has already revoked:
+/// broadcasting it would hand the whole channel to the other side as a
+/// penalty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SyncVerdict {
+    /// No reestablish yet, or both copies within one state of each other.
+    #[default]
+    InStep,
+    /// Our copy is older than what the peer proves it holds: our latest
+    /// commitment may be revoked. Nothing is resent, nothing may be signed or
+    /// broadcast; the peer, which holds the latest state, is the one to close.
+    WeAreBehind,
+    /// The peer's copy is older than ours: its latest commitment may be
+    /// revoked. We close with our latest state, so that the peer gets its
+    /// funds back instead of losing them all by closing with its own.
+    PeerIsBehind,
+}
+
+/// Compares our reestablish counters with the peer's. Each is `[next local
+/// commitment, next remote commitment, next revocation sent, next revocation
+/// received]`, as [`Machine::reestablish_for`] builds them: one more than the
+/// state number, 0 for none.
+pub fn sync_verdict(ours: [u64; 4], theirs: [u64; 4]) -> SyncVerdict {
+    let [n_local, n_remote, n_sent, n_recv] = ours;
+    let [p_local, p_remote, p_sent, p_recv] = theirs;
+    // We are behind if the peer holds the revocation of our latest
+    // commitment, signed commitments of ours two or more beyond it, holds a
+    // commitment of its own we never signed, or revoked states we never
+    // received the secrets of beyond the one in flight.
+    let we_behind = (n_local > 0 && p_recv >= n_local)
+        || p_remote >= n_local.saturating_add(2)
+        || p_local > n_remote
+        || p_sent > n_recv.saturating_add(1)
+        || p_recv > n_sent;
+    // The peer is behind in the mirror cases: we hold the revocation of its
+    // latest commitment, signed two or more beyond it, it forgot signing our
+    // latest, or it forgot revoking states we hold the secrets of.
+    let peer_behind = (p_local > 0 && n_recv >= p_local)
+        || n_remote >= p_local.saturating_add(2)
+        || n_local > p_remote
+        || p_sent < n_recv
+        || p_recv.saturating_add(1) < n_sent;
+    match (we_behind, peer_behind) {
+        (false, false) => SyncVerdict::InStep,
+        // Both at once is no honest history either: the safe side is to
+        // broadcast nothing ourselves.
+        (true, _) => SyncVerdict::WeAreBehind,
+        (false, true) => SyncVerdict::PeerIsBehind,
+    }
 }
 
 /// Reestablish nonces remembered per channel. One is accepted per reconnection;
@@ -457,6 +518,7 @@ impl Machine {
             control_recv: 0,
             peer_proposal: None,
             crossed: None,
+            sync: SyncVerdict::InStep,
         })
     }
 
@@ -1628,6 +1690,11 @@ impl Machine {
         Ok(())
     }
 
+    /// The wallet key index our channel key derives from, when journaled.
+    pub fn key_index(&self) -> Option<u32> {
+        self.key_index
+    }
+
     /// The height at which the funding confirmed, if recorded.
     pub fn funding_height(&self) -> Option<u64> {
         self.funding_height
@@ -1706,6 +1773,7 @@ impl Machine {
             control_recv: 0,
             peer_proposal: None,
             crossed: None,
+            sync: SyncVerdict::InStep,
         };
         m.replay(&records);
         m.compact_if_long()?;
@@ -1817,12 +1885,7 @@ impl Machine {
     /// `nonce`: the proof of our funding key signs it, so the message is good
     /// for that session only.
     pub fn reestablish_for(&self, nonce: [u8; 32]) -> Message {
-        let counters = [
-            self.local_commit_number.map_or(0, |n| n + 1),
-            self.remote_commit_number.map_or(0, |n| n + 1),
-            self.revocations_sent.map_or(0, |m| m + 1),
-            self.revocations_recv.map_or(0, |m| m + 1),
-        ];
+        let counters = self.sync_counters();
         let proof = self.signer.sign(&reestablish_message(
             self.channel_id,
             nonce,
@@ -1839,6 +1902,21 @@ impl Machine {
             direction: self.our_index as u8,
             proof,
         }
+    }
+
+    /// Our reestablish counters (see [`sync_verdict`]).
+    fn sync_counters(&self) -> [u64; 4] {
+        [
+            self.local_commit_number.map_or(0, |n| n + 1),
+            self.remote_commit_number.map_or(0, |n| n + 1),
+            self.revocations_sent.map_or(0, |m| m + 1),
+            self.revocations_recv.map_or(0, |m| m + 1),
+        ]
+    }
+
+    /// What the last reestablish showed of the two copies of the channel.
+    pub fn sync(&self) -> SyncVerdict {
+        self.sync
     }
 
     /// Verifies a peer's [`Message::Reestablish`] and returns the messages we
@@ -1893,6 +1971,21 @@ impl Machine {
             self.phase,
             Phase::Forcing | Phase::Penalised | Phase::Closed
         ) {
+            return Ok(Vec::new());
+        }
+        // Two copies more than one state apart: one side runs an older copy
+        // of the channel. Nothing is resent over a history that does not
+        // match; the caller decides who closes (see [`SyncVerdict`]).
+        self.sync = sync_verdict(
+            self.sync_counters(),
+            [
+                *their_next_local,
+                *their_next_remote,
+                *their_next_sent,
+                *their_next_recv,
+            ],
+        );
+        if self.sync != SyncVerdict::InStep {
             return Ok(Vec::new());
         }
 
