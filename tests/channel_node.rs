@@ -3251,6 +3251,40 @@ fn history_and_archives_survive_a_restart() {
     assert_eq!(reloaded.history(cid).len(), 3, "its history is kept too");
 }
 
+/// 0.5.3: a channel remembers the identity address its peer's session
+/// proved, so that the wallet names the contact it is with while the peer is
+/// offline, after a restart and in the archives.
+#[test]
+fn a_channel_remembers_whom_it_is_with() {
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel([0xa7u8; 32], [0xb8u8; 32], "peer-owner");
+    let owner = p.acceptor.own_owner();
+    assert_eq!(
+        p.funder.info(cid).unwrap().peer_owner,
+        "",
+        "no session owner seen yet"
+    );
+    // A session proving the peer's identity address fills it in.
+    p.funder.set_session_owner(A_PEER, owner);
+    assert_eq!(p.funder.list()[0].peer_owner, owner.to_hex());
+    assert_eq!(p.funder.info(cid).unwrap().peer_owner, owner.to_hex());
+
+    let close = p.funder.close(cid).unwrap().expect("a close frame");
+    p.queue.push_back((1, close));
+    p.pump();
+    drive(&p.funder, &chain);
+    drive(&p.acceptor, &chain);
+    bury(&[&p.funder, &p.acceptor], &chain);
+    assert_eq!(p.funder.archived()[0].peer_owner, owner.to_hex());
+    drop(p);
+    let reloaded = one_manager([0xa7u8; 32], wallet, chain, &dir.join("funder"));
+    assert_eq!(
+        reloaded.archived()[0].peer_owner,
+        owner.to_hex(),
+        "kept across a restart"
+    );
+}
+
 /// 0.5.3: a close without the peer broadcasts the highest fee tier, so that
 /// it gets through a congested pool (there is no way to bump it later), and
 /// the summary says what it costs before the holder decides.

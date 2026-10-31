@@ -716,6 +716,7 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("force_close_fee", Json::u64(s.force_close_fee))
         .set("synced", Json::Bool(s.synced))
         .set("peer_identity", Json::str(s.peer_identity))
+        .set("peer_owner", Json::str(s.peer_owner))
         .set("behind", Json::Bool(s.behind))
         .build()
 }
@@ -1596,6 +1597,7 @@ impl RpcContext {
                     Json::obj()
                         .set("channel_id", Json::str(a.channel_id.to_hex()))
                         .set("peer_identity", Json::str(a.peer_identity))
+                        .set("peer_owner", Json::str(a.peer_owner))
                         .set("capacity", Json::u64(a.capacity))
                         .set("we_funded", Json::Bool(a.we_funded))
                         .set("final_local", Json::u64(a.final_local))

@@ -209,6 +209,9 @@ pub struct ChannelSummary {
     pub synced: bool,
     /// The node id the channel is bound to, as its session authenticated it.
     pub peer_identity: String,
+    /// The identity address (hex) the peer's session proved, as a contact
+    /// pins it: empty until a session with the peer has been seen.
+    pub peer_owner: String,
     /// Our copy of the channel is older than the peer's: it can no longer be
     /// operated, the peer is to close it (see [`SyncVerdict::WeAreBehind`]).
     pub behind: bool,
@@ -252,6 +255,8 @@ impl ClosedHow {
 pub struct ArchivedChannel {
     pub channel_id: Hash256,
     pub peer_identity: String,
+    /// The peer's identity address (hex), when it was recorded.
+    pub peer_owner: String,
     pub capacity: u64,
     pub we_funded: bool,
     /// Our balance in the last state, before any on-chain fee.
@@ -330,6 +335,11 @@ struct Chan {
     /// [`is_node_id`]), replaced at the first reestablish that proves the
     /// channel's funding key over an authenticated session.
     peer_identity: String,
+    /// The identity address the peer's session proved, persisted beside the
+    /// journal once seen: it names the contact the channel is with, also
+    /// while the peer is offline and once the channel is archived. Display
+    /// only: nothing the channel accepts depends on it.
+    peer_owner: Option<Hash256>,
     capacity: u64,
     /// Whether the peer's reestablish has been received and answered on the
     /// current connection. Until it has, a message one side lost may still be
@@ -822,12 +832,14 @@ impl ChannelManager {
                 // in a sidecar, tells which session the channel is with.
                 let peer_identity = self.read_peer_identity(cid);
                 let behind = self.behind_path(cid).exists();
+                let peer_owner = self.read_owner(cid);
                 g.channels.insert(
                     cid,
                     Chan {
                         machine,
                         peer: u64::MAX,
                         peer_identity,
+                        peer_owner,
                         capacity,
                         synced: false,
                         close: None,
@@ -894,6 +906,7 @@ impl ChannelManager {
         if let Some(l) = g.links.get_mut(&peer) {
             l.owner = Some(owner);
         }
+        self.fill_owners(&mut g);
     }
 
     /// The identity address the session on connection `peer` proved: the
@@ -1143,6 +1156,39 @@ impl ChannelManager {
         );
     }
 
+    /// The sidecar holding the identity address of a channel's peer, in hex.
+    fn owner_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.owner", cid.to_hex()))
+    }
+
+    fn write_owner(&self, cid: Hash256, owner: &Hash256) {
+        let _ =
+            crate::channel::journal::atomic_write(&self.owner_path(cid), owner.to_hex().as_bytes());
+    }
+
+    fn read_owner(&self, cid: Hash256) -> Option<Hash256> {
+        let text = std::fs::read_to_string(self.owner_path(cid)).ok()?;
+        Hash256::from_hex(text.trim())
+    }
+
+    /// Gives the channels whose peer's identity address is not known yet the
+    /// one a session with the same node id has proved, and keeps it.
+    fn fill_owners(&self, g: &mut Inner) {
+        let Inner {
+            channels, links, ..
+        } = g;
+        for c in channels.values_mut().filter(|c| c.peer_owner.is_none()) {
+            let found = links
+                .values()
+                .find(|l| !c.peer_identity.is_empty() && l.identity == c.peer_identity)
+                .and_then(|l| l.owner);
+            if let Some(o) = found {
+                self.write_owner(c.machine.channel_id(), &o);
+                c.peer_owner = Some(o);
+            }
+        }
+    }
+
     /// The sidecar marking a channel whose copy is older than the peer's.
     fn behind_path(&self, cid: Hash256) -> PathBuf {
         self.journal_dir.join(format!("{}.behind", cid.to_hex()))
@@ -1252,6 +1298,7 @@ impl ChannelManager {
         ArchivedChannel {
             channel_id: cid,
             peer_identity: self.read_peer_identity(cid),
+            peer_owner: self.read_owner(cid).map(|o| o.to_hex()).unwrap_or_default(),
             capacity: machine.params().capacity.units(),
             we_funded: us == crate::channel::txbuild::FUNDER,
             final_local: bal[us],
@@ -1719,12 +1766,17 @@ impl ChannelManager {
         )
         .map_err(err)?;
         self.write_peer_identity(cid, &pending.peer_identity);
+        let peer_owner = g.links.get(&peer).and_then(|l| l.owner);
+        if let Some(o) = peer_owner {
+            self.write_owner(cid, &o);
+        }
         g.channels.insert(
             cid,
             Chan {
                 machine,
                 peer,
                 peer_identity: pending.peer_identity,
+                peer_owner,
                 capacity: pending.capacity,
                 synced: true,
                 close: None,
@@ -2015,12 +2067,17 @@ impl ChannelManager {
             g.spare_payout = None;
         }
         self.write_peer_identity(cid, &pending.peer_identity);
+        let peer_owner = g.links.get(&peer).and_then(|l| l.owner);
+        if let Some(o) = peer_owner {
+            self.write_owner(cid, &o);
+        }
         g.channels.insert(
             cid,
             Chan {
                 machine,
                 peer,
                 peer_identity: pending.peer_identity,
+                peer_owner,
                 capacity: pending.capacity,
                 synced: true,
                 close: None,
@@ -2942,7 +2999,8 @@ impl ChannelManager {
     // --- RPC views --------------------------------------------------------
 
     pub fn list(&self) -> Vec<ChannelSummary> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
+        self.fill_owners(&mut g);
         g.channels.values().map(summary).collect()
     }
 
@@ -3136,6 +3194,7 @@ fn summary(c: &Chan) -> ChannelSummary {
         force_close_fee: c.machine.commit_fee(FORCE_CLOSE_TIER),
         synced: c.synced,
         peer_identity: c.peer_identity.clone(),
+        peer_owner: c.peer_owner.map(|o| o.to_hex()).unwrap_or_default(),
         behind: c.behind,
     }
 }
