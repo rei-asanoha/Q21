@@ -1355,11 +1355,12 @@ mod sessions {
         connect(&mut c, &b).unwrap();
         let at_h = mine(&c, &[], MINER);
         let s = side(0x43, "user-agent", &b);
-        assert_eq!(introduced_as(&s), "q21:0.4", "below H");
+        let base = q21_core::net::user_agent_base();
+        assert_eq!(introduced_as(&s), base, "below H");
         reach_h(&s, &at_h);
         assert_eq!(
             introduced_as(&s),
-            format!("q21:0.4{}", q21_core::wire::CHANNELS_CAPABILITY),
+            format!("{base}{}", q21_core::wire::CHANNELS_CAPABILITY),
             "at H"
         );
         s.node.shutdown();

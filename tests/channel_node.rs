@@ -3379,12 +3379,59 @@ fn restore_dir(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
+/// 0.5.3: a reestablish held up on a second session (a slower route) while
+/// payments go on over the first arrives with counters older than the
+/// channel's: it must not read as an older copy, nor close anything.
+#[test]
+fn a_reestablish_held_up_on_a_second_session_closes_nothing() {
+    let (mut p, _wallet, chain, _dir, cid, _capacity) =
+        open_channel([0x5au8; 32], [0x5bu8; 32], "race-second-session");
+    const A2: u64 = 91;
+    const F2: u64 = 92;
+    let binding = next_binding();
+    let to_acceptor = p.funder.on_session(A2, &p.acceptor.node_id(), "", binding);
+    let to_funder = p.acceptor.on_session(F2, &p.funder.node_id(), "", binding);
+    assert!(!to_acceptor.is_empty() && !to_funder.is_empty());
+    // Payments go on over the first session meanwhile.
+    for amount in [300_000u64, 200_000] {
+        let m = p.funder.pay(cid, amount).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+    }
+    let h0 = chain.lock().unwrap().height();
+    // The held reestablishes arrive now, both ways.
+    for f in to_acceptor {
+        assert_eq!(p.acceptor.deliver(F2, &f).penalize, 0);
+    }
+    for f in to_funder {
+        assert_eq!(p.funder.deliver(A2, &f).penalize, 0);
+    }
+    drive(&p.funder, &chain);
+    drive(&p.acceptor, &chain);
+    assert_eq!(chain.lock().unwrap().height(), h0, "nothing broadcast");
+    for m in [&p.funder, &p.acceptor] {
+        let i = m.info(cid).unwrap();
+        assert_eq!(i.phase, Phase::Open);
+        assert!(!i.behind && !i.peer_behind, "{i:?}");
+    }
+    assert_eq!(
+        p.acceptor.peer_of(cid),
+        Some(F_PEER),
+        "the channel stays where it runs"
+    );
+    // And it still pays over the first session.
+    let m = p.funder.pay(cid, 100_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 600_000);
+}
+
 /// B4, the loss the 0.5.0 review reproduced: a data folder restored from a
 /// copy taken two payments ago, then "close without the peer", broadcast a
 /// revoked state and lost the whole channel to the penalty. Now the restored
 /// side learns at the reestablish that its copy is older, refuses to pay, to
 /// close and to close alone; the peer, which holds the latest state, closes
-/// with it; and the restored side gets exactly its latest balance back, less
+/// with it once a second session confirms what the first showed; and the restored side gets exactly its latest balance back, less
 /// the claim fee. Nobody is penalised.
 #[test]
 fn a_channel_restored_from_an_older_copy_is_closed_by_the_peer_and_loses_nothing() {
@@ -3428,7 +3475,17 @@ fn a_channel_restored_from_an_older_copy_is_closed_by_the_peer_and_loses_nothing
     let refused = p.funder.force_close(cid).unwrap_err();
     assert!(refused.contains("older"), "{refused}");
 
-    // The peer closed with the latest state at once.
+    // The peer saw an older copy once: not proof enough — a reestablish held
+    // up in transit looks the same — so it closes nothing yet, and says so.
+    assert_eq!(
+        chain.lock().unwrap().height(),
+        h0,
+        "nothing broadcast on one sighting"
+    );
+    assert!(p.acceptor.info(cid).unwrap().peer_behind);
+    assert!(!p.funder.info(cid).unwrap().peer_behind);
+    // The next session shows the same: the peer closes with the latest state.
+    reconnect(&mut p);
     assert!(
         chain.lock().unwrap().height() > h0,
         "the peer's commitment is on chain"

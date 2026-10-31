@@ -51,10 +51,15 @@ journal, beside the wallet in the data folder, and the code does not hold it:
   the 200 first keys of each kind are looked at, more if channels went
   further). Ask the other person to close the channel;
 - a data folder restored from an **older copy** is recognised the first time
-  the channel reconnects: the copy refuses to pay or to close, the other side
-  closes with the latest state, and our side comes back to the wallet. Closing
-  such a copy alone would have broadcast a state it had already revoked, and
-  lost the whole channel to the penalty.
+  the channel reconnects: the copy refuses to pay or to close, and says why.
+  The other side, which holds the latest state, closes with it once a second
+  connection shows the same (one sighting could be a message held up in
+  transit), or sooner if its holder closes from the page; our side then comes
+  back to the wallet. Closing such a copy alone would have broadcast a state
+  it had already revoked, and lost the whole channel to the penalty. The
+  copy's refusal is not lifted by the other side's word alone: a peer that
+  claims we are behind when we are not can hold the channel until it closes,
+  its own funds held with ours.
 
 `checkbackup` (the wallet page: Info → Check my backup) checks the sheet
 against the wallet at any time, long before the day it is needed.

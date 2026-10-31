@@ -218,6 +218,10 @@ pub struct ChannelSummary {
     /// Our copy of the channel is older than the peer's: it can no longer be
     /// operated, the peer is to close it (see [`SyncVerdict::WeAreBehind`]).
     pub behind: bool,
+    /// The peer's last reestablish showed an older copy of the channel than
+    /// ours, once: closed with our latest state if the next session shows the
+    /// same (see [`SyncVerdict::PeerIsBehind`]); the holder may close it now.
+    pub peer_behind: bool,
 }
 
 /// How a channel ended, as its last phase before it was marked closed tells.
@@ -343,6 +347,10 @@ struct Chan {
     /// while the peer is offline and once the channel is archived. Display
     /// only: nothing the channel accepts depends on it.
     peer_owner: Option<Hash256>,
+    /// A reestablish that showed the peer's copy older than ours: its
+    /// counters, ours then, and the session it came over. A second session
+    /// showing the same, with nothing moved in between, closes the channel.
+    peer_behind: Option<([u64; 4], [u64; 4], [u8; 32])>,
     /// The height the transaction that ends the channel confirmed at, and
     /// when this node first saw it there: the date the archives give the
     /// close. Persisted beside the journal.
@@ -457,6 +465,11 @@ pub const ACCEPTOR_COUNTER_BASE: u32 = 0x4000_0000;
 /// funds a close paid to a channel key: a wallet restored from its backup
 /// code knows none of its channels.
 pub const KEY_SCAN_WINDOW: u32 = 200;
+
+/// How long a claim of a key output is remembered, in blocks: past it, an
+/// output still there is claimed again, and the memory of claims stays
+/// bounded.
+const CLAIM_MEMORY_BLOCKS: u64 = 1_000;
 
 /// Why a channel whose copy is older than the peer's refuses everything.
 const BEHIND: &str =
@@ -848,6 +861,7 @@ impl ChannelManager {
                         peer: u64::MAX,
                         peer_identity,
                         peer_owner,
+                        peer_behind: None,
                         closing,
                         capacity,
                         synced: false,
@@ -1824,6 +1838,7 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 peer_owner,
+                peer_behind: None,
                 closing: None,
                 capacity: pending.capacity,
                 synced: true,
@@ -1846,6 +1861,14 @@ impl ChannelManager {
             return self.accept_open(peer, peer_identity, cid, msg);
         }
         let mut g = self.inner.lock().unwrap();
+        // The sessions alive now, for a reestablish: one arriving over a
+        // second session while the channel runs on another may be older than
+        // the traffic that went over that one since it was sent.
+        let live: Vec<u64> = if matches!(msg, ChMsg::Reestablish { .. }) {
+            g.links.keys().copied().collect()
+        } else {
+            Vec::new()
+        };
         let Some(chan) = g.channels.get_mut(&cid) else {
             // A peer that still tracks a channel we have settled and forgotten
             // (closed on our side, still closing on theirs) offers its
@@ -1989,8 +2012,29 @@ impl ChannelManager {
                     self.broadcast_or_warn(&tx, "cooperative close");
                 }
             }
-            ChMsg::Reestablish { .. } => {
+            ChMsg::Reestablish {
+                local_commit_number,
+                remote_commit_number,
+                next_revocation_sent,
+                next_revocation_recv,
+                ..
+            } => {
+                let theirs = [
+                    local_commit_number,
+                    remote_commit_number,
+                    next_revocation_sent,
+                    next_revocation_recv,
+                ];
+                // The channel runs, in step, over another session still
+                // alive: this reestablish may predate payments made over that
+                // one since, and would show the peer behind when it is not.
+                // It is checked, and nothing more: the channel stays where it
+                // runs.
+                let elsewhere = chan.synced && chan.peer != peer && live.contains(&chan.peer);
                 let frames = chan.machine.on_reestablish(&msg).map_err(err)?;
+                if elsewhere && chan.machine.sync() != SyncVerdict::InStep {
+                    return Ok(out);
+                }
                 // The channel's funding key proved itself over this session:
                 // the channel's traffic goes over it from now on. A channel
                 // still named by a legacy id is bound to the node id.
@@ -2005,6 +2049,7 @@ impl ChannelManager {
                             out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
                         }
                         chan.synced = true;
+                        chan.peer_behind = None;
                     }
                     // Our copy is older: our latest commitment may be one we
                     // revoked. Never signed nor broadcast from now on; the
@@ -2025,12 +2070,35 @@ impl ChannelManager {
                     }
                     // The peer's copy is older: its latest commitment may be
                     // revoked, and broadcasting it would lose it the whole
-                    // channel. We close with the latest state instead: its
-                    // side comes back to it at once, ours after the delay.
+                    // channel. Once is not proof enough — a reestablish held
+                    // up in transit looks the same — so the first time it is
+                    // noted, and the holder can close; a second session that
+                    // shows the same, with nothing moved on either side in
+                    // between, closes the channel with the latest state: the
+                    // peer's side comes back to it at once, ours after the
+                    // delay.
                     SyncVerdict::PeerIsBehind => {
-                        if chan.machine.phase() == Phase::Open
+                        let ours = chan.machine.sync_counters();
+                        let confirmed = chan
+                            .peer_behind
+                            .is_some_and(|(t, o, b)| t == theirs && o == ours && b != from.binding);
+                        if !confirmed {
+                            if chan
+                                .peer_behind
+                                .map_or(true, |(t, o, _)| t != theirs || o != ours)
+                            {
+                                eprintln!(
+                                    "ALERT: channel {}: the peer seems to run an older copy of \
+                                     the channel; closed with the latest state if its next \
+                                     session shows the same",
+                                    cid.to_hex()
+                                );
+                            }
+                            chan.peer_behind = Some((theirs, ours, from.binding));
+                        } else if chan.machine.phase() == Phase::Open
                             || chan.machine.phase() == Phase::Closing
                         {
+                            chan.peer_behind = None;
                             match chan.machine.force_close(FORCE_CLOSE_TIER) {
                                 Ok(tx) => {
                                     eprintln!(
@@ -2126,6 +2194,7 @@ impl ChannelManager {
                 peer,
                 peer_identity: pending.peer_identity,
                 peer_owner,
+                peer_behind: None,
                 closing: None,
                 capacity: pending.capacity,
                 synced: true,
@@ -2502,7 +2571,9 @@ impl ChannelManager {
                                     pending.push((tx, "cooperative close"));
                                 }
                             }
-                            Phase::Forcing => {
+                            // Never from an older copy: its latest commitment
+                            // may be revoked.
+                            Phase::Forcing if !c.behind => {
                                 let latest = c.machine.local_commit_number().and_then(|n| {
                                     c.machine.signed_commitment_at(n, FORCE_CLOSE_TIER).ok()
                                 });
@@ -2954,8 +3025,9 @@ impl ChannelManager {
     ///
     /// Every key output paying a channel key is ours to take at once: the
     /// `to_remote` of a commitment carries no delay, and a funding is a
-    /// two-key policy, never a key output. Live channels claim theirs
-    /// themselves and are skipped. Returns how many claims went out.
+    /// two-key policy, never a key output. A live channel claims the one its
+    /// own close pays, and that one is skipped. Returns how many claims went
+    /// out.
     pub fn recover_key_outputs(
         &self,
         height: u64,
@@ -2974,23 +3046,29 @@ impl ChannelManager {
                 map.insert(self.signer(i).pubkey_hash(), i);
             }
             g.key_hashes = Some((funder_upto.max(f0), acceptor_upto.max(a0), map));
-            let live: std::collections::HashSet<u32> = g
+            // A live channel claims its own `to_remote` from the close it
+            // follows; any other output paying one of its keys — left by an
+            // earlier channel on the same index, before a restore reset the
+            // counters — is recovered here.
+            let live: std::collections::HashSet<Hash256> = g
                 .channels
                 .values()
                 .filter(|c| c.machine.phase() != Phase::Closed)
-                .filter_map(|c| c.machine.key_index())
+                .filter_map(|c| c.spend)
                 .collect();
+            g.claimed
+                .retain(|_, at| height < at.saturating_add(CLAIM_MEMORY_BLOCKS));
             let hashes: Vec<(Hash256, u32)> = g
                 .key_hashes
                 .as_ref()
                 .map(|(_, _, m)| m.iter().map(|(h, i)| (*h, *i)).collect())
                 .unwrap_or_default();
             for (hash, index) in hashes {
-                if live.contains(&index) {
-                    continue;
-                }
                 for (op, out) in find(&hash) {
-                    if out.scheme != CHANNEL_SCHEME || out.pubkey_hash != hash {
+                    if out.scheme != CHANNEL_SCHEME
+                        || out.pubkey_hash != hash
+                        || live.contains(&op.txid)
+                    {
                         continue;
                     }
                     // Claimed already, and not yet long enough ago to try again.
@@ -3251,6 +3329,7 @@ fn summary(c: &Chan) -> ChannelSummary {
         peer_identity: c.peer_identity.clone(),
         peer_owner: c.peer_owner.map(|o| o.to_hex()).unwrap_or_default(),
         behind: c.behind,
+        peer_behind: c.peer_behind.is_some(),
     }
 }
 

@@ -384,14 +384,25 @@ impl Wallet {
     /// Several candidates, or none: no suggestion.
     pub fn backup_slip(code: &str, network: Network) -> Option<(usize, char, char)> {
         const ALPHABET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        // The same characters left out as the decoding leaves out, so that a
+        // position counts as the holder counts on the sheet.
         let cleaned: Vec<char> = code
             .chars()
-            .filter(|c| !c.is_whitespace())
+            .filter(|c| {
+                !c.is_whitespace()
+                    && !matches!(
+                        *c,
+                        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}'
+                    )
+            })
             .map(|c| c.to_ascii_lowercase())
             .collect();
-        if cleaned.len() > 200
-            || Wallet::seed_from_backup(&cleaned.iter().collect::<String>(), network).is_ok()
-        {
+        let decodes = |text: &str| {
+            Wallet::seed_from_backup(text, network)
+                .map(|mut seed| crate::kdf::wipe(&mut seed))
+                .is_ok()
+        };
+        if cleaned.len() > 200 || decodes(&cleaned.iter().collect::<String>()) {
             return None;
         }
         let separator = cleaned.iter().rposition(|c| *c == '1')?;
@@ -405,7 +416,7 @@ impl Wallet {
                 let mut attempt = cleaned.clone();
                 attempt[i] = a;
                 let text: String = attempt.iter().collect();
-                if Wallet::seed_from_backup(&text, network).is_ok() {
+                if decodes(&text) {
                     if found.is_some() {
                         return None;
                     }
@@ -419,11 +430,12 @@ impl Wallet {
     /// Whether `code` is the backup code of this wallet: what the holder
     /// wrote down still restores it. Compared on the seed, in constant time.
     pub fn backup_matches(&self, code: &str) -> Result<bool, WalletError> {
-        let seed = Wallet::seed_from_backup(code, self.network)?;
+        let mut seed = Wallet::seed_from_backup(code, self.network)?;
         let mut diff = 0u8;
         for (a, b) in seed.iter().zip(self.seed.iter()) {
             diff |= a ^ b;
         }
+        crate::kdf::wipe(&mut seed);
         Ok(diff == 0)
     }
 
@@ -2054,6 +2066,15 @@ impl PreparedSpend {
     /// Indices whose coins are committed in this spend.
     pub fn indices(&self) -> Vec<u32> {
         self.chosen.iter().map(|(_, _, i)| *i).collect()
+    }
+
+    /// The fee this spend pays: what its coins hold, less what its outputs
+    /// pay. More than the fee asked for when the change would have been too
+    /// small to keep and went to the fee.
+    pub fn fee_paid(&self) -> u64 {
+        let inputs: u64 = self.chosen.iter().map(|(_, o, _)| o.value.units()).sum();
+        let outputs: u64 = self.tx.outputs.iter().map(|o| o.value.units()).sum();
+        inputs.saturating_sub(outputs)
     }
 }
 

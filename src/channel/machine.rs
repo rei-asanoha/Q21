@@ -1905,7 +1905,7 @@ impl Machine {
     }
 
     /// Our reestablish counters (see [`sync_verdict`]).
-    fn sync_counters(&self) -> [u64; 4] {
+    pub fn sync_counters(&self) -> [u64; 4] {
         [
             self.local_commit_number.map_or(0, |n| n + 1),
             self.remote_commit_number.map_or(0, |n| n + 1),

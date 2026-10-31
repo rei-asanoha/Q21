@@ -65,6 +65,48 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.5.1 or 0.5.2 to 0.5.3
+
+0.5.3 changes no rule of the chain and no message of the protocol: a 0.5.3
+node agrees with 0.5.1 and 0.5.2 nodes on every block, and keeps its payment
+channels with them. It reworks the wallet's channel tab and makes the funds in
+a channel, and every fee, safer.
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200.
+
+## What changes
+
+| | 0.5.2 | 0.5.3 |
+|---|---|---|
+| The channel tab | Called **Links**: contact cards, then forms and tables below | Called **Private channel**. Your names on top (up to three, an empty place offers to take one), the three steps, then your contacts on the left and, on the right, the channel with the one you choose: what you can send, what they can send you, what is in the channel, Pay, the payments made in it, Close |
+| Archives | The links closed since the wallet was opened, gone at the next start | Every closed channel, kept for good: when it closed, with whom, what you put in, what you paid or received, what came back. Folded behind an arrow, sorted by month and year |
+| A data folder restored from an older copy | A channel in it could broadcast a state it had already revoked, and lose the whole channel to the other side | The older copy is recognized when the two sides reconnect. It refuses to pay or to close, and says why; the other side, which holds the latest state, closes the channel once a second connection confirms it, and the restored side gets its latest balance back |
+| Close without the other side | The lowest fee: in a busy network the close could wait for days, and it cannot be bumped | The highest fee tier, so that it gets through, shown in the confirmation before you decide |
+| The other side's delay | An acceptor took any delay the funder proposed within the network's range | An acceptor takes no less than its own default: the delay is how long it may stay offline and still answer an old state |
+| Fees | Estimated from the median of the waiting transactions, which a few large ones could inflate | Estimated from what the next block takes, and capped. Registering a name, gathering small coins and bringing back what sits on your identity address show their fee first; the fee you confirm is the most the node may take, change too small to keep included |
+| The backup code | Shown as one long line; the check asked for the whole code | Shown in numbered groups of four; the check asks for three groups. **Info → Check my backup** says whether the code on your sheet restores this wallet, and where a single slip is |
+| A wallet restored from its backup code alone | Funds a channel close paid to the channel's key stayed there | Claimed back to the balance automatically |
+| A late clock | Blocks refused in silence | A banner says this computer's clock seems late, with the gap observed |
+
+## Who should upgrade, and when
+
+Anyone with a wallet, and both sides of a channel: the protection against an
+older copy works best when both run 0.5.3. A node that only runs as a server
+(entry point, explorer) gains little and can stay on 0.5.1 or 0.5.2.
+
+## The data folder
+
+0.5.3 writes a few small files beside each channel's journal in the
+`channels` folder: the date and height it closed at, how it ended, its
+payments, and the identity of the person it is with. They are only read for
+the page; the channel's funds never depend on them. A channel accepted under
+0.5.3 uses a key from a new range, so that a wallet restored from its backup
+code finds it again. Going back to 0.5.2 is possible, but close the channels
+opened toward you under 0.5.3 first.
+
+---
+
 # Upgrading from 0.5.1 to 0.5.2
 
 0.5.2 changes the wallet page only: no rule of the chain, no message of the

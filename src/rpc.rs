@@ -738,7 +738,7 @@ pub const CHANNEL_FUND_FEE: u64 = 50_000;
 /// to-self delay of a forced close (and the range a peer accepts) and the
 /// confirmations a funding waits for ([`crate::channel::terms`]). Null
 /// without the signing backend, where no channel runs.
-fn channel_terms(network: Network) -> Json {
+fn channel_terms(network: Network, accepted_min_delay: Option<u16>) -> Json {
     #[cfg(feature = "mldsa")]
     {
         use crate::channel::{manager::CLOSE_FEE, MAX_CAPACITY, MIN_CAPACITY};
@@ -759,11 +759,16 @@ fn channel_terms(network: Network) -> Json {
             .set("close_fee", amount_json(Amount::from_units(CLOSE_FEE)))
             .set("delay_blocks", Json::u64(u64::from(t.default_delay)))
             .set("min_delay_blocks", Json::u64(u64::from(t.min_delay)))
-            // What this node accepts from a funder: its own default delay
-            // (see `ChannelManager::acceptor_min_delay`).
+            // What this node accepts from a funder: the shortest delay it
+            // takes, as its channel manager enforces it
+            // (`ChannelManager::acceptor_min_delay`).
             .set(
                 "accepted_min_delay_blocks",
-                Json::u64(u64::from(t.default_delay.max(t.min_delay))),
+                Json::u64(u64::from(
+                    accepted_min_delay
+                        .unwrap_or(t.default_delay.max(t.min_delay))
+                        .min(t.max_delay),
+                )),
             )
             .set("max_delay_blocks", Json::u64(u64::from(t.max_delay)))
             .set("funding_depth", Json::u64(u64::from(t.funding_depth)))
@@ -771,7 +776,7 @@ fn channel_terms(network: Network) -> Json {
     }
     #[cfg(not(feature = "mldsa"))]
     {
-        let _ = network;
+        let _ = (network, accepted_min_delay);
         Json::Null
     }
 }
@@ -2025,18 +2030,25 @@ impl RpcContext {
         let lack = (NAME_PRICE + Self::identity_tx_fee(rate, coins.len() + 1, true))
             .saturating_sub(have)
             .max(MIN_OUTPUT_VALUE);
+        drop(g);
+        // The funding's fee as the spend would pay it, change too small to
+        // keep included; the registration's, with what is left over below
+        // the dust floor, which goes to its fee.
         let funding_fee = if needs_funding {
-            self.node
-                .with_chain_and_mempool(|c, m| automatic_fee(&g, c, m, lack, 1, &[]))
-                .map(|e| e.fee)
-                .map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?
+            self.spend_fee_preview(w, &[(identity_address, Amount::from_units(lack))])?
         } else {
             0
         };
-        drop(g);
         let registration_fee =
             Self::identity_tx_fee(rate, coins.len() + usize::from(needs_funding), true);
-        let fees = funding_fee + registration_fee;
+        let gathered = have + if needs_funding { lack } else { 0 };
+        let leftover = gathered.saturating_sub(NAME_PRICE + registration_fee);
+        let registration_paid = if leftover >= MIN_OUTPUT_VALUE {
+            registration_fee
+        } else {
+            registration_fee + leftover
+        };
+        let fees = funding_fee + registration_paid;
         if matches!(params.get("preview"), Some(Json::Bool(true))) {
             return Ok(Json::obj()
                 .set("preview", Json::Bool(true))
@@ -2046,19 +2058,23 @@ impl RpcContext {
                 .set("total", amount_json(Amount::from_units(NAME_PRICE + fees)))
                 .build());
         }
-        if let Some(limit) = max_fee_param(params)?.filter(|l| fees > *l) {
+        let limit = max_fee_param(params)?;
+        if let Some(limit) = limit.filter(|l| fees > *l) {
             return Err(fee_rose(fees, limit));
         }
 
-        // 2. Pay the identity what it lacks, if anything.
+        // 2. Pay the identity what it lacks, if anything, within what the
+        //    confirmed fee leaves once the registration's is set aside.
         let mut funding = None;
+        let mut funding_paid = 0;
         if needs_funding {
-            let (ftx, ftxid, _) = self.spend(
+            let (ftx, ftxid, paid) = self.spend(
                 w,
                 &[(identity_address, Amount::from_units(lack))],
                 None,
-                None,
+                limit.map(|l| l.saturating_sub(registration_paid)),
             )?;
+            funding_paid = paid;
             self.node.announce_tx(ftxid);
             self.record_name_txs(w, &[ftxid]);
             let index = ftx
@@ -2108,6 +2124,12 @@ impl RpcContext {
                 scheme: change.scheme,
                 pubkey_hash: change.hash,
             });
+        }
+        // The coins may have moved since the preview: the fee paid in all
+        // stays within what was confirmed. The funding, if sent, sits on the
+        // identity address, where the next registration or a sweep takes it.
+        if let Some(limit) = limit.filter(|l| funding_paid + paid_fee > *l) {
+            return Err(fee_rose(funding_paid + paid_fee, limit));
         }
         let mut tx = Transaction {
             version: 1,
@@ -2878,7 +2900,19 @@ impl RpcContext {
             })
             // The terms of a channel, for the same reason: the page checks a
             // capacity and states the fees before an open or a close.
-            .set("channel_terms", channel_terms(self.network))
+            .set(
+                "channel_terms",
+                channel_terms(self.network, {
+                    #[cfg(feature = "mldsa")]
+                    {
+                        self.channels.as_ref().map(|m| m.acceptor_min_delay())
+                    }
+                    #[cfg(not(feature = "mldsa"))]
+                    {
+                        None
+                    }
+                }),
+            )
             .set(
                 "network_stats",
                 Json::obj()
@@ -5188,7 +5222,56 @@ impl RpcContext {
         let mut g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let prepare = self.prepare_spend(&mut g, destinations, fee)?;
+        // What the spend pays in all: the fee, and change too small to keep,
+        // which goes to the fee. Above what the holder confirmed on the
+        // preview, it is refused, never paid: nothing is signed yet.
+        let fee = prepare.fee_paid();
+        if let Some(limit) = max_fee.filter(|l| fee > *l) {
+            g.cancel_spend(prepare);
+            return Err(fee_rose(fee, limit));
+        }
 
+        // 2. Write-ahead, outside the chain lock: the reserved indices reach
+        //    the disk before the slightest signature exists. A failure signs
+        //    nothing and gives the indices back.
+        if self.save_wallet(&g).is_err() {
+            g.cancel_spend(prepare);
+            return Err(rpc_error(
+                ERR_WALLET,
+                wallet_message(&crate::wallet::WalletError::SaveFailed),
+            ));
+        }
+        self.sign_and_accept(&mut g, prepare, fee)
+    }
+
+    /// The fee a spend to `destinations` would pay in all, change too small
+    /// to keep included: prepared, then given back. Nothing is reserved or
+    /// signed.
+    #[cfg(feature = "mldsa")]
+    fn spend_fee_preview(
+        &self,
+        w: &Arc<Mutex<Wallet>>,
+        destinations: &[(crate::address::Address, Amount)],
+    ) -> Result<u64, Json> {
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let prepare = self.prepare_spend(&mut g, destinations, None)?;
+        let fee = prepare.fee_paid();
+        g.cancel_spend(prepare);
+        Ok(fee)
+    }
+
+    /// Step 1 of a spend: coins chosen and reserved, change address derived,
+    /// nothing signed. `fee` given is the fee asked for; none, the automatic
+    /// one.
+    fn prepare_spend(
+        &self,
+        g: &mut Wallet,
+        destinations: &[(crate::address::Address, Amount)],
+        fee: Option<u64>,
+    ) -> Result<crate::wallet::PreparedSpend, Json> {
         // 1. Reservation, under the chain lock - without the mempool, which is
         //    not needed yet.
         //
@@ -5213,7 +5296,7 @@ impl RpcContext {
                     }));
                 }
             }
-            let pending = own_pending_coins(&g, c, m);
+            let pending = own_pending_coins(g, c, m);
             let fee = match fee {
                 Some(f) => Ok(f),
                 None => {
@@ -5222,7 +5305,7 @@ impl RpcContext {
                         .try_fold(0u64, |a, (_, v)| a.checked_add(v.units()))
                         .ok_or(crate::wallet::WalletError::AmountOutOfRange);
                     total_out.and_then(|t| {
-                        automatic_fee(&g, c, m, t, destinations.len() as u64, &pending)
+                        automatic_fee(g, c, m, t, destinations.len() as u64, &pending)
                             .map(|e| e.fee)
                     })
                 }
@@ -5268,28 +5351,20 @@ impl RpcContext {
             }
             r.map_err(Some)
         });
-        let (prepare, fee) = prepare.map_err(|e| match e {
+        let (prepare, _) = prepare.map_err(|e| match e {
             Some(e) => rpc_error(ERR_WALLET, wallet_message(&e)),
             None => rpc_error(ERR_WALLET, PENDING_FUNDS),
         })?;
-        // A fee above what the holder confirmed on the preview is refused,
-        // never paid: nothing is signed yet.
-        if let Some(limit) = max_fee.filter(|l| fee > *l) {
-            g.cancel_spend(prepare);
-            return Err(fee_rose(fee, limit));
-        }
+        Ok(prepare)
+    }
 
-        // 2. Write-ahead, outside the chain lock: the reserved indices reach
-        //    the disk before the slightest signature exists. A failure signs
-        //    nothing and gives the indices back.
-        if self.save_wallet(&g).is_err() {
-            g.cancel_spend(prepare);
-            return Err(rpc_error(
-                ERR_WALLET,
-                wallet_message(&crate::wallet::WalletError::SaveFailed),
-            ));
-        }
-
+    /// Steps 3 and 4 of a spend: signed and handed to the mempool.
+    fn sign_and_accept(
+        &self,
+        g: &mut Wallet,
+        prepare: crate::wallet::PreparedSpend,
+        fee: u64,
+    ) -> Result<(crate::tx::Transaction, crate::hash::Hash256, u64), Json> {
         // 3. Signature and acceptance, under the chain and mempool lock: both
         //    live under the same one, and taking one inside the other would
         //    freeze the node.
@@ -5304,7 +5379,7 @@ impl RpcContext {
         // The reserved indices are on disk; we save again for what has moved
         // since - indices gone from reserved to consumed, or given back if the
         // coins had disappeared.
-        if let Err(e) = self.save_wallet(&g) {
+        if let Err(e) = self.save_wallet(g) {
             eprintln!("WARNING: wallet not saved after the send: {e}");
         }
         let (tx, accepted) = result.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
