@@ -63,14 +63,90 @@ pub struct ContactBook {
 /// invisible characters that reorder or hide text dropped, trimmed, cut at
 /// [`MAX_LABEL_LEN`] characters, never in the middle of one.
 pub fn clean_label(text: &str) -> String {
-    let s: String = text
-        .trim()
-        .chars()
-        .filter(|c| !is_invisible(*c))
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(MAX_LABEL_LEN)
-        .collect();
+    clean_text(text, MAX_LABEL_LEN)
+}
+
+/// [`clean_label`] with another length: control characters turned to
+/// spaces, invisible characters dropped, at most two combining marks kept on
+/// a letter (a pile of them overflows the line and hides what is next to
+/// it), trimmed, cut at `max` characters.
+pub fn clean_text(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut marks = 0usize;
+    for c in text.trim().chars().filter(|c| !is_invisible(*c)) {
+        if is_combining(c) {
+            marks += 1;
+            if marks > 2 {
+                continue;
+            }
+        } else {
+            marks = 0;
+        }
+        out.push(if c.is_control() { ' ' } else { c });
+    }
+    let s: String = out.chars().take(max).collect();
     s.trim().to_string()
+}
+
+/// The combining marks of the common blocks: accents placed on the letter
+/// before them.
+fn is_combining(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
+/// What a name looks like, for telling two names apart: lowercase, accents
+/// dropped, and the Cyrillic and Greek letters drawn like Latin ones read as
+/// those. "Mum" and "Мum" (a Cyrillic М) are one name to the eye, so they are
+/// one name here too: a second contact cannot pass for the first in a list
+/// (red-team campaign 6, W1).
+pub fn look_alike_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| !is_combining(*c) && !is_invisible(*c))
+        .flat_map(|c| c.to_lowercase())
+        .map(|c| match c {
+            // Latin letters with an accent, written as one character.
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+            'ç' | 'ć' | 'č' => 'c',
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' | 'ě' => 'e',
+            'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' => 'i',
+            'ñ' | 'ń' | 'ň' => 'n',
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => 'o',
+            'ś' | 'š' | 'ş' => 's',
+            'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' | 'ų' => 'u',
+            'ý' | 'ÿ' => 'y',
+            'ź' | 'ż' | 'ž' => 'z',
+            'а' | 'α' => 'a',
+            'в' | 'β' => 'b',
+            'с' | 'ϲ' => 'c',
+            'е' | 'ё' | 'ε' => 'e',
+            'һ' | 'н' | 'η' => 'h',
+            'і' | 'ї' | 'ι' | 'ı' => 'i',
+            'ј' => 'j',
+            'к' | 'κ' => 'k',
+            'м' | 'μ' => 'm',
+            'о' | 'ο' | 'σ' | '0' => 'o',
+            'р' | 'ρ' => 'p',
+            'ԛ' => 'q',
+            'ѕ' => 's',
+            'т' | 'τ' => 't',
+            'у' | 'γ' => 'y',
+            'υ' | 'ս' => 'u',
+            'х' | 'χ' => 'x',
+            'ν' => 'v',
+            'ԝ' | 'ω' => 'w',
+            'з' => '3',
+            'l' | '1' | '|' => 'l',
+            other => other,
+        })
+        .filter(|c| !c.is_whitespace())
+        .collect()
 }
 
 /// The characters that show nothing yet change what is shown: the
@@ -129,11 +205,11 @@ impl ContactBook {
         if label.is_empty() {
             return Err(ContactError::EmptyLabel);
         }
-        let lower = label.to_lowercase();
+        let key = look_alike_key(&label);
         if self
             .by_owner
             .values()
-            .any(|c| c.owner != owner && c.label.to_lowercase() == lower)
+            .any(|c| c.owner != owner && look_alike_key(&c.label) == key)
         {
             return Err(ContactError::LabelTaken);
         }

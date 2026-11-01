@@ -634,7 +634,7 @@ fn restrict_access(path: &Path) -> bool {
             return false;
         };
 
-        std::process::Command::new("icacls")
+        std::process::Command::new(windows_system32("icacls.exe"))
             .arg(path)
             .arg("/inheritance:r")
             .arg("/grant:r")
@@ -7267,17 +7267,32 @@ fn handle_setup(
 /// No library: three commands, one per system. That is exactly what the
 /// libraries we could have imported do, and it avoids adding a dependency to
 /// software that keeps private keys.
+/// A Windows system program, by its full path.
+///
+/// Started by its bare name, `cmd` or `icacls` is looked for first in the
+/// folder of `q21.exe` itself: an archive extracted into Downloads, beside a
+/// `cmd.exe` dropped there earlier, would have run that file with the user's
+/// rights at every launch (red-team campaign 6, O5).
+#[allow(dead_code)]
+fn windows_system32(program: &str) -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(program)
+}
+
 fn open_browser(url: &str) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let mut c = if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
+        let mut c = Command::new("/usr/bin/open");
         c.arg(url);
         c
     } else if cfg!(target_os = "windows") {
         // `start` is a built-in command of the interpreter, hence `cmd /C`.
         // The first empty argument is the window title: without it, `start`
         // takes the address for a title and opens nothing.
-        let mut c = Command::new("cmd");
+        let mut c = Command::new(windows_system32("cmd.exe"));
         c.args(["/C", "start", "", url]);
         c
     } else {

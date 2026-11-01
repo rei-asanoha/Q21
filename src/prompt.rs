@@ -148,7 +148,7 @@ fn echo(on: bool) -> bool {
     // the BSDs, and a mistake there would leave the terminal mute after the
     // program exits.
     let arg = if on { "echo" } else { "-echo" };
-    std::process::Command::new("stty")
+    std::process::Command::new("/bin/stty")
         .arg(arg)
         // `stty` acts on its controlling terminal: it must be given ours.
         .stdin(std::process::Stdio::inherit())

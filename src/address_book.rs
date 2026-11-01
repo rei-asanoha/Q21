@@ -10,7 +10,7 @@
 //!
 //! Strictly local: kept in the wallet file, sealed with it, never sent.
 
-use crate::contacts::clean_label;
+use crate::contacts::{clean_label, clean_text, look_alike_key};
 use std::collections::BTreeMap;
 
 /// Most entries the book holds.
@@ -51,10 +51,10 @@ pub struct AddressBook {
     by_address: BTreeMap<String, Entry>,
 }
 
-/// A note as it is kept: cleaned as a name is, cut at [`MAX_NOTE_LEN`].
+/// A note as it is kept: cleaned as a name is, cut at [`MAX_NOTE_LEN`] — not
+/// at the shorter length of a name.
 pub fn clean_note(text: &str) -> String {
-    let s: String = clean_label(text).chars().take(MAX_NOTE_LEN).collect();
-    s.trim().to_string()
+    clean_text(text, MAX_NOTE_LEN)
 }
 
 fn hex(s: &str) -> String {
@@ -93,10 +93,12 @@ impl AddressBook {
     }
 
     fn name_taken(&self, name: &str, other_than: &str) -> bool {
-        let lower = name.to_lowercase();
+        // Two names that look alike are one name: a second contact must not
+        // pass for the first in the list (red-team campaign 6, W1).
+        let key = look_alike_key(name);
         self.by_address
             .values()
-            .any(|e| e.address != other_than && e.name.to_lowercase() == lower)
+            .any(|e| e.address != other_than && look_alike_key(&e.name) == key)
     }
 
     /// Keeps a new address. An address already kept is refused with the
@@ -229,7 +231,44 @@ mod tests {
         let long = "n".repeat(MAX_NOTE_LEN + 50);
         let e = b.add("\u{202E}Exchange\u{200F}", "tq21aaa", &long).unwrap();
         assert_eq!(e.name, "Exchange");
-        assert!(e.note.chars().count() <= MAX_NOTE_LEN);
+        assert_eq!(
+            e.note.chars().count(),
+            MAX_NOTE_LEN,
+            "a note keeps its 120 characters"
+        );
+        // A pile of accents on one letter is cut to two.
+        let e = b
+            .add("Z\u{0301}\u{0302}\u{0303}\u{0304}oe", "tq21zal", "")
+            .unwrap();
+        assert_eq!(e.name, "Z\u{0301}\u{0302}oe");
+    }
+
+    /// Red-team campaign 6, W1: a name drawn like another — a Cyrillic М, a
+    /// Greek ο, a zero for an o, another case or accent — is that name.
+    #[test]
+    fn a_look_alike_name_is_the_same_name() {
+        let mut b = AddressBook::default();
+        b.add("Mum", "tq21aaa", "").unwrap();
+        for twin in ["\u{041C}um", "MUM", "Mυm", "Mùm", "M u m"] {
+            assert_eq!(
+                b.add(twin, "tq21bbb", ""),
+                Err(BookError::NameTaken),
+                "{twin}"
+            );
+        }
+        b.add("Binance", "tq21ccc", "").unwrap();
+        assert_eq!(
+            b.add("Bin\u{0430}nce", "tq21ddd", ""),
+            Err(BookError::NameTaken)
+        );
+        assert_eq!(
+            b.add("B1nance", "tq21ddd", "").map(|e| e.name.clone()),
+            Ok("B1nance".into()),
+            "1 is not i"
+        );
+        // Real names with accents are kept as written.
+        let e = b.add("Hélène", "tq21eee", "").unwrap();
+        assert_eq!(e.name, "Hélène");
     }
 
     #[test]

@@ -5186,7 +5186,16 @@ impl RpcContext {
             .set("total_attempts", Json::u64(total))
             .set("blocks_found", Json::u64(blocks))
             .set("earned", amount_json(Amount::from_units(earned)))
-            .set("found", Json::array(list))
+            // A public explorer does not list the blocks its own node found:
+            // they would tie its rewards to it (red-team campaign 6, O7).
+            .set(
+                "found",
+                Json::array(if self.scans.is_some() {
+                    Vec::new()
+                } else {
+                    list
+                }),
+            )
             // --- Memory: the whole point of this proof of work, and it was
             // shown nowhere.
             //
