@@ -700,4 +700,5 @@ fn the_release_never_merges_the_artifacts_of_two_platforms() {
     );
     assert!(workflow.contains("carries an unexpected file"));
     assert!(workflow.contains("two artifacts carry"));
+    assert!(workflow.contains("names another platform's file"));
 }
