@@ -150,6 +150,14 @@ pub struct Wallet {
     known: HashMap<Hash256, u32>,
     /// Indices already used to sign. Forbidden from reuse.
     consumed: Vec<u32>,
+    /// One-time schemes only: the hashes of the next indices not derived yet
+    /// ([`Wallet::ONE_TIME_LOOKAHEAD`] of them), so a spend by a key the
+    /// wallet has not derived again — a data folder restored whole from a
+    /// backup — is still seen in the chain (see [`Wallet::record_spends`]).
+    /// In memory only.
+    lookahead: HashMap<Hash256, u32>,
+    /// The first index past those in [`Self::lookahead`].
+    lookahead_to: u32,
     /// Indices **reserved** for a spend in progress, with the chain height at
     /// the time of the reservation.
     ///
@@ -249,6 +257,8 @@ impl Wallet {
             next_index: 0,
             known: HashMap::new(),
             consumed: Vec::new(),
+            lookahead: HashMap::new(),
+            lookahead_to: 0,
             reserved: std::collections::BTreeMap::new(),
             verified_up_to: 0,
             labels: HashMap::new(),
@@ -285,6 +295,8 @@ impl Wallet {
             next_index: 0,
             known: HashMap::new(),
             consumed: Vec::new(),
+            lookahead: HashMap::new(),
+            lookahead_to: 0,
             reserved: std::collections::BTreeMap::new(),
             verified_up_to: 0,
             labels: HashMap::new(),
@@ -611,6 +623,9 @@ impl Wallet {
         }
         self.known.retain(|_, i| *i < from);
         self.next_index = from;
+        // The look-ahead window starts again from there.
+        self.lookahead.clear();
+        self.lookahead_to = 0;
     }
 
     /// Produces a fresh address **at the holder's request**, and remembers
@@ -1173,6 +1188,39 @@ impl Wallet {
         }
     }
 
+    /// How far past the last derived index a one-time wallet looks for its
+    /// own keys in the chain.
+    ///
+    /// # The defect this closes (red-team campaign 6, S1)
+    ///
+    /// A data folder restored whole — `wallet.dat` and `wallet.seq` together,
+    /// so no replay guard fires — rewinds the next index below keys that
+    /// already signed on chain. The scan then reread the blocks where they
+    /// signed but did not recognise them, since only derived indices were
+    /// looked for; the wallet later derived one of them again as a change
+    /// address and signed with it a second time, revealing the Lamport
+    /// private key. The scan now also looks this far ahead, and a key found
+    /// spent there is derived and marked consumed before any new address can
+    /// reuse it. A miner derives one address per block found: a thousand
+    /// covers a backup that many blocks old, and each find moves the window.
+    pub const ONE_TIME_LOOKAHEAD: u32 = 1_000;
+
+    /// Derives the hashes of the next [`Self::ONE_TIME_LOOKAHEAD`] indices
+    /// not derived yet, for a one-time scheme.
+    fn refresh_lookahead(&mut self) {
+        if !self.scheme.is_one_time() {
+            return;
+        }
+        let next = self.next_index;
+        self.lookahead.retain(|_, i| *i >= next);
+        let to = next.saturating_add(Self::ONE_TIME_LOOKAHEAD);
+        for index in self.lookahead_to.max(next)..to {
+            let h = pubkey_hash(self.scheme, &self.public_key(index));
+            self.lookahead.insert(h, index);
+        }
+        self.lookahead_to = self.lookahead_to.max(to);
+    }
+
     /// Observes a block and marks as consumed any key that signed in it.
     ///
     /// # Why the chain is the best source
@@ -1185,12 +1233,30 @@ impl Wallet {
     /// Returns the number of newly marked indices.
     pub fn record_spends(&mut self, block: &crate::block::Block) -> usize {
         let mut new_count = 0;
+        let one_time = self.scheme.is_one_time();
         for tx in &block.transactions {
             for input in &tx.inputs {
                 if input.witness.pubkey.is_empty() {
                     continue; // coinbase
                 }
                 let h = pubkey_hash(self.scheme, &input.witness.pubkey);
+                // A one-time key this wallet has not derived again: derive up
+                // to it, so that no new address can ever reuse it.
+                if one_time && !self.known.contains_key(&h) {
+                    self.refresh_lookahead();
+                    if let Some(ahead) = self.lookahead.get(&h).copied() {
+                        let found: Vec<(Hash256, u32)> = self
+                            .lookahead
+                            .iter()
+                            .filter(|(_, i)| **i <= ahead)
+                            .map(|(k, i)| (*k, *i))
+                            .collect();
+                        for (k, i) in found {
+                            self.known.insert(k, i);
+                        }
+                        self.next_index = self.next_index.max(ahead.saturating_add(1));
+                    }
+                }
                 if let Some(index) = self.known.get(&h).copied() {
                     // A signature in a block lifts the reservation: the key is
                     // no longer reserved, it is revealed.
@@ -2743,6 +2809,54 @@ mod tests {
             .spendable(&c.utxo, c.height())
             .iter()
             .any(|(_, _, i)| *i == index));
+    }
+
+    /// Red-team campaign 6, S1: a data folder restored whole rewinds the
+    /// next index below a one-time key that already signed. The scan rereads
+    /// the block where it signed and, looking ahead, recognises it: the
+    /// index is derived again, marked consumed, and no new address — a change
+    /// address above all — can reuse it.
+    #[test]
+    fn a_one_time_key_spent_after_the_backup_is_never_reused() {
+        let mut w = test_wallet();
+        let c = chain_with_funds(&mut w);
+        let backup_next = w.next_index();
+        // After the backup, the wallet derives further, and a key it derived
+        // then signs in a block (only the revealed public key matters to the
+        // scan: the block is read, not validated, here).
+        for _ in 0..7 {
+            let _ = w.new_address();
+        }
+        let spent_index = backup_next + 5;
+        let mut dest = Wallet::from_seed([0x98; 32], Network::Regtest);
+        let out = dest.new_address();
+        let mut spend = w
+            .create_transaction(
+                &c.utxo,
+                c.height(),
+                &out,
+                Amount::from_units(50_000),
+                Amount::from_units(1_000),
+            )
+            .unwrap();
+        spend.inputs[0].witness.pubkey = w.public_key(spent_index);
+        let signer = pubkey_hash(w.scheme(), &spend.inputs[0].witness.pubkey);
+        let mut block = c.block_at(c.height()).unwrap();
+        block.transactions.push(spend);
+
+        // The folder restored whole: the wallet knows only up to the backup.
+        let mut r = Wallet::from_seed([0x11; 32], Network::Regtest);
+        r.rescan(backup_next);
+        assert!(r.next_index() <= spent_index);
+        assert_eq!(r.record_spends(&block), 1, "the spend is seen");
+        assert!(r.is_consumed(spent_index), "the key is recognised as spent");
+        assert!(r.next_index() > spent_index, "and is never derived anew");
+        assert!(r.owns(&signer));
+        for _ in 0..5 {
+            let a = r.new_address();
+            assert_ne!(a.hash, signer, "a new address reused a spent key");
+        }
+        // An ML-DSA wallet is not one-time: nothing is looked ahead.
     }
 
     /// Tests of the ML-DSA wallet — the path that mainnet will use. Lamport is
