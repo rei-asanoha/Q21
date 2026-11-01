@@ -119,51 +119,29 @@ neither.
 **Required.** The server is running a version that does not yet know the
 `--rpc-public` option. Without this step, step 3 will fail.
 
-### On your PC
-
-1. Push the latest archive into your Q21 folder with GitHub Desktop.
-2. Wait until **Actions → Release** is green.
-3. Download **two** artifacts: **`q21-linux-x86_64.tar.gz`** — the one with
-   `linux` — and **`SHA256SUMS-signed`**.
-
-In a **PC WINDOW**, open the two GitHub `.zip` files — and only those: the
-`.tar.gz` they contain stays closed, it is what the signature covers (adjust
-the path):
-
-```powershell
-cd "C:\Users\YourName\Documents\Q21\Server\linux server"
-```
-
-```powershell
-Expand-Archive .\q21-linux-x86_64.tar.gz.zip -DestinationPath .\update -Force; Expand-Archive .\SHA256SUMS-signed.zip -DestinationPath .\update -Force
-```
-
-```powershell
-cd .\update; dir
-```
-
-You should see **three** files: `q21-linux-x86_64.tar.gz`, `SHA256SUMS`,
-`SHA256SUMS.minisig`. Send them:
-
-```powershell
-scp .\q21-linux-x86_64.tar.gz .\SHA256SUMS .\SHA256SUMS.minisig ubuntu@SERVER-IPV4-ADDRESS:~/
-```
-
 ### On the server
 
-In the **SERVER WINDOW**, check the signature **before** installing
-(`sudo apt install -y minisign` the first time; `RW…` is the public key from
-the README):
+The program comes from the **signed release** of the version you install
+(replace `v0.5.6`); a build of the **Actions** tab is never signed, and is
+never installed:
+
+```bash
+cd ~ && V=v0.5.6 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
+```
+
+Check the signature **before** installing (`sudo apt install -y minisign`
+the first time; `RW…` is the public key from the README):
 
 ```bash
 minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 Expected: `Signature and comment signature verified`, a comment
-`Trusted comment: Q21 main <commit hash> -- Rei Asanoha`, and
-`q21-linux-x86_64.tar.gz: OK`. ⛔ A branch other than `main`, a commit hash
-other than that of the run you started, a red run: **do not install** (see
-[SIGNING.md](SIGNING.md)).
+`Trusted comment: Q21 v<version> <commit hash> -- Rei Asanoha` naming the
+version you meant to install, and `q21-linux-x86_64.tar.gz: OK`. ⛔ A comment
+naming `main` (an old build signed by CI), a version older than the one
+running, a commit other than the one the release page shows: **do not
+install** (see [SIGNING.md](SIGNING.md)).
 
 ```bash
 tar -xzf ~/q21-linux-x86_64.tar.gz && sudo systemctl stop q21

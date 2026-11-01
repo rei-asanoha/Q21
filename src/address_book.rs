@@ -249,7 +249,7 @@ mod tests {
     fn a_look_alike_name_is_the_same_name() {
         let mut b = AddressBook::default();
         b.add("Mum", "tq21aaa", "").unwrap();
-        for twin in ["\u{041C}um", "MUM", "Mυm", "Mùm", "M u m"] {
+        for twin in ["\u{041C}um", "MUM", "M\u{03C5}m", "M\u{00F9}m", "M u m"] {
             assert_eq!(
                 b.add(twin, "tq21bbb", ""),
                 Err(BookError::NameTaken),
@@ -267,8 +267,8 @@ mod tests {
             "1 is not i"
         );
         // Real names with accents are kept as written.
-        let e = b.add("Hélène", "tq21eee", "").unwrap();
-        assert_eq!(e.name, "Hélène");
+        let e = b.add("H\u{00E9}l\u{00E8}ne", "tq21eee", "").unwrap();
+        assert_eq!(e.name, "H\u{00E9}l\u{00E8}ne");
     }
 
     #[test]

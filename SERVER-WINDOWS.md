@@ -457,44 +457,23 @@ addresses (zero at first).
 
 # Step 9 — Send the program
 
-The file is downloaded **on the PC** (GitHub requires you to be logged in,
-which the server cannot do), then pushed to the server.
+The program comes from the **signed release** of the version you install:
+the release page is public, so the server downloads it itself. Releases are
+signed offline by the project's key ([SIGNING.md](SIGNING.md)); a build of
+the **Actions** tab is never signed, and is never installed.
 
-### On the PC
-
-On `github.com/rei-asanoha/Q21` → **Actions** → **Release** → the latest
-**green** run → **Artifacts** section → download **two** artifacts:
-**`q21-linux-x86_64.tar.gz`** and **`SHA256SUMS-signed`**.
-
-⚠️ **Make sure it is `linux`**, not `windows`: this is the server's program.
-
-GitHub delivers each artifact inside a `.zip`. You open those `.zip` files,
-and **only them** — the `.tar.gz` they contain stays closed, it is what the
-signature covers. In PowerShell:
-
-```powershell
-cd $env:USERPROFILE\Downloads
-Expand-Archive .\q21-linux-x86_64.tar.gz.zip -DestinationPath .\for-server -Force
-Expand-Archive .\SHA256SUMS-signed.zip -DestinationPath .\for-server -Force
-cd .\for-server
-dir
-```
-
-`dir` must list **three** files: `q21-linux-x86_64.tar.gz`, `SHA256SUMS`
-and `SHA256SUMS.minisig`.
-
-Send them:
-
-```powershell
-scp .\q21-linux-x86_64.tar.gz .\SHA256SUMS .\SHA256SUMS.minisig q21op@YOUR_IP:~/
-```
-
-Three progress bars, three `100%`.
-
-Then connect:
+Connect from PowerShell:
 
 ```powershell
 ssh q21op@YOUR_IP
+```
+
+### On the server — download the release
+
+Replace `v0.5.6` with the version you install:
+
+```bash
+cd ~ && V=v0.5.6 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
 ```
 
 ### On the server — check the signature before installing
@@ -510,13 +489,15 @@ minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore
 ```
 
 **You should see** `Signature and comment signature verified`, then a line
-`Trusted comment: Q21 main <commit hash> -- Rei Asanoha` (or `Q21 v…` for a
-tagged release), then `q21-linux-x86_64.tar.gz: OK`.
+`Trusted comment: Q21 v<version> <commit hash> -- Rei Asanoha` naming the
+version you meant to install, then `q21-linux-x86_64.tar.gz: OK`.
 
-⛔ **Refuse to install** if the second word of the comment is neither `main`
-nor a `v…` tag, if the commit hash is not that of the run you started, or if
-the run was red. A valid signature of something you did not want is still
-something you did not want.
+⛔ **Refuse to install** if the comment does not name a `v…` version, if it
+names `main` (the old builds signed by CI, 0.4.0 to 0.5.0, are never to be
+installed again), if the version is older than the one already running (a
+signed old release replayed under a new name), or if the commit is not the
+one the release page shows. A valid signature of something you did not want
+is still something you did not want.
 
 Then, and only then:
 

@@ -57,6 +57,14 @@ If those two secrets still exist — *Settings → Environments → release*, or
 *Settings → Secrets and variables → Actions* — **delete them**. Nothing reads
 them any more, and a secret that exists can leak.
 
+Deleting them does not undo the years they spent there: the key that was in
+GitHub up to 0.5.0 is the key that still signs today. A leak from that time —
+a third-party action, a log, a compromised account — would last for good.
+**Before the main network, create a new key offline and treat the old one as
+exposed** (section 7): announce the new public key through the second channel
+of section 1, with a statement signed by the old key, and change
+`q21-release.pub`, the README and JOIN.md in the same commit.
+
 ## 3 · Releasing a version, step by step
 
 1. **Tag** the version on `main` and push the tag. The pipeline refuses a tag
@@ -134,8 +142,11 @@ spoofed without the secret key. The name confers no authority — Q21 has no
 governance — it only attests a constant origin from one release to the next.
 
 **Read it, and refuse anything that does not look like it.** The second word
-must be the version you meant to download; the third, the commit that version
-was tagged on. The second command must say `OK` for the archive you
+must be the version you meant to download — never `main`: the builds the
+pipeline signed itself, up to 0.5.0, said `main`, and none is to be installed
+again — and never a version older than the one you run, which would be an old
+release replayed under a new file name; the third word, the commit that
+version was tagged on. The second command must say `OK` for the archive you
 downloaded. **If either one fails, do not install**: this is not your
 release.
 

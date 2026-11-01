@@ -571,8 +571,33 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: artifacts
-          merge-multiple: true
+          path: downloaded
+      - name: Collect the artifacts, one platform each
+        shell: bash
+        run: |
+          set -eu
+          # One folder per artifact, each holding only the files of its own
+          # platform: a build job that uploads a file under another
+          # platform's name is refused, never merged over it.
+          mkdir -p artifacts
+          for dir in downloaded/*/; do
+            art=$(basename "$dir")
+            stem="${art%%.*}"
+            for f in "$dir"* "$dir".[!.]*; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f")
+              case "$art:$name" in
+                SHA256SUMS:SHA256SUMS) ;;
+                "$art:$art" | "$art:$art.sha256" | "$art:$stem.bin.sha256") ;;
+                *) echo "::error::artifact $art carries an unexpected file: $name"; exit 1 ;;
+              esac
+              if [ -e "artifacts/$name" ]; then
+                echo "::error::two artifacts carry $name"; exit 1
+              fi
+              cp "$f" "artifacts/$name"
+            done
+          done
+          ls -l artifacts
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
@@ -591,8 +616,33 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: artifacts
-          merge-multiple: true
+          path: downloaded
+      - name: Collect the artifacts, one platform each
+        shell: bash
+        run: |
+          set -eu
+          # One folder per artifact, each holding only the files of its own
+          # platform: a build job that uploads a file under another
+          # platform's name is refused, never merged over it.
+          mkdir -p artifacts
+          for dir in downloaded/*/; do
+            art=$(basename "$dir")
+            stem="${art%%.*}"
+            for f in "$dir"* "$dir".[!.]*; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f")
+              case "$art:$name" in
+                SHA256SUMS:SHA256SUMS) ;;
+                "$art:$art" | "$art:$art.sha256" | "$art:$stem.bin.sha256") ;;
+                *) echo "::error::artifact $art carries an unexpected file: $name"; exit 1 ;;
+              esac
+              if [ -e "artifacts/$name" ]; then
+                echo "::error::two artifacts carry $name"; exit 1
+              fi
+              cp "$f" "artifacts/$name"
+            done
+          done
+          ls -l artifacts
 
       # A single file, two kinds of lines, separated and labeled.
       #
@@ -654,8 +704,33 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: artifacts
-          merge-multiple: true
+          path: downloaded
+      - name: Collect the artifacts, one platform each
+        shell: bash
+        run: |
+          set -eu
+          # One folder per artifact, each holding only the files of its own
+          # platform: a build job that uploads a file under another
+          # platform's name is refused, never merged over it.
+          mkdir -p artifacts
+          for dir in downloaded/*/; do
+            art=$(basename "$dir")
+            stem="${art%%.*}"
+            for f in "$dir"* "$dir".[!.]*; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f")
+              case "$art:$name" in
+                SHA256SUMS:SHA256SUMS) ;;
+                "$art:$art" | "$art:$art.sha256" | "$art:$stem.bin.sha256") ;;
+                *) echo "::error::artifact $art carries an unexpected file: $name"; exit 1 ;;
+              esac
+              if [ -e "artifacts/$name" ]; then
+                echo "::error::two artifacts carry $name"; exit 1
+              fi
+              cp "$f" "artifacts/$name"
+            done
+          done
+          ls -l artifacts
       - name: tools/verify-release.sh, throwaway key
         shell: bash
         run: |
@@ -708,8 +783,33 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: artifacts
-          merge-multiple: true
+          path: downloaded
+      - name: Collect the artifacts, one platform each
+        shell: bash
+        run: |
+          set -eu
+          # One folder per artifact, each holding only the files of its own
+          # platform: a build job that uploads a file under another
+          # platform's name is refused, never merged over it.
+          mkdir -p artifacts
+          for dir in downloaded/*/; do
+            art=$(basename "$dir")
+            stem="${art%%.*}"
+            for f in "$dir"* "$dir".[!.]*; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f")
+              case "$art:$name" in
+                SHA256SUMS:SHA256SUMS) ;;
+                "$art:$art" | "$art:$art.sha256" | "$art:$stem.bin.sha256") ;;
+                *) echo "::error::artifact $art carries an unexpected file: $name"; exit 1 ;;
+              esac
+              if [ -e "artifacts/$name" ]; then
+                echo "::error::two artifacts carry $name"; exit 1
+              fi
+              cp "$f" "artifacts/$name"
+            done
+          done
+          ls -l artifacts
 
       - name: Create the draft release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

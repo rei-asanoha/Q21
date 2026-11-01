@@ -677,3 +677,27 @@ fn upgrading_md_announces_the_compiled_testnet_activation() {
         "the newest upgrade notes do not announce {names}, the compiled name activation"
     );
 }
+
+/// Red-team campaign 6, O4: the jobs that hash, attest and publish never
+/// merge the artifacts of the build jobs into one folder. Merged, a build job
+/// that uploaded a file under another platform's name silently replaced that
+/// platform's archive before its hash was taken.
+#[test]
+fn the_release_never_merges_the_artifacts_of_two_platforms() {
+    let workflow = read(".github/workflows/release.yml");
+    assert!(
+        !workflow.contains("merge-multiple"),
+        "an artifact download merges platforms"
+    );
+    let downloads = workflow.matches("uses: actions/download-artifact@").count();
+    let collected = workflow
+        .matches("name: Collect the artifacts, one platform each")
+        .count();
+    assert!(downloads >= 4);
+    assert_eq!(
+        downloads, collected,
+        "a download without the per-platform check"
+    );
+    assert!(workflow.contains("carries an unexpected file"));
+    assert!(workflow.contains("two artifacts carry"));
+}

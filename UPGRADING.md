@@ -57,11 +57,13 @@ On `github.com/rei-asanoha/Q21`:
 
 **Actions** → **Release** (left column) → **Run workflow** ▾ → green **Run workflow** button
 
-Ten to twenty minutes. Then download, at the bottom of the page,
-`q21-windows-x86_64.zip` **and** `SHA256SUMS-signed`, and check the signature
-before installing — the steps are in [SIGNING.md](SIGNING.md), section 4. A
-red run, or a trusted comment that does not say `Q21 main <commit hash>`, is a
-file you do not install.
+Ten to twenty minutes. That run checks the build; it is **not** what you
+install: a build of the **Actions** tab is never signed. Install only from the
+**signed release** of a version (the **Releases** page): download the archive,
+`SHA256SUMS` and `SHA256SUMS.minisig`, and check the signature first — the
+steps are in [SIGNING.md](SIGNING.md), section 4. A trusted comment that does
+not say `Q21 v<version> <commit hash>`, that says `main`, or that names a
+version older than the one you run, is a file you do not install.
 
 ---
 
