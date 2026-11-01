@@ -2973,7 +2973,13 @@ mod tests {
         let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
         let to = dest.new_address();
         let tx = w
-            .create_transaction(&c.utxo, h, &to, Amount::from_units(50_000), Amount::from_units(1_000))
+            .create_transaction(
+                &c.utxo,
+                h,
+                &to,
+                Amount::from_units(50_000),
+                Amount::from_units(1_000),
+            )
             .expect("a send still works");
         assert!(!tx.inputs.is_empty());
     }

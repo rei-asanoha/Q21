@@ -72,25 +72,52 @@ pub fn clean_label(text: &str) -> String {
 }
 
 /// [`clean_label`] with another length: control characters turned to
-/// spaces, invisible characters dropped, at most two combining marks kept on
-/// a letter (a pile of them overflows the line and hides what is next to
-/// it), trimmed, cut at `max` characters.
+/// spaces, invisible characters dropped, at most three combining marks kept
+/// on a letter (a pile of them overflows the line and hides what is next to
+/// it), trimmed, cut at `max` characters. The joiners that shape a word or
+/// an emoji are kept between two characters that show.
 pub fn clean_text(text: &str, max: usize) -> String {
-    let mut out = String::new();
+    let mut out: Vec<char> = Vec::new();
     let mut marks = 0usize;
-    for c in text.trim().chars().filter(|c| !is_invisible(*c)) {
+    for c in text.trim().chars() {
+        if is_joiner(c) {
+            // Kept once, after a character that shows: never first, never
+            // in a run; and it does not start a new pile of marks.
+            if out.last().is_some_and(|p| !is_joiner(*p)) {
+                out.push(c);
+            }
+            continue;
+        }
+        if is_invisible(c) {
+            continue;
+        }
         if is_combining(c) {
-            marks += 1;
-            if marks > 2 {
-                continue;
+            // A Tibetan subjoined letter is a letter stacked under the one
+            // before, not an accent: not counted.
+            if !('\u{0F8D}'..='\u{0FBC}').contains(&c) {
+                marks += 1;
+                if marks > 3 {
+                    continue;
+                }
             }
         } else {
             marks = 0;
         }
         out.push(if c.is_control() { ' ' } else { c });
     }
-    let s: String = out.chars().take(max).collect();
+    out.truncate(max);
+    while out.last().is_some_and(|c| is_joiner(*c)) {
+        out.pop();
+    }
+    let s: String = out.into_iter().collect();
     s.trim().to_string()
+}
+
+/// The zero-width joiner and non-joiner, and the text and emoji
+/// presentation selectors: invisible, but they shape a Persian word or an
+/// emoji. Kept in a name, never read in its key.
+fn is_joiner(c: char) -> bool {
+    matches!(c, '\u{200C}' | '\u{200D}' | '\u{FE0E}' | '\u{FE0F}')
 }
 
 /// The combining marks: accents placed on the letter before them, in every
@@ -116,34 +143,104 @@ fn in_ranges(table: &[(char, char)], c: char) -> bool {
 
 /// Characters drawn to imitate letters and digits — mathematical letters,
 /// the letters among the letter-like symbols, Roman numerals, Cherokee,
-/// phonetic small capitals, circled and squared letters, ligatures —
-/// refused in a contact's name: no one names their mother in mathematical
-/// bold, and each would have to be told apart from the letter it copies
-/// (red-team campaign 6, W1). Symbols that copy no letter (a trademark sign,
-/// a circled number, a flag) are left alone.
+/// phonetic small capitals, circled and squared letters, ligatures, CJK
+/// radicals, Arabic presentation forms — refused in a contact's name: no
+/// one names their mother in mathematical bold, and each would have to be
+/// told apart from the letter it copies (red-team campaign 6, W1). Symbols
+/// that copy no letter (a trademark sign, a circled number, a flag) are left
+/// alone. A code point the tables do not know yet is refused too.
 pub fn imitates_letters(name: &str) -> bool {
-    name.chars().any(|c| in_ranges(tables::IMITATIONS, c))
+    name.chars()
+        .any(|c| in_ranges(tables::IMITATIONS, c) || in_ranges(tables::UNASSIGNED, c))
 }
 
-/// A letter written in one piece, as its letter and its mark.
-fn decompose(c: char) -> Option<(char, char)> {
-    tables::DECOMPOSE
-        .binary_search_by(|&(k, _, _)| k.cmp(&c))
+/// A character's entry in one of the sorted tables of strings.
+fn lookup(table: &'static [(char, &'static str)], c: char) -> Option<&'static str> {
+    table
+        .binary_search_by(|&(k, _)| k.cmp(&c))
         .ok()
-        .map(|i| (tables::DECOMPOSE[i].1, tables::DECOMPOSE[i].2))
+        .map(|i| table[i].1)
 }
 
-/// Pushes `c` fully decomposed: its letter, read through the look-alikes,
-/// then its marks in order (a Vietnamese letter carries two).
-fn push_decomposed(out: &mut String, c: char) {
-    let mut marks = Vec::new();
-    let mut base = c;
-    while let Some((b, mark)) = decompose(base) {
-        marks.push(mark);
-        base = b;
+/// The canonical combining class of a mark, 0 for anything else.
+fn combining_class(c: char) -> u8 {
+    tables::CCC
+        .binary_search_by(|&(lo, hi, _)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .map_or(0, |i| tables::CCC[i].2)
+}
+
+/// A Hangul syllable as its letters (jamo): Unicode computes the
+/// decomposition of the 11,172 syllables rather than listing it.
+fn hangul_letters(c: char) -> Option<[Option<char>; 3]> {
+    let s = (c as u32).checked_sub(0xAC00).filter(|s| *s < 11_172)?;
+    let lead = char::from_u32(0x1100 + s / 588);
+    let vowel = char::from_u32(0x1161 + (s % 588) / 28);
+    let tail = (s % 28 != 0)
+        .then(|| char::from_u32(0x11A7 + s % 28))
+        .flatten();
+    Some([lead, vowel, tail])
+}
+
+/// Pushes what `c` looks like: split into its letter and marks, read
+/// through the look-alikes, in small letters. With `capitals`, a capital is
+/// read as drawn before it is lowered (a capital I is an l); without, it is
+/// lowered first (a capital I is an i).
+fn push_key(out: &mut Vec<char>, c: char, capitals: bool, depth: u8) {
+    // Fullwidth ASCII, as the ASCII it copies.
+    let c = match c {
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        _ => c,
+    };
+    if depth > 8 {
+        out.push(c);
+        return;
     }
-    out.push(small_look_alike(base));
-    out.extend(marks.into_iter().rev());
+    if let Some(parts) = lookup(tables::NFD, c) {
+        for p in parts.chars() {
+            push_key(out, p, capitals, depth + 1);
+        }
+        return;
+    }
+    if let Some(parts) = hangul_letters(c) {
+        for p in parts.into_iter().flatten() {
+            push_key(out, p, capitals, depth + 1);
+        }
+        return;
+    }
+    if capitals {
+        if let Some(as_) = lookup(tables::FOLD, c) {
+            for p in as_.chars() {
+                push_key(out, p, capitals, depth + 1);
+            }
+            return;
+        }
+        if let Some(l) = capital_look_alike(c) {
+            out.push(l);
+            return;
+        }
+    }
+    let mut lower = c.to_lowercase();
+    if lower.len() != 1 || lower.next() != Some(c) {
+        for l in c.to_lowercase() {
+            push_key(out, l, capitals, depth + 1);
+        }
+        return;
+    }
+    if let Some(as_) = lookup(tables::FOLD, c) {
+        for p in as_.chars() {
+            push_key(out, p, capitals, depth + 1);
+        }
+        return;
+    }
+    out.push(small_look_alike(c));
 }
 
 /// A capital drawn like a Latin letter, read as that letter.
@@ -267,37 +364,60 @@ pub fn same_keys(a: &(String, String), b: &(String, String)) -> bool {
 }
 
 fn key_of(name: &str, read_capitals: bool) -> String {
-    let mut out = String::new();
+    let mut out = Vec::new();
     for c in name
         .chars()
         .filter(|c| !is_invisible(*c) && !c.is_whitespace())
     {
-        // Fullwidth ASCII, as the ASCII it copies.
-        let c = match c {
-            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-            _ => c,
-        };
-        if read_capitals {
-            if let Some(l) = capital_look_alike(c) {
-                out.push(l);
-                continue;
-            }
-        }
-        for c in c.to_lowercase() {
-            push_decomposed(&mut out, c);
+        push_key(&mut out, c, read_capitals, 0);
+    }
+    // The marks on a letter in one order: those of different classes in
+    // the canonical one, so the order they were typed in does not matter.
+    let mut i = 0;
+    while i < out.len() {
+        let is_mark = |c: char| is_combining(c) || combining_class(c) != 0;
+        if is_mark(out[i]) {
+            let end = out[i..]
+                .iter()
+                .position(|c| !is_mark(*c))
+                .map_or(out.len(), |n| i + n);
+            out[i..end].sort_by_key(|c| combining_class(*c));
+            i = end;
+        } else {
+            i += 1;
         }
     }
-    out
+    out.into_iter().collect()
 }
 
 /// [`look_alike_key`] without the accents: a name with an accent and the
 /// same name without it meet here. Not a refusal — two people can bear them
 /// — but a name to show with a warning, so the holder checks the address.
 pub fn look_alike_loose(name: &str) -> String {
-    look_alike_key(name)
+    let mut key: Vec<char> = look_alike_key(name)
         .chars()
         .filter(|c| !is_combining(*c))
-        .collect()
+        .collect();
+    // In a line written left to right, a number or a word placed before a
+    // right-to-left name and the same placed after it can show the same
+    // way: such names are read as the letters they hold, in any order.
+    if key.iter().any(|c| is_right_to_left(*c)) {
+        key.sort_unstable();
+    }
+    key.into_iter().collect()
+}
+
+/// A letter of a script written right to left: Hebrew, Arabic, Syriac,
+/// Thaana, N'Ko and their neighbors.
+fn is_right_to_left(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0590}'..='\u{08FF}'
+            | '\u{FB1D}'..='\u{FDFF}'
+            | '\u{FE70}'..='\u{FEFF}'
+            | '\u{10800}'..='\u{10FFF}'
+            | '\u{1E800}'..='\u{1EFFF}'
+    )
 }
 
 /// The characters that show nothing yet change what is shown: the

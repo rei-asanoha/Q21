@@ -1590,14 +1590,16 @@ fn a_wallet_off_the_channel_scheme_neither_opens_nor_accepts() {
         &dir,
     );
     let capacity = 4 * MIN_OUTPUT_VALUE;
-    p.funder.refuse_opens("payment channels need a wallet on ML-DSA-87");
+    p.funder
+        .refuse_opens("payment channels need a wallet on ML-DSA-87");
     let err = p.funder.open(A_PEER, capacity, None, None).unwrap_err();
     assert!(err.contains("need a wallet on"), "{err}");
     // The acceptor side: a Hello is not answered and nothing is pending.
     let other = one_manager([0x63u8; 32], wallet, chain, &dir.join("other"));
     session(&other, A_PEER, &p.acceptor.node_id());
     let hello = other.open(A_PEER, capacity, None, None).unwrap();
-    p.acceptor.refuse_opens("payment channels need a wallet on ML-DSA-87");
+    p.acceptor
+        .refuse_opens("payment channels need a wallet on ML-DSA-87");
     let r = p.acceptor.deliver(F_PEER, &hello);
     assert_eq!(r.penalize, 0);
     assert!(r.frames.is_empty(), "a refusing node answered a Hello");
