@@ -365,11 +365,16 @@ mod tests {
     }
 
     /// The write timeout of the slow-reader tests. Short, so that the transfers
-    /// last several times longer; not so short that a busy test machine,
-    /// pausing the reader thread, stalls the writer that long.
-    const SHORT_TIMEOUT: Duration = Duration::from_secs(2);
+    /// last longer than it; not so short that a busy test machine, pausing the
+    /// reader thread, stalls the writer that long. Two seconds proved too
+    /// short on a loaded macOS Intel build machine: five leave a wide margin,
+    /// and the reader's pace below keeps every transfer longer still.
+    const SHORT_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Reads `total` bytes slowly — 32 KiB every 20 ms, at most 1.6 MB/s —
+    /// The pause between two reads of the slow reader.
+    const READ_PAUSE: Duration = Duration::from_millis(50);
+
+    /// Reads `total` bytes slowly — 32 KiB every 50 ms, at most 0.66 MB/s —
     /// and returns how many arrived.
     ///
     /// Far below what the writer could send, yet every read moves more than a
@@ -378,13 +383,13 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 32 * 1024];
             let mut got = 0usize;
-            b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            b.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
             while got < total {
                 match b.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => got += n,
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(READ_PAUSE);
             }
             (got, b)
         })
