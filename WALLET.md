@@ -225,6 +225,31 @@ Both wallets need 0.5.5 or later; the button shows only then.
 
 ---
 
+## My contacts
+
+The Send page keeps the addresses you send to under a name of your own —
+"Mum", "Exchange" — with a note if you want one (0.5.6). Each address is
+checked by the node before it is kept: its checksum, which catches a typo,
+and its network, so a testnet contact is never a mainnet address. An address
+is kept under one name only, and two contacts cannot share a name.
+
+Choosing a contact fills in the address; the payment's recap shows the name
+next to the address. After a payment to a new address, the page offers to
+keep it. Renaming and removing ask first; removing a contact changes nothing
+on the chain.
+
+The book is written in `wallet.dat`, sealed with it, and never sent. It is
+not in the backup code: a wallet restored from the code starts with an empty
+book. It is not the card of the Private channel either, "My verified
+contacts", which holds people reached through a channel and checked with
+words read aloud.
+
+RPC: `addressbooklist`, `addressbookadd` (`name`, `address`, `note`),
+`addressbookupdate` (`address`, `name`, `note`), `addressbookremove`
+(`address`).
+
+---
+
 ## What protects the wallet
 
 | Defense | What it prevents |

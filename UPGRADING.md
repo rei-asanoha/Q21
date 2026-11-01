@@ -65,6 +65,36 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.5.5 to 0.5.6
+
+0.5.6 changes no rule of the chain and nothing in a channel: a 0.5.5 node
+and a 0.5.6 node accept the same blocks and keep the same channels. Mining
+does not need to stop. It is a release of the wallet page.
+
+## What changes
+
+| | 0.5.5 | 0.5.6 |
+|---|---|---|
+| Addresses you send to | Typed or pasted each time | **My contacts**, on the Send page: an address kept under a name and a note, checked before it is kept (checksum and network), chosen in one click above the address field, named in the payment's recap. Sealed in the wallet file, like the channel contacts (WALLET.md, "My contacts") |
+| Channel contacts card | "My contacts" | "My verified contacts", so the two books are not confused |
+| The page's words | Protocol words on several pages | Plain words on every page but the balance: the Network page shows Tor first, the Mine page the time of the last block and the pace of the chain, a refused payment is explained before the node's own words |
+| Channel table and archives | The amounts with the opener's close reserve | What can really be sent, as on the panel; the archives as the amount was typed |
+| `getmining` | — | `tip_time`, and `mean_block_seconds` over the last 30 blocks |
+| `addressbooklist`, `addressbookadd`, `addressbookupdate`, `addressbookremove` | — | My contacts, over RPC (`name`, `address`, `note`) |
+
+## Who should upgrade, and when
+
+Wallets, when convenient. Entry points and explorers serve no wallet page to
+anyone but their owner: their update is optional.
+
+## The data folder
+
+My contacts are written as one more line of `wallet.dat`. An older release
+ignores that line, and drops it the next time it writes the wallet: go back
+to 0.5.5 with that folder and My contacts are lost, nothing else.
+
+---
+
 # Upgrading from 0.5.4 to 0.5.5
 
 0.5.5 brings the strict block time forward on the testnet: from **block
