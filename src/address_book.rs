@@ -11,7 +11,7 @@
 //! Strictly local: kept in the wallet file, sealed with it, never sent.
 
 use crate::contacts::{
-    clean_label, clean_text, imitates_letters, look_alike_key, look_alike_loose,
+    clean_label, clean_text, imitates_letters, look_alike_loose, name_keys, same_keys,
 };
 use std::collections::BTreeMap;
 
@@ -101,10 +101,10 @@ impl AddressBook {
     fn name_taken(&self, name: &str, other_than: &str) -> Option<String> {
         // Two names that look alike are one name: a second contact must not
         // pass for the first in the list (red-team campaign 6, W1).
-        let key = look_alike_key(name);
+        let keys = name_keys(name);
         self.by_address
             .values()
-            .find(|e| e.address != other_than && look_alike_key(&e.name) == key)
+            .find(|e| e.address != other_than && same_keys(&name_keys(&e.name), &keys))
             .map(|e| e.name.clone())
     }
 
@@ -117,6 +117,28 @@ impl AddressBook {
             .values()
             .find(|e| e.address != entry.address && look_alike_loose(&e.name) == key)
             .map(|e| e.name.clone())
+    }
+
+    /// [`Self::looks_like`] for every entry at once, each name read once:
+    /// the address of each entry that looks like another, with that other's
+    /// name.
+    pub fn look_alikes(&self) -> BTreeMap<String, String> {
+        let keyed: Vec<(String, &Entry)> = self
+            .by_address
+            .values()
+            .map(|e| (look_alike_loose(&e.name), e))
+            .collect();
+        let mut by_key: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
+        for (k, e) in &keyed {
+            by_key.entry(k.as_str()).or_default().push(e);
+        }
+        let mut out = BTreeMap::new();
+        for (k, e) in &keyed {
+            if let Some(other) = by_key[k.as_str()].iter().find(|o| o.address != e.address) {
+                out.insert(e.address.clone(), other.name.clone());
+            }
+        }
+        out
     }
 
     /// Keeps a new address. An address already kept is refused with the
@@ -153,14 +175,20 @@ impl AddressBook {
         if name.is_empty() {
             return Err(BookError::EmptyName);
         }
-        if imitates_letters(&name) {
+        let Some(current) = self.by_address.get(address) else {
+            return Err(BookError::Unknown);
+        };
+        // The name kept as it is (a note edited, or the case changed): no
+        // new look-alike is made, so a book written before look-alikes were
+        // refused can still have its notes edited.
+        let same = same_keys(&name_keys(&current.name), &name_keys(&name));
+        if !same && imitates_letters(&name) {
             return Err(BookError::Imitation);
         }
-        if !self.by_address.contains_key(address) {
-            return Err(BookError::Unknown);
-        }
-        if let Some(other) = self.name_taken(&name, address) {
-            return Err(BookError::NameTaken(other));
+        if !same {
+            if let Some(other) = self.name_taken(&name, address) {
+                return Err(BookError::NameTaken(other));
+            }
         }
         let e = self.by_address.get_mut(address).expect("checked above");
         e.name = name;
@@ -350,6 +378,79 @@ mod tests {
             b.add("Le\u{0301}a", "tq21kkk", ""),
             Err(BookError::NameTaken(_))
         ));
+    }
+
+    /// Red-team campaign 6, round 3: the names that still slipped through —
+    /// a case variant with an i, letters of other scripts written in one
+    /// piece or in two, two accents on one letter, a kana with its voicing
+    /// mark, tag characters beyond the first block — are the same name; marks
+    /// of every script are capped; symbols that copy no letter are allowed.
+    #[test]
+    fn the_round_three_look_alikes_are_the_same_name() {
+        let mut b = AddressBook::default();
+        b.add("Ivan", "tq21aaa", "").unwrap();
+        assert!(matches!(b.add("ivan", "tq21bbb", ""), Err(BookError::NameTaken(_))));
+        assert!(matches!(b.add("lvan", "tq21bbb", ""), Err(BookError::NameTaken(_))));
+        for (one, two) in [
+            ("\u{0219}tefan", "s\u{0326}tefan"),
+            ("Ng\u{1EC5}n", "Nge\u{0302}\u{0303}n"),
+            ("\u{304C}\u{304F}", "\u{304B}\u{3099}\u{304F}"),
+            ("B\u{1EE5}i", "Bu\u{0323}i"),
+        ] {
+            b.add(one, "tq21ccc", "").unwrap();
+            assert!(
+                matches!(b.add(two, "tq21ddd", ""), Err(BookError::NameTaken(_))),
+                "{two:?}"
+            );
+            b.remove("tq21ccc").unwrap();
+        }
+        b.add("Tom", "tq21eee", "").unwrap();
+        for twin in ["To\u{E0200}m", "T\u{1BCA0}om"] {
+            assert!(matches!(b.add(twin, "tq21fff", ""), Err(BookError::NameTaken(_))), "{twin:?}");
+        }
+        // Thai and Devanagari marks are piled no higher than Latin accents.
+        let thai = b
+            .add("\u{0E01}\u{0E34}\u{0E35}\u{0E36}\u{0E37}\u{0E38}", "tq21ggg", "")
+            .unwrap();
+        assert_eq!(thai.name.chars().count(), 3);
+        let deva = b.add("\u{0915}\u{0941}\u{0942}\u{0943}", "tq21hhh", "").unwrap();
+        assert_eq!(deva.name.chars().count(), 3);
+        // Symbols that copy no letter are names like any other.
+        for (i, ok) in ["Shop\u{2122}", "Flat \u{2116}3", "Team \u{2460}", "Ana \u{1F1EB}\u{1F1F7}"]
+            .iter()
+            .enumerate()
+        {
+            b.add(ok, &format!("tq21ok{i}"), "").unwrap();
+        }
+        // The letters among symbols are still refused.
+        for fake in ["\u{24B6}na", "\u{1F130}na", "\u{FB01}ona", "\u{2102}ana"] {
+            assert_eq!(b.add(fake, "tq21iii", ""), Err(BookError::Imitation), "{fake:?}");
+        }
+    }
+
+    /// An entry of a book written before look-alikes were refused keeps
+    /// its name while its note is edited, or its name's case changed; and
+    /// the list's warnings, read once for all, match the ones read one by one.
+    #[test]
+    fn an_older_look_alike_can_still_have_its_note_edited() {
+        let line = format!(
+            "tq21aaa:{}:,tq21bbb:{}:,tq21ccc:{}:",
+            hex("Mum"),
+            hex("\u{041C}um"),
+            hex("\u{2133}ax")
+        );
+        let mut b = AddressBook::from_line(&line, any);
+        b.update("tq21bbb", "\u{041C}um", "the other one").unwrap();
+        b.update("tq21bbb", "\u{041C}UM", "the other one").unwrap();
+        b.update("tq21ccc", "\u{2133}ax", "old").unwrap();
+        // A real rename still goes through every check.
+        assert!(matches!(b.update("tq21ccc", "MUM", ""), Err(BookError::NameTaken(_))));
+        assert_eq!(b.update("tq21ccc", "\u{2133}um", ""), Err(BookError::Imitation));
+        let all = b.look_alikes();
+        for e in b.list() {
+            assert_eq!(all.get(&e.address).cloned(), b.looks_like(e), "{}", e.address);
+        }
+        assert_eq!(all.len(), 2);
     }
 
     /// Two people can bear names that differ by an accent only: both are

@@ -2247,6 +2247,8 @@ async function loadBook(){
     if (round !== bookRound) return;
     addressBook = Array.isArray(list) ? list : [];
   }catch(e){
+    // A newer read is on its way: its answer, not this error, is shown.
+    if (round !== bookRound) return;
     document.getElementById("book-list").innerHTML =
       `<p class="help">${esc("Your contacts could not be read: " + e.message)}</p>`;
     return;

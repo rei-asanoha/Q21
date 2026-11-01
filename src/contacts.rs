@@ -15,6 +15,8 @@
 use crate::hash::Hash256;
 use std::collections::BTreeMap;
 
+mod tables;
+
 /// Most contacts a book holds.
 pub const MAX_CONTACTS: usize = 1000;
 
@@ -91,109 +93,57 @@ pub fn clean_text(text: &str, max: usize) -> String {
     s.trim().to_string()
 }
 
-/// The combining marks: accents placed on the letter before them.
+/// The combining marks: accents placed on the letter before them, in every
+/// script (a pile of Thai or Devanagari marks overflows a line as well as a
+/// pile of Latin accents).
 fn is_combining(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0300}'..='\u{036F}'
-            | '\u{0483}'..='\u{0489}'
-            | '\u{0591}'..='\u{05BD}'
-            | '\u{0610}'..='\u{061A}'
-            | '\u{064B}'..='\u{065F}'
-            | '\u{1AB0}'..='\u{1AFF}'
-            | '\u{1DC0}'..='\u{1DFF}'
-            | '\u{20D0}'..='\u{20FF}'
-            | '\u{A66F}'..='\u{A67F}'
-            | '\u{FE20}'..='\u{FE2F}'
-    )
+    in_ranges(tables::COMBINING, c)
+}
+
+fn in_ranges(table: &[(char, char)], c: char) -> bool {
+    table
+        .binary_search_by(|&(lo, hi)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Characters drawn to imitate letters and digits — mathematical letters,
-/// letter-like symbols, Roman numerals, Cherokee, small capitals, circled
-/// and fullwidth forms used as letters elsewhere — refused in a contact's
-/// name: no one names their mother in mathematical bold, and each would have
-/// to be told apart from the letter it copies (red-team campaign 6, W1).
+/// the letters among the letter-like symbols, Roman numerals, Cherokee,
+/// phonetic small capitals, circled and squared letters, ligatures —
+/// refused in a contact's name: no one names their mother in mathematical
+/// bold, and each would have to be told apart from the letter it copies
+/// (red-team campaign 6, W1). Symbols that copy no letter (a trademark sign,
+/// a circled number, a flag) are left alone.
 pub fn imitates_letters(name: &str) -> bool {
-    name.chars().any(|c| {
-        matches!(
-            c,
-            '\u{1D00}'..='\u{1DBF}'
-                | '\u{2100}'..='\u{218F}'
-                | '\u{2460}'..='\u{24FF}'
-                | '\u{13A0}'..='\u{13FF}'
-                | '\u{AB70}'..='\u{ABBF}'
-                | '\u{FB00}'..='\u{FB4F}'
-                | '\u{1D400}'..='\u{1D7FF}'
-                | '\u{1F100}'..='\u{1F1FF}'
-        )
-    })
+    name.chars().any(|c| in_ranges(tables::IMITATIONS, c))
 }
 
-/// A precomposed accented letter, as its base letter and its accent.
+/// A letter written in one piece, as its letter and its mark.
 fn decompose(c: char) -> Option<(char, char)> {
-    match c {
-        '\u{00E0}' => Some(('\u{0061}', '\u{0300}')),
-        '\u{00E1}' => Some(('\u{0061}', '\u{0301}')),
-        '\u{00E2}' => Some(('\u{0061}', '\u{0302}')),
-        '\u{00E3}' => Some(('\u{0061}', '\u{0303}')),
-        '\u{00E4}' => Some(('\u{0061}', '\u{0308}')),
-        '\u{00E5}' => Some(('\u{0061}', '\u{030A}')),
-        '\u{0101}' => Some(('\u{0061}', '\u{0304}')),
-        '\u{0103}' => Some(('\u{0061}', '\u{0306}')),
-        '\u{0105}' => Some(('\u{0061}', '\u{0328}')),
-        '\u{00E7}' => Some(('\u{0063}', '\u{0327}')),
-        '\u{0107}' => Some(('\u{0063}', '\u{0301}')),
-        '\u{010D}' => Some(('\u{0063}', '\u{030C}')),
-        '\u{010F}' => Some(('\u{0064}', '\u{030C}')),
-        '\u{00E8}' => Some(('\u{0065}', '\u{0300}')),
-        '\u{00E9}' => Some(('\u{0065}', '\u{0301}')),
-        '\u{00EA}' => Some(('\u{0065}', '\u{0302}')),
-        '\u{00EB}' => Some(('\u{0065}', '\u{0308}')),
-        '\u{0113}' => Some(('\u{0065}', '\u{0304}')),
-        '\u{0117}' => Some(('\u{0065}', '\u{0307}')),
-        '\u{0119}' => Some(('\u{0065}', '\u{0328}')),
-        '\u{011B}' => Some(('\u{0065}', '\u{030C}')),
-        '\u{011F}' => Some(('\u{0067}', '\u{0306}')),
-        '\u{00EC}' => Some(('\u{0069}', '\u{0300}')),
-        '\u{00ED}' => Some(('\u{0069}', '\u{0301}')),
-        '\u{00EE}' => Some(('\u{0069}', '\u{0302}')),
-        '\u{00EF}' => Some(('\u{0069}', '\u{0308}')),
-        '\u{012B}' => Some(('\u{0069}', '\u{0304}')),
-        '\u{012F}' => Some(('\u{0069}', '\u{0328}')),
-        '\u{00F1}' => Some(('\u{006E}', '\u{0303}')),
-        '\u{0144}' => Some(('\u{006E}', '\u{0301}')),
-        '\u{0148}' => Some(('\u{006E}', '\u{030C}')),
-        '\u{00F2}' => Some(('\u{006F}', '\u{0300}')),
-        '\u{00F3}' => Some(('\u{006F}', '\u{0301}')),
-        '\u{00F4}' => Some(('\u{006F}', '\u{0302}')),
-        '\u{00F5}' => Some(('\u{006F}', '\u{0303}')),
-        '\u{00F6}' => Some(('\u{006F}', '\u{0308}')),
-        '\u{014D}' => Some(('\u{006F}', '\u{0304}')),
-        '\u{0151}' => Some(('\u{006F}', '\u{030B}')),
-        '\u{0159}' => Some(('\u{0072}', '\u{030C}')),
-        '\u{015B}' => Some(('\u{0073}', '\u{0301}')),
-        '\u{0161}' => Some(('\u{0073}', '\u{030C}')),
-        '\u{015F}' => Some(('\u{0073}', '\u{0327}')),
-        '\u{0165}' => Some(('\u{0074}', '\u{030C}')),
-        '\u{0163}' => Some(('\u{0074}', '\u{0327}')),
-        '\u{00F9}' => Some(('\u{0075}', '\u{0300}')),
-        '\u{00FA}' => Some(('\u{0075}', '\u{0301}')),
-        '\u{00FB}' => Some(('\u{0075}', '\u{0302}')),
-        '\u{00FC}' => Some(('\u{0075}', '\u{0308}')),
-        '\u{016B}' => Some(('\u{0075}', '\u{0304}')),
-        '\u{016F}' => Some(('\u{0075}', '\u{030A}')),
-        '\u{0171}' => Some(('\u{0075}', '\u{030B}')),
-        '\u{0173}' => Some(('\u{0075}', '\u{0328}')),
-        '\u{00FD}' => Some(('\u{0079}', '\u{0301}')),
-        '\u{00FF}' => Some(('\u{0079}', '\u{0308}')),
-        '\u{017A}' => Some(('\u{007A}', '\u{0301}')),
-        '\u{017C}' => Some(('\u{007A}', '\u{0307}')),
-        '\u{017E}' => Some(('\u{007A}', '\u{030C}')),
-        '\u{0451}' => Some(('\u{0065}', '\u{0308}')),
-        '\u{0457}' => Some(('\u{0069}', '\u{0308}')),
-        '\u{0439}' => Some(('\u{0438}', '\u{0306}')),
-        _ => None,
+    tables::DECOMPOSE
+        .binary_search_by(|&(k, _, _)| k.cmp(&c))
+        .ok()
+        .map(|i| (tables::DECOMPOSE[i].1, tables::DECOMPOSE[i].2))
+}
+
+/// Pushes `c` fully decomposed: its letter, read through the look-alikes,
+/// then its marks in order (a Vietnamese letter carries two).
+fn push_decomposed(out: &mut String, c: char) {
+    let mut marks = Vec::new();
+    let mut base = c;
+    while let Some((b, mark)) = decompose(base) {
+        marks.push(mark);
+        base = b;
     }
+    out.push(small_look_alike(base));
+    out.extend(marks.into_iter().rev());
 }
 
 /// A capital drawn like a Latin letter, read as that letter.
@@ -300,6 +250,23 @@ fn small_look_alike(c: char) -> char {
 /// W1). Accents are kept: a name with an accent and the same name without
 /// it are two names, which [`look_alike_loose`] still notices.
 pub fn look_alike_key(name: &str) -> String {
+    key_of(name, true)
+}
+
+/// The two keys of a name: [`look_alike_key`], and the same read after
+/// lowering every letter first, where a capital I is an i. "Ivan" and "lvan"
+/// meet on the first, "Ivan" and "ivan" on the second; two names are one
+/// when either key is the same.
+pub fn name_keys(name: &str) -> (String, String) {
+    (key_of(name, true), key_of(name, false))
+}
+
+/// Whether two names, by their [`name_keys`], are one name to the eye.
+pub fn same_keys(a: &(String, String), b: &(String, String)) -> bool {
+    a.0 == b.0 || a.1 == b.1
+}
+
+fn key_of(name: &str, read_capitals: bool) -> String {
     let mut out = String::new();
     for c in name
         .chars()
@@ -310,18 +277,14 @@ pub fn look_alike_key(name: &str) -> String {
             '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
             _ => c,
         };
-        if let Some(l) = capital_look_alike(c) {
-            out.push(l);
-            continue;
+        if read_capitals {
+            if let Some(l) = capital_look_alike(c) {
+                out.push(l);
+                continue;
+            }
         }
         for c in c.to_lowercase() {
-            match decompose(c) {
-                Some((base, mark)) => {
-                    out.push(small_look_alike(base));
-                    out.push(mark);
-                }
-                None => out.push(small_look_alike(c)),
-            }
+            push_decomposed(&mut out, c);
         }
     }
     out
@@ -361,8 +324,8 @@ fn is_invisible(c: char) -> bool {
             | '\u{FFA0}'
             | '\u{FFF0}'..='\u{FFFC}'
             | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E007F}'
-            | '\u{E0100}'..='\u{E01EF}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{E0000}'..='\u{E0FFF}'
     )
 }
 
@@ -402,11 +365,11 @@ impl ContactBook {
         if imitates_letters(&label) {
             return Err(ContactError::Imitation);
         }
-        let key = look_alike_key(&label);
+        let keys = name_keys(&label);
         if self
             .by_owner
             .values()
-            .any(|c| c.owner != owner && look_alike_key(&c.label) == key)
+            .any(|c| c.owner != owner && same_keys(&name_keys(&c.label), &keys))
         {
             return Err(ContactError::LabelTaken);
         }

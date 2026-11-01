@@ -4522,6 +4522,8 @@ impl RpcContext {
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
         let book = g.address_book();
+        // Every name read once, not once per pair of entries.
+        let twins = book.look_alikes();
         Ok(Json::array(
             book.list()
                 .into_iter()
@@ -4532,7 +4534,7 @@ impl RpcContext {
                     if let Json::Object(fields) = &mut j {
                         fields.insert(
                             "looks_like".to_string(),
-                            book.looks_like(e).map_or(Json::Null, Json::str),
+                            twins.get(&e.address).map_or(Json::Null, Json::str),
                         );
                     }
                     j
