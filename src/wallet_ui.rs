@@ -3937,13 +3937,17 @@ function paintChannels(){
       ? `<span class="row-actions">${html(pay)}${html(close)}</span>` : "";
     const arriving = channelUnits(ch.pending_incoming);
     const comes = arriving !== null && arriving > 0n;
+    // The same figures as the panel: what can really be sent, without the
+    // close reserve the opener keeps. "Arriving" is shown apart, so it is
+    // taken out of what we can send here.
+    const send = channelSendable(ch) - (comes ? arriving : 0n);
     return `
       <tr>
         <td class="peer">${html(channelWho(ch))}<span class="state">${html(channelState(ch))}</span>${html(actions)}</td>
-        <td>${esc(channelAmount(ch.local_balance))}</td>
+        <td>${esc(q21FromUnits(send > 0n ? send : 0n))}</td>
         <td${html(comes ? ' class="plus"' : '')}>${esc(comes ? "+ " + q21FromUnits(arriving) : "—")}</td>
-        <td>${esc(channelAmount(ch.remote_balance))}</td>
-        <td>${esc(channelAmount(ch.capacity))}</td>
+        <td>${esc(q21FromUnits(channelReceivable(ch)))}</td>
+        <td>${esc(q21FromUnits(channelUsable(ch)))}</td>
       </tr>`;
   }).join("");
 }
@@ -4391,8 +4395,12 @@ function paintArchive(){
     const who = c
       ? `<span translate="no">${esc(c.label)}</span>`
       : `<span class="id">${trunc(String(a.channel_id), 8)}</span>`;
-    const put = a.we_funded === true ? channelUnits(a.capacity) : 0n;
-    const back = channelUnits(a.final_local);
+    // Without the close reserve the opener kept, as the amount was typed:
+    // it is set on top at the opening, and it is what pays the close fee.
+    const keep = a.we_funded === true ? closeReserve() : 0n;
+    const cap = channelUnits(a.capacity), last = channelUnits(a.final_local);
+    const put = a.we_funded === true ? (cap === null ? null : cap > keep ? cap - keep : 0n) : 0n;
+    const back = last === null ? null : last > keep ? last - keep : 0n;
     const moved = put !== null && back !== null ? back - put : null;
     const sign = moved === null ? "—" : moved < 0n ? "− " + shortQ21(-moved) : moved > 0n ? "+ " + shortQ21(moved) : shortQ21(0n);
     return `<tr>
@@ -7625,9 +7633,9 @@ mod tests {
             "trunc(p.channel_session, 8)",
             r#"data-pay="${esc(cid)}""#,
             r#"data-close="${esc(cid)}""#,
-            "esc(channelAmount(ch.capacity))",
-            "esc(channelAmount(ch.local_balance))",
-            "esc(channelAmount(ch.remote_balance))",
+            "esc(q21FromUnits(channelUsable(ch)))",
+            "esc(q21FromUnits(send > 0n ? send : 0n))",
+            "esc(q21FromUnits(channelReceivable(ch)))",
             "q21FromUnits(arriving)",
         ] {
             assert!(rows.contains(e), "the channel table does not escape: {e}");
@@ -7642,6 +7650,7 @@ mod tests {
         assert!(archive.contains(r#"<span translate="no">${esc(c.label)}</span>"#));
         assert!(archive.contains("trunc(String(a.channel_id), 8)"));
         assert!(archive.contains("channelUnits(a.final_local)"));
+        assert!(archive.contains("closeReserve()"), "archives without the reserve");
         let refusal = channel_function("function channelRefusal(");
         assert!(refusal.contains("esc(plain || m)"));
         assert!(refusal.contains(r#"esc("Node message: " + m)"#));
