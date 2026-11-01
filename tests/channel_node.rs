@@ -3596,6 +3596,92 @@ fn a_channel_restored_from_an_older_copy_is_closed_by_the_peer_and_loses_nothing
     }
 }
 
+/// Red-team campaign 6, C1: a peer's word that our copy is older never
+/// freezes the channel for good. One signed reestablish with inflated
+/// counters, from a peer that does not announce proofs, used to latch a
+/// refusal written to disk and never lifted: the honest side could no longer
+/// pay, close, nor close alone. Now an unproven claim holds only for the
+/// session, is never written, and lapses after UNPROVEN_BEHIND; a proof, from
+/// a peer that announces it, still makes it final.
+#[test]
+fn an_unproven_claim_of_an_older_copy_never_freezes_the_channel() {
+    let funder_seed = [0xc5u8; 32];
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, [0xd6u8; 32], "unproven-claim");
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    // A copy two payments behind makes the peer's reestablish claim it.
+    let backup = dir.join("funder-backup");
+    restore_dir(&dir.join("funder"), &backup);
+    for amount in [2_000_000u64, 500_000] {
+        let pay = p.funder.pay(cid, amount).unwrap();
+        p.queue.push_back((1, pay));
+        p.pump();
+    }
+    restore_dir(&backup, &dir.join("funder"));
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+    // Neither side announces proofs: the claim is a word, not a proof.
+    reconnect(&mut p);
+    assert!(p.funder.info(cid).unwrap().behind, "refused while claimed");
+    assert!(p.funder.force_close(cid).is_err());
+    assert!(
+        !dir.join("funder")
+            .join(format!("{}.behind", cid.to_hex()))
+            .exists(),
+        "an unproven claim is never written"
+    );
+    // A restart does not keep it.
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+    assert!(
+        !p.funder.info(cid).unwrap().behind,
+        "not kept across a restart"
+    );
+    // Claimed again, then left unproven past the grace: it lapses.
+    reconnect(&mut p);
+    assert!(p.funder.info(cid).unwrap().behind);
+    p.funder.age_unproven_claims(
+        q21_core::channel::manager::UNPROVEN_BEHIND + std::time::Duration::from_secs(1),
+    );
+    assert!(
+        !p.funder.info(cid).unwrap().behind,
+        "an unproven claim lapses: the channel can be closed again"
+    );
+    // A later session claiming it again does not restart the grace.
+    reconnect(&mut p);
+    assert!(
+        !p.funder.info(cid).unwrap().behind,
+        "the grace is not reset"
+    );
+
+    // With proofs announced, the peer proves it: the refusal is final,
+    // kept across a restart and never aged out.
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+    let binding = next_binding();
+    let (fid, aid) = (p.funder.node_id(), p.acceptor.node_id());
+    p.funder.note_peer_splices(A_PEER, true);
+    p.acceptor.note_peer_splices(F_PEER, true);
+    for f in p.funder.on_session(A_PEER, &aid, "", binding) {
+        p.queue.push_back((1, f));
+    }
+    for f in p.acceptor.on_session(F_PEER, &fid, "", binding) {
+        p.queue.push_back((0, f));
+    }
+    p.pump();
+    assert!(p.funder.info(cid).unwrap().behind);
+    assert!(
+        dir.join("funder")
+            .join(format!("{}.behind", cid.to_hex()))
+            .exists(),
+        "a proven older copy is written"
+    );
+    p.funder
+        .age_unproven_claims(q21_core::channel::manager::UNPROVEN_BEHIND * 10);
+    assert!(p.funder.info(cid).unwrap().behind, "a proof never lapses");
+    p.reload_funder(funder_seed, wallet, chain, &dir);
+    assert!(p.funder.info(cid).unwrap().behind, "kept across a restart");
+}
+
 /// The verdict over every pair of counters an honest channel can show:
 /// the two copies differ by at most the state in flight, and then nothing
 /// is suspected. Any copy two states older is recognised, from both sides.

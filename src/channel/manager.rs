@@ -455,11 +455,13 @@ struct Chan {
     /// it. Persisted beside the journal, so a restart keeps it, once proven
     /// (see [`Chan::behind_proven`]).
     behind: bool,
-    /// The older copy is proven: by the peer's proof, or, with a peer that
-    /// proves nothing (before 0.5.5), by its word. Written beside the
-    /// journal, and never lifted. Unproven, the refusal lasts while the peer
-    /// keeps saying so.
+    /// The older copy is proven by the peer's proof (0.5.5 and later).
+    /// Written beside the journal, and never lifted. Unproven, the refusal
+    /// lasts while the peer keeps saying so, and at most
+    /// [`UNPROVEN_BEHIND`] from its first claim (see [`Chan::refuses`]).
     behind_proven: bool,
+    /// When the peer first claimed, without proof, that our copy is older.
+    behind_since: Option<std::time::Instant>,
     /// Our splice, while its wallet coins are held back.
     splice_held: Option<Transaction>,
     /// Our last splice was refused (see [`ChannelSummary::splice_refused`]).
@@ -554,6 +556,29 @@ const CLAIM_MEMORY_BLOCKS: u64 = 1_000;
 /// Why a payment or a close waits during a splice.
 const SPLICING: &str = "coins are being added to this channel: payments and closes resume \
      once the addition is buried in the chain";
+
+/// How long a peer's unproven claim that our copy is older holds the channel.
+///
+/// A peer that really holds a later state proves it (0.5.5 and later) right
+/// after its reestablish, within the same session. A claim left unproven
+/// this long is not taken as fact: otherwise one signed message with
+/// inflated counters, from a peer that simply never proves — or claims to be
+/// an older release that cannot — would freeze our side of the channel for
+/// good (red-team campaign 6, C1).
+pub const UNPROVEN_BEHIND: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl Chan {
+    /// Whether nothing may be signed nor broadcast on this channel: our copy
+    /// is proven older, or the peer has just claimed it and may still prove
+    /// it.
+    fn refuses(&self) -> bool {
+        self.behind
+            && (self.behind_proven
+                || self
+                    .behind_since
+                    .map_or(true, |t| t.elapsed() < UNPROVEN_BEHIND))
+    }
+}
 
 const BEHIND: &str =
     "this copy of the channel is older than your contact's (restored from a backup?): \
@@ -969,6 +994,7 @@ impl ChannelManager {
                         logged: None,
                         behind,
                         behind_proven: behind,
+                        behind_since: None,
                         splice_held: None,
                         splice_refused: false,
                     },
@@ -1600,7 +1626,7 @@ impl ChannelManager {
     pub fn pay(&self, cid: Hash256, amount: u64) -> Result<Vec<u8>, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
-        if chan.behind {
+        if chan.refuses() {
             return Err(BEHIND.into());
         }
         if chan.machine.phase() != Phase::Open {
@@ -1646,7 +1672,7 @@ impl ChannelManager {
         let (funding, funding_output, new_output, sequence) = {
             let g = self.inner.lock().unwrap();
             let chan = g.channels.get(&cid).ok_or("unknown channel")?;
-            if chan.behind {
+            if chan.refuses() {
                 return Err(BEHIND.into());
             }
             if chan.machine.phase() != Phase::Open {
@@ -1746,7 +1772,7 @@ impl ChannelManager {
     pub fn close(&self, cid: Hash256) -> Result<Option<Vec<u8>>, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
-        if chan.behind {
+        if chan.refuses() {
             return Err(BEHIND.into());
         }
         if !chan.synced {
@@ -1830,6 +1856,19 @@ impl ChannelManager {
             ));
         }
         out
+    }
+
+    /// Ages every unproven claim of an older copy by `by`, as if it had been
+    /// made that much earlier: tests use it to cross [`UNPROVEN_BEHIND`]
+    /// without waiting.
+    #[doc(hidden)]
+    pub fn age_unproven_claims(&self, by: std::time::Duration) {
+        let mut g = self.inner.lock().unwrap();
+        for c in g.channels.values_mut() {
+            if let Some(t) = c.behind_since {
+                c.behind_since = Some(t.checked_sub(by).unwrap_or(t));
+            }
+        }
     }
 
     /// Records whether connection `peer` announced splices, before its
@@ -2118,6 +2157,7 @@ impl ChannelManager {
                 logged: None,
                 behind: false,
                 behind_proven: false,
+                behind_since: None,
                 splice_held: None,
                 splice_refused: false,
             },
@@ -2336,6 +2376,7 @@ impl ChannelManager {
                         // it keeps saying so.
                         if !chan.behind_proven {
                             chan.behind = false;
+                            chan.behind_since = None;
                         }
                     }
                     // Our copy is older: our latest commitment may be one we
@@ -2345,10 +2386,13 @@ impl ChannelManager {
                     //
                     // A peer that proves (0.5.5 and later) sends its proof
                     // next: until it does, the refusal holds for this session
-                    // only, so a peer claiming it falsely cannot freeze our
-                    // side for good. An older peer proves nothing: its word
-                    // is taken, as before.
-                    SyncVerdict::WeAreBehind if peer_proves => {
+                    // only, and at most UNPROVEN_BEHIND from the first claim,
+                    // so a peer claiming it falsely cannot freeze our side
+                    // for good. A peer that proves nothing (it does not
+                    // announce splices, as before 0.5.5) is not taken at its
+                    // word either: one signed reestablish with inflated
+                    // counters would otherwise latch the refusal forever.
+                    SyncVerdict::WeAreBehind => {
                         if !chan.behind {
                             eprintln!(
                                 "ALERT: channel {}: the peer says this copy of the channel is \
@@ -2358,19 +2402,8 @@ impl ChannelManager {
                             );
                         }
                         chan.behind = true;
-                    }
-                    SyncVerdict::WeAreBehind => {
-                        if !chan.behind_proven {
-                            chan.behind = true;
-                            chan.behind_proven = true;
-                            self.write_behind(cid);
-                            eprintln!(
-                                "ALERT: channel {}: this copy of the channel is older than \
-                                 the peer's (a data folder restored from a backup?). Do not \
-                                 close it from here: the peer closes it with the latest state, \
-                                 and our side comes back to the wallet",
-                                cid.to_hex()
-                            );
+                        if !chan.behind_proven && chan.behind_since.is_none() {
+                            chan.behind_since = Some(std::time::Instant::now());
                         }
                     }
                     // The peer's copy is older: its latest commitment may be
@@ -2435,7 +2468,7 @@ impl ChannelManager {
             // commitment on the new funding is persisted — or a refusal,
             // keeping nothing, when a payment of ours crossed it.
             ChMsg::Splice { .. } => {
-                if chan.behind {
+                if chan.refuses() {
                     return Ok(out);
                 }
                 for m in chan.machine.on_splice(&msg).map_err(err)? {
@@ -2567,6 +2600,7 @@ impl ChannelManager {
                 logged: None,
                 behind: false,
                 behind_proven: false,
+                behind_since: None,
                 splice_held: None,
                 splice_refused: false,
             },
@@ -2698,7 +2732,7 @@ impl ChannelManager {
                 // A close alone, broadcast while the splice was waiting: its
                 // old state can no longer confirm once the splice did; the
                 // first state on the new funding goes instead.
-                if c.machine.phase() == Phase::Forcing && c.spend.is_none() && !c.behind {
+                if c.machine.phase() == Phase::Forcing && c.spend.is_none() && !c.refuses() {
                     if let Ok(tx) = c.machine.closing_commitment(FORCE_CLOSE_TIER) {
                         let spends = tx.inputs[0].prev_out;
                         if depth_of(&spends).is_some() {
@@ -2982,7 +3016,7 @@ impl ChannelManager {
                             }
                             // Never from an older copy: its latest commitment
                             // may be revoked.
-                            Phase::Forcing if !c.behind => {
+                            Phase::Forcing if !c.refuses() => {
                                 if let Ok(tx) = c.machine.closing_commitment(FORCE_CLOSE_TIER) {
                                     pending.push((tx, "commitment"));
                                 }
@@ -3622,7 +3656,7 @@ impl ChannelManager {
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
         // An older copy's latest commitment may be revoked: broadcasting it
         // would lose the whole channel to a penalty.
-        if chan.behind {
+        if chan.refuses() {
             return Err(BEHIND.into());
         }
         let splicing = chan.machine.splicing();
@@ -3815,7 +3849,7 @@ fn summary(c: &Chan, splices: bool) -> ChannelSummary {
         },
         peer_identity: c.peer_identity.clone(),
         peer_owner: c.peer_owner.map(|o| o.to_hex()).unwrap_or_default(),
-        behind: c.behind,
+        behind: c.refuses(),
         sendable: c.machine.sendable(),
         close_reserve: c.machine.close_reserve(),
         remote_sendable: c.machine.remote_sendable(),
