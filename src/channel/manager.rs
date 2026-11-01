@@ -248,6 +248,10 @@ pub struct ChannelSummary {
     /// ours, once: closed with our latest state if the next session shows the
     /// same (see [`SyncVerdict::PeerIsBehind`]); the holder may close it now.
     pub peer_behind: bool,
+    /// The peer claimed our copy older without proving it, and the claim has
+    /// lapsed: a close alone asks for a confirmation first
+    /// ([`ChannelManager::force_close_with`]).
+    pub behind_claimed: bool,
     /// A splice in progress: more coins put into the channel.
     pub splice: Option<crate::channel::machine::SpliceStatus>,
     /// The peer's current session takes splices.
@@ -579,6 +583,12 @@ impl Chan {
                     .map_or(true, |t| t.elapsed() < UNPROVEN_BEHIND))
     }
 }
+
+/// The refusal of a close alone after an unproven claim of an older copy has
+/// lapsed: the holder confirms it first ([`ChannelManager::force_close_with`]).
+pub const UNPROVEN_CLAIM: &str = "the other side said this copy of the channel is older than \
+its own, without proving it: if this wallet was restored from a backup, closing alone could \
+lose the whole channel. Confirm the close alone to go on";
 
 const BEHIND: &str =
     "this copy of the channel is older than your contact's (restored from a backup?): \
@@ -3652,12 +3662,31 @@ impl ChannelManager {
     /// Force-closes a channel by broadcasting our latest commitment. Returns
     /// the transaction broadcast.
     pub fn force_close(&self, cid: Hash256) -> Result<Transaction, String> {
+        self.force_close_with(cid, false)
+    }
+
+    /// [`Self::force_close`], once the holder has read that the peer claimed,
+    /// without proving it, that this copy is older (`despite_claim`).
+    ///
+    /// The claim lapses after [`UNPROVEN_BEHIND`], so that a peer lying
+    /// cannot freeze the channel. But a copy restored from a backup really is
+    /// older, and a peer that withholds its proof would wait for it to close
+    /// alone with a revoked state, then take the whole channel by penalty:
+    /// the holder, who knows whether they restored a backup, decides.
+    pub fn force_close_with(
+        &self,
+        cid: Hash256,
+        despite_claim: bool,
+    ) -> Result<Transaction, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
         // An older copy's latest commitment may be revoked: broadcasting it
         // would lose the whole channel to a penalty.
         if chan.refuses() {
             return Err(BEHIND.into());
+        }
+        if chan.behind && !chan.behind_proven && !despite_claim {
+            return Err(UNPROVEN_CLAIM.into());
         }
         let splicing = chan.machine.splicing();
         let tx = chan.machine.force_close(FORCE_CLOSE_TIER).map_err(err)?;
@@ -3850,6 +3879,7 @@ fn summary(c: &Chan, splices: bool) -> ChannelSummary {
         peer_identity: c.peer_identity.clone(),
         peer_owner: c.peer_owner.map(|o| o.to_hex()).unwrap_or_default(),
         behind: c.refuses(),
+        behind_claimed: c.behind && !c.behind_proven && !c.refuses(),
         sendable: c.machine.sendable(),
         close_reserve: c.machine.close_reserve(),
         remote_sendable: c.machine.remote_sendable(),

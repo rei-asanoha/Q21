@@ -3643,10 +3643,16 @@ fn an_unproven_claim_of_an_older_copy_never_freezes_the_channel() {
     p.funder.age_unproven_claims(
         q21_core::channel::manager::UNPROVEN_BEHIND + std::time::Duration::from_secs(1),
     );
+    let info = p.funder.info(cid).unwrap();
     assert!(
-        !p.funder.info(cid).unwrap().behind,
+        !info.behind,
         "an unproven claim lapses: the channel can be closed again"
     );
+    // But closing alone asks the holder first: a restored copy really is
+    // older, and a peer withholding its proof would wait for exactly that.
+    assert!(info.behind_claimed);
+    let refused = p.funder.force_close(cid).unwrap_err();
+    assert_eq!(refused, q21_core::channel::manager::UNPROVEN_CLAIM);
     // A later session claiming it again does not restart the grace.
     reconnect(&mut p);
     assert!(

@@ -743,6 +743,7 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("remote_sendable", Json::u64(s.remote_sendable))
         .set("funder_reserve", Json::u64(s.funder_reserve))
         .set("peer_behind", Json::Bool(s.peer_behind))
+        .set("behind_claimed", Json::Bool(s.behind_claimed))
         .set("splices", Json::Bool(s.splices))
         .set("splice_refused", Json::Bool(s.splice_refused))
         .set(
@@ -1654,9 +1655,10 @@ impl RpcContext {
         let mgr = self.channels_open()?;
         let cid = self.channel_id_param(params)?;
         let force = matches!(params.get("force"), Some(Json::Bool(true)));
+        let despite_claim = matches!(params.get("despite_claim"), Some(Json::Bool(true)));
         if force {
             let tx = mgr
-                .force_close(cid)
+                .force_close_with(cid, despite_claim)
                 .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
             return Ok(Json::obj()
                 .set("status", Json::str("force_closing"))
@@ -6343,6 +6345,7 @@ mod tests {
             peer_owner: "cd".repeat(32),
             behind: false,
             peer_behind: true,
+            behind_claimed: false,
             sendable: 0,
             close_reserve: 0,
             remote_sendable: 0,
@@ -6373,6 +6376,7 @@ mod tests {
             "peer_owner",
             "behind",
             "peer_behind",
+            "behind_claimed",
         ] {
             assert!(j.get(field).is_some(), "channellist lacks {field}");
         }
