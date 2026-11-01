@@ -47,6 +47,9 @@ pub enum ContactError {
     EmptyLabel,
     /// Another contact already holds this local name.
     LabelTaken,
+    /// The name is written with characters that imitate letters
+    /// ([`imitates_letters`]).
+    Imitation,
     /// The book is full ([`MAX_CONTACTS`]).
     Full,
     /// No contact with this identity address.
@@ -88,68 +91,249 @@ pub fn clean_text(text: &str, max: usize) -> String {
     s.trim().to_string()
 }
 
-/// The combining marks of the common blocks: accents placed on the letter
-/// before them.
+/// The combining marks: accents placed on the letter before them.
 fn is_combining(c: char) -> bool {
     matches!(
         c,
         '\u{0300}'..='\u{036F}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{0591}'..='\u{05BD}'
+            | '\u{0610}'..='\u{061A}'
+            | '\u{064B}'..='\u{065F}'
             | '\u{1AB0}'..='\u{1AFF}'
             | '\u{1DC0}'..='\u{1DFF}'
             | '\u{20D0}'..='\u{20FF}'
+            | '\u{A66F}'..='\u{A67F}'
             | '\u{FE20}'..='\u{FE2F}'
     )
 }
 
-/// What a name looks like, for telling two names apart: lowercase, accents
-/// dropped, and the Cyrillic and Greek letters drawn like Latin ones read as
-/// those. "Mum" and "Мum" (a Cyrillic М) are one name to the eye, so they are
-/// one name here too: a second contact cannot pass for the first in a list
-/// (red-team campaign 6, W1).
+/// Characters drawn to imitate letters and digits — mathematical letters,
+/// letter-like symbols, Roman numerals, Cherokee, small capitals, circled
+/// and fullwidth forms used as letters elsewhere — refused in a contact's
+/// name: no one names their mother in mathematical bold, and each would have
+/// to be told apart from the letter it copies (red-team campaign 6, W1).
+pub fn imitates_letters(name: &str) -> bool {
+    name.chars().any(|c| {
+        matches!(
+            c,
+            '\u{1D00}'..='\u{1DBF}'
+                | '\u{2100}'..='\u{218F}'
+                | '\u{2460}'..='\u{24FF}'
+                | '\u{13A0}'..='\u{13FF}'
+                | '\u{AB70}'..='\u{ABBF}'
+                | '\u{FB00}'..='\u{FB4F}'
+                | '\u{1D400}'..='\u{1D7FF}'
+                | '\u{1F100}'..='\u{1F1FF}'
+        )
+    })
+}
+
+/// A precomposed accented letter, as its base letter and its accent.
+fn decompose(c: char) -> Option<(char, char)> {
+    match c {
+        '\u{00E0}' => Some(('\u{0061}', '\u{0300}')),
+        '\u{00E1}' => Some(('\u{0061}', '\u{0301}')),
+        '\u{00E2}' => Some(('\u{0061}', '\u{0302}')),
+        '\u{00E3}' => Some(('\u{0061}', '\u{0303}')),
+        '\u{00E4}' => Some(('\u{0061}', '\u{0308}')),
+        '\u{00E5}' => Some(('\u{0061}', '\u{030A}')),
+        '\u{0101}' => Some(('\u{0061}', '\u{0304}')),
+        '\u{0103}' => Some(('\u{0061}', '\u{0306}')),
+        '\u{0105}' => Some(('\u{0061}', '\u{0328}')),
+        '\u{00E7}' => Some(('\u{0063}', '\u{0327}')),
+        '\u{0107}' => Some(('\u{0063}', '\u{0301}')),
+        '\u{010D}' => Some(('\u{0063}', '\u{030C}')),
+        '\u{010F}' => Some(('\u{0064}', '\u{030C}')),
+        '\u{00E8}' => Some(('\u{0065}', '\u{0300}')),
+        '\u{00E9}' => Some(('\u{0065}', '\u{0301}')),
+        '\u{00EA}' => Some(('\u{0065}', '\u{0302}')),
+        '\u{00EB}' => Some(('\u{0065}', '\u{0308}')),
+        '\u{0113}' => Some(('\u{0065}', '\u{0304}')),
+        '\u{0117}' => Some(('\u{0065}', '\u{0307}')),
+        '\u{0119}' => Some(('\u{0065}', '\u{0328}')),
+        '\u{011B}' => Some(('\u{0065}', '\u{030C}')),
+        '\u{011F}' => Some(('\u{0067}', '\u{0306}')),
+        '\u{00EC}' => Some(('\u{0069}', '\u{0300}')),
+        '\u{00ED}' => Some(('\u{0069}', '\u{0301}')),
+        '\u{00EE}' => Some(('\u{0069}', '\u{0302}')),
+        '\u{00EF}' => Some(('\u{0069}', '\u{0308}')),
+        '\u{012B}' => Some(('\u{0069}', '\u{0304}')),
+        '\u{012F}' => Some(('\u{0069}', '\u{0328}')),
+        '\u{00F1}' => Some(('\u{006E}', '\u{0303}')),
+        '\u{0144}' => Some(('\u{006E}', '\u{0301}')),
+        '\u{0148}' => Some(('\u{006E}', '\u{030C}')),
+        '\u{00F2}' => Some(('\u{006F}', '\u{0300}')),
+        '\u{00F3}' => Some(('\u{006F}', '\u{0301}')),
+        '\u{00F4}' => Some(('\u{006F}', '\u{0302}')),
+        '\u{00F5}' => Some(('\u{006F}', '\u{0303}')),
+        '\u{00F6}' => Some(('\u{006F}', '\u{0308}')),
+        '\u{014D}' => Some(('\u{006F}', '\u{0304}')),
+        '\u{0151}' => Some(('\u{006F}', '\u{030B}')),
+        '\u{0159}' => Some(('\u{0072}', '\u{030C}')),
+        '\u{015B}' => Some(('\u{0073}', '\u{0301}')),
+        '\u{0161}' => Some(('\u{0073}', '\u{030C}')),
+        '\u{015F}' => Some(('\u{0073}', '\u{0327}')),
+        '\u{0165}' => Some(('\u{0074}', '\u{030C}')),
+        '\u{0163}' => Some(('\u{0074}', '\u{0327}')),
+        '\u{00F9}' => Some(('\u{0075}', '\u{0300}')),
+        '\u{00FA}' => Some(('\u{0075}', '\u{0301}')),
+        '\u{00FB}' => Some(('\u{0075}', '\u{0302}')),
+        '\u{00FC}' => Some(('\u{0075}', '\u{0308}')),
+        '\u{016B}' => Some(('\u{0075}', '\u{0304}')),
+        '\u{016F}' => Some(('\u{0075}', '\u{030A}')),
+        '\u{0171}' => Some(('\u{0075}', '\u{030B}')),
+        '\u{0173}' => Some(('\u{0075}', '\u{0328}')),
+        '\u{00FD}' => Some(('\u{0079}', '\u{0301}')),
+        '\u{00FF}' => Some(('\u{0079}', '\u{0308}')),
+        '\u{017A}' => Some(('\u{007A}', '\u{0301}')),
+        '\u{017C}' => Some(('\u{007A}', '\u{0307}')),
+        '\u{017E}' => Some(('\u{007A}', '\u{030C}')),
+        '\u{0451}' => Some(('\u{0065}', '\u{0308}')),
+        '\u{0457}' => Some(('\u{0069}', '\u{0308}')),
+        '\u{0439}' => Some(('\u{0438}', '\u{0306}')),
+        _ => None,
+    }
+}
+
+/// A capital drawn like a Latin letter, read as that letter.
+fn capital_look_alike(c: char) -> Option<char> {
+    match c {
+        '\u{0391}' => Some('\u{0061}'),
+        '\u{0392}' => Some('\u{0062}'),
+        '\u{0395}' => Some('\u{0065}'),
+        '\u{0396}' => Some('\u{007A}'),
+        '\u{0397}' => Some('\u{0068}'),
+        '\u{0399}' => Some('\u{006C}'),
+        '\u{039A}' => Some('\u{006B}'),
+        '\u{039C}' => Some('\u{006D}'),
+        '\u{039D}' => Some('\u{006E}'),
+        '\u{039F}' => Some('\u{006F}'),
+        '\u{03A1}' => Some('\u{0070}'),
+        '\u{03A4}' => Some('\u{0074}'),
+        '\u{03A5}' => Some('\u{0079}'),
+        '\u{03A7}' => Some('\u{0078}'),
+        '\u{0410}' => Some('\u{0061}'),
+        '\u{0412}' => Some('\u{0062}'),
+        '\u{0415}' => Some('\u{0065}'),
+        '\u{041A}' => Some('\u{006B}'),
+        '\u{041C}' => Some('\u{006D}'),
+        '\u{041D}' => Some('\u{0068}'),
+        '\u{041E}' => Some('\u{006F}'),
+        '\u{0420}' => Some('\u{0070}'),
+        '\u{0421}' => Some('\u{0063}'),
+        '\u{0422}' => Some('\u{0074}'),
+        '\u{0425}' => Some('\u{0078}'),
+        '\u{04AE}' => Some('\u{0079}'),
+        '\u{04C0}' => Some('\u{006C}'),
+        '\u{0405}' => Some('\u{0073}'),
+        '\u{0406}' => Some('\u{006C}'),
+        '\u{0408}' => Some('\u{006A}'),
+        '\u{0049}' => Some('\u{006C}'),
+        _ => None,
+    }
+}
+
+/// A small letter or a digit drawn like a Latin letter, read as that letter.
+fn small_look_alike(c: char) -> char {
+    match c {
+        '\u{0430}' => '\u{0061}',
+        '\u{03B1}' => '\u{0061}',
+        '\u{0432}' => '\u{0062}',
+        '\u{03B2}' => '\u{0062}',
+        '\u{0441}' => '\u{0063}',
+        '\u{03F2}' => '\u{0063}',
+        '\u{0501}' => '\u{0064}',
+        '\u{0435}' => '\u{0065}',
+        '\u{03B5}' => '\u{0065}',
+        '\u{04BB}' => '\u{0068}',
+        '\u{043D}' => '\u{0068}',
+        '\u{03B7}' => '\u{0068}',
+        '\u{0456}' => '\u{0069}',
+        '\u{03B9}' => '\u{0069}',
+        '\u{0131}' => '\u{0069}',
+        '\u{04CF}' => '\u{006C}',
+        '\u{0458}' => '\u{006A}',
+        '\u{043A}' => '\u{006B}',
+        '\u{03BA}' => '\u{006B}',
+        '\u{043C}' => '\u{006D}',
+        '\u{03BC}' => '\u{006D}',
+        '\u{00B5}' => '\u{0075}',
+        '\u{043E}' => '\u{006F}',
+        '\u{03BF}' => '\u{006F}',
+        '\u{03C3}' => '\u{006F}',
+        '\u{0585}' => '\u{006F}',
+        '\u{1D0F}' => '\u{006F}',
+        '\u{0440}' => '\u{0070}',
+        '\u{03C1}' => '\u{0070}',
+        '\u{051B}' => '\u{0071}',
+        '\u{0455}' => '\u{0073}',
+        '\u{0442}' => '\u{0074}',
+        '\u{03C4}' => '\u{0074}',
+        '\u{0443}' => '\u{0079}',
+        '\u{03B3}' => '\u{0079}',
+        '\u{04AF}' => '\u{0079}',
+        '\u{03C5}' => '\u{0075}',
+        '\u{057D}' => '\u{0075}',
+        '\u{0578}' => '\u{006E}',
+        '\u{0445}' => '\u{0078}',
+        '\u{03C7}' => '\u{0078}',
+        '\u{03BD}' => '\u{0076}',
+        '\u{051D}' => '\u{0077}',
+        '\u{03C9}' => '\u{0077}',
+        '\u{0437}' => '\u{0033}',
+        '\u{0030}' => '\u{006F}',
+        '\u{0031}' => '\u{006C}',
+        '\u{007C}' => '\u{006C}',
+        other => other,
+    }
+}
+
+/// What a name looks like, for telling two names apart: invisible
+/// characters and spaces dropped; fullwidth forms read as plain ones; a
+/// capital I read as an l; the Cyrillic, Greek and Armenian letters drawn
+/// like Latin ones, and digits drawn like letters, read as those letters;
+/// accented letters written as their letter and their accent, so one
+/// written in one piece and one written in two are the same. "Mum" and "Мum"
+/// (a Cyrillic М) are one name to the eye, so they are one name here too: a
+/// second contact cannot pass for the first in a list (red-team campaign 6,
+/// W1). Accents are kept: a name with an accent and the same name without
+/// it are two names, which [`look_alike_loose`] still notices.
 pub fn look_alike_key(name: &str) -> String {
-    name.chars()
-        .filter(|c| !is_combining(*c) && !is_invisible(*c))
-        .flat_map(|c| c.to_lowercase())
-        .map(|c| match c {
-            // Latin letters with an accent, written as one character.
-            '\u{00E0}' | '\u{00E1}' | '\u{00E2}' | '\u{00E3}' | '\u{00E4}' | '\u{00E5}'
-            | '\u{0101}' | '\u{0103}' | '\u{0105}' => 'a',
-            '\u{00E7}' | '\u{0107}' | '\u{010D}' => 'c',
-            '\u{00E8}' | '\u{00E9}' | '\u{00EA}' | '\u{00EB}' | '\u{0113}' | '\u{0117}'
-            | '\u{0119}' | '\u{011B}' => 'e',
-            '\u{00EC}' | '\u{00ED}' | '\u{00EE}' | '\u{00EF}' | '\u{012B}' | '\u{012F}' => 'i',
-            '\u{00F1}' | '\u{0144}' | '\u{0148}' => 'n',
-            '\u{00F2}' | '\u{00F3}' | '\u{00F4}' | '\u{00F5}' | '\u{00F6}' | '\u{00F8}'
-            | '\u{014D}' | '\u{0151}' => 'o',
-            '\u{015B}' | '\u{0161}' | '\u{015F}' => 's',
-            '\u{00F9}' | '\u{00FA}' | '\u{00FB}' | '\u{00FC}' | '\u{016B}' | '\u{016F}'
-            | '\u{0171}' | '\u{0173}' => 'u',
-            '\u{00FD}' | '\u{00FF}' => 'y',
-            '\u{017A}' | '\u{017C}' | '\u{017E}' => 'z',
-            '\u{0430}' | '\u{03B1}' => 'a',
-            '\u{0432}' | '\u{03B2}' => 'b',
-            '\u{0441}' | '\u{03F2}' => 'c',
-            '\u{0435}' | '\u{0451}' | '\u{03B5}' => 'e',
-            '\u{04BB}' | '\u{043D}' | '\u{03B7}' => 'h',
-            '\u{0456}' | '\u{0457}' | '\u{03B9}' | '\u{0131}' => 'i',
-            '\u{0458}' => 'j',
-            '\u{043A}' | '\u{03BA}' => 'k',
-            '\u{043C}' | '\u{03BC}' => 'm',
-            '\u{043E}' | '\u{03BF}' | '\u{03C3}' | '0' => 'o',
-            '\u{0440}' | '\u{03C1}' => 'p',
-            '\u{051B}' => 'q',
-            '\u{0455}' => 's',
-            '\u{0442}' | '\u{03C4}' => 't',
-            '\u{0443}' | '\u{03B3}' => 'y',
-            '\u{03C5}' | '\u{057D}' => 'u',
-            '\u{0445}' | '\u{03C7}' => 'x',
-            '\u{03BD}' => 'v',
-            '\u{051D}' | '\u{03C9}' => 'w',
-            '\u{0437}' => '3',
-            'l' | '1' | '|' => 'l',
-            other => other,
-        })
-        .filter(|c| !c.is_whitespace())
+    let mut out = String::new();
+    for c in name
+        .chars()
+        .filter(|c| !is_invisible(*c) && !c.is_whitespace())
+    {
+        // Fullwidth ASCII, as the ASCII it copies.
+        let c = match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            _ => c,
+        };
+        if let Some(l) = capital_look_alike(c) {
+            out.push(l);
+            continue;
+        }
+        for c in c.to_lowercase() {
+            match decompose(c) {
+                Some((base, mark)) => {
+                    out.push(small_look_alike(base));
+                    out.push(mark);
+                }
+                None => out.push(small_look_alike(c)),
+            }
+        }
+    }
+    out
+}
+
+/// [`look_alike_key`] without the accents: a name with an accent and the
+/// same name without it meet here. Not a refusal — two people can bear them
+/// — but a name to show with a warning, so the holder checks the address.
+pub fn look_alike_loose(name: &str) -> String {
+    look_alike_key(name)
+        .chars()
+        .filter(|c| !is_combining(*c))
         .collect()
 }
 
@@ -162,17 +346,23 @@ fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
+            | '\u{034F}'
             | '\u{061C}'
             | '\u{115F}'..='\u{1160}'
-            | '\u{180E}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
             | '\u{200B}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{2800}'
             | '\u{3164}'
             | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
             | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFC}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
@@ -208,6 +398,9 @@ impl ContactBook {
         let label = clean_label(label);
         if label.is_empty() {
             return Err(ContactError::EmptyLabel);
+        }
+        if imitates_letters(&label) {
+            return Err(ContactError::Imitation);
         }
         let key = look_alike_key(&label);
         if self
