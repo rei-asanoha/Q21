@@ -164,6 +164,9 @@ fn wallet_message(e: &crate::wallet::WalletError) -> &'static str {
 /// for the price of one request.
 pub const MAX_BATCH: usize = 100;
 
+/// Calls in one batch on a public explorer (`--rpc-public`).
+pub const MAX_PUBLIC_BATCH: usize = 10;
+
 /// The last blocks the chain's pace is measured over, in `getmining`.
 pub const PACE_BLOCKS: u64 = 30;
 
@@ -1158,7 +1161,14 @@ impl RpcContext {
         // The batch stays useful - it saves round trips - but it is bounded,
         // and so is the response.
         if let Some(batch) = request.as_array() {
-            if batch.len() > MAX_BATCH {
+            // A public explorer serves anyone: a batch there is short, so one
+            // request cannot queue a hundred calls behind the node's lock.
+            let max = if self.scans.is_some() {
+                MAX_PUBLIC_BATCH
+            } else {
+                MAX_BATCH
+            };
+            if batch.len() > max {
                 return Json::obj()
                     .set("jsonrpc", Json::str("2.0"))
                     .set("id", Json::Null)
@@ -1166,7 +1176,7 @@ impl RpcContext {
                         "error",
                         rpc_error(
                             ERR_REQUEST,
-                            &format!("batch of {} calls: maximum {MAX_BATCH}", batch.len()),
+                            &format!("batch of {} calls: maximum {max}", batch.len()),
                         ),
                     )
                     .build()
@@ -3139,24 +3149,47 @@ impl RpcContext {
     /// check a snapshot, not a value refreshed in a loop. `getinfo` therefore
     /// stays light.
     fn getutxocommitment(&self) -> Json {
-        let (height, tip, entries, issued, commitment, muhash) = self.node.with_chain(|c| {
-            (
-                c.height(),
-                c.tip_id().to_hex(),
-                c.utxo_count(),
-                c.total_issued(),
-                c.state_commitment().to_hex(),
-                c.utxo_commitment().to_hex(),
-            )
-        });
-        Json::obj()
+        // --- Computed once per tip (red-team campaign 6, O1).
+        //
+        // The MuHash digest ends in a 3072-bit modular inverse, some thirty
+        // milliseconds, computed under the node's global lock: a public
+        // explorer answered a hundred of them per batch request to anyone,
+        // and a few such requests held block relay up for tens of seconds.
+        // The commitment only changes with the tip: it is kept with the tip
+        // it belongs to, and computed again only when the tip moves.
+        static CACHE: Mutex<Option<(Hash256, Json)>> = Mutex::new(None);
+        let tip_now = self.node.with_chain(|c| c.tip_id());
+        if let Ok(g) = CACHE.lock() {
+            if let Some((tip, json)) = g.as_ref() {
+                if *tip == tip_now {
+                    return json.clone();
+                }
+            }
+        }
+        let (tip_id, height, tip, entries, issued, commitment, muhash) =
+            self.node.with_chain(|c| {
+                (
+                    c.tip_id(),
+                    c.height(),
+                    c.tip_id().to_hex(),
+                    c.utxo_count(),
+                    c.total_issued(),
+                    c.state_commitment().to_hex(),
+                    c.utxo_commitment().to_hex(),
+                )
+            });
+        let json = Json::obj()
             .set("height", Json::u64(height))
             .set("tip", Json::str(tip))
             .set("inputs", Json::u64(entries as u64))
             .set("total", amount_json(issued))
             .set("commitment", Json::str(commitment))
             .set("muhash", Json::str(muhash))
-            .build()
+            .build();
+        if let Ok(mut g) = CACHE.lock() {
+            *g = Some((tip_id, json.clone()));
+        }
+        json
     }
 
     fn getblock(&self, params: &Json, full: bool) -> Result<Json, Json> {
@@ -5205,29 +5238,28 @@ impl RpcContext {
     fn getnetworkhashrate(&self) -> Json {
         // One day of blocks, or whatever exists if the chain is younger.
         const WINDOW: usize = 720;
-        let headers = self.node.with_chain(|c| c.headers());
-        let n = headers.len();
-        // --- Genesis never counts as a starting point.
-        //
-        // Its timestamp is a protocol constant, not the moment someone mined.
-        // On a young chain, the window included it and the measured span
-        // became the distance between that constant and today: 141 blocks
-        // mined in nine seconds announced themselves as "371.8 days of chain",
-        // and the resulting rate was zero. The anchor is the first block of
-        // the window: its timestamp opens the interval, and the work is summed
-        // over the ones that follow it. It never goes below height 1.
-        //
-        // A first draft wrote `.max(1)` and then reread `headers[start - 1..]`,
-        // which brought back exactly the genesis that had just been excluded.
-        // The test `genesis_is_not_used_as_the_starting_point` caught it right
-        // away; the review did not.
-        let anchor = n.saturating_sub(WINDOW + 1).max(1);
-        let slice = if n > anchor {
-            &headers[anchor..]
-        } else {
-            &headers[..0]
-        };
-
+        // Only the window's headers, read by height: copying every header of
+        // the chain under the node's lock cost more with each block, for a
+        // call anyone may make on a public explorer (red-team campaign 6, O1).
+        // `slice` holds the headers from height `anchor` to the tip.
+        let slice: Vec<crate::block::BlockHeader> = self.node.with_chain(|c| {
+            let n = c.height() as usize + 1;
+            // --- Genesis never counts as a starting point.
+            //
+            // Its timestamp is a protocol constant, not the moment someone
+            // mined. On a young chain, the window included it and the
+            // measured span became the distance between that constant and
+            // today: 141 blocks mined in nine seconds announced themselves as
+            // "371.8 days of chain", and the resulting rate was zero. The
+            // anchor is the first block of the window: its timestamp opens
+            // the interval, and the work is summed over the ones that follow
+            // it. It never goes below height 1.
+            let anchor = n.saturating_sub(WINDOW + 1).max(1);
+            let slice = (anchor..n)
+                .filter_map(|h| c.active_at(h as u64).and_then(|id| c.header_of(&id)))
+                .collect();
+            slice
+        });
         let mut work: u128 = 0;
         for h in slice.iter().skip(1) {
             work = work.saturating_add(work_to_u128(crate::pow::block_work(h.bits)));
@@ -7551,14 +7583,51 @@ mod tests {
             "[{}]",
             std::iter::repeat_n(
                 r#"{"jsonrpc":"2.0","id":1,"method":"getamount","params":{"amount":"1.0"}}"#,
-                MAX_BATCH
+                MAX_PUBLIC_BATCH
             )
             .collect::<Vec<_>>()
             .join(",")
         );
         let r = c.handle_from(&batch, a);
-        assert_eq!(r.matches("too many searches").count(), MAX_BATCH);
+        assert_eq!(r.matches("too many searches").count(), MAX_PUBLIC_BATCH);
         assert!(!scan_refused(&c, b), "B is deprived by A's batch");
+    }
+
+    /// Red-team campaign 6, O1: a public explorer takes short batches only,
+    /// and the state commitment is computed once per tip, not once per call.
+    #[test]
+    fn a_public_explorer_takes_short_batches_and_computes_the_commitment_once() {
+        let c = public_context();
+        let a = ip("198.51.100.8");
+        let batch = |n: usize| {
+            format!(
+                "[{}]",
+                std::iter::repeat_n(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"getutxocommitment","params":{}}"#,
+                    n
+                )
+                .collect::<Vec<_>>()
+                .join(",")
+            )
+        };
+        let r = c.handle_from(&batch(MAX_PUBLIC_BATCH + 1), a);
+        assert!(r.contains("maximum 10"), "{r}");
+        let r = c.handle_from(&batch(MAX_PUBLIC_BATCH), a);
+        assert_eq!(r.matches("\"commitment\"").count(), MAX_PUBLIC_BATCH);
+        // A local node keeps the larger batch.
+        let local = context(false);
+        let r = local.handle(&batch(MAX_PUBLIC_BATCH + 1));
+        assert_eq!(r.matches("\"commitment\"").count(), MAX_PUBLIC_BATCH + 1);
+        // A hundred calls at one tip cost about one computation.
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = call_ok(&local, "getutxocommitment", "{}");
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(1500),
+            "{:?} for 100 calls",
+            t.elapsed()
+        );
     }
 
     /// The bucket itself: burst per client, `/64` in IPv6, bounded table with
