@@ -464,12 +464,9 @@ fn policy_decoding_is_total_and_canonical() {
         if round % 4 == 0 {
             let t = random_policy(&mut rng, 1, &k.hashes, k.hash);
             let bytes = t.encode();
-            match Policy::decode(&bytes) {
-                Ok(p) => {
-                    check_decoded(&p, &bytes, &format!("random round {round}"));
-                    assert_eq!(p, t, "a random tree decoded as another tree");
-                }
-                Err(_) => {}
+            if let Ok(p) = Policy::decode(&bytes) {
+                check_decoded(&p, &bytes, &format!("random round {round}"));
+                assert_eq!(p, t, "a random tree decoded as another tree");
             }
         }
         // Raw noise, short.
@@ -580,23 +577,20 @@ fn satisfaction_reading_never_panics_and_is_not_malleable() {
             );
             assert!(Policy::decode(&w.pubkey).is_ok());
         }
-        match pre {
-            true => {
-                prechecked += 1;
-                // The full check, signatures included: only the honest
-                // witness may pass.
-                if rng.one_in(2) {
-                    checked += 1;
-                    let r = policy::check_spend(&s.tx, 0, NET, &entry, height, &w);
-                    if r.is_ok() {
-                        assert_eq!(
-                            w, s.witness,
-                            "a policy witness other than the one signed was accepted (malleable) for {p:?}"
-                        );
-                    }
+        if pre {
+            prechecked += 1;
+            // The full check, signatures included: only the honest
+            // witness may pass.
+            if rng.one_in(2) {
+                checked += 1;
+                let r = policy::check_spend(&s.tx, 0, NET, &entry, height, &w);
+                if r.is_ok() {
+                    assert_eq!(
+                        w, s.witness,
+                        "a policy witness other than the one signed was accepted (malleable) for {p:?}"
+                    );
                 }
             }
-            false => {}
         }
 
         // One key's signature, as a channel peer's is checked.

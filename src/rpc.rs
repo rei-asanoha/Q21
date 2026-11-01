@@ -5388,10 +5388,9 @@ impl RpcContext {
             // the interval, and the work is summed over the ones that follow
             // it. It never goes below height 1.
             let anchor = n.saturating_sub(WINDOW + 1).max(1);
-            let slice = (anchor..n)
+            (anchor..n)
                 .filter_map(|h| c.active_at(h as u64).and_then(|id| c.header_of(&id)))
-                .collect();
-            slice
+                .collect()
         });
         let mut work: u128 = 0;
         for h in slice.iter().skip(1) {

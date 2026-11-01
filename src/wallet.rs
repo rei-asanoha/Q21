@@ -1261,12 +1261,19 @@ impl Wallet {
         // index ahead moves it there, as discovery does, so a long run of
         // used addresses — a miner's, one per block found — never leaves a
         // later key out of sight.
+        // The window is derived only when a hash this wallet does not know
+        // shows up, and once per process: a wallet whose blocks hold only
+        // its own keys never pays for it.
+        let mut refreshed = false;
         if one_time {
-            self.refresh_lookahead();
             for tx in &block.transactions {
                 for out in &tx.outputs {
                     if self.known.contains_key(&out.pubkey_hash) {
                         continue;
+                    }
+                    if !refreshed {
+                        self.refresh_lookahead();
+                        refreshed = true;
                     }
                     if let Some(ahead) = self.lookahead.get(&out.pubkey_hash).copied() {
                         self.adopt_lookahead_up_to(ahead);
@@ -1283,6 +1290,10 @@ impl Wallet {
                 // A one-time key this wallet has not derived again: derive up
                 // to it, so that no new address can ever reuse it.
                 if one_time && !self.known.contains_key(&h) {
+                    if !refreshed {
+                        self.refresh_lookahead();
+                        refreshed = true;
+                    }
                     if let Some(ahead) = self.lookahead.get(&h).copied() {
                         self.adopt_lookahead_up_to(ahead);
                     }
