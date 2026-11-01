@@ -485,9 +485,13 @@ pub const CALL_BURST: u32 = 120;
 /// handful, a person browsing never comes near.
 pub const CALLS_PER_SECOND: u32 = 20;
 /// Burst of the global net of calls.
-pub const GLOBAL_CALL_BURST: u32 = 1000;
-/// Calls per second in all, sustained.
-pub const GLOBAL_CALLS_PER_SECOND: u32 = 200;
+pub const GLOBAL_CALL_BURST: u32 = 3000;
+/// Calls per second in all, sustained: thirty clients at full speed. Each
+/// call is cheap (the costly ones have a budget of their own, the scans),
+/// so the net is set where it protects the machine, not much lower: set at
+/// ten clients' worth, ten addresses were enough to shut everyone else out
+/// (red-team campaign 6, O1).
+pub const GLOBAL_CALLS_PER_SECOND: u32 = 600;
 
 /// A token bucket: a burst, a refill.
 struct Bucket {
@@ -510,14 +514,15 @@ pub const MAX_TRACKED_CLIENTS: usize = 1024;
 
 /// What identifies a client in the table.
 ///
-/// An IPv4 address as is. An IPv6 address reduced to its `/64`: a subscriber
-/// receives a whole one, and counting each of its 2^64 addresses as a
-/// different client would give it as many bursts. An IPv4 carried in IPv6
+/// An IPv4 address as is. An IPv6 address reduced to its `/48`: a
+/// subscriber or a rented server often receives a whole one, and counting
+/// each of its 65,536 `/64`s as a different client would give it as many
+/// bursts (red-team campaign 6, O1). An IPv4 carried in IPv6
 /// (`::ffff:a.b.c.d`) is reduced to the IPv4.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ClientKey {
     V4(std::net::Ipv4Addr),
-    V6([u8; 8]),
+    V6([u8; 6]),
 }
 
 impl ClientKey {
@@ -528,8 +533,8 @@ impl ClientKey {
                 Some(v4) => ClientKey::V4(v4),
                 None => {
                     let o = a.octets();
-                    let mut p = [0u8; 8];
-                    p.copy_from_slice(&o[..8]);
+                    let mut p = [0u8; 6];
+                    p.copy_from_slice(&o[..6]);
                     ClientKey::V6(p)
                 }
             },
@@ -7812,7 +7817,7 @@ mod tests {
         );
     }
 
-    /// The bucket itself: burst per client, `/64` in IPv6, bounded table with
+    /// The bucket itself: burst per client, `/48` in IPv6, bounded table with
     /// eviction of the least recently seen, and a global net that holds on its
     /// own.
     #[test]
@@ -7837,16 +7842,16 @@ mod tests {
         }
         assert!(!s.allow(Some(a), t1));
 
-        // Two addresses from the same IPv6 /64 share a bucket; two distinct
-        // /64s do not.
+        // Two addresses from the same IPv6 /48 share a bucket, even from
+        // two of its /64s; two distinct /48s do not.
         let v6a = ip("2001:db8:1:2::1").unwrap();
-        let v6b = ip("2001:db8:1:2:ffff::9").unwrap();
-        let v6c = ip("2001:db8:1:3::1").unwrap();
+        let v6b = ip("2001:db8:1:ff02:ffff::9").unwrap();
+        let v6c = ip("2001:db8:2:2::1").unwrap();
         for _ in 0..SCAN_BURST {
             assert!(s.allow(Some(v6a), t1));
         }
-        assert!(!s.allow(Some(v6b), t1), "same /64: same bucket");
-        assert!(s.allow(Some(v6c), t1), "other /64: other bucket");
+        assert!(!s.allow(Some(v6b), t1), "same /48: same bucket");
+        assert!(s.allow(Some(v6c), t1), "other /48: other bucket");
         // An IPv4 carried in IPv6 is the IPv4.
         assert!(!s.allow(ip("::ffff:198.51.100.7"), t1));
 

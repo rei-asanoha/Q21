@@ -701,4 +701,13 @@ fn the_release_never_merges_the_artifacts_of_two_platforms() {
     assert!(workflow.contains("carries an unexpected file"));
     assert!(workflow.contains("two artifacts carry"));
     assert!(workflow.contains("names another platform's file"));
+    // A last line without its line feed is read, and a line naming no file
+    // fails: `while read` alone skipped the one and let the other through.
+    assert_eq!(
+        workflow
+            .matches(r#"while read -r _hash file || [ -n "${_hash}${file}" ]; do"#)
+            .count(),
+        4
+    );
+    assert_eq!(workflow.matches("malformed\"; exit 1;").count(), 4);
 }

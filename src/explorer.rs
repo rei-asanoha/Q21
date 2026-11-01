@@ -596,7 +596,7 @@ function askForToken(){
   return tokenWait;
 }
 
-async function call(method, params){
+async function call(method, params, tries){
   if (exchange){ await exchange; exchange = null; }
   const r = await fetch(RPC, {
     method:"POST",
@@ -613,6 +613,12 @@ async function call(method, params){
     return call(method, params);
   }
   const j = await r.json();
+  // A public node that counts calls asks a fast page to slow down: wait a
+  // moment and try again, a few times, before showing the error.
+  if (j.error && /too many requests/i.test(j.error.message) && (tries||0) < 4){
+    await new Promise(ok => setTimeout(ok, 500 * 2 ** (tries||0)));
+    return call(method, params, (tries||0) + 1);
+  }
   if (j.error) throw new Error(j.error.message);
   return j.result;
 }
@@ -1405,6 +1411,18 @@ mod tests {
         // And the fragment is erased as soon as it is read: a screenshot or a
         // shared tab must not carry the secret away.
         assert!(PAGE.contains("history.replaceState"));
+    }
+
+    /// A public node that counts calls answers a fast page "too many
+    /// requests": the page waits and tries again, a bounded number of times,
+    /// with a growing wait (red-team campaign 6, O1).
+    #[test]
+    fn a_page_told_to_slow_down_waits_and_tries_again() {
+        let start = PAGE.find("async function call(").expect("call");
+        let body = &PAGE[start..start + PAGE[start..].find("\n}\n").expect("end")];
+        assert!(body.contains("/too many requests/i.test(j.error.message)"));
+        assert!(body.contains("(tries||0) < 4"));
+        assert!(body.contains("500 * 2 ** (tries||0)"));
     }
 
     /// The fragment is a one-time launch token, exchanged before any call.

@@ -594,7 +594,10 @@ jobs:
               # A binary's hash file names only that platform's binaries.
               case "$name" in
                 *.bin.sha256)
-                  while read -r _hash file; do
+                  # The last line is read even without its line feed, and a
+                  # line naming no file fails: neither slips past the check.
+                  while read -r _hash file || [ -n "${_hash}${file}" ]; do
+                    [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
                       "$stem" | "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
@@ -650,7 +653,10 @@ jobs:
               # A binary's hash file names only that platform's binaries.
               case "$name" in
                 *.bin.sha256)
-                  while read -r _hash file; do
+                  # The last line is read even without its line feed, and a
+                  # line naming no file fails: neither slips past the check.
+                  while read -r _hash file || [ -n "${_hash}${file}" ]; do
+                    [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
                       "$stem" | "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
@@ -749,7 +755,10 @@ jobs:
               # A binary's hash file names only that platform's binaries.
               case "$name" in
                 *.bin.sha256)
-                  while read -r _hash file; do
+                  # The last line is read even without its line feed, and a
+                  # line naming no file fails: neither slips past the check.
+                  while read -r _hash file || [ -n "${_hash}${file}" ]; do
+                    [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
                       "$stem" | "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
@@ -839,7 +848,10 @@ jobs:
               # A binary's hash file names only that platform's binaries.
               case "$name" in
                 *.bin.sha256)
-                  while read -r _hash file; do
+                  # The last line is read even without its line feed, and a
+                  # line naming no file fails: neither slips past the check.
+                  while read -r _hash file || [ -n "${_hash}${file}" ]; do
+                    [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
                       "$stem" | "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;

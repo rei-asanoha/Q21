@@ -787,7 +787,9 @@ without ceasing to validate.
 
 This budget is **per visitor address**: a reserve of thirty, then twelve per
 minute, for each address the reverse proxy passes in `X-Forwarded-For` (a
-`/64` block counts as one address in IPv6). The first version kept only one
+`/48` block counts as one address in IPv6: a rented server often holds a
+whole one, and each of its 65,536 `/64` blocks counted as a visitor of its
+own). The first version kept only one
 count for everyone: a single visitor in a loop emptied it, and all the others
 read "try again in a minute". A global safety net remains — a hundred and
 fifty at once, then sixty per minute, all addresses combined — so that a
@@ -796,5 +798,12 @@ longer can. The node only trusts this header on a connection coming from the
 loopback, that is, from the reverse proxy: a visitor who wrote it themselves
 would not change their budget.
 
-What this budget does not do: bound the number of connections or requests of
-an address. That is the purpose of step 4.2a.
+Every call is counted the same way, scans or not: a reserve of a hundred and
+twenty per visitor address, then twenty per second, and a net of six hundred
+per second for all addresses combined. A page of the explorer makes a
+handful; a visitor beyond it reads "too many requests on this public service:
+slow down a little", and the explorer page waits a moment and tries again by
+itself.
+
+What this budget does not do: bound the number of connections of an address.
+That is the purpose of step 4.2a.
