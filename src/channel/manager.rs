@@ -812,6 +812,10 @@ pub struct ChannelManager {
     /// Splices whose wallet coins are to be released, once no lock of ours
     /// is held (the wallet's hook takes the wallet's).
     to_release: Mutex<Vec<Transaction>>,
+    /// Set when no new channel may be opened or accepted, with the reason:
+    /// a wallet whose addresses are not of [`CHANNEL_SCHEME`] would be paid
+    /// by every close an output no key of it can ever spend.
+    opens_refused: std::sync::OnceLock<String>,
 }
 
 fn write_frame(cid: Hash256, kind: u8, body: &[u8]) -> Vec<u8> {
@@ -844,6 +848,7 @@ impl ChannelManager {
             default_depth,
             hooks,
             replaying: AtomicBool::new(false),
+            opens_refused: std::sync::OnceLock::new(),
             inner: Mutex::new(Inner {
                 channels: HashMap::new(),
                 links: HashMap::new(),
@@ -1572,6 +1577,12 @@ impl ChannelManager {
 
     // --- Operations the node/RPC initiate --------------------------------
 
+    /// From now on, no new channel is opened or accepted; `open` answers
+    /// `reason`. Channels already open keep running, closing and watching.
+    pub fn refuse_opens(&self, reason: &str) {
+        let _ = self.opens_refused.set(reason.to_string());
+    }
+
     /// Opens a channel to `peer` as funder, returning the control frame to
     /// send. The funding policy — and thus the channel id — cannot exist until
     /// the acceptor's key is known, so this first exchanges keys. The channel
@@ -1583,6 +1594,9 @@ impl ChannelManager {
         delay: Option<u16>,
         depth: Option<u16>,
     ) -> Result<Vec<u8>, String> {
+        if let Some(why) = self.opens_refused.get() {
+            return Err(why.clone());
+        }
         let identity = self
             .peer_node_id(peer)
             .ok_or("the peer holds no authenticated channel session")?;
@@ -2040,6 +2054,10 @@ impl ChannelManager {
         // network's floor (720 blocks on testnet, about a day) left whoever
         // accepted a channel a single day offline, and nothing told them.
         if delay < self.acceptor_min_delay() {
+            return Ok(Vec::new());
+        }
+        // Not answered either when this node takes no new channel.
+        if self.opens_refused.get().is_some() {
             return Ok(Vec::new());
         }
         // Bounded: opens in progress across all peers and per announced

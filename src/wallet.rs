@@ -1037,8 +1037,8 @@ impl Wallet {
             if !self.reserved.contains_key(index) {
                 continue;
             }
-            let largest = utxo
-                .spendable_for(h, height, COINBASE_MATURITY)
+            let largest = self
+                .own_coins(utxo, h, height)
                 .iter()
                 .map(|(_, e)| e.output.value.units())
                 .max()
@@ -1374,7 +1374,7 @@ impl Wallet {
             if one_time && (self.consumed.contains(index) || self.reserved.contains_key(index)) {
                 continue;
             }
-            let coins = utxo.spendable_for(h, height, COINBASE_MATURITY);
+            let coins = self.own_coins(utxo, h, height);
             if one_time {
                 // A single coin per index, and the largest: it is the one that
                 // leaves the most value accessible. At equal amounts, the
@@ -1417,7 +1417,7 @@ impl Wallet {
         }
         let mut total: u64 = 0;
         for (h, index) in &self.known {
-            let coins = utxo.spendable_for(h, height, COINBASE_MATURITY);
+            let coins = self.own_coins(utxo, h, height);
             let sum = coins
                 .iter()
                 .fold(0u64, |a, (_, e)| a.saturating_add(e.output.value.units()));
@@ -1465,7 +1465,10 @@ impl Wallet {
         let mut next: Option<(u64, u64)> = None;
         for hash in self.known.keys() {
             for (_, e) in utxo.outputs_of(hash) {
-                if !e.is_coinbase || height >= e.height + COINBASE_MATURITY {
+                if e.output.scheme != self.scheme
+                    || !e.is_coinbase
+                    || height >= e.height + COINBASE_MATURITY
+                {
                     continue;
                 }
                 let value = e.output.value.units();
@@ -1500,12 +1503,35 @@ impl Wallet {
             .known
             .keys()
             .filter_map(|h| {
-                let n = utxo.spendable_for(h, height, COINBASE_MATURITY).len();
+                let n = self.own_coins(utxo, h, height).len();
                 (n > 1).then_some((*h, n))
             })
             .collect();
         v.sort_by_key(|(h, _)| *h);
         v
+    }
+
+    /// The spendable coins at key hash `h` that this wallet can sign for:
+    /// those of its own scheme only.
+    ///
+    /// # The defect this closes (red-team campaign 6, S3)
+    ///
+    /// The coins were looked up by key hash alone. Anyone who knows an
+    /// address could pay its hash under another scheme — an output no key of
+    /// this wallet can ever spend. Counted all the same, it swelled the
+    /// balance; chosen first, being the largest, it made every send and every
+    /// gathering fail, and burned a one-time index on the way. Only an
+    /// output of the wallet's own scheme is a coin of this wallet.
+    fn own_coins(
+        &self,
+        utxo: &UtxoSet,
+        h: &Hash256,
+        height: u64,
+    ) -> Vec<(OutPoint, crate::utxo::UtxoEntry)> {
+        utxo.spendable_for(h, height, COINBASE_MATURITY)
+            .into_iter()
+            .filter(|(_, e)| e.output.scheme == self.scheme)
+            .collect()
     }
 
     pub fn balance(&self, utxo: &UtxoSet, height: u64) -> Amount {
@@ -2898,6 +2924,58 @@ mod tests {
             assert_ne!(a.hash, signer, "a new address reused a spent key");
         }
         // An ML-DSA wallet is not one-time: nothing is looked ahead.
+    }
+
+    /// Red-team campaign 6, S3: an output of another scheme paid to one of
+    /// the wallet's key hashes is not a coin of the wallet: neither counted
+    /// nor chosen, so it can neither swell the balance nor wedge a send.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_coin_of_another_scheme_on_our_hash_is_ignored() {
+        // The same chain twice: once the first new coinbase pays one of our
+        // hashes under another scheme, once it pays a stranger. Our balance
+        // must be the same in both.
+        let run = |to_us: bool| {
+            let mut w = test_wallet();
+            let mut c = chain_with_funds(&mut w);
+            let victim = w.new_address();
+            let foreign = if w.scheme() == SchemeId::MlDsa87 {
+                SchemeId::LamportOts
+            } else {
+                SchemeId::MlDsa87
+            };
+            let stranger = Wallet::from_seed([0x77; 32], Network::Regtest).new_address();
+            let start = c.height();
+            for i in 0..(COINBASE_MATURITY + 2) {
+                let (hash, scheme) = if i == 0 && to_us {
+                    (victim.hash, foreign)
+                } else {
+                    (stranger.hash, stranger.scheme)
+                };
+                let t = GENESIS_TIME + (start + i + 1) * TARGET_BLOCK_SECS;
+                let b = c.mine_block(hash, scheme, &[], t, 20_000_000).unwrap();
+                c.connect(&b, t + 1).unwrap();
+            }
+            (w, c)
+        };
+        let (w0, c0) = run(false);
+        let (mut w, c) = run(true);
+        let h = c.height();
+        assert!(w
+            .spendable(&c.utxo, h)
+            .iter()
+            .all(|(_, o, _)| o.scheme == w.scheme()));
+        assert_eq!(
+            w.balance(&c.utxo, h),
+            w0.balance(&c0.utxo, c0.height()),
+            "the foreign coin is not counted"
+        );
+        let mut dest = Wallet::from_seed([0x99; 32], Network::Regtest);
+        let to = dest.new_address();
+        let tx = w
+            .create_transaction(&c.utxo, h, &to, Amount::from_units(50_000), Amount::from_units(1_000))
+            .expect("a send still works");
+        assert!(!tx.inputs.is_empty());
     }
 
     /// Red-team campaign 6, S1 (second round): the look-ahead follows the

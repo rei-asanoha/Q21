@@ -3193,7 +3193,7 @@ fn cmd_balance(datadir: &Path) -> Result<(), String> {
     for (_, entry) in e.chain.utxo.iter() {
         if entry.is_coinbase
             && h < entry.height + COINBASE_MATURITY
-            && e.wallet.owns(&entry.output.pubkey_hash)
+            && e.wallet.owns_output(&entry.output)
         {
             immature += entry.output.value.units();
         }
@@ -3483,7 +3483,7 @@ fn cmd_utxo(datadir: &Path) -> Result<(), String> {
     let mut n_ours = 0usize;
 
     for (_, entry) in e.chain.utxo.iter() {
-        if e.wallet.owns(&entry.output.pubkey_hash) {
+        if e.wallet.owns_output(&entry.output) {
             n_ours += 1;
             if entry.is_coinbase && h < entry.height + COINBASE_MATURITY {
                 immature += entry.output.value.units();
@@ -5005,6 +5005,17 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             ));
             // The manager holds its own copy, wiped when it is dropped.
             q21_core::kdf::wipe(&mut seed);
+            // A close, a sweep or a penalty pays a wallet address as an
+            // output of the channel scheme: a wallet on another scheme could
+            // never spend it. Such a wallet opens and accepts no channel.
+            let wallet_scheme = wallet.lock().unwrap().scheme();
+            if wallet_scheme != q21_core::channel::keys::CHANNEL_SCHEME {
+                mgr.refuse_opens(&format!(
+                    "payment channels need a wallet on {}; this wallet is on {}",
+                    q21_core::channel::keys::CHANNEL_SCHEME.name(),
+                    wallet_scheme.name()
+                ));
+            }
             // Every channel frame travels in an authenticated session: the
             // transport is what the node talks to, the manager behind it.
             node.set_channel_sink(q21_core::channel::link::ChannelTransport::new(mgr.clone()));

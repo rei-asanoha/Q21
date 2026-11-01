@@ -2138,6 +2138,9 @@ impl RpcContext {
             .utxo
             .spendable_for(owner, c.height(), COINBASE_MATURITY)
             .into_iter()
+            // Only the identity key's own scheme: an output of another
+            // scheme on its hash can never be spent (red-team campaign 6, S3).
+            .filter(|(_, e)| identity_coin(&e.output))
             .filter(|(o, _)| !m.spends(o))
             .map(|(o, e)| (o, e.output))
             .chain(

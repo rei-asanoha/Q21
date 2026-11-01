@@ -1573,6 +1573,37 @@ fn channels_per_peer_are_bounded() {
     assert!(!p.acceptor.deliver(F_PEER + 50, &hello).frames.is_empty());
 }
 
+/// A wallet whose addresses are not of the channel scheme would be paid, by
+/// every close, an output none of its keys can spend: such a node neither
+/// opens nor accepts a channel, and says why.
+#[test]
+fn a_wallet_off_the_channel_scheme_neither_opens_nor_accepts() {
+    let (funder_seed, acceptor_seed) = ([0x61u8; 32], [0x62u8; 32]);
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("off-scheme");
+    let p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = 4 * MIN_OUTPUT_VALUE;
+    p.funder.refuse_opens("payment channels need a wallet on ML-DSA-87");
+    let err = p.funder.open(A_PEER, capacity, None, None).unwrap_err();
+    assert!(err.contains("need a wallet on"), "{err}");
+    // The acceptor side: a Hello is not answered and nothing is pending.
+    let other = one_manager([0x63u8; 32], wallet, chain, &dir.join("other"));
+    session(&other, A_PEER, &p.acceptor.node_id());
+    let hello = other.open(A_PEER, capacity, None, None).unwrap();
+    p.acceptor.refuse_opens("payment channels need a wallet on ML-DSA-87");
+    let r = p.acceptor.deliver(F_PEER, &hello);
+    assert_eq!(r.penalize, 0);
+    assert!(r.frames.is_empty(), "a refusing node answered a Hello");
+    assert_eq!(p.acceptor.pending_opens().1, 0);
+}
+
 // --- Startup rescan: what confirmed while a node was down ---------------------
 
 /// Restarts a manager from `dir` with `hooks` and runs its startup rescan
