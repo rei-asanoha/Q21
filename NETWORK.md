@@ -248,10 +248,11 @@ trust (`--bootstrap`), and start it again.
 
 ## A block comes after its parent
 
-From testnet block 5,950 (0.5.5; 0.5.4 had scheduled it at 7,600), a block's timestamp must be strictly later
-than its parent's, on top of the older rule: later than the median of the
-eleven blocks before it. The median alone let a miner with a minority of the
-hashrate date its blocks back, block after block, and slow the chain down:
+From testnet block 5,950 (0.5.5; 0.5.4 had scheduled it at 7,600), a
+block's timestamp must be strictly later than its parent's, on top of the
+older rule: later than the median of the eleven blocks before it. The
+median alone let a miner with a minority of the hashrate date its blocks
+back, block after block, and slow the chain down:
 measured on the difficulty rule itself (`tests/strict_block_time.rs`), a
 tenth of the hashrate brought the average block from two minutes to three, a
 third to more than eighteen. With the rule, the same miner leaves it within

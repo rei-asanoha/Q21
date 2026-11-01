@@ -65,6 +65,58 @@ file you do not install.
 
 ---
 
+# Upgrading from 0.5.4 to 0.5.5
+
+0.5.5 brings the strict block time forward on the testnet: from **block
+5,950** rather than 7,600, a block's timestamp must be strictly later than
+its parent's. The miners stopped at block 5,814 so that every node could
+take 0.5.5 first. A 0.5.4 node accepts every block a 0.5.5 node accepts and
+keeps following the chain; a miner still on 0.5.4 between blocks 5,950 and
+7,600 may produce blocks the others refuse. **Every node that mines must
+run 0.5.5 before block 5,950**; run it everywhere, servers included.
+
+It also lets either side of a payment channel add coins to it, and lets the
+side holding the latest state prove that the other runs an older copy.
+
+The rest of the testnet schedule is unchanged: payment channels open since
+block 4,980, names since block 5,200.
+
+## What changes
+
+| | 0.5.4 | 0.5.5 |
+|---|---|---|
+| Block timestamps | Strictly after the parent's from block 7,600 | From block 5,950 |
+| A channel's capacity | Fixed at the opening | **Add Q21**: either side adds coins to the same channel, through one transaction that spends the funding output and pays a larger one to the same two keys. Payments pause until it is buried to the funding depth, then resume (WALLET.md, "Adding Q21 to a channel") |
+| An older copy of a channel | Recognized by the counters the peer reports, and refused for good on its word | The peer proves it, with our own revocation secret of the latest state the copy holds: then refused for good. A claim without proof holds the copy back only while the peer keeps making it |
+| Sending from the side that opened a channel | The page showed its whole balance; sending all of it was refused (`BadBalances`) | It keeps the highest-tier fee of a close without the other side (0.00002538 Q21 on testnet), which comes back at a close agreed by both. The page adds it on top of the amount typed at the opening, so that this amount is what can be sent; `channelinfo` gives `sendable` and `close_reserve`, `getinfo` the reserve in `channel_terms` |
+| User agent | `+chanv3` | `+chanv3+splice1`: splices and proofs go only to a peer that announces it |
+| `channelsplice` | — | Adds coins of the wallet to an open channel (`channel_id`, `amount` in units). `channelinfo` shows a splice in progress, `channelhistory` the coins added |
+
+## Who should upgrade, and when
+
+Everyone, before block 5,950: entry points, explorers, servers, wallets.
+Mining nodes first. The two sides of a channel both need 0.5.5 to add coins
+to it; the wallet page offers it only then.
+
+## How to check a node
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getinfo","params":{}}' \
+  http://127.0.0.1:21080/rpc | grep -o '"block_time_rule":{[^}]*}'
+```
+
+A 0.5.5 node answers with `"activation_height":5950`; a 0.5.4 node with
+7600.
+
+## The data folder
+
+Nothing changes in it until coins are added to a channel. A channel that took
+an addition writes records a 0.5.4 node cannot read: once a channel has
+taken one, do not go back to 0.5.4 with that data folder.
+
+---
+
 # Upgrading from 0.5.3 to 0.5.4
 
 0.5.4 schedules one new rule of the chain on the testnet: from **block

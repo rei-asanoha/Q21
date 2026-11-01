@@ -56,11 +56,17 @@ journal, beside the wallet in the data folder, and the code does not hold it:
   connection shows the same (one sighting could be a message held up in
   transit), or sooner if its holder closes from the page; our side then comes
   back to the wallet. Closing such a copy alone would have broadcast a state
-  it had already revoked, and lost the whole channel to the penalty. The
-  copy's refusal is not lifted by the other side's word alone: a peer that
-  claims we are behind when we are not can hold the channel until it closes,
-  its own funds held with ours. Either way, the funds of an older copy come
-  back only through the other side: it must be online to close.
+  it had already revoked, and lost the whole channel to the penalty. Since
+  0.5.5 the other side proves it: it sends back our own revocation secret of
+  the latest state the copy holds, which only we could have revealed. The
+  proof makes the refusal final. A claim without a proof holds the copy back
+  only while the peer keeps making it: a peer that says we are behind when
+  we are not can no longer freeze the channel for good. A peer older than
+  0.5.5 proves nothing, and its word is still taken; a peer can also pass
+  itself off as older, so this protects against a mistaken peer more than
+  against a hostile one. Either way,
+  the funds of an older copy come back only through the other side: it must
+  be online to close.
 
 `checkbackup` (the wallet page: Info → Check my backup) checks the sheet
 against the wallet at any time, long before the day it is needed.
@@ -186,6 +192,36 @@ nothing useful: the token is drawn at each run and dies with it; what the
 browser keeps after shutdown is an inert string, erased at the node's first
 refusal. No cookie, no `indexedDB`, nothing else: the seed and the passphrase
 never go through the page.
+
+---
+
+## Adding Q21 to a channel
+
+An open channel holds what was put in at its opening. **Add Q21** (0.5.5)
+puts more of either side's coins into the same channel, with the same person:
+one transaction spends the channel's funding output and the coins added, and
+pays a larger funding output to the same two keys (a *splice*). The channel
+keeps its history and its revocations; the page shows the addition in the
+channel's history.
+
+How it stays safe:
+
+- the side that adds signs the other side's first commitment on the new
+  funding; the other side keeps it, signs the adder's, and only then signs
+  the splice's input that spends the old funding. Neither can put the splice
+  on chain while the other lacks a commitment it can close with;
+- until the splice is buried to the funding depth, neither side revokes the
+  last state on the old funding: a close without the other side broadcasts
+  that state while the splice is not on chain, and the first new one once it
+  is. A revoked older state is punished on either funding;
+- no payment moves meanwhile, a few blocks: the state is in flight until the
+  chain buries it, and both sides then reveal the secret of the old state;
+- a payment of the other side that crosses the addition wins: the adder
+  drops the splice, which nobody can complete without its signature, and the
+  page says to add again;
+- the adder pays the fee, from its own coins, as for an opening.
+
+Both wallets need 0.5.5 or later; the button shows only then.
 
 ---
 
