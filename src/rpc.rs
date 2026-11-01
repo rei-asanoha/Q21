@@ -164,6 +164,9 @@ fn wallet_message(e: &crate::wallet::WalletError) -> &'static str {
 /// for the price of one request.
 pub const MAX_BATCH: usize = 100;
 
+/// The last blocks the chain's pace is measured over, in `getmining`.
+pub const PACE_BLOCKS: u64 = 30;
+
 /// Cumulative size of a batch's responses, in bytes.
 ///
 /// The response used to be assembled entirely in memory before being sent,
@@ -5105,6 +5108,19 @@ impl RpcContext {
             let n = crate::memhard::table_size(c.pow_params(), epoch) as u64;
             (n * crate::consensus::POW_ELEMENT_SIZE as u64, epoch)
         });
+        // The pace of the chain, read in the chain itself: the time of the
+        // last block, and the mean time between the last blocks. Right as
+        // soon as the page opens, rather than after watching blocks arrive.
+        let (tip_time, mean_block_seconds) = self.node.with_chain(|c| {
+            let tip = c.tip();
+            let span = tip.height.min(PACE_BLOCKS);
+            let mean = (span > 0)
+                .then(|| c.active_at(tip.height - span))
+                .flatten()
+                .and_then(|id| c.header_of(&id))
+                .map(|old| tip.time.saturating_sub(old.time) / span);
+            (tip.time, mean)
+        });
 
         // The last twenty finds are enough for the screen; the counter and the
         // earnings carry the total since launch.
@@ -5149,6 +5165,11 @@ impl RpcContext {
             // readable.
             .set("memory_bytes", Json::u64(mining_memory))
             .set("epoch_memory", Json::u64(epoch))
+            .set("tip_time", Json::u64(tip_time))
+            .set(
+                "mean_block_seconds",
+                mean_block_seconds.map_or(Json::Null, Json::u64),
+            )
             .build()
     }
 
