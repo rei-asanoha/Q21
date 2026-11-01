@@ -471,7 +471,23 @@ pub struct RpcContext {
 pub struct ScanBucket {
     global: Bucket,
     clients: Vec<(ClientKey, Bucket, std::time::Instant)>,
+    /// Every call, however cheap, per client and in all: the reads of a
+    /// public explorer all take the node's lock, the one blocks are applied
+    /// under, and a few dozen connections looping on the cheapest of them
+    /// held block relay up for seconds (red-team campaign 6, O1b).
+    calls_global: Bucket,
+    calls: Vec<(ClientKey, Bucket, std::time::Instant)>,
 }
+
+/// Calls granted up front to each client of a public explorer.
+pub const CALL_BURST: u32 = 120;
+/// Calls regained per second, per client: a page of the explorer makes a
+/// handful, a person browsing never comes near.
+pub const CALLS_PER_SECOND: u32 = 20;
+/// Burst of the global net of calls.
+pub const GLOBAL_CALL_BURST: u32 = 1000;
+/// Calls per second in all, sustained.
+pub const GLOBAL_CALLS_PER_SECOND: u32 = 200;
 
 /// A token bucket: a burst, a refill.
 struct Bucket {
@@ -545,6 +561,27 @@ impl Bucket {
     }
 }
 
+impl Bucket {
+    /// [`Bucket::allow`], refilled per second, to the millisecond.
+    fn allow_per_second(&mut self, burst: u32, per_second: u32, now: std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_millis();
+        let gain = (elapsed.min(u32::MAX as u128) as u64).saturating_mul(per_second as u64) / 1000;
+        if gain > 0 {
+            self.tokens = self
+                .tokens
+                .saturating_add(gain.min(u32::MAX as u64) as u32)
+                .min(burst);
+            self.last = now;
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Default for ScanBucket {
     fn default() -> Self {
         Self::new()
@@ -556,6 +593,8 @@ impl ScanBucket {
         ScanBucket {
             global: Bucket::full(GLOBAL_SCAN_BURST, std::time::Instant::now()),
             clients: Vec::new(),
+            calls_global: Bucket::full(GLOBAL_CALL_BURST, std::time::Instant::now()),
+            calls: Vec::new(),
         }
     }
 
@@ -596,6 +635,45 @@ impl ScanBucket {
         let granted = bucket.allow(SCAN_BURST, SCANS_PER_MINUTE, now);
         self.clients.push((key, bucket, now));
         granted
+    }
+
+    /// Grants one call to this client, or not: its own bucket first, then
+    /// the global one.
+    pub fn allow_call(
+        &mut self,
+        client: Option<std::net::IpAddr>,
+        now: std::time::Instant,
+    ) -> bool {
+        if let Some(ip) = client {
+            let key = ClientKey::from_ip(ip);
+            let granted = match self.calls.iter_mut().find(|(c, _, _)| *c == key) {
+                Some(entry) => {
+                    entry.2 = now;
+                    entry.1.allow_per_second(CALL_BURST, CALLS_PER_SECOND, now)
+                }
+                None => {
+                    if self.calls.len() >= MAX_TRACKED_CLIENTS {
+                        if let Some((i, _)) = self
+                            .calls
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, (_, _, seen))| *seen)
+                        {
+                            self.calls.swap_remove(i);
+                        }
+                    }
+                    let mut bucket = Bucket::full(CALL_BURST, now);
+                    let granted = bucket.allow_per_second(CALL_BURST, CALLS_PER_SECOND, now);
+                    self.calls.push((key, bucket, now));
+                    granted
+                }
+            };
+            if !granted {
+                return false;
+            }
+        }
+        self.calls_global
+            .allow_per_second(GLOBAL_CALL_BURST, GLOBAL_CALLS_PER_SECOND, now)
     }
 
     /// Number of clients tracked right now. For tests.
@@ -1221,6 +1299,27 @@ impl RpcContext {
             }
         };
         let params = request.get("params").cloned().unwrap_or(Json::Null);
+
+        // A public explorer counts every call, per client and in all.
+        if let Some(bucket) = &self.scans {
+            let granted = bucket
+                .lock()
+                .map(|mut s| s.allow_call(client, std::time::Instant::now()))
+                .unwrap_or(false);
+            if !granted {
+                return Json::obj()
+                    .set("jsonrpc", Json::str("2.0"))
+                    .set("id", id)
+                    .set(
+                        "error",
+                        rpc_error(
+                            ERR_REQUEST,
+                            "too many requests on this public service: slow down a little",
+                        ),
+                    )
+                    .build();
+            }
+        }
 
         match self.dispatch(&method, &params, client) {
             Ok(r) => Json::obj()
@@ -2534,6 +2633,9 @@ impl RpcContext {
                         crate::contacts::ContactError::LabelTaken => {
                             "another contact already has this name"
                         }
+                        crate::contacts::ContactError::Imitation => {
+                            "this name is written with characters that imitate letters"
+                        }
                         crate::contacts::ContactError::Full => "the contact book is full",
                         crate::contacts::ContactError::Unknown => "unknown contact",
                     },
@@ -3159,27 +3261,31 @@ impl RpcContext {
         // and a few such requests held block relay up for tens of seconds.
         // The commitment only changes with the tip: it is kept with the tip
         // it belongs to, and computed again only when the tip moves.
+        //
+        // The cache lock is held through the computation: callers that come
+        // in while the tip moves wait for the one computation, rather than
+        // each making its own (red-team campaign 6, O1c). And the digest is
+        // computed once, the state commitment derived from it.
         static CACHE: Mutex<Option<(Hash256, Json)>> = Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let tip_now = self.node.with_chain(|c| c.tip_id());
-        if let Ok(g) = CACHE.lock() {
-            if let Some((tip, json)) = g.as_ref() {
-                if *tip == tip_now {
-                    return json.clone();
-                }
+        if let Some((tip, json)) = cache.as_ref() {
+            if *tip == tip_now {
+                return json.clone();
             }
         }
-        let (tip_id, height, tip, entries, issued, commitment, muhash) =
-            self.node.with_chain(|c| {
-                (
-                    c.tip_id(),
-                    c.height(),
-                    c.tip_id().to_hex(),
-                    c.utxo_count(),
-                    c.total_issued(),
-                    c.state_commitment().to_hex(),
-                    c.utxo_commitment().to_hex(),
-                )
-            });
+        let (tip_id, height, tip, entries, issued, muhash) = self.node.with_chain(|c| {
+            (
+                c.tip_id(),
+                c.height(),
+                c.tip_id().to_hex(),
+                c.utxo_count(),
+                c.total_issued(),
+                c.utxo_commitment(),
+            )
+        });
+        let commitment = crate::state::state_commitment(muhash, issued.units()).to_hex();
+        let muhash = muhash.to_hex();
         let json = Json::obj()
             .set("height", Json::u64(height))
             .set("tip", Json::str(tip))
@@ -3188,9 +3294,7 @@ impl RpcContext {
             .set("commitment", Json::str(commitment))
             .set("muhash", Json::str(muhash))
             .build();
-        if let Ok(mut g) = CACHE.lock() {
-            *g = Some((tip_id, json.clone()));
-        }
+        *cache = Some((tip_id, json.clone()));
         json
     }
 
@@ -4383,7 +4487,14 @@ impl RpcContext {
         use crate::address_book::BookError;
         match e {
             BookError::EmptyName => rpc_error(ERR_PARAMS, "the name is empty"),
-            BookError::NameTaken => rpc_error(ERR_PARAMS, "another contact already has this name"),
+            BookError::NameTaken(other) => rpc_error(
+                ERR_PARAMS,
+                &format!("another contact already has this name, or one that looks just like it: {other}"),
+            ),
+            BookError::Imitation => rpc_error(
+                ERR_PARAMS,
+                "this name is written with characters that imitate letters",
+            ),
             BookError::AlreadyKept(name) => rpc_error(
                 ERR_PARAMS,
                 &format!("this address is already in your contacts, as {name}"),
@@ -4407,11 +4518,22 @@ impl RpcContext {
         let g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let book = g.address_book();
         Ok(Json::array(
-            g.address_book()
-                .list()
+            book.list()
                 .into_iter()
-                .map(Self::book_entry_json)
+                .map(|e| {
+                    let mut j = Self::book_entry_json(e);
+                    // A name that looks like another's: the page shows both
+                    // with a warning (red-team campaign 6, W1).
+                    if let Json::Object(fields) = &mut j {
+                        fields.insert(
+                            "looks_like".to_string(),
+                            book.looks_like(e).map_or(Json::Null, Json::str),
+                        );
+                    }
+                    j
+                })
                 .collect(),
         ))
     }
@@ -5801,6 +5923,9 @@ impl RpcContext {
         // in between is refused rather than paid.
         if preview {
             let estimate = self.node.with_chain_and_mempool(|c, m| {
+                if g.scheme().is_one_time() && g.verified_up_to() < c.height() {
+                    g.scan_chain(c.height(), |h| c.block_at(h));
+                }
                 let f = fee_for(m.automatic_fee_rate());
                 g.consolidation_estimate(&c.utxo, c.height(), max_inputs, &|o| m.spends(o), &f)
             });
@@ -5815,6 +5940,18 @@ impl RpcContext {
                 .build());
         }
         let prepared = self.node.with_chain_and_mempool(|c, m| {
+            // As a send does: a one-time scheme first learns which of its
+            // keys already signed up to the tip, or the gathered output could
+            // land on one of them (red-team campaign 6, S1b).
+            if g.scheme().is_one_time() && g.verified_up_to() < c.height() {
+                g.scan_chain(c.height(), |h| c.block_at(h));
+                if g.verified_up_to() < c.height() {
+                    return Err(crate::wallet::WalletError::VerificationBehind {
+                        verified: g.verified_up_to(),
+                        height: c.height(),
+                    });
+                }
+            }
             let f = fee_for(m.automatic_fee_rate());
             g.prepare_consolidation(&c.utxo, c.height(), max_inputs, &|o| m.spends(o), &f)
         });
@@ -7604,6 +7741,34 @@ mod tests {
         let r = c.handle_from(&batch, a);
         assert_eq!(r.matches("too many searches").count(), MAX_PUBLIC_BATCH);
         assert!(!scan_refused(&c, b), "B is deprived by A's batch");
+    }
+
+    /// Red-team campaign 6, O1b: a public explorer counts every call, per
+    /// client: a client looping on the cheapest read is slowed, the others
+    /// are not; a local node counts nothing.
+    #[test]
+    fn a_public_explorer_counts_every_call_per_client() {
+        let c = public_context();
+        let (a, b) = (ip("198.51.100.20"), ip("203.0.113.20"));
+        let one = r#"{"jsonrpc":"2.0","id":1,"method":"getinfo","params":{}}"#;
+        let mut refused = 0;
+        for _ in 0..(CALL_BURST + 30) {
+            if c.handle_from(one, a).contains("too many requests") {
+                refused += 1;
+            }
+        }
+        assert!(
+            refused >= 20,
+            "a client looping is slowed: {refused} refused"
+        );
+        assert!(
+            !c.handle_from(one, b).contains("too many requests"),
+            "B is not"
+        );
+        let local = context(false);
+        for _ in 0..(CALL_BURST + 30) {
+            assert!(!local.handle(one).contains("too many requests"));
+        }
     }
 
     /// Red-team campaign 6, O1: a public explorer takes short batches only,

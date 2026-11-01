@@ -2288,6 +2288,14 @@ impl Episode {
             }
         };
         let Some(m) = m else { return };
+        // An Update the peer signed for a state not settled yet is a real
+        // payment of the peer, which the victim may rightly accept later —
+        // a crossing refused it at the time. Its replay is not an attack.
+        if let Message::Update { state, .. } = &m {
+            if *state >= self.v.next_state_number() {
+                return;
+            }
+        }
         let before = Snap::of(&self.v);
         let r = self.guarded_deliver(&m, rng, "replay/mutation");
         stats.note("mutation", &r);
