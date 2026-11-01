@@ -733,6 +733,28 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("peer_owner", Json::str(s.peer_owner))
         .set("behind", Json::Bool(s.behind))
         .set("peer_behind", Json::Bool(s.peer_behind))
+        .set("splices", Json::Bool(s.splices))
+        .set("splice_refused", Json::Bool(s.splice_refused))
+        .set(
+            "splice",
+            match s.splice {
+                Some(sp) => Json::obj()
+                    .set("amount", Json::u64(sp.add))
+                    .set("ours", Json::Bool(sp.ours))
+                    .set("txid", Json::str(sp.txid.to_hex()))
+                    .set("signed", Json::Bool(sp.signed))
+                    .set(
+                        "height",
+                        match sp.height {
+                            Some(h) => Json::u64(h),
+                            None => Json::Null,
+                        },
+                    )
+                    .set("locked", Json::Bool(sp.locked))
+                    .build(),
+                None => Json::Null,
+            },
+        )
         .build()
 }
 
@@ -1297,6 +1319,10 @@ impl RpcContext {
                 "[wallet] Pay over a channel (channel_id, amount); settled once irrevocable",
             ),
             (
+                "channelsplice",
+                "[wallet] Add coins of the wallet to an open channel (channel_id, amount)",
+            ),
+            (
                 "channelclose",
                 "[wallet] Close a channel cooperatively, or force-close (channel_id, [force])",
             ),
@@ -1479,6 +1505,58 @@ impl RpcContext {
     }
 
     #[cfg(feature = "mldsa")]
+    fn channelsplice(&self, params: &Json) -> Result<Json, Json> {
+        let mgr = self.channels_open()?;
+        let cid = self.channel_id_param(params)?;
+        let amount = params
+            .get("amount")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "amount (in units) is required"))?;
+        let peer = mgr
+            .peer_of(cid)
+            .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))?;
+        if !self.node.channel_peers().contains(&peer) {
+            return Err(rpc_error(ERR_REQUEST, "peer is not connected"));
+        }
+        let frame = mgr
+            .splice(cid, amount)
+            .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
+        if !mgr.send(peer, frame) {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "peer disconnected; the addition goes on when the channel reconnects",
+            ));
+        }
+        // The answer takes a round trip; the addition then waits for the
+        // chain, which `channelinfo` follows.
+        let deadline = std::time::Instant::now() + CHANNELPAY_SETTLE_WAIT;
+        let signed = loop {
+            let info = mgr.info(cid);
+            let signed = info
+                .as_ref()
+                .and_then(|s| s.splice)
+                .is_some_and(|sp| sp.signed);
+            let refused = info.as_ref().is_some_and(|s| s.splice.is_none());
+            if signed || refused || std::time::Instant::now() >= deadline {
+                break if refused { None } else { Some(signed) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        match signed {
+            None => Err(rpc_error(
+                ERR_REQUEST,
+                "your contact made a payment at the same moment: try again",
+            )),
+            Some(signed) => Ok(Json::obj()
+                .set("channel_id", Json::str(cid.to_hex()))
+                .set("amount", Json::u64(amount))
+                .set("signed", Json::Bool(signed))
+                .set("fee", Json::u64(CHANNEL_FUND_FEE))
+                .build()),
+        }
+    }
+
+    #[cfg(feature = "mldsa")]
     fn channelpay(&self, params: &Json) -> Result<Json, Json> {
         let mgr = self.channels_open()?;
         let cid = self.channel_id_param(params)?;
@@ -1591,14 +1669,27 @@ impl RpcContext {
             mgr.history(cid)
                 .into_iter()
                 .map(|e| {
-                    let units = u64::try_from(e.delta.unsigned_abs()).unwrap_or(u64::MAX);
+                    // Coins put into the channel are no payment: "added" by
+                    // us, "added_by_peer" by the other side.
+                    let (direction, units) = if e.added > 0 {
+                        (
+                            if e.added_by_us {
+                                "added"
+                            } else {
+                                "added_by_peer"
+                            },
+                            e.added,
+                        )
+                    } else {
+                        (
+                            if e.delta < 0 { "sent" } else { "received" },
+                            u64::try_from(e.delta.unsigned_abs()).unwrap_or(u64::MAX),
+                        )
+                    };
                     Json::obj()
                         .set("state", Json::u64(e.state))
                         .set("time", Json::u64(e.time))
-                        .set(
-                            "direction",
-                            Json::str(if e.delta < 0 { "sent" } else { "received" }),
-                        )
+                        .set("direction", Json::str(direction))
                         .set("amount", amount_json(Amount::from_units(units)))
                         .build()
                 })
@@ -2642,6 +2733,7 @@ impl RpcContext {
                 | "consolidate"
                 | "channelopen"
                 | "channelpay"
+                | "channelsplice"
                 | "channelclose"
                 | "nameregister"
                 | "identitysweep"
@@ -2718,6 +2810,8 @@ impl RpcContext {
             "channelopen" => self.channelopen(params),
             #[cfg(feature = "mldsa")]
             "channelpay" => self.channelpay(params),
+            #[cfg(feature = "mldsa")]
+            "channelsplice" => self.channelsplice(params),
             #[cfg(feature = "mldsa")]
             "channelclose" => self.channelclose(params),
             #[cfg(feature = "mldsa")]
@@ -6007,6 +6101,9 @@ mod tests {
             peer_owner: "cd".repeat(32),
             behind: false,
             peer_behind: true,
+            splice: None,
+            splices: true,
+            splice_refused: false,
         };
         let j = channel_json(s);
         for field in [

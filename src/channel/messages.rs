@@ -36,6 +36,17 @@ const T_CLOSE: u8 = 10;
 const T_CLOSE_SIGNED: u8 = 11;
 const T_ERROR: u8 = 12;
 // 13 was `Challenge`, in version 2.
+const T_SPLICE: u8 = 14;
+const T_SPLICE_ACK: u8 = 15;
+const T_SPLICE_SIG: u8 = 16;
+const T_SPLICE_LOCKED: u8 = 17;
+const T_SPLICE_BUSY: u8 = 18;
+const T_BEHIND_PROOF: u8 = 19;
+
+/// Largest splice transaction a [`Message::Splice`] carries, stripped of its
+/// witnesses: some forty inputs. With its three tier signatures the frame
+/// still fits one record (see [`crate::channel::transport::MAX_RECORD`]).
+pub const MAX_SPLICE_TX: usize = 1_800;
 
 /// Most announced revocation hashes a message may carry. A channel announces
 /// the next one or two points ahead; a larger count is a malformed frame.
@@ -149,6 +160,40 @@ pub enum Message {
     CloseSigned { fee: u64, signature: Vec<u8> },
     /// An abort, with a short reason. Informational: nothing acts on it.
     Error { reason: String },
+    /// Adder → other side: adds `add` units of the adder's own coins to the
+    /// channel. `tx` is the splice transaction, stripped of its witnesses:
+    /// input `funding_input` spends the current funding output, the others
+    /// are the adder's coins, and output 0 is the new funding output for the
+    /// capacity plus `add`. `state` is the first state on the new funding;
+    /// `tier_sigs` are the adder's signatures of the other side's commitment
+    /// at that state, on the new funding.
+    Splice {
+        state: u64,
+        add: u64,
+        funding_input: u32,
+        tx: Vec<u8>,
+        tier_sigs: TierSigs,
+    },
+    /// Other side → adder: its signatures of the adder's commitment at the
+    /// splice state, on the new funding. Sent with [`Message::SpliceSig`].
+    SpliceAck { state: u64, tier_sigs: TierSigs },
+    /// Other side → adder: its signature of the splice transaction's input
+    /// that spends the current funding output. Given only once its own
+    /// commitment on the new funding is persisted: from then on, the adder
+    /// can put the splice on chain.
+    SpliceSig { state: u64, signature: Vec<u8> },
+    /// Either side, once the splice is buried to the funding depth: the
+    /// revocation of the last state on the old funding, which nothing can
+    /// spend any more.
+    SpliceLocked { state: u64, revocation: Revocation },
+    /// Other side → adder: a payment of its own crossed the splice, which is
+    /// refused with nothing kept; the adder may try again.
+    SpliceBusy { state: u64 },
+    /// The side holding the latest state → a peer whose reestablish showed
+    /// an older copy: the peer's own revocation secret for `state`, its
+    /// latest commitment as it stands. Only the peer could have revealed it:
+    /// it proves the copy older, where the counters alone are a claim.
+    BehindProof { state: u64, secret: [u8; 32] },
 }
 
 /// The control message kinds a [`control_message`] signature covers.
@@ -363,6 +408,35 @@ impl Message {
                 let bytes = &bytes[..bytes.len().min(MAX_ERROR_LEN)];
                 w.u8(T_ERROR).var_bytes(bytes);
             }
+            Message::Splice {
+                state,
+                add,
+                funding_input,
+                tx,
+                tier_sigs,
+            } => {
+                w.u8(T_SPLICE).u64(*state).u64(*add).u32(*funding_input);
+                w.var_bytes(tx);
+                write_tier_sigs(&mut w, tier_sigs);
+            }
+            Message::SpliceAck { state, tier_sigs } => {
+                w.u8(T_SPLICE_ACK).u64(*state);
+                write_tier_sigs(&mut w, tier_sigs);
+            }
+            Message::SpliceSig { state, signature } => {
+                w.u8(T_SPLICE_SIG).u64(*state);
+                write_crypto(&mut w, signature);
+            }
+            Message::SpliceLocked { state, revocation } => {
+                w.u8(T_SPLICE_LOCKED).u64(*state);
+                write_revocation(&mut w, revocation);
+            }
+            Message::SpliceBusy { state } => {
+                w.u8(T_SPLICE_BUSY).u64(*state);
+            }
+            Message::BehindProof { state, secret } => {
+                w.u8(T_BEHIND_PROOF).u64(*state).bytes(secret);
+            }
         }
         w.finish()
     }
@@ -476,6 +550,39 @@ impl Message {
                     reason: String::from_utf8_lossy(&bytes).into_owned(),
                 }
             }
+            T_SPLICE => {
+                let state = r.u64()?;
+                let add = r.u64()?;
+                let funding_input = r.u32()?;
+                let tx = read_bounded(&mut r, MAX_SPLICE_TX)?;
+                let tier_sigs = read_tier_sigs(&mut r)?;
+                Message::Splice {
+                    state,
+                    add,
+                    funding_input,
+                    tx,
+                    tier_sigs,
+                }
+            }
+            T_SPLICE_ACK => {
+                let state = r.u64()?;
+                let tier_sigs = read_tier_sigs(&mut r)?;
+                Message::SpliceAck { state, tier_sigs }
+            }
+            T_SPLICE_SIG => {
+                let state = r.u64()?;
+                let signature = read_sig(&mut r)?;
+                Message::SpliceSig { state, signature }
+            }
+            T_SPLICE_LOCKED => Message::SpliceLocked {
+                state: r.u64()?,
+                revocation: read_revocation(&mut r)?,
+            },
+            T_SPLICE_BUSY => Message::SpliceBusy { state: r.u64()? },
+            T_BEHIND_PROOF => Message::BehindProof {
+                state: r.u64()?,
+                secret: r.array32()?,
+            },
             other => return Err(WireError::UnknownType(other)),
         };
         r.expect_end()?;

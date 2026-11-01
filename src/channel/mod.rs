@@ -125,4 +125,6 @@ pub const MIN_CAPACITY: u64 = 4 * crate::consensus::MIN_OUTPUT_VALUE;
 pub const MAX_CAPACITY: u64 = 21_000_000_000_000;
 
 #[cfg(all(test, feature = "mldsa"))]
+mod splice_tests;
+#[cfg(all(test, feature = "mldsa"))]
 mod tests;

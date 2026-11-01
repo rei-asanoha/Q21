@@ -249,9 +249,21 @@ impl ChannelParams {
         network: crate::address::Network,
         signer: usize,
     ) -> Hash256 {
+        self.funding_sighash_at(tx, 0, network, signer)
+    }
+
+    /// [`ChannelParams::funding_sighash`] for the funding spent by input
+    /// `input`: a splice spends it beside the adder's own coins.
+    pub fn funding_sighash_at(
+        &self,
+        tx: &Transaction,
+        input: u32,
+        network: crate::address::Network,
+        signer: usize,
+    ) -> Hash256 {
         policy::sighash(
             tx,
-            0,
+            input,
             network,
             &self.funding_output(),
             &self.funding_policy(),
@@ -267,6 +279,17 @@ impl ChannelParams {
         sigs: [&[u8]; 2],
         pubkeys: [&[u8]; 2],
     ) {
+        self.complete_funding_spend_at(tx, 0, sigs, pubkeys);
+    }
+
+    /// [`ChannelParams::complete_funding_spend`] for input `input`.
+    pub fn complete_funding_spend_at(
+        &self,
+        tx: &mut Transaction,
+        input: usize,
+        sigs: [&[u8]; 2],
+        pubkeys: [&[u8]; 2],
+    ) {
         let s = Satisfaction::All(
             (0..2)
                 .map(|i| Satisfaction::Key {
@@ -275,7 +298,7 @@ impl ChannelParams {
                 })
                 .collect(),
         );
-        tx.inputs[0].witness = policy::witness(&self.funding_policy(), &s);
+        tx.inputs[input].witness = policy::witness(&self.funding_policy(), &s);
     }
 
     /// A cooperative close paying each party its final balance, the side of

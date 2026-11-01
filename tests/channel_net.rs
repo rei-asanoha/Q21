@@ -109,6 +109,7 @@ fn hooks(wallet: Arc<Mutex<Wallet>>, node: Node, pending: Pending, can_fund: boo
         }
     });
     Hooks {
+        splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
         fund,
         broadcast,
         sweep_address,

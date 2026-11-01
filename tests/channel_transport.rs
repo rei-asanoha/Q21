@@ -24,6 +24,7 @@ const NET: Network = Network::Regtest;
 
 fn hooks() -> Hooks {
     Hooks {
+        splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
         fund: Box::new(|_, _| Err("no funds here".into())),
         broadcast: Box::new(|_| Ok(())),
         sweep_address: Box::new(|| Hash256([1; 32])),
@@ -80,6 +81,7 @@ fn link(seed_a: u8, seed_b: u8, tag: &str) -> (Vec<End>, Wire) {
                     outbound,
                     local_nonce: 0xa000 + i,
                     remote_nonce: 0xa000 + (1 - i),
+                    splices: true,
                 },
             }
         })

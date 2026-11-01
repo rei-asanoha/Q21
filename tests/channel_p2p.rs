@@ -179,7 +179,8 @@ fn introduced_as(node: &Node, network: Network) -> String {
 
 /// A node with channels advertises the capability, alone: no id rides with
 /// it. The node id is what a channel session authenticates; a stable one in
-/// the user agent linked every address the wallet connected from.
+/// the user agent linked every address the wallet connected from. Splices
+/// (0.5.5) add their own token after it.
 #[test]
 fn the_channel_capability_travels_without_an_id() {
     let a = node();
@@ -188,10 +189,17 @@ fn the_channel_capability_travels_without_an_id() {
         last: Default::default(),
     }));
     let base = format!("q21:{}", env!("CARGO_PKG_VERSION"));
+    let ua = introduced_as(&a, NET);
     assert_eq!(
-        introduced_as(&a, NET),
-        format!("{base}{}", q21_core::wire::CHANNELS_CAPABILITY)
+        ua,
+        format!(
+            "{base}{}{}",
+            q21_core::wire::CHANNELS_CAPABILITY,
+            q21_core::wire::SPLICE_CAPABILITY
+        )
     );
+    assert!(q21_core::wire::user_agent_advertises_channels(&ua));
+    assert!(q21_core::wire::user_agent_advertises_splices(&ua));
     a.shutdown();
     let plain = node();
     assert_eq!(introduced_as(&plain, NET), base);

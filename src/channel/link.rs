@@ -605,6 +605,7 @@ impl ChannelTransport {
                     took.as_millis()
                 );
             }
+            self.mgr.note_peer_splices(peer, link.splices);
             for frame in self.mgr.on_session(peer, &identity, &legacy, binding) {
                 self.send(peer, frame);
             }

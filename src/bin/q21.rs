@@ -4881,6 +4881,44 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 },
             );
 
+            // A splice: the wallet's coins for the addition and its fee, beside
+            // the channel's funding output, which the channel signs itself.
+            let w_splice = wallet.clone();
+            let n_splice = node.clone();
+            let folder_splice = folder.clone();
+            let splice = Box::new(
+                move |_cid: q21_core::hash::Hash256,
+                      funding: q21_core::tx::OutPoint,
+                      funding_output: TxOut,
+                      new_output: TxOut,
+                      sequence: u32|
+                      -> Result<Transaction, String> {
+                    let _sending = q21_core::shutdown::begin_send()
+                        .ok_or_else(|| "the node is shutting down".to_string())?;
+                    let mut w = w_splice.lock().map_err(|_| "wallet locked".to_string())?;
+                    let tx = n_splice.with_chain_and_mempool(|c, m| {
+                        let prepared = w
+                            .prepare_splice(
+                                &c.utxo,
+                                c.height(),
+                                funding,
+                                &funding_output,
+                                new_output,
+                                Amount::from_units(CHANNEL_FUND_FEE),
+                                sequence,
+                                &|o| m.spends(o),
+                            )
+                            .map_err(|e| format!("{e:?}"))?;
+                        w.sign_spend(&m.view(&c.utxo), prepared)
+                            .map_err(|e| format!("{e:?}"))
+                    })?;
+                    let coins: Vec<_> = tx.inputs.iter().map(|i| i.prev_out).collect();
+                    w.lock_coins(&coins);
+                    let _ = write_wallet(&folder_splice, &w);
+                    Ok(tx)
+                },
+            );
+
             let n_b = node.clone();
             // A penalty is rebroadcast at every block until it confirms: one
             // already in our pool is announced again rather than refused, so
@@ -4945,6 +4983,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 q21_core::channel::terms(network).funding_depth,
                 Hooks {
                     fund,
+                    splice,
                     broadcast,
                     sweep_address,
                     payout_address,

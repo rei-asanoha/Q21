@@ -148,6 +148,11 @@ const _: () = assert!(INIT_LEN <= crate::wire::MAX_CHANNEL_MSG);
 const _: () = assert!(RESP_LEN <= crate::wire::MAX_CHANNEL_MSG);
 const _: () = assert!(FIN_LEN <= crate::wire::MAX_CHANNEL_MSG);
 const _: () = assert!(33 + 64 + 3 * (SIG_LEN + 4) < MAX_RECORD);
+// And so does a splice: its transaction, bounded, beside the three tier
+// signatures.
+const _: () = assert!(
+    33 + 2 + 20 + 4 + crate::channel::messages::MAX_SPLICE_TX + 1 + 3 * (SIG_LEN + 4) < MAX_RECORD
+);
 
 /// Records a direction carries under one key before it rekeys.
 pub const REKEY_RECORDS: u64 = 1 << 20;

@@ -134,6 +134,28 @@ pub enum Record {
     /// spends being spent on chain by another transaction, buried. Settled
     /// like [`Record::Closed`]; the journal is kept, never deleted.
     Abandoned,
+    /// A splice: `adder` puts `add` more units into the channel with `tx`,
+    /// which spends the funding output at `old_funding` (for `old_capacity`)
+    /// in its input `funding_input` and pays the new funding output in its
+    /// output 0. From `state` on, commitments spend the new funding. The
+    /// adder keeps its own coins' witnesses in `tx`; the other side, the
+    /// stripped transaction it received.
+    Splice {
+        state: u64,
+        adder: u8,
+        add: u64,
+        old_capacity: u64,
+        old_funding: (Hash256, u32),
+        funding_input: u32,
+        tx: Vec<u8>,
+    },
+    /// The adder: the other side's signature of the splice's funding input.
+    SpliceSig { signature: Vec<u8> },
+    /// The adder: the splice, fully signed and ready for the chain.
+    SpliceTx { tx: Vec<u8> },
+    /// The splice is buried to the funding depth, and we revealed the secret
+    /// of the last state on the old funding.
+    SpliceLocked,
 }
 
 const R_OPENED: u8 = 1;
@@ -160,6 +182,10 @@ const R_OPENED_INDEXED: u8 = 20;
 const R_CONTROL_SENT: u8 = 21;
 const R_CONTROL_RECV: u8 = 22;
 const R_ABANDONED: u8 = 23;
+const R_SPLICE: u8 = 24;
+const R_SPLICE_SIG: u8 = 25;
+const R_SPLICE_TX: u8 = 26;
+const R_SPLICE_LOCKED: u8 = 27;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -280,6 +306,30 @@ impl Record {
             Record::Abandoned => {
                 w.u8(R_ABANDONED);
             }
+            Record::Splice {
+                state,
+                adder,
+                add,
+                old_capacity,
+                old_funding,
+                funding_input,
+                tx,
+            } => {
+                w.u8(R_SPLICE).u64(*state).u8(*adder).u64(*add);
+                w.u64(*old_capacity)
+                    .bytes(old_funding.0.as_bytes())
+                    .u32(old_funding.1);
+                w.u32(*funding_input).var_bytes(tx);
+            }
+            Record::SpliceSig { signature } => {
+                w.u8(R_SPLICE_SIG).var_bytes(signature);
+            }
+            Record::SpliceTx { tx } => {
+                w.u8(R_SPLICE_TX).var_bytes(tx);
+            }
+            Record::SpliceLocked => {
+                w.u8(R_SPLICE_LOCKED);
+            }
         }
         w.finish()
     }
@@ -381,6 +431,22 @@ impl Record {
                 fee: r.u64()?,
                 signature: r.var_bytes()?.to_vec(),
             },
+            R_SPLICE => Record::Splice {
+                state: r.u64()?,
+                adder: r.u8()?,
+                add: r.u64()?,
+                old_capacity: r.u64()?,
+                old_funding: (Hash256(r.array32()?), r.u32()?),
+                funding_input: r.u32()?,
+                tx: r.var_bytes()?.to_vec(),
+            },
+            R_SPLICE_SIG => Record::SpliceSig {
+                signature: r.var_bytes()?.to_vec(),
+            },
+            R_SPLICE_TX => Record::SpliceTx {
+                tx: r.var_bytes()?.to_vec(),
+            },
+            R_SPLICE_LOCKED => Record::SpliceLocked,
             _ => return Err(ReadError::InvalidValue),
         };
         r.expect_end()?;

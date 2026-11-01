@@ -18,31 +18,31 @@ use crate::tx::OutPoint;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const NET: Network = Network::Regtest;
-const CAP: u64 = 50 * UNITS_PER_COIN;
-const DELAY: u16 = 12;
-const DEPTH: u16 = 2;
-const RATE: u64 = 10;
+pub(super) const NET: Network = Network::Regtest;
+pub(super) const CAP: u64 = 50 * UNITS_PER_COIN;
+pub(super) const DELAY: u16 = 12;
+pub(super) const DEPTH: u16 = 2;
+pub(super) const RATE: u64 = 10;
 
 static CTR: AtomicU64 = AtomicU64::new(0);
 
-fn tmpdir() -> PathBuf {
+pub(super) fn tmpdir() -> PathBuf {
     let n = CTR.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!("q21chan-{}-{}", std::process::id(), n));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
 
-fn fkey() -> Box<dyn Signer> {
+pub(super) fn fkey() -> Box<dyn Signer> {
     Box::new(ChannelKey::from_seed(&[1u8; 32]))
 }
-fn akey() -> Box<dyn Signer> {
+pub(super) fn akey() -> Box<dyn Signer> {
     Box::new(ChannelKey::from_seed(&[2u8; 32]))
 }
 
 /// A funded, open channel pair, with a fixed funding outpoint. Returns
 /// `(funder, acceptor)`.
-fn open_pair(dir: &std::path::Path) -> (Machine, Machine) {
+pub(super) fn open_pair(dir: &std::path::Path) -> (Machine, Machine) {
     let f_signer = fkey();
     let a_signer = akey();
     let a_pub = a_signer.pubkey().to_vec();
@@ -87,7 +87,7 @@ fn open_pair(dir: &std::path::Path) -> (Machine, Machine) {
 }
 
 /// Runs one payment update, `initiator` paying so that balances become `bal`.
-fn pay(initiator: &mut Machine, responder: &mut Machine, bal: [u64; 2]) {
+pub(super) fn pay(initiator: &mut Machine, responder: &mut Machine, bal: [u64; 2]) {
     let upd = initiator.propose(bal).unwrap();
     let ack = responder.on_update(&upd).unwrap();
     let rev = initiator.on_ack(&ack).unwrap();
@@ -589,7 +589,10 @@ fn an_old_state_is_punished_and_the_latest_is_not() {
 // --- Reestablish ------------------------------------------------------------
 
 /// Verifies a peer reestablish and returns the resends, checking the proof.
-fn exchange_reestablish(x: &mut Machine, y: &mut Machine) -> (Vec<Message>, Vec<Message>) {
+pub(super) fn exchange_reestablish(
+    x: &mut Machine,
+    y: &mut Machine,
+) -> (Vec<Message>, Vec<Message>) {
     let rx = x.reestablish().unwrap();
     let ry = y.reestablish().unwrap();
     let for_y = y.on_reestablish(&rx).unwrap();
@@ -1515,7 +1518,7 @@ fn a_testnet_acceptor_applies_the_testnet_bounds() {
 
 /// Keeps only the first `keep` record frames of a journal, as a crash right
 /// after the `keep`-th `fsync` would leave it.
-fn keep_records(path: &std::path::Path, keep: usize) {
+pub(super) fn keep_records(path: &std::path::Path, keep: usize) {
     let bytes = read_journal(path);
     let mut offset = 0usize;
     for _ in 0..keep {
@@ -1525,7 +1528,7 @@ fn keep_records(path: &std::path::Path, keep: usize) {
     std::fs::write(path, &bytes[..offset]).unwrap();
 }
 
-fn record_count(path: &std::path::Path) -> usize {
+pub(super) fn record_count(path: &std::path::Path) -> usize {
     journal::replay(&read_journal(path)).len()
 }
 

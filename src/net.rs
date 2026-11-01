@@ -1793,6 +1793,8 @@ pub struct ChannelLink {
     pub local_nonce: u64,
     /// The nonce the peer introduced itself with in its `Version`.
     pub remote_nonce: u64,
+    /// The peer announced [`crate::wire::SPLICE_CAPABILITY`].
+    pub splices: bool,
 }
 
 /// A handle that queues channel payloads to a peer, for a channel component
@@ -2151,7 +2153,12 @@ impl Node {
     /// address the wallet connects from, through Tor or not.
     fn user_agent(&self, open: bool) -> String {
         if open && self.channels_enabled() {
-            format!("{}{}", user_agent_base(), crate::wire::CHANNELS_CAPABILITY)
+            format!(
+                "{}{}{}",
+                user_agent_base(),
+                crate::wire::CHANNELS_CAPABILITY,
+                crate::wire::SPLICE_CAPABILITY
+            )
         } else {
             user_agent_base()
         }
@@ -3953,6 +3960,9 @@ impl Node {
                                         outbound: p.outbound,
                                         local_nonce,
                                         remote_nonce: p.remote_nonce.unwrap_or(0),
+                                        splices: crate::wire::user_agent_advertises_splices(
+                                            &p.user_agent,
+                                        ),
                                     });
                                 }
                                 (p.start_height > height, g.chain.locator())
@@ -5188,6 +5198,7 @@ impl Node {
                                 outbound: p.outbound,
                                 local_nonce,
                                 remote_nonce: p.remote_nonce.unwrap_or(0),
+                                splices: crate::wire::user_agent_advertises_splices(&p.user_agent),
                             });
                             channel_in = link.map(|l| (bytes, l));
                         }

@@ -1828,6 +1828,67 @@ impl Wallet {
         self.finish_prepare(chosen, outputs, height)
     }
 
+    /// Prepares a splice (0.5.5): `add` units of this wallet's confirmed
+    /// coins put into a payment channel beside its funding output `funding`,
+    /// which pays `funding_output` and is spent by the channel's two keys,
+    /// never by this wallet. The coins come first and the funding output
+    /// last — signed afterwards by the channel, not here; the transaction
+    /// pays `new_funding`, the channel's funding output grown by `add`, then
+    /// the change. The fee comes from the coins as well. The funding input
+    /// carries `sequence`, which the channel chooses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_splice(
+        &mut self,
+        utxo: &UtxoSet,
+        height: u64,
+        funding: OutPoint,
+        funding_output: &TxOut,
+        new_funding: TxOut,
+        fee: Amount,
+        sequence: u32,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+    ) -> Result<PreparedSpend, WalletError> {
+        if !self.scheme.is_available() {
+            return Err(WalletError::UnsupportedScheme(self.scheme));
+        }
+        let add = new_funding
+            .value
+            .units()
+            .checked_sub(funding_output.value.units())
+            .filter(|a| *a >= crate::consensus::MIN_OUTPUT_VALUE)
+            .ok_or(WalletError::AmountBelowFloor {
+                minimum: crate::consensus::MIN_OUTPUT_VALUE,
+                received: new_funding
+                    .value
+                    .units()
+                    .saturating_sub(funding_output.value.units()),
+            })?;
+        let needed = add
+            .checked_add(fee.units())
+            .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
+            .ok_or(WalletError::AmountOutOfRange)?;
+        let avoid_funding = |o: &OutPoint| *o == funding || avoid(o);
+        let (chosen, total) =
+            self.select_coins_avoiding(utxo, height, needed, &avoid_funding, &[])?;
+        let mut outputs = vec![new_funding];
+        let change = total - needed;
+        if change >= crate::consensus::MIN_OUTPUT_VALUE {
+            let change_address = self.new_address();
+            outputs.push(TxOut {
+                value: Amount::from_units(change),
+                scheme: change_address.scheme,
+                pubkey_hash: change_address.hash,
+            });
+        }
+        let mut spend = self.finish_prepare(chosen, outputs, height)?;
+        spend.tx.inputs.push(TxIn {
+            prev_out: funding,
+            witness: Witness::default(),
+            sequence,
+        });
+        Ok(spend)
+    }
+
     /// The part of a prepared spend that does not depend on how the coins
     /// were chosen: the stripped transaction, the key barrier, the
     /// reservation.

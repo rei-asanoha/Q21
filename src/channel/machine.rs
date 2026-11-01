@@ -48,6 +48,28 @@
 //! with both payments, and completing it reveals both secrets of `n`, which
 //! revokes every commitment at that index whatever its balances.
 
+//!
+//! # Splices
+//!
+//! Either side may put more of its own coins into an open channel
+//! ([`Machine::propose_splice`]). One transaction spends the funding output
+//! and the adder's coins, and pays a larger funding output to the same two
+//! keys: the channel keeps its identity, its history and its revocations.
+//!
+//! The splice is an update to state `n`, the first on the new funding, whose
+//! revocation step waits for the chain. The adder signs the other side's
+//! commitment `n` on the new funding; the other side persists it, signs the
+//! adder's, and only then signs the splice's funding input. Neither side
+//! reveals the secret of `n - 1`, the last state on the old funding, until
+//! the splice is buried to the funding depth: until then commitment `n - 1`
+//! is what either side broadcasts to close alone, since the new funding may
+//! never confirm. No payment moves meanwhile: the update is in flight. Once
+//! both secrets of `n - 1` are in, the old funding is forgotten.
+//!
+//! A payment of the other side that crosses the splice wins: the adder drops
+//! its splice, which nobody can complete without its signature, and the
+//! payment settles as usual.
+
 use crate::address::Network;
 use crate::channel::journal::{Balances, Journal, Record};
 use crate::channel::keys::{Signer, CHANNEL_SCHEME};
@@ -149,6 +171,23 @@ fn prune_to_latest<V>(map: &mut BTreeMap<u64, V>, keep: usize) {
     }
 }
 
+/// The sequence number of a splice's funding input at `state`: two splices
+/// at different states never share a transaction id, so signatures given for
+/// a splice that was dropped can never apply to a later one.
+pub fn splice_sequence(state: u64) -> u32 {
+    (state & 0xffff_ffff) as u32
+}
+
+/// `tx` without its witnesses: what the other side of a splice receives,
+/// and what every signature of it covers.
+fn stripped(tx: &Transaction) -> Transaction {
+    let mut t = tx.clone();
+    for i in &mut t.inputs {
+        i.witness = crate::tx::Witness::default();
+    }
+    t
+}
+
 /// The message a reestablish proof signs: the channel, the session's binding,
 /// the sender's direction, and the four counters it reports — so a relay
 /// cannot alter where the sender says it stands.
@@ -166,6 +205,50 @@ fn reestablish_message(
         TAG_REESTABLISH,
         &[channel_id.as_bytes(), &nonce, &[direction], &c],
     )
+}
+
+/// A splice in progress (see "Splices" in the module documentation).
+#[derive(Clone, Debug)]
+struct Splice {
+    /// The first state on the new funding.
+    state: u64,
+    /// Who adds coins, and how many units.
+    adder: usize,
+    add: u64,
+    /// The funding the splice spends, and its capacity.
+    old_capacity: u64,
+    old_outpoint: OutPoint,
+    /// The splice's input that spends the old funding.
+    funding_input: u32,
+    /// The splice transaction: the adder's carries its own coins'
+    /// witnesses, then every witness; the other side's is stripped.
+    tx: Transaction,
+    /// The adder: the other side's signature of the funding input.
+    peer_sig: Option<Vec<u8>>,
+    /// The adder: the transaction is fully signed.
+    complete: bool,
+    /// Buried to the funding depth, and our secret of `state - 1` revealed.
+    locked: bool,
+}
+
+/// What [`Machine::splice_status`] tells of a splice in progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpliceStatus {
+    /// The units added, and whether we add them.
+    pub add: u64,
+    pub ours: bool,
+    /// The splice transaction and the new funding output.
+    pub txid: Hash256,
+    pub new_funding: OutPoint,
+    /// The funding the splice spends.
+    pub old_funding: OutPoint,
+    /// Both sides hold their commitments on the new funding: the splice may
+    /// reach the chain.
+    pub signed: bool,
+    /// Where it confirmed, as the node last saw it.
+    pub height: Option<u64>,
+    /// Buried, and our secret of the last old state revealed.
+    pub locked: bool,
 }
 
 /// One running channel.
@@ -260,6 +343,14 @@ pub struct Machine {
     /// one of them behind by more than a message lost in flight (see
     /// [`SyncVerdict`]). Not journaled: every reestablish decides anew.
     sync: SyncVerdict,
+    /// The peer's counters at its last reestablish, for a proof that its
+    /// copy is older (see [`Machine::behind_proof`]).
+    peer_counters: Option<[u64; 4]>,
+    /// A splice in progress, until both secrets of its last old state are in.
+    splice: Option<Splice>,
+    /// Where the splice confirmed, as the node last saw the chain. Not
+    /// journaled: the node tells it anew at every block and restart.
+    splice_height: Option<u64>,
 }
 
 /// What a reestablish shows of the two sides' copies of the channel.
@@ -519,6 +610,9 @@ impl Machine {
             peer_proposal: None,
             crossed: None,
             sync: SyncVerdict::InStep,
+            peer_counters: None,
+            splice: None,
+            splice_height: None,
         })
     }
 
@@ -556,8 +650,29 @@ impl Machine {
 
     // --- Commitment construction --------------------------------------------
 
-    fn with_funding_input(&self, mut c: Commitment) -> Commitment {
-        if let Some(op) = self.funding_outpoint {
+    /// The channel's parameters for state `n`: those of the old funding for
+    /// a state below a splice in progress, the current ones otherwise. Only
+    /// the capacity differs.
+    fn params_at(&self, n: u64) -> ChannelParams {
+        match &self.splice {
+            Some(sp) if n < sp.state => ChannelParams {
+                capacity: crate::amount::Amount::from_units(sp.old_capacity),
+                ..self.params.clone()
+            },
+            _ => self.params.clone(),
+        }
+    }
+
+    /// The funding outpoint a commitment at state `n` spends.
+    fn outpoint_at(&self, n: u64) -> Option<OutPoint> {
+        match &self.splice {
+            Some(sp) if n < sp.state => Some(sp.old_outpoint),
+            _ => self.funding_outpoint,
+        }
+    }
+
+    fn with_funding_input(&self, n: u64, mut c: Commitment) -> Commitment {
+        if let Some(op) = self.outpoint_at(n) {
             c.tx.inputs[0].prev_out = op;
         }
         c
@@ -568,38 +683,35 @@ impl Machine {
     fn their_commitment(&self, n: u64, bal: Balances, tier: FeeTier) -> Option<Commitment> {
         let holder = 1 - self.our_index;
         let rev = *self.their_points.get(&n)?;
-        Some(self.with_funding_input(self.params.commitment(
-            holder,
-            n,
-            bal,
-            self.commit_fee(tier),
-            rev,
-        )))
+        Some(
+            self.with_funding_input(
+                n,
+                self.params_at(n)
+                    .commitment(holder, n, bal, self.commit_fee(tier), rev),
+            ),
+        )
     }
 
     /// Our own commitment at state `n`, tier `tier`: we are the holder, so the
     /// revocation point is ours.
     fn our_commitment(&self, n: u64, bal: Balances, tier: FeeTier) -> Commitment {
         let rev = self.our_point(n);
-        self.with_funding_input(self.params.commitment(
-            self.our_index,
+        self.with_funding_input(
             n,
-            bal,
-            self.commit_fee(tier),
-            rev,
-        ))
+            self.params_at(n)
+                .commitment(self.our_index, n, bal, self.commit_fee(tier), rev),
+        )
     }
 
     /// Signs the counterparty's commitment at `n`, at every tier.
     fn sign_their_commitment(&self, n: u64, bal: Balances) -> Result<TierSigs, ChannelError> {
+        let params = self.params_at(n);
         let mut sigs: [Vec<u8>; 3] = Default::default();
         for tier in FeeTier::ALL {
             let c = self
                 .their_commitment(n, bal, tier)
                 .ok_or(ChannelError::Invariant("missing counterparty point"))?;
-            let m = self
-                .params
-                .funding_sighash(&c.tx, self.network, self.our_index);
+            let m = params.funding_sighash(&c.tx, self.network, self.our_index);
             sigs[tier as usize] = self.signer.sign(&m);
         }
         Ok(sigs)
@@ -614,8 +726,9 @@ impl Machine {
         sigs: &TierSigs,
     ) -> Result<(), ChannelError> {
         let their_leaf = (1 - self.our_index) as u8;
-        let policy_bytes = self.params.funding_policy().encode();
-        let spent = self.params.funding_output();
+        let params = self.params_at(n);
+        let policy_bytes = params.funding_policy().encode();
+        let spent = params.funding_output();
         for tier in FeeTier::ALL {
             let c = self.our_commitment(n, bal, tier);
             crate::policy::check_signature(
@@ -913,7 +1026,7 @@ impl Machine {
     /// returning the [`Message::Update`] to send. Persists our signature of the
     /// counterparty's new commitment before returning.
     pub fn propose(&mut self, balances: Balances) -> Result<Message, ChannelError> {
-        if self.phase != Phase::Open {
+        if self.phase != Phase::Open || self.splice.is_some() {
             return Err(ChannelError::Unexpected);
         }
         self.check_balances(balances)?;
@@ -943,6 +1056,11 @@ impl Machine {
         // State 0 is the funding commitment, never the subject of an update;
         // its predecessor `n - 1` does not exist.
         if n == 0 {
+            return Err(ChannelError::Unexpected);
+        }
+        // During a splice, no update: its state completes on the chain's
+        // word alone (see "Splices" in the module documentation).
+        if self.splice.as_ref().is_some_and(|sp| n >= sp.state) {
             return Err(ChannelError::Unexpected);
         }
         // Idempotent resend: we already processed this update. Answered even
@@ -1022,6 +1140,29 @@ impl Machine {
         if n == 0 {
             return Err(ChannelError::Unexpected);
         }
+        // The other side finished a splice we locked, and its
+        // `SpliceLocked` was lost: it resends its revocation as the Ack of
+        // the splice state. Taken; ours goes back as our `SpliceLocked`.
+        if let Some(sp) = self.splice.clone() {
+            let ours_locked = sp.state == n
+                && sp.locked
+                && self.local_commit_number >= Some(n)
+                && self.remote_commit_number >= Some(n);
+            if !ours_locked {
+                return Err(ChannelError::Unexpected);
+            }
+            let ours = Message::SpliceLocked {
+                state: n,
+                revocation: self.make_revocation(n - 1)?,
+            };
+            // Journaled as revealed before it leaves us.
+            self.persist_revocation_sent(n - 1)?;
+            if self.revocations_recv < Some(n - 1) {
+                self.take_revocation(n - 1, revocation)?;
+            }
+            self.finish_splice()?;
+            return Ok(ours);
+        }
         // Idempotent resend path.
         if self.local_commit_number >= Some(n) && self.revocations_recv >= Some(n - 1) {
             return self.resend_revoke(n);
@@ -1060,9 +1201,12 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         }
         if self.revocations_recv >= Some(n - 1) {
-            return Ok(()); // idempotent resend
+            return self.finish_splice(); // idempotent resend
         }
         self.take_revocation(n - 1, revocation)?;
+        // The adder resends its revocation of a splice it finished this
+        // way, when its `SpliceLocked` was lost.
+        self.finish_splice()?;
         self.compact_if_long()?;
         Ok(())
     }
@@ -1108,6 +1252,727 @@ impl Machine {
         self.their_points.insert(m + 2, rev.next_hash);
         self.persist_revocation_recv(m, rev.secret)?;
         Ok(())
+    }
+
+    // --- Splices --------------------------------------------------------------
+
+    /// Whether a splice is in progress: from its proposal until both secrets
+    /// of its last old state are in.
+    pub fn splicing(&self) -> bool {
+        self.splice.is_some()
+    }
+
+    /// Where a splice in progress stands.
+    pub fn splice_status(&self) -> Option<SpliceStatus> {
+        let sp = self.splice.as_ref()?;
+        let txid = sp.tx.txid();
+        Some(SpliceStatus {
+            add: sp.add,
+            ours: sp.adder == self.our_index,
+            txid,
+            new_funding: OutPoint { txid, index: 0 },
+            old_funding: sp.old_outpoint,
+            signed: self.local_commit_number >= Some(sp.state)
+                && self.remote_commit_number >= Some(sp.state),
+            height: self.splice_height,
+            locked: sp.locked,
+        })
+    }
+
+    /// The adder's splice transaction, once fully signed: to broadcast, and
+    /// again at every block until it confirms.
+    pub fn splice_tx(&self) -> Option<&Transaction> {
+        self.splice
+            .as_ref()
+            .filter(|sp| sp.complete)
+            .map(|sp| &sp.tx)
+    }
+
+    /// Our own splice transaction, signed or not: its wallet coins are held
+    /// back until it confirms or can no longer.
+    pub fn our_splice_tx(&self) -> Option<&Transaction> {
+        self.splice
+            .as_ref()
+            .filter(|sp| sp.adder == self.our_index)
+            .map(|sp| &sp.tx)
+    }
+
+    /// The node saw the splice confirm at `height`, or leave the chain.
+    pub fn note_splice_height(&mut self, height: Option<u64>) {
+        if self.splice.is_some() {
+            self.splice_height = height;
+        }
+    }
+
+    /// `bal` is a valid state of a channel with `params`: the capacity
+    /// conserved, and the funder still able to pay the highest-tier fee.
+    fn check_balances_for(
+        &self,
+        params: &ChannelParams,
+        bal: Balances,
+    ) -> Result<(), ChannelError> {
+        let sum = bal[0]
+            .checked_add(bal[1])
+            .ok_or(ChannelError::BadBalances)?;
+        if sum != params.capacity.units() || bal[FUNDER] < self.commit_fee(FeeTier::High) {
+            return Err(ChannelError::BadBalances);
+        }
+        Ok(())
+    }
+
+    /// Checks a splice transaction against the channel as it stands, and
+    /// returns the parameters of the new funding: its last input, and only
+    /// that one, spends the funding output; another input at least brings
+    /// the added coins; output 0 is the new funding output, for the capacity
+    /// plus `add`; nothing in it waits for a height.
+    fn check_splice_tx(
+        &self,
+        tx: &Transaction,
+        state: u64,
+        funding_input: u32,
+        add: u64,
+    ) -> Result<ChannelParams, ChannelError> {
+        let funding = self.funding()?;
+        let k = funding_input as usize;
+        if tx.inputs.get(k).map(|i| i.sequence) != Some(splice_sequence(state)) {
+            return Err(ChannelError::BadParameters);
+        }
+        let inputs: std::collections::BTreeSet<OutPoint> =
+            tx.inputs.iter().map(|i| i.prev_out).collect();
+        if tx.inputs.len() < 2
+            || k + 1 != tx.inputs.len()
+            || tx.inputs[k].prev_out != funding
+            || tx.inputs[..k].iter().any(|i| i.prev_out == funding)
+            || inputs.len() != tx.inputs.len()
+            || tx.lock_time != 0
+            || add < crate::consensus::MIN_OUTPUT_VALUE
+        {
+            return Err(ChannelError::BadParameters);
+        }
+        let capacity = self
+            .params
+            .capacity
+            .units()
+            .checked_add(add)
+            .filter(|c| *c <= crate::channel::MAX_CAPACITY)
+            .ok_or(ChannelError::BadParameters)?;
+        let params = ChannelParams {
+            capacity: crate::amount::Amount::from_units(capacity),
+            ..self.params.clone()
+        };
+        if tx.outputs.first() != Some(&params.funding_output()) {
+            return Err(ChannelError::BadParameters);
+        }
+        Ok(params)
+    }
+
+    /// Takes a splice into the machine, in memory only: from its state on,
+    /// commitments spend the new funding.
+    fn install_splice(&mut self, sp: Splice, params: ChannelParams) {
+        self.funding_outpoint = Some(OutPoint {
+            txid: sp.tx.txid(),
+            index: 0,
+        });
+        self.params = params;
+        self.splice = Some(sp);
+        self.splice_height = None;
+    }
+
+    /// Undoes [`Machine::install_splice`] before anything was journaled.
+    fn uninstall_splice(&mut self) {
+        if let Some(sp) = self.splice.take() {
+            self.params.capacity = crate::amount::Amount::from_units(sp.old_capacity);
+            self.funding_outpoint = Some(sp.old_outpoint);
+        }
+        self.splice_height = None;
+    }
+
+    fn journal_splice(&mut self, tx: &Transaction) -> Result<(), ChannelError> {
+        let sp = self
+            .splice
+            .as_ref()
+            .ok_or(ChannelError::Invariant("no splice to journal"))?;
+        self.journal.append(&Record::Splice {
+            state: sp.state,
+            adder: sp.adder as u8,
+            add: sp.add,
+            old_capacity: sp.old_capacity,
+            old_funding: (sp.old_outpoint.txid, sp.old_outpoint.index),
+            funding_input: sp.funding_input,
+            tx: tx.encode(),
+        })?;
+        Ok(())
+    }
+
+    /// Adder: proposes putting `add` units of our own coins into the channel
+    /// with `tx`, built by the wallet: its last input spends the funding
+    /// output, unsigned; the others are our coins, signed. Persists the
+    /// splice and our signature of the other side's first commitment on the
+    /// new funding, then returns the [`Message::Splice`] to send.
+    pub fn propose_splice(&mut self, add: u64, tx: Transaction) -> Result<Message, ChannelError> {
+        if self.phase != Phase::Open
+            || self.splice.is_some()
+            || self.update_in_flight()
+            || self.sync != SyncVerdict::InStep
+        {
+            return Err(ChannelError::Unexpected);
+        }
+        let funding_input = tx.inputs.len().saturating_sub(1) as u32;
+        let n = self.next_state();
+        let params = self.check_splice_tx(&tx, n, funding_input, add)?;
+        let stripped = stripped(&tx).encode();
+        if stripped.len() > messages::MAX_SPLICE_TX {
+            return Err(ChannelError::BadParameters);
+        }
+        let us = self.our_index;
+        let mut bal = self.current_balances();
+        bal[us] = bal[us].checked_add(add).ok_or(ChannelError::BadBalances)?;
+        self.check_balances_for(&params, bal)?;
+        let funding = self.funding()?;
+        self.install_splice(
+            Splice {
+                state: n,
+                adder: us,
+                add,
+                old_capacity: self.params.capacity.units(),
+                old_outpoint: funding,
+                funding_input,
+                tx: tx.clone(),
+                peer_sig: None,
+                complete: false,
+                locked: false,
+            },
+            params,
+        );
+        let signed = self
+            .sign_their_commitment(n, bal)
+            .and_then(|t| self.journal_splice(&tx).map(|()| t));
+        let tier_sigs = match signed {
+            Ok(t) => t,
+            Err(e) => {
+                // Nothing in the journal, or a torn record a reopen cuts off.
+                self.uninstall_splice();
+                return Err(e);
+            }
+        };
+        // From here the journal holds the splice: so does the machine. A
+        // failure leaves it waiting for the reestablish to send it again.
+        self.persist_remote_commit(n, bal)?;
+        Ok(Message::Splice {
+            state: n,
+            add,
+            funding_input,
+            tx: stripped,
+            tier_sigs,
+        })
+    }
+
+    /// Other side: handles a peer's [`Message::Splice`]. Answers
+    /// [`Message::SpliceAck`] and [`Message::SpliceSig`], each signature
+    /// given only once our own commitment on the new funding is persisted;
+    /// or [`Message::SpliceBusy`], with nothing kept, when a payment of ours
+    /// or a revocation is still in flight.
+    pub fn on_splice(&mut self, msg: &Message) -> Result<Vec<Message>, ChannelError> {
+        let Message::Splice {
+            state,
+            add,
+            funding_input,
+            tx,
+            tier_sigs,
+        } = msg
+        else {
+            return Err(ChannelError::Unexpected);
+        };
+        let n = *state;
+        let tx = Transaction::decode(tx).map_err(|_| ChannelError::BadParameters)?;
+        if tx
+            .inputs
+            .iter()
+            .any(|i| !i.witness.pubkey.is_empty() || !i.witness.signature.is_empty())
+        {
+            return Err(ChannelError::BadParameters);
+        }
+        // The same splice again: our answer was lost, or a crash came before
+        // we persisted our commitment.
+        if let Some(sp) = self.splice.clone() {
+            // Both sides proposed a splice at once: refused on both sides,
+            // keeping nothing; each drops its own, and may try again.
+            if sp.adder == self.our_index && self.local_commit_number < Some(sp.state) {
+                return Ok(vec![Message::SpliceBusy { state: n }]);
+            }
+            if sp.state != n || sp.adder == self.our_index || sp.tx.txid() != tx.txid() {
+                return Err(ChannelError::Unexpected);
+            }
+            if self.local_commit_number < Some(n) {
+                let mut bal = self.current_balances();
+                bal[sp.adder] = bal[sp.adder]
+                    .checked_add(sp.add)
+                    .ok_or(ChannelError::BadBalances)?;
+                self.verify_our_commitment(n, bal, tier_sigs)?;
+                self.persist_local_commit(n, bal, tier_sigs.clone(), false)?;
+            }
+            return self.splice_answer();
+        }
+        // A close crossing it, closed: refused, nothing kept.
+        if self.phase != Phase::Open {
+            return Ok(vec![Message::SpliceBusy { state: n }]);
+        }
+        // A payment of ours crossed it, or the last update still settles:
+        // refused, nothing kept. The adder drops its splice. The proposal a
+        // reestablish told us to wait for may be this very splice.
+        let awaited = self.peer_proposal;
+        if awaited == Some(n) {
+            self.peer_proposal = None;
+        }
+        if n == 0
+            || n != self.next_state()
+            || self.update_in_flight()
+            || self.sync != SyncVerdict::InStep
+        {
+            self.peer_proposal = awaited;
+            return Ok(vec![Message::SpliceBusy { state: n }]);
+        }
+        let params = self.check_splice_tx(&tx, n, *funding_input, *add)?;
+        let adder = 1 - self.our_index;
+        let mut bal = self.current_balances();
+        bal[adder] = bal[adder]
+            .checked_add(*add)
+            .ok_or(ChannelError::BadBalances)?;
+        self.check_balances_for(&params, bal)?;
+        let funding = self.funding()?;
+        self.install_splice(
+            Splice {
+                state: n,
+                adder,
+                add: *add,
+                old_capacity: self.params.capacity.units(),
+                old_outpoint: funding,
+                funding_input: *funding_input,
+                tx: tx.clone(),
+                peer_sig: None,
+                complete: false,
+                locked: false,
+            },
+            params,
+        );
+        // Their signatures over our commitment on the new funding, checked
+        // before anything is journaled.
+        if let Err(e) = self
+            .verify_our_commitment(n, bal, tier_sigs)
+            .and_then(|()| self.journal_splice(&tx))
+        {
+            self.uninstall_splice();
+            return Err(e);
+        }
+        // INV2: persisted before we sign anything.
+        self.persist_local_commit(n, bal, tier_sigs.clone(), false)?;
+        self.splice_answer()
+    }
+
+    /// Other side: our signatures for the splice — the adder's commitment on
+    /// the new funding, then the funding input. Completes the answer a crash
+    /// interrupted, each write `fsync`ed first.
+    fn splice_answer(&mut self) -> Result<Vec<Message>, ChannelError> {
+        let sp = self
+            .splice
+            .clone()
+            .ok_or(ChannelError::Invariant("no splice"))?;
+        let n = sp.state;
+        let bal = self
+            .local_commits
+            .get(&n)
+            .map(|(b, _)| *b)
+            .ok_or(ChannelError::Invariant("missing local commitment"))?;
+        let tier_sigs = self.sign_their_commitment(n, bal)?;
+        if self.remote_commit_number < Some(n) {
+            self.persist_remote_commit(n, bal)?;
+            self.initiated.insert(n, false);
+        }
+        let signature = self.sign_splice_input(&sp);
+        Ok(vec![
+            Message::SpliceAck {
+                state: n,
+                tier_sigs,
+            },
+            Message::SpliceSig {
+                state: n,
+                signature,
+            },
+        ])
+    }
+
+    /// Reestablish during a splice: what we owe the peer of it, from where
+    /// its counters show it stands.
+    fn resync_splice(
+        &mut self,
+        their_local: Option<u64>,
+        their_recv: Option<u64>,
+    ) -> Result<Vec<Message>, ChannelError> {
+        let sp = self
+            .splice
+            .clone()
+            .ok_or(ChannelError::Invariant("no splice"))?;
+        let n = sp.state;
+        let mut out = Vec::new();
+        if sp.adder == self.our_index {
+            // Our proposal did not land: the peer holds no commitment of ours
+            // on the new funding.
+            if self.local_commit_number < Some(n) && their_local.map_or(true, |tl| tl < n) {
+                out.push(self.resend_splice()?);
+            }
+        } else if self.local_commit_number >= Some(n) && !sp.locked {
+            // Our signatures may have been lost, the funding input's among
+            // them: given again, the adder takes what it lacks.
+            out.extend(self.splice_answer()?);
+        }
+        if sp.locked && their_recv.map_or(true, |tr| tr < n - 1) {
+            out.push(self.splice_locked()?);
+        }
+        Ok(out)
+    }
+
+    /// Adder: our [`Message::Splice`] again, finishing what a crash
+    /// interrupted.
+    fn resend_splice(&mut self) -> Result<Message, ChannelError> {
+        let sp = self
+            .splice
+            .clone()
+            .ok_or(ChannelError::Invariant("no splice"))?;
+        let n = sp.state;
+        let bal = match self.remote_balances.get(&n) {
+            Some(b) => *b,
+            None => {
+                let mut b = self.current_balances();
+                b[sp.adder] = b[sp.adder]
+                    .checked_add(sp.add)
+                    .ok_or(ChannelError::BadBalances)?;
+                self.persist_remote_commit(n, b)?;
+                b
+            }
+        };
+        Ok(Message::Splice {
+            state: n,
+            add: sp.add,
+            funding_input: sp.funding_input,
+            tx: stripped(&sp.tx).encode(),
+            tier_sigs: self.sign_their_commitment(n, bal)?,
+        })
+    }
+
+    /// Our signature of the splice's input that spends the old funding.
+    fn sign_splice_input(&self, sp: &Splice) -> Vec<u8> {
+        let old = self.params_at(sp.state - 1);
+        let m = old.funding_sighash_at(&sp.tx, sp.funding_input, self.network, self.our_index);
+        self.signer.sign(&m)
+    }
+
+    /// Adder: handles [`Message::SpliceAck`], the other side's signatures of
+    /// our commitment on the new funding. With the funding input's signature
+    /// already in, the splice is completed and returned, to broadcast.
+    /// Idempotent.
+    pub fn on_splice_ack(&mut self, msg: &Message) -> Result<Option<Transaction>, ChannelError> {
+        let Message::SpliceAck { state, tier_sigs } = msg else {
+            return Err(ChannelError::Unexpected);
+        };
+        let n = *state;
+        let ours = self
+            .splice
+            .as_ref()
+            .is_some_and(|sp| sp.state == n && sp.adder == self.our_index);
+        if !ours {
+            return Err(ChannelError::Unexpected);
+        }
+        if self.local_commit_number >= Some(n) {
+            return Ok(None);
+        }
+        if self.remote_commit_number != Some(n) {
+            return Err(ChannelError::Unexpected);
+        }
+        let bal = *self
+            .remote_balances
+            .get(&n)
+            .ok_or(ChannelError::Invariant("missing remote balances"))?;
+        self.verify_our_commitment(n, bal, tier_sigs)?;
+        self.persist_local_commit(n, bal, tier_sigs.clone(), true)?;
+        self.complete_splice()
+    }
+
+    /// Adder: handles [`Message::SpliceSig`], the other side's signature of
+    /// the splice's funding input. Kept, and once our own commitment on the
+    /// new funding is held, the splice is completed with our signature and
+    /// returned, to broadcast; `None` for a signature already taken.
+    pub fn on_splice_sig(&mut self, msg: &Message) -> Result<Option<Transaction>, ChannelError> {
+        let Message::SpliceSig { state, signature } = msg else {
+            return Err(ChannelError::Unexpected);
+        };
+        let Some(sp) = self.splice.clone() else {
+            return Err(ChannelError::Unexpected);
+        };
+        if sp.state != *state || sp.adder != self.our_index {
+            return Err(ChannelError::Unexpected);
+        }
+        if sp.complete || sp.peer_sig.is_some() {
+            return Ok(None);
+        }
+        let old = self.params_at(sp.state - 1);
+        crate::policy::check_signature(
+            &sp.tx,
+            sp.funding_input,
+            self.network,
+            &old.funding_output(),
+            &old.funding_policy().encode(),
+            (1 - self.our_index) as u8,
+            &[],
+            &self.their_pubkey,
+            signature,
+        )
+        .map_err(|_| ChannelError::BadSignature)?;
+        self.journal.append(&Record::SpliceSig {
+            signature: signature.clone(),
+        })?;
+        if let Some(s) = self.splice.as_mut() {
+            s.peer_sig = Some(signature.clone());
+        }
+        self.complete_splice()
+    }
+
+    /// Adder: signs the funding input and completes the splice, once we hold
+    /// both our commitment on the new funding and the other side's signature.
+    fn complete_splice(&mut self) -> Result<Option<Transaction>, ChannelError> {
+        let Some(sp) = self.splice.clone() else {
+            return Ok(None);
+        };
+        let Some(signature) = sp.peer_sig.clone() else {
+            return Ok(None);
+        };
+        if sp.complete || sp.adder != self.our_index || self.local_commit_number < Some(sp.state) {
+            return Ok(None);
+        }
+        let old = self.params_at(sp.state - 1);
+        let our_sig = self.sign_splice_input(&sp);
+        let mut tx = sp.tx.clone();
+        let mut sigs: [&[u8]; 2] = [&[], &[]];
+        let mut pks: [&[u8]; 2] = [&[], &[]];
+        sigs[self.our_index] = &our_sig;
+        sigs[1 - self.our_index] = &signature;
+        pks[self.our_index] = &self.our_pubkey;
+        pks[1 - self.our_index] = &self.their_pubkey;
+        old.complete_funding_spend_at(&mut tx, sp.funding_input as usize, sigs, pks);
+        self.journal.append(&Record::SpliceTx { tx: tx.encode() })?;
+        if let Some(s) = self.splice.as_mut() {
+            s.tx = tx.clone();
+            s.complete = true;
+        }
+        Ok(Some(tx))
+    }
+
+    /// Adder: the other side refused the splice ([`Message::SpliceBusy`]).
+    /// Dropped, if it still can be: returns the transaction whose coins go
+    /// back to the wallet.
+    pub fn on_splice_busy(&mut self, msg: &Message) -> Result<Option<Transaction>, ChannelError> {
+        let Message::SpliceBusy { state } = msg else {
+            return Err(ChannelError::Unexpected);
+        };
+        let ours = self.splice.as_ref().is_some_and(|sp| {
+            sp.state == *state
+                && sp.adder == self.our_index
+                && self.local_commit_number < Some(sp.state)
+        });
+        if !ours {
+            return Ok(None);
+        }
+        self.cancel_splice().map(Some)
+    }
+
+    /// Adder: whether `msg`, an update crossing our splice not yet taken,
+    /// is one we would accept once the splice is dropped. Nothing changes.
+    fn check_update_over_splice(&self, msg: &Message) -> Result<(), ChannelError> {
+        let Message::Update {
+            state,
+            balances,
+            tier_sigs,
+        } = msg
+        else {
+            return Err(ChannelError::Unexpected);
+        };
+        let sp = self
+            .splice
+            .as_ref()
+            .ok_or(ChannelError::Invariant("no splice"))?;
+        let n = *state;
+        let old = self.params_at(sp.state - 1);
+        if Some(n) != self.local_commit_number.map(|l| l + 1) {
+            return Err(ChannelError::Unexpected);
+        }
+        self.check_balances_for(&old, *balances)?;
+        let us = self.our_index;
+        if balances[us] < self.current_balances()[us] {
+            return Err(ChannelError::WrongDirection);
+        }
+        // Our commitment `n` on the old funding, as the update proposes it.
+        let rev = self.our_point(n);
+        let policy_bytes = old.funding_policy().encode();
+        let spent = old.funding_output();
+        for tier in FeeTier::ALL {
+            let mut c = old.commitment(us, n, *balances, self.commit_fee(tier), rev);
+            c.tx.inputs[0].prev_out = sp.old_outpoint;
+            crate::policy::check_signature(
+                &c.tx,
+                0,
+                self.network,
+                &spent,
+                &policy_bytes,
+                (1 - us) as u8,
+                &[],
+                &self.their_pubkey,
+                &tier_sigs[tier as usize],
+            )
+            .map_err(|_| ChannelError::BadSignature)?;
+        }
+        Ok(())
+    }
+
+    /// Adder: drops a splice the other side has not taken. Safe because no
+    /// one can complete it without our signature of its funding input, which
+    /// we never gave: the other side's commitment we signed spends an output
+    /// that never comes to exist. The journal is rewritten without it.
+    fn cancel_splice(&mut self) -> Result<Transaction, ChannelError> {
+        let sp = self
+            .splice
+            .clone()
+            .ok_or(ChannelError::Invariant("no splice"))?;
+        if sp.adder != self.our_index || sp.complete || self.local_commit_number >= Some(sp.state) {
+            return Err(ChannelError::Invariant("a splice already taken stays"));
+        }
+        self.uninstall_splice();
+        self.remote_balances.remove(&sp.state);
+        self.initiated.remove(&sp.state);
+        self.remote_commit_number = self.local_commit_number;
+        self.compact()?;
+        Ok(sp.tx)
+    }
+
+    /// Either side, once the splice is buried to the funding depth: reveals
+    /// the secret of the last state on the old funding, which nothing can
+    /// spend any more, and returns [`Message::SpliceLocked`]. Idempotent.
+    pub fn splice_locked(&mut self) -> Result<Message, ChannelError> {
+        let sp = self.splice.clone().ok_or(ChannelError::Unexpected)?;
+        if !matches!(self.phase, Phase::Open | Phase::Closing) {
+            return Err(ChannelError::Unexpected);
+        }
+        let m = sp.state - 1;
+        // INV1: our commitment on the new funding is persisted.
+        let revocation = self.make_revocation(m)?;
+        if !sp.locked {
+            self.journal.append(&Record::SpliceLocked)?;
+            if let Some(s) = self.splice.as_mut() {
+                s.locked = true;
+            }
+        }
+        self.persist_revocation_sent(m)?;
+        let msg = Message::SpliceLocked {
+            state: sp.state,
+            revocation,
+        };
+        self.finish_splice()?;
+        Ok(msg)
+    }
+
+    /// Handles a peer's [`Message::SpliceLocked`]: its revocation of the last
+    /// state on the old funding. Taken even before we see the splice buried
+    /// ourselves: it can only cost the peer.
+    pub fn on_splice_locked(&mut self, msg: &Message) -> Result<(), ChannelError> {
+        let Message::SpliceLocked { state, revocation } = msg else {
+            return Err(ChannelError::Unexpected);
+        };
+        let n = *state;
+        if self.revocations_recv >= Some(n.saturating_sub(1)) && n >= 1 {
+            return self.finish_splice(); // a resend
+        }
+        let ok = self
+            .splice
+            .as_ref()
+            .is_some_and(|sp| sp.state == n && self.local_commit_number >= Some(n))
+            && self.remote_commit_number >= Some(n);
+        if !ok {
+            return Err(ChannelError::Unexpected);
+        }
+        self.take_revocation(n - 1, revocation)?;
+        self.finish_splice()
+    }
+
+    /// Once both secrets of the last old state are in, the old funding is
+    /// forgotten and the journal rewritten for the new one.
+    fn finish_splice(&mut self) -> Result<(), ChannelError> {
+        let done = self.splice.as_ref().is_some_and(|sp| {
+            sp.locked
+                && self.revocations_sent >= Some(sp.state - 1)
+                && self.revocations_recv >= Some(sp.state - 1)
+        });
+        if done {
+            self.splice = None;
+            self.splice_height = None;
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// The state a close without the peer broadcasts: our latest, except
+    /// during a splice not yet seen on chain, when it is the last state on
+    /// the old funding — the new one may never exist.
+    fn close_state(&self) -> Result<u64, ChannelError> {
+        let n = self
+            .local_commit_number
+            .ok_or(ChannelError::Invariant("no commitment yet"))?;
+        // Never once we revealed its secret: after a reorganization that
+        // took a buried splice back, the last old state is revoked, and the
+        // first new one is the only safe close, once the splice is back.
+        Ok(match &self.splice {
+            Some(sp)
+                if n >= sp.state
+                    && self.splice_height.is_none()
+                    && !sp.locked
+                    && self.revocations_sent < Some(sp.state - 1) =>
+            {
+                sp.state - 1
+            }
+            _ => n,
+        })
+    }
+
+    // --- Proof of an older copy ----------------------------------------------
+
+    /// The side holding the latest state, after a reestablish that showed the
+    /// peer's copy older: the peer's own revocation secret of the latest
+    /// commitment its copy holds, if we have it. Only the peer could have
+    /// revealed it: it proves the copy older, and that broadcasting its
+    /// latest commitment would lose it the channel.
+    pub fn behind_proof(&self) -> Option<Message> {
+        if self.sync != SyncVerdict::PeerIsBehind {
+            return None;
+        }
+        let state = self.peer_counters?[0].checked_sub(1)?;
+        let secret = self.store.get(shachain::MAX_INDEX - state)?;
+        Some(Message::BehindProof { state, secret })
+    }
+
+    /// Checks a peer's [`Message::BehindProof`]: our own secret of a state at
+    /// or beyond the latest commitment our copy holds. True if it proves our
+    /// copy older.
+    pub fn check_behind_proof(&self, msg: &Message) -> bool {
+        let Message::BehindProof { state, secret } = msg else {
+            return false;
+        };
+        let Some(latest) = self.local_commit_number else {
+            return false;
+        };
+        if *state < latest || *state > shachain::MAX_INDEX {
+            return false;
+        }
+        let mut ours = self.our_secret(*state);
+        let proven = crate::kdf::constant_time_eq(&ours, secret);
+        crate::kdf::wipe(&mut ours);
+        proven
     }
 
     // --- Persistence helpers (each fsyncs before returning) ------------------
@@ -1183,11 +2048,17 @@ impl Machine {
     /// revocation counters with the counterparty's secrets in compact shachain
     /// form, the points announced and not yet revoked, and the phase.
     fn snapshot_records(&self) -> Vec<Record> {
+        // During a splice the opening and funding records name the old
+        // funding; the splice record that follows moves to the new one.
+        let (capacity, funding_outpoint) = match &self.splice {
+            Some(sp) => (sp.old_capacity, Some(sp.old_outpoint)),
+            None => (self.params.capacity.units(), self.funding_outpoint),
+        };
         let mut out = vec![Record::Opened {
             channel_id: self.channel_id,
             our_index: self.our_index as u8,
             funding: self.params.funding,
-            capacity: self.params.capacity.units(),
+            capacity,
             delay: self.params.delay,
             funding_depth: self.funding_depth,
             our_pubkey: self.our_pubkey.clone(),
@@ -1195,11 +2066,40 @@ impl Machine {
             payout: self.payout,
             key_index: self.key_index,
         }];
-        if let Some(op) = self.funding_outpoint {
+        if let Some(op) = funding_outpoint {
             out.push(Record::Funded {
                 funding_txid: op.txid,
                 funding_index: op.index,
             });
+        }
+        if let Some(sp) = &self.splice {
+            // The adder's own copy keeps its coins' witnesses until the
+            // whole transaction is signed.
+            let first = if sp.complete {
+                stripped(&sp.tx)
+            } else {
+                sp.tx.clone()
+            };
+            out.push(Record::Splice {
+                state: sp.state,
+                adder: sp.adder as u8,
+                add: sp.add,
+                old_capacity: sp.old_capacity,
+                old_funding: (sp.old_outpoint.txid, sp.old_outpoint.index),
+                funding_input: sp.funding_input,
+                tx: first.encode(),
+            });
+            if let Some(signature) = &sp.peer_sig {
+                out.push(Record::SpliceSig {
+                    signature: signature.clone(),
+                });
+            }
+            if sp.complete {
+                out.push(Record::SpliceTx { tx: sp.tx.encode() });
+            }
+            if sp.locked {
+                out.push(Record::SpliceLocked);
+            }
         }
         let mut states: Vec<u64> = self
             .local_commits
@@ -1359,7 +2259,7 @@ impl Machine {
             .map(|(n, b)| (*n, *b))
             .collect();
         let text = format!(
-            "{:?} {:?} L{:?} R{:?} S{:?} V{:?} lc{:?} rb{:?} in{:?} tp{:?} st{:?} cf{:?} cs{} ps{:?} fh{:?} cr{:?}",
+            "{:?} {:?} L{:?} R{:?} S{:?} V{:?} lc{:?} rb{:?} in{:?} tp{:?} st{:?} cf{:?} cs{} ps{:?} fh{:?} cr{:?} cap{} sp{:?}",
             self.phase,
             self.funding_outpoint,
             self.local_commit_number,
@@ -1376,6 +2276,19 @@ impl Machine {
             self.close_peer_sig,
             self.funding_height,
             self.crossed,
+            self.params.capacity.units(),
+            self.splice.as_ref().map(|sp| (
+                sp.state,
+                sp.adder,
+                sp.add,
+                sp.old_capacity,
+                sp.old_outpoint,
+                sp.funding_input,
+                sp.tx.wtxid(),
+                sp.peer_sig.is_some(),
+                sp.complete,
+                sp.locked
+            )),
         );
         format!(
             "{:?} L{:?} R{:?} {}",
@@ -1774,6 +2687,9 @@ impl Machine {
             peer_proposal: None,
             crossed: None,
             sync: SyncVerdict::InStep,
+            peer_counters: None,
+            splice: None,
+            splice_height: None,
         };
         m.replay(&records);
         m.compact_if_long()?;
@@ -1860,7 +2776,70 @@ impl Machine {
                         self.store = store;
                     }
                 }
+                Record::Splice {
+                    state,
+                    adder,
+                    add,
+                    old_capacity,
+                    old_funding,
+                    funding_input,
+                    tx,
+                } => {
+                    if let Ok(tx) = Transaction::decode(tx) {
+                        let params = ChannelParams {
+                            capacity: crate::amount::Amount::from_units(
+                                old_capacity.saturating_add(*add),
+                            ),
+                            ..self.params.clone()
+                        };
+                        self.params.capacity = crate::amount::Amount::from_units(*old_capacity);
+                        self.install_splice(
+                            Splice {
+                                state: *state,
+                                adder: usize::from(*adder).min(1),
+                                add: *add,
+                                old_capacity: *old_capacity,
+                                old_outpoint: OutPoint {
+                                    txid: old_funding.0,
+                                    index: old_funding.1,
+                                },
+                                funding_input: *funding_input,
+                                tx,
+                                peer_sig: None,
+                                complete: false,
+                                locked: false,
+                            },
+                            params,
+                        );
+                    }
+                }
+                Record::SpliceSig { signature } => {
+                    if let Some(sp) = self.splice.as_mut() {
+                        sp.peer_sig = Some(signature.clone());
+                    }
+                }
+                Record::SpliceTx { tx } => {
+                    if let (Some(sp), Ok(tx)) = (self.splice.as_mut(), Transaction::decode(tx)) {
+                        sp.tx = tx;
+                        sp.complete = true;
+                    }
+                }
+                Record::SpliceLocked => {
+                    if let Some(sp) = self.splice.as_mut() {
+                        sp.locked = true;
+                    }
+                }
             }
+        }
+        // A splice whose both secrets of its last old state are in is over:
+        // the old funding is forgotten (the next compaction drops it).
+        let done = self.splice.as_ref().is_some_and(|sp| {
+            sp.locked
+                && self.revocations_sent >= Some(sp.state - 1)
+                && self.revocations_recv >= Some(sp.state - 1)
+        });
+        if done {
+            self.splice = None;
         }
         if self.phase == Phase::Opening && self.local_commit_number == Some(0) {
             self.phase = Phase::Funded;
@@ -1985,8 +2964,20 @@ impl Machine {
                 *their_next_recv,
             ],
         );
+        self.peer_counters = Some([
+            *their_next_local,
+            *their_next_remote,
+            *their_next_sent,
+            *their_next_recv,
+        ]);
         if self.sync != SyncVerdict::InStep {
             return Ok(Vec::new());
+        }
+        if self.splice.is_some() {
+            return self.resync_splice(
+                their_next_local.checked_sub(1),
+                their_next_recv.checked_sub(1),
+            );
         }
 
         // --- Resync. The protocol is strictly sequential: at most one state
@@ -2110,6 +3101,20 @@ impl Machine {
         };
         if self.crossed == Some(*state) && self.local_commit_number >= Some(*state) {
             return Ok(Vec::new());
+        }
+        // The peer paid while our splice was on its way: the payment wins.
+        // Our splice is dropped — the peer, as its own crossing, refuses it
+        // with `SpliceBusy` — and the payment settles as any other.
+        let crossed_splice = self.splice.as_ref().is_some_and(|sp| {
+            sp.adder == self.our_index
+                && sp.state == *state
+                && self.local_commit_number < Some(sp.state)
+        });
+        if crossed_splice {
+            // Checked against the old funding first: a forged update must
+            // not drop our splice.
+            self.check_update_over_splice(msg)?;
+            self.cancel_splice()?;
         }
         if self.crosses_our_proposal(msg) {
             return self.on_crossed_update(msg);
@@ -2253,31 +3258,16 @@ impl Machine {
     /// Our latest enforceable commitment, fully signed at `tier`, ready to
     /// broadcast as a unilateral (force) close.
     pub fn force_close(&mut self, tier: FeeTier) -> Result<Transaction, ChannelError> {
-        let n = self
-            .local_commit_number
-            .ok_or(ChannelError::Invariant("no commitment yet"))?;
-        let (bal, their_sigs) = self
-            .local_commits
-            .get(&n)
-            .cloned()
-            .ok_or(ChannelError::Invariant("missing local commitment"))?;
-        let c = self.our_commitment(n, bal, tier);
-        let mut tx = c.tx;
-        let m = self
-            .params
-            .funding_sighash(&tx, self.network, self.our_index);
-        let our_sig = self.signer.sign(&m);
-        let their_sig = &their_sigs[tier as usize];
-        let mut sigs: [&[u8]; 2] = [&[], &[]];
-        let mut pks: [&[u8]; 2] = [&[], &[]];
-        sigs[self.our_index] = &our_sig;
-        sigs[1 - self.our_index] = their_sig;
-        pks[self.our_index] = &self.our_pubkey;
-        pks[1 - self.our_index] = &self.their_pubkey;
-        self.params.complete_funding_spend(&mut tx, sigs, pks);
+        let tx = self.closing_commitment(tier)?;
         self.journal.append(&Record::Forcing)?;
         self.phase = Phase::Forcing;
         Ok(tx)
+    }
+
+    /// The commitment a close without the peer broadcasts now, fully signed
+    /// at `tier` (see [`Machine::close_state`]).
+    pub fn closing_commitment(&self, tier: FeeTier) -> Result<Transaction, ChannelError> {
+        self.signed_commitment_at(self.close_state()?, tier)
     }
 
     /// Records that a commitment is on chain and the channel is force-closing.
@@ -2330,9 +3320,8 @@ impl Machine {
             .ok_or(ChannelError::Invariant("commitment not retained"))?;
         let c = self.our_commitment(n, bal, tier);
         let mut tx = c.tx;
-        let m = self
-            .params
-            .funding_sighash(&tx, self.network, self.our_index);
+        let params = self.params_at(n);
+        let m = params.funding_sighash(&tx, self.network, self.our_index);
         let our_sig = self.signer.sign(&m);
         let their_sig = &their_sigs[tier as usize];
         let mut sigs: [&[u8]; 2] = [&[], &[]];
@@ -2341,7 +3330,7 @@ impl Machine {
         sigs[1 - self.our_index] = their_sig;
         pks[self.our_index] = &self.our_pubkey;
         pks[1 - self.our_index] = &self.their_pubkey;
-        self.params.complete_funding_spend(&mut tx, sigs, pks);
+        params.complete_funding_spend(&mut tx, sigs, pks);
         Ok(tx)
     }
 
@@ -2434,6 +3423,10 @@ impl Machine {
     pub fn local_commit_number(&self) -> Option<u64> {
         self.local_commit_number
     }
+    /// The state the next proposal, or splice, would take.
+    pub fn next_state_number(&self) -> u64 {
+        self.next_state()
+    }
     pub fn revocation_store(&self) -> &shachain::Store {
         &self.store
     }
@@ -2442,6 +3435,15 @@ impl Machine {
     }
     pub fn funding_outpoint(&self) -> Option<OutPoint> {
         self.funding_outpoint
+    }
+    /// Every funding output a commitment of this channel may spend: the
+    /// current one, and during a splice the one it spends.
+    pub fn watched_outpoints(&self) -> Vec<OutPoint> {
+        let mut out: Vec<OutPoint> = self.funding_outpoint.into_iter().collect();
+        if let Some(sp) = &self.splice {
+            out.push(sp.old_outpoint);
+        }
+        out
     }
     pub fn funding_depth(&self) -> u16 {
         self.funding_depth
@@ -2469,10 +3471,16 @@ impl Machine {
     /// balance was dust, leaving a lone `to_remote`) fall through to the
     /// output-count heuristic [`crate::channel::watcher::classify`].
     pub fn identify_spend(&self, tx: &Transaction) -> Watch {
-        let Some(funding) = self.funding_outpoint else {
+        let Some(current) = self.funding_outpoint else {
             return Watch::NotOurChannel;
         };
-        if tx.inputs.first().map(|i| i.prev_out) != Some(funding) {
+        // During a splice, a commitment may spend the old funding too.
+        let spent = tx.inputs.first().map(|i| i.prev_out);
+        let funding = match &self.splice {
+            Some(sp) if spent == Some(sp.old_outpoint) => sp.old_outpoint,
+            _ => current,
+        };
+        if spent != Some(funding) {
             return Watch::NotOurChannel;
         }
         let n = self.params.state_of(tx);

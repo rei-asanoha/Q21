@@ -1067,6 +1067,7 @@ mod channels {
             q21_core::channel::terms(NET).default_delay,
             q21_core::channel::terms(NET).funding_depth,
             Hooks {
+                splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
                 fund: Box::new(|_, _| Err("no wallet here".into())),
                 broadcast: Box::new(|_| Err("no relay here".into())),
                 sweep_address: Box::new(|| Hash256([0x71; 32])),
@@ -1256,6 +1257,7 @@ mod sessions {
 
     fn hooks() -> Hooks {
         Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             fund: Box::new(|_, _| Err("no funding here".into())),
             broadcast: Box::new(|_| Ok(())),
             sweep_address: Box::new(|| Hash256([1; 32])),
@@ -1360,7 +1362,11 @@ mod sessions {
         reach_h(&s, &at_h);
         assert_eq!(
             introduced_as(&s),
-            format!("{base}{}", q21_core::wire::CHANNELS_CAPABILITY),
+            format!(
+                "{base}{}{}",
+                q21_core::wire::CHANNELS_CAPABILITY,
+                q21_core::wire::SPLICE_CAPABILITY
+            ),
             "at H"
         );
         s.node.shutdown();

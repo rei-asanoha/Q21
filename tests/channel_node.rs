@@ -180,6 +180,7 @@ fn funder_hooks(wallet: Arc<Mutex<Wallet>>, chain: Arc<Mutex<SharedChain>>) -> H
     );
     let broadcast = mining_broadcast(chain.clone());
     Hooks {
+        splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
         fund,
         broadcast,
         sweep_address: Box::new(|| FUNDER_PAYOUT),
@@ -288,6 +289,7 @@ const ACCEPTOR_PAYOUT: Hash256 = Hash256([0xa0; 32]);
 /// The acceptor's hooks: it never funds; it broadcasts penalties/claims.
 fn acceptor_hooks(chain: Arc<Mutex<SharedChain>>, sweep: Hash256) -> Hooks {
     Hooks {
+        splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
         fund: Box::new(|_, _| Err("acceptor does not fund".into())),
         broadcast: mining_broadcast(chain),
         sweep_address: Box::new(move || sweep),
@@ -1265,6 +1267,7 @@ fn relaying_manager(
         DELAY,
         DEPTH,
         Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             fund: Box::new(|_, _| Err("does not fund".into())),
             broadcast: Box::new(move |tx: &Transaction| {
                 s1.lock().unwrap().push(tx.clone());
@@ -1944,6 +1947,7 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
         DELAY,
         DEPTH,
         Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             fund: Box::new(move |cid, out| {
                 *b1.lock().unwrap() += 1;
                 fund(cid, out)
@@ -2365,6 +2369,7 @@ fn a_broadcast_funding_is_never_forgotten() {
         DELAY,
         DEPTH,
         Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             broadcast: Box::new(|_| Ok(())),
             ..funder_hooks(wallet, chain)
         },
@@ -2737,6 +2742,7 @@ fn unconfirmed_funding_pair(
         DELAY,
         DEPTH,
         Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             broadcast: Box::new(move |tx| {
                 s1.lock().unwrap().push(tx.clone());
                 Ok(())
@@ -2813,6 +2819,7 @@ fn funding_coins_are_held_back_until_the_funding_confirms() {
         [0xb1u8; 32],
         &dir.join("funder"),
         Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             broadcast: Box::new(|_| Ok(())),
             ..funder_hooks(wallet.clone(), chain.clone())
         },
@@ -3032,6 +3039,7 @@ fn a_funding_confirmed_while_we_were_down_is_claimed_not_given_up() {
         funder_seed,
         &dir.join("funder"),
         Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             broadcast: Box::new(move |tx: &Transaction| {
                 let mut c = c.lock().unwrap();
                 if tx

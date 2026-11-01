@@ -122,6 +122,16 @@ pub const CLOSE_FEE: u64 = crate::channel::txbuild::SWEEP_FEE;
 /// acceptor has signed our first commitment. Takes the chain and wallet locks
 /// itself.
 pub type FundFn = dyn Fn(Hash256, TxOut) -> Result<Transaction, String> + Send + Sync;
+/// Builds a splice for channel `cid`: the wallet's coins for the addition
+/// and its fee, then the funding output at the given outpoint (unsigned,
+/// last, with the given sequence number: see
+/// [`crate::channel::machine::splice_sequence`]), paying the new funding
+/// output and the change. The wallet's own
+/// inputs are signed and its coins held back. Not broadcast: the channel
+/// signs the funding input once both new commitments are held. Takes the
+/// chain and wallet locks itself.
+pub type SpliceFn =
+    dyn Fn(Hash256, OutPoint, TxOut, TxOut, u32) -> Result<Transaction, String> + Send + Sync;
 /// Broadcasts a transaction (cooperative close, penalty, sweep) through the
 /// normal mempool and relay.
 pub type BroadcastFn = dyn Fn(&Transaction) -> Result<(), String> + Send + Sync;
@@ -144,6 +154,8 @@ pub type DepthOf<'a> = dyn Fn(&OutPoint) -> Option<(u64, TxOut)> + 'a;
 /// What the node must do for the manager when the chain is involved.
 pub struct Hooks {
     pub fund: Box<FundFn>,
+    /// See [`SpliceFn`].
+    pub splice: Box<SpliceFn>,
     pub broadcast: Box<BroadcastFn>,
     pub sweep_address: Box<SweepAddrFn>,
     /// See [`ReserveFn`]: from the funding's signature at Accept until it
@@ -225,6 +237,12 @@ pub struct ChannelSummary {
     /// ours, once: closed with our latest state if the next session shows the
     /// same (see [`SyncVerdict::PeerIsBehind`]); the holder may close it now.
     pub peer_behind: bool,
+    /// A splice in progress: more coins put into the channel.
+    pub splice: Option<crate::channel::machine::SpliceStatus>,
+    /// The peer's current session takes splices.
+    pub splices: bool,
+    /// Our last splice was refused: a payment of the peer crossed it.
+    pub splice_refused: bool,
 }
 
 /// How a channel ended, as its last phase before it was marked closed tells.
@@ -286,11 +304,16 @@ pub struct ArchivedChannel {
 
 /// One payment in a channel's history: the state it settled in, when, and
 /// how much our balance moved (negative: we paid; positive: we were paid).
+/// Or coins added to the channel (a splice): `added`, by us or the peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub state: u64,
     pub time: u64,
     pub delta: i128,
+    /// Units put into the channel at this state, `0` for a payment.
+    pub added: u64,
+    /// Whether we put them in.
+    pub added_by_us: bool,
 }
 
 /// The time now, in seconds since 1970; 0 on a clock set before it.
@@ -301,36 +324,67 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A history line: when, the balance, and the coins a splice put in.
+type HistoryLine = (u64, u64, Option<(u64, bool)>);
+
 /// Parses a channel history: lines `state time balance`, in the order they
 /// were appended. A state appears once (the first line wins: a payment is
 /// dated when it settled), states are taken in order, and each entry is the
 /// move of our balance from the state before. `initial` is our balance in
 /// the first commitment. A malformed line is skipped: the history is a
 /// courtesy, never what the channel's funds depend on.
+///
+/// A splice adds `splice <units> <1 if ours, else 0>` to its line: the
+/// coins put in are told apart from a payment.
 pub fn parse_history(text: &str, initial: u64) -> Vec<HistoryEntry> {
-    let mut by_state: std::collections::BTreeMap<u64, (u64, u64)> = Default::default();
+    let mut by_state: std::collections::BTreeMap<u64, HistoryLine> = Default::default();
     for line in text.lines() {
-        let mut it = line.split_ascii_whitespace();
-        let (Some(a), Some(b), Some(c), None) = (it.next(), it.next(), it.next(), it.next()) else {
+        let f: Vec<&str> = line.split_ascii_whitespace().collect();
+        let splice = match f.len() {
+            3 => None,
+            6 if f[3] == "splice" => match (f[4].parse::<u64>(), f[5]) {
+                (Ok(add), "1") => Some((add, true)),
+                (Ok(add), "0") => Some((add, false)),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let (Ok(state), Ok(time), Ok(balance)) = (
+            f[0].parse::<u64>(),
+            f[1].parse::<u64>(),
+            f[2].parse::<u64>(),
+        ) else {
             continue;
         };
-        let (Ok(state), Ok(time), Ok(balance)) =
-            (a.parse::<u64>(), b.parse::<u64>(), c.parse::<u64>())
-        else {
-            continue;
-        };
-        by_state.entry(state).or_insert((time, balance));
+        by_state.entry(state).or_insert((time, balance, splice));
     }
     let mut out = Vec::new();
     let mut previous = initial;
-    for (state, (time, balance)) in by_state {
-        let delta = i128::from(balance) - i128::from(previous);
+    for (state, (time, balance, splice)) in by_state {
+        let (added, added_by_us) = splice.unwrap_or((0, false));
+        let ours = if added_by_us { added } else { 0 };
+        let delta = i128::from(balance) - i128::from(previous) - i128::from(ours);
         previous = balance;
-        if delta != 0 {
-            out.push(HistoryEntry { state, time, delta });
+        if delta != 0 || added != 0 {
+            out.push(HistoryEntry {
+                state,
+                time,
+                delta,
+                added,
+                added_by_us,
+            });
         }
     }
     out
+}
+
+/// What the splices in a history put into the channel, by both sides: the
+/// capacity now, less this, is the capacity it opened with.
+pub fn history_additions(text: &str) -> u64 {
+    parse_history(text, 0)
+        .iter()
+        .map(|e| e.added)
+        .fold(0u64, u64::saturating_add)
 }
 
 struct Chan {
@@ -360,7 +414,6 @@ struct Chan {
     /// when this node first saw it there: the date the archives give the
     /// close. Persisted beside the journal.
     closing: Option<(u64, u64)>,
-    capacity: u64,
     /// Whether the peer's reestablish has been received and answered on the
     /// current connection. Until it has, a message one side lost may still be
     /// owed, and a new update or close stacked on top of it would be refused
@@ -388,8 +441,18 @@ struct Chan {
     logged: Option<u64>,
     /// Our copy of the channel is older than the peer's (see
     /// [`SyncVerdict::WeAreBehind`]): nothing may be signed or broadcast on
-    /// it. Persisted beside the journal, so a restart keeps it.
+    /// it. Persisted beside the journal, so a restart keeps it, once proven
+    /// (see [`Chan::behind_proven`]).
     behind: bool,
+    /// The older copy is proven: by the peer's proof, or, with a peer that
+    /// proves nothing (before 0.5.5), by its word. Written beside the
+    /// journal, and never lifted. Unproven, the refusal lasts while the peer
+    /// keeps saying so.
+    behind_proven: bool,
+    /// Our splice, while its wallet coins are held back.
+    splice_held: Option<Transaction>,
+    /// Our last splice was refused (see [`ChannelSummary::splice_refused`]).
+    splice_refused: bool,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -477,6 +540,10 @@ pub const KEY_SCAN_WINDOW: u32 = 200;
 const CLAIM_MEMORY_BLOCKS: u64 = 1_000;
 
 /// Why a channel whose copy is older than the peer's refuses everything.
+/// Why a payment or a close waits during a splice.
+const SPLICING: &str = "coins are being added to this channel: payments and closes resume \
+     once the addition is buried in the chain";
+
 const BEHIND: &str =
     "this copy of the channel is older than your contact's (restored from a backup?): \
      it can no longer be operated from here. Ask your contact to close it: your side \
@@ -539,6 +606,9 @@ struct Link {
     /// When the session was established, in the order of all sessions: a
     /// later one is told apart from one opened at the same moment.
     seq: u64,
+    /// The peer announced splices and the proof of an older copy
+    /// ([`crate::wire::SPLICE_CAPABILITY`]).
+    splices: bool,
 }
 
 /// Sessions established at once. A connection holds at most one, and the
@@ -585,6 +655,8 @@ struct Inner {
     /// Outputs paying a channel key already claimed, with the height of the
     /// claim: claimed again only if still unspent a few blocks later.
     claimed: HashMap<OutPoint, u64>,
+    /// Connections that announced splices, from their handshake on.
+    splice_peers: std::collections::HashSet<u64>,
 }
 
 impl Inner {
@@ -691,6 +763,9 @@ pub struct ChannelManager {
     /// Transactions decided while the channel lock was held, broadcast once
     /// it is released (the broadcast hook takes the chain lock).
     to_broadcast: Mutex<Vec<(Transaction, &'static str)>>,
+    /// Splices whose wallet coins are to be released, once no lock of ours
+    /// is held (the wallet's hook takes the wallet's).
+    to_release: Mutex<Vec<Transaction>>,
 }
 
 fn write_frame(cid: Hash256, kind: u8, body: &[u8]) -> Vec<u8> {
@@ -741,8 +816,10 @@ impl ChannelManager {
                 free_acceptor: Vec::new(),
                 key_hashes: None,
                 claimed: HashMap::new(),
+                splice_peers: Default::default(),
             }),
             to_broadcast: Mutex::new(Vec::new()),
+            to_release: Mutex::new(Vec::new()),
         };
         // Reload every channel persisted under `journal_dir`, so a restart —
         // clean or after a crash — finds its channels again, with the watcher
@@ -858,7 +935,6 @@ impl ChannelManager {
                     return;
                 }
                 let cid = machine.channel_id();
-                let capacity = machine.params().capacity.units();
                 // The peer's connection is transient; its node id, persisted
                 // in a sidecar, tells which session the channel is with.
                 let peer_identity = self.read_peer_identity(cid);
@@ -874,7 +950,6 @@ impl ChannelManager {
                         peer_owner,
                         peer_behind: None,
                         closing,
-                        capacity,
                         synced: false,
                         close: None,
                         spend: None,
@@ -882,6 +957,9 @@ impl ChannelManager {
                         conflict: None,
                         logged: None,
                         behind,
+                        behind_proven: behind,
+                        splice_held: None,
+                        splice_refused: false,
                     },
                 );
             }
@@ -1293,6 +1371,25 @@ impl ChannelManager {
     /// Appends the channel's latest state to its history once it has
     /// settled: no update in flight, and a state not written yet.
     fn note_history(&self, chan: &mut Chan) {
+        // A splice is written once both sides hold its first new state, and
+        // its line names the coins put in.
+        if let Some(st) = chan.machine.splice_status() {
+            let state = chan.machine.local_commit_number();
+            if st.signed && state.is_some() && chan.logged < state {
+                let state = state.unwrap_or(0);
+                let balance = chan.machine.latest_balances()[chan.machine.our_index()];
+                let line = format!(
+                    "{state} {} {balance} splice {} {}\n",
+                    unix_now(),
+                    st.add,
+                    u8::from(st.ours)
+                );
+                if self.append_history(chan.machine.channel_id(), &line) {
+                    chan.logged = Some(state);
+                }
+            }
+            return;
+        }
         if chan.machine.update_in_flight() {
             return;
         }
@@ -1305,24 +1402,31 @@ impl ChannelManager {
         let us = chan.machine.our_index();
         let balance = chan.machine.latest_balances()[us];
         let line = format!("{state} {} {balance}\n", unix_now());
-        let path = self.history_path(chan.machine.channel_id());
-        use std::io::Write;
-        let ok = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut f| f.write_all(line.as_bytes()))
-            .is_ok();
-        if ok {
+        if self.append_history(chan.machine.channel_id(), &line) {
             chan.logged = Some(state);
         }
     }
 
+    fn append_history(&self, cid: Hash256, line: &str) -> bool {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.history_path(cid))
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .is_ok()
+    }
+
     /// Our balance when the channel opened: the whole capacity for the
-    /// funder, nothing for the acceptor.
-    fn initial_balance(machine: &Machine) -> u64 {
+    /// funder — the capacity now, less what splices added since, as its
+    /// `history` tells — nothing for the acceptor.
+    fn initial_balance(machine: &Machine, history: &str) -> u64 {
         if machine.our_index() == crate::channel::txbuild::FUNDER {
-            machine.params().capacity.units()
+            machine
+                .params()
+                .capacity
+                .units()
+                .saturating_sub(history_additions(history))
         } else {
             0
         }
@@ -1330,18 +1434,18 @@ impl ChannelManager {
 
     /// The payments made in a channel, oldest first.
     pub fn history(&self, cid: Hash256) -> Vec<HistoryEntry> {
+        let text = std::fs::read_to_string(self.history_path(cid)).unwrap_or_default();
         let initial = {
             let g = self.inner.lock().unwrap();
             match g.channels.get(&cid) {
-                Some(c) => Self::initial_balance(&c.machine),
+                Some(c) => Self::initial_balance(&c.machine, &text),
                 None => match g.archived.iter().find(|a| a.channel_id == cid) {
-                    Some(a) if a.we_funded => a.capacity,
+                    Some(a) if a.we_funded => a.capacity.saturating_sub(history_additions(&text)),
                     Some(_) => 0,
                     None => return Vec::new(),
                 },
             }
         };
-        let text = std::fs::read_to_string(self.history_path(cid)).unwrap_or_default();
         parse_history(&text, initial)
     }
 
@@ -1378,7 +1482,10 @@ impl ChannelManager {
             closed_time: time,
             closed_height: height,
             how,
-            payments: parse_history(&history, Self::initial_balance(machine)).len(),
+            payments: parse_history(&history, Self::initial_balance(machine, &history))
+                .iter()
+                .filter(|e| e.added == 0)
+                .count(),
         }
     }
 
@@ -1491,6 +1598,9 @@ impl ChannelManager {
         if !chan.synced {
             return Err("channel is not yet resynchronized with its peer".into());
         }
+        if chan.machine.splicing() {
+            return Err(SPLICING.into());
+        }
         // Derived from the persisted counters, so a proposal reloaded from the
         // journal after a crash still counts until the reestablish settles it.
         if chan.machine.update_in_flight() {
@@ -1507,6 +1617,105 @@ impl ChannelManager {
         Ok(write_frame(cid, KIND_ENGINE, &msg.encode()))
     }
 
+    /// Adds `add` units of our wallet's coins to the open channel `cid`
+    /// (a splice), returning the `Splice` frame to send. The wallet builds
+    /// the transaction and holds its coins back; they are released if the
+    /// peer refuses it or the channel closes before it confirms.
+    pub fn splice(&self, cid: Hash256, add: u64) -> Result<Vec<u8>, String> {
+        let (funding, funding_output, new_output, sequence) = {
+            let g = self.inner.lock().unwrap();
+            let chan = g.channels.get(&cid).ok_or("unknown channel")?;
+            if chan.behind {
+                return Err(BEHIND.into());
+            }
+            if chan.machine.phase() != Phase::Open {
+                return Err("channel not open".into());
+            }
+            if !chan.synced {
+                return Err("channel is not yet resynchronized with its peer".into());
+            }
+            if !Self::peer_splices(&g, chan.peer) {
+                return Err(
+                    "your contact's wallet does not take additions yet (0.5.5 or later)".into(),
+                );
+            }
+            if chan.machine.splicing() {
+                return Err(SPLICING.into());
+            }
+            if chan.machine.update_in_flight() {
+                return Err("a payment is still settling: try again in a moment".into());
+            }
+            let capacity = chan.machine.params().capacity.units();
+            let total = capacity
+                .checked_add(add)
+                .filter(|t| *t <= crate::channel::MAX_CAPACITY)
+                .ok_or("the channel would hold too much")?;
+            if add < crate::consensus::MIN_OUTPUT_VALUE {
+                return Err("the amount is too small".into());
+            }
+            let params = crate::channel::txbuild::ChannelParams {
+                capacity: crate::amount::Amount::from_units(total),
+                ..chan.machine.params().clone()
+            };
+            (
+                chan.machine.funding_outpoint().ok_or("no funding")?,
+                chan.machine.funding_output(),
+                params.funding_output(),
+                crate::channel::machine::splice_sequence(chan.machine.next_state_number()),
+            )
+        };
+        // The wallet takes the chain lock: not under ours.
+        let tx = (self.hooks.splice)(cid, funding, funding_output, new_output, sequence)?;
+        let proposed = (|| {
+            let mut g = self.inner.lock().unwrap();
+            let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+            let m = chan.machine.propose_splice(add, tx.clone()).map_err(err)?;
+            chan.splice_held = Some(tx.clone());
+            chan.splice_refused = false;
+            Ok::<_, String>(m)
+        })();
+        match proposed {
+            Ok(m) => Ok(write_frame(cid, KIND_ENGINE, &m.encode())),
+            Err(e) => {
+                // A journal failure after the splice was written keeps it:
+                // the reestablish sends it again, and its coins stay held.
+                let mut g = self.inner.lock().unwrap();
+                let kept = g.channels.get_mut(&cid).is_some_and(|chan| {
+                    let ours = chan
+                        .machine
+                        .our_splice_tx()
+                        .is_some_and(|t| t.txid() == tx.txid());
+                    if ours {
+                        chan.splice_held = Some(tx.clone());
+                    }
+                    ours
+                });
+                drop(g);
+                if !kept {
+                    (self.hooks.reserve)(&tx, false);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Releases the wallet coins of our splice, if held: it was refused,
+    /// dropped, or can no longer confirm.
+    fn release_splice(&self, chan: &mut Chan) {
+        if let Some(tx) = chan.splice_held.take() {
+            self.to_release.lock().unwrap().push(tx);
+        }
+    }
+
+    /// Releases what [`ChannelManager::release_splice`] set aside. Called
+    /// with none of our locks held.
+    fn release_pending(&self) {
+        let txs = std::mem::take(&mut *self.to_release.lock().unwrap());
+        for tx in txs {
+            (self.hooks.reserve)(&tx, false);
+        }
+    }
+
     /// Proposes a cooperative close of `cid`, returning the `Close` frame to
     /// send. While a payment is still settling the close is agreed at once
     /// (no new payment starts) and its frame goes out when the payment
@@ -1521,6 +1730,9 @@ impl ChannelManager {
         }
         if !chan.synced {
             return Err("channel is not yet resynchronized with its peer".into());
+        }
+        if chan.machine.splicing() {
+            return Err(SPLICING.into());
         }
         if chan.machine.update_in_flight() {
             chan.machine.agree_close(CLOSE_FEE, true).map_err(err)?;
@@ -1566,6 +1778,7 @@ impl ChannelManager {
         }
         g.session_seq += 1;
         let seq = g.session_seq;
+        let splices = g.splice_peers.contains(&peer);
         g.links.insert(
             peer,
             Link {
@@ -1574,6 +1787,7 @@ impl ChannelManager {
                 binding,
                 owner: None,
                 seq,
+                splices,
             },
         );
         let mut out = Vec::new();
@@ -1597,12 +1811,32 @@ impl ChannelManager {
         out
     }
 
+    /// Records whether connection `peer` announced splices, before its
+    /// session is recorded ([`ChannelManager::on_session`]).
+    pub fn note_peer_splices(&self, peer: u64, splices: bool) {
+        let mut g = self.inner.lock().unwrap();
+        if splices {
+            g.splice_peers.insert(peer);
+        } else {
+            g.splice_peers.remove(&peer);
+        }
+        if let Some(l) = g.links.get_mut(&peer) {
+            l.splices = splices;
+        }
+    }
+
+    /// Whether the session `peer` takes splices and proofs.
+    fn peer_splices(g: &Inner, peer: u64) -> bool {
+        g.links.get(&peer).is_some_and(|l| l.splices)
+    }
+
     /// Called when the session on connection `peer` ends — the connection
     /// closed, or the session failed and a new one is to be negotiated.
     /// Nothing more is taken from it, and its channels wait for the next.
     pub fn on_session_closed(&self, peer: u64) {
         let mut g = self.inner.lock().unwrap();
         g.links.remove(&peer);
+        g.splice_peers.remove(&peer);
         g.verifications.remove(&peer);
         g.verify_waiting.remove(&peer);
         g.pending_funder.remove(&peer);
@@ -1671,6 +1905,7 @@ impl ChannelManager {
             binding,
         };
         let reaction = self.deliver_inner(&from, bytes);
+        self.release_pending();
         let decided = std::mem::take(&mut *self.to_broadcast.lock().unwrap());
         for (tx, what) in decided {
             self.broadcast_or_warn(&tx, what);
@@ -1854,7 +2089,6 @@ impl ChannelManager {
                 peer_owner,
                 peer_behind: None,
                 closing: None,
-                capacity: pending.capacity,
                 synced: true,
                 close: None,
                 spend: None,
@@ -1862,6 +2096,9 @@ impl ChannelManager {
                 conflict: None,
                 logged: None,
                 behind: false,
+                behind_proven: false,
+                splice_held: None,
+                splice_refused: false,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &open.encode())])
@@ -1884,6 +2121,8 @@ impl ChannelManager {
             Vec::new()
         };
         let (from_seq, seq_now) = (g.links.get(&peer).map_or(0, |l| l.seq), g.session_seq);
+        // The peer proves an older copy and takes splices (0.5.5 and later).
+        let peer_proves = Self::peer_splices(&g, peer);
         let Some(chan) = g.channels.get_mut(&cid) else {
             // A peer that still tracks a channel we have settled and forgotten
             // (closed on our side, still closing on theirs) offers its
@@ -1985,8 +2224,15 @@ impl ChannelManager {
             ChMsg::Update { .. } => {
                 // An ordinary update, one crossing our own proposal (both ends
                 // paid at once: the two are merged into the next state), or a
-                // crossed proposal resent at a reestablish.
-                for m in chan.machine.on_peer_update(&msg).map_err(err)? {
+                // crossed proposal resent at a reestablish. A payment that
+                // crossed our splice wins: the splice is dropped.
+                let splicing = chan.machine.splicing();
+                let answered = chan.machine.on_peer_update(&msg).map_err(err)?;
+                if splicing && !chan.machine.splicing() {
+                    chan.splice_refused = true;
+                    self.release_splice(chan);
+                }
+                for m in answered {
                     out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
                 }
             }
@@ -2065,14 +2311,37 @@ impl ChannelManager {
                         }
                         chan.synced = true;
                         chan.peer_behind = None;
+                        // A refusal the peer never proved lasts only while
+                        // it keeps saying so.
+                        if !chan.behind_proven {
+                            chan.behind = false;
+                        }
                     }
                     // Our copy is older: our latest commitment may be one we
                     // revoked. Never signed nor broadcast from now on; the
                     // peer holds the latest state and closes with it, which
                     // pays our side to our channel key, claimed as usual.
-                    SyncVerdict::WeAreBehind => {
+                    //
+                    // A peer that proves (0.5.5 and later) sends its proof
+                    // next: until it does, the refusal holds for this session
+                    // only, so a peer claiming it falsely cannot freeze our
+                    // side for good. An older peer proves nothing: its word
+                    // is taken, as before.
+                    SyncVerdict::WeAreBehind if peer_proves => {
                         if !chan.behind {
+                            eprintln!(
+                                "ALERT: channel {}: the peer says this copy of the channel is \
+                                 older than its own; nothing is signed nor broadcast until \
+                                 it proves it or says otherwise",
+                                cid.to_hex()
+                            );
+                        }
+                        chan.behind = true;
+                    }
+                    SyncVerdict::WeAreBehind => {
+                        if !chan.behind_proven {
                             chan.behind = true;
+                            chan.behind_proven = true;
                             self.write_behind(cid);
                             eprintln!(
                                 "ALERT: channel {}: this copy of the channel is older than \
@@ -2093,6 +2362,12 @@ impl ChannelManager {
                     // peer's side comes back to it at once, ours after the
                     // delay.
                     SyncVerdict::PeerIsBehind => {
+                        // Its own secret of its latest commitment: the proof.
+                        if peer_proves {
+                            if let Some(p) = chan.machine.behind_proof() {
+                                out.push(write_frame(cid, KIND_ENGINE, &p.encode()));
+                            }
+                        }
                         let ours = chan.machine.sync_counters();
                         let confirmed = chan.peer_behind.is_some_and(|(t, o, mark)| {
                             t == theirs && o == ours && from_seq > mark
@@ -2135,6 +2410,58 @@ impl ChannelManager {
                 }
             }
             ChMsg::Error { .. } | ChMsg::Open { .. } => {}
+            // The peer adds coins: our signatures, each once our own
+            // commitment on the new funding is persisted — or a refusal,
+            // keeping nothing, when a payment of ours crossed it.
+            ChMsg::Splice { .. } => {
+                if chan.behind {
+                    return Ok(out);
+                }
+                for m in chan.machine.on_splice(&msg).map_err(err)? {
+                    out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
+                }
+            }
+            // Our splice: once both its answers are in, it is complete, and
+            // goes to the chain.
+            ChMsg::SpliceAck { .. } | ChMsg::SpliceSig { .. } => {
+                let done = if matches!(msg, ChMsg::SpliceAck { .. }) {
+                    chan.machine.on_splice_ack(&msg)
+                } else {
+                    chan.machine.on_splice_sig(&msg)
+                }
+                .map_err(err)?;
+                if let Some(tx) = done {
+                    self.to_broadcast.lock().unwrap().push((tx, "splice"));
+                }
+            }
+            ChMsg::SpliceLocked { .. } => {
+                chan.machine.on_splice_locked(&msg).map_err(err)?;
+                out.extend(pending_close(chan, cid));
+            }
+            ChMsg::SpliceBusy { .. } => {
+                if chan.machine.on_splice_busy(&msg).map_err(err)?.is_some() {
+                    chan.splice_refused = true;
+                    self.release_splice(chan);
+                }
+                // A close agreed while it waited goes on now.
+                out.extend(pending_close(chan, cid));
+            }
+            // Proof that our copy is older: the refusal becomes final.
+            ChMsg::BehindProof { .. } => {
+                if chan.machine.sync() == SyncVerdict::WeAreBehind
+                    && chan.machine.check_behind_proof(&msg)
+                    && !chan.behind_proven
+                {
+                    chan.behind = true;
+                    chan.behind_proven = true;
+                    self.write_behind(cid);
+                    eprintln!(
+                        "ALERT: channel {}: the peer proved this copy of the channel older \
+                         than its own: it closes the channel with the latest state",
+                        cid.to_hex()
+                    );
+                }
+            }
         }
         Ok(out)
     }
@@ -2211,7 +2538,6 @@ impl ChannelManager {
                 peer_owner,
                 peer_behind: None,
                 closing: None,
-                capacity: pending.capacity,
                 synced: true,
                 close: None,
                 spend: None,
@@ -2219,6 +2545,9 @@ impl ChannelManager {
                 conflict: None,
                 logged: None,
                 behind: false,
+                behind_proven: false,
+                splice_held: None,
+                splice_refused: false,
             },
         );
         Ok(vec![write_frame(cid, KIND_ENGINE, &accept.encode())])
@@ -2333,6 +2662,28 @@ impl ChannelManager {
                     && tx.inputs.iter().all(|i| depth_of(&i.prev_out).is_some());
                 if pending {
                     again.push(tx);
+                }
+            }
+            for c in g.channels.values() {
+                let Some(st) = c.machine.splice_status() else {
+                    continue;
+                };
+                let on_chain = depth_of(&st.new_funding).is_some();
+                let old_unspent = depth_of(&st.old_funding).is_some();
+                // Our splice, signed and in no block yet: announced again.
+                if let (false, true, Some(tx)) = (on_chain, old_unspent, c.machine.splice_tx()) {
+                    again.push(tx.clone());
+                }
+                // A close alone, broadcast while the splice was waiting: its
+                // old state can no longer confirm once the splice did; the
+                // first state on the new funding goes instead.
+                if c.machine.phase() == Phase::Forcing && c.spend.is_none() && !c.behind {
+                    if let Ok(tx) = c.machine.closing_commitment(FORCE_CLOSE_TIER) {
+                        let spends = tx.inputs[0].prev_out;
+                        if depth_of(&spends).is_some() {
+                            again.push(tx);
+                        }
+                    }
                 }
             }
         }
@@ -2518,17 +2869,38 @@ impl ChannelManager {
             }
             self.replaying.store(false, Ordering::SeqCst);
         }
-        self.resume_after_restart(depth_of);
+        self.resume_after_restart(tip, depth_of);
     }
 
     /// Broadcasts, once, every transaction a channel still waits on (see
     /// [`ChannelManager::rescan`]).
-    fn resume_after_restart(&self, depth_of: &DepthOf) {
+    fn resume_after_restart(&self, tip: u64, depth_of: &DepthOf) {
         let mut pending: Vec<(Transaction, &'static str)> = Vec::new();
         let mut hold = Vec::new();
         {
             let mut g = self.inner.lock().unwrap();
             for c in g.channels.values_mut() {
+                // A splice in progress: where it stands on chain; ours, not
+                // yet there, holds its coins back again and goes out again
+                // once signed.
+                if let Some(st) = c.machine.splice_status() {
+                    match depth_of(&st.new_funding) {
+                        Some((depth, _)) => c
+                            .machine
+                            .note_splice_height(Some(tip.saturating_add(1).saturating_sub(depth))),
+                        None => {
+                            if let Some(tx) = c.machine.our_splice_tx() {
+                                hold.push(tx.clone());
+                                c.splice_held = Some(tx.clone());
+                            }
+                            if let (true, Some(tx)) =
+                                (depth_of(&st.old_funding).is_some(), c.machine.splice_tx())
+                            {
+                                pending.push((tx.clone(), "splice"));
+                            }
+                        }
+                    }
+                }
                 // Our funding, signed and not yet on chain: its coins are held
                 // back again (the wallet keeps that in memory only).
                 if matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
@@ -2574,8 +2946,9 @@ impl ChannelManager {
                     None => {
                         let unspent = c
                             .machine
-                            .funding_outpoint()
-                            .is_some_and(|op| depth_of(&op).is_some());
+                            .watched_outpoints()
+                            .iter()
+                            .any(|op| depth_of(op).is_some());
                         if !unspent {
                             continue;
                         }
@@ -2589,10 +2962,7 @@ impl ChannelManager {
                             // Never from an older copy: its latest commitment
                             // may be revoked.
                             Phase::Forcing if !c.behind => {
-                                let latest = c.machine.local_commit_number().and_then(|n| {
-                                    c.machine.signed_commitment_at(n, FORCE_CLOSE_TIER).ok()
-                                });
-                                if let Some(tx) = latest {
+                                if let Ok(tx) = c.machine.closing_commitment(FORCE_CLOSE_TIER) {
                                     pending.push((tx, "commitment"));
                                 }
                             }
@@ -2651,6 +3021,14 @@ impl ChannelManager {
             if chan.conflict.is_some_and(|(t, _)| gone.contains(&t)) {
                 chan.conflict = None;
             }
+            // Our splice left the chain: waiting again for it.
+            if chan
+                .machine
+                .splice_status()
+                .is_some_and(|st| gone.contains(&st.txid))
+            {
+                chan.machine.note_splice_height(None);
+            }
         }
     }
 
@@ -2679,6 +3057,21 @@ impl ChannelManager {
             return;
         };
         let txid = tx.txid();
+        // Our splice on chain: not a close. Its output is the channel's
+        // funding now, and the splice is locked once buried.
+        if chan
+            .machine
+            .splice_status()
+            .is_some_and(|st| st.txid == txid)
+        {
+            chan.machine.note_splice_height(Some(height));
+            return;
+        }
+        // Anything else spending a funding output ends the channel: a splice
+        // still waiting can no longer confirm, and its coins come back.
+        if chan.machine.splicing() {
+            self.release_splice(chan);
+        }
         if chan.spend == Some(txid) {
             // The same spend again: a reorganization put it in a later block.
             // The clocks that count from its confirmation restart there.
@@ -2796,6 +3189,34 @@ impl ChannelManager {
             );
             let _ = self.forget(&mut g, cid);
         }
+        // Splices buried to the funding depth: the last old state is revoked
+        // on both sides, and the old funding forgotten.
+        let mut frames = Vec::new();
+        for c in g.channels.values_mut() {
+            let Some(st) = c.machine.splice_status() else {
+                continue;
+            };
+            let Some((depth, output)) = depth_of(&st.new_funding) else {
+                continue;
+            };
+            c.machine
+                .note_splice_height(Some(height.saturating_add(1).saturating_sub(depth)));
+            if output != c.machine.funding_output() {
+                continue;
+            }
+            // Its coins are spent on chain: nothing left to hold back.
+            if let Some(tx) = c.splice_held.take() {
+                confirmed.push(tx);
+            }
+            if !st.locked && st.signed && depth >= u64::from(c.machine.funding_depth()) {
+                if let Ok(m) = c.machine.splice_locked() {
+                    frames.push((
+                        c.peer,
+                        write_frame(st_cid(&c.machine), KIND_ENGINE, &m.encode()),
+                    ));
+                }
+            }
+        }
         let ready: Vec<(Hash256, u64)> = g
             .channels
             .values()
@@ -2824,7 +3245,6 @@ impl ChannelManager {
                     .then_some((c.machine.channel_id(), c.peer))
             })
             .collect();
-        let mut frames = Vec::new();
         for (cid, peer) in ready {
             if let Some(chan) = g.channels.get_mut(&cid) {
                 if let Ok(msg) = chan.machine.funding_confirmed() {
@@ -3132,10 +3552,12 @@ impl ChannelManager {
         let g = self.inner.lock().unwrap();
         g.channels
             .values()
-            .filter_map(|c| {
+            .flat_map(|c| {
+                let cid = c.machine.channel_id();
                 c.machine
-                    .funding_outpoint()
-                    .map(|o| (c.machine.channel_id(), o))
+                    .watched_outpoints()
+                    .into_iter()
+                    .map(move |o| (cid, o))
             })
             .collect()
     }
@@ -3145,12 +3567,18 @@ impl ChannelManager {
     pub fn list(&self) -> Vec<ChannelSummary> {
         let mut g = self.inner.lock().unwrap();
         self.fill_owners(&mut g);
-        g.channels.values().map(summary).collect()
+        let g = &*g;
+        g.channels
+            .values()
+            .map(|c| summary(c, Self::peer_splices(g, c.peer)))
+            .collect()
     }
 
     pub fn info(&self, cid: Hash256) -> Option<ChannelSummary> {
         let g = self.inner.lock().unwrap();
-        g.channels.get(&cid).map(summary)
+        g.channels
+            .get(&cid)
+            .map(|c| summary(c, Self::peer_splices(&g, c.peer)))
     }
 
     /// The funding output a channel expects on chain: the 2-of-2 policy for
@@ -3176,10 +3604,25 @@ impl ChannelManager {
         if chan.behind {
             return Err(BEHIND.into());
         }
+        let splicing = chan.machine.splicing();
         let tx = chan.machine.force_close(FORCE_CLOSE_TIER).map_err(err)?;
         drop(g);
-        (self.hooks.broadcast)(&tx)?;
-        Ok(tx)
+        match (self.hooks.broadcast)(&tx) {
+            Ok(()) => Ok(tx),
+            // During a splice the pool may already hold the splice, which
+            // spends the same funding: whichever reaches a block first, the
+            // channel closes. Once the splice is in, the first state on the
+            // new funding goes instead, at the next block.
+            Err(e) if splicing => {
+                eprintln!(
+                    "channel {}: closing alone during a splice: {e}; the splice is ahead in \
+                     the pool, the close follows it",
+                    cid.to_hex()
+                );
+                Ok(tx)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// A fully-signed commitment at state `n`, for exercising the watcher with
@@ -3309,7 +3752,7 @@ fn finish_settling(chan: &mut Chan, height: u64, network: Network) -> Option<(u6
     None
 }
 
-fn summary(c: &Chan) -> ChannelSummary {
+fn summary(c: &Chan, splices: bool) -> ChannelSummary {
     let bal = c.machine.latest_balances();
     let us = c.machine.our_index();
     let sure = c.machine.irrevocable_balance().min(bal[us]);
@@ -3317,7 +3760,7 @@ fn summary(c: &Chan) -> ChannelSummary {
         channel_id: c.machine.channel_id(),
         peer: c.peer,
         phase: c.machine.phase(),
-        capacity: c.capacity,
+        capacity: c.machine.params().capacity.units(),
         local_balance: sure,
         pending_incoming: bal[us] - sure,
         remote_balance: bal[1 - us],
@@ -3353,7 +3796,15 @@ fn summary(c: &Chan) -> ChannelSummary {
         peer_owner: c.peer_owner.map(|o| o.to_hex()).unwrap_or_default(),
         behind: c.behind,
         peer_behind: c.peer_behind.is_some(),
+        splice: c.machine.splice_status(),
+        splices: splices && c.synced,
+        splice_refused: c.splice_refused,
     }
+}
+
+/// The channel id of `m`, for a frame.
+fn st_cid(m: &Machine) -> Hash256 {
+    m.channel_id()
 }
 
 fn err(e: ChannelError) -> String {
@@ -3433,6 +3884,7 @@ mod tests {
     fn the_channel_seed_is_wiped_on_drop() {
         let dir = std::env::temp_dir().join(format!("q21-mgr-wipe-{}", std::process::id()));
         let hooks = Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
             fund: Box::new(|_, _| Err("no".into())),
             broadcast: Box::new(|_| Ok(())),
             sweep_address: Box::new(|| Hash256::ZERO),

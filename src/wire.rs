@@ -358,6 +358,18 @@ pub const CHANNELS_CAPABILITY: &str = "+chanv3";
 /// channel peer of its own kind, and its opens go unanswered.
 pub const LEGACY_CHANNELS_CAPABILITY: &str = "+chan";
 
+/// Announced, after [`CHANNELS_CAPABILITY`], by a node whose channels take
+/// splices and prove an older copy ([`crate::channel::messages::Message::Splice`],
+/// [`crate::channel::messages::Message::BehindProof`]), from 0.5.5. Those
+/// messages go only to a peer that announces it: an older one would read
+/// them as malformed.
+pub const SPLICE_CAPABILITY: &str = "+splice1";
+
+/// Whether a user agent announces [`SPLICE_CAPABILITY`].
+pub fn user_agent_advertises_splices(user_agent: &str) -> bool {
+    user_agent_advertises_channels(user_agent) && user_agent.contains(SPLICE_CAPABILITY)
+}
+
 /// Does this user agent advertise the channel capability (version 3)?
 pub fn user_agent_advertises_channels(user_agent: &str) -> bool {
     user_agent.contains(CHANNELS_CAPABILITY)
