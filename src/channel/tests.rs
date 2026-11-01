@@ -2644,3 +2644,41 @@ fn a_tampered_reestablish_is_refused() {
     );
     assert!(f.on_reestablish(&honest).is_ok());
 }
+
+// --- The opener's close reserve ---------------------------------------------
+
+#[test]
+fn the_opener_can_send_all_but_its_close_reserve_and_the_reserve_is_announced_exactly() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    // What the terms announce is what the engine keeps.
+    assert_eq!(f.close_reserve(), txbuild::close_reserve(DELAY, RATE));
+    assert_eq!(f.close_reserve(), f.commit_fee(FeeTier::High));
+    for delay in [6u16, 12, 720, 1_440, 2_016] {
+        let p = ChannelParams {
+            funding: [Hash256([1; 32]), Hash256([2; 32])],
+            capacity: crate::amount::Amount::from_units(CAP),
+            delay,
+        };
+        assert_eq!(
+            txbuild::commitment_fee(&p, txbuild::tier_rate(RATE, FeeTier::High)),
+            txbuild::close_reserve(delay, RATE),
+            "delay {delay}"
+        );
+    }
+    assert_eq!(a.close_reserve(), 0);
+    let reserve = f.close_reserve();
+    assert_eq!(f.sendable(), CAP - reserve);
+    // One unit more than what can be sent is refused…
+    assert_eq!(
+        f.propose([reserve - 1, CAP - reserve + 1]),
+        Err(ChannelError::BadBalances)
+    );
+    // …and all of it goes.
+    pay(&mut f, &mut a, [reserve, CAP - reserve]);
+    assert_eq!(f.sendable(), 0);
+    // The other side sends everything back, to the last unit.
+    assert_eq!(a.sendable(), CAP - reserve);
+    pay(&mut a, &mut f, [CAP, 0]);
+    assert_eq!(a.sendable(), 0);
+}

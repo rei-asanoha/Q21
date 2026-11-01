@@ -420,6 +420,25 @@ pub fn commitment_fee(params: &ChannelParams, rate: u64) -> u64 {
     rate.saturating_mul(standard_commitment_weight(params)) / 1000
 }
 
+/// What the side that opens a channel keeps in it, on top of what it can
+/// send, to pay the highest-tier fee of a close without the other side
+/// (the funder pays every commitment's fee): the highest-tier commitment fee
+/// of a channel with this to-self `delay` at `base_rate`. It comes back to
+/// the funder at a close agreed by both. The weight depends on neither the
+/// keys nor the capacity, beyond a capacity too small for two outputs (which
+/// [`crate::channel::MIN_CAPACITY`] rules out): only on their sizes and on
+/// the delay.
+pub fn close_reserve(delay: u16, base_rate: u64) -> u64 {
+    let params = ChannelParams {
+        funding: [Hash256::ZERO, Hash256::ZERO],
+        // Large enough that no output of the representative commitment is
+        // trimmed: the weight is that of a commitment with both outputs.
+        capacity: Amount::from_units(crate::consensus::UNITS_PER_COIN),
+        delay,
+    };
+    commitment_fee(&params, tier_rate(base_rate, FeeTier::High))
+}
+
 /// A penalty transaction: the counterparty broadcast a revoked commitment, and
 /// we sweep its `to_local` output through the revocation branch, which needs
 /// our key and the revocation secret.

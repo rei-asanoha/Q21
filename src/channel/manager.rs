@@ -233,6 +233,17 @@ pub struct ChannelSummary {
     /// Our copy of the channel is older than the peer's: it can no longer be
     /// operated, the peer is to close it (see [`SyncVerdict::WeAreBehind`]).
     pub behind: bool,
+    /// The most we can pay now: our balance, less what the side that opened
+    /// the channel keeps to close it alone ([`Self::close_reserve`]).
+    pub sendable: u64,
+    /// What we keep to close the channel alone: the highest-tier fee of a
+    /// commitment, as the side that opened it; nothing as the other side.
+    pub close_reserve: u64,
+    /// The most the peer can pay us now, less its own close reserve.
+    pub remote_sendable: u64,
+    /// What the side that opened the channel keeps to close it alone: the
+    /// capacity less this is what payments move between the two sides.
+    pub funder_reserve: u64,
     /// The peer's last reestablish showed an older copy of the channel than
     /// ours, once: closed with our latest state if the next session shows the
     /// same (see [`SyncVerdict::PeerIsBehind`]); the holder may close it now.
@@ -1610,6 +1621,16 @@ impl ChannelManager {
         let mut bal = chan.machine.balances();
         if bal[us] < amount {
             return Err("insufficient channel balance".into());
+        }
+        // The side that opened the channel pays the fee of every close
+        // without the other side: it keeps that fee in the channel.
+        if amount > chan.machine.sendable() {
+            return Err(format!(
+                "insufficient channel balance: at most {} units can be sent; the side that \
+                 opened the channel keeps {} units to close it alone",
+                chan.machine.sendable(),
+                chan.machine.close_reserve()
+            ));
         }
         bal[us] -= amount;
         bal[1 - us] += amount;
@@ -3795,6 +3816,10 @@ fn summary(c: &Chan, splices: bool) -> ChannelSummary {
         peer_identity: c.peer_identity.clone(),
         peer_owner: c.peer_owner.map(|o| o.to_hex()).unwrap_or_default(),
         behind: c.behind,
+        sendable: c.machine.sendable(),
+        close_reserve: c.machine.close_reserve(),
+        remote_sendable: c.machine.remote_sendable(),
+        funder_reserve: c.machine.funder_reserve(),
         peer_behind: c.peer_behind.is_some(),
         splice: c.machine.splice_status(),
         splices: splices && c.synced,

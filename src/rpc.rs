@@ -732,6 +732,10 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("peer_identity", Json::str(s.peer_identity))
         .set("peer_owner", Json::str(s.peer_owner))
         .set("behind", Json::Bool(s.behind))
+        .set("sendable", Json::u64(s.sendable))
+        .set("close_reserve", Json::u64(s.close_reserve))
+        .set("remote_sendable", Json::u64(s.remote_sendable))
+        .set("funder_reserve", Json::u64(s.funder_reserve))
         .set("peer_behind", Json::Bool(s.peer_behind))
         .set("splices", Json::Bool(s.splices))
         .set("splice_refused", Json::Bool(s.splice_refused))
@@ -787,6 +791,16 @@ fn channel_terms(network: Network, accepted_min_delay: Option<u16>) -> Json {
                 amount_json(Amount::from_units(CHANNEL_FUND_FEE)),
             )
             .set("close_fee", amount_json(Amount::from_units(CLOSE_FEE)))
+            // Kept by the side that opens, on top of what it can send, to
+            // close alone (`txbuild::close_reserve`); the wallet page adds it
+            // to the capacity so that the amount typed is what can be sent.
+            .set(
+                "close_reserve",
+                amount_json(Amount::from_units(crate::channel::txbuild::close_reserve(
+                    t.default_delay,
+                    crate::mempool::MIN_FEE_RATE,
+                ))),
+            )
             .set("delay_blocks", Json::u64(u64::from(t.default_delay)))
             .set("min_delay_blocks", Json::u64(u64::from(t.min_delay)))
             // What this node accepts from a funder: the shortest delay it
@@ -6101,6 +6115,10 @@ mod tests {
             peer_owner: "cd".repeat(32),
             behind: false,
             peer_behind: true,
+            sendable: 0,
+            close_reserve: 0,
+            remote_sendable: 0,
+            funder_reserve: 0,
             splice: None,
             splices: true,
             splice_refused: false,

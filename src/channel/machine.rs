@@ -3423,6 +3423,39 @@ impl Machine {
     pub fn local_commit_number(&self) -> Option<u64> {
         self.local_commit_number
     }
+    /// What we keep in the channel to close it alone, as the side that
+    /// opened it (see [`txbuild::close_reserve`]); nothing as the other side.
+    pub fn close_reserve(&self) -> u64 {
+        if self.our_index == FUNDER {
+            self.commit_fee(FeeTier::High)
+        } else {
+            0
+        }
+    }
+
+    /// What the side that opened the channel keeps to close it alone,
+    /// whichever side we are.
+    pub fn funder_reserve(&self) -> u64 {
+        self.commit_fee(FeeTier::High)
+    }
+
+    /// The most the peer can pay us now: its balance, less the close
+    /// reserve if it opened the channel.
+    pub fn remote_sendable(&self) -> u64 {
+        let peer = 1 - self.our_index;
+        let keep = if peer == FUNDER {
+            self.funder_reserve()
+        } else {
+            0
+        };
+        self.current_balances()[peer].saturating_sub(keep)
+    }
+
+    /// The most we can pay now: our balance, less the close reserve.
+    pub fn sendable(&self) -> u64 {
+        self.current_balances()[self.our_index].saturating_sub(self.close_reserve())
+    }
+
     /// The state the next proposal, or splice, would take.
     pub fn next_state_number(&self) -> u64 {
         self.next_state()
