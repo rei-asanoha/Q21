@@ -602,6 +602,13 @@ impl Wallet {
     /// Each call consumes an index. With Lamport this is mandatory, not a
     /// privacy best practice.
     pub fn new_address(&mut self) -> Address {
+        // A one-time key already seen signing is never handed out again,
+        // whatever brought the index back below it.
+        if self.scheme.is_one_time() {
+            while self.consumed.contains(&self.next_index) {
+                self.next_index += 1;
+            }
+        }
         let index = self.next_index;
         self.next_index += 1;
         let h = pubkey_hash(self.scheme, &self.public_key(index));
@@ -1221,6 +1228,22 @@ impl Wallet {
         self.lookahead_to = self.lookahead_to.max(to);
     }
 
+    /// Takes every look-ahead index up to `ahead` as derived.
+    fn adopt_lookahead_up_to(&mut self, ahead: u32) {
+        let found: Vec<(Hash256, u32)> = self
+            .lookahead
+            .iter()
+            .filter(|(_, i)| **i <= ahead)
+            .map(|(k, i)| (*k, *i))
+            .collect();
+        for (k, i) in found {
+            self.known.insert(k, i);
+        }
+        self.next_index = self.next_index.max(ahead.saturating_add(1));
+        // The window moves on with it.
+        self.refresh_lookahead();
+    }
+
     /// Observes a block and marks as consumed any key that signed in it.
     ///
     /// # Why the chain is the best source
@@ -1234,6 +1257,23 @@ impl Wallet {
     pub fn record_spends(&mut self, block: &crate::block::Block) -> usize {
         let mut new_count = 0;
         let one_time = self.scheme.is_one_time();
+        // The window follows the wallet's own outputs too: a payment to an
+        // index ahead moves it there, as discovery does, so a long run of
+        // used addresses — a miner's, one per block found — never leaves a
+        // later key out of sight.
+        if one_time {
+            self.refresh_lookahead();
+            for tx in &block.transactions {
+                for out in &tx.outputs {
+                    if self.known.contains_key(&out.pubkey_hash) {
+                        continue;
+                    }
+                    if let Some(ahead) = self.lookahead.get(&out.pubkey_hash).copied() {
+                        self.adopt_lookahead_up_to(ahead);
+                    }
+                }
+            }
+        }
         for tx in &block.transactions {
             for input in &tx.inputs {
                 if input.witness.pubkey.is_empty() {
@@ -1243,18 +1283,8 @@ impl Wallet {
                 // A one-time key this wallet has not derived again: derive up
                 // to it, so that no new address can ever reuse it.
                 if one_time && !self.known.contains_key(&h) {
-                    self.refresh_lookahead();
                     if let Some(ahead) = self.lookahead.get(&h).copied() {
-                        let found: Vec<(Hash256, u32)> = self
-                            .lookahead
-                            .iter()
-                            .filter(|(_, i)| **i <= ahead)
-                            .map(|(k, i)| (*k, *i))
-                            .collect();
-                        for (k, i) in found {
-                            self.known.insert(k, i);
-                        }
-                        self.next_index = self.next_index.max(ahead.saturating_add(1));
+                        self.adopt_lookahead_up_to(ahead);
                     }
                 }
                 if let Some(index) = self.known.get(&h).copied() {
@@ -2857,6 +2887,56 @@ mod tests {
             assert_ne!(a.hash, signer, "a new address reused a spent key");
         }
         // An ML-DSA wallet is not one-time: nothing is looked ahead.
+    }
+
+    /// Red-team campaign 6, S1 (second round): the look-ahead follows the
+    /// wallet's own outputs, so a backup older than the window — a miner
+    /// derives one address per block found — still sees a key spent far
+    /// ahead; and a new address never lands on a consumed index.
+    #[test]
+    fn the_look_ahead_follows_the_outputs_past_its_window() {
+        let w = test_wallet();
+        let c = chain_with_funds(&mut test_wallet());
+        let base = 3u32;
+        let step = Wallet::ONE_TIME_LOOKAHEAD - 100;
+        let pays_to = |i: u32| crate::tx::TxOut {
+            value: Amount::from_units(50_000),
+            scheme: w.scheme(),
+            pubkey_hash: pubkey_hash(w.scheme(), &w.public_key(i)),
+        };
+        let template = c.block_at(c.height()).unwrap();
+        // Two payments, each just inside the window the previous one opens.
+        let mut b1 = template.clone();
+        let mut t1 = b1.transactions[0].clone();
+        t1.outputs = vec![pays_to(base + step)];
+        b1.transactions.push(t1);
+        let mut b2 = template.clone();
+        let mut t2 = b2.transactions[0].clone();
+        t2.outputs = vec![pays_to(base + 2 * step)];
+        b2.transactions.push(t2);
+        // Then a spend by a key beyond the first window entirely.
+        let far = base + 2 * step + 500;
+        let mut b3 = template.clone();
+        let mut t3 = b3.transactions[0].clone();
+        t3.inputs[0].witness.pubkey = w.public_key(far);
+        b3.transactions.push(t3);
+
+        let mut r = Wallet::from_seed([0x11; 32], Network::Regtest);
+        r.rescan(base);
+        for b in [&b1, &b2, &b3] {
+            r.record_spends(b);
+        }
+        assert!(
+            r.is_consumed(far),
+            "a key spent beyond the first window is seen"
+        );
+        assert!(r.next_index() > far);
+        // Brought back below it, a new address still skips the spent key.
+        let mut back = Wallet::from_seed([0x11; 32], Network::Regtest);
+        back.rescan(far);
+        back.mark_consumed(&[far, far + 1]);
+        let a = back.new_address();
+        assert_eq!(a.hash, pubkey_hash(w.scheme(), &w.public_key(far + 2)));
     }
 
     /// Tests of the ML-DSA wallet — the path that mainnet will use. Lamport is
