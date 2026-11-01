@@ -40,6 +40,7 @@
 
 pub mod addr;
 pub mod address;
+pub mod address_book;
 pub mod amount;
 pub mod argon2;
 pub mod bech32;

@@ -7650,7 +7650,10 @@ mod tests {
         assert!(archive.contains(r#"<span translate="no">${esc(c.label)}</span>"#));
         assert!(archive.contains("trunc(String(a.channel_id), 8)"));
         assert!(archive.contains("channelUnits(a.final_local)"));
-        assert!(archive.contains("closeReserve()"), "archives without the reserve");
+        assert!(
+            archive.contains("closeReserve()"),
+            "archives without the reserve"
+        );
         let refusal = channel_function("function channelRefusal(");
         assert!(refusal.contains("esc(plain || m)"));
         assert!(refusal.contains(r#"esc("Node message: " + m)"#));

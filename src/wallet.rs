@@ -214,6 +214,10 @@ pub struct Wallet {
     /// identity address ([`crate::contacts`]). Strictly local, sealed with
     /// the rest of the wallet.
     contacts: crate::contacts::ContactBook,
+    /// "My contacts": the payment addresses this wallet sends to, by a name
+    /// of its own ([`crate::address_book`]). Strictly local, sealed with the
+    /// rest of the wallet.
+    address_book: crate::address_book::AddressBook,
     /// The transactions this wallet sent to register a name: the payment of
     /// the price to its identity address, and the registration itself. Only
     /// to tell them apart in the history from an ordinary payment to that
@@ -251,6 +255,7 @@ impl Wallet {
             requested: BTreeSet::new(),
             locked: BTreeSet::new(),
             contacts: crate::contacts::ContactBook::default(),
+            address_book: crate::address_book::AddressBook::default(),
             name_txs: Vec::new(),
         }
     }
@@ -286,6 +291,7 @@ impl Wallet {
             requested: BTreeSet::new(),
             locked: BTreeSet::new(),
             contacts: crate::contacts::ContactBook::default(),
+            address_book: crate::address_book::AddressBook::default(),
             name_txs: Vec::new(),
         })
     }
@@ -1085,6 +1091,21 @@ impl Wallet {
     /// Restores the contact book read from the file.
     pub fn load_contacts(&mut self, book: crate::contacts::ContactBook) {
         self.contacts = book;
+    }
+
+    /// "My contacts", the address book of the Send page.
+    pub fn address_book(&self) -> &crate::address_book::AddressBook {
+        &self.address_book
+    }
+
+    /// The address book, to change it; the caller saves the wallet.
+    pub fn address_book_mut(&mut self) -> &mut crate::address_book::AddressBook {
+        &mut self.address_book
+    }
+
+    /// Restores the address book read from the file.
+    pub fn load_address_book(&mut self, book: crate::address_book::AddressBook) {
+        self.address_book = book;
     }
 
     /// Whether `txid` is one this wallet sent to register a name.

@@ -1272,6 +1272,22 @@ impl RpcContext {
                 "setaddresslabel",
                 "[wallet] Names an address in the local address book",
             ),
+            (
+                "addressbooklist",
+                "[wallet] My contacts: the addresses kept to send to, by name",
+            ),
+            (
+                "addressbookadd",
+                "[wallet] Keeps an address in My contacts (name, address, note)",
+            ),
+            (
+                "addressbookupdate",
+                "[wallet] Renames a contact of My contacts (address, name, note)",
+            ),
+            (
+                "addressbookremove",
+                "[wallet] Removes an address from My contacts (address)",
+            ),
             ("listtransactions", "[wallet] History of movements"),
             (
                 "estimatefee",
@@ -2807,6 +2823,10 @@ impl RpcContext {
             "checkbackup" => self.checkbackup(params),
             "listaddresses" => self.listaddresses(),
             "setaddresslabel" => self.setaddresslabel(params),
+            "addressbooklist" => self.addressbooklist(),
+            "addressbookadd" => self.addressbookadd(params),
+            "addressbookupdate" => self.addressbookupdate(params),
+            "addressbookremove" => self.addressbookremove(params),
             "listtransactions" => self.listtransactions(params),
             "estimatefee" => self.estimatefee(params),
             "preparesend" => self.preparesend(params),
@@ -4303,6 +4323,152 @@ impl RpcContext {
     /// not written into the chain, and not visible to anyone who receives a
     /// payment. They are sealed with the wallet when a passphrase exists,
     /// because "for my therapist" says a lot about who you associate with.
+    // --- "My contacts": the addresses kept to send to.
+    //
+    // Each address is checked before it is kept — its checksum, and the
+    // network of this node — so a contact chosen on the Send page is never a
+    // typo nor an address of another network. Strictly local: the book is
+    // sealed in the wallet file, like the channel contacts.
+
+    fn book_entry_json(e: &crate::address_book::Entry) -> Json {
+        Json::obj()
+            .set("address", Json::str(e.address.clone()))
+            .set("name", Json::str(e.name.clone()))
+            .set("note", Json::str(e.note.clone()))
+            .build()
+    }
+
+    /// The `address` parameter, checked and in its canonical form.
+    fn book_address_param(&self, params: &Json) -> Result<String, Json> {
+        let text = params
+            .get("address")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'address' expected"))?;
+        match Address::parse_on(text.trim(), self.network) {
+            Ok(a) => Ok(a.to_string_bech32()),
+            Err(crate::address::AddressError::WrongNetwork { .. }) => Err(rpc_error(
+                ERR_PARAMS,
+                "this address belongs to another network",
+            )),
+            Err(_) => Err(rpc_error(
+                ERR_PARAMS,
+                "invalid address: a character is probably mistyped",
+            )),
+        }
+    }
+
+    fn book_error(e: crate::address_book::BookError) -> Json {
+        use crate::address_book::BookError;
+        match e {
+            BookError::EmptyName => rpc_error(ERR_PARAMS, "the name is empty"),
+            BookError::NameTaken => rpc_error(ERR_PARAMS, "another contact already has this name"),
+            BookError::AlreadyKept(name) => rpc_error(
+                ERR_PARAMS,
+                &format!("this address is already in your contacts, as {name}"),
+            ),
+            BookError::Full => rpc_error(ERR_PARAMS, "your contacts are full"),
+            BookError::Unknown => rpc_error(ERR_NOT_FOUND, "unknown contact"),
+        }
+    }
+
+    fn book_save(&self, g: &Wallet) -> Result<(), Json> {
+        self.save_wallet(g).map_err(|_| {
+            rpc_error(
+                ERR_WALLET,
+                wallet_message(&crate::wallet::WalletError::SaveFailed),
+            )
+        })
+    }
+
+    fn addressbooklist(&self) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        Ok(Json::array(
+            g.address_book()
+                .list()
+                .into_iter()
+                .map(Self::book_entry_json)
+                .collect(),
+        ))
+    }
+
+    fn addressbookadd(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let address = self.book_address_param(params)?;
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let added = g
+            .address_book_mut()
+            .add(name, &address, note)
+            .cloned()
+            .map_err(Self::book_error)?;
+        if let Err(e) = self.book_save(&g) {
+            // Not kept on disk: not kept at all, so the page says so truly.
+            let _ = g.address_book_mut().remove(&address);
+            return Err(e);
+        }
+        Ok(Self::book_entry_json(&added))
+    }
+
+    fn addressbookupdate(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let address = self.book_address_param(params)?;
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let before = g
+            .address_book()
+            .get(&address)
+            .cloned()
+            .ok_or_else(|| Self::book_error(crate::address_book::BookError::Unknown))?;
+        let note = params
+            .get("note")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&before.note)
+            .to_string();
+        let updated = g
+            .address_book_mut()
+            .update(&address, name, &note)
+            .cloned()
+            .map_err(Self::book_error)?;
+        if let Err(e) = self.book_save(&g) {
+            let _ = g
+                .address_book_mut()
+                .update(&address, &before.name, &before.note);
+            return Err(e);
+        }
+        Ok(Self::book_entry_json(&updated))
+    }
+
+    fn addressbookremove(&self, params: &Json) -> Result<Json, Json> {
+        let w = self.require_wallet()?;
+        let address = self.book_address_param(params)?;
+        let mut g = w
+            .lock()
+            .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
+        let before = g
+            .address_book()
+            .get(&address)
+            .cloned()
+            .ok_or_else(|| Self::book_error(crate::address_book::BookError::Unknown))?;
+        g.address_book_mut()
+            .remove(&address)
+            .map_err(Self::book_error)?;
+        if let Err(e) = self.book_save(&g) {
+            let _ = g
+                .address_book_mut()
+                .add(&before.name, &before.address, &before.note);
+            return Err(e);
+        }
+        Ok(Json::obj().set("removed", Json::Bool(true)).build())
+    }
+
     fn setaddresslabel(&self, params: &Json) -> Result<Json, Json> {
         let w = self.require_wallet()?;
         let key_index = params
@@ -8123,6 +8289,118 @@ mod tests {
         // problem.
         let s = c.handle(r#"{"jsonrpc":"2.0","id":1,"method":"listtransactions"}"#);
         assert!(s.contains("complete_history"));
+    }
+
+    /// "My contacts": an address is checked, kept under one name, renamed,
+    /// removed; a typo or an address of another network is never kept.
+    #[test]
+    fn my_contacts_keep_checked_addresses() {
+        let c = context(true);
+        let mum = Wallet::from_seed([0x41; 32], NETWORK)
+            .new_address()
+            .to_string_bech32();
+        let dad = Wallet::from_seed([0x42; 32], NETWORK)
+            .new_address()
+            .to_string_bech32();
+        assert_eq!(
+            call_ok(&c, "addressbooklist", "{}")
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let r = call_ok(
+            &c,
+            "addressbookadd",
+            &format!(r#"{{"name":"Mum","address":"  {mum} ","note":"her phone"}}"#),
+        );
+        assert_eq!(
+            r.get("address").and_then(|v| v.as_str()),
+            Some(mum.as_str())
+        );
+        assert_eq!(r.get("note").and_then(|v| v.as_str()), Some("her phone"));
+        // The same address again: refused, with the name it has.
+        let e = call(
+            &c,
+            "addressbookadd",
+            &format!(r#"{{"name":"Mother","address":"{mum}"}}"#),
+        );
+        assert!(
+            e.encode().contains("already in your contacts, as Mum"),
+            "{}",
+            e.encode()
+        );
+        // The same name for another address: refused.
+        let e = call(
+            &c,
+            "addressbookadd",
+            &format!(r#"{{"name":"mum","address":"{dad}"}}"#),
+        );
+        assert!(
+            e.encode().contains("already has this name"),
+            "{}",
+            e.encode()
+        );
+        // A typo: one character changed breaks the checksum.
+        let mut typo: Vec<char> = dad.chars().collect();
+        let i = typo.len() - 3;
+        typo[i] = if typo[i] == 'q' { 'p' } else { 'q' };
+        let typo: String = typo.into_iter().collect();
+        let e = call(
+            &c,
+            "addressbookadd",
+            &format!(r#"{{"name":"Dad","address":"{typo}"}}"#),
+        );
+        assert!(e.encode().contains("mistyped"), "{}", e.encode());
+        // Another network.
+        let main = Wallet::from_seed([0x43; 32], Network::Mainnet)
+            .new_address()
+            .to_string_bech32();
+        let e = call(
+            &c,
+            "addressbookadd",
+            &format!(r#"{{"name":"Main","address":"{main}"}}"#),
+        );
+        assert!(e.encode().contains("another network"), "{}", e.encode());
+        call_ok(
+            &c,
+            "addressbookadd",
+            &format!(r#"{{"name":"Dad","address":"{dad}"}}"#),
+        );
+        let list = call_ok(&c, "addressbooklist", "{}");
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(names, ["Dad", "Mum"]);
+        // Renamed, the note kept when none is given.
+        let r = call_ok(
+            &c,
+            "addressbookupdate",
+            &format!(r#"{{"address":"{mum}","name":"Maman"}}"#),
+        );
+        assert_eq!(r.get("name").and_then(|v| v.as_str()), Some("Maman"));
+        assert_eq!(r.get("note").and_then(|v| v.as_str()), Some("her phone"));
+        call_ok(
+            &c,
+            "addressbookremove",
+            &format!(r#"{{"address":"{mum}"}}"#),
+        );
+        let e = call(
+            &c,
+            "addressbookremove",
+            &format!(r#"{{"address":"{mum}"}}"#),
+        );
+        assert!(e.get("error").is_some());
+        assert_eq!(
+            call_ok(&c, "addressbooklist", "{}")
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// An address gets a name, and the name comes back with the list.
