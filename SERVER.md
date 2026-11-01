@@ -218,6 +218,7 @@ and unable to log in**:
 
 ```bash
 adduser --system --group --home /opt/q21 --shell /usr/sbin/nologin q21
+chown root:root /opt/q21
 ```
 
 ---
@@ -459,6 +460,21 @@ NoNewPrivileges=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+# A network program with no reason to load code, change its personality,
+# reach devices, the kernel's modules, logs or clock, or open other kinds of
+# sockets: none of it is allowed, so a flaw in it cannot use any of it.
+MemoryDenyWriteExecute=true
+LockPersonality=true
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+UMask=0077
 
 # Ceilings: a node that runs away is restarted, the machine stays up.
 # Testnet needs well under 1 GiB; see "Memory and thread ceilings" below.
@@ -684,6 +700,7 @@ RuntimeDirectoryPreserve=yes
 PrivateTmp=true
 NoNewPrivileges=true
 ProtectHome=true
+ProtectSystem=full
 ExecStart=/opt/q21/monitor.sh
 EOF
 sudo tee /etc/systemd/system/q21-monitor.timer > /dev/null <<'EOF'
