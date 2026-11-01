@@ -596,8 +596,14 @@ function askForToken(){
   return tokenWait;
 }
 
+// One pause for the whole page: when the node asks it to slow down, every
+// call waits, rather than each retrying on its own and making it worse.
+let slowUntil = 0, slowStep = 0;
+const pause = ms => new Promise(ok => setTimeout(ok, ms));
+
 async function call(method, params, tries){
   if (exchange){ await exchange; exchange = null; }
+  if (Date.now() < slowUntil) await pause(slowUntil - Date.now());
   const r = await fetch(RPC, {
     method:"POST",
     headers: headers(),
@@ -613,12 +619,15 @@ async function call(method, params, tries){
     return call(method, params);
   }
   const j = await r.json();
-  // A public node that counts calls asks a fast page to slow down: wait a
-  // moment and try again, a few times, before showing the error.
-  if (j.error && /too many requests/i.test(j.error.message) && (tries||0) < 4){
-    await new Promise(ok => setTimeout(ok, 500 * 2 ** (tries||0)));
+  // A public node that counts calls asks a fast page to slow down: the
+  // whole page waits a growing moment, and this call tries again, a few
+  // times, before showing the error.
+  if (j.error && /too many requests/i.test(j.error.message) && (tries||0) < 3){
+    slowStep = Math.min(slowStep + 1, 5);
+    slowUntil = Math.max(slowUntil, Date.now() + 500 * 2 ** slowStep);
     return call(method, params, (tries||0) + 1);
   }
+  if (!j.error) slowStep = Math.max(slowStep - 1, 0);
   if (j.error) throw new Error(j.error.message);
   return j.result;
 }
@@ -709,7 +718,7 @@ function show(view){
   // past block no longer changes, and a page that reloads under your eyes
   // while you read it is a nuisance.
   if (heartbeat){ clearInterval(heartbeat); heartbeat = null; }
-  if (view === "home") heartbeat = setInterval(home, 4000);
+  if (view === "home") heartbeat = setInterval(refreshHome, 4000);
 }
 
 async function router(){
@@ -761,6 +770,15 @@ document.getElementById("search-form").addEventListener("submit", async ev => {
 // ---------------------------------------------------------------------------
 // Home
 // ---------------------------------------------------------------------------
+
+// A refresh still under way (a slow node, a page told to slow down) is not
+// stacked with another one.
+let homeRunning = false;
+async function refreshHome(){
+  if (homeRunning) return;
+  homeRunning = true;
+  try{ await home(); } finally { homeRunning = false; }
+}
 
 async function home(){
   try{
@@ -1421,8 +1439,12 @@ mod tests {
         let start = PAGE.find("async function call(").expect("call");
         let body = &PAGE[start..start + PAGE[start..].find("\n}\n").expect("end")];
         assert!(body.contains("/too many requests/i.test(j.error.message)"));
-        assert!(body.contains("(tries||0) < 4"));
-        assert!(body.contains("500 * 2 ** (tries||0)"));
+        assert!(body.contains("(tries||0) < 3"));
+        // One pause for the whole page, not one per call.
+        assert!(body.contains("if (Date.now() < slowUntil) await pause(slowUntil - Date.now());"));
+        assert!(body.contains("slowUntil = Math.max(slowUntil, Date.now() + 500 * 2 ** slowStep);"));
+        // And a home refresh never stacks on one still running.
+        assert!(PAGE.contains("if (homeRunning) return;"));
     }
 
     /// The fragment is a one-time launch token, exchanged before any call.

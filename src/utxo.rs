@@ -430,6 +430,28 @@ impl UtxoSet {
         (sum, count)
     }
 
+    /// [`UtxoSet::balance_of`], counting only the outputs of `scheme`: an
+    /// address is a scheme and a key hash, and an output of another scheme
+    /// on the same hash can never be spent by that address's key.
+    pub fn balance_of_scheme(
+        &self,
+        pubkey_hash: &crate::hash::Hash256,
+        scheme: crate::sig::SchemeId,
+    ) -> (u64, u64) {
+        let Some(points) = self.by_pubkey_hash.get(pubkey_hash) else {
+            return (0, 0);
+        };
+        let mut sum = 0u64;
+        let mut count = 0u64;
+        for e in points.iter().filter_map(|o| self.map.get(o)) {
+            if e.output.scheme == scheme {
+                sum = sum.saturating_add(e.output.value.units());
+                count += 1;
+            }
+        }
+        (sum, count)
+    }
+
     /// All the unspent outputs of a public key hash, **regardless of
     /// maturity**.
     ///

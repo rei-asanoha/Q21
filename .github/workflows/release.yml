@@ -596,13 +596,22 @@ jobs:
                 *.bin.sha256)
                   # The last line is read even without its line feed, and a
                   # line naming no file fails: neither slips past the check.
+                  # Each line is a full hash and a name; the platform's own
+                  # binary is among them, or the file is refused.
+                  seen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
+                    case "$_hash" in
+                      *[!0-9a-f]*) echo "::error::$name malformed"; exit 1 ;;
+                    esac
+                    [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem" | "q21-wallet-${stem#q21-}") ;;
+                      "$stem") seen=1 ;;
+                      "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"
+                  [ "$seen" = 1 ] || { echo "::error::$name does not name $stem"; exit 1; }
                   ;;
               esac
               if [ -e "artifacts/$name" ]; then
@@ -655,13 +664,22 @@ jobs:
                 *.bin.sha256)
                   # The last line is read even without its line feed, and a
                   # line naming no file fails: neither slips past the check.
+                  # Each line is a full hash and a name; the platform's own
+                  # binary is among them, or the file is refused.
+                  seen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
+                    case "$_hash" in
+                      *[!0-9a-f]*) echo "::error::$name malformed"; exit 1 ;;
+                    esac
+                    [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem" | "q21-wallet-${stem#q21-}") ;;
+                      "$stem") seen=1 ;;
+                      "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"
+                  [ "$seen" = 1 ] || { echo "::error::$name does not name $stem"; exit 1; }
                   ;;
               esac
               if [ -e "artifacts/$name" ]; then
@@ -757,13 +775,22 @@ jobs:
                 *.bin.sha256)
                   # The last line is read even without its line feed, and a
                   # line naming no file fails: neither slips past the check.
+                  # Each line is a full hash and a name; the platform's own
+                  # binary is among them, or the file is refused.
+                  seen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
+                    case "$_hash" in
+                      *[!0-9a-f]*) echo "::error::$name malformed"; exit 1 ;;
+                    esac
+                    [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem" | "q21-wallet-${stem#q21-}") ;;
+                      "$stem") seen=1 ;;
+                      "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"
+                  [ "$seen" = 1 ] || { echo "::error::$name does not name $stem"; exit 1; }
                   ;;
               esac
               if [ -e "artifacts/$name" ]; then
@@ -850,13 +877,22 @@ jobs:
                 *.bin.sha256)
                   # The last line is read even without its line feed, and a
                   # line naming no file fails: neither slips past the check.
+                  # Each line is a full hash and a name; the platform's own
+                  # binary is among them, or the file is refused.
+                  seen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
+                    case "$_hash" in
+                      *[!0-9a-f]*) echo "::error::$name malformed"; exit 1 ;;
+                    esac
+                    [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem" | "q21-wallet-${stem#q21-}") ;;
+                      "$stem") seen=1 ;;
+                      "q21-wallet-${stem#q21-}") ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"
+                  [ "$seen" = 1 ] || { echo "::error::$name does not name $stem"; exit 1; }
                   ;;
               esac
               if [ -e "artifacts/$name" ]; then

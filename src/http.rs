@@ -132,9 +132,18 @@ pub fn client_address(peer: Option<IpAddr>, headers: &BTreeMap<String, String>) 
     // (red-team 8b). The last entry is the one of the immediate trusted hop,
     // the only one we did not let the attacker choose.
     let last = forwarded.split(',').next_back().unwrap_or("").trim();
-    match last.parse::<IpAddr>() {
-        Ok(ip) => Some(ip),
-        Err(_) => Some(peer),
+    // A front server may write the address with its port (`1.2.3.4:5678`,
+    // `[2001:db8::1]:5678`) or an IPv6 one in brackets: read as the address,
+    // or every visitor fell back to the loopback and shared one budget.
+    let bare = last.strip_prefix('[').and_then(|v| v.strip_suffix(']'));
+    match last
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| bare.and_then(|v| v.parse::<IpAddr>().ok()))
+        .or_else(|| last.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+    {
+        Some(ip) => Some(ip),
+        None => Some(peer),
     }
 }
 
@@ -2029,6 +2038,18 @@ mod tests {
 
         // From elsewhere, the same header is a forgery: ignored.
         assert_eq!(client_address(Some(remote), &h), Some(remote));
+
+        // With its port, or an IPv6 one in brackets: still the visitor.
+        h.insert(
+            "x-forwarded-for".into(),
+            "1.2.3.4, 198.51.100.7:5678".into(),
+        );
+        assert_eq!(client_address(Some(loopback), &h), Some(visitor));
+        let v6: IpAddr = "2001:db8::7".parse().unwrap();
+        h.insert("x-forwarded-for".into(), "[2001:db8::7]:443".into());
+        assert_eq!(client_address(Some(loopback), &h), Some(v6));
+        h.insert("x-forwarded-for".into(), "[2001:db8::7]".into());
+        assert_eq!(client_address(Some(loopback), &h), Some(v6));
 
         // Unreadable: we fall back to the connection, without failing.
         h.insert("x-forwarded-for".into(), "not-an-address".into());

@@ -1577,8 +1577,9 @@ impl ChannelManager {
 
     // --- Operations the node/RPC initiate --------------------------------
 
-    /// From now on, no new channel is opened or accepted; `open` answers
-    /// `reason`. Channels already open keep running, closing and watching.
+    /// From now on, no new channel is opened or accepted, and no coin is
+    /// added to one; `open` and `splice` answer `reason`. Channels already
+    /// open keep running, closing and watching.
     pub fn refuse_opens(&self, reason: &str) {
         let _ = self.opens_refused.set(reason.to_string());
     }
@@ -1693,6 +1694,11 @@ impl ChannelManager {
     /// the transaction and holds its coins back; they are released if the
     /// peer refuses it or the channel closes before it confirms.
     pub fn splice(&self, cid: Hash256, add: u64) -> Result<Vec<u8>, String> {
+        // No more of the wallet's coins go into a channel this node no
+        // longer opens: the same reason holds.
+        if let Some(why) = self.opens_refused.get() {
+            return Err(why.clone());
+        }
         let (funding, funding_output, new_output, sequence) = {
             let g = self.inner.lock().unwrap();
             let chan = g.channels.get(&cid).ok_or("unknown channel")?;

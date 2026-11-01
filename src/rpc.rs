@@ -550,12 +550,33 @@ impl Bucket {
         }
     }
 
-    fn allow(&mut self, burst: u32, per_minute: u32, now: std::time::Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last).as_secs();
-        let gain = (elapsed.min(u32::MAX as u64) as u32).saturating_mul(per_minute) / 60;
+    /// Adds the tokens earned since the last refill, `per_period` every
+    /// `period_ms`, up to `burst`, then takes one if there is one. The time
+    /// a partial token has earned is kept for the next call: dropping it at
+    /// every refill gave a steady stream of calls about half its rate
+    /// (red-team campaign 6, round 4).
+    fn take(
+        &mut self,
+        burst: u32,
+        per_period: u32,
+        period_ms: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        let per_period = u64::from(per_period.max(1));
+        let elapsed = now.saturating_duration_since(self.last).as_millis();
+        let elapsed = elapsed.min(u128::from(u32::MAX)) as u64;
+        let gain = elapsed.saturating_mul(per_period) / period_ms;
         if gain > 0 {
-            self.tokens = self.tokens.saturating_add(gain).min(burst);
-            self.last = now;
+            let room = u64::from(burst.saturating_sub(self.tokens));
+            if gain >= room {
+                // Full: nothing more is banked.
+                self.tokens = burst;
+                self.last = now;
+            } else {
+                self.tokens += gain as u32;
+                let spent = gain.saturating_mul(period_ms).div_ceil(per_period);
+                self.last += std::time::Duration::from_millis(spent);
+            }
         }
         if self.tokens > 0 {
             self.tokens -= 1;
@@ -564,26 +585,14 @@ impl Bucket {
             false
         }
     }
-}
 
-impl Bucket {
+    fn allow(&mut self, burst: u32, per_minute: u32, now: std::time::Instant) -> bool {
+        self.take(burst, per_minute, 60_000, now)
+    }
+
     /// [`Bucket::allow`], refilled per second, to the millisecond.
     fn allow_per_second(&mut self, burst: u32, per_second: u32, now: std::time::Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last).as_millis();
-        let gain = (elapsed.min(u32::MAX as u128) as u64).saturating_mul(per_second as u64) / 1000;
-        if gain > 0 {
-            self.tokens = self
-                .tokens
-                .saturating_add(gain.min(u32::MAX as u64) as u32)
-                .min(burst);
-            self.last = now;
-        }
-        if self.tokens > 0 {
-            self.tokens -= 1;
-            true
-        } else {
-            false
-        }
+        self.take(burst, per_second, 1_000, now)
     }
 }
 
@@ -4057,6 +4066,11 @@ impl RpcContext {
             ));
         }
         let key_hash = address.hash;
+        // An address is a scheme and a key hash: an output of another scheme
+        // on the same hash is not this address's, and no key of it can spend
+        // it (red-team campaign 6, round 4).
+        let scheme = address.scheme;
+        let mine = |o: &crate::tx::TxOut| o.pubkey_hash == key_hash && o.scheme == scheme;
         let maximum = params
             .get("max")
             .and_then(|v| v.as_u64())
@@ -4087,7 +4101,7 @@ impl RpcContext {
                     for h in floor..=height {
                         if let Some(b) = c.block_at(h) {
                             for (rank, t) in b.transactions.iter().enumerate() {
-                                if t.outputs.iter().any(|o| o.pubkey_hash == key_hash) {
+                                if t.outputs.iter().any(mine) {
                                     v.push((h, rank as u32));
                                 }
                             }
@@ -4117,7 +4131,7 @@ impl RpcContext {
                     let received: u64 = tx
                         .outputs
                         .iter()
-                        .filter(|o| o.pubkey_hash == key_hash)
+                        .filter(|o| mine(o))
                         .map(|o| o.value.units())
                         .sum();
                     // A coin spent by a mempool transaction is still in the
@@ -4126,7 +4140,7 @@ impl RpcContext {
                         .inputs
                         .iter()
                         .filter_map(|i| c.utxo.get(&i.prev_out))
-                        .filter(|e| e.output.pubkey_hash == key_hash)
+                        .filter(|e| mine(&e.output))
                         .map(|e| e.output.value.units())
                         .sum();
                     if received == 0 && sent == 0 {
@@ -4166,7 +4180,7 @@ impl RpcContext {
             let received: u64 = tx
                 .outputs
                 .iter()
-                .filter(|o| o.pubkey_hash == key_hash)
+                .filter(|o| mine(o))
                 .map(|o| o.value.units())
                 .sum();
             let mut sent: u64 = 0;
@@ -4176,7 +4190,7 @@ impl RpcContext {
                     continue;
                 }
                 match self.resolve_output(&input.prev_out) {
-                    Some(o) if o.pubkey_hash == key_hash => sent += o.value.units(),
+                    Some(o) if mine(&o) => sent += o.value.units(),
                     Some(_) => {}
                     None => known = false,
                 }
@@ -4206,7 +4220,9 @@ impl RpcContext {
         // Through the key hash index, never through a scan: this request is
         // public and unauthenticated, and the lock it takes is the consensus
         // lock. See `UtxoSet::balance_of`.
-        let (balance, outputs) = self.node.with_chain(|c| c.utxo.balance_of(&key_hash));
+        let (balance, outputs) = self
+            .node
+            .with_chain(|c| c.utxo.balance_of_scheme(&key_hash, scheme));
 
         Ok(Json::obj()
             .set("address", Json::str(raw))
@@ -4797,7 +4813,7 @@ impl RpcContext {
                 .iter()
                 .filter_map(|id| m.get(id))
                 .filter(|tx| {
-                    tx.outputs.iter().any(|o| g.owns(&o.pubkey_hash))
+                    tx.outputs.iter().any(|o| g.owns_output(o))
                         || tx.inputs.iter().any(|e| {
                             !e.witness.pubkey.is_empty()
                                 && g.owns(&crate::sig::pubkey_hash(scheme, &e.witness.pubkey))
@@ -4838,7 +4854,7 @@ impl RpcContext {
                 let received: u64 = tx
                     .outputs
                     .iter()
-                    .filter(|o| g.owns(&o.pubkey_hash))
+                    .filter(|o| g.owns_output(o))
                     .map(|o| o.value.units())
                     .sum();
                 let mut committed: u64 = 0;
@@ -4945,7 +4961,7 @@ impl RpcContext {
                     let received: u64 = tx
                         .outputs
                         .iter()
-                        .filter(|o| g.owns(&o.pubkey_hash))
+                        .filter(|o| g.owns_output(o))
                         .map(|o| o.value.units())
                         .sum();
                     let mut inputs: Vec<(Hash256, u32)> = Vec::new();
@@ -7817,6 +7833,50 @@ mod tests {
         );
     }
 
+    /// A steady stream of calls a little faster than the refill gets the
+    /// burst and then the refill rate, not half of it: the time a partial
+    /// token has earned is kept (red-team campaign 6, round 4).
+    #[test]
+    fn a_steady_stream_gets_the_whole_refill_rate() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut b = Bucket::full(CALL_BURST, t0);
+        let mut granted = 0u32;
+        // 30 calls per second for 20 seconds, one every 33 ms.
+        for i in 0..600u64 {
+            if b.allow_per_second(
+                CALL_BURST,
+                CALLS_PER_SECOND,
+                t0 + Duration::from_millis(i * 33),
+            ) {
+                granted += 1;
+            }
+        }
+        // The burst, then what 19.767 s refill (the last call's time).
+        let expected = CALL_BURST + CALLS_PER_SECOND * 19_767 / 1000;
+        assert!(
+            granted + 2 >= expected && granted <= expected,
+            "{granted} granted, {expected} expected"
+        );
+        // The per-minute bucket, at twice its rate for ten minutes.
+        let mut m = Bucket::full(SCAN_BURST, t0);
+        let mut scans = 0u32;
+        for i in 0..240u64 {
+            if m.allow(
+                SCAN_BURST,
+                SCANS_PER_MINUTE,
+                t0 + Duration::from_millis(i * 2_500),
+            ) {
+                scans += 1;
+            }
+        }
+        let expected = SCAN_BURST + SCANS_PER_MINUTE * 5975 / 600;
+        assert!(
+            scans + 2 >= expected && scans <= expected,
+            "{scans} {expected}"
+        );
+    }
+
     /// The bucket itself: burst per client, `/48` in IPv6, bounded table with
     /// eviction of the least recently seen, and a global net that holds on its
     /// own.
@@ -9684,6 +9744,50 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .contains("Bounded"));
+    }
+
+    /// Red-team campaign 6, round 4: an output of another scheme on one of
+    /// the wallet's key hashes — anyone can make one from the address, and no
+    /// key can ever spend it — shows neither as received in the wallet's
+    /// activity nor in the explorer's balance of the real address.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn a_coin_of_another_scheme_is_not_shown_as_received() {
+        let c = context_with_funds();
+        let a = c.wallet.as_ref().unwrap().lock().unwrap().new_address();
+        let foreign = if a.scheme == SchemeId::MlDsa65 {
+            SchemeId::MlDsa87
+        } else {
+            SchemeId::MlDsa65
+        };
+        let before = call_ok(
+            &c,
+            "getaddress",
+            &format!(r#"{{"address":"{}"}}"#, a.to_string_bech32()),
+        );
+        let history = |c: &RpcContext| call_ok(c, "listtransactions", r#"{"limit":1000}"#).encode();
+        let activity_before = history(&c);
+        c.node.with_chain(|chain| {
+            let t = crate::chain::GENESIS_TIME + (chain.height() + 1) * TARGET_BLOCK_SECS;
+            let b = chain
+                .mine_block(a.hash, foreign, &[], t, 5_000_000)
+                .expect("mining");
+            chain.connect(&b, t + 1).expect("connect");
+        });
+        let after = call_ok(
+            &c,
+            "getaddress",
+            &format!(r#"{{"address":"{}"}}"#, a.to_string_bech32()),
+        );
+        assert_eq!(after.get("balance"), before.get("balance"));
+        assert_eq!(after.get("unspent_outputs"), before.get("unspent_outputs"));
+        assert_eq!(after.get("total_movements"), before.get("total_movements"));
+        // The activity gains no line: the coin is not the wallet's.
+        let activity_after = history(&c);
+        assert_eq!(
+            activity_after.matches("\"txid\"").count(),
+            activity_before.matches("\"txid\"").count()
+        );
     }
 
     /// An unreadable address does not make the node work.

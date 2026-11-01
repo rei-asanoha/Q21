@@ -709,5 +709,8 @@ fn the_release_never_merges_the_artifacts_of_two_platforms() {
             .count(),
         4
     );
-    assert_eq!(workflow.matches("malformed\"; exit 1;").count(), 4);
+    assert_eq!(workflow.matches("malformed\"; exit 1;").count(), 8);
+    // Every line holds a full hash, and the platform's own binary is named.
+    assert_eq!(workflow.matches(r#"[ "${#_hash}" -eq 64 ]"#).count(), 4);
+    assert_eq!(workflow.matches("does not name $stem").count(), 4);
 }

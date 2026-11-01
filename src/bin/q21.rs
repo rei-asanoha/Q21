@@ -4854,6 +4854,18 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
 
             let folder = datadir.to_path_buf();
             let mut seed = wallet.lock().unwrap().channel_seed();
+            // A wallet on another scheme than the channels' could never
+            // spend an output of the channel scheme paid to one of its own
+            // addresses. Its channels — opened before such wallets were
+            // refused — pay the node's identity address instead, an address
+            // of the channel scheme that `identitysweep` brings back to the
+            // wallet.
+            let channel_scheme = q21_core::channel::keys::CHANNEL_SCHEME;
+            let off_scheme = wallet.lock().unwrap().scheme() != channel_scheme;
+            let identity_address = q21_core::sig::pubkey_hash(
+                channel_scheme,
+                q21_core::channel::keys::NodeIdentity::derive(&seed).pubkey(),
+            );
             let jdir = datadir.join("channels");
             let _ = std::fs::create_dir_all(&jdir);
 
@@ -4954,6 +4966,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // time; persist it at once so a crash cannot leave the recovered
             // funds paying an address the reloaded wallet has forgotten.
             let sweep_address = Box::new(move || {
+                if off_scheme {
+                    return identity_address;
+                }
                 let mut w = w_sweep.lock().unwrap();
                 let h = w.new_address().hash;
                 let _ = write_wallet(&folder_sweep, &w);
@@ -4964,6 +4979,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             let w_payout = wallet.clone();
             let folder_payout = folder.clone();
             let payout_address = Box::new(move || {
+                if off_scheme {
+                    return identity_address;
+                }
                 let mut w = w_payout.lock().unwrap();
                 let h = w.new_address().hash;
                 // Persist at once: a fresh address must survive a crash, or the
@@ -5008,13 +5026,21 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // A close, a sweep or a penalty pays a wallet address as an
             // output of the channel scheme: a wallet on another scheme could
             // never spend it. Such a wallet opens and accepts no channel.
-            let wallet_scheme = wallet.lock().unwrap().scheme();
-            if wallet_scheme != q21_core::channel::keys::CHANNEL_SCHEME {
+            if off_scheme {
+                let wallet_scheme = wallet.lock().unwrap().scheme();
                 mgr.refuse_opens(&format!(
                     "payment channels need a wallet on {}; this wallet is on {}",
-                    q21_core::channel::keys::CHANNEL_SCHEME.name(),
+                    channel_scheme.name(),
                     wallet_scheme.name()
                 ));
+                let journaled = mgr.list().len();
+                if journaled > 0 {
+                    eprintln!(
+                        "  note: this wallet is on {}: its {journaled} payment channel(s) pay \
+                         their closes to the identity address; bring them back with identitysweep.",
+                        wallet_scheme.name()
+                    );
+                }
             }
             // Every channel frame travels in an authenticated session: the
             // transport is what the node talks to, the manager behind it.
