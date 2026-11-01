@@ -340,6 +340,17 @@ impl Parser<'_> {
         }
     }
 
+    /// Four hexadecimal digits, as the value they write.
+    fn hex4(&mut self) -> Result<u32, JsonError> {
+        let mut code = 0u32;
+        for _ in 0..4 {
+            let h = self.peek()?;
+            self.i += 1;
+            code = code * 16 + h.to_digit(16).ok_or(JsonError::InvalidEscape)?;
+        }
+        Ok(code)
+    }
+
     fn string(&mut self) -> Result<String, JsonError> {
         self.expect('"')?;
         let mut s = String::new();
@@ -361,14 +372,33 @@ impl Parser<'_> {
                         'b' => s.push('\u{08}'),
                         'f' => s.push('\u{0c}'),
                         'u' => {
-                            let mut code = 0u32;
-                            for _ in 0..4 {
-                                let h = self.peek()?;
-                                self.i += 1;
-                                code =
-                                    code * 16 + h.to_digit(16).ok_or(JsonError::InvalidEscape)?;
-                            }
-                            s.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                            let code = self.hex4()?;
+                            // A character beyond the first plane comes as a
+                            // pair of escapes, high then low: joined, it is
+                            // that one character (an emoji in a contact's
+                            // name). Half a pair is refused rather than
+                            // turned into a replacement character.
+                            let c = match code {
+                                0xD800..=0xDBFF => {
+                                    if self.peek()? != '\\' {
+                                        return Err(JsonError::InvalidEscape);
+                                    }
+                                    self.i += 1;
+                                    if self.peek()? != 'u' {
+                                        return Err(JsonError::InvalidEscape);
+                                    }
+                                    self.i += 1;
+                                    let low = self.hex4()?;
+                                    if !(0xDC00..=0xDFFF).contains(&low) {
+                                        return Err(JsonError::InvalidEscape);
+                                    }
+                                    let v = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                    char::from_u32(v).ok_or(JsonError::InvalidEscape)?
+                                }
+                                0xDC00..=0xDFFF => return Err(JsonError::InvalidEscape),
+                                _ => char::from_u32(code).ok_or(JsonError::InvalidEscape)?,
+                            };
+                            s.push(c);
                         }
                         _ => return Err(JsonError::InvalidEscape),
                     }
@@ -487,6 +517,20 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A character beyond the first plane, escaped as a pair, is that
+    /// character; half a pair is refused (red-team campaign 6, W5c).
+    #[test]
+    fn escaped_surrogate_pairs_are_joined() {
+        let v = parse(r#""a\ud83d\ude00b""#).unwrap();
+        assert_eq!(v.as_str(), Some("a\u{1F600}b"));
+        assert!(parse(r#""\ud83d""#).is_err());
+        assert!(parse(r#""\ud83dx""#).is_err());
+        assert!(parse(r#""\ude00""#).is_err());
+        assert!(parse(r#""\ud83d\u0041""#).is_err());
+        assert_eq!(parse(r#""\u00e9""#).unwrap().as_str(), Some("\u{e9}"));
+    }
+
     use super::*;
 
     #[test]
