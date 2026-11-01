@@ -4310,22 +4310,6 @@ impl RpcContext {
         Ok(Json::array(v))
     }
 
-    /// Names an address in the local address book.
-    ///
-    /// # Why this exists
-    ///
-    /// Q21 encourages giving a different address to each correspondent: that
-    /// is what keeps your payments from being linked together. The price to pay
-    /// is that after a month you have four hundred strings of characters and
-    /// no idea who is who. The address book gives back to the owner what
-    /// privacy cost them.
-    ///
-    /// # What this is not
-    ///
-    /// These names **never leave the machine**. They are not passed to peers,
-    /// not written into the chain, and not visible to anyone who receives a
-    /// payment. They are sealed with the wallet when a passphrase exists,
-    /// because "for my therapist" says a lot about who you associate with.
     // --- "My contacts": the addresses kept to send to.
     //
     // Each address is checked before it is kept — its checksum, and the
@@ -4472,6 +4456,22 @@ impl RpcContext {
         Ok(Json::obj().set("removed", Json::Bool(true)).build())
     }
 
+    /// Names an address in the local address book.
+    ///
+    /// # Why this exists
+    ///
+    /// Q21 encourages giving a different address to each correspondent: that
+    /// is what keeps your payments from being linked together. The price to pay
+    /// is that after a month you have four hundred strings of characters and
+    /// no idea who is who. The address book gives back to the owner what
+    /// privacy cost them.
+    ///
+    /// # What this is not
+    ///
+    /// These names **never leave the machine**. They are not passed to peers,
+    /// not written into the chain, and not visible to anyone who receives a
+    /// payment. They are sealed with the wallet when a passphrase exists,
+    /// because "for my therapist" says a lot about who you associate with.
     fn setaddresslabel(&self, params: &Json) -> Result<Json, Json> {
         let w = self.require_wallet()?;
         let key_index = params

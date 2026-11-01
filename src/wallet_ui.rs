@@ -2213,9 +2213,12 @@ function bookRefusal(title, e){
   return `<div class="warn"><h3>${esc(title)}</h3><p>${esc(plain || m)}</p>${html(words)}</div>`;
 }
 
+let bookRound = 0;
 async function loadBook(){
+  const round = ++bookRound;
   try{
     const list = await call("addressbooklist");
+    if (round !== bookRound) return;
     addressBook = Array.isArray(list) ? list : [];
   }catch(e){
     document.getElementById("book-list").innerHTML =
@@ -2257,6 +2260,8 @@ document.getElementById("book-select").addEventListener("change", ev => {
   const a = ev.target.value;
   if (!a) return;
   document.getElementById("address-field").value = a;
+  // Back to "Choose a contact…", so the same contact can be chosen again.
+  ev.target.value = "";
   document.getElementById("amount-field").focus();
 });
 
@@ -2323,7 +2328,7 @@ document.getElementById("book-list").addEventListener("click", async ev => {
   const send = t.closest("[data-book-send]");
   if (send){
     document.getElementById("address-field").value = send.dataset.bookSend;
-    document.getElementById("book-select").value = send.dataset.bookSend;
+    document.getElementById("book-select").value = "";
     document.getElementById("send-form").scrollIntoView({block: "start"});
     document.getElementById("amount-field").focus();
     return;
@@ -2435,7 +2440,7 @@ function sendProblem(message){
     return "This amount needs too many small coins at once. Gather your small coins with the button below, then send again.";
   if (/below the floor|dust/i.test(m))
     return "The minimum amount is 0.0001 Q21.";
-  if (/FeeRateTooLow|fee/i.test(m))
+  if (/FeeRateTooLow|fee rate|fee too low/i.test(m))
     return "The fee is too low. In “Fee setting (advanced)”, put 3 or 4, then Recalculate the fee.";
   if (/failed to fetch|networkerror|load failed/i.test(m))
     return "Could not reach the node. Is the wallet still running?";
@@ -2600,7 +2605,9 @@ document.getElementById("send-button").addEventListener("click", async () => {
     //
     // The delay leaves time to read the green card before the screen changes:
     // switching within the second would feel like a jumping screen.
-    setTimeout(() => show("activity"), 1200);
+    // Except when the page offers to keep a new address in My contacts:
+    // the button would leave with the screen.
+    if (!offerToKeep(p.address)) setTimeout(() => show("activity"), 1200);
   }catch(e){
     const plain = sendProblem(e.message);
     // Too many small coins for one transaction: the remedy is one click
@@ -3343,11 +3350,11 @@ document.getElementById("reachable-switch").addEventListener("click", async () =
     // other hand, is decided at launch; `paintReachable` says so when needed.
     let mining = false;
     try{ mining = !!(await call("getmining")).active; }catch(e){ /* no wallet: no mining */ }
-    paintReachable({
+    paintReachable(Object.assign({}, lastNetInfo, {
       reachable: !!res.reachable,
       reachable_session: res.reachable_session,
       port_mapping: ""
-    }, mining);
+    }), mining);
   }catch(e){
     showError("The setting could not be changed: " + e.message);
   }finally{
@@ -3449,7 +3456,7 @@ document.getElementById("tor-switch").addEventListener("click", async () => {
   const want = b.getAttribute("aria-pressed") !== "true";
   try{
     const res = await call("settor", {active: want});
-    paintTor({tor: !!res.tor, tor_session: !!res.tor_session, peers: 1});
+    paintTor(Object.assign({}, lastNetInfo, {tor: !!res.tor, tor_session: !!res.tor_session}));
   }catch(e){
     showError("The Tor setting could not be changed: " + e.message);
   }finally{
@@ -3512,6 +3519,10 @@ function paintReachable(info, miningActive){
   state.textContent = text;
 }
 
+// The last full information the Network page was painted from: a switch's
+// reply carries only its own setting, and is merged into it.
+let lastNetInfo = {};
+
 async function loadNetwork(){
   try{
     const r = await call("getnetworkhashrate");
@@ -3520,6 +3531,7 @@ async function loadNetwork(){
       let mining = false;
       try{ mining = !!(await call("getmining")).active; }catch(e){ /* no wallet: no mining */ }
       const info = await call("getinfo");
+      lastNetInfo = info;
       paintReachable(info, mining);
       paintTor(info);
     }catch(e){ /* the tab stays useful without this detail */ }
@@ -4681,7 +4693,10 @@ function paintArchive(){
     const cap = channelUnits(a.capacity), last = channelUnits(a.final_local);
     const put = a.we_funded === true ? (cap === null ? null : cap > keep ? cap - keep : 0n) : 0n;
     const back = last === null ? null : last > keep ? last - keep : 0n;
-    const moved = put !== null && back !== null ? back - put : null;
+    // What moved does not depend on the reserve: what came back less what
+    // was put in, from the node's own figures.
+    const moved = last === null || (a.we_funded === true && cap === null) ? null
+      : last - (a.we_funded === true ? cap : 0n);
     const sign = moved === null ? "—" : moved < 0n ? "− " + shortQ21(-moved) : moved > 0n ? "+ " + shortQ21(moved) : shortQ21(0n);
     return `<tr>
         <td>${esc(when)}</td>

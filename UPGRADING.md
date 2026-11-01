@@ -71,6 +71,10 @@ file you do not install.
 and a 0.5.6 node accept the same blocks and keep the same channels. Mining
 does not need to stop. It is a release of the wallet page.
 
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, and block timestamps strictly after their parent's
+from block 5,950.
+
 ## What changes
 
 | | 0.5.5 | 0.5.6 |
