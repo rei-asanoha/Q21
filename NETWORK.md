@@ -248,7 +248,7 @@ trust (`--bootstrap`), and start it again.
 
 ## A block comes after its parent
 
-From testnet block 7,600 (0.5.4), a block's timestamp must be strictly later
+From testnet block 5,950 (0.5.5; 0.5.4 had scheduled it at 7,600), a block's timestamp must be strictly later
 than its parent's, on top of the older rule: later than the median of the
 eleven blocks before it. The median alone let a miner with a minority of the
 hashrate date its blocks back, block after block, and slow the chain down:
@@ -260,7 +260,7 @@ about a tenth of two minutes.
 It is a stricter rule: every block it accepts, an older node accepts too,
 and an older node follows the chain it builds. Only a miner still on an
 older release may produce a block the others refuse; mining nodes must run
-0.5.4 before block 7,600. `getinfo` → `block_time_rule` says from which
+0.5.5 before block 5,950. `getinfo` → `block_time_rule` says from which
 height the rule holds and whether the next block is under it.
 
 ## The testnet entry points, today

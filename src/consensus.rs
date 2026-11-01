@@ -673,11 +673,12 @@ pub const NAME_ACTIVATION_REGTEST: u64 = 1;
 /// Mainnet: from its first block. Regtest: never, so that tests and local
 /// test networks may mine many blocks a second; an audit build moves it
 /// there.
-/// Testnet: block 7,600, scheduled on 31 October 2026 with the tip at 5,789
-/// — about two and a half days later at the target spacing, two days or so
-/// after the release.
+/// Testnet: block 5,950. 0.5.4 scheduled it at 7,600, with the tip at 5,789
+/// on 31 October 2026; the miners stopped at 5,814 so that every node could
+/// take 0.5.5, and its earlier height, before the chain moves on. A node on
+/// 0.5.4 accepts every block a 0.5.5 node accepts.
 pub const STRICT_TIME_ACTIVATION_MAINNET: u64 = 1;
-pub const STRICT_TIME_ACTIVATION_TESTNET: u64 = 7_600;
+pub const STRICT_TIME_ACTIVATION_TESTNET: u64 = 5_950;
 pub const STRICT_TIME_ACTIVATION_REGTEST: u64 = u64::MAX;
 
 /// What a name costs, in units: 0.5 Q21, destroyed. The output that carries
@@ -769,7 +770,7 @@ const _: () = {
     // and on testnet past the tip it was scheduled at and after the names.
     assert!(STRICT_TIME_ACTIVATION_MAINNET == 1);
     assert!(STRICT_TIME_ACTIVATION_REGTEST == u64::MAX);
-    assert!(STRICT_TIME_ACTIVATION_TESTNET > 5_789 + 1_440);
+    assert!(STRICT_TIME_ACTIVATION_TESTNET > 5_814 + 100);
     assert!(STRICT_TIME_ACTIVATION_TESTNET > NAME_ACTIVATION_TESTNET);
 
     // Names: never on mainnet yet, at block 1 on regtest, and on testnet
