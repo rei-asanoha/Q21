@@ -231,7 +231,11 @@ The Send page keeps the addresses you send to under a name of your own —
 "Mum", "Exchange" — with a note if you want one (0.5.6). Each address is
 checked by the node before it is kept: its checksum, which catches a typo,
 and its network, so a testnet contact is never a mainnet address. An address
-is kept under one name only, and two contacts cannot share a name.
+is kept under one name only, and two contacts cannot share a name — nor two
+names drawn alike: "Mum" and "Мum" (a Cyrillic М) are one name, and the
+second is refused with the name it copies. Names that differ only by an
+accent are both kept, each shown with a warning to check the address
+(0.5.7).
 
 Choosing a contact fills in the address; the payment's recap shows the name
 next to the address. After a payment to a new address, the page offers to

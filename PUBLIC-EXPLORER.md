@@ -122,11 +122,11 @@ neither.
 ### On the server
 
 The program comes from the **signed release** of the version you install
-(replace `v0.5.6`); a build of the **Actions** tab is never signed, and is
+(replace `v0.5.7`); a build of the **Actions** tab is never signed, and is
 never installed:
 
 ```bash
-cd ~ && V=v0.5.6 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
+cd ~ && V=v0.5.7 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
 ```
 
 Check the signature **before** installing (`sudo apt install -y minisign`

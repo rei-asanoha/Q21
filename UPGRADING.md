@@ -67,6 +67,41 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.5.6 to 0.5.7
+
+0.5.7 changes no rule of the chain and nothing in a channel's protocol: a
+0.5.6 node and a 0.5.7 node accept the same blocks and keep the same
+channels. Mining does not need to stop. It is a security release: the fixes
+of the sixth red-team campaign (RED-TEAM-2026-6.md).
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, and block timestamps strictly after their parent's
+from block 5,950.
+
+## What changes
+
+| | 0.5.6 | 0.5.7 |
+|---|---|---|
+| A channel peer's unproven claim that your copy is older | Froze the channel | Held two minutes; closing alone then asks whether this wallet was restored from a backup |
+| A coin of another scheme paid to one of your key hashes | Counted in the balance, chosen for a send | Ignored: no key of the wallet can spend it. The explorer and the activity ignore it too |
+| A wallet on another signature than the default | Could open channels whose closes it could not spend | Opens, accepts and adds to none; its older channels close alone, to the identity address |
+| One-time keys after a backup | Could be derived again | Recognized in the chain and never used twice |
+| My contacts | Look-alike names refused through a short table | Read through Unicode's data and the letters fonts draw alike; three accents kept, emoji kept whole |
+| Public explorer | Batches of ten | Every call counted: 120 at once then 20 a second per visitor, 600 a second in all; an IPv6 visitor counted by its `/48`; the page waits and tries again when told to slow down |
+| Release | One folder for all platforms | One folder per platform; a hash file names only its own platform's files |
+
+## Who should upgrade, and when
+
+Everyone, when convenient: wallets for the fixes above, public explorers and
+entry points for the call budget. A server updates from the signed release
+only (SERVER.md).
+
+## The data folder
+
+Unchanged. Going back to 0.5.6 with the same folder loses nothing.
+
+---
+
 # Upgrading from 0.5.5 to 0.5.6
 
 0.5.6 changes no rule of the chain and nothing in a channel: a 0.5.5 node
