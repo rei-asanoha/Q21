@@ -87,6 +87,20 @@ port, and listens on the computer itself only (`127.0.0.1`). The card then
 says *Hidden node on*. The onion address is kept in `q21-data/tor/onion/`:
 as long as that folder is kept, the address stays the same.
 
+A hidden node checks that it can really be reached (0.5.7): a few minutes
+after Tor starts, then every twenty minutes, it calls its own onion address
+through Tor, as a contact calling it would. Twice without an answer, and the
+log says *this node's onion address does not answer*; the Tor the wallet
+started is then started again, at most every half hour. After the computer
+slept twenty minutes or more, that Tor is started again at once: a Tor left
+as it was after a night of sleep kept running with its onion service
+unreachable for hours. The onion address does not change.
+
+Calling a contact (**Private channel** → **Connect**), the page follows the
+call to its end: *Calling this contact…*, then *✓ Connected*, or *This
+contact does not answer* when its onion address does not answer — its
+wallet closed, its computer asleep, or its Tor not ready.
+
 ---
 
 ## 3 · A node from the command line

@@ -479,6 +479,42 @@ pub struct ScanBucket {
     calls: Vec<(ClientKey, Bucket, std::time::Instant)>,
 }
 
+/// How a call of a contact went ([`RpcContext::contactconnect`]).
+#[cfg(feature = "mldsa")]
+#[derive(Clone, Debug)]
+enum Call {
+    /// Its peers were asked where it listens, at this time.
+    Searching(std::time::Instant),
+    /// Being dialed through Tor since this time.
+    Dialing(std::time::Instant),
+    /// Reached at this time: the handshake and the session follow.
+    Answered(std::time::Instant),
+    /// The call failed, and why.
+    Failed(String),
+}
+
+/// A call through Tor gives up after a minute ([`crate::socks::TOR_CONNECT_TIMEOUT`]).
+#[cfg(feature = "mldsa")]
+const CALL_DIAL_LIMIT: std::time::Duration = std::time::Duration::from_secs(75);
+/// Reached, the contact's session opens within seconds.
+#[cfg(feature = "mldsa")]
+const CALL_SESSION_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Peers answer where a contact listens within seconds, or not at all.
+#[cfg(feature = "mldsa")]
+const CALL_SEARCH_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The calls of this process, by contact: a handful, kept small.
+#[cfg(feature = "mldsa")]
+fn calls() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<Hash256, Call>> {
+    static CALLS: Mutex<std::collections::BTreeMap<Hash256, Call>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    let mut g = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() > 256 {
+        g.clear();
+    }
+    g
+}
+
 /// Calls granted up front to each client of a public explorer.
 pub const CALL_BURST: u32 = 120;
 /// Calls regained per second, per client: a page of the explorer makes a
@@ -1519,7 +1555,7 @@ impl RpcContext {
             ("contactremove", "[wallet] Remove a contact (owner)"),
             (
                 "contactconnect",
-                "[wallet] Connect to a contact where it listens (owner)",
+                "[wallet] Connect to a contact where it listens, or how the call went (owner, [check])",
             ),
             (
                 "contactverify",
@@ -2693,22 +2729,67 @@ impl RpcContext {
 
     /// Gets a contact connected: `connected` if a session with its key is up,
     /// `dialing` if this node knows where it listens and is calling it,
-    /// `searching` if it asked its peers where it listens. Called again until
-    /// `connected`.
+    /// `searching` if it asked its peers where it listens.
+    ///
+    /// With `check`, nothing new is started, except the call of a contact
+    /// whose address a search has just brought: the page asks this every few
+    /// seconds after Connect, and says how the call ended — `unreachable`
+    /// (with a `reason`) when the contact's onion address did not answer,
+    /// `not_found` when no peer knew where it listens. Until 0.5.7 a failed
+    /// call was dropped without a word: the page said "Calling this
+    /// contact…" for ever.
     #[cfg(feature = "mldsa")]
     fn contactconnect(&self, params: &Json) -> Result<Json, Json> {
         let mgr = self.channels_open()?;
         let owner = self.owner_param(params)?;
+        let check = matches!(params.get("check"), Some(Json::Bool(true)));
         let status = |s: &str| Ok(Json::obj().set("status", Json::str(s)).build());
         if mgr.connection_of_owner(&owner).is_some() {
+            calls().remove(&owner);
             return status("connected");
+        }
+        let now = std::time::Instant::now();
+        let state = calls().get(&owner).cloned();
+        match state {
+            // A call under way: never a second one at the same time.
+            Some(Call::Dialing(at)) if now.duration_since(at) < CALL_DIAL_LIMIT => {
+                return status("dialing");
+            }
+            // Connected through Tor; the handshake and the session follow.
+            Some(Call::Answered(at)) if now.duration_since(at) < CALL_SESSION_LIMIT => {
+                return status("dialing");
+            }
+            _ => {}
+        }
+        if check {
+            return match state {
+                Some(Call::Failed(reason)) => Ok(Json::obj()
+                    .set("status", Json::str("unreachable"))
+                    .set("reason", Json::str(reason))
+                    .build()),
+                Some(Call::Answered(_)) | Some(Call::Dialing(_)) => Ok(Json::obj()
+                    .set("status", Json::str("unreachable"))
+                    .set(
+                        "reason",
+                        Json::str("the contact's wallet did not open a session"),
+                    )
+                    .build()),
+                Some(Call::Searching(at)) => match self.node.reach_of(&owner) {
+                    // The answer of a peer has come: call now, without
+                    // waiting for the holder to press again.
+                    Some(target) => {
+                        self.start_call(owner, target);
+                        status("dialing")
+                    }
+                    None if now.duration_since(at) < CALL_SEARCH_LIMIT => status("searching"),
+                    None => status("not_found"),
+                },
+                None => status("idle"),
+            };
         }
         match self.node.reach_of(&owner) {
             Some(target) => {
-                let node = self.node.clone();
-                std::thread::spawn(move || {
-                    let _ = node.dial_reach(&target);
-                });
+                self.start_call(owner, target);
                 status("dialing")
             }
             None => {
@@ -2719,9 +2800,25 @@ impl RpcContext {
                         "no connected peer can say where this contact listens",
                     ));
                 }
+                calls().insert(owner, Call::Searching(now));
                 status("searching")
             }
         }
+    }
+
+    /// Calls `owner` where it said it listens, on a thread of its own, and
+    /// keeps how the call ended for [`Self::contactconnect`].
+    #[cfg(feature = "mldsa")]
+    fn start_call(&self, owner: Hash256, target: crate::wire::ReachTarget) {
+        calls().insert(owner, Call::Dialing(std::time::Instant::now()));
+        let node = self.node.clone();
+        std::thread::spawn(move || {
+            let end = match node.dial_reach(&target) {
+                Ok(_) => Call::Answered(std::time::Instant::now()),
+                Err(e) => Call::Failed(e.to_string()),
+            };
+            calls().insert(owner, end);
+        });
     }
 
     /// The protocol version of connection `peer`.

@@ -89,6 +89,8 @@ from block 5,950.
 | My contacts | Look-alike names refused through a short table | Read through Unicode's data and the letters fonts draw alike; three accents kept, emoji kept whole |
 | Public explorer | Batches of ten | Every call counted: 120 at once then 20 a second per visitor, 600 a second in all; an IPv6 visitor counted by its `/48`; the page waits and tries again when told to slow down |
 | Release | One folder for all platforms | One folder per platform; a hash file names only its own platform's files |
+| Calling a contact (Private channel → Connect) | "Calling this contact…" for ever when it did not answer; press again after a search | The page follows the call: connected, does not answer, or cannot be found, and calls by itself once the address is found |
+| A hidden node after the computer slept | Its Tor could stay unreachable for hours | Its own onion address is checked every twenty minutes; Tor is started again after a sleep of twenty minutes or more, or when the address does not answer |
 
 ## Who should upgrade, and when
 

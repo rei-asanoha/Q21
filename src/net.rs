@@ -2696,6 +2696,19 @@ impl Node {
         self.proxy.read().ok().and_then(|g| *g)
     }
 
+    /// Calls this node's own onion service through Tor and hangs up at once,
+    /// as anyone who wants to reach it would: `None` when there is no onion
+    /// service or no proxy to try it with. A Tor that stalled after the
+    /// computer slept kept its process alive and its service unreachable for
+    /// hours, and nothing showed it: every call of a contact to this wallet
+    /// failed without a word. Blocks up to [`crate::socks::TOR_CONNECT_TIMEOUT`].
+    pub fn probe_own_onion(&self) -> Option<std::io::Result<()>> {
+        let proxy = self.proxy()?;
+        let own = self.own_onion()?;
+        let target = crate::socks::Target::Name(own.host(), own.port);
+        Some(crate::socks::connect(proxy, &target, crate::socks::TOR_CONNECT_TIMEOUT).map(drop))
+    }
+
     /// Connects to a target through the proxy: an IPv4 address, a host name
     /// or an onion service, the name being resolved by the proxy. The peer is
     /// filed under [`crate::socks::Target::label`]. Refused without a proxy.
@@ -10039,6 +10052,38 @@ mod tests_handler_review {
         assert_eq!(n.onions_to_try(5).len(), 1);
         n.set_own_onion(Some(test_onion()));
         assert!(n.onions_to_try(5).is_empty(), "never this node's own");
+    }
+
+    /// The check of this node's own onion service: nothing to check without
+    /// a proxy or an onion name; through a proxy, an answer of the service
+    /// is a success, a refusal (the service is offline) a failure — the
+    /// call a contact would make, made by the node itself.
+    #[test]
+    fn the_own_onion_check_calls_it_through_the_proxy() {
+        use std::io::{Read, Write};
+        let n = node();
+        assert!(n.probe_own_onion().is_none(), "no onion, no proxy");
+        n.set_own_onion(Some(test_onion()));
+        assert!(n.probe_own_onion().is_none(), "no proxy");
+        // A SOCKS5 proxy answering `reply` to the connect request.
+        let proxy = |reply: u8| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (mut c, _) = l.accept().unwrap();
+                let mut b = [0u8; 512];
+                let _ = c.read(&mut b);
+                c.write_all(&[5, 0]).unwrap();
+                let _ = c.read(&mut b);
+                c.write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            });
+            addr
+        };
+        n.set_proxy(Some(proxy(0)));
+        assert!(matches!(n.probe_own_onion(), Some(Ok(()))));
+        n.set_proxy(Some(proxy(4)));
+        assert!(matches!(n.probe_own_onion(), Some(Err(_))));
     }
 
     /// Through Tor, the second outbound link to the same node (same nonce) is
