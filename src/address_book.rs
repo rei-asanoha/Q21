@@ -561,6 +561,61 @@ mod tests {
         }
     }
 
+    /// Red-team campaign 6, round 5: capitals of one look read alike in both
+    /// keys, more letters found alike in more fonts; the joiners of an emoji
+    /// sequence kept, never left at an end; Tibetan stacks capped; a new
+    /// emoji allowed.
+    #[test]
+    fn the_round_five_look_alikes_are_the_same_name() {
+        for (one, two) in [
+            (
+                "\u{0398}\u{0391}\u{039D}\u{0391}\u{03A3}",
+                "\u{03F4}\u{0391}N\u{0391}\u{03A3}",
+            ),
+            ("Ilya", "\u{0196}Iya"),
+            ("Ilya", "\u{A646}Iya"),
+            ("\u{0110}or\u{0111}e", "D\u{0335}or\u{0111}e"),
+            ("\u{0197}van", "I\u{0335}van"),
+            (
+                "\u{03A6}\u{03CE}\u{03C4}\u{03B7}\u{03C2}",
+                "\u{0424}\u{03CE}\u{03C4}\u{03B7}\u{03C2}",
+            ),
+            (
+                "\u{0432}\u{0456}\u{0454}\u{043D}",
+                "\u{0432}\u{0456}\u{03F5}\u{043D}",
+            ),
+            ("\u{0B95}\u{0BA3}", "\u{0BE7}\u{0BA3}"),
+            ("J. Smith", "J\u{A4F8} Smith"),
+            ("John", "\u{A4D9}ohn"),
+            ("Lea", "\u{053C}ea"),
+        ] {
+            let mut b = AddressBook::default();
+            b.add(one, "tq21aaa", "").unwrap();
+            assert!(
+                matches!(b.add(two, "tq21bbb", ""), Err(BookError::NameTaken(_))),
+                "{one:?} {two:?}"
+            );
+        }
+        let mut b = AddressBook::default();
+        assert_eq!(
+            b.add("\u{2C9E}lga", "tq21ccc", ""),
+            Err(BookError::Imitation)
+        );
+        let flag = b
+            .add("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}", "tq21ddd", "")
+            .unwrap();
+        assert_eq!(flag.name, "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}");
+        let edge = b
+            .add("\u{0001}\u{200D}Ann\u{200D}\u{0001}", "tq21eee", "")
+            .unwrap();
+        assert_eq!(edge.name, "Ann");
+        let tower = b
+            .add(&format!("\u{0F40}{}", "\u{0F90}".repeat(10)), "tq21fff", "")
+            .unwrap();
+        assert_eq!(tower.name.chars().count(), 4);
+        b.add("Dad \u{1FAE9}", "tq21ggg", "").unwrap();
+    }
+
     /// A rename to a name that would be refused on adding is refused too:
     /// only the name kept as it is passes the checks it already failed.
     #[test]

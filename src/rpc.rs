@@ -562,20 +562,25 @@ impl Bucket {
         period_ms: u64,
         now: std::time::Instant,
     ) -> bool {
-        let per_period = u64::from(per_period.max(1));
-        let elapsed = now.saturating_duration_since(self.last).as_millis();
-        let elapsed = elapsed.min(u128::from(u32::MAX)) as u64;
-        let gain = elapsed.saturating_mul(per_period) / period_ms;
+        // In nanoseconds: rounded to the millisecond, each token of a fast
+        // refill (600 a second) cost 2 ms instead of 1.67, and the rate fell
+        // by a sixth.
+        let per_period = u128::from(per_period.max(1));
+        let period_ns = u128::from(period_ms) * 1_000_000;
+        let elapsed = now.saturating_duration_since(self.last).as_nanos();
+        // Beyond a day the bucket is full whatever its rate.
+        let elapsed = elapsed.min(86_400 * 1_000_000_000);
+        let gain = elapsed * per_period / period_ns;
         if gain > 0 {
-            let room = u64::from(burst.saturating_sub(self.tokens));
+            let room = u128::from(burst.saturating_sub(self.tokens));
             if gain >= room {
                 // Full: nothing more is banked.
                 self.tokens = burst;
                 self.last = now;
             } else {
                 self.tokens += gain as u32;
-                let spent = gain.saturating_mul(period_ms).div_ceil(per_period);
-                self.last += std::time::Duration::from_millis(spent);
+                let spent = (gain * period_ns).div_ceil(per_period);
+                self.last += std::time::Duration::from_nanos(spent as u64);
             }
         }
         if self.tokens > 0 {
@@ -590,7 +595,7 @@ impl Bucket {
         self.take(burst, per_minute, 60_000, now)
     }
 
-    /// [`Bucket::allow`], refilled per second, to the millisecond.
+    /// [`Bucket::allow`], refilled per second.
     fn allow_per_second(&mut self, burst: u32, per_second: u32, now: std::time::Instant) -> bool {
         self.take(burst, per_second, 1_000, now)
     }
@@ -4170,6 +4175,7 @@ impl RpcContext {
         // --- The detail of each movement, the pending ones first.
         let mut movements = pending;
         let mut all_out_resolved = true;
+        let mut not_ours = 0usize;
         for (h, rank) in positions {
             let Some(block) = self.node.with_chain(|c| c.block_at(h)) else {
                 continue;
@@ -4194,6 +4200,12 @@ impl RpcContext {
                     Some(_) => {}
                     None => known = false,
                 }
+            }
+            // Indexed by key hash alone: a transaction that pays this hash
+            // only under another scheme is not a movement of this address.
+            if received == 0 && sent == 0 && known {
+                not_ours += 1;
+                continue;
             }
             if !known {
                 all_out_resolved = false;
@@ -4230,7 +4242,10 @@ impl RpcContext {
             .set("balance", amount_json(Amount::from_units(balance)))
             .set("unspent_outputs", Json::u64(outputs))
             .set("movements", Json::array(movements))
-            .set("total_movements", Json::u64(total_movements as u64))
+            .set(
+                "total_movements",
+                Json::u64(total_movements.saturating_sub(not_ours) as u64),
+            )
             .set("via_index", Json::Bool(via_index))
             .set("amounts_out_all_resolved", Json::Bool(all_out_resolved))
             .set("complete_history", Json::Bool(via_index || floor == 0))
@@ -7874,6 +7889,24 @@ mod tests {
         assert!(
             scans + 2 >= expected && scans <= expected,
             "{scans} {expected}"
+        );
+        // The global net, a fast refill: a thousand calls a second for ten
+        // seconds gets its burst and six hundred a second, not five hundred.
+        let mut n = Bucket::full(GLOBAL_CALL_BURST, t0);
+        let mut calls = 0u32;
+        for i in 0..10_000u64 {
+            if n.allow_per_second(
+                GLOBAL_CALL_BURST,
+                GLOBAL_CALLS_PER_SECOND,
+                t0 + Duration::from_millis(i),
+            ) {
+                calls += 1;
+            }
+        }
+        let expected = GLOBAL_CALL_BURST + GLOBAL_CALLS_PER_SECOND * 9_999 / 1000;
+        assert!(
+            calls + 2 >= expected && calls <= expected,
+            "{calls} {expected}"
         );
     }
 

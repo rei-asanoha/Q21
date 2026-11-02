@@ -584,6 +584,10 @@ impl Chan {
     }
 }
 
+/// Why a wallet off the channel scheme closes its channels alone.
+const NO_COOPERATIVE_CLOSE: &str = "this wallet cannot receive a cooperative close: close the \
+     channel alone, and your share comes back to the identity address";
+
 /// The refusal of a close alone after an unproven claim of an older copy has
 /// lapsed: the holder confirms it first ([`ChannelManager::force_close_with`]).
 pub const UNPROVEN_CLAIM: &str = "the other side said this copy of the channel is older than \
@@ -1800,6 +1804,13 @@ impl ChannelManager {
     /// cooperatively it returns the agreed `Close` again, so a close
     /// interrupted by a crash or a dropped link can be completed.
     pub fn close(&self, cid: Hash256) -> Result<Option<Vec<u8>>, String> {
+        // A wallet off the channel scheme: the payout agreed at the opening
+        // is one of its addresses, which a close would pay as an output it
+        // can never spend. Closed alone instead, its share comes back to the
+        // identity address (red-team campaign 6, round 5).
+        if self.opens_refused.get().is_some() {
+            return Err(NO_COOPERATIVE_CLOSE.into());
+        }
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
         if chan.refuses() {
@@ -2344,6 +2355,11 @@ impl ChannelManager {
                     out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
                 }
                 out.extend(pending_close(chan, cid));
+            }
+            ChMsg::Close { .. } if self.opens_refused.get().is_some() => {
+                // Not signed: it would pay our share to an address of this
+                // wallet as an output it can never spend. The peer can close
+                // alone; so can we, to the identity address.
             }
             ChMsg::Close { .. } => {
                 // Signed by the counterparty's funding key: from a connection

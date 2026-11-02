@@ -1573,6 +1573,59 @@ fn channels_per_peer_are_bounded() {
     assert!(!p.acceptor.deliver(F_PEER + 50, &hello).frames.is_empty());
 }
 
+/// A channel opened before such wallets were refused: its agreed payout is a
+/// wallet address the close would pay as an output it cannot spend. The
+/// node neither proposes nor signs a cooperative close; it closes alone,
+/// and its share then goes to the identity address (red-team campaign 6,
+/// round 5).
+#[test]
+fn a_wallet_off_the_channel_scheme_closes_only_alone() {
+    let (funder_seed, acceptor_seed) = ([0x71u8; 32], [0x72u8; 32]);
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("off-scheme-close");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    // The wallet turns out to be off the channel scheme (as after an
+    // upgrade): no cooperative close, either way, and no addition.
+    p.funder
+        .refuse_opens("payment channels need a wallet on ML-DSA-87");
+    let err = p.funder.close(cid).unwrap_err();
+    assert!(err.contains("cooperative close"), "{err}");
+    assert!(p.funder.splice(cid, MIN_OUTPUT_VALUE).is_err());
+    let close = p.acceptor.close(cid).unwrap().expect("a close frame");
+    let r = p.funder.deliver(A_PEER, &close);
+    assert!(r.frames.is_empty(), "a refusing node signed a close");
+    assert_eq!(r.penalize, 0);
+    // Closing alone still works.
+    assert!(p.funder.force_close(cid).is_ok());
+}
+
 /// A wallet whose addresses are not of the channel scheme would be paid, by
 /// every close, an output none of its keys can spend: such a node neither
 /// opens nor accepts a channel, and says why.

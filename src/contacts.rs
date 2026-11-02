@@ -78,12 +78,13 @@ pub fn clean_label(text: &str) -> String {
 /// an emoji are kept between two characters that show.
 pub fn clean_text(text: &str, max: usize) -> String {
     let mut out: Vec<char> = Vec::new();
-    let mut marks = 0usize;
+    let (mut marks, mut stacked) = (0usize, 0usize);
     for c in text.trim().chars() {
         if is_joiner(c) {
-            // Kept once, after a character that shows: never first, never
-            // in a run; and it does not start a new pile of marks.
-            if out.last().is_some_and(|p| !is_joiner(*p)) {
+            // Kept after a character, never first and never twice in a row
+            // (an emoji's presentation selector followed by a joiner is two
+            // different ones); it does not start a new pile of marks.
+            if out.last().is_some_and(|p| *p != c) {
                 out.push(c);
             }
             continue;
@@ -93,24 +94,28 @@ pub fn clean_text(text: &str, max: usize) -> String {
         }
         if is_combining(c) {
             // A Tibetan subjoined letter is a letter stacked under the one
-            // before, not an accent: not counted.
-            if !('\u{0F8D}'..='\u{0FBC}').contains(&c) {
-                marks += 1;
-                if marks > 3 {
-                    continue;
-                }
+            // before, not an accent: counted apart, three at most too.
+            let pile = if ('\u{0F8D}'..='\u{0FBC}').contains(&c) {
+                &mut stacked
+            } else {
+                &mut marks
+            };
+            *pile += 1;
+            if *pile > 3 {
+                continue;
             }
         } else {
             marks = 0;
+            stacked = 0;
         }
         out.push(if c.is_control() { ' ' } else { c });
     }
     out.truncate(max);
-    while out.last().is_some_and(|c| is_joiner(*c)) {
-        out.pop();
-    }
     let s: String = out.into_iter().collect();
-    s.trim().to_string()
+    // Trimmed last: a control character turned to a space must not leave a
+    // joiner at an end.
+    s.trim_matches(|c: char| c.is_whitespace() || is_joiner(c))
+        .to_string()
 }
 
 /// The zero-width joiner and non-joiner, and the text and emoji
@@ -277,6 +282,8 @@ fn capital_look_alike(c: char) -> Option<char> {
         '\u{0406}' => Some('\u{006C}'),
         '\u{0408}' => Some('\u{006A}'),
         '\u{0049}' => Some('\u{006C}'),
+        '\u{0196}' => Some('\u{006C}'),
+        '\u{A646}' => Some('\u{006C}'),
         _ => None,
     }
 }

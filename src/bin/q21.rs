@@ -5036,8 +5036,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 let journaled = mgr.list().len();
                 if journaled > 0 {
                     eprintln!(
-                        "  note: this wallet is on {}: its {journaled} payment channel(s) pay \
-                         their closes to the identity address; bring them back with identitysweep.",
+                        "  note: this wallet is on {}: close its {journaled} payment channel(s) \
+                         alone (channelclose with force); the funds come back to the identity \
+                         address, and identitysweep brings them to the wallet.",
                         wallet_scheme.name()
                     );
                 }
