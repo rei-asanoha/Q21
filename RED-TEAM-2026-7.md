@@ -97,8 +97,10 @@ backup.
 
 ## W1. Small capitals in contact names
 
-`ɴora` passed for `nora`: the phonetic small capitals G, I, N, Œ, R, Y, L,
-F, Q and the Latin alpha were neither refused nor read as their letter. They
+"nora" written with a small capital N (U+0274) passed for "nora": the
+phonetic small capitals G, I, N, OE, R, Y, L, F, Q (U+0262 and its
+neighbors) and the Latin alpha (U+0251) were neither refused nor read as
+their letter. They
 are now read as letters; a second contact named with them is refused.
 
 ## F1, S1. Cheap load
