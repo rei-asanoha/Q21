@@ -298,6 +298,11 @@ impl FrameBudget {
     }
 }
 
+/// Inbound connections an address group may open per
+/// [`INBOUND_ARRIVALS_WINDOW`], admitted or not.
+pub const INBOUND_ARRIVALS_PER_GROUP: usize = 6;
+pub const INBOUND_ARRIVALS_WINDOW: Duration = Duration::from_secs(60);
+
 /// How long having delivered something protects a peer from eviction: an
 /// occupant that relayed one transaction once was protected for good, and
 /// four of them locked the onion pool (red-team campaign 7).
@@ -389,16 +394,23 @@ fn eviction_candidate(
     {
         return Some(*id);
     }
+    // Past its first minute: a newcomer is never the one to go, whatever the
+    // arrival — through Tor, every arrival is of the same group.
+    let settled = |p: &Peer| p.handshaked && age(p) >= EVICTION_NEWCOMER_GRACE;
     // The arrival's own group (loopback is one): it replaces its own.
     let group = |a: SocketAddr| (inbound_group(a), is_loopback(a));
     if let Some(f) = from {
-        if let Some((id, _)) = rest.iter().rev().find(|(_, p)| group(p.addr) == group(f)) {
+        if let Some((id, _)) = rest
+            .iter()
+            .rev()
+            .find(|(_, p)| group(p.addr) == group(f) && settled(p))
+        {
             return Some(*id);
         }
     }
     rest.iter()
         .rev()
-        .find(|(_, p)| p.handshaked && age(p) >= EVICTION_NEWCOMER_GRACE)
+        .find(|(_, p)| settled(p))
         .map(|(id, _)| *id)
 }
 
@@ -1824,6 +1836,9 @@ struct Shared {
     /// after its last one, waiting for the spacing to pass. Bounded by
     /// [`MAX_REACH`].
     reach_deferred: HashMap<Hash256, crate::wire::Reach>,
+    /// When each inbound address group last arrived, within the window of
+    /// [`INBOUND_ARRIVALS_PER_GROUP`].
+    inbound_arrivals: HashMap<NetGroup, Vec<Instant>>,
     /// The announcements this node will still verify: a signature costs a
     /// post-quantum verification. See [`REACH_RATE_PER_SEC`].
     reach_bucket: TokenBucket,
@@ -2218,6 +2233,7 @@ impl Node {
                 reach: HashMap::new(),
                 reach_kept_at: HashMap::new(),
                 reach_deferred: HashMap::new(),
+                inbound_arrivals: HashMap::new(),
                 reach_bucket: TokenBucket {
                     tokens: REACH_BUCKET_MAX,
                     last: Instant::now(),
@@ -3003,6 +3019,33 @@ impl Node {
     /// A group at its [`INBOUND_PER_GROUP`] is refused outright: it makes no
     /// room for itself. Loopback, on a public network, is held to
     /// [`INBOUND_LOOPBACK_MAX`] and makes room only among loopback peers.
+    /// Counts an inbound arrival of its address group, and says whether the
+    /// group may still arrive. A group arrives at most a few times a minute:
+    /// a peer that closed and redialed its seats to keep them all in their
+    /// first minute, or reconnected after each frame budget, now pays in
+    /// address groups (red-team campaign 7). Tor arrives from loopback, one
+    /// group for every Tor user: its defense is Tor's own (TOR.md).
+    fn note_arrival(&self, address: Option<SocketAddr>) -> bool {
+        let Some(gr) = address.and_then(inbound_group) else {
+            return true;
+        };
+        let mut g = self.shared.lock().unwrap();
+        let now = Instant::now();
+        let seen = g.inbound_arrivals.entry(gr).or_default();
+        seen.retain(|t| now.saturating_duration_since(*t) < INBOUND_ARRIVALS_WINDOW);
+        if seen.len() >= INBOUND_ARRIVALS_PER_GROUP {
+            return false;
+        }
+        seen.push(now);
+        if g.inbound_arrivals.len() > 4096 {
+            g.inbound_arrivals.retain(|_, v| {
+                v.iter()
+                    .any(|t| now.saturating_duration_since(*t) < INBOUND_ARRIVALS_WINDOW)
+            });
+        }
+        true
+    }
+
     fn inbound_decision(&self, address: Option<SocketAddr>) -> InboundDecision {
         let g = self.shared.lock().unwrap();
         if let Some(gr) = address.and_then(inbound_group) {
@@ -3514,6 +3557,10 @@ impl Node {
                 match stream {
                     Ok(s) => {
                         let address = s.peer_addr().ok();
+                        if !node.note_arrival(address) {
+                            report_rejection(address, "its address group arrived too often");
+                            continue;
+                        }
                         match node.inbound_decision(address) {
                             InboundDecision::Refuse(reason) => {
                                 report_rejection(address, reason);
@@ -7192,6 +7239,27 @@ mod tests {
             a.inbound_decision(Some(newcomer)),
             InboundDecision::Refuse(_)
         ));
+        a.shutdown();
+    }
+
+    /// An address group arrives a few times a minute, no more; Tor, from
+    /// loopback, is not counted (red-team campaign 7).
+    #[test]
+    fn an_address_group_arrives_a_few_times_a_minute() {
+        let a = node();
+        let from =
+            |k: u8| -> Option<SocketAddr> { Some(format!("10.9.{k}.1:4000").parse().unwrap()) };
+        for k in 0..INBOUND_ARRIVALS_PER_GROUP as u8 {
+            assert!(a.note_arrival(from(k)));
+        }
+        assert!(!a.note_arrival(from(200)), "the same /16 once too often");
+        assert!(
+            a.note_arrival(Some("10.10.0.1:4000".parse().unwrap())),
+            "another group"
+        );
+        for _ in 0..50 {
+            assert!(a.note_arrival(Some("127.0.0.1:4000".parse().unwrap())));
+        }
         a.shutdown();
     }
 

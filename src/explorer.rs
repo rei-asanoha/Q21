@@ -618,7 +618,9 @@ async function call(method, params, tries){
     await askForToken();
     return call(method, params);
   }
-  const j = await r.json();
+  // A node with too many requests at once answers 429, as JSON-RPC.
+  const j = r.status === 429 && !/json/.test(r.headers.get("Content-Type") || "")
+    ? {error: {message: "too many requests"}} : await r.json();
   // A public node that counts calls asks a fast page to slow down: the
   // whole page waits a growing moment, and this call tries again, a few
   // times, before showing the error.

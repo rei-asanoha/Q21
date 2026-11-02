@@ -831,23 +831,20 @@ fn handle_connection<F>(
     // read taken separately.
     let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
     let peer = stream.peer_addr().ok().map(|a| a.ip());
-    // A public server holds a client to a few requests at a time, counted
-    // from the moment its head is read: one visitor announcing bodies it
-    // never sends held all the server's threads, and every other visitor
-    // read "too many simultaneous connections" (red-team campaign 7, P1).
-    let mut slot: Option<ClientSlot> = None;
-    let on_head = |headers: &BTreeMap<String, String>| -> Result<(), &'static str> {
-        if public_host.is_some() {
-            if let Some(client) = client_address(peer, headers) {
-                slot = Some(
-                    ClientSlot::take(client)
-                        .ok_or("too many requests at once from this address")?,
-                );
-            }
+    // A public server holds a client to a few requests waiting for their
+    // body at a time: one visitor announcing bodies it never sends held all
+    // the server's threads, and every other visitor read "too many
+    // simultaneous connections" (red-team campaign 7). Complete requests are
+    // not counted: the explorer's own page sends a dozen at once.
+    let on_wait = |headers: &BTreeMap<String, String>| -> Result<Option<ClientSlot>, &'static str> {
+        match client_address(peer, headers).filter(|_| public_host.is_some()) {
+            Some(client) => ClientSlot::take(client)
+                .map(Some)
+                .ok_or("too many requests at once from this address"),
+            None => Ok(None),
         }
-        Ok(())
     };
-    let response = match read_request(&stream, deadline, on_head) {
+    let response = match read_request(&stream, deadline, on_wait) {
         Ok(mut req) => {
             req.client = client_address(peer, &req.headers);
             let public = public_paths.contains(&req.path.as_str());
@@ -879,12 +876,19 @@ fn handle_connection<F>(
                 }
             }
         }
-        Err(msg) if msg.starts_with("too many requests") => Response::text(429, msg),
+        // As a JSON-RPC error too, so that a page reading it as one (the
+        // explorer) waits and tries again.
+        Err(msg) if msg.starts_with("too many requests") => {
+            let mut r = Response::json(format!(
+                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32005,"message":"{msg}"}}}}"#
+            ));
+            r.status = 429;
+            r
+        }
         Err(msg) => Response::text(400, msg),
     };
     let _ = write_response(&mut stream, &response);
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    drop(slot);
 }
 
 /// Requests that may wait for their body at once, all clients together.
@@ -1236,7 +1240,7 @@ fn authorized(req: &Request, expected: &str) -> bool {
 fn read_request(
     stream: &TcpStream,
     deadline: std::time::Instant,
-    on_head: impl FnOnce(&BTreeMap<String, String>) -> Result<(), &'static str>,
+    on_wait: impl FnOnce(&BTreeMap<String, String>) -> Result<Option<ClientSlot>, &'static str>,
 ) -> Result<Request, &'static str> {
     let mut reader = BufReader::new(stream);
     let check_deadline = |e: std::time::Instant| -> Result<(), &'static str> {
@@ -1336,9 +1340,6 @@ fn read_request(
     if length > MAX_BODY {
         return Err("request body too large");
     }
-    // The head is read: who sends it is known, before a single byte of the
-    // body is waited for (see `ClientSlots`).
-    on_head(&headers)?;
 
     // --- The buffer is filled, not preallocated.
     //
@@ -1353,7 +1354,10 @@ fn read_request(
     // fill them all, and complete requests are still served (red-team
     // campaign 7).
     let _waiting = if length > reader.buffer().len() {
-        Some(BodyWait::take().ok_or("too many requests at once: try again in a moment")?)
+        let all = BodyWait::take().ok_or("too many requests at once: try again in a moment")?;
+        // And per client: who sends it is known from the head, before a
+        // single byte of the body is waited for (see `ClientSlot`).
+        Some((all, on_wait(&headers)?))
     } else {
         None
     };

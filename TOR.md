@@ -178,10 +178,30 @@ keep the address after a reinstall.
 Every connection through the onion address reaches the node from
 `127.0.0.1`, whoever opened it. The node therefore keeps at most half of its
 inbound slots — twelve — for loopback, so that circuits opened by one
-person can never take the slots of peers reaching it by IP; when the twelve
-are taken, a newcomer replaces the most recent loopback peer, unless every
-one of them has recently brought a block or a transaction the node kept, or
-has been connected longest.
+person can never take the slots of peers reaching it by IP, and a connection
+in the clear never takes a Tor peer's seat. When the twelve are taken, a
+newcomer replaces the most recent loopback peer connected for more than a
+minute, unless it brought a block or a transaction the node kept in the last
+ten minutes, or is among the eight connected longest; four seats always stay
+open to newcomers.
+
+The node cannot tell two Tor users apart: someone opening circuits in a loop
+can still keep newcomers waiting. Tor itself can make each circuit cost
+them. On an entry point, add to the same block of `/etc/tor/torrc` (Tor
+0.4.8 or later):
+
+```
+HiddenServiceEnableIntroDoSDefense 1
+HiddenServicePoWDefensesEnabled 1
+HiddenServiceMaxStreams 4
+HiddenServiceMaxStreamsCloseCircuit 1
+```
+
+The first limits the rate of introductions at the introduction points; the
+second asks a client for a small proof of work once the service is under
+load; the last two close a circuit that opens more than four streams, so a
+loop of connections needs a new circuit each time. `sudo systemctl restart
+tor` again: the onion address does not change.
 
 ### 4.2 · Start the node behind it
 
