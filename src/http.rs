@@ -831,7 +831,23 @@ fn handle_connection<F>(
     // read taken separately.
     let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
     let peer = stream.peer_addr().ok().map(|a| a.ip());
-    let response = match read_request(&stream, deadline) {
+    // A public server holds a client to a few requests at a time, counted
+    // from the moment its head is read: one visitor announcing bodies it
+    // never sends held all the server's threads, and every other visitor
+    // read "too many simultaneous connections" (red-team campaign 7, P1).
+    let mut slot: Option<ClientSlot> = None;
+    let on_head = |headers: &BTreeMap<String, String>| -> Result<(), &'static str> {
+        if public_host.is_some() {
+            if let Some(client) = client_address(peer, headers) {
+                slot = Some(
+                    ClientSlot::take(client)
+                        .ok_or("too many requests at once from this address")?,
+                );
+            }
+        }
+        Ok(())
+    };
+    let response = match read_request(&stream, deadline, on_head) {
         Ok(mut req) => {
             req.client = client_address(peer, &req.headers);
             let public = public_paths.contains(&req.path.as_str());
@@ -863,10 +879,68 @@ fn handle_connection<F>(
                 }
             }
         }
+        Err(msg) if msg.starts_with("too many requests") => Response::text(429, msg),
         Err(msg) => Response::text(400, msg),
     };
     let _ = write_response(&mut stream, &response);
     let _ = stream.shutdown(std::net::Shutdown::Both);
+    drop(slot);
+}
+
+/// Requests a single client of a public server may have under way at once.
+pub const MAX_REQUESTS_PER_CLIENT: usize = 8;
+
+/// One request under way for a client of a public server, given back when
+/// dropped. Clients are told apart as the call budget does: an IPv4 address,
+/// an IPv6 `/48`.
+struct ClientSlot([u8; 6]);
+
+impl ClientSlot {
+    fn table() -> std::sync::MutexGuard<'static, BTreeMap<[u8; 6], usize>> {
+        static T: std::sync::Mutex<BTreeMap<[u8; 6], usize>> =
+            std::sync::Mutex::new(BTreeMap::new());
+        // A poisoned lock still holds a sound table: counters only.
+        T.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn key(ip: IpAddr) -> [u8; 6] {
+        match ip {
+            IpAddr::V4(a) => {
+                let o = a.octets();
+                [4, 0, o[0], o[1], o[2], o[3]]
+            }
+            IpAddr::V6(a) => match a.to_ipv4_mapped() {
+                Some(v4) => Self::key(IpAddr::V4(v4)),
+                None => {
+                    let o = a.octets();
+                    [o[0], o[1], o[2], o[3], o[4], o[5]]
+                }
+            },
+        }
+    }
+
+    fn take(ip: IpAddr) -> Option<ClientSlot> {
+        let k = Self::key(ip);
+        let mut t = Self::table();
+        let n = t.entry(k).or_insert(0);
+        if *n >= MAX_REQUESTS_PER_CLIENT {
+            return None;
+        }
+        *n += 1;
+        Some(ClientSlot(k))
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        let mut t = Self::table();
+        if let Some(n) = t.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                t.remove(&self.0);
+            }
+        }
+    }
 }
 
 /// Exchanges the launch token for the session token, only once.
@@ -1133,7 +1207,11 @@ fn authorized(req: &Request, expected: &str) -> bool {
     false
 }
 
-fn read_request(stream: &TcpStream, deadline: std::time::Instant) -> Result<Request, &'static str> {
+fn read_request(
+    stream: &TcpStream,
+    deadline: std::time::Instant,
+    on_head: impl FnOnce(&BTreeMap<String, String>) -> Result<(), &'static str>,
+) -> Result<Request, &'static str> {
     let mut reader = BufReader::new(stream);
     let check_deadline = |e: std::time::Instant| -> Result<(), &'static str> {
         if std::time::Instant::now() >= e {
@@ -1232,6 +1310,9 @@ fn read_request(stream: &TcpStream, deadline: std::time::Instant) -> Result<Requ
     if length > MAX_BODY {
         return Err("request body too large");
     }
+    // The head is read: who sends it is known, before a single byte of the
+    // body is waited for (see `ClientSlots`).
+    on_head(&headers)?;
 
     // --- The buffer is filled, not preallocated.
     //
@@ -1245,6 +1326,11 @@ fn read_request(stream: &TcpStream, deadline: std::time::Instant) -> Result<Requ
         let mut buf = [0u8; 16 * 1024];
         while raw.len() < length {
             check_deadline(deadline)?;
+            // No read may outlive the request's deadline: a body announced
+            // and never sent held its thread for the deadline plus one more
+            // full read timeout (red-team campaign 7, P1).
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(1))));
             let wanted = (length - raw.len()).min(buf.len());
             match reader.read(&mut buf[..wanted]) {
                 Ok(0) => return Err("incomplete request body"),

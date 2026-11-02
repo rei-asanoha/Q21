@@ -3954,3 +3954,79 @@ fn a_wallet_restored_from_its_seed_recovers_what_a_peer_close_paid_it() {
     );
     assert!(commit_fee > 0);
 }
+/// Red-team campaign 7: a peer alternating a claim that our copy is older and
+/// an in-step reestablish used to start the two-minute grace again each time,
+/// and froze the channel for as long as it liked — even the holder's
+/// confirmed close alone was refused. The grace now runs from the first
+/// claim, and a confirmed close alone goes through whatever the peer says.
+#[test]
+fn an_unproven_claim_cannot_be_rearmed_by_an_in_step_reestablish() {
+    let funder_seed = [0x71u8; 32];
+    let acceptor_seed = [0x72u8; 32];
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, acceptor_seed, "thinker-rearm");
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    // Snapshot both folders at this state S.
+    restore_dir(&dir.join("funder"), &dir.join("funder-S"));
+    restore_dir(&dir.join("acceptor"), &dir.join("acceptor-S"));
+    for amount in [2_000_000u64, 500_000] {
+        let pay = p.funder.pay(cid, amount).unwrap();
+        p.queue.push_back((1, pay));
+        p.pump();
+    }
+    // Victim = funder at S. "claim" copy = live acceptor (S+2): its
+    // reestablish reads WeAreBehind on the victim. "in step" copy = acceptor
+    // at S.
+    restore_dir(&dir.join("funder-S"), &dir.join("funder"));
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+    let in_step = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("acceptor-S"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+    );
+    let fid = p.funder.node_id();
+    let aid = p.acceptor.node_id();
+
+    // One session of the attacker, from `copy`: only its reestablish reaches
+    // the victim; what the victim answers is dropped (the attacker reads it
+    // and does nothing).
+    let session_from = |victim: &ChannelManager, copy: &ChannelManager| {
+        victim.on_session_closed(A_PEER);
+        let binding = next_binding();
+        let _ = victim.on_session(A_PEER, &aid, "", binding);
+        for f in copy.on_session(F_PEER, &fid, "", binding) {
+            let r = victim.deliver(A_PEER, &f);
+            assert_eq!(r.penalize, 0);
+        }
+    };
+
+    // First claim.
+    session_from(&p.funder, &p.acceptor);
+    assert!(p.funder.info(cid).unwrap().behind, "claimed");
+
+    // The attacker re-arms just before the grace lapses: the grace still
+    // runs from the first claim.
+    let almost = q21_core::channel::manager::UNPROVEN_BEHIND - std::time::Duration::from_secs(1);
+    p.funder.age_unproven_claims(almost);
+    session_from(&p.funder, &in_step);
+    session_from(&p.funder, &p.acceptor);
+    p.funder
+        .age_unproven_claims(std::time::Duration::from_secs(2));
+    for round in 0..3 {
+        session_from(&p.funder, &in_step);
+        session_from(&p.funder, &p.acceptor);
+        let info = p.funder.info(cid).unwrap();
+        assert!(!info.behind, "round {round}: the grace did not start again");
+        // Alone, the holder is still asked first.
+        let e = p.funder.force_close(cid).unwrap_err();
+        assert!(e.contains("without proving it"), "round {round}: {e}");
+    }
+    // Confirmed by the holder, the close alone goes through.
+    assert!(p.funder.force_close_with(cid, true).is_ok());
+}

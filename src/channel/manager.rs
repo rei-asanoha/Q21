@@ -2426,10 +2426,13 @@ impl ChannelManager {
                         chan.synced = true;
                         chan.peer_behind = None;
                         // A refusal the peer never proved lasts only while
-                        // it keeps saying so.
+                        // it keeps saying so. The time of its first claim
+                        // stays: a peer alternating a claim and an in-step
+                        // reestablish started the grace again each time, and
+                        // kept the channel frozen for as long as it liked
+                        // (red-team campaign 7).
                         if !chan.behind_proven {
                             chan.behind = false;
-                            chan.behind_since = None;
                         }
                     }
                     // Our copy is older: our latest commitment may be one we
@@ -3724,8 +3727,10 @@ impl ChannelManager {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
         // An older copy's latest commitment may be revoked: broadcasting it
-        // would lose the whole channel to a penalty.
-        if chan.refuses() {
+        // would lose the whole channel to a penalty. A claim never proved is
+        // the holder's to judge: once they confirm that this wallet was not
+        // restored from a backup, nothing the peer said holds the close back.
+        if chan.refuses() && !(despite_claim && !chan.behind_proven) {
             return Err(BEHIND.into());
         }
         if chan.behind && !chan.behind_proven && !despite_claim {

@@ -411,7 +411,12 @@ explorer.example.org {
 	respond @blocked 404
 
 	encode gzip
-	reverse_proxy 127.0.0.1:21080
+	reverse_proxy 127.0.0.1:21080 {
+		request_buffers 1MB
+		transport http {
+			max_conns_per_host 48
+		}
+	}
 }
 ```
 
@@ -428,6 +433,8 @@ Each block, and why it is there:
 | `-Server` | Does not advertise which software runs here |
 | `max_size 1MB` | The same limit as the node's, one step earlier |
 | `@blocked … 404` | A second lock on the wallet's door |
+| `request_buffers 1MB` | Caddy reads a request's whole body before it passes it on: a visitor announcing a body it never sends holds a Caddy buffer, not one of the node's threads |
+| `max_conns_per_host 48` | Never more than 48 requests at once to the node, below its own limit of 64: visitors wait at Caddy's door rather than fill the node's |
 
 The reverse proxy passes each visitor's address to the node in the
 `X-Forwarded-For` header — that is its default behavior, and it erases
@@ -804,6 +811,11 @@ per second for all addresses combined. A page of the explorer makes a
 handful; a visitor beyond it reads "too many requests on this public service:
 slow down a little", and the explorer page waits a moment and tries again by
 itself.
+
+The node also holds each visitor address to **eight requests under way at
+once** (0.5.8): a visitor opening many requests and never finishing them
+holds eight of its threads, not all sixty-four, and every other visitor is
+still served.
 
 What this budget does not do: bound the number of connections of an address.
 That is the purpose of step 4.2a.

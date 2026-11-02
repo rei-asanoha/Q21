@@ -249,6 +249,51 @@ enum InboundDecision {
     Refuse(&'static str),
 }
 
+/// Frames a peer may send at once, then per second: a node catching up
+/// receives a few hundred a second at most.
+pub const FRAME_BURST: u32 = 20_000;
+pub const FRAMES_PER_SECOND: u32 = 5_000;
+
+/// The frame budget of one connection, kept by its own read loop.
+struct FrameBudget {
+    tokens: u32,
+    last: Instant,
+}
+
+impl FrameBudget {
+    fn new(now: Instant) -> FrameBudget {
+        FrameBudget {
+            tokens: FRAME_BURST,
+            last: now,
+        }
+    }
+
+    /// One frame, if the budget allows it.
+    fn take(&mut self, now: Instant) -> bool {
+        let gain = now.saturating_duration_since(self.last).as_millis() as u64
+            * u64::from(FRAMES_PER_SECOND)
+            / 1000;
+        if gain > 0 {
+            self.tokens = (u64::from(self.tokens) + gain).min(u64::from(FRAME_BURST)) as u32;
+            self.last = now;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+/// How long having delivered something protects a peer from eviction: an
+/// occupant that relayed one transaction once was protected for good, and
+/// four of them locked the onion pool (red-team campaign 7, P3).
+pub const EVICTION_DELIVERING_FRESH: Duration = Duration::from_secs(600);
+
+/// Inbound peers never protected, whatever the pool: there is always one
+/// seat a newcomer can be given (red-team campaign 7, P3).
+pub const EVICTION_ALWAYS_OPEN: usize = 4;
+
 /// The inbound peer to let go to make room, among those `eligible` selects.
 ///
 /// # The defect this closes
@@ -259,15 +304,21 @@ enum InboundDecision {
 /// room, but never at the expense of the peers that matter most:
 ///
 /// - the [`EVICTION_PROTECT_DELIVERING`] that were most recently first to
-///   bring a block we took or a transaction we admitted — work or fees an
-///   occupant cannot fake for free;
-/// - then the [`EVICTION_PROTECT_OLDEST`] connected longest.
+///   bring a block we took or a transaction we admitted, within the last
+///   [`EVICTION_DELIVERING_FRESH`] — work or fees an occupant cannot fake for
+///   free, and cannot bank;
+/// - then the [`EVICTION_PROTECT_OLDEST`] connected longest;
+/// - never more than all but [`EVICTION_ALWAYS_OPEN`] of the candidates.
 ///
-/// Among the rest, the most recent connection goes. An occupant that keeps
-/// arriving therefore only ever evicts itself or another newcomer: the
-/// peers already settled — a household's wallets behind one router among
-/// them — keep their seats.
+/// Among the rest, a connection that never completed its handshake goes
+/// first; then the most recent of the address group that holds the most of
+/// them. Until 0.5.8 the most recent connection went, whoever it was: an
+/// occupant holding the old seats, arriving every fraction of a second,
+/// evicted every honest newcomer before it could sync (red-team campaign 7,
+/// P2). An occupant now evicts its own idle connections, then its own group,
+/// before a newcomer alone in its group.
 fn eviction_candidate(peers: &HashMap<u64, Peer>, eligible: impl Fn(&Peer) -> bool) -> Option<u64> {
+    let now = Instant::now();
     let mut cands: Vec<(u64, &Peer)> = peers
         .iter()
         .filter(|(_, p)| !p.outbound && eligible(p))
@@ -280,6 +331,7 @@ fn eviction_candidate(peers: &HashMap<u64, Peer>, eligible: impl Fn(&Peer) -> bo
         .iter()
         .filter(|(_, p)| p.handshaked)
         .filter_map(|(id, p)| p.last_useful.map(|t| (*id, t)))
+        .filter(|(_, t)| now.saturating_duration_since(*t) < EVICTION_DELIVERING_FRESH)
         .collect();
     useful.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     protected.extend(
@@ -295,11 +347,31 @@ fn eviction_candidate(peers: &HashMap<u64, Peer>, eligible: impl Fn(&Peer) -> bo
         .map(|(id, _)| *id)
         .collect();
     protected.extend(oldest);
-    cands
+    protected.truncate(cands.len().saturating_sub(EVICTION_ALWAYS_OPEN));
+    let rest: Vec<&(u64, &Peer)> = cands
         .iter()
-        .rev()
-        .find(|(id, _)| !protected.contains(id))
-        .map(|(id, _)| *id)
+        .filter(|(id, _)| !protected.contains(id))
+        .collect();
+    // A connection that never said who it is: the one that had longest to.
+    if let Some((id, _)) = rest.iter().find(|(_, p)| !p.handshaked) {
+        return Some(*id);
+    }
+    // The address group holding the most seats; loopback (Tor) is one group.
+    let group = |p: &Peer| inbound_group(p.addr);
+    let mut best: Option<(usize, Instant, u64)> = None;
+    for (id, p) in &rest {
+        let n = rest.iter().filter(|(_, q)| group(q) == group(p)).count();
+        let better = match best {
+            None => true,
+            Some((bn, bt, bid)) => {
+                n > bn || (n == bn && (p.connected_at > bt || (p.connected_at == bt && *id > bid)))
+            }
+        };
+        if better {
+            best = Some((n, p.connected_at, *id));
+        }
+    }
+    best.map(|(_, _, id)| id)
 }
 
 /// Tells the operator, at most every ten minutes, that blocks are refused
@@ -1736,11 +1808,15 @@ const MAX_PARKED: usize = 2 * MAX_BODIES_IN_FLIGHT;
 /// The served snapshot, frozen for a given tip.
 struct SnapshotCache {
     tip: Hash256,
+    built: Instant,
     bytes: Vec<u8>,
     height: u64,
     announced_tip: Hash256,
     commitment: Hash256,
 }
+
+/// The least time between two builds of the served snapshot.
+pub const SNAPSHOT_REBUILD_EVERY: Duration = Duration::from_secs(600);
 
 /// Rebuilds the served snapshot if the tip has moved since last time.
 ///
@@ -1749,13 +1825,22 @@ struct SnapshotCache {
 /// it and it starts over. Consistency is therefore never broken silently.
 fn refresh_snapshot(g: &mut Shared) {
     let tip = g.chain.tip_id();
-    if g.snapshot_cache.as_ref().map(|c| c.tip) == Some(tip) {
+    // Rebuilt at most every few minutes, not at every tip: the build holds
+    // the node's lock, and any peer could ask for it right after each block
+    // — exactly when the block's relay matters (red-team campaign 7). An
+    // older snapshot is as good a start: its client fetches the blocks after
+    // it like any others.
+    if g.snapshot_cache
+        .as_ref()
+        .is_some_and(|c| c.tip == tip || c.built.elapsed() < SNAPSHOT_REBUILD_EVERY)
+    {
         return;
     }
     g.snapshot_cache = g.chain.build_sync_snapshot().map(|a| {
         let bytes = a.encode();
         SnapshotCache {
             tip,
+            built: Instant::now(),
             height: a.announced_height().unwrap_or(0),
             announced_tip: a.announced_tip().unwrap_or(Hash256::ZERO),
             commitment: a.announced_commitment().unwrap_or(Hash256::ZERO),
@@ -3571,6 +3656,10 @@ impl Node {
     fn read_loop(&self, id: u64, mut stream: TcpStream) {
         let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut chunk = [0u8; 32 * 1024];
+        // Every frame takes the node's lock; a peer sending a million empty
+        // pongs a second kept two cores busy (red-team campaign 7, P4). Far
+        // above any honest pace, a peer beyond the budget is let go.
+        let mut frames = FrameBudget::new(Instant::now());
 
         loop {
             if self.is_stopped() {
@@ -3599,6 +3688,9 @@ impl Node {
                 match Message::parse(&buffer, self.magic) {
                     Ok((msg, consumed)) => {
                         buffer.drain(..consumed);
+                        if !frames.take(Instant::now()) {
+                            return;
+                        }
                         if msg.carries_policy_output() && self.policy_is_malformed_from(id, &msg) {
                             self.penalize(id, MISCONDUCT_MALFORMED);
                             return;
@@ -6947,9 +7039,29 @@ mod tests {
         p.last_useful = useful;
     }
 
-    /// A full node makes room for a newcomer at the expense of the most
-    /// recent connection — never of a peer that brought something we kept,
-    /// nor of the longest connected.
+    /// A connection gets a burst of frames and a steady pace far above an
+    /// honest peer's, and no more (red-team campaign 7, P4).
+    #[test]
+    fn a_flood_of_frames_ends_the_connection() {
+        let t0 = Instant::now();
+        let mut b = FrameBudget::new(t0);
+        for _ in 0..FRAME_BURST {
+            assert!(b.take(t0));
+        }
+        assert!(!b.take(t0), "beyond the burst at once");
+        let one_second = t0 + Duration::from_secs(1);
+        for _ in 0..FRAMES_PER_SECOND {
+            assert!(b.take(one_second));
+        }
+        assert!(!b.take(one_second));
+    }
+
+    /// A full node makes room for a newcomer at the expense of the address
+    /// group holding the most seats, its most recent connection — never of a
+    /// peer that recently brought something we kept, nor of the longest
+    /// connected; a connection that never completed its handshake goes
+    /// first; and a delivery long past protects no more (red-team campaign 7,
+    /// P2 and P3).
     #[test]
     fn a_full_node_makes_room_but_keeps_its_best_peers() {
         let a = node();
@@ -6957,7 +7069,7 @@ mod tests {
         let base = Instant::now();
         let at = |k: u64| base + Duration::from_millis(k);
         for id in 1..=inbound {
-            // Peers 13 to 16 share a group: a household behind one router.
+            // Peers 13 to 16 share a group: four seats from one router.
             let addr: SocketAddr = if (13..=16).contains(&id) {
                 format!("203.0.113.{id}:21021").parse().unwrap()
             } else {
@@ -6970,25 +7082,8 @@ mod tests {
         let newcomer: SocketAddr = "198.51.100.7:40000".parse().unwrap();
         assert_eq!(
             a.inbound_decision(Some(newcomer)),
-            InboundDecision::Evict(inbound),
-            "the most recent connection goes"
-        );
-        // The most recent one brought a block we took: the next one goes.
-        settle_peer(&a, inbound, at(inbound), Some(at(10_000)));
-        assert_eq!(
-            a.inbound_decision(Some(newcomer)),
-            InboundDecision::Evict(inbound - 1)
-        );
-        // The household is never singled out for sharing a group: with the
-        // younger peers useful, the youngest unprotected is still chosen by
-        // age alone.
-        for id in 17..=inbound {
-            settle_peer(&a, id, at(id), Some(at(10_000 + id)));
-        }
-        // Protected: four useful (21 to 24), the eight oldest (1 to 8).
-        assert_eq!(
-            a.inbound_decision(Some(newcomer)),
-            InboundDecision::Evict(20)
+            InboundDecision::Evict(16),
+            "the group holding the most seats gives up its most recent"
         );
         // A newcomer from a group at its share makes no room for itself.
         let same: SocketAddr = "203.0.113.200:40000".parse().unwrap();
@@ -6996,6 +7091,53 @@ mod tests {
             a.inbound_decision(Some(same)),
             InboundDecision::Refuse(_)
         ));
+        // The younger peers useful: four of them protected (21 to 24), the
+        // eight oldest too (1 to 8); the crowded group still goes first.
+        for id in 17..=inbound {
+            settle_peer(&a, id, at(id), Some(at(10_000 + id)));
+        }
+        assert_eq!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Evict(16)
+        );
+        // One seat per group left among the unprotected: the most recent.
+        for id in 13..=15 {
+            a.shared.lock().unwrap().peers.get_mut(&id).unwrap().addr =
+                format!("10.{id}.0.1:21021").parse().unwrap();
+        }
+        assert_eq!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Evict(20)
+        );
+        // A connection that never completed its handshake goes first.
+        a.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&9)
+            .unwrap()
+            .handshaked = false;
+        assert_eq!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Evict(9)
+        );
+        // A delivery older than ten minutes protects no more.
+        if let Some(old) = Instant::now().checked_sub(EVICTION_DELIVERING_FRESH * 2) {
+            a.shared
+                .lock()
+                .unwrap()
+                .peers
+                .get_mut(&9)
+                .unwrap()
+                .handshaked = true;
+            for id in 17..=inbound {
+                settle_peer(&a, id, at(id), Some(old));
+            }
+            assert_eq!(
+                a.inbound_decision(Some(newcomer)),
+                InboundDecision::Evict(inbound)
+            );
+        }
         a.shutdown();
     }
 
@@ -7022,13 +7164,15 @@ mod tests {
             InboundDecision::Evict(share),
             "loopback makes room among loopback, youngest first"
         );
-        // The four youngest useful, the eight oldest protected: no room.
+        // The four youngest useful and the eight oldest would protect the
+        // whole pool: four seats always stay open, and a newcomer through
+        // Tor is never shut out for good (red-team campaign 7, P3).
         for id in (EVICTION_PROTECT_OLDEST as u64 + 1)..=share {
             settle_peer(&a, id, at(id), Some(at(10_000 + id)));
         }
         assert!(matches!(
             a.inbound_decision(Some(lo(99))),
-            InboundDecision::Refuse(r) if r.contains("loopback")
+            InboundDecision::Evict(_)
         ));
         a.shutdown();
 

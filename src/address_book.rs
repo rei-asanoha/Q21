@@ -588,6 +588,12 @@ mod tests {
             ("J. Smith", "J\u{A4F8} Smith"),
             ("John", "\u{A4D9}ohn"),
             ("Lea", "\u{053C}ea"),
+            // Campaign 7: the small capitals of the phonetic block.
+            ("nora", "\u{0274}ora"),
+            ("Greg", "\u{0262}reg"),
+            ("Lina", "\u{029F}ina"),
+            ("Rita", "\u{0280}ita"),
+            ("Anna", "\u{0251}nna"),
         ] {
             let mut b = AddressBook::default();
             b.add(one, "tq21aaa", "").unwrap();
