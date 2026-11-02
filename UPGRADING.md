@@ -67,12 +67,13 @@ version older than the one you run, is a file you do not install.
 
 ---
 
-# Upgrading from 0.5.6 to 0.5.7
+# Upgrading from 0.5.6 to 0.5.8
 
-0.5.7 changes no rule of the chain and nothing in a channel's protocol: a
-0.5.6 node and a 0.5.7 node accept the same blocks and keep the same
-channels. Mining does not need to stop. It is a security release: the fixes
-of the sixth red-team campaign (RED-TEAM-2026-6.md).
+0.5.7 was never published: 0.5.8 holds its changes and more. 0.5.8 changes
+no rule of the chain and nothing in a channel's protocol: a 0.5.6 node and a
+0.5.8 node accept the same blocks and keep the same channels. Mining does
+not need to stop. It is a security release: the fixes of the sixth and
+seventh red-team campaigns (RED-TEAM-2026-6.md, RED-TEAM-2026-7.md).
 
 The testnet schedule is unchanged: payment channels open since block 4,980,
 names since block 5,200, and block timestamps strictly after their parent's
@@ -80,7 +81,7 @@ from block 5,950.
 
 ## What changes
 
-| | 0.5.6 | 0.5.7 |
+| | 0.5.6 | 0.5.8 |
 |---|---|---|
 | A channel peer's unproven claim that your copy is older | Froze the channel | Held two minutes; closing alone then asks whether this wallet was restored from a backup |
 | A coin of another scheme paid to one of your key hashes | Counted in the balance, chosen for a send | Ignored: no key of the wallet can spend it. The explorer and the activity ignore it too |
@@ -91,12 +92,21 @@ from block 5,950.
 | Release | One folder for all platforms | One folder per platform; a hash file names only its own platform's files |
 | Calling a contact (Private channel → Connect) | "Calling this contact…" for ever when it did not answer; press again after a search | The page follows the call: connected, does not answer, or cannot be found, and calls by itself once the address is found |
 | A hidden node after the computer slept | Its Tor could stay unreachable for hours | Its own onion address is checked every twenty minutes; Tor is started again after a sleep of twenty minutes or more, or when the address does not answer |
+| Opening a channel | A sentence while the funding waited | The funding's confirmations shown block by block, one cell each, as a closing |
+| Entry points, peers | The most recent connection evicted for a newcomer, whoever it was | A connection that never completed its handshake goes first, then the arrival's own address group; a newcomer is spared its first minute; Tor peers are never evicted for a connection in the clear; an address group arrives at most six times a minute; a frame budget per connection |
+| Public explorer | 64 requests at once, from anyone | A visitor holds at most 8 requests waiting for their body, all visitors 21 |
+| A channel peer claiming, without proof, that your copy is older | Could start its two minutes again and again | The two minutes run from its first claim; a close alone you confirm always goes through |
 
 ## Who should upgrade, and when
 
-Everyone, when convenient: wallets for the fixes above, public explorers and
-entry points for the call budget. A server updates from the signed release
-only (SERVER.md).
+Everyone, when convenient: wallets for the fixes above, entry points and
+public explorers first, for the limits on peers and requests. A server
+updates from the signed release only (SERVER.md).
+
+A public explorer behind Caddy also takes the two new lines of its Caddyfile
+(`request_buffers 1MB` and `max_conns_per_host 48`, PUBLIC-EXPLORER.md), and
+an entry point with an onion service the four Tor defense lines of TOR.md,
+section 4.1.
 
 ## The data folder
 

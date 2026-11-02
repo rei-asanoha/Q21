@@ -181,7 +181,10 @@ fn refusals_of_late_connections(kept: &mut [TcpStream], sample: usize) -> usize 
         let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
         let mut buf = [0u8; 64];
         if let Ok(n) = s.read(&mut buf) {
-            if String::from_utf8_lossy(&buf[..n]).contains("503") {
+            // 503: no thread left; 429 (0.5.8): too many requests waiting
+            // for their body. Either way refused, without a thread held.
+            let head = String::from_utf8_lossy(&buf[..n]);
+            if head.contains("503") || head.contains("429") {
                 refused += 1;
             }
         }
