@@ -887,6 +887,32 @@ fn handle_connection<F>(
     drop(slot);
 }
 
+/// Requests that may wait for their body at once, all clients together.
+pub const MAX_WAITING_FOR_BODY: usize = MAX_CONNECTIONS / 3;
+
+/// One request waiting for its body, given back when dropped.
+struct BodyWait;
+
+static WAITING_FOR_BODY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl BodyWait {
+    fn take() -> Option<BodyWait> {
+        use std::sync::atomic::Ordering;
+        let n = WAITING_FOR_BODY.fetch_add(1, Ordering::SeqCst);
+        if n >= MAX_WAITING_FOR_BODY {
+            WAITING_FOR_BODY.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(BodyWait)
+    }
+}
+
+impl Drop for BodyWait {
+    fn drop(&mut self) {
+        WAITING_FOR_BODY.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Requests a single client of a public server may have under way at once.
 pub const MAX_REQUESTS_PER_CLIENT: usize = 8;
 
@@ -1322,6 +1348,15 @@ fn read_request(
     // for zero bytes sent. We read in chunks: what is allocated is what has
     // arrived.
     let mut raw: Vec<u8> = Vec::new();
+    // Requests still waiting for their body (not already arrived with the
+    // head) hold at most a third of the threads: eight visitors announcing bodies they never send no longer
+    // fill them all, and complete requests are still served (red-team
+    // campaign 7).
+    let _waiting = if length > reader.buffer().len() {
+        Some(BodyWait::take().ok_or("too many requests at once: try again in a moment")?)
+    } else {
+        None
+    };
     if length > 0 {
         let mut buf = [0u8; 16 * 1024];
         while raw.len() < length {

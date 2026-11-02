@@ -249,32 +249,45 @@ enum InboundDecision {
     Refuse(&'static str),
 }
 
-/// Frames a peer may send at once, then per second: a node catching up
-/// receives a few hundred a second at most.
-pub const FRAME_BURST: u32 = 20_000;
-pub const FRAMES_PER_SECOND: u32 = 5_000;
+/// Frames a peer may send once its handshake is done, at once, then per
+/// second: a node catching up receives a few hundred a second at most.
+pub const FRAME_BURST: u32 = 2_000;
+pub const FRAMES_PER_SECOND: u32 = 1_000;
+/// Frames a connection may send before its handshake is done: a version, a
+/// verack, and little else. A peer that reconnected after each burst got a
+/// fresh one every time, before saying who it was (red-team campaign 7).
+pub const FRAMES_BEFORE_HANDSHAKE: u32 = 16;
 
 /// The frame budget of one connection, kept by its own read loop.
 struct FrameBudget {
     tokens: u32,
     last: Instant,
+    open: bool,
 }
 
 impl FrameBudget {
     fn new(now: Instant) -> FrameBudget {
         FrameBudget {
-            tokens: FRAME_BURST,
+            tokens: FRAMES_BEFORE_HANDSHAKE,
             last: now,
+            open: false,
         }
     }
 
-    /// One frame, if the budget allows it.
-    fn take(&mut self, now: Instant) -> bool {
-        let gain = now.saturating_duration_since(self.last).as_millis() as u64
-            * u64::from(FRAMES_PER_SECOND)
-            / 1000;
-        if gain > 0 {
-            self.tokens = (u64::from(self.tokens) + gain).min(u64::from(FRAME_BURST)) as u32;
+    /// One frame, if the budget allows it; `handshaked` is asked only when
+    /// the budget before the handshake runs out.
+    fn take(&mut self, now: Instant, handshaked: impl FnOnce() -> bool) -> bool {
+        if self.open {
+            let gain = now.saturating_duration_since(self.last).as_millis() as u64
+                * u64::from(FRAMES_PER_SECOND)
+                / 1000;
+            if gain > 0 {
+                self.tokens = (u64::from(self.tokens) + gain).min(u64::from(FRAME_BURST)) as u32;
+                self.last = now;
+            }
+        } else if self.tokens == 0 && handshaked() {
+            self.open = true;
+            self.tokens = FRAME_BURST;
             self.last = now;
         }
         if self.tokens == 0 {
@@ -287,14 +300,23 @@ impl FrameBudget {
 
 /// How long having delivered something protects a peer from eviction: an
 /// occupant that relayed one transaction once was protected for good, and
-/// four of them locked the onion pool (red-team campaign 7, P3).
+/// four of them locked the onion pool (red-team campaign 7).
 pub const EVICTION_DELIVERING_FRESH: Duration = Duration::from_secs(600);
 
 /// Inbound peers never protected, whatever the pool: there is always one
-/// seat a newcomer can be given (red-team campaign 7, P3).
+/// seat a newcomer can be given (red-team campaign 7).
 pub const EVICTION_ALWAYS_OPEN: usize = 4;
 
-/// The inbound peer to let go to make room, among those `eligible` selects.
+/// A peer that completed its handshake this recently is not evicted: a
+/// newcomer gets the time to sync before anyone can take its seat.
+pub const EVICTION_NEWCOMER_GRACE: Duration = Duration::from_secs(60);
+
+/// A connection still saying who it is, this recently, is not evicted: an
+/// honest newcomer's handshake through Tor takes a second or two.
+pub const EVICTION_HALF_OPEN_GRACE: Duration = Duration::from_secs(5);
+
+/// The inbound peer to let go to make room for an arrival from `from`,
+/// among those `eligible` selects.
 ///
 /// # The defect this closes
 ///
@@ -310,14 +332,20 @@ pub const EVICTION_ALWAYS_OPEN: usize = 4;
 /// - then the [`EVICTION_PROTECT_OLDEST`] connected longest;
 /// - never more than all but [`EVICTION_ALWAYS_OPEN`] of the candidates.
 ///
-/// Among the rest, a connection that never completed its handshake goes
-/// first; then the most recent of the address group that holds the most of
-/// them. Until 0.5.8 the most recent connection went, whoever it was: an
-/// occupant holding the old seats, arriving every fraction of a second,
-/// evicted every honest newcomer before it could sync (red-team campaign 7,
-/// P2). An occupant now evicts its own idle connections, then its own group,
-/// before a newcomer alone in its group.
-fn eviction_candidate(peers: &HashMap<u64, Peer>, eligible: impl Fn(&Peer) -> bool) -> Option<u64> {
+/// Among the rest: a connection that has not completed its handshake within
+/// [`EVICTION_HALF_OPEN_GRACE`] goes first; then the most recent of the
+/// arrival's own address group; then, from another group, the most recent
+/// peer past its [`EVICTION_NEWCOMER_GRACE`] — or none, and the arrival is
+/// refused. Until 0.5.8 the most recent connection went, whoever it was: an
+/// occupant arriving again and again evicted every honest newcomer before it
+/// could sync (red-team campaign 7). An occupant now replaces its own
+/// connections, and to evict anyone else needs a new address group each
+/// time, which then cannot touch a newcomer within its first minute.
+fn eviction_candidate(
+    peers: &HashMap<u64, Peer>,
+    from: Option<SocketAddr>,
+    eligible: impl Fn(&Peer) -> bool,
+) -> Option<u64> {
     let now = Instant::now();
     let mut cands: Vec<(u64, &Peer)> = peers
         .iter()
@@ -348,30 +376,30 @@ fn eviction_candidate(peers: &HashMap<u64, Peer>, eligible: impl Fn(&Peer) -> bo
         .collect();
     protected.extend(oldest);
     protected.truncate(cands.len().saturating_sub(EVICTION_ALWAYS_OPEN));
+    let age = |p: &Peer| now.saturating_duration_since(p.connected_at);
     let rest: Vec<&(u64, &Peer)> = cands
         .iter()
         .filter(|(id, _)| !protected.contains(id))
         .collect();
-    // A connection that never said who it is: the one that had longest to.
-    if let Some((id, _)) = rest.iter().find(|(_, p)| !p.handshaked) {
+    // A connection that never said who it is, in time: the one that had
+    // longest to.
+    if let Some((id, _)) = rest
+        .iter()
+        .find(|(_, p)| !p.handshaked && age(p) >= EVICTION_HALF_OPEN_GRACE)
+    {
         return Some(*id);
     }
-    // The address group holding the most seats; loopback (Tor) is one group.
-    let group = |p: &Peer| inbound_group(p.addr);
-    let mut best: Option<(usize, Instant, u64)> = None;
-    for (id, p) in &rest {
-        let n = rest.iter().filter(|(_, q)| group(q) == group(p)).count();
-        let better = match best {
-            None => true,
-            Some((bn, bt, bid)) => {
-                n > bn || (n == bn && (p.connected_at > bt || (p.connected_at == bt && *id > bid)))
-            }
-        };
-        if better {
-            best = Some((n, p.connected_at, *id));
+    // The arrival's own group (loopback is one): it replaces its own.
+    let group = |a: SocketAddr| (inbound_group(a), is_loopback(a));
+    if let Some(f) = from {
+        if let Some((id, _)) = rest.iter().rev().find(|(_, p)| group(p.addr) == group(f)) {
+            return Some(*id);
         }
     }
-    best.map(|(_, _, id)| id)
+    rest.iter()
+        .rev()
+        .find(|(_, p)| p.handshaked && age(p) >= EVICTION_NEWCOMER_GRACE)
+        .map(|(id, _)| *id)
 }
 
 /// Tells the operator, at most every ten minutes, that blocks are refused
@@ -2998,7 +3026,7 @@ impl Node {
                 .filter(|p| !p.outbound && is_loopback(p.addr))
                 .count();
             if loopback >= INBOUND_LOOPBACK_MAX {
-                return match eviction_candidate(&g.peers, |p| is_loopback(p.addr)) {
+                return match eviction_candidate(&g.peers, address, |p| is_loopback(p.addr)) {
                     Some(id) => InboundDecision::Evict(id),
                     None => InboundDecision::Refuse("all loopback inbound slots are taken"),
                 };
@@ -3007,7 +3035,12 @@ impl Node {
         if !full {
             return InboundDecision::Admit;
         }
-        match eviction_candidate(&g.peers, |_| true) {
+        // A connection in the clear never makes room at the expense of a
+        // Tor one: those have their own share, above. Counted with the
+        // others, they were the first a clearnet occupant evicted (red-team
+        // campaign 7).
+        let tor_kept = !from_loopback && g.network != Network::Regtest;
+        match eviction_candidate(&g.peers, address, |p| !(tor_kept && is_loopback(p.addr))) {
             Some(id) => InboundDecision::Evict(id),
             None => InboundDecision::Refuse("all inbound slots are taken"),
         }
@@ -3688,7 +3721,16 @@ impl Node {
                 match Message::parse(&buffer, self.magic) {
                     Ok((msg, consumed)) => {
                         buffer.drain(..consumed);
-                        if !frames.take(Instant::now()) {
+                        let handshaked = || {
+                            self.shared
+                                .lock()
+                                .unwrap()
+                                .peers
+                                .get(&id)
+                                .is_some_and(|p| p.handshaked)
+                        };
+                        if !frames.take(Instant::now(), handshaked) {
+                            self.penalize(id, MISCONDUCT_MALFORMED);
                             return;
                         }
                         if msg.carries_policy_output() && self.policy_is_malformed_from(id, &msg) {
@@ -7044,29 +7086,43 @@ mod tests {
     #[test]
     fn a_flood_of_frames_ends_the_connection() {
         let t0 = Instant::now();
+        // Before the handshake: a handful of frames, no more.
         let mut b = FrameBudget::new(t0);
-        for _ in 0..FRAME_BURST {
-            assert!(b.take(t0));
+        for _ in 0..FRAMES_BEFORE_HANDSHAKE {
+            assert!(b.take(t0, || false));
         }
-        assert!(!b.take(t0), "beyond the burst at once");
+        assert!(!b.take(t0, || false), "no handshake, no burst");
+        assert!(
+            !b.take(t0 + Duration::from_secs(5), || false),
+            "nor any refill"
+        );
+        // Handshake done: the burst, then the pace.
+        let mut b = FrameBudget::new(t0);
+        for _ in 0..FRAMES_BEFORE_HANDSHAKE + FRAME_BURST {
+            assert!(b.take(t0, || true));
+        }
+        assert!(!b.take(t0, || true), "beyond the burst at once");
         let one_second = t0 + Duration::from_secs(1);
         for _ in 0..FRAMES_PER_SECOND {
-            assert!(b.take(one_second));
+            assert!(b.take(one_second, || true));
         }
-        assert!(!b.take(one_second));
+        assert!(!b.take(one_second, || true));
     }
 
-    /// A full node makes room for a newcomer at the expense of the address
-    /// group holding the most seats, its most recent connection — never of a
-    /// peer that recently brought something we kept, nor of the longest
-    /// connected; a connection that never completed its handshake goes
-    /// first; and a delivery long past protects no more (red-team campaign 7,
-    /// P2 and P3).
+    /// A full node makes room for a newcomer at the expense of its most
+    /// recent connection past its grace — never of a peer that recently
+    /// brought something we kept, nor of the longest connected, nor of a
+    /// newcomer within its first minute; a connection that never completed
+    /// its handshake goes first; a delivery long past protects no more
+    /// (red-team campaign 7).
     #[test]
     fn a_full_node_makes_room_but_keeps_its_best_peers() {
         let a = node();
         let inbound = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) as u64;
-        let base = Instant::now();
+        // Everyone connected an hour ago, one millisecond apart.
+        let Some(base) = Instant::now().checked_sub(Duration::from_secs(3600)) else {
+            return;
+        };
         let at = |k: u64| base + Duration::from_millis(k);
         for id in 1..=inbound {
             // Peers 13 to 16 share a group: four seats from one router.
@@ -7076,14 +7132,13 @@ mod tests {
                 format!("10.{id}.0.1:21021").parse().unwrap()
             };
             fake_peer(&a, id, addr, false);
-            // Peer 1 connected first, peer 24 last.
             settle_peer(&a, id, at(id), None);
         }
         let newcomer: SocketAddr = "198.51.100.7:40000".parse().unwrap();
         assert_eq!(
             a.inbound_decision(Some(newcomer)),
-            InboundDecision::Evict(16),
-            "the group holding the most seats gives up its most recent"
+            InboundDecision::Evict(inbound),
+            "the most recent connection goes"
         );
         // A newcomer from a group at its share makes no room for itself.
         let same: SocketAddr = "203.0.113.200:40000".parse().unwrap();
@@ -7091,25 +7146,20 @@ mod tests {
             a.inbound_decision(Some(same)),
             InboundDecision::Refuse(_)
         ));
-        // The younger peers useful: four of them protected (21 to 24), the
-        // eight oldest too (1 to 8); the crowded group still goes first.
-        for id in 17..=inbound {
-            settle_peer(&a, id, at(id), Some(at(10_000 + id)));
-        }
+        // The most recent one brought a block we took: the next one goes.
+        settle_peer(&a, inbound, at(inbound), Some(Instant::now()));
         assert_eq!(
             a.inbound_decision(Some(newcomer)),
-            InboundDecision::Evict(16)
+            InboundDecision::Evict(inbound - 1)
         );
-        // One seat per group left among the unprotected: the most recent.
-        for id in 13..=15 {
-            a.shared.lock().unwrap().peers.get_mut(&id).unwrap().addr =
-                format!("10.{id}.0.1:21021").parse().unwrap();
-        }
+        // A newcomer within its first minute is not chosen: the next one is.
+        settle_peer(&a, inbound - 1, Instant::now(), None);
         assert_eq!(
             a.inbound_decision(Some(newcomer)),
-            InboundDecision::Evict(20)
+            InboundDecision::Evict(inbound - 2)
         );
-        // A connection that never completed its handshake goes first.
+        // A connection that never completed its handshake goes first, once
+        // it had time to.
         a.shared
             .lock()
             .unwrap()
@@ -7122,22 +7172,81 @@ mod tests {
             InboundDecision::Evict(9)
         );
         // A delivery older than ten minutes protects no more.
-        if let Some(old) = Instant::now().checked_sub(EVICTION_DELIVERING_FRESH * 2) {
-            a.shared
-                .lock()
-                .unwrap()
-                .peers
-                .get_mut(&9)
-                .unwrap()
-                .handshaked = true;
-            for id in 17..=inbound {
-                settle_peer(&a, id, at(id), Some(old));
-            }
-            assert_eq!(
-                a.inbound_decision(Some(newcomer)),
-                InboundDecision::Evict(inbound)
-            );
+        a.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&9)
+            .unwrap()
+            .handshaked = true;
+        settle_peer(&a, inbound, at(inbound), Some(at(inbound)));
+        assert_eq!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Evict(inbound)
+        );
+        // Everyone unprotected within its grace: the arrival waits.
+        for id in 9..=inbound {
+            settle_peer(&a, id, Instant::now(), None);
         }
+        assert!(matches!(
+            a.inbound_decision(Some(newcomer)),
+            InboundDecision::Refuse(_)
+        ));
+        a.shutdown();
+    }
+
+    /// An occupant holding the oldest seats and arriving again and again
+    /// evicts its own connections, not a newcomer that arrived before them,
+    /// and a Tor wallet is never evicted for a connection in the clear
+    /// (red-team campaign 7).
+    #[test]
+    fn an_occupant_arriving_again_and_again_evicts_itself() {
+        let net = Network::Testnet;
+        let a = Node::new(net, Chain::new(net, genesis_block(net)));
+        let Some(base) = Instant::now().checked_sub(Duration::from_secs(3600)) else {
+            return;
+        };
+        let inbound = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) as u64;
+        let lo = |k: u64| -> SocketAddr { format!("127.0.0.1:{}", 40000 + k).parse().unwrap() };
+        // Tor wallets settled long ago: 1 to 4. The occupant: 5 to 23, its
+        // newest arrivals last. The honest newcomer: 24, older than the
+        // occupant's last arrivals, past its grace.
+        for id in 1..=inbound {
+            let addr = if id <= 4 {
+                lo(id)
+            } else {
+                format!("10.{id}.0.1:21021").parse().unwrap()
+            };
+            fake_peer(&a, id, addr, false);
+        }
+        for id in 1..=4 {
+            settle_peer(&a, id, base + Duration::from_millis(id), None);
+        }
+        settle_peer(&a, inbound, base + Duration::from_secs(1000), None);
+        for id in 5..inbound {
+            settle_peer(&a, id, base + Duration::from_secs(2000 + id), None);
+        }
+        let arrival: SocketAddr = "10.200.0.1:21021".parse().unwrap();
+        let out = a.inbound_decision(Some(arrival));
+        assert_eq!(
+            out,
+            InboundDecision::Evict(inbound - 1),
+            "its own newest goes"
+        );
+        assert!(!matches!(out, InboundDecision::Evict(id) if id <= 4 || id == inbound));
+        // From one of its own groups: the newest of that group, itself.
+        let again: SocketAddr = "10.20.9.9:21021".parse().unwrap();
+        assert_eq!(a.inbound_decision(Some(again)), InboundDecision::Evict(20));
+        // The newcomer within its first minute: an arrival from a new group
+        // never takes its seat.
+        settle_peer(&a, inbound, Instant::now(), None);
+        for id in 5..inbound {
+            settle_peer(&a, id, Instant::now(), None);
+        }
+        assert!(matches!(
+            a.inbound_decision(Some(arrival)),
+            InboundDecision::Refuse(_)
+        ));
         a.shutdown();
     }
 
@@ -7148,7 +7257,9 @@ mod tests {
         let net = Network::Testnet;
         let a = Node::new(net, Chain::new(net, genesis_block(net)));
         let lo = |k: u64| -> SocketAddr { format!("127.0.0.1:{}", 40000 + k).parse().unwrap() };
-        let base = Instant::now();
+        let Some(base) = Instant::now().checked_sub(Duration::from_secs(3600)) else {
+            return;
+        };
         let at = |k: u64| base + Duration::from_millis(k);
         let share = INBOUND_LOOPBACK_MAX as u64;
         for id in 1..=share {
@@ -7168,7 +7279,7 @@ mod tests {
         // whole pool: four seats always stay open, and a newcomer through
         // Tor is never shut out for good (red-team campaign 7, P3).
         for id in (EVICTION_PROTECT_OLDEST as u64 + 1)..=share {
-            settle_peer(&a, id, at(id), Some(at(10_000 + id)));
+            settle_peer(&a, id, at(id), Some(Instant::now()));
         }
         assert!(matches!(
             a.inbound_decision(Some(lo(99))),
