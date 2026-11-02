@@ -222,6 +222,9 @@ pub struct ChannelSummary {
     /// When the transaction that ends the channel was first seen confirmed,
     /// in seconds since 1970, alongside [`Self::close_height`].
     pub close_time: Option<u64>,
+    /// The height of the block that holds the funding, once one does: the
+    /// page counts its confirmations up to [`Self::funding_depth`].
+    pub funding_height: Option<u64>,
     /// After our own commitment confirmed: the height from which our side,
     /// held by the delay, can be swept back to the wallet.
     pub release_height: Option<u64>,
@@ -3890,6 +3893,7 @@ fn summary(c: &Chan, splices: bool) -> ChannelSummary {
         remote_balance: bal[1 - us],
         state_number: c.machine.local_commit_number().unwrap_or(0),
         funding: c.machine.funding_outpoint(),
+        funding_height: c.machine.funding_height(),
         in_flight: c.machine.update_in_flight(),
         close_txid: match &c.close {
             Some(CloseTracker::Settling { by, .. }) => by.last().copied(),
