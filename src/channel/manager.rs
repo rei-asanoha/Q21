@@ -3730,7 +3730,7 @@ impl ChannelManager {
         // would lose the whole channel to a penalty. A claim never proved is
         // the holder's to judge: once they confirm that this wallet was not
         // restored from a backup, nothing the peer said holds the close back.
-        if chan.refuses() && !(despite_claim && !chan.behind_proven) {
+        if chan.refuses() && (!despite_claim || chan.behind_proven) {
             return Err(BEHIND.into());
         }
         if chan.behind && !chan.behind_proven && !despite_claim {
