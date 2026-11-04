@@ -5735,7 +5735,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // What the page needs to know to distinguish "I have nobody's
             // address" from "nobody let me in".
             configured_bootstrap: targets.len(),
-            reachable: std::sync::atomic::AtomicBool::new(read_reachable(datadir)),
+            // `reachable=onion` (the wallet's own default) holds through Tor
+            // only: with Tor off, the page must not say reachable.
+            reachable: std::sync::atomic::AtomicBool::new(
+                read_reachable(datadir)
+                    && (q21_core::settings::tor(datadir)
+                        || q21_core::settings::reachable_in_clear(datadir)),
+            ),
             // What governs THIS session: was listening requested at launch?
             // The wallet requests it when the setting was yes at startup; a
             // user can also request it by hand.
@@ -7130,8 +7136,11 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     // through it — an onion service, which never reveals the internet
     // address. A choice already written, `no` included, is kept.
     // `settings.txt` is written before anything reads it below.
+    // A Tor this wallet starts itself: bundled, or installed on the
+    // computer. Not merely a port open on 9050 or 9150: any program of any
+    // account could listen there, and would then see and answer every
+    // connection of a wallet that never chose Tor (red-team campaign 8).
     let tor_available = q21_core::tor_process::find_bundled_next_to_program().is_some()
-        || q21_core::socks::find_local_tor().is_some()
         || q21_core::tor_process::find_on_path().is_some();
     match q21_core::settings::wallet_defaults(datadir, tor_available) {
         Ok(w) if !w.is_empty() => println!(
@@ -7171,7 +7180,14 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
             arguments.push(onion);
         }
     }
-    if read_reachable(datadir) && !rest.iter().any(|a| a == "--listen") {
+    // In the clear only for an explicit `reachable=yes`: the default the
+    // wallet writes for itself is through Tor only (red-team campaign 8).
+    let listen = if tor_on {
+        read_reachable(datadir)
+    } else {
+        q21_core::settings::reachable_in_clear(datadir)
+    };
+    if listen && !rest.iter().any(|a| a == "--listen") {
         arguments.push("--listen".to_string());
         if tor_on {
             arguments.push("127.0.0.1".to_string());

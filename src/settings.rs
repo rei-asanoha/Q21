@@ -48,7 +48,38 @@ pub fn reachable(datadir: &Path) -> bool {
 
 /// The parsing half of [`reachable`], on the file's text.
 pub fn reachable_from_text(text: &str) -> bool {
-    yes_in_text(text, REACHABLE_KEY)
+    matches!(
+        value_in_text(text, REACHABLE_KEY).as_deref(),
+        Some("yes" | ONION_ONLY)
+    )
+}
+
+/// The value the wallet writes when it makes itself reachable on its own
+/// (0.5.9): reachable through Tor only. If Tor is turned off later, the
+/// wallet does not become reachable in the clear: that, with its router port
+/// and its address announced, needs an explicit `reachable=yes` (red-team
+/// campaign 8).
+pub const ONION_ONLY: &str = "onion";
+
+/// Reachable in the clear: only an explicit `reachable=yes`, never the
+/// default [`ONION_ONLY`].
+pub fn reachable_in_clear(datadir: &Path) -> bool {
+    std::fs::read_to_string(datadir.join(FILE_NAME))
+        .map(|t| value_in_text(&t, REACHABLE_KEY).as_deref() == Some("yes"))
+        .unwrap_or(false)
+}
+
+/// The value of `key` in this text, trimmed; `None` when the key is absent.
+/// A byte-order mark before the first key is not part of it.
+pub fn value_in_text(text: &str, wanted: &str) -> Option<String> {
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        if let Some((key, value)) = line.trim().split_once('=') {
+            if key.trim() == wanted {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Reads the Tor setting: only an explicit `tor=yes` turns it on, as for
@@ -63,14 +94,7 @@ pub fn tor(datadir: &Path) -> bool {
 /// any other value, `None` when the key is absent. An unreadable file reads
 /// as absent.
 pub fn choice_in_text(text: &str, wanted: &str) -> Option<bool> {
-    for line in text.lines() {
-        if let Some((key, value)) = line.trim().split_once('=') {
-            if key.trim() == wanted {
-                return Some(value.trim() == "yes");
-            }
-        }
-    }
-    None
+    value_in_text(text, wanted).map(|v| v == "yes")
 }
 
 /// The wallet's defaults (0.5.9): a contact found in the directory must be
@@ -89,7 +113,13 @@ pub fn choice_in_text(text: &str, wanted: &str) -> Option<bool> {
 /// A key the user wrote, `no` included, is never changed. Returns what was
 /// written, for the log.
 pub fn wallet_defaults(datadir: &Path, tor_available: bool) -> Result<Vec<&'static str>, String> {
-    let text = std::fs::read_to_string(datadir.join(FILE_NAME)).unwrap_or_default();
+    // A file that cannot be read (not UTF-8, a folder in its place) is not
+    // an absent one: nothing is written over the user's own words.
+    let text = match std::fs::read_to_string(datadir.join(FILE_NAME)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{FILE_NAME} unreadable, left as it is: {e}")),
+    };
     let mut written = Vec::new();
     let tor_on = match choice_in_text(&text, TOR_KEY) {
         Some(on) => on,
@@ -101,7 +131,7 @@ pub fn wallet_defaults(datadir: &Path, tor_available: bool) -> Result<Vec<&'stat
         None => false,
     };
     if tor_on && choice_in_text(&text, REACHABLE_KEY).is_none() {
-        set_reachable(datadir, true)?;
+        set_value(datadir, REACHABLE_KEY, ONION_ONLY)?;
         written.push(REACHABLE_KEY);
     }
     Ok(written)
@@ -114,26 +144,12 @@ pub const ONION_KEY: &str = "onion";
 /// Reads the onion service name, if any.
 pub fn onion(datadir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(datadir.join(FILE_NAME)).ok()?;
-    for line in text.lines() {
-        if let Some((key, value)) = line.trim().split_once('=') {
-            if key.trim() == ONION_KEY && !value.trim().is_empty() {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    None
+    value_in_text(&text, ONION_KEY).filter(|v| !v.is_empty())
 }
 
 /// Is `key` set to exactly `yes` in this text?
 pub fn yes_in_text(text: &str, wanted: &str) -> bool {
-    for line in text.lines() {
-        if let Some((key, value)) = line.trim().split_once('=') {
-            if key.trim() == wanted {
-                return value.trim() == "yes";
-            }
-        }
-    }
-    false
+    value_in_text(text, wanted).as_deref() == Some("yes")
 }
 
 /// Writes the reachability setting. Atomic write (temporary file then
@@ -149,10 +165,19 @@ pub fn set_tor(datadir: &Path, on: bool) -> Result<(), String> {
 }
 
 fn set_yes_no(datadir: &Path, wanted: &str, on: bool) -> Result<(), String> {
+    set_value(datadir, wanted, if on { "yes" } else { "no" })
+}
+
+fn set_value(datadir: &Path, wanted: &str, value: &str) -> Result<(), String> {
     let path = datadir.join(FILE_NAME);
-    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    // Never rewrite from nothing a file that exists but cannot be read.
+    let old = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{FILE_NAME} unreadable, left as it is: {e}")),
+    };
     let mut text = String::new();
-    for line in old.lines() {
+    for line in old.trim_start_matches('\u{feff}').lines() {
         let key = line.trim().split_once('=').map(|(c, _)| c.trim());
         if key == Some(wanted) {
             continue;
@@ -160,7 +185,7 @@ fn set_yes_no(datadir: &Path, wanted: &str, on: bool) -> Result<(), String> {
         text.push_str(line);
         text.push('\n');
     }
-    text.push_str(&format!("{wanted}={}\n", if on { "yes" } else { "no" }));
+    text.push_str(&format!("{wanted}={value}\n"));
     write_atomic(&path, &text)
 }
 
@@ -249,6 +274,39 @@ mod tests {
     /// The wallet's defaults (0.5.9): Tor on when a Tor is there, and
     /// reachable through it; what the user chose is kept, `no` included;
     /// never reachable in the clear by default.
+    /// Red-team campaign 8: the reachability the wallet gives itself holds
+    /// through Tor only; Tor turned off later does not make it reachable in
+    /// the clear. A byte-order mark does not hide a key, and a file that
+    /// cannot be read is never rewritten from nothing.
+    #[test]
+    fn the_default_reachability_never_becomes_reachable_in_the_clear() {
+        let d = dir("defaults-onion-only");
+        wallet_defaults(&d, true).unwrap();
+        assert!(reachable(&d), "reachable through Tor");
+        assert!(!reachable_in_clear(&d), "never in the clear by default");
+        set_tor(&d, false).unwrap();
+        assert!(!reachable_in_clear(&d), "Tor off: still not in the clear");
+        set_reachable(&d, true).unwrap();
+        assert!(reachable_in_clear(&d), "an explicit yes is");
+        let _ = std::fs::remove_dir_all(&d);
+
+        let d = dir("defaults-bom");
+        std::fs::write(d.join(FILE_NAME), "\u{feff}tor=no\nreachable=no\n").unwrap();
+        assert!(wallet_defaults(&d, true).unwrap().is_empty());
+        assert!(!tor(&d) && !reachable(&d));
+        let _ = std::fs::remove_dir_all(&d);
+
+        let d = dir("defaults-latin1");
+        std::fs::write(d.join(FILE_NAME), b"# caf\xe9\ntor=no\n").unwrap();
+        assert!(wallet_defaults(&d, true).is_err());
+        assert_eq!(
+            std::fs::read(d.join(FILE_NAME)).unwrap(),
+            b"# caf\xe9\ntor=no\n".to_vec(),
+            "left as it is"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn the_wallet_defaults_to_tor_and_reachable_through_it() {
         // A new wallet, with a Tor: both on.

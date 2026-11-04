@@ -10,11 +10,16 @@ Since 0.4.8, **Tor comes with the wallet** on Windows, macOS and Linux
 is both on Tor and reachable becomes a hidden node by itself.
 
 Since 0.5.9, **the wallet turns Tor on by itself** when you never chose and
-this computer has a Tor (the one in the archive, a Tor service, Tor Browser
-left open), and it makes itself **reachable through Tor**: a hidden node.
-A contact who finds you in the directory can then call you, and your
-internet address is never announced. A choice you made in the Network tab,
-"off" included, is kept. Without a Tor on the computer, the wallet works as
+this computer has a Tor it can start itself (the one in the archive, or a
+`tor` program installed on the computer), and it makes itself **reachable
+through Tor**: a hidden node. It writes `tor=yes` and `reachable=onion` in
+`settings.txt`: reachable through Tor only. If you turn Tor off later, the
+wallet does not become reachable in the clear; that needs your explicit
+choice (`reachable=yes`). A contact who finds you in the directory can call
+you, and your internet address is never announced. A choice you made in the
+Network tab, "off" included, is kept. A port merely open on 9050 or 9150 does
+not count as a Tor for this default: any program of any account on the
+computer could be listening there. Without a Tor, the wallet works as
 before, without it. A node started from the command line (`q21 node`) never
 turns Tor on by itself.
 
