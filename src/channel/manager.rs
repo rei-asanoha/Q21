@@ -2990,9 +2990,7 @@ impl ChannelManager {
                                 hold.push(tx.clone());
                                 c.splice_held = Some(tx.clone());
                             }
-                            if let (true, Some(tx)) =
-                                (depth_of(&st.old_funding).is_some(), c.machine.splice_tx())
-                            {
+                            if let (true, Some(tx)) = (alive, c.machine.splice_tx()) {
                                 pending.push((tx.clone(), "splice"));
                             }
                         }

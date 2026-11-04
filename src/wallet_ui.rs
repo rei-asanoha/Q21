@@ -4391,6 +4391,9 @@ function keepSelection(){
 // Another person, or another channel: what was under way for the previous
 // one is dropped, so that nothing prepared for one is sent to the other.
 function selectPanel(owner, cid){
+  // Another panel: the call followed on screen stops there, so that its
+  // words never land under another contact's name (red-team campaign 8).
+  callRound++;
   selectedOwner = owner || null;
   selectedChannel = cid || null;
   preparedChannel = null;
@@ -8577,6 +8580,10 @@ mod tests {
         assert!(owner.contains("OWNER_HEX.test(kept)"));
         // Choosing another person drops what was prepared for the previous one.
         let select = channel_function("function selectPanel(");
+        assert!(
+            select.contains("callRound++;"),
+            "a call's note never follows to another panel"
+        );
         assert!(select.contains("preparedChannel = null;"));
         assert!(select.contains("showOpenForm();"));
         // A refresh does not rebuild the list or the panel while nothing changed.

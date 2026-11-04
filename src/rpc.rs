@@ -2962,7 +2962,11 @@ impl RpcContext {
         let owner = mgr
             .peer_owner(peer)
             .ok_or_else(|| rpc_error(ERR_REQUEST, "the session ended"))?;
-        // The answer holds for the words and the identity the holder saw,
+        if !matched {
+            mgr.conclude_verification(peer, false);
+            return Ok(Json::obj().set("verified", Json::Bool(false)).build());
+        }
+        // "The words match" holds for the words and the identity the holder saw,
         // not for whatever the connection carries at the moment of the
         // click: a new session on the same connection, between the reading
         // and the click, could otherwise be marked verified under the name
@@ -2986,10 +2990,6 @@ impl RpcContext {
                 ERR_REQUEST,
                 "the words on this connection changed: read the new words aloud first",
             ));
-        }
-        if !matched {
-            mgr.conclude_verification(peer, false);
-            return Ok(Json::obj().set("verified", Json::Bool(false)).build());
         }
         let mut g = w
             .lock()
