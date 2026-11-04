@@ -25,7 +25,7 @@
 //! says so and waits, exactly as when no Tor is found at all.
 
 use std::io::{BufRead, BufReader};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -99,9 +99,9 @@ pub struct ManagedTor {
 }
 
 impl ManagedTor {
-    /// Starts Tor and returns at once: the SOCKS port is known before Tor has
-    /// finished building its circuits, and the node's connections simply fail
-    /// until it has (see [`ManagedTor::progress`]).
+    /// Starts Tor and returns once it has opened its SOCKS port (a second or
+    /// so), before it has finished building its circuits: the node's
+    /// connections simply fail until it has (see [`ManagedTor::progress`]).
     pub fn start(options: &Options) -> std::io::Result<ManagedTor> {
         let progress = Arc::new(AtomicU8::new(0));
         let last_problem = Arc::new(Mutex::new(String::new()));
@@ -215,7 +215,11 @@ fn spawn(
             "# Written by q21: the configuration is on the command line.\n",
         )?;
     }
-    let socks = SocketAddr::from(([127, 0, 0, 1], free_port()?));
+    // Tor picks its SOCKS port itself, and says which in its log: a port
+    // drawn here and let go could be taken by another program before Tor
+    // binds it, which would then see, and could answer, every connection of
+    // the node (red-team campaign 8).
+    let opened: SocksOpened = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
 
     let mut cmd = Command::new(&options.executable);
     cmd.arg("-f")
@@ -223,7 +227,7 @@ fn spawn(
         .arg("--defaults-torrc")
         .arg(&torrc)
         .arg("--SocksPort")
-        .arg(socks.to_string())
+        .arg("127.0.0.1:auto")
         .arg("--DataDirectory")
         .arg(&options.data_dir)
         .arg("--ClientOnly")
@@ -276,12 +280,20 @@ fn spawn(
     if let Some(out) = child.stdout.take() {
         let p = progress.clone();
         let problem = last_problem.clone();
+        let seen = opened.clone();
         std::thread::Builder::new()
             .name("tor-log".to_string())
             .spawn(move || {
                 for line in BufReader::new(out).lines().map_while(Result::ok) {
                     if let Some(n) = bootstrap_percent(&line) {
                         p.store(n, Ordering::SeqCst);
+                    }
+                    if let Some(a) = socks_listener(&line) {
+                        let (slot, ready) = &*seen;
+                        if let Ok(mut g) = slot.lock() {
+                            g.get_or_insert(a);
+                        }
+                        ready.notify_all();
                     }
                     if line.contains("[warn]") || line.contains("[err]") {
                         if let Ok(mut g) = problem.lock() {
@@ -291,15 +303,51 @@ fn spawn(
                 }
             })?;
     }
+    // Its SOCKS port, as Tor announces it. A Tor that exits or stays silent
+    // is stopped, and the node waits: never a guessed port.
+    let deadline = std::time::Instant::now() + SOCKS_OPEN_LIMIT;
+    let (slot, ready) = &*opened;
+    let mut g = slot
+        .lock()
+        .map_err(|_| std::io::Error::other("Tor's log reader failed"))?;
+    let socks = loop {
+        if let Some(a) = *g {
+            break a;
+        }
+        let now = std::time::Instant::now();
+        let exited = matches!(child.try_wait(), Ok(Some(_)));
+        if now >= deadline || exited {
+            drop(g);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other(
+                "Tor did not open its SOCKS port (see its last message)",
+            ));
+        }
+        g = ready
+            .wait_timeout(g, std::time::Duration::from_millis(200))
+            .map_err(|_| std::io::Error::other("Tor's log reader failed"))?
+            .0;
+    };
+    drop(g);
     Ok((child, socks, onion_dir))
 }
 
-/// A free TCP port on the loopback. Another program could take it between
-/// this call and Tor's start; Tor then fails to start and says so, and the
-/// node waits instead of connecting in the clear.
-fn free_port() -> std::io::Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
+/// What Tor's log says of the SOCKS port it opened, once it has.
+type SocksOpened = Arc<(Mutex<Option<SocketAddr>>, std::sync::Condvar)>;
+
+/// How long Tor may take to open its SOCKS port: it does so at once, before
+/// any network access.
+const SOCKS_OPEN_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The SOCKS port a line of Tor's log says it opened, on the loopback:
+/// `[notice] Opened Socks listener connection (ready) on 127.0.0.1:41387`
+/// (Tor 0.4.x); `Opened Socks listener on 127.0.0.1:41387` (older).
+pub fn socks_listener(line: &str) -> Option<SocketAddr> {
+    let rest = line.split("Opened Socks listener").nth(1)?;
+    let at = rest.rsplit(" on ").next()?.trim();
+    let a: SocketAddr = at.parse().ok()?;
+    a.ip().is_loopback().then_some(a)
 }
 
 /// Tor refuses a data directory that other accounts can read.
@@ -353,6 +401,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn the_socks_port_is_read_from_tor_lines() {
+        let want = SocketAddr::from(([127, 0, 0, 1], 41387));
+        assert_eq!(
+            socks_listener(
+                "Nov 04 20:00:00.000 [notice] Opened Socks listener connection (ready) on 127.0.0.1:41387"
+            ),
+            Some(want)
+        );
+        assert_eq!(
+            socks_listener("[notice] Opened Socks listener on 127.0.0.1:41387"),
+            Some(want)
+        );
+        // Never a port outside the loopback, nor a line about another listener.
+        assert_eq!(
+            socks_listener("[notice] Opened Socks listener connection (ready) on 0.0.0.0:9050"),
+            None
+        );
+        assert_eq!(
+            socks_listener("[notice] Opened Control listener connection (ready) on 127.0.0.1:9051"),
+            None
+        );
+        assert_eq!(
+            socks_listener("[notice] Bootstrapped 5% (conn): Connecting"),
+            None
+        );
+    }
+
+    /// A Tor that exits without opening its SOCKS port is an error: the node
+    /// never guesses a port another program could hold (red-team campaign 8).
+    #[cfg(unix)]
+    #[test]
+    fn a_tor_that_opens_no_socks_port_is_not_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("q21-silenttor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let fake = d.join("tor");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho '[warn] Could not bind to 127.0.0.1:auto'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = ManagedTor::start(&Options {
+            executable: fake,
+            data_dir: d.join("data"),
+            hidden_service: None,
+        });
+        assert!(r.is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A stand-in for Tor, written as a shell script: it prints the lines the
     /// real one prints and writes an onion name where it was asked to.
     #[cfg(unix)]
@@ -372,6 +473,7 @@ mod tests {
                  if [ \"$1\" = --HiddenServiceDir ]; then mkdir -p \"$2\"; echo {name} > \"$2/hostname\"; fi\n\
                  shift\n\
                  done\n\
+                 echo '[notice] Opened Socks listener connection (ready) on 127.0.0.1:19050'\n\
                  echo '[notice] Bootstrapped 10% (conn): Connecting'\n\
                  echo '[notice] Bootstrapped 100% (done): Done'\n\
                  sleep 30\n"
@@ -385,7 +487,11 @@ mod tests {
             hidden_service: Some((21121, SocketAddr::from(([127, 0, 0, 1], 21999)))),
         })
         .expect("start");
-        assert!(t.socks().ip().is_loopback());
+        assert_eq!(
+            t.socks(),
+            SocketAddr::from(([127, 0, 0, 1], 19050)),
+            "the port Tor announced"
+        );
         let mut waited = 0;
         while (t.progress() < 100 || t.onion_name().is_none()) && waited < 100 {
             std::thread::sleep(std::time::Duration::from_millis(50));
