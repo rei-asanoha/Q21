@@ -4568,6 +4568,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
     let mut listen_on: Option<String> = None;
+    // Set by the wallet for its listen through Tor: see below.
+    let mut listen_any_free = false;
     let mut connect_to: Vec<String> = Vec::new();
     let mut mine = false;
     let mut duration = 0u64;
@@ -4624,6 +4626,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
             "--upnp" => {
                 upnp = true;
+                i += 1;
+            }
+            "--listen-any-free" => {
+                listen_any_free = true;
                 i += 1;
             }
             "--tor" => {
@@ -5087,6 +5093,31 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // 2. a Tor already running on this machine (the Tor service on 9050, Tor
     //    Browser on 9150);
     // 3. a `tor` on the PATH, started by the node.
+    // The wallet's listen through Tor: the network's port when it is free on
+    // this computer, otherwise one the system picks. A program of another
+    // account on that port, a second wallet, or a node kept the wallet from
+    // starting at all (red-team campaign 8, third round). Tor forwards the
+    // onion address to whichever port is used: the address does not change.
+    if listen_any_free {
+        let wanted: Option<std::net::SocketAddr> = listen_on
+            .as_deref()
+            .and_then(|a| q21_core::bootstrap::listen_address(a, network).parse().ok());
+        if let Some(s) = wanted.filter(|s| s.ip().is_loopback()) {
+            if std::net::TcpListener::bind(s).is_err() {
+                if let Ok(free) =
+                    std::net::TcpListener::bind((s.ip(), 0)).and_then(|l| l.local_addr())
+                {
+                    println!(
+                        "  port {} is taken on this computer: listening on {} instead, \
+                         behind Tor",
+                        s.port(),
+                        free.port()
+                    );
+                    listen_on = Some(free.to_string());
+                }
+            }
+        }
+    }
     let listen_socket: Option<std::net::SocketAddr> = listen_on
         .as_deref()
         .and_then(|a| q21_core::bootstrap::listen_address(a, network).parse().ok());
@@ -5460,7 +5491,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // when the user explicitly asked for `--listen` (a bootstrap
             // node), the failure stays fatal: that is precisely what they
             // wanted.
-            Err(e) if upnp => {
+            Err(e) if upnp || listen_any_free => {
                 println!(
                     "  cannot listen ({e}): this wallet starts in client mode. \
                      It connects out to the network, but is not reachable. Nothing is broken."
@@ -5517,13 +5548,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // they are then counted, kept in `onions.dat`, and passed on to peers
     // like those learned from the network.
     let port = q21_core::bootstrap::default_port(network);
-    let from_file: Vec<q21_core::wire::OnionAddr> = targets
+    let from_file: Vec<(q21_core::wire::OnionAddr, bool)> = targets
         .iter()
         .filter(|a| is_onion_target(a))
         .filter_map(|a| q21_core::wire::OnionAddr::parse(a, port))
         .map(|mut o| {
             o.last_seen = unix_now();
-            o
+            (o, false)
         })
         .collect();
     if !from_file.is_empty() {
@@ -5619,7 +5650,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
     // The onion names learned before: a node through Tor finds the onion
     // services again even when the entry points are down.
-    let onions = q21_core::addr::load_onions(&onions_path(datadir), unix_now());
+    let onions = q21_core::addr::load_onion_entries(&onions_path(datadir), unix_now());
     if !onions.is_empty() {
         let n = node.seed_onions(onions);
         println!("  onion addresses: {n} reloaded");
@@ -6167,6 +6198,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 .filter(|_| slept >= TOR_RESTART_AFTER_SLEEP)
             {
                 last_tor_restart = std::time::Instant::now();
+                // Tor frees its SOCKS port first: until the new one is read,
+                // nothing goes to the old port (red-team campaign 8).
+                node.set_proxy(Some(TOR_GONE));
                 match t.restart() {
                     Ok(a) => {
                         node.set_proxy(Some(a));
@@ -6224,6 +6258,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 // at once (see the onion check).
                 if ready && onion_restart_now.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     last_tor_restart = std::time::Instant::now();
+                    // Tor frees its SOCKS port first: until the new one is read,
+                    // nothing goes to the old port (red-team campaign 8).
+                    node.set_proxy(Some(TOR_GONE));
                     match t.restart() {
                         Ok(a) => {
                             node.set_proxy(Some(a));
@@ -6248,6 +6285,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     onion_unreachable.store(false, std::sync::atomic::Ordering::SeqCst);
                     unreachable_restarts = unreachable_restarts.saturating_add(1);
                     last_tor_restart = std::time::Instant::now();
+                    // Tor frees its SOCKS port first: until the new one is read,
+                    // nothing goes to the old port (red-team campaign 8).
+                    node.set_proxy(Some(TOR_GONE));
                     match t.restart() {
                         Ok(a) => {
                             node.set_proxy(Some(a));
@@ -6263,6 +6303,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 if !t.is_running() && last_tor_restart.elapsed().as_secs() >= 60 {
                     last_tor_restart = std::time::Instant::now();
                     let why = t.last_problem();
+                    // Tor frees its SOCKS port first: until the new one is read,
+                    // nothing goes to the old port (red-team campaign 8).
+                    node.set_proxy(Some(TOR_GONE));
                     match t.restart() {
                         Ok(a) => {
                             node.set_proxy(Some(a));
@@ -6821,7 +6864,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     if let Err(e) = address_book.save_entries(&node.address_entries()) {
         eprintln!("warning: address book not written: {e}");
     }
-    if let Err(e) = q21_core::addr::save_onions(&onions_path(datadir), &node.onion_entries()) {
+    if let Err(e) = q21_core::addr::save_onion_entries(&onions_path(datadir), &node.onion_entries())
+    {
         eprintln!("warning: onion addresses not written: {e}");
     }
     // The snapshot is written at shutdown, not at every block: it is a
@@ -7201,6 +7245,7 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         arguments.push("--listen".to_string());
         if tor_on {
             arguments.push("127.0.0.1".to_string());
+            arguments.push("--listen-any-free".to_string());
         } else {
             arguments.push(String::new()); // default P2P port of the network
             arguments.push("--upnp".to_string());

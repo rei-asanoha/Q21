@@ -182,6 +182,16 @@ pub enum NetGroup {
 /// what listening on `[::]` yields) is grouped with the IPv4 ones: treating
 /// it as a `/64` would put the entire v4 Internet in a single group.
 ///
+/// The key under which the onion book counts the names one source wrote
+/// (see [`crate::addr::ONION_SHARE_PER_SOURCE`]): the peer's address group,
+/// every Tor peer being one. Never [`crate::addr::ONION_SOURCE_LOCAL`].
+fn onion_source(source: (Option<NetGroup>, bool)) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut h);
+    h.finish().max(1)
+}
+
 /// Loopback is not a group: several nodes on the same machine (regtest,
 /// tests) do not eclipse one another.
 pub fn inbound_group(address: SocketAddr) -> Option<NetGroup> {
@@ -309,12 +319,15 @@ impl FrameBudget {
 pub const INBOUND_ARRIVALS_PER_GROUP: usize = 6;
 pub const INBOUND_ARRIVALS_WINDOW: Duration = Duration::from_secs(60);
 
-/// A group that arrived this many times within [`INBOUND_REDIAL_WINDOW`]
-/// redials: its seats lose the newcomer's first-minute grace. A seat kept
-/// young by hanging up and calling again within the minute, one seat per
-/// address group, still locked an entry point against every newcomer
-/// (red-team campaign 8, round 2); an honest newcomer arrives once.
-pub const INBOUND_REDIALS: usize = 3;
+/// A group whose callers hung up this many times within their first minute,
+/// within [`INBOUND_REDIAL_WINDOW`], redials: its seats lose the newcomer's
+/// first-minute grace. A seat kept young by hanging up and calling again
+/// within the minute, one seat per address group, still locked an entry
+/// point against every newcomer (red-team campaign 8, round 2). Only the
+/// caller's own hang-ups count: an honest wallet this node let go, and that
+/// calls again, keeps its grace (third round: counting arrivals took it from
+/// a wallet evicted twice).
+pub const INBOUND_REDIALS: usize = 2;
 pub const INBOUND_REDIAL_WINDOW: Duration = Duration::from_secs(600);
 
 /// How long having delivered something protects a peer from eviction: an
@@ -362,7 +375,7 @@ pub const EVICTION_HALF_OPEN_GRACE: Duration = Duration::from_secs(5);
 /// time, which then cannot touch a newcomer within its first minute.
 fn eviction_candidate(
     peers: &HashMap<u64, Peer>,
-    arrivals: &HashMap<NetGroup, Vec<Instant>>,
+    hangups: &HashMap<NetGroup, Vec<Instant>>,
     from: Option<SocketAddr>,
     eligible: impl Fn(&Peer) -> bool,
 ) -> Option<u64> {
@@ -436,11 +449,11 @@ fn eviction_candidate(
     }
     // Past its first minute: a newcomer is never the one to go, whatever the
     // arrival — through Tor, every arrival is of the same group.
-    // A seat of a group that keeps redialing has no grace: it stays young
-    // only by calling again (red-team campaign 8).
+    // A seat of a group that keeps hanging up young has no grace: it stays
+    // young only by calling again (red-team campaign 8).
     let redialing = |p: &Peer| {
         inbound_group(p.addr)
-            .and_then(|gr| arrivals.get(&gr))
+            .and_then(|gr| hangups.get(&gr))
             .is_some_and(|v| {
                 v.iter()
                     .filter(|t| now.saturating_duration_since(**t) < INBOUND_REDIAL_WINDOW)
@@ -673,6 +686,10 @@ pub const ADDR_NEW_PER_INBOUND_GROUP_HOUR: u32 = 512;
 /// `getaddr`, not a stream (red-team campaign 8: a caller that got itself
 /// dialed then wrote ten a second without end).
 pub const ADDR_NEW_PER_OUTBOUND: u32 = crate::wire::MAX_ADDR as u32;
+/// New onion names one connection we dialed can write: the onion book holds
+/// [`crate::addr::MAX_ONIONS`], and one peer we dialed filled it whole
+/// (red-team campaign 8, third round).
+pub const ONION_NEW_PER_OUTBOUND: u32 = 64;
 
 /// Cost of a batch of headers nobody requested. No honest node sends one: only
 /// the reply to a request produces one.
@@ -1619,6 +1636,9 @@ struct Peer {
     /// New addresses this peer wrote into the book. See
     /// [`ADDR_NEW_PER_INBOUND`].
     addr_added: u32,
+    /// New onion names this peer wrote (a peer we dialed: see
+    /// [`ONION_NEW_PER_OUTBOUND`]).
+    onion_added: u32,
     /// Header replies we expect from this peer. See
     /// [`MAX_EXPECTED_HEADERS`].
     expected_headers: u8,
@@ -1973,6 +1993,9 @@ struct Shared {
     /// When each inbound address group last arrived, within the window of
     /// [`INBOUND_ARRIVALS_PER_GROUP`].
     inbound_arrivals: HashMap<NetGroup, Vec<Instant>>,
+    /// Hang-ups of callers within their first minute, by address group,
+    /// within [`INBOUND_REDIAL_WINDOW`]. See [`INBOUND_REDIALS`].
+    inbound_hangups: HashMap<NetGroup, Vec<Instant>>,
     /// New addresses written by inbound peers, per address group (loopback
     /// is one), within the current hour. See [`ADDR_NEW_PER_INBOUND`].
     addr_from_inbound: HashMap<(Option<NetGroup>, bool), (Instant, u32)>,
@@ -2374,6 +2397,7 @@ impl Node {
                 reach_kept_at: HashMap::new(),
                 reach_deferred: HashMap::new(),
                 inbound_arrivals: HashMap::new(),
+                inbound_hangups: HashMap::new(),
                 addr_from_inbound: HashMap::new(),
                 reach_bucket: TokenBucket {
                     tokens: REACH_BUCKET_MAX,
@@ -2898,22 +2922,24 @@ impl Node {
         }
     }
 
-    /// The onion names known, to write at shutdown.
-    pub fn onion_entries(&self) -> Vec<crate::wire::OnionAddr> {
-        self.shared
-            .lock()
-            .unwrap()
-            .onions
-            .to_announce(crate::addr::MAX_ONIONS)
+    /// The onion names known, with whether each answered: to write at
+    /// shutdown.
+    pub fn onion_entries(&self) -> Vec<crate::addr::OnionEntry> {
+        self.shared.lock().unwrap().onions.entries()
     }
 
-    /// Pours onion names back into the book: from `onions.dat` at startup.
-    pub fn seed_onions(&self, v: Vec<crate::wire::OnionAddr>) -> usize {
+    /// Pours onion names back into the book: from `onions.dat` at startup,
+    /// with the names that answered before.
+    pub fn seed_onions(&self, v: Vec<(crate::wire::OnionAddr, bool)>) -> usize {
         let mut g = self.shared.lock().unwrap();
         let now = unix_now();
         let before = g.onions.len();
-        for a in v {
+        for (a, answered) in v {
+            let (name, port) = (a.name.clone(), a.port);
             g.onions.add(a, now);
+            if answered {
+                g.onions.mark_answered(&name, port);
+            }
         }
         g.onions.len() - before
     }
@@ -3185,26 +3211,45 @@ impl Node {
         let mut g = self.shared.lock().unwrap();
         let now = Instant::now();
         let seen = g.inbound_arrivals.entry(gr).or_default();
-        seen.retain(|t| now.saturating_duration_since(*t) < INBOUND_REDIAL_WINDOW);
-        let last_minute = seen
-            .iter()
-            .filter(|t| now.saturating_duration_since(**t) < INBOUND_ARRIVALS_WINDOW)
-            .count();
-        if last_minute >= INBOUND_ARRIVALS_PER_GROUP {
+        seen.retain(|t| now.saturating_duration_since(*t) < INBOUND_ARRIVALS_WINDOW);
+        if seen.len() >= INBOUND_ARRIVALS_PER_GROUP {
             return false;
-        }
-        // Bounded: the redial count needs no more than this.
-        if seen.len() >= 4 * INBOUND_ARRIVALS_PER_GROUP {
-            seen.remove(0);
         }
         seen.push(now);
         if g.inbound_arrivals.len() > 4096 {
             g.inbound_arrivals.retain(|_, v| {
                 v.iter()
-                    .any(|t| now.saturating_duration_since(*t) < INBOUND_REDIAL_WINDOW)
+                    .any(|t| now.saturating_duration_since(*t) < INBOUND_ARRIVALS_WINDOW)
             });
         }
         true
+    }
+
+    /// A caller that hung up within its first minute: counted for its
+    /// address group, see [`INBOUND_REDIALS`].
+    fn note_young_hangup(&self, id: u64) {
+        let mut g = self.shared.lock().unwrap();
+        let now = Instant::now();
+        let Some(p) = g.peers.get(&id) else {
+            return;
+        };
+        if p.outbound || now.saturating_duration_since(p.connected_at) >= EVICTION_NEWCOMER_GRACE {
+            return;
+        }
+        let Some(gr) = inbound_group(p.addr) else {
+            return;
+        };
+        let seen = g.inbound_hangups.entry(gr).or_default();
+        seen.retain(|t| now.saturating_duration_since(*t) < INBOUND_REDIAL_WINDOW);
+        if seen.len() < 4 * INBOUND_REDIALS {
+            seen.push(now);
+        }
+        if g.inbound_hangups.len() > 4096 {
+            g.inbound_hangups.retain(|_, v| {
+                v.iter()
+                    .any(|t| now.saturating_duration_since(*t) < INBOUND_REDIAL_WINDOW)
+            });
+        }
     }
 
     fn inbound_decision(&self, address: Option<SocketAddr>) -> InboundDecision {
@@ -3230,7 +3275,7 @@ impl Node {
                 .filter(|p| !p.outbound && is_loopback(p.addr))
                 .count();
             if loopback >= INBOUND_LOOPBACK_MAX {
-                return match eviction_candidate(&g.peers, &g.inbound_arrivals, address, |p| {
+                return match eviction_candidate(&g.peers, &g.inbound_hangups, address, |p| {
                     is_loopback(p.addr)
                 }) {
                     Some(id) => InboundDecision::Evict(id),
@@ -3246,7 +3291,7 @@ impl Node {
         // others, they were the first a clearnet occupant evicted (red-team
         // campaign 7).
         let tor_kept = !from_loopback && g.network != Network::Regtest;
-        match eviction_candidate(&g.peers, &g.inbound_arrivals, address, |p| {
+        match eviction_candidate(&g.peers, &g.inbound_hangups, address, |p| {
             !(tor_kept && is_loopback(p.addr))
         }) {
             Some(id) => InboundDecision::Evict(id),
@@ -3811,6 +3856,7 @@ impl Node {
                     headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                     addr_bucket: TokenBucket::for_addresses(Instant::now()),
                     addr_added: 0,
+                    onion_added: 0,
                     expected_headers: 0,
                     requested_bodies: HashMap::new(),
                     bodies_to_request: VecDeque::new(),
@@ -3865,7 +3911,10 @@ impl Node {
 
         let node = self.clone();
         std::thread::spawn(move || {
-            node.read_loop(id, reader);
+            let hung_up = node.read_loop(id, reader);
+            if hung_up {
+                node.note_young_hangup(id);
+            }
             node.disconnect(id);
         });
         id
@@ -3898,8 +3947,9 @@ impl Node {
     ///
     /// The buffer never grows beyond the maximum size of a frame: this is what
     /// prevents a peer from exhausting memory by announcing a gigantic payload
-    /// and then sending nothing.
-    fn read_loop(&self, id: u64, mut stream: TcpStream) {
+    /// and then sending nothing. Returns whether the peer hung up (its end
+    /// closed or reset), rather than this node letting it go.
+    fn read_loop(&self, id: u64, mut stream: TcpStream) -> bool {
         let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut chunk = [0u8; 32 * 1024];
         // Every frame takes the node's lock; a peer sending a million empty
@@ -3909,10 +3959,10 @@ impl Node {
 
         loop {
             if self.is_stopped() {
-                return;
+                return false;
             }
             let n = match stream.read(&mut chunk) {
-                Ok(0) => return,
+                Ok(0) => return true,
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 // A read cut short by a signal, not by the peer. On Linux a
@@ -3921,13 +3971,13 @@ impl Node {
                 // Ctrl-Z, then SIGCONT), handler or not: treated as fatal, a
                 // pause of a few seconds dropped every live link at once.
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
+                Err(_) => return true,
             };
             buffer.extend_from_slice(&chunk[..n]);
 
             if buffer.len() > MAX_PAYLOAD + HEADER_LEN {
                 self.penalize(id, MISCONDUCT_MALFORMED * 10);
-                return;
+                return false;
             }
 
             loop {
@@ -3944,21 +3994,21 @@ impl Node {
                         };
                         if !frames.take(Instant::now(), handshaked) {
                             self.penalize(id, MISCONDUCT_MALFORMED);
-                            return;
+                            return false;
                         }
                         if msg.carries_policy_output() && self.policy_is_malformed_from(id, &msg) {
                             self.penalize(id, MISCONDUCT_MALFORMED);
-                            return;
+                            return false;
                         }
                         if !self.handle(id, msg) {
-                            return;
+                            return false;
                         }
                     }
                     Err(WireError::Incomplete) => break,
                     Err(_) => {
                         self.penalize(id, MISCONDUCT_MALFORMED);
                         // Lost framing cannot be recovered: we disconnect.
-                        return;
+                        return false;
                     }
                 }
             }
@@ -5398,7 +5448,12 @@ impl Node {
                             // be a way to get ahead of all the others.
                             let mut a = a;
                             a.last_seen = a.last_seen.min(now);
-                            if book.add(a, now) {
+                            // Only a new address counts: a peer passing on
+                            // the addresses we already know, then its own,
+                            // must not have spent its share on the first
+                            // (red-team campaign 8, third round).
+                            let known = book.contains(&a);
+                            if book.add(a, now) && !known {
                                 Self::wrote_address(peer, addr_from_inbound, source);
                             }
                         }
@@ -5434,14 +5489,16 @@ impl Node {
                                 addr_from_inbound,
                                 source,
                                 instant,
-                            ) {
+                            ) || (peer.outbound && peer.onion_added >= ONION_NEW_PER_OUTBOUND)
+                            {
                                 self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
                             let mut a = a;
                             a.last_seen = a.last_seen.min(now);
-                            if onions.add(a, now) {
+                            if onions.add_from(a, now, onion_source(source)) {
                                 Self::wrote_address(peer, addr_from_inbound, source);
+                                peer.onion_added = peer.onion_added.saturating_add(1);
                             }
                         }
                     }
@@ -6330,11 +6387,16 @@ impl Node {
     /// ten minutes; the reply is bounded by each peer's bucket.
     pub fn ask_addresses(&self) -> usize {
         let targets: Vec<Arc<Outbox>> = {
-            let g = self.shared.lock().unwrap();
+            let mut g = self.shared.lock().unwrap();
             g.peers
-                .values()
+                .values_mut()
                 .filter(|p| p.handshaked && p.outbound)
-                .map(|p| p.writer.clone())
+                .map(|p| {
+                    // Each reply may bring the onion names that appeared
+                    // since: a long-lived link keeps teaching them.
+                    p.onion_added = 0;
+                    p.writer.clone()
+                })
                 .collect()
         };
         self.broadcast(&targets, &Message::GetAddr);
@@ -7231,6 +7293,7 @@ mod tests {
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 addr_added: 0,
+                onion_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -7510,13 +7573,81 @@ mod tests {
                 let times: Vec<Instant> = (0..INBOUND_REDIALS as u64)
                     .filter_map(|k| now.checked_sub(Duration::from_secs(60 * k + 1)))
                     .collect();
-                g.inbound_arrivals.insert(gr, times);
+                g.inbound_hangups.insert(gr, times);
             }
         }
         match a.inbound_decision(Some(honest)) {
             InboundDecision::Evict(gone) => assert!(gone >= 1 && gone <= inbound),
             other => panic!("a newcomer was refused by redialing groups: {other:?}"),
         }
+        a.shutdown();
+    }
+
+    /// Red-team campaign 8, third round: counting a group's arrivals took
+    /// the grace from an honest wallet this node had let go twice, which
+    /// called again; only a caller's own hang-ups in its first minute count.
+    #[test]
+    fn an_honest_wallet_let_go_twice_keeps_its_first_minute() {
+        let net = Network::Testnet;
+        let a = Node::new(net, Chain::new(net, genesis_block(net)));
+        let inbound = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) as u64;
+        let now = Instant::now();
+        for id in 1..inbound {
+            let addr: SocketAddr = format!("51.{id}.0.1:21121").parse().unwrap();
+            fake_peer(&a, id, addr, false);
+            settle_peer(&a, id, now - Duration::from_secs(300 + 60 * id), None);
+        }
+        // It arrived 9 and 4 minutes ago, let go each time, and once more now.
+        let h: SocketAddr = "88.77.1.2:50001".parse().unwrap();
+        fake_peer(&a, inbound, h, false);
+        settle_peer(&a, inbound, now - Duration::from_secs(1), None);
+        {
+            let mut g = a.shared.lock().unwrap();
+            let gr = inbound_group(h).unwrap();
+            g.inbound_arrivals.insert(
+                gr,
+                vec![
+                    now - Duration::from_secs(540),
+                    now - Duration::from_secs(240),
+                    now - Duration::from_secs(1),
+                ],
+            );
+        }
+        let other: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        assert_ne!(
+            a.inbound_decision(Some(other)),
+            InboundDecision::Evict(inbound),
+            "the honest wallet lost its seat one second after its handshake"
+        );
+        a.shutdown();
+    }
+
+    /// A caller's hang-up within its first minute is counted for its group;
+    /// one after its first minute, a peer we dialed, or a Tor arrival is not.
+    #[test]
+    fn only_young_callers_hanging_up_are_counted() {
+        let net = Network::Testnet;
+        let a = Node::new(net, Chain::new(net, genesis_block(net)));
+        let now = Instant::now();
+        let young: SocketAddr = "47.1.0.1:21121".parse().unwrap();
+        let old: SocketAddr = "47.2.0.1:21121".parse().unwrap();
+        let dialed: SocketAddr = "47.3.0.1:21121".parse().unwrap();
+        let tor: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        fake_peer(&a, 1, young, false);
+        settle_peer(&a, 1, now - Duration::from_secs(10), None);
+        fake_peer(&a, 2, old, false);
+        settle_peer(&a, 2, now - Duration::from_secs(120), None);
+        fake_peer(&a, 3, dialed, true);
+        settle_peer(&a, 3, now - Duration::from_secs(10), None);
+        fake_peer(&a, 4, tor, false);
+        settle_peer(&a, 4, now - Duration::from_secs(10), None);
+        for id in 1..=4 {
+            a.note_young_hangup(id);
+        }
+        let g = a.shared.lock().unwrap();
+        assert_eq!(g.inbound_hangups.len(), 1);
+        assert_eq!(g.inbound_hangups[&inbound_group(young).unwrap()].len(), 1);
+        drop(g);
         a.shutdown();
     }
 
@@ -8068,6 +8199,7 @@ mod tests_hardening {
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
                 addr_added: 0,
+                onion_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -9736,6 +9868,7 @@ mod tests_handler_fuzz {
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 addr_added: 0,
+                onion_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -10601,6 +10734,7 @@ mod tests_handler_review {
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
                 addr_added: 0,
+                onion_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -11321,6 +11455,184 @@ mod tests_handler_review {
             n.onion_count()
         );
         assert!(n.onion_count() > 0, "but some are taken");
+    }
+
+    /// Onion names for the tests: valid v3 names, distinct per (tag, k).
+    fn onion_names(tag: u8, n: u32, last_seen: u64) -> Vec<crate::wire::OnionAddr> {
+        const B32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        (0..n)
+            .map(|k| {
+                let mut s = String::new();
+                s.push(B32[(tag as usize) % 32] as char);
+                let mut x = k;
+                for _ in 0..4 {
+                    s.push(B32[(x % 32) as usize] as char);
+                    x /= 32;
+                }
+                while s.len() < 55 {
+                    s.push(B32[(s.len() * 7 + tag as usize) % 32] as char);
+                }
+                s.push('d');
+                crate::wire::OnionAddr {
+                    name: s,
+                    port: 21121,
+                    last_seen,
+                }
+            })
+            .collect()
+    }
+
+    /// Red-team campaign 8, third round: one peer we dialed wrote a whole
+    /// reply of onion names, the size of the book, and replaced it.
+    #[test]
+    fn one_peer_we_dialed_cannot_replace_the_onion_book() {
+        let n = node();
+        let now = unix_now();
+        let honest = onion_names(1, crate::addr::MAX_ONIONS as u32, now - 3600);
+        n.seed_onions(honest.iter().cloned().map(|a| (a, false)).collect());
+        assert_eq!(n.onion_count(), crate::addr::MAX_ONIONS);
+        let _l = anonymous_peer(&n, 9);
+        establish(&n, 9);
+        n.shared.lock().unwrap().peers.get_mut(&9).unwrap().outbound = true;
+        let evil = onion_names(2, crate::wire::MAX_ADDR as u32, now);
+        assert!(n.handle(9, Message::OnionAddr(evil)));
+        let kept = n
+            .onion_entries()
+            .iter()
+            .filter(|e| honest.iter().any(|h| h.name == e.addr.name))
+            .count();
+        assert!(
+            kept >= crate::addr::MAX_ONIONS - ONION_NEW_PER_OUTBOUND as usize,
+            "{kept} honest names left"
+        );
+        // Asked again ten minutes later, the same link teaches what appeared
+        // since.
+        n.ask_addresses();
+        n.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&9)
+            .unwrap()
+            .addr_bucket = TokenBucket::for_addresses(Instant::now());
+        let before = n.onion_count();
+        let fresh = onion_names(3, 1, now);
+        assert!(n.handle(9, Message::OnionAddr(fresh.clone())));
+        assert!(n
+            .onion_entries()
+            .iter()
+            .any(|e| e.addr.name == fresh[0].name));
+        assert_eq!(n.onion_count(), before, "the book stays full");
+    }
+
+    /// Red-team campaign 8, third round: two address groups, four callers
+    /// each, replaced every onion name; now each source holds a share of
+    /// the book, and a name that answered is never pushed out.
+    #[test]
+    fn a_few_address_groups_cannot_replace_the_onion_book() {
+        let n = node();
+        let now = unix_now();
+        let honest = onion_names(1, 30, now - 60);
+        assert_eq!(
+            n.seed_onions(honest.iter().cloned().map(|a| (a, false)).collect()),
+            30
+        );
+        let mut id = 100u64;
+        let mut tag = 10u8;
+        let mut keep = Vec::new();
+        for g in 1..=2u8 {
+            for c in 0..4u8 {
+                keep.push(anonymous_peer(&n, id));
+                n.shared.lock().unwrap().peers.get_mut(&id).unwrap().addr =
+                    format!("45.{g}.{c}.1:40000").parse().unwrap();
+                establish(&n, id);
+                let batch = onion_names(tag, ADDR_NEW_PER_INBOUND, u64::MAX);
+                assert!(n.handle(id, Message::OnionAddr(batch)));
+                id += 1;
+                tag += 1;
+            }
+        }
+        let book = n.onion_entries();
+        let honest_left = book
+            .iter()
+            .filter(|e| honest.iter().any(|h| h.name == e.addr.name))
+            .count();
+        assert_eq!(honest_left, 30, "every honest name is kept");
+        assert!(book.len() <= 30 + 2 * crate::addr::ONION_SHARE_PER_SOURCE);
+
+        // A full book: the names that answered stay, and are dialed first.
+        let m = node();
+        let all = onion_names(1, crate::addr::MAX_ONIONS as u32, now - 3600);
+        m.seed_onions(
+            all.iter()
+                .cloned()
+                .enumerate()
+                .map(|(k, a)| (a, k < 8))
+                .collect(),
+        );
+        let answered: Vec<String> = all.iter().take(8).map(|a| a.name.clone()).collect();
+        let mut id = 100u64;
+        let mut tag = 10u8;
+        for g in 1..=8u8 {
+            for c in 0..2u8 {
+                keep.push(anonymous_peer(&m, id));
+                m.shared.lock().unwrap().peers.get_mut(&id).unwrap().addr =
+                    format!("46.{g}.{c}.1:40000").parse().unwrap();
+                establish(&m, id);
+                let batch = onion_names(tag, ADDR_NEW_PER_INBOUND, u64::MAX);
+                assert!(m.handle(id, Message::OnionAddr(batch)));
+                id += 1;
+                tag = tag.wrapping_add(1);
+            }
+        }
+        let book = m.onion_entries();
+        for name in &answered {
+            assert!(
+                book.iter().any(|e| &e.addr.name == name),
+                "{name} pushed out"
+            );
+        }
+        let first: Vec<String> = m.onions_to_try(8).into_iter().map(|a| a.name).collect();
+        assert!(first.iter().all(|f| answered.contains(f)), "{first:?}");
+    }
+
+    /// Red-team campaign 8, third round: addresses already known, passed on
+    /// again, spent a peer's share, and a hidden node's own onion name that
+    /// came after them was refused; a long-lived link stopped teaching.
+    #[test]
+    fn known_addresses_passed_on_again_spend_no_share() {
+        let n = node();
+        let now = unix_now();
+        let book: Vec<crate::wire::NetAddr> = (0..128u32)
+            .map(|k| crate::wire::NetAddr {
+                ip: [23 + (k % 100) as u8, 6 + (k / 100) as u8, 7, 9],
+                port: 21121,
+                last_seen: now - 600,
+            })
+            .collect();
+        let _o = anonymous_peer(&n, 8);
+        establish(&n, 8);
+        n.shared.lock().unwrap().peers.get_mut(&8).unwrap().outbound = true;
+        assert!(n.handle(8, Message::Addr(book.clone())));
+        // A hidden node calling through Tor: its book, then its own name.
+        let _l = anonymous_peer(&n, 9);
+        establish(&n, 9);
+        assert!(n.handle(9, Message::Addr(book.clone())));
+        let before = n.onion_count();
+        assert!(n.handle(9, Message::OnionAddr(onion_names(4, 1, now))));
+        assert_eq!(n.onion_count(), before + 1, "its own name was refused");
+        // The long-lived link of peer 8, asked ten times.
+        for _ in 0..10 {
+            n.shared
+                .lock()
+                .unwrap()
+                .peers
+                .get_mut(&8)
+                .unwrap()
+                .addr_bucket = TokenBucket::for_addresses(Instant::now());
+            assert!(n.handle(8, Message::Addr(book.clone())));
+        }
+        assert_eq!(n.shared.lock().unwrap().peers[&8].addr_added, 128);
     }
 
     fn establish(n: &Node, id: u64) {

@@ -192,6 +192,13 @@ impl AddrBook {
         self.groups.len()
     }
 
+    /// Whether this address is in the book already.
+    pub fn contains(&self, a: &NetAddr) -> bool {
+        self.groups
+            .get(&group(a.ip))
+            .is_some_and(|v| v.iter().any(|e| e.addr.ip == a.ip && e.addr.port == a.port))
+    }
+
     /// Adds or refreshes an address.
     ///
     /// Returns `false` if the address is rejected: not routable, zero port, or
@@ -507,9 +514,17 @@ impl AddrStore {
 /// it is only of use to a node that goes through Tor. Bounded, refreshed in
 /// place, the stalest dropped first; a name that keeps failing is dropped
 /// too, once it has not been seen for [`ONION_FORGET_AFTER`]. Written to
-/// `onions.dat` at shutdown (see [`save_onions`]): a node that restarts
-/// while the entry points are down still knows where the onion services
-/// are.
+/// `onions.dat` at shutdown (see [`save_onion_entries`]): a node that
+/// restarts while the entry points are down still knows where the onion
+/// services are.
+///
+/// A name that answered once is never pushed out by a name nobody tried,
+/// and is dialed and passed on first; the names one source wrote, and that
+/// never answered, hold at most [`ONION_SHARE_PER_SOURCE`] places, its newer
+/// names then replacing its older ones. Until 0.5.9 the stalest name went,
+/// whoever had vouched for it: two address groups, or one peer we dialed,
+/// replaced the whole book with names of their own, which the node then
+/// dialed first and passed on to every peer (red-team campaign 8).
 #[derive(Debug, Default)]
 pub struct OnionBook {
     entries: Vec<OnionEntry>,
@@ -519,7 +534,18 @@ pub struct OnionBook {
 pub struct OnionEntry {
     pub addr: crate::wire::OnionAddr,
     pub failures: u32,
+    /// The name answered a call of ours at least once.
+    pub answered: bool,
+    /// Who wrote it: a key of the peer's address group, or
+    /// [`ONION_SOURCE_LOCAL`] for this node's own file.
+    pub source: u64,
 }
+
+/// Places the names one source wrote, and that never answered, hold at most.
+pub const ONION_SHARE_PER_SOURCE: usize = MAX_ONIONS / 8;
+
+/// The source of names read from this node's own `onions.dat`: no share.
+pub const ONION_SOURCE_LOCAL: u64 = 0;
 
 /// Onion names kept at most.
 pub const MAX_ONIONS: usize = 1_000;
@@ -541,10 +567,15 @@ impl OnionBook {
         self.entries.is_empty()
     }
 
-    /// Adds or refreshes a name. A timestamp from the future is brought back
-    /// to `now`, as for IPv4 addresses.
-    /// Returns whether the name is new to the book.
+    /// Adds or refreshes a name, from this node itself. See [`Self::add_from`].
     pub fn add(&mut self, a: crate::wire::OnionAddr, now: u64) -> bool {
+        self.add_from(a, now, ONION_SOURCE_LOCAL)
+    }
+
+    /// Adds or refreshes a name written by `source`. A timestamp from the
+    /// future is brought back to `now`, as for IPv4 addresses.
+    /// Returns whether the name is new to the book.
+    pub fn add_from(&mut self, a: crate::wire::OnionAddr, now: u64, source: u64) -> bool {
         let mut a = a;
         a.last_seen = a.last_seen.min(now.saturating_add(FUTURE_TOLERANCE));
         if let Some(e) = self
@@ -555,33 +586,76 @@ impl OnionBook {
             e.addr.last_seen = e.addr.last_seen.max(a.last_seen);
             return false;
         }
-        if self.entries.len() >= MAX_ONIONS {
-            if let Some((pos, _)) = self
-                .entries
+        // The stalest name nobody has seen answer, among `pick`.
+        let stalest = |entries: &[OnionEntry], pick: &dyn Fn(&OnionEntry) -> bool| {
+            entries
                 .iter()
                 .enumerate()
+                .filter(|(_, e)| !e.answered && pick(e))
                 .min_by_key(|(_, e)| e.addr.last_seen)
-            {
+                .map(|(i, _)| i)
+        };
+        // A source past its share replaces its own names.
+        if source != ONION_SOURCE_LOCAL
+            && self
+                .entries
+                .iter()
+                .filter(|e| !e.answered && e.source == source)
+                .count()
+                >= ONION_SHARE_PER_SOURCE
+        {
+            if let Some(pos) = stalest(&self.entries, &|e| e.source == source) {
                 self.entries.swap_remove(pos);
+            }
+        } else if self.entries.len() >= MAX_ONIONS {
+            // Full: a name that answered is never the one to go.
+            match stalest(&self.entries, &|_| true) {
+                Some(pos) => {
+                    self.entries.swap_remove(pos);
+                }
+                None => return false,
             }
         }
         self.entries.push(OnionEntry {
             addr: a,
             failures: 0,
+            answered: false,
+            source,
         });
         true
     }
 
-    /// The freshest names, at most `count`.
-    pub fn to_announce(&self, count: usize) -> Vec<crate::wire::OnionAddr> {
-        let mut v: Vec<&OnionEntry> = self.entries.iter().collect();
+    /// Every entry, those that answered first, then the freshest: the order
+    /// in which they are passed on and written.
+    pub fn entries(&self) -> Vec<OnionEntry> {
+        let mut v = self.entries.clone();
         v.sort_by(|a, b| {
-            b.addr
-                .last_seen
-                .cmp(&a.addr.last_seen)
+            b.answered
+                .cmp(&a.answered)
+                .then(b.addr.last_seen.cmp(&a.addr.last_seen))
                 .then(a.addr.name.cmp(&b.addr.name))
         });
-        v.into_iter().take(count).map(|e| e.addr.clone()).collect()
+        v
+    }
+
+    /// Marks a name read back from this node's own file as having answered.
+    pub fn mark_answered(&mut self, name: &str, port: u16) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.addr.name == name && e.addr.port == port)
+        {
+            e.answered = true;
+        }
+    }
+
+    /// The names that answered first, then the freshest, at most `count`.
+    pub fn to_announce(&self, count: usize) -> Vec<crate::wire::OnionAddr> {
+        self.entries()
+            .into_iter()
+            .take(count)
+            .map(|e| e.addr)
+            .collect()
     }
 
     pub fn note_failure(&mut self, name: &str, port: u16, now: u64) {
@@ -604,8 +678,9 @@ impl OnionBook {
     pub fn to_try(&self) -> Vec<crate::wire::OnionAddr> {
         let mut v: Vec<&OnionEntry> = self.entries.iter().collect();
         v.sort_by(|a, b| {
-            a.failures
-                .cmp(&b.failures)
+            b.answered
+                .cmp(&a.answered)
+                .then(a.failures.cmp(&b.failures))
                 .then(b.addr.last_seen.cmp(&a.addr.last_seen))
                 .then(a.addr.name.cmp(&b.addr.name))
         });
@@ -619,6 +694,7 @@ impl OnionBook {
             .find(|e| e.addr.name == name && e.addr.port == port)
         {
             e.failures = 0;
+            e.answered = true;
             e.addr.last_seen = now;
         }
     }
@@ -635,6 +711,50 @@ pub fn save_onions(path: &Path, names: &[crate::wire::OnionAddr]) -> std::io::Re
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Writes the entries to `path`, as [`save_onions`], with a fourth field:
+/// `1` for a name that answered. A 0.5.8 node reads the first three.
+pub fn save_onion_entries(path: &Path, entries: &[OnionEntry]) -> std::io::Result<()> {
+    let mut text = String::from("# q21 onion addresses: name port last_seen answered\n");
+    for e in entries.iter().take(MAX_ONIONS) {
+        text.push_str(&format!(
+            "{} {} {} {}\n",
+            e.addr.host(),
+            e.addr.port,
+            e.addr.last_seen,
+            u8::from(e.answered)
+        ));
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Reads what [`save_onion_entries`] (or [`save_onions`]) wrote, with the
+/// names that answered: see [`load_onions`].
+pub fn load_onion_entries(path: &Path, now: u64) -> Vec<(crate::wire::OnionAddr, bool)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let name = it.next()?;
+            let port: u16 = it.next()?.parse().ok()?;
+            let seen: u64 = it.next()?.parse().ok()?;
+            let answered = it.next() == Some("1");
+            let mut a = crate::wire::OnionAddr::parse(name, port)?;
+            if port == 0 {
+                return None;
+            }
+            a.port = port;
+            a.last_seen = seen.min(now);
+            Some((a, answered))
+        })
+        .take(MAX_ONIONS)
+        .collect()
 }
 
 /// Reads what [`save_onions`] wrote. A line that does not parse, a name that
@@ -885,7 +1005,57 @@ mod tests {
         assert_eq!(back[1].port, 21500);
         assert_eq!(back[2].last_seen, 1_000, "no date from the future");
         assert!(load_onions(&d.join("absent.dat"), 1_000).is_empty());
+        // The names that answered are written as such, and read back; a
+        // file of 0.5.8 reads as names that never answered, and 0.5.8 reads
+        // the new file's first three fields.
+        let mut book = OnionBook::default();
+        book.add(onion('a', 21121, 50), 1_000);
+        book.add(onion('b', 21500, 70), 1_000);
+        book.note_success(&onion('a', 0, 0).name, 21121, 900);
+        save_onion_entries(&p, &book.entries()).expect("write");
+        let back = load_onion_entries(&p, 1_000);
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0].0.port, back[0].1), (21121, true));
+        assert_eq!((back[1].0.port, back[1].1), (21500, false));
+        assert_eq!(load_onions(&p, 1_000).len(), 2);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A name that answered is never pushed out by names nobody tried, and
+    /// one source past its share replaces its own names (red-team campaign
+    /// 8, third round).
+    #[test]
+    fn answered_onion_names_stay_and_a_source_replaces_its_own() {
+        let mut book = OnionBook::default();
+        for k in 0..MAX_ONIONS as u32 {
+            let mut o = onion('a', 21121, 10);
+            o.name = format!("{}{:0>5}d", &onion('a', 0, 0).name[..50], to_b32(k));
+            book.add_from(o, 1_000, 7);
+        }
+        assert_eq!(book.len(), ONION_SHARE_PER_SOURCE, "one source, one share");
+        let kept: Vec<String> = book.entries().iter().map(|e| e.addr.name.clone()).collect();
+        book.note_success(&kept[0], 21121, 1_000);
+        for k in 0..MAX_ONIONS as u32 {
+            let mut o = onion('b', 21121, 999);
+            o.name = format!("{}{:0>5}d", &onion('b', 0, 0).name[..50], to_b32(k));
+            book.add_from(o, 1_000, 1_000 + u64::from(k % 16));
+        }
+        assert_eq!(book.len(), MAX_ONIONS);
+        assert!(book
+            .entries()
+            .iter()
+            .any(|e| e.addr.name == kept[0] && e.answered));
+        assert_eq!(book.to_try()[0].name, kept[0], "dialed first");
+    }
+
+    fn to_b32(mut k: u32) -> String {
+        const B32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut s = String::new();
+        for _ in 0..5 {
+            s.push(B32[(k % 32) as usize] as char);
+            k /= 32;
+        }
+        s
     }
 
     #[test]

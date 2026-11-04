@@ -8,7 +8,8 @@ and the technicians (the release, Tor, the servers, the local machine).
 Every area was covered: the chain, payment channels, the wallet and its page,
 the servers, and the communication between nodes. They worked as a team on
 one board; each fix was then attacked again, by its own finder and by a
-reviewer of another area. Rules: nothing that creates money, takes control
+reviewer of another area, and a third round checked the second's fixes on
+the release build. Rules: nothing that creates money, takes control
 of anything, or slows the real network — every attack ran in a local lab.*
 
 *As in the previous campaigns, a finding is CONFIRMED only when it was run
@@ -21,16 +22,16 @@ became a test, checked to fail without its fix.*
 
 | # | Severity | Topic | Status |
 |---|---|---|---|
-| R1 | 🔴 CRITICAL | A release archive that two archive readers read differently passed `verify-release.sh` with an evil program inside | Fixed; three bypasses in round 2, all closed |
+| R1 | 🔴 CRITICAL | A release archive that two archive readers read differently passed `verify-release.sh` with an evil program inside | Fixed; three bypasses in round 2, all closed; held in round 3 |
 | R2 | 🔴 HIGH | A hash file naming the program twice passed the release workflow and the verifier | Fixed, re-checked |
 | C1 | 🔴 HIGH | A wallet restored from a backup could be led to close a channel with a revoked state | Fixed; residual below |
 | W1 | 🔴 HIGH | Another account on the same computer could take the wallet page's port and get the wallet | Fixed, re-checked on both launch paths |
-| T1 | 🔴 HIGH | Another program could take the bundled Tor's SOCKS port, at start or after Tor stopped | Fixed, re-checked |
-| N1 | 🔴 HIGH | A few address groups could hold every seat of an entry point | Fixed; a bypass in round 2, closed |
-| N2 | 🔴 HIGH | One caller could fill an entry point's address book, then its onion book | Fixed; residual below |
+| T1 | 🔴 HIGH | Another program could take the bundled Tor's SOCKS port, at start, after Tor stopped, or while it restarted | Fixed, re-checked twice |
+| N1 | 🔴 HIGH | A few address groups could hold every seat of an entry point | Fixed; a bypass in round 2, closed; residual below |
+| N2 | 🔴 HIGH | One caller could fill an entry point's address book, then its onion book | Fixed; the onion book bypassed in round 3, fixed again; residual below |
 | N3 | 🟠 MEDIUM/HIGH | After a deep reorganization, blocks of the new branch were missing from disk | Fixed; the first fix regressed, replaced |
 | E1 | 🔴 HIGH | One HTTP/2 connection froze a public explorer behind the documented Caddy | Fixed in the guide; memory capped |
-| D1 | 🟠 MEDIUM | 0.5.9's Tor-by-default could leak or be steered (three ways) | Fixed before release |
+| D1 | 🟠 MEDIUM | 0.5.9's Tor-by-default could leak or be steered (six ways) | Fixed before release |
 | T2 | 🟠 MEDIUM | The onion self-check could restart Tor in a loop | Fixed |
 | W2 | 🟠 MEDIUM | "The words match" was not bound to the words shown | Fixed |
 | C2 | 🟡 LOW-MEDIUM | A splice's coins stayed held after its channel ended | Fixed |
@@ -84,8 +85,9 @@ carried the launch token to it. The bundled Tor's SOCKS port had the same
 gap, and again after Tor stopped. **Fix.** The page's port is held from its
 choice until the page serves it, and the launcher checks that the wallet
 itself answers. Tor picks its own SOCKS port and the node reads it from
-Tor's log; when Tor stops, the node's proxy becomes port 0, where nothing
-can listen, until Tor runs again. Checked with a fake Tor printing
+Tor's log; when Tor stops, and before each restart of Tor, the node's
+proxy becomes port 0, where nothing can listen, until the new port is read
+(round 3: during a restart, up to a minute, the old port was still used). Checked with a fake Tor printing
 misleading lines: only Tor's own first line is believed.
 
 ## N1, N2. Seats and addresses of an entry point
@@ -93,14 +95,25 @@ misleading lines: only Tor's own first line is believed.
 The round-1 fix of eviction was bypassed in round 2: occupants spread over
 twelve address groups, one young seat each, redialed every minute.
 **Fix.** Protection is shared out per address group; when every seat is
-young, the most crowded group gives up one; a group that arrived three times
-in ten minutes loses the newcomer's first-minute grace (an honest newcomer
-arrives once). Tor arrivals are not a group and keep it. The address book:
-a caller writes at most 128 new addresses per connection, an address group
-512 an hour, a peer we dialed one reply's worth; onion names were left out
-in round 1 and now share the same bounds. **Residual:** one address group
-patient for an hour can still replace the entries no one has proven yet, and
-every Tor caller shares one budget.
+young, the most crowded group gives up one; a group whose callers hung up
+twice within their first minute, in ten minutes, loses the newcomer's
+first-minute grace. Only a caller's own hang-ups count: counting arrivals,
+as the round-2 fix did, took the grace from an honest wallet the node had
+let go twice (round 3). Tor arrivals are not a group and keep it.
+**Residual:** with every Tor seat held, about twenty address groups pacing
+their hang-ups still keep clear newcomers out (sixty without the Tor seats).
+
+The address book: a caller writes at most 128 new addresses per connection,
+an address group 512 an hour, a peer we dialed one reply's worth; an
+address already known, passed on again, counts for nothing (round 3: a
+hidden node's own onion name, sent after addresses the node knew, was
+refused). The onion book was bypassed in round 3: two address groups, or
+one peer we dialed, still replaced every name. **Fix.** A name that answered
+is never pushed out by a name nobody tried, and is dialed and passed on
+first; the names of one source hold at most an eighth of the book; a peer
+we dialed writes 64 names per request. **Residual:** an entry point that
+never dials an onion proves none, and eight address groups can still
+replace its untried names; every Tor caller shares one hourly budget.
 
 ## N3. Blocks of a deep reorganization
 
@@ -127,10 +140,18 @@ Three ways round the new default were found before release: a wallet made
 reachable by default became reachable **in the clear** once Tor was turned
 off; any program listening on port 9050 counted as a Tor; a `settings.txt`
 saved with a byte-order mark, or not in UTF-8, was read as empty and
-rewritten. **Fix.** The default is `reachable=onion`: reachable through Tor
-only, never in the clear. Only a Tor the wallet starts itself counts. A
-byte-order mark is read through, and a file that cannot be read is never
-written.
+rewritten. Round 3 found three more: one click on **reachable** under Tor
+wrote `yes`, and Tor turned off then listened in the clear; with a `tor`
+installed, a program of another account listening on 9150 was still used as
+Tor; and the wallet, now listening by default, refused to start when its
+port was taken on the computer. **Fix.** The default, and the switch turned
+on under Tor, are `reachable=onion`: reachable through Tor only, never in
+the clear. Only a Tor the wallet starts itself makes the default; on Linux,
+a Tor port is trusted only from this account or a system one. A taken port
+makes the wallet listen on another, behind Tor. A byte-order mark is read
+through, and a file that cannot be read is never written. Checked end to
+end with a stand-in Tor and every system call traced: nothing leaves the
+computer except through Tor, before Tor is ready included.
 
 ## T2, W2, W3, C2, P1
 
@@ -155,6 +176,13 @@ before the peer's budget is counted.
 - **After the last issuing block**, an empty block has no valid coinbase:
   for the review of the chain's rules before mainnet, with A1 and A2 of the
   seventh campaign.
+- **A program on the same computer** can connect to the port Tor forwards
+  to and learn the wallet's onion address (TOR.md, section 6).
+- **Tor restarts:** one answered check resets their spacing; a forward jump
+  of the clock is taken for a sleep. A peer cannot drive either.
+- **Blocks of a branch refused for its depth** are kept in memory only
+  until the branch wins; evicted from memory first, the reorganization
+  waits for a restart.
 - **Low:** a fast sync accepts extra headers it does not check; compact
   blocks name transactions by txid; the address-index log is not synced to
   disk at each write (it repairs itself); a name tells where its owner can be

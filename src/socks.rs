@@ -177,13 +177,66 @@ pub fn connect(
     Ok(s)
 }
 
-/// Finds a local Tor: the service port first, then Tor Browser's. Only
-/// checks that something listens; the first connection tells the rest.
+/// Finds a local Tor: the service port first, then Tor Browser's. Checks
+/// that something listens, and on Linux that it belongs to this account or
+/// to a system account (the Tor service's): a program of another person's
+/// account listening on 9050 or 9150 would otherwise see, and answer, every
+/// connection of this node (red-team campaign 8). Elsewhere, the first
+/// connection tells the rest.
 pub fn find_local_tor() -> Option<SocketAddr> {
     [TOR_SERVICE_PORT, TOR_BROWSER_PORT]
         .into_iter()
         .map(|p| SocketAddr::from(([127, 0, 0, 1], p)))
-        .find(|a| TcpStream::connect_timeout(a, Duration::from_millis(500)).is_ok())
+        .find(|a| {
+            TcpStream::connect_timeout(a, Duration::from_millis(500)).is_ok()
+                && listener_owner_trusted(a.port())
+        })
+}
+
+/// Below this, a Linux account is a system one (`SYS_UID_MAX` is 999).
+const FIRST_PERSON_UID: u32 = 1000;
+
+/// Whether the program listening on 127.0.0.1:`port` runs as this account
+/// or a system one. Not known (not Linux, `/proc` unreadable): trusted, as
+/// before 0.5.9.
+fn listener_owner_trusted(port: u16) -> bool {
+    let (Some(owner), Some(me)) = (listener_uid(port), own_uid()) else {
+        return true;
+    };
+    owner_trusted(owner, me)
+}
+
+/// This account, or a system one.
+fn owner_trusted(owner: u32, me: u32) -> bool {
+    owner == me || owner < FIRST_PERSON_UID
+}
+
+/// The account of the socket listening on 127.0.0.1:`port`, from
+/// `/proc/net/tcp`.
+fn listener_uid(port: u16) -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    listener_uid_in(&text, port)
+}
+
+/// The parsing half of [`listener_uid`]: `local_address` is `0100007F:PORT`
+/// in hexadecimal, state `0A` is listening, the eighth field the account.
+fn listener_uid_in(text: &str, port: u16) -> Option<u32> {
+    let wanted = format!("0100007F:{port:04X}");
+    text.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.len() > 7 && f[1] == wanted && f[3] == "0A")
+            .then(|| f[7].parse().ok())
+            .flatten()
+    })
+}
+
+/// This process's account, from `/proc/self/status`.
+fn own_uid() -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
 }
 
 fn failure(msg: &str) -> std::io::Error {
@@ -208,6 +261,23 @@ fn reply_text(code: u8) -> &'static str {
 pub mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// The owner of a listening port is read from `/proc/net/tcp`; another
+    /// person's account is not trusted, a system one is (red-team campaign
+    /// 8, third round).
+    #[test]
+    fn a_tor_port_of_another_account_is_not_trusted() {
+        let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   \
+             0: 0100007F:235A 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 1 1 0000000000000000 100 0 0 10 0\n   \
+             1: 0100007F:23BE 00000000:0000 0A 00000000:00000000 00:00000000 00000000   108        0 2 1 0000000000000000 100 0 0 10 0\n   \
+             2: 0100007F:2382 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1001        0 3 1 0000000000000000 100 0 0 10 0\n";
+        assert_eq!(listener_uid_in(text, TOR_SERVICE_PORT), Some(1001));
+        assert_eq!(listener_uid_in(text, TOR_BROWSER_PORT), Some(108));
+        assert_eq!(listener_uid_in(text, 0x2382), None, "not listening");
+        assert!(owner_trusted(108, 1000), "the Tor service's account");
+        assert!(owner_trusted(1000, 1000), "this account");
+        assert!(!owner_trusted(1001, 1000), "another person's");
+    }
 
     /// A minimal SOCKS5 server for the tests: no authentication, CONNECT
     /// only, names looked up in `names` (which stands for the Tor network),

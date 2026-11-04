@@ -59,7 +59,9 @@ With `--tor` (or the switch in the wallet), the node takes, in this order:
    when it closes. Its files (guard relays, onion service key) live in a
    `tor/` folder inside the data directory;
 2. a Tor already running on this computer: the Tor service on port 9050,
-   Tor Browser on 9150;
+   Tor Browser on 9150. On Linux, only one run by your own account or by
+   the system (0.5.9): a program of another person's account listening
+   there is not taken for Tor;
 3. a `tor` on the PATH, started the same way as the bundled one.
 
 If none works, the node says so and **does not connect in the clear**: it
@@ -98,6 +100,13 @@ other nodes reach it there. The wallet never asks your router to open a
 port, and listens on the computer itself only (`127.0.0.1`). The card then
 says *Hidden node on*. The onion address is kept in `q21-data/tor/onion/`:
 as long as that folder is kept, the address stays the same.
+
+Since 0.5.9, **reachable** turned on while Tor is on is written
+`reachable=onion`: reachable through Tor only. Turning Tor off later makes
+the wallet unreachable, never reachable in the clear; that is a choice made
+with Tor off. When the network's port is already taken on the computer (a
+second wallet, a node, another program), the wallet listens on another
+port, which Tor forwards to: the onion address does not change.
 
 A hidden node checks that it can really be reached (0.5.7): a few minutes
 after Tor starts, then every twenty minutes, it calls its own onion address
@@ -322,6 +331,11 @@ its IP address, which ties that address to the rewards.
 - **No Dandelion++.** A payment is relayed to every peer at once. Behind
   Tor, that reveals nothing about your address; without Tor, the first node
   to relay it is a good guess of where it comes from.
+- **A program on the same computer can link a hidden wallet to it.** Tor
+  hands the onion's connections to a port on `127.0.0.1`; any program of
+  any account on the computer can connect there without Tor, and the
+  wallet greets it with its onion address. On a computer you share, this
+  tells the other accounts which onion — and which name — is yours.
 - **A name tells where its owner can be reached.** A wallet that owns a name
   signs its onion address, and every node relays the pair: that is how a
   contact finds it. Anyone can therefore list the names and the onion

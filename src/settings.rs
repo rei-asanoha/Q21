@@ -156,7 +156,15 @@ pub fn yes_in_text(text: &str, wanted: &str) -> bool {
 /// Writes the reachability setting. Atomic write (temporary file then
 /// rename), like `wallet.anchor`: a power cut leaves the old file whole,
 /// never a half-written one. Other keys already in the file are kept.
+///
+/// Turned on while Tor is on, it is `onion`: reachable through Tor only, as
+/// the card says. Turning Tor off later then makes the wallet unreachable,
+/// never reachable in the clear: that is a choice made with Tor off
+/// (red-team campaign 8, third round).
 pub fn set_reachable(datadir: &Path, reachable: bool) -> Result<(), String> {
+    if reachable && tor(datadir) {
+        return set_value(datadir, REACHABLE_KEY, ONION_ONLY);
+    }
     set_yes_no(datadir, REACHABLE_KEY, reachable)
 }
 
@@ -289,6 +297,15 @@ mod tests {
         assert!(!reachable_in_clear(&d), "Tor off: still not in the clear");
         set_reachable(&d, true).unwrap();
         assert!(reachable_in_clear(&d), "an explicit yes is");
+        // The switch, turned on while Tor is on, is Tor-only too (third
+        // round: one click wrote `yes`, and Tor off then listened in the
+        // clear).
+        set_tor(&d, true).unwrap();
+        set_reachable(&d, false).unwrap();
+        set_reachable(&d, true).unwrap();
+        assert!(reachable(&d) && !reachable_in_clear(&d));
+        set_tor(&d, false).unwrap();
+        assert!(!reachable_in_clear(&d));
         let _ = std::fs::remove_dir_all(&d);
 
         let d = dir("defaults-bom");

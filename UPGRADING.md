@@ -90,9 +90,9 @@ from block 5,950.
 | Checking a contact's words aloud | "The words match" was taken whatever the words shown | Taken only for the words on screen; if they changed, read the new ones first |
 | A splice after a restart | Its coins held, and it was sent again, even once it could no longer confirm | Only while it can still confirm |
 | Entry points, peers | A few address groups could keep every seat | Protection shared out per address group; a crowded group gives up a seat first; a group that hangs up and calls again within the minute loses the newcomer's grace |
-| Address book | Any caller could fill it | A caller writes at most 128 new addresses per connection, an address group 512 an hour; onion addresses under the same bounds |
+| Address book | Any caller could fill it | A caller writes at most 128 new addresses per connection, an address group 512 an hour; an onion address that answered is never pushed out, and one source holds at most an eighth of the onion book |
 | Wallet page and explorer port | Another program could take the port between its choice and its use | Held from its choice until the page serves it; the launcher checks that the wallet itself answers |
-| Bundled Tor | Its SOCKS port chosen by Q21, and kept when Tor stopped | Chosen by Tor itself and read from its log; when Tor stops, no connection goes anywhere until it runs again |
+| Bundled Tor | Its SOCKS port chosen by Q21, and kept when Tor stopped | Chosen by Tor itself and read from its log; when Tor stops or restarts, no connection goes anywhere until it runs again. On Linux, a Tor on 9050 or 9150 is used only when it runs under your account or the system's |
 | After a reorganization | The blocks of the new branch could be missing from the index log | Every block of the new branch is written there |
 | `tools/verify-release.sh` | Read archives as `tar` and `unzip` do | Also reads every archive header itself, and refuses an archive two readers would read differently, or a hash file naming a file twice |
 | Public explorer behind Caddy | At most 48 connections to the node | No cap on connections; each answer buffered by Caddy (`response_buffers 4MB`), an answer not delivered in 30 seconds dropped, Caddy's memory capped |
@@ -112,7 +112,9 @@ under `request_buffers 1MB`, change `write 60s` to `write 30s`, and add the
 ## The data folder
 
 Unchanged, except `settings.txt`: a wallet that never chose gets `tor=yes`
-and `reachable=onion` there at its first start with a Tor. Going back to
+and `reachable=onion` there at its first start with a Tor, and **reachable**
+turned on while Tor is on is written `onion` too. `onions.dat` gains a
+fourth field, `1` for a name that answered. Going back to
 0.5.8 with the same folder loses nothing: 0.5.8 keeps Tor on and reads
 `reachable=onion` as not reachable.
 
