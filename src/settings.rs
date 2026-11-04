@@ -103,12 +103,13 @@ pub fn choice_in_text(text: &str, wanted: &str) -> Option<bool> {
 /// - No `tor` key, and a Tor this computer can use (`tor_available`):
 ///   `tor=yes` is written. Without a Tor, nothing is written: the wallet
 ///   runs as before, and the next start looks again.
-/// - No `reachable` key, and Tor on: `reachable=yes` is written. Reachable
-///   through Tor is an onion service: the wallet listens on the computer
+/// - No `reachable` key, and Tor on: `reachable=onion` is written: reachable
+///   through Tor only, an onion service. The wallet listens on the computer
 ///   itself only, never asks the router for anything, and its internet
-///   address is never announced. Without Tor, nothing is written: a wallet
-///   reachable in the clear would announce its owner's address, which stays
-///   a choice (see [`reachable`]).
+///   address is never announced, even if Tor is later turned off. Without
+///   Tor, nothing is written: a wallet reachable in the clear would announce
+///   its owner's address, which stays a choice (`reachable=yes`, see
+///   [`reachable_in_clear`]).
 ///
 /// A key the user wrote, `no` included, is never changed. Returns what was
 /// written, for the log.

@@ -67,6 +67,57 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.5.8 to 0.5.9
+
+0.5.9 changes no rule of the chain and nothing in a channel's protocol: a
+0.5.8 node and a 0.5.9 node accept the same blocks and keep the same
+channels. Mining does not need to stop. It brings the wallet that can be
+called without setting anything, and the fixes of the eighth red-team
+campaign (RED-TEAM-2026-8.md).
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, and block timestamps strictly after their parent's
+from block 5,950.
+
+## What changes
+
+| | 0.5.8 | 0.5.9 |
+|---|---|---|
+| Tor in the wallet | Off until switched on | On by itself when you never chose and the computer has a Tor the wallet can start (the one in the archive, or a `tor` program installed): the wallet becomes reachable **through Tor only**, and a contact who finds you in the directory can call you. A choice you made, "off" included, is kept. `q21 node` is unchanged (TOR.md) |
+| A hidden node just started, or just awake | Waited for two failed checks before starting its Tor again | Starts it again at once, once, when its onion address does not answer yet; never while Tor is still starting; when the address keeps not answering, restarts spaced 30 minutes, then 1, 2 and 4 hours |
+| Calling a contact | "Does not answer" after one try | Tries again for five minutes, with a countdown; the Network and Private channel pages say plainly whether you, and the contact, can be called |
+| A channel peer claiming that your copy is older | A node with the latest state could be led to close by itself | It never closes by itself: it warns, and you close from the page once you confirm your wallet was not restored from a backup |
+| Checking a contact's words aloud | "The words match" was taken whatever the words shown | Taken only for the words on screen; if they changed, read the new ones first |
+| A splice after a restart | Its coins held, and it was sent again, even once it could no longer confirm | Only while it can still confirm |
+| Entry points, peers | A few address groups could keep every seat | Protection shared out per address group; a crowded group gives up a seat first; a group that hangs up and calls again within the minute loses the newcomer's grace |
+| Address book | Any caller could fill it | A caller writes at most 128 new addresses per connection, an address group 512 an hour; onion addresses under the same bounds |
+| Wallet page and explorer port | Another program could take the port between its choice and its use | Held from its choice until the page serves it; the launcher checks that the wallet itself answers |
+| Bundled Tor | Its SOCKS port chosen by Q21, and kept when Tor stopped | Chosen by Tor itself and read from its log; when Tor stops, no connection goes anywhere until it runs again |
+| After a reorganization | The blocks of the new branch could be missing from the index log | Every block of the new branch is written there |
+| `tools/verify-release.sh` | Read archives as `tar` and `unzip` do | Also reads every archive header itself, and refuses an archive two readers would read differently, or a hash file naming a file twice |
+| Public explorer behind Caddy | At most 48 connections to the node | No cap on connections; each answer buffered by Caddy (`response_buffers 4MB`), an answer not delivered in 30 seconds dropped, Caddy's memory capped |
+
+## Who should upgrade, and when
+
+Everyone, when convenient: wallets for Tor and calls, entry points first, for
+the limits on peers and addresses. A server updates from the signed release
+only (SERVER.md).
+
+A public explorer behind Caddy also updates its Caddyfile
+(PUBLIC-EXPLORER.md, step 4.2): **delete** the three lines `transport http {`,
+`max_conns_per_host 48` and `}` that 0.5.8 added, add `response_buffers 4MB`
+under `request_buffers 1MB`, change `write 60s` to `write 30s`, and add the
+`memory.conf` file of step 4.1. Then check and apply it as in step 4.3.
+
+## The data folder
+
+Unchanged, except `settings.txt`: a wallet that never chose gets `tor=yes`
+and `reachable=onion` there at its first start with a Tor. Going back to
+0.5.8 with the same folder loses nothing: 0.5.8 keeps Tor on and reads
+`reachable=onion` as not reachable.
+
+---
+
 # Upgrading from 0.5.6 to 0.5.8
 
 0.5.7 was never published: 0.5.8 holds its changes and more. 0.5.8 changes

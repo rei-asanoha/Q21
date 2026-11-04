@@ -69,6 +69,11 @@ journal, beside the wallet in the data folder, and the code does not hold it:
   the funds of an older copy come back only through the other side: it must
   be online to close.
 
+  A copy of a data folder is therefore never a backup of a channel: restore
+  the wallet from its code, never an old copy of its `channels` folder. A
+  peer that answers as an old copy would, or says nothing, cannot be told
+  apart from an honest one by the copy itself (red-team campaign 8).
+
 `checkbackup` (the wallet page: Info → Check my backup) checks the sheet
 against the wallet at any time, long before the day it is needed.
 

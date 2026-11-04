@@ -322,3 +322,9 @@ its IP address, which ties that address to the rewards.
 - **No Dandelion++.** A payment is relayed to every peer at once. Behind
   Tor, that reveals nothing about your address; without Tor, the first node
   to relay it is a good guess of where it comes from.
+- **A name tells where its owner can be reached.** A wallet that owns a name
+  signs its onion address, and every node relays the pair: that is how a
+  contact finds it. Anyone can therefore list the names and the onion
+  address of each, and see when a given wallet answers — not where it is.
+  A wallet that does not want to be called keeps no name, or turns
+  **reachable** off.
