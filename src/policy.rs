@@ -628,6 +628,10 @@ struct Path<'a> {
     min_height: u64,
     /// Every `Any` choice, in the order the satisfaction states them.
     choices: Vec<u8>,
+    /// Whether preimages are hashed and checked. Not when only counting the
+    /// keys for the relay budget, which is charged before anything costly
+    /// (red-team campaign 8).
+    check_preimages: bool,
 }
 
 impl Path<'_> {
@@ -674,7 +678,7 @@ fn walk<'a>(
         }
         Policy::Preimage(h) => {
             let secret = r.array32()?;
-            if sha256(&secret) != h.0 {
+            if path.check_preimages && sha256(&secret) != h.0 {
                 return Err(PolicyError::WrongPreimage);
             }
             *leaf += 1;
@@ -735,6 +739,7 @@ fn read_spend<'a>(spent: &TxOut, witness: &'a Witness) -> Result<(Policy, Path<'
         min_age: 0,
         min_height: 0,
         choices: Vec::new(),
+        check_preimages: true,
     };
     walk(&policy, &mut r, &mut 0, &mut path)?;
     if r.remaining() != 0 {
@@ -920,6 +925,7 @@ pub fn verifications_claimed(witness: &Witness) -> u64 {
         min_age: 0,
         min_height: 0,
         choices: Vec::new(),
+        check_preimages: false,
     };
     if walk(&policy, &mut r, &mut 0, &mut path).is_err() {
         return 1;
