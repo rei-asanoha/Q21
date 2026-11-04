@@ -2953,7 +2953,7 @@ impl RpcContext {
             Some(Json::Bool(b)) => *b,
             _ => return Err(rpc_error(ERR_PARAMS, "parameter 'matched': true or false")),
         };
-        let Some(State::Ready { count, .. }) = mgr.verification(peer) else {
+        let Some(State::Ready { count, indices, .. }) = mgr.verification(peer) else {
             return Err(rpc_error(
                 ERR_REQUEST,
                 "no words to confirm on this connection",
@@ -2962,6 +2962,31 @@ impl RpcContext {
         let owner = mgr
             .peer_owner(peer)
             .ok_or_else(|| rpc_error(ERR_REQUEST, "the session ended"))?;
+        // The answer holds for the words and the identity the holder saw,
+        // not for whatever the connection carries at the moment of the
+        // click: a new session on the same connection, between the reading
+        // and the click, could otherwise be marked verified under the name
+        // typed for someone else (red-team campaign 8).
+        let lang = params
+            .get("lang")
+            .and_then(|v| v.as_str())
+            .and_then(crate::channel::verify::Language::from_code)
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'lang' expected"))?;
+        let seen = params
+            .get("seen")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'seen' expected"))?;
+        let shown = format!(
+            "{peer}:ready:{}",
+            crate::channel::verify::words(&indices, lang).join(" ")
+        );
+        let owner_seen = params.get("owner").and_then(|v| v.as_str()).unwrap_or("");
+        if seen != shown || owner_seen != owner.to_hex() {
+            return Err(rpc_error(
+                ERR_REQUEST,
+                "the words on this connection changed: read the new words aloud first",
+            ));
+        }
         if !matched {
             mgr.conclude_verification(peer, false);
             return Ok(Json::obj().set("verified", Json::Bool(false)).build());

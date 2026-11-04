@@ -178,6 +178,32 @@ fn ready_words(port: u16, lang: &str) -> (u64, Vec<String>) {
     })
 }
 
+/// The answer of a holder on the words of `lang` they read on `conn`, with
+/// what they saw (red-team campaign 8: an answer is bound to its words and
+/// identity).
+fn seen(port: u16, conn: u64, lang: &str) -> String {
+    let v = list(
+        &rpc(port, "verifications", &format!(r#"{{"lang":"{lang}"}}"#))
+            .unwrap()
+            .get("result")
+            .unwrap()
+            .clone(),
+    );
+    let r = v
+        .into_iter()
+        .find(|x| x.get("connection").and_then(|c| c.as_u64()) == Some(conn))
+        .expect("the verification");
+    let words: Vec<String> = list(r.get("words").unwrap())
+        .iter()
+        .filter_map(|w| w.as_str().map(String::from))
+        .collect();
+    format!(
+        r#""seen":"{conn}:ready:{}","owner":"{}","lang":"{lang}""#,
+        words.join(" "),
+        str_of(&r, "owner")
+    )
+}
+
 #[test]
 fn two_wallets_read_the_same_words_and_verify_each_other() {
     let base = dir("pair");
@@ -258,15 +284,31 @@ fn two_wallets_read_the_same_words_and_verify_each_other() {
     assert_ne!(wy_en, wy);
 
     // Both holders confirm. Y did not know X yet: it names it.
+    // An answer for other words than those on the connection is refused.
+    let stale = rpc(
+        rpc_x,
+        "contactconfirm",
+        &format!(
+            r#"{{"connection":{cx},"matched":true,"seen":"{cx}:ready:a b c","owner":"{owner}","lang":"fr"}}"#
+        ),
+    )
+    .unwrap();
+    assert!(
+        str_of(stale.get("error").unwrap(), "message").contains("changed"),
+        "{}",
+        stale.encode()
+    );
+    let sx = seen(rpc_x, cx, "fr");
     result(
         rpc_x,
         "contactconfirm",
-        &format!(r#"{{"connection":{cx},"matched":true}}"#),
+        &format!(r#"{{"connection":{cx},"matched":true,{sx}}}"#),
     );
+    let sy = seen(rpc_y, cy, "fr");
     let on_y = result(
         rpc_y,
         "contactconfirm",
-        &format!(r#"{{"connection":{cy},"matched":true,"label":"Xavier"}}"#),
+        &format!(r#"{{"connection":{cy},"matched":true,"label":"Xavier",{sy}}}"#),
     );
     assert_eq!(on_y.get("verified"), Some(&Json::Bool(true)));
     let book_x = list(&result(rpc_x, "contactlist", "{}"));
@@ -288,10 +330,11 @@ fn two_wallets_read_the_same_words_and_verify_each_other() {
     result(rpc_x, "contactverify", &format!(r#"{{"owner":"{owner}"}}"#));
     let (cx, w4) = ready_words(rpc_x, "en");
     assert_eq!(w4.len(), 4);
+    let s4 = seen(rpc_x, cx, "en");
     result(
         rpc_x,
         "contactconfirm",
-        &format!(r#"{{"connection":{cx},"matched":false}}"#),
+        &format!(r#"{{"connection":{cx},"matched":false,{s4}}}"#),
     );
     let refused = rpc(rpc_x, "contactverify", &format!(r#"{{"owner":"{owner}"}}"#)).unwrap();
     assert!(
