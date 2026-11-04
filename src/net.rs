@@ -309,6 +309,14 @@ impl FrameBudget {
 pub const INBOUND_ARRIVALS_PER_GROUP: usize = 6;
 pub const INBOUND_ARRIVALS_WINDOW: Duration = Duration::from_secs(60);
 
+/// A group that arrived this many times within [`INBOUND_REDIAL_WINDOW`]
+/// redials: its seats lose the newcomer's first-minute grace. A seat kept
+/// young by hanging up and calling again within the minute, one seat per
+/// address group, still locked an entry point against every newcomer
+/// (red-team campaign 8, round 2); an honest newcomer arrives once.
+pub const INBOUND_REDIALS: usize = 3;
+pub const INBOUND_REDIAL_WINDOW: Duration = Duration::from_secs(600);
+
 /// How long having delivered something protects a peer from eviction: an
 /// occupant that relayed one transaction once was protected for good, and
 /// four of them locked the onion pool (red-team campaign 7).
@@ -354,6 +362,7 @@ pub const EVICTION_HALF_OPEN_GRACE: Duration = Duration::from_secs(5);
 /// time, which then cannot touch a newcomer within its first minute.
 fn eviction_candidate(
     peers: &HashMap<u64, Peer>,
+    arrivals: &HashMap<NetGroup, Vec<Instant>>,
     from: Option<SocketAddr>,
     eligible: impl Fn(&Peer) -> bool,
 ) -> Option<u64> {
@@ -427,7 +436,19 @@ fn eviction_candidate(
     }
     // Past its first minute: a newcomer is never the one to go, whatever the
     // arrival — through Tor, every arrival is of the same group.
-    let settled = |p: &Peer| p.handshaked && age(p) >= EVICTION_NEWCOMER_GRACE;
+    // A seat of a group that keeps redialing has no grace: it stays young
+    // only by calling again (red-team campaign 8).
+    let redialing = |p: &Peer| {
+        inbound_group(p.addr)
+            .and_then(|gr| arrivals.get(&gr))
+            .is_some_and(|v| {
+                v.iter()
+                    .filter(|t| now.saturating_duration_since(**t) < INBOUND_REDIAL_WINDOW)
+                    .count()
+                    >= INBOUND_REDIALS
+            })
+    };
+    let settled = |p: &Peer| p.handshaked && (age(p) >= EVICTION_NEWCOMER_GRACE || redialing(p));
     // The arrival's own group (loopback is one): it replaces its own.
     if let Some(f) = from {
         if let Some((id, _)) = rest
@@ -3164,15 +3185,23 @@ impl Node {
         let mut g = self.shared.lock().unwrap();
         let now = Instant::now();
         let seen = g.inbound_arrivals.entry(gr).or_default();
-        seen.retain(|t| now.saturating_duration_since(*t) < INBOUND_ARRIVALS_WINDOW);
-        if seen.len() >= INBOUND_ARRIVALS_PER_GROUP {
+        seen.retain(|t| now.saturating_duration_since(*t) < INBOUND_REDIAL_WINDOW);
+        let last_minute = seen
+            .iter()
+            .filter(|t| now.saturating_duration_since(**t) < INBOUND_ARRIVALS_WINDOW)
+            .count();
+        if last_minute >= INBOUND_ARRIVALS_PER_GROUP {
             return false;
+        }
+        // Bounded: the redial count needs no more than this.
+        if seen.len() >= 4 * INBOUND_ARRIVALS_PER_GROUP {
+            seen.remove(0);
         }
         seen.push(now);
         if g.inbound_arrivals.len() > 4096 {
             g.inbound_arrivals.retain(|_, v| {
                 v.iter()
-                    .any(|t| now.saturating_duration_since(*t) < INBOUND_ARRIVALS_WINDOW)
+                    .any(|t| now.saturating_duration_since(*t) < INBOUND_REDIAL_WINDOW)
             });
         }
         true
@@ -3201,7 +3230,9 @@ impl Node {
                 .filter(|p| !p.outbound && is_loopback(p.addr))
                 .count();
             if loopback >= INBOUND_LOOPBACK_MAX {
-                return match eviction_candidate(&g.peers, address, |p| is_loopback(p.addr)) {
+                return match eviction_candidate(&g.peers, &g.inbound_arrivals, address, |p| {
+                    is_loopback(p.addr)
+                }) {
                     Some(id) => InboundDecision::Evict(id),
                     None => InboundDecision::Refuse("all loopback inbound slots are taken"),
                 };
@@ -3215,7 +3246,9 @@ impl Node {
         // others, they were the first a clearnet occupant evicted (red-team
         // campaign 7).
         let tor_kept = !from_loopback && g.network != Network::Regtest;
-        match eviction_candidate(&g.peers, address, |p| !(tor_kept && is_loopback(p.addr))) {
+        match eviction_candidate(&g.peers, &g.inbound_arrivals, address, |p| {
+            !(tor_kept && is_loopback(p.addr))
+        }) {
             Some(id) => InboundDecision::Evict(id),
             None => InboundDecision::Refuse("all inbound slots are taken"),
         }
@@ -7446,6 +7479,44 @@ mod tests {
             InboundDecision::Evict(500),
             "the newcomer keeps its seat"
         );
+        a.shutdown();
+    }
+
+    #[test]
+    fn one_young_seat_per_redialing_group_cannot_lock_the_entry() {
+        let net = Network::Testnet;
+        let a = Node::new(net, Chain::new(net, genesis_block(net)));
+        let inbound = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) as u64;
+        let now = Instant::now();
+        // Every seat young, one per address group: nothing settled, no
+        // crowded group.
+        for id in 1..=inbound {
+            let addr: SocketAddr = format!("47.{id}.0.1:21121").parse().unwrap();
+            fake_peer(&a, id, addr, false);
+            settle_peer(&a, id, now - Duration::from_secs(id), None);
+        }
+        let honest: SocketAddr = "203.77.113.7:50000".parse().unwrap();
+        // Arrived once each: honest newcomers keep their first minute.
+        assert_eq!(
+            a.inbound_decision(Some(honest)),
+            InboundDecision::Refuse("all inbound slots are taken")
+        );
+        // The same groups redialing every minute lose that grace.
+        {
+            let mut g = a.shared.lock().unwrap();
+            for id in 1..=inbound {
+                let addr: SocketAddr = format!("47.{id}.0.1:21121").parse().unwrap();
+                let gr = inbound_group(addr).unwrap();
+                let times: Vec<Instant> = (0..INBOUND_REDIALS as u64)
+                    .filter_map(|k| now.checked_sub(Duration::from_secs(60 * k + 1)))
+                    .collect();
+                g.inbound_arrivals.insert(gr, times);
+            }
+        }
+        match a.inbound_decision(Some(honest)) {
+            InboundDecision::Evict(gone) => assert!(gone >= 1 && gone <= inbound),
+            other => panic!("a newcomer was refused by redialing groups: {other:?}"),
+        }
         a.shutdown();
     }
 
