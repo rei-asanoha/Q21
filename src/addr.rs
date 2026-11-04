@@ -543,7 +543,8 @@ impl OnionBook {
 
     /// Adds or refreshes a name. A timestamp from the future is brought back
     /// to `now`, as for IPv4 addresses.
-    pub fn add(&mut self, a: crate::wire::OnionAddr, now: u64) {
+    /// Returns whether the name is new to the book.
+    pub fn add(&mut self, a: crate::wire::OnionAddr, now: u64) -> bool {
         let mut a = a;
         a.last_seen = a.last_seen.min(now.saturating_add(FUTURE_TOLERANCE));
         if let Some(e) = self
@@ -552,7 +553,7 @@ impl OnionBook {
             .find(|e| e.addr.name == a.name && e.addr.port == a.port)
         {
             e.addr.last_seen = e.addr.last_seen.max(a.last_seen);
-            return;
+            return false;
         }
         if self.entries.len() >= MAX_ONIONS {
             if let Some((pos, _)) = self
@@ -568,6 +569,7 @@ impl OnionBook {
             addr: a,
             failures: 0,
         });
+        true
     }
 
     /// The freshest names, at most `count`.

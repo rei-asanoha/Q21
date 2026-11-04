@@ -648,6 +648,10 @@ pub const ADDR_RATE_PER_SEC: u64 = 10;
 /// peers tell us is not.
 pub const ADDR_NEW_PER_INBOUND: u32 = 128;
 pub const ADDR_NEW_PER_INBOUND_GROUP_HOUR: u32 = 512;
+/// New addresses one connection we dialed can write: a whole reply to our
+/// `getaddr`, not a stream (red-team campaign 8: a caller that got itself
+/// dialed then wrote ten a second without end).
+pub const ADDR_NEW_PER_OUTBOUND: u32 = crate::wire::MAX_ADDR as u32;
 
 /// Cost of a batch of headers nobody requested. No honest node sends one: only
 /// the reply to a request produces one.
@@ -5343,11 +5347,6 @@ impl Node {
                     } = *g;
                     if let Some(peer) = peers.get_mut(&id) {
                         let source = (inbound_group(peer.addr), is_loopback(peer.addr));
-                        if addr_from_inbound.len() > 4096 {
-                            addr_from_inbound.retain(|_, (t, _)| {
-                                instant.saturating_duration_since(*t) < Duration::from_secs(3600)
-                            });
-                        }
                         for a in v.into_iter().take(crate::wire::MAX_ADDR) {
                             if !peer.addr_bucket.allow_with(
                                 1,
@@ -5358,29 +5357,16 @@ impl Node {
                                 self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if !peer.outbound {
-                                let hour = addr_from_inbound.entry(source).or_insert((instant, 0));
-                                if instant.saturating_duration_since(hour.0)
-                                    >= Duration::from_secs(3600)
-                                {
-                                    *hour = (instant, 0);
-                                }
-                                if peer.addr_added >= ADDR_NEW_PER_INBOUND
-                                    || hour.1 >= ADDR_NEW_PER_INBOUND_GROUP_HOUR
-                                {
-                                    self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
-                                    break;
-                                }
+                            if !Self::may_write_address(peer, addr_from_inbound, source, instant) {
+                                self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
+                                break;
                             }
                             // An address announced as seen in the future would
                             // be a way to get ahead of all the others.
                             let mut a = a;
                             a.last_seen = a.last_seen.min(now);
-                            if book.add(a, now) && !peer.outbound {
-                                peer.addr_added += 1;
-                                if let Some(hour) = addr_from_inbound.get_mut(&source) {
-                                    hour.1 += 1;
-                                }
+                            if book.add(a, now) {
+                                Self::wrote_address(peer, addr_from_inbound, source);
                             }
                         }
                     }
@@ -5393,20 +5379,37 @@ impl Node {
                     // book, and nothing is dialed because a peer said so.
                     let now = unix_now();
                     let instant = Instant::now();
+                    // And the same bounds on what a stranger who called us
+                    // writes, shared with `addr` (red-team campaign 8: one
+                    // caller filled the whole onion book).
                     let Shared {
                         ref mut onions,
                         ref mut peers,
+                        ref mut addr_from_inbound,
                         ..
                     } = *g;
-                    if let Some(bucket) = peers.get_mut(&id).map(|p| &mut p.addr_bucket) {
+                    if let Some(peer) = peers.get_mut(&id) {
+                        let source = (inbound_group(peer.addr), is_loopback(peer.addr));
                         for a in v.into_iter().take(crate::wire::MAX_ADDR) {
-                            if !bucket.allow_with(1, instant, ADDR_BUCKET_MAX, ADDR_RATE_PER_SEC) {
+                            if !peer.addr_bucket.allow_with(
+                                1,
+                                instant,
+                                ADDR_BUCKET_MAX,
+                                ADDR_RATE_PER_SEC,
+                            ) || !Self::may_write_address(
+                                peer,
+                                addr_from_inbound,
+                                source,
+                                instant,
+                            ) {
                                 self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
                             let mut a = a;
                             a.last_seen = a.last_seen.min(now);
-                            onions.add(a, now);
+                            if onions.add(a, now) {
+                                Self::wrote_address(peer, addr_from_inbound, source);
+                            }
                         }
                     }
                 }
@@ -6123,6 +6126,44 @@ impl Node {
                     }
                 }
                 true
+            }
+        }
+    }
+
+    /// Whether `peer` may still write a new address (or onion name) into a
+    /// book: [`ADDR_NEW_PER_INBOUND`] per connection and
+    /// [`ADDR_NEW_PER_INBOUND_GROUP_HOUR`] per address group of callers;
+    /// [`ADDR_NEW_PER_OUTBOUND`] per connection for a peer we dialed.
+    fn may_write_address(
+        peer: &Peer,
+        per_group: &mut HashMap<(Option<NetGroup>, bool), (Instant, u32)>,
+        source: (Option<NetGroup>, bool),
+        now: Instant,
+    ) -> bool {
+        if peer.outbound {
+            return peer.addr_added < ADDR_NEW_PER_OUTBOUND;
+        }
+        if per_group.len() > 4096 {
+            per_group
+                .retain(|_, (t, _)| now.saturating_duration_since(*t) < Duration::from_secs(3600));
+        }
+        let hour = per_group.entry(source).or_insert((now, 0));
+        if now.saturating_duration_since(hour.0) >= Duration::from_secs(3600) {
+            *hour = (now, 0);
+        }
+        peer.addr_added < ADDR_NEW_PER_INBOUND && hour.1 < ADDR_NEW_PER_INBOUND_GROUP_HOUR
+    }
+
+    /// Counts a new address `peer` wrote, see [`Self::may_write_address`].
+    fn wrote_address(
+        peer: &mut Peer,
+        per_group: &mut HashMap<(Option<NetGroup>, bool), (Instant, u32)>,
+        source: (Option<NetGroup>, bool),
+    ) {
+        peer.addr_added = peer.addr_added.saturating_add(1);
+        if !peer.outbound {
+            if let Some(hour) = per_group.get_mut(&source) {
+                hour.1 = hour.1.saturating_add(1);
             }
         }
     }
@@ -11170,6 +11211,45 @@ mod tests_handler_review {
             n.address_count()
         );
         assert!(n.address_count() > 0, "but some are taken");
+    }
+
+    /// Red-team campaign 8 (perse1): one caller filled the whole onion book
+    /// with a thousand names of its own. `onionaddr` is held to the same
+    /// bounds as `addr`.
+    #[test]
+    fn an_inbound_peer_writes_a_bounded_share_of_the_onion_book() {
+        let n = node();
+        let _e = anonymous_peer(&n, 9);
+        establish(&n, 9);
+        const B32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let names: Vec<crate::wire::OnionAddr> = (0..1000u32)
+            .map(|k| {
+                let mut s: String = (0..55)
+                    .map(|i| B32[((k >> (i % 10)) as usize + i * 7) % 32] as char)
+                    .collect();
+                s.replace_range(
+                    0..4,
+                    &format!("{:04}", k)
+                        .replace('0', "a")
+                        .replace('1', "b")
+                        .replace('8', "c")
+                        .replace('9', "e"),
+                );
+                s.push('d');
+                crate::wire::OnionAddr {
+                    name: s,
+                    port: 21121,
+                    last_seen: 1,
+                }
+            })
+            .collect();
+        assert!(n.handle(9, Message::OnionAddr(names)));
+        assert!(
+            n.onion_count() <= ADDR_NEW_PER_INBOUND as usize,
+            "{} onion names from one inbound peer",
+            n.onion_count()
+        );
+        assert!(n.onion_count() > 0, "but some are taken");
     }
 
     fn establish(n: &Node, id: u64) {
