@@ -5973,6 +5973,7 @@ impl Node {
             }
             return true;
         }
+        let height_before = g.chain.height();
         let result = g.chain.submit(b, unix_now());
         if deep && matches!(result, Ok(Accept::SideBranch | Accept::Reorganized { .. })) {
             if let Some(p) = g.peers.get_mut(&source) {
@@ -5992,6 +5993,20 @@ impl Node {
                 // this node mined itself reached the disk.
                 if let Some(j) = &g.journal {
                     j.record(b);
+                    // A reorganization connects the whole winning branch:
+                    // every block of it is written, not only this tip. Some
+                    // of them, refused for where the node stood when they
+                    // came (the depth penalty), were kept in memory only, and
+                    // a restart came back on the abandoned branch (red-team
+                    // campaign 8). Blocks already written are skipped.
+                    if let Accept::Reorganized { depth } = accepted {
+                        let fork = height_before.saturating_sub(depth);
+                        for h in fork.saturating_add(1)..=g.chain.height() {
+                            if let Some(block) = g.chain.block_at(h) {
+                                j.record(&block);
+                            }
+                        }
+                    }
                 }
                 g.mempool.on_block_connected(b);
                 // A connected block: hand its transactions to the channel
@@ -6089,16 +6104,6 @@ impl Node {
             // body, its slot is free, and the rest of that batch, which builds
             // on a block we did not take, is not asked for.
             Err(e) if refusal_is_contextual(&e) => {
-                // Refused as a reorganization for now, but kept in the index
-                // with its body, like a side branch: written too. Once the
-                // branch wins with a later block, it is part of the chain,
-                // and a restart without it came back on the abandoned branch
-                // (red-team campaign 8).
-                if g.chain.has_block(&bid) {
-                    if let Some(j) = &g.journal {
-                        j.record(b);
-                    }
-                }
                 report_beyond_finality(&e);
                 note_future_block(&e, source);
                 if let Some(p) = g.peers.get_mut(&source) {
