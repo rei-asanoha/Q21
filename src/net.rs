@@ -238,6 +238,12 @@ pub const EVICTION_PROTECT_DELIVERING: usize = 4;
 /// longest, once [`EVICTION_PROTECT_DELIVERING`] are set aside.
 pub const EVICTION_PROTECT_OLDEST: usize = 8;
 
+/// At most this many protected seats per address group
+/// ([`EVICTION_PROTECT_PER_GROUP_TOR`] for the loopback, where every Tor
+/// peer arrives): protection goes to diverse groups.
+pub const EVICTION_PROTECT_PER_GROUP: usize = 2;
+pub const EVICTION_PROTECT_PER_GROUP_TOR: usize = 6;
+
 /// What becomes of an inbound connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InboundDecision {
@@ -359,27 +365,52 @@ fn eviction_candidate(
         .collect();
     // Deterministic order: oldest first, then by id.
     cands.sort_by(|a, b| a.1.connected_at.cmp(&b.1.connected_at).then(a.0.cmp(&b.0)));
+    // The address group of a peer: loopback (every arrival through Tor) is
+    // one.
+    let group = |a: SocketAddr| (inbound_group(a), is_loopback(a));
+    // Protection goes to diverse groups: at most a few seats of one group
+    // are protected, so a few address groups cannot hold every protected
+    // seat (red-team campaign 8). Through Tor, every peer is of one group.
+    let cap = |p: &Peer| {
+        if is_loopback(p.addr) {
+            EVICTION_PROTECT_PER_GROUP_TOR
+        } else {
+            EVICTION_PROTECT_PER_GROUP
+        }
+    };
     let mut protected: Vec<u64> = Vec::new();
-    let mut useful: Vec<(u64, Instant)> = cands
+    let mut per_group: HashMap<(Option<NetGroup>, bool), usize> = HashMap::new();
+    let mut useful: Vec<(u64, Instant, &Peer)> = cands
         .iter()
         .filter(|(_, p)| p.handshaked)
-        .filter_map(|(id, p)| p.last_useful.map(|t| (*id, t)))
-        .filter(|(_, t)| now.saturating_duration_since(*t) < EVICTION_DELIVERING_FRESH)
+        .filter_map(|(id, p)| p.last_useful.map(|t| (*id, t, *p)))
+        .filter(|(_, t, _)| now.saturating_duration_since(*t) < EVICTION_DELIVERING_FRESH)
         .collect();
     useful.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    protected.extend(
-        useful
-            .iter()
-            .take(EVICTION_PROTECT_DELIVERING)
-            .map(|(id, _)| *id),
-    );
-    let oldest: Vec<u64> = cands
-        .iter()
-        .filter(|(id, p)| p.handshaked && !protected.contains(id))
-        .take(EVICTION_PROTECT_OLDEST)
-        .map(|(id, _)| *id)
-        .collect();
-    protected.extend(oldest);
+    for (id, _, p) in &useful {
+        if protected.len() >= EVICTION_PROTECT_DELIVERING {
+            break;
+        }
+        let n = per_group.entry(group(p.addr)).or_insert(0);
+        if *n < cap(p) {
+            *n += 1;
+            protected.push(*id);
+        }
+    }
+    let delivering = protected.len();
+    for (id, p) in &cands {
+        if protected.len() >= delivering + EVICTION_PROTECT_OLDEST {
+            break;
+        }
+        if !p.handshaked || protected.contains(id) {
+            continue;
+        }
+        let n = per_group.entry(group(p.addr)).or_insert(0);
+        if *n < cap(p) {
+            *n += 1;
+            protected.push(*id);
+        }
+    }
     protected.truncate(cands.len().saturating_sub(EVICTION_ALWAYS_OPEN));
     let age = |p: &Peer| now.saturating_duration_since(p.connected_at);
     let rest: Vec<&(u64, &Peer)> = cands
@@ -398,7 +429,6 @@ fn eviction_candidate(
     // arrival — through Tor, every arrival is of the same group.
     let settled = |p: &Peer| p.handshaked && age(p) >= EVICTION_NEWCOMER_GRACE;
     // The arrival's own group (loopback is one): it replaces its own.
-    let group = |a: SocketAddr| (inbound_group(a), is_loopback(a));
     if let Some(f) = from {
         if let Some((id, _)) = rest
             .iter()
@@ -408,9 +438,27 @@ fn eviction_candidate(
             return Some(*id);
         }
     }
+    if let Some((id, _)) = rest.iter().rev().find(|(_, p)| settled(p)) {
+        return Some(*id);
+    }
+    // Every seat left is in its first minute. The grace protects a newcomer,
+    // not a group holding several seats: a group that redials its seats
+    // before their minute is up kept every one of them, and refused every
+    // newcomer (red-team campaign 8). The group with the most seats, more
+    // than the arrival's own, gives up its most recent one.
+    let mut count: HashMap<(Option<NetGroup>, bool), usize> = HashMap::new();
+    for (_, p) in &rest {
+        *count.entry(group(p.addr)).or_insert(0) += 1;
+    }
+    let own = from.map_or(0, |f| count.get(&group(f)).copied().unwrap_or(0));
+    let most = count.values().copied().max().unwrap_or(0);
+    if most < 2 || most <= own + 1 {
+        return None;
+    }
+    // Ties: the most recent seat among the groups with the most.
     rest.iter()
         .rev()
-        .find(|(_, p)| settled(p))
+        .find(|(_, p)| p.handshaked && count.get(&group(p.addr)) == Some(&most))
         .map(|(id, _)| *id)
 }
 
@@ -7230,6 +7278,77 @@ mod tests {
     /// newcomer within its first minute; a connection that never completed
     /// its handshake goes first; a delivery long past protects no more
     /// (red-team campaign 7).
+    /// Red-team campaign 8 (arch2): six address groups held every inbound
+    /// seat — three groups for the oldest and delivering protections, three
+    /// redialing their seats before their first minute was up — and every
+    /// newcomer in the clear was refused. Protection now goes to diverse
+    /// groups, and a group holding several seats within their first minute
+    /// gives one up to a newcomer from another group.
+    #[test]
+    fn a_few_address_groups_cannot_hold_every_seat_young() {
+        let net = Network::Testnet;
+        let a = Node::new(net, Chain::new(net, genesis_block(net)));
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(Duration::from_secs(3600)) else {
+            return;
+        };
+        let inbound = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) as u64;
+        let mut id = 0u64;
+        for g in 1..=3u8 {
+            for j in 1..=4u8 {
+                id += 1;
+                fake_peer(
+                    &a,
+                    id,
+                    format!("45.{g}.0.{j}:21121").parse().unwrap(),
+                    false,
+                );
+                let useful = if id > 8 {
+                    now.checked_sub(Duration::from_secs(300))
+                } else {
+                    None
+                };
+                settle_peer(&a, id, long_ago + Duration::from_millis(id), useful);
+            }
+        }
+        for g in 1..=3u8 {
+            for j in 1..=4u8 {
+                id += 1;
+                fake_peer(
+                    &a,
+                    id,
+                    format!("46.{g}.0.{j}:21121").parse().unwrap(),
+                    false,
+                );
+                let k = u64::from((g - 1) * 4 + (j - 1));
+                settle_peer(&a, id, now - Duration::from_secs(2 + 5 * k), None);
+            }
+        }
+        assert_eq!(id, inbound);
+        for k in [0u8, 7, 200] {
+            let honest: SocketAddr = format!("203.{k}.113.7:50000").parse().unwrap();
+            match a.inbound_decision(Some(honest)) {
+                InboundDecision::Evict(gone) => {
+                    assert!(gone >= 1 && gone <= inbound, "an occupant's seat: {gone}");
+                }
+                other => panic!("a newcomer from 203.{k}/16 was refused: {other:?}"),
+            }
+        }
+        // A newcomer alone in its group, within its first minute, is not the
+        // one a crowded group's arrival evicts.
+        a.disconnect(inbound);
+        let newcomer: SocketAddr = "203.9.113.7:50000".parse().unwrap();
+        fake_peer(&a, 500, newcomer, false);
+        settle_peer(&a, 500, Instant::now(), None);
+        let rotating: SocketAddr = "46.3.0.9:21121".parse().unwrap();
+        assert_ne!(
+            a.inbound_decision(Some(rotating)),
+            InboundDecision::Evict(500),
+            "the newcomer keeps its seat"
+        );
+        a.shutdown();
+    }
+
     #[test]
     fn a_full_node_makes_room_but_keeps_its_best_peers() {
         let a = node();
@@ -7299,9 +7418,21 @@ mod tests {
             a.inbound_decision(Some(newcomer)),
             InboundDecision::Evict(inbound)
         );
-        // Everyone unprotected within its grace: the arrival waits.
+        // Everyone unprotected within its grace: the group holding four seats
+        // gives one up (red-team campaign 8)...
         for id in 9..=inbound {
             settle_peer(&a, id, Instant::now(), None);
+        }
+        match a.inbound_decision(Some(newcomer)) {
+            InboundDecision::Evict(x) => assert!((13..=16).contains(&x), "{x}"),
+            other => panic!("{other:?}"),
+        }
+        // ...and with one seat per group, the arrival waits.
+        for id in 14..=16 {
+            a.disconnect(id);
+            let addr: SocketAddr = format!("10.{}.0.1:21021", 100 + id).parse().unwrap();
+            fake_peer(&a, 900 + id, addr, false);
+            settle_peer(&a, 900 + id, Instant::now(), None);
         }
         assert!(matches!(
             a.inbound_decision(Some(newcomer)),
