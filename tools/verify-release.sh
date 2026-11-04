@@ -57,30 +57,98 @@ sha() {
 }
 # The hash SHA256SUMS gives to a name, CR stripped; empty if none.
 listed() { tr -d '\r' < "$REL/SHA256SUMS" | awk -v n="$1" '$2 == n {print $1; exit}'; }
-# Every entry of a tar archive is a plain file ('0', or NUL in old archives)
-# or a folder ('5'), read from the raw headers. Extended headers (pax 'x' and
-# 'g', GNU 'L', 'K', 'N', 'V'...) are refused: tar programs do not all read
-# them the same way, so the same archive could unpack one program for this
-# check and another one on a user's Mac.
-plain_tar() {
-  local T=$1 OFF=0 N=0 TYPE SIZE
-  local LEN
+# A tar archive read header by header, strictly, and listed: every entry a
+# plain file ('0', or NUL in old archives) or a folder ('5', size 0, name
+# ending in '/'); each header's checksum right; each size field the eleven
+# octal digits every tar writes; names printable ASCII. Prints the names, one
+# per line; fails on anything else. Extended headers (pax 'x' and 'g', GNU
+# 'L', 'K'...) and every irregular field are refused: tar programs do not all
+# read them the same way, so the same archive could unpack one program for
+# this check and another one on a user's Mac (red-team campaign 8).
+strict_tar_names() {
+  local T=$1 OFF=0 N=0 LEN LINE SIZE
   LEN=$(wc -c < "$T" | tr -d ' ')
   while [ $((OFF + 512)) -le "$LEN" ]; do
     N=$((N + 1))
     [ "$N" -le 100000 ] || return 1
-    if [ "$(od -An -tx1 -j "$OFF" -N1 "$T" | tr -d ' \n')" = 00 ]; then
-      # The end: two zero blocks, nothing after but zeros.
-      [ -z "$(tail -c +$((OFF + 1)) "$T" | tr -d '\000' | head -c 1)" ] || return 1
-      return 0
-    fi
-    TYPE=$(od -An -tx1 -j $((OFF + 156)) -N1 "$T" | tr -d ' \n')
-    case "$TYPE" in 30|00|35) ;; *) return 1 ;; esac
-    SIZE=$(dd if="$T" bs=1 skip=$((OFF + 124)) count=12 2>/dev/null | tr -d '\000 ')
-    case "$SIZE" in ''|*[!0-7]*) return 1 ;; esac
-    OFF=$((OFF + 512 + (8#$SIZE + 511) / 512 * 512))
+    LINE=$(od -An -v -tu1 -j "$OFF" -N 512 "$T" | awk '
+      { for (i = 1; i <= NF; i++) b[n++] = $i }
+      END {
+        if (n != 512) { print "BAD"; exit }
+        zero = 1; for (i = 0; i < 512; i++) if (b[i] != 0) zero = 0
+        if (zero) { print "END"; exit }
+        sum = 0; for (i = 0; i < 512; i++) sum += (i >= 148 && i < 156) ? 32 : b[i]
+        # Checksum: six octal digits, then NUL and space.
+        ck = 0; for (i = 148; i < 154; i++) { if (b[i] < 48 || b[i] > 55) { print "BAD"; exit }; ck = ck * 8 + b[i] - 48 }
+        if (b[154] != 0 || b[155] != 32 || ck != sum) { print "BAD"; exit }
+        # Size: eleven octal digits, then NUL or space.
+        sz = 0; for (i = 124; i < 135; i++) { if (b[i] < 48 || b[i] > 55) { print "BAD"; exit }; sz = sz * 8 + b[i] - 48 }
+        if (b[135] != 0 && b[135] != 32) { print "BAD"; exit }
+        t = b[156]
+        if (t != 0 && t != 48 && t != 53) { print "BAD"; exit }
+        # The name: prefix "/" name, printable ASCII, NUL-padded.
+        name = ""
+        for (k = 0; k < 2; k++) {
+          s = (k == 0) ? 345 : 0; e = (k == 0) ? 500 : 100; part = ""; ended = 0
+          for (i = s; i < e; i++) {
+            if (b[i] == 0) { ended = 1; continue }
+            if (ended || b[i] < 32 || b[i] > 126) { print "BAD"; exit }
+            part = part sprintf("%c", b[i])
+          }
+          if (k == 0 && part != "") name = part "/"
+          if (k == 1) name = name part
+        }
+        if (name == "") { print "BAD"; exit }
+        dir = (substr(name, length(name), 1) == "/")
+        if (t == 53 && (!dir || sz != 0)) { print "BAD"; exit }
+        if (t != 53 && dir) { print "BAD"; exit }
+        print sz " " name
+      }')
+    case "$LINE" in
+      END)
+        # The end: nothing after but zeros.
+        [ -z "$(tail -c +$((OFF + 1)) "$T" | tr -d '\000' | head -c 1)" ] || return 1
+        return 0 ;;
+      BAD|'') return 1 ;;
+    esac
+    SIZE=${LINE%% *}
+    printf '%s\n' "${LINE#* }"
+    OFF=$((OFF + 512 + (SIZE + 511) / 512 * 512))
   done
   return 1
+}
+# A zip archive whose every local header names what the central directory
+# names, at the offsets it gives, with nothing between the entries: unzip
+# reads the central directory, other programs (the tar of Windows) the local
+# headers; both must see the same files (red-team campaign 8).
+strict_zip() {
+  local Z=$1 EXPECT=0 COUNT=0 OFFSET NAME CSIZE DESC LNAME NLEN XLEN SIG
+  while IFS='|' read -r OFFSET CSIZE DESC NAME; do
+    COUNT=$((COUNT + 1))
+    [ "$OFFSET" = "$EXPECT" ] || return 1
+    SIG=$(od -An -tx1 -j "$OFFSET" -N 4 "$Z" | tr -d ' \n')
+    [ "$SIG" = 504b0304 ] || return 1
+    XLEN=$(od -An -tu1 -j $((OFFSET + 28)) -N 2 "$Z" | awk '{print $1 + 256 * $2}')
+    NLEN=$(od -An -tu1 -j $((OFFSET + 26)) -N 2 "$Z" | awk '{print $1 + 256 * $2}')
+    LNAME=$(dd if="$Z" bs=1 skip=$((OFFSET + 30)) count="$NLEN" 2>/dev/null)
+    [ "$LNAME" = "$NAME" ] || return 1
+    EXPECT=$((OFFSET + 30 + NLEN + XLEN + CSIZE))
+    if [ "$DESC" = yes ]; then
+      if [ "$(od -An -tx1 -j "$EXPECT" -N 4 "$Z" | tr -d ' \n')" = 504b0708 ]; then
+        EXPECT=$((EXPECT + 16))
+      else
+        EXPECT=$((EXPECT + 12))
+      fi
+    fi
+  done < <(zipinfo -v "$Z" | awk '
+    /^Central directory entry #/ { if (have) print off "|" cs "|" ds "|" nm; have = 1; nm = ""; getline; getline; getline; while ($0 ~ /^  There are an extra/ || $0 == "") getline; sub(/^  /, ""); nm = $0 }
+    /offset of local header from start of archive:/ { off = $NF }
+    /^  compressed size:/ { cs = $3 }
+    /extended local header:/ { ds = $NF }
+    END { if (have) print off "|" cs "|" ds "|" nm }')
+  [ "$COUNT" -gt 0 ] || return 1
+  # The central directory comes right after the last entry.
+  [ "$(od -An -tx1 -j "$EXPECT" -N 4 "$Z" | tr -d ' \n')" = 504b0102 ] || return 1
 }
 
 PLATFORMS="linux-x86_64 linux-arm64 macos-arm64 macos-x86_64 windows-x86_64"
@@ -133,16 +201,20 @@ for P in $PLATFORMS; do
   # no `..`, no two names that a case-insensitive disk would merge.
   case "$A" in
     *.zip)
+      strict_zip "$REL/$A" \
+        || fail "$A: its local headers do not name what its central directory names, or entries are hidden between them"
       NAMES=$(zipinfo -1 "$REL/$A")
       LONG=$(zipinfo "$REL/$A")
       if grep -q '^l' <<<"$LONG"; then fail "$A holds a symbolic link"; fi
       ;;
     *)
       gzip -dc < "$REL/$A" > "$WORK/raw.tar" || fail "$A is not a gzip archive"
-      plain_tar "$WORK/raw.tar" \
-        || fail "$A holds an entry that is neither a plain file nor a folder (extended or link header)"
+      STRICT=$(strict_tar_names "$WORK/raw.tar") \
+        || fail "$A holds an entry that is not a plain file or folder with regular headers (extended or link header, bad checksum or size field, irregular name)"
       rm -f "$WORK/raw.tar"
       NAMES=$(tar -tzf "$REL/$A")
+      # What tar lists is exactly what the strict reading saw.
+      [ "$STRICT" = "$NAMES" ] || fail "$A: tar lists other entries than its headers hold"
       LONG=$(tar -tvzf "$REL/$A")
       if grep -q '^[lh]' <<<"$LONG"; then fail "$A holds a link"; fi
       ;;
@@ -160,9 +232,10 @@ for P in $PLATFORMS; do
     | tr '[:upper:]' '[:lower:]' | sort | uniq -d)
   [ -z "$DUP" ] || fail "$A holds entries that differ only by case, or twice: $DUP"
   case "$A" in
-    # unzip says 1 for a warning — backslashes read as slashes —, more for
-    # an error.
-    *.zip) unzip -q "$REL/$A" -d "$D" || [ "$?" -eq 1 ] || fail "$A cannot be unpacked"
+    # A warning (exit 1) is refused too: backslashes read as slashes, or a
+    # local name that differs from the central one, are read otherwise by
+    # other programs.
+    *.zip) unzip -q "$REL/$A" -d "$D" || fail "$A cannot be unpacked without a warning"
            PROGRAM="$D/q21.exe" ;;
     *) tar -xzf "$REL/$A" -C "$D"; PROGRAM="$D/q21" ;;
   esac
