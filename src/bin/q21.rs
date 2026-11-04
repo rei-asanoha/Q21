@@ -6192,6 +6192,16 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 .unwrap_or_else(std::time::Instant::now);
         }
 
+        // The Tor this node started is gone: its SOCKS port is free, and
+        // another program could take it and see every connection. Until
+        // Tor runs again, the node's proxy is port 0, where no program can
+        // listen: connections fail, never in the clear, never to a stranger
+        // (red-team campaign 8).
+        if let Some(t) = &managed_tor {
+            if !t.is_running() && node.proxy() != Some(TOR_GONE) {
+                node.set_proxy(Some(TOR_GONE));
+            }
+        }
         if last_search.elapsed().as_secs() >= 15 {
             last_search = std::time::Instant::now();
 
@@ -7585,6 +7595,12 @@ const ONION_CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30
 const TOR_RESTART_AFTER_SLEEP: u64 = 20 * 60;
 /// At most one restart of Tor for an onion service that does not answer.
 const TOR_RESTART_UNREACHABLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1800);
+/// Where the node's connections go while the Tor it started is not running:
+/// port 0, which no program can listen on.
+const TOR_GONE: std::net::SocketAddr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::LOCALHOST,
+    0,
+));
 /// The longest spacing of those restarts, once several did not help.
 const TOR_RESTART_UNREACHABLE_MAX: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
 /// What the onion check is told, see `onion_check_soon`: nothing new.
