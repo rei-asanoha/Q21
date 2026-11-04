@@ -6926,15 +6926,11 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
     // It is drawn **before** setup: the setup page must know where to send
     // the browser when it is done, and it cannot ask a server that does not
     // exist yet.
-    let port = if port != 0 {
-        port
-    } else {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("no port available: {e}"))?
-            .local_addr()
-            .map_err(|e| e.to_string())?
-            .port()
-    };
+    // Held from now on, until the node's server takes it: a port drawn and
+    // let go could be taken by another account in between (red-team
+    // campaign 8).
+    let port = q21_core::http::reserve_loopback_port(port)
+        .map_err(|e| format!("no port available: {e}"))?;
 
     // 2. The session token. Thirty-two bytes drawn from the system generator:
     //    it cannot be guessed, and it only serves for the duration of this
@@ -7026,14 +7022,13 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         // The browser opens once the server is ready. We probe the port rather
         // than waiting a fixed duration: a fixed duration is always too short
         // on a loaded machine and too long elsewhere.
-        let a = address.clone();
         let u = url.clone();
         // Up to ten minutes: on a small machine, the chain takes a while to
         // load before the server listens, and there may be no window in
         // which to say "open it by hand".
         std::thread::spawn(move || {
             for _ in 0..6000 {
-                if std::net::TcpStream::connect(&a).is_ok() {
+                if q21_core::http::is_serving(port) {
                     if let Err(e) = open_browser(&u) {
                         tell_user(&format!(
                             "The browser could not be opened ({e}).\n\n\
@@ -7313,11 +7308,8 @@ fn run_setup(
     // open for the whole lifetime of the program would be attack surface with
     // no use.
     std::thread::spawn(move || {
-        let target = std::net::SocketAddr::from(([127, 0, 0, 1], node_port));
         for _ in 0..600 {
-            if std::net::TcpStream::connect_timeout(&target, std::time::Duration::from_millis(200))
-                .is_ok()
-            {
+            if q21_core::http::is_serving(node_port) {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
                 break;
             }
@@ -7472,14 +7464,11 @@ fn handle_setup(
 
         // "Is the node listening?" The page cannot ask it itself: the node is
         // on another origin, and the browser refuses to read its answer. This
-        // server, on the other hand, has no same-origin policy to respect: it
-        // opens a connection and says what it saw.
+        // server, in the node's own process, can.
         "node" => {
-            let ready = std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], node_port)),
-                std::time::Duration::from_millis(200),
-            )
-            .is_ok();
+            // Asked of this process, not of the port: whoever listens on
+            // the port is not necessarily the node (red-team campaign 8).
+            let ready = q21_core::http::is_serving(node_port);
             Json::obj().set("ready", Json::Bool(ready)).build()
         }
 
@@ -7688,15 +7677,11 @@ fn cmd_explorer(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
     read_wallet(datadir)?;
 
-    let port = if port != 0 {
-        port
-    } else {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("no port available: {e}"))?
-            .local_addr()
-            .map_err(|e| e.to_string())?
-            .port()
-    };
+    // Held from now on, until the node's server takes it: a port drawn and
+    // let go could be taken by another account in between (red-team
+    // campaign 8).
+    let port = q21_core::http::reserve_loopback_port(port)
+        .map_err(|e| format!("no port available: {e}"))?;
 
     let raw: [u8; 32] =
         q21_core::rng::bytes().map_err(|_| "system random generator unavailable".to_string())?;
@@ -7718,11 +7703,10 @@ fn cmd_explorer(datadir: &Path, args: &[String]) -> Result<(), String> {
     println!();
 
     if !no_browser {
-        let a = address.clone();
         let u = url.clone();
         std::thread::spawn(move || {
             for _ in 0..200 {
-                if std::net::TcpStream::connect(&a).is_ok() {
+                if q21_core::http::is_serving(port) {
                     if let Err(e) = open_browser(&u) {
                         eprintln!("  The browser could not be opened ({e}).");
                     }

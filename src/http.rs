@@ -293,6 +293,53 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Loopback ports this process holds until its own server takes them, and
+/// the ports its servers already answer on.
+///
+/// A port drawn by binding `127.0.0.1:0` and closed again stayed free until
+/// the node's server bound it, after the wallet was unlocked and the chain
+/// loaded: another account on the same computer could take it meanwhile,
+/// receive the browser with the launch token, and act as the wallet's own
+/// page (red-team campaign 8). The port is now held from the draw, and the
+/// launcher asks this process — not the port — whether its server is up.
+static RESERVED: std::sync::Mutex<Vec<TcpListener>> = std::sync::Mutex::new(Vec::new());
+static SERVING: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+/// Binds a loopback port for a server this process starts later, and keeps
+/// it bound: `port` 0 draws a free one. Returns the port.
+pub fn reserve_loopback_port(port: u16) -> std::io::Result<u16> {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))?;
+    let port = listener.local_addr()?.port();
+    RESERVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(listener);
+    Ok(port)
+}
+
+/// Whether a server of this process answers on this loopback port.
+pub fn is_serving(port: u16) -> bool {
+    SERVING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&port)
+}
+
+/// The listener reserved for `address`, if this process holds one; bound
+/// now otherwise.
+fn take_or_bind(address: &str) -> std::io::Result<TcpListener> {
+    if let Ok(wanted) = address.parse::<SocketAddr>() {
+        let mut held = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = held
+            .iter()
+            .position(|l| l.local_addr().ok() == Some(wanted))
+        {
+            return Ok(held.swap_remove(i));
+        }
+    }
+    TcpListener::bind(address)
+}
+
 pub struct ServerHandle {
     pub addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -430,7 +477,7 @@ fn serve_full<F>(
 where
     F: Fn(Request) -> Response + Send + Sync + 'static,
 {
-    let listener = TcpListener::bind(address)?;
+    let listener = take_or_bind(address)?;
     let local = listener.local_addr()?;
 
     let loopback = match local.ip() {
@@ -471,6 +518,12 @@ where
     // system thread, with no cap.
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    if local.ip().is_loopback() {
+        SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(local.port());
+    }
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             if stop_thread.load(Ordering::Relaxed) {
@@ -1567,6 +1620,26 @@ mod tests {
                 &format!("{} {} q={:?} body={}", r.method, r.path, r.query, r.body),
             )
         }
+    }
+
+    /// Red-team campaign 8: the wallet's port is held from the draw until the
+    /// node's server takes it, so no other program can listen there in
+    /// between; and "is the node up?" is asked of this process, not of
+    /// whoever answers on the port.
+    #[test]
+    fn a_reserved_port_stays_held_until_its_server_takes_it() {
+        let port = reserve_loopback_port(0).expect("reserve");
+        assert!(
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).is_err(),
+            "another program cannot listen on the reserved port"
+        );
+        assert!(!is_serving(port), "not served yet");
+        let h = serve(&format!("127.0.0.1:{port}"), None, echo()).expect("startup");
+        assert_eq!(h.addr.port(), port);
+        assert!(is_serving(port));
+        let r = get(h.addr, "/status");
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "{r}");
+        h.shutdown();
     }
 
     #[test]
