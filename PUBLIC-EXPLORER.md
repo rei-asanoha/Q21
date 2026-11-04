@@ -372,6 +372,24 @@ systemctl show caddy -p Restart -p RestartUSec
 → `Restart=on-failure` and `RestartUSec=5s`. The file sits next to the package's
 service without modifying it, and survives Caddy updates.
 
+Then cap the memory Caddy may take. It holds each answer in memory while a
+visitor reads it (`response_buffers`, below): many visitors that never read
+could otherwise make it grow until the server itself runs short, node
+included. With a cap, Caddy alone is stopped, and restarts five seconds later.
+
+```bash
+sudo tee /etc/systemd/system/caddy.service.d/memory.conf > /dev/null <<'EOF'
+[Service]
+MemoryHigh=384M
+MemoryMax=512M
+EOF
+sudo systemctl daemon-reload
+systemctl show caddy -p MemoryHigh -p MemoryMax
+```
+
+→ `MemoryHigh=402653184` and `MemoryMax=536870912`. On a server with less than
+1 GB of memory, halve both numbers.
+
 ### 4.2 — Configure it
 
 ```bash
@@ -388,7 +406,7 @@ empty — then paste exactly this (**right-click** to paste):
 		timeouts {
 			read_header 5s
 			read_body   10s
-			write       60s
+			write       30s
 			idle        30s
 		}
 	}
@@ -434,7 +452,7 @@ Each block, and why it is there:
 | `@blocked … 404` | A second lock on the wallet's door |
 | `request_buffers 1MB` | Caddy reads a request's whole body before it passes it on: a visitor announcing a body it never sends holds a Caddy buffer, not one of the node's threads |
 | `response_buffers 4MB` | Caddy reads the node's whole answer before it sends it on: a visitor that reads slowly, or not at all, holds a Caddy buffer, not a connection to the node. Until 0.5.9 this file capped the connections to the node at 48 (`max_conns_per_host`): one HTTP/2 connection that granted no window to its 48 answers then held all of them, and the explorer stopped answering everyone (red-team campaign 8, reproduced against Caddy 2.10) |
-| `write 60s` | An answer still not delivered after a minute is dropped |
+| `write 30s` | An answer still not delivered after 30 seconds is dropped: a visitor that stops reading frees its buffers soon |
 
 The reverse proxy passes each visitor's address to the node in the
 `X-Forwarded-For` header — that is its default behavior, and it erases
@@ -546,7 +564,7 @@ it one in the global block, then place it in the site:
 		timeouts {
 			read_header 5s
 			read_body   10s
-			write       60s
+			write       30s
 			idle        30s
 		}
 	}
