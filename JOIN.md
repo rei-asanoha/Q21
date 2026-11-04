@@ -13,10 +13,12 @@ already makes it a full node. Your wallet is a **client**: it connects out to
 the network and accepts no incoming connection. You can turn on the Network
 tab's setting so that it also accepts connections from others and asks your
 home router to open access to it, which helps the network depend less on a
-single machine. It is off by default since version 0.4.1, because a reachable
-wallet announces your public IP address to every node of the network, and an
-address once announced cannot be called back. Turn it on only if you accept
-that. See Part 1.
+single machine. In the clear, it is off by default since version 0.4.1,
+because a reachable wallet announces your public IP address to every node of
+the network, and an address once announced cannot be called back. Turn it on
+only if you accept that. See Part 1. Through Tor, nothing is announced but an
+onion address: since 0.5.9 a wallet that has Tor is reachable through it by
+default (see [TOR.md](TOR.md)).
 
 **Being an entry point** — a *bootstrap node*. A newcomer knows no one; they
 need a first address to knock on. An entry point is a node that can be reached

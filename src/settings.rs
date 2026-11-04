@@ -6,7 +6,9 @@
 //!
 //! Two keys today. `reachable`: does this node accept incoming connections
 //! and ask the router to open its port? `tor` (0.4.7): does every outgoing
-//! connection go through Tor? Both are **off** unless the user turns them on.
+//! connection go through Tor? Both are **off** unless the user turns them on,
+//! for every node; the wallet alone (0.5.9) turns them on when the user never
+//! chose, see [`wallet_defaults`].
 //! Up to 0.3.x the file
 //! had another name and other keys; [`crate::legacy::migrate_data_dir`]
 //! translates it before anything reads it.
@@ -55,6 +57,54 @@ pub fn tor(datadir: &Path) -> bool {
     std::fs::read_to_string(datadir.join(FILE_NAME))
         .map(|t| yes_in_text(&t, TOR_KEY))
         .unwrap_or(false)
+}
+
+/// What `key` says in this text: `Some(true)` for `yes`, `Some(false)` for
+/// any other value, `None` when the key is absent. An unreadable file reads
+/// as absent.
+pub fn choice_in_text(text: &str, wanted: &str) -> Option<bool> {
+    for line in text.lines() {
+        if let Some((key, value)) = line.trim().split_once('=') {
+            if key.trim() == wanted {
+                return Some(value.trim() == "yes");
+            }
+        }
+    }
+    None
+}
+
+/// The wallet's defaults (0.5.9): a contact found in the directory must be
+/// able to call this wallet, without anyone setting anything.
+///
+/// - No `tor` key, and a Tor this computer can use (`tor_available`):
+///   `tor=yes` is written. Without a Tor, nothing is written: the wallet
+///   runs as before, and the next start looks again.
+/// - No `reachable` key, and Tor on: `reachable=yes` is written. Reachable
+///   through Tor is an onion service: the wallet listens on the computer
+///   itself only, never asks the router for anything, and its internet
+///   address is never announced. Without Tor, nothing is written: a wallet
+///   reachable in the clear would announce its owner's address, which stays
+///   a choice (see [`reachable`]).
+///
+/// A key the user wrote, `no` included, is never changed. Returns what was
+/// written, for the log.
+pub fn wallet_defaults(datadir: &Path, tor_available: bool) -> Result<Vec<&'static str>, String> {
+    let text = std::fs::read_to_string(datadir.join(FILE_NAME)).unwrap_or_default();
+    let mut written = Vec::new();
+    let tor_on = match choice_in_text(&text, TOR_KEY) {
+        Some(on) => on,
+        None if tor_available => {
+            set_tor(datadir, true)?;
+            written.push(TOR_KEY);
+            true
+        }
+        None => false,
+    };
+    if tor_on && choice_in_text(&text, REACHABLE_KEY).is_none() {
+        set_reachable(datadir, true)?;
+        written.push(REACHABLE_KEY);
+    }
+    Ok(written)
 }
 
 /// Key of this node's own onion service, written by hand once Tor has
@@ -194,5 +244,53 @@ mod tests {
         assert!(!tor(&d) && reachable(&d));
         assert!(!yes_in_text("tor=YES\n", TOR_KEY));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The wallet's defaults (0.5.9): Tor on when a Tor is there, and
+    /// reachable through it; what the user chose is kept, `no` included;
+    /// never reachable in the clear by default.
+    #[test]
+    fn the_wallet_defaults_to_tor_and_reachable_through_it() {
+        // A new wallet, with a Tor: both on.
+        let d = dir("defaults-new");
+        assert_eq!(
+            wallet_defaults(&d, true).unwrap(),
+            vec![TOR_KEY, REACHABLE_KEY]
+        );
+        assert!(tor(&d) && reachable(&d));
+        // A second start writes nothing more.
+        assert!(wallet_defaults(&d, true).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+
+        // No Tor on this computer: nothing written, not reachable in the clear.
+        let d = dir("defaults-no-tor");
+        assert!(wallet_defaults(&d, false).unwrap().is_empty());
+        assert!(!tor(&d) && !reachable(&d));
+        assert!(!d.join(FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(&d);
+
+        // The user's choices are kept.
+        for (text, tor_after, reachable_after) in [
+            ("tor=no\n", false, false),
+            ("tor=no\nreachable=yes\n", false, true),
+            ("tor=yes\nreachable=no\n", true, false),
+            ("reachable=no\n", true, false),
+            ("tor=yes\n", true, true),
+            ("reachable=yes\n", true, true),
+            ("tor=YES\n", false, false),
+        ] {
+            let d = dir("defaults-kept");
+            std::fs::write(d.join(FILE_NAME), text).unwrap();
+            wallet_defaults(&d, true).unwrap();
+            assert_eq!(
+                (tor(&d), reachable(&d)),
+                (tor_after, reachable_after),
+                "{text}"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        assert_eq!(choice_in_text("a=1\n", TOR_KEY), None);
+        assert_eq!(choice_in_text("tor=no\n", TOR_KEY), Some(false));
+        assert_eq!(choice_in_text(" tor = yes \n", TOR_KEY), Some(true));
     }
 }

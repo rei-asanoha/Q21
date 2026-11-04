@@ -9,7 +9,14 @@ Since 0.4.8, **Tor comes with the wallet** on Windows, macOS and Linux
 (x86_64): one switch, nothing to install, nothing to keep open. A wallet that
 is both on Tor and reachable becomes a hidden node by itself.
 
-Tor is off by default. Nothing changes for anyone who does not turn it on.
+Since 0.5.9, **the wallet turns Tor on by itself** when you never chose and
+this computer has a Tor (the one in the archive, a Tor service, Tor Browser
+left open), and it makes itself **reachable through Tor**: a hidden node.
+A contact who finds you in the directory can then call you, and your
+internet address is never announced. A choice you made in the Network tab,
+"off" included, is kept. Without a Tor on the computer, the wallet works as
+before, without it. A node started from the command line (`q21 node`) never
+turns Tor on by itself.
 
 ---
 

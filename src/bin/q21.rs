@@ -7105,12 +7105,38 @@ fn cmd_wallet(datadir: &Path, args: &[String]) -> Result<(), String> {
         // information, the address to open.
         "--quiet".to_string(),
     ];
+    // --- The wallet's defaults (0.5.9): Tor, and reachable through it.
+    //
+    // Two wallets left as installed could find each other in the directory
+    // and never connect: a channel needs one of them to call the other, and
+    // neither could be called. When the user never chose, the wallet now
+    // turns Tor on if this computer has one, and makes itself reachable
+    // through it — an onion service, which never reveals the internet
+    // address. A choice already written, `no` included, is kept.
+    // `settings.txt` is written before anything reads it below.
+    let tor_available = q21_core::tor_process::find_bundled_next_to_program().is_some()
+        || q21_core::socks::find_local_tor().is_some()
+        || q21_core::tor_process::find_on_path().is_some();
+    match q21_core::settings::wallet_defaults(datadir, tor_available) {
+        Ok(w) if !w.is_empty() => println!(
+            "  Settings: {} turned on (Network tab to change)",
+            w.join(" and ")
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("  Settings could not be written: {e}"),
+    }
+    if !tor_available && !q21_core::settings::tor(datadir) {
+        println!(
+            "  Tor: none found on this computer; the wallet works without it, and \
+             contacts cannot call it (Network tab)"
+        );
+    }
     // Layers 1 and 2: only when the user turned it on (Network tab, stored in
     // `settings.txt`), the wallet listens for incoming connections and asks
-    // the router to open its port. It is off by default: a reachable wallet
-    // announces its owner's public address to the whole network, see
-    // `q21_core::settings::reachable`. Nothing is added if the user already
-    // set `--listen` by hand: their choice wins.
+    // the router to open its port. In the clear, it is off by default: a
+    // reachable wallet announces its owner's public address to the whole
+    // network, see `q21_core::settings::reachable`. Nothing is added if the
+    // user already set `--listen` by hand: their choice wins.
     // --- Tor (0.4.7), from the Network tab.
     //
     // Every outgoing connection goes through the local Tor. Reachable on
