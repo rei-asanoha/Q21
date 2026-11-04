@@ -5988,6 +5988,16 @@ impl Node {
             // body, its slot is free, and the rest of that batch, which builds
             // on a block we did not take, is not asked for.
             Err(e) if refusal_is_contextual(&e) => {
+                // Refused as a reorganization for now, but kept in the index
+                // with its body, like a side branch: written too. Once the
+                // branch wins with a later block, it is part of the chain,
+                // and a restart without it came back on the abandoned branch
+                // (red-team campaign 8).
+                if g.chain.has_block(&bid) {
+                    if let Some(j) = &g.journal {
+                        j.record(b);
+                    }
+                }
                 report_beyond_finality(&e);
                 note_future_block(&e, source);
                 if let Some(p) = g.peers.get_mut(&source) {
