@@ -2979,7 +2979,14 @@ impl ChannelManager {
                             .machine
                             .note_splice_height(Some(tip.saturating_add(1).saturating_sub(depth))),
                         None => {
-                            if let Some(tx) = c.machine.our_splice_tx() {
+                            // Only while the splice can still confirm: once a
+                            // commitment spent the old funding, its coins
+                            // were held for good, until the channel was
+                            // archived and the node restarted once more
+                            // (red-team campaign 8).
+                            let alive = depth_of(&st.old_funding).is_some()
+                                && matches!(c.machine.phase(), Phase::Open | Phase::Closing);
+                            if let Some(tx) = c.machine.our_splice_tx().filter(|_| alive) {
                                 hold.push(tx.clone());
                                 c.splice_held = Some(tx.clone());
                             }
