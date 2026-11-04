@@ -96,6 +96,14 @@ slept twenty minutes or more, that Tor is started again at once: a Tor left
 as it was after a night of sleep kept running with its onion service
 unreachable for hours. The onion address does not change.
 
+Since 0.5.9, the first check after Tor starts, or after the computer wakes,
+does not wait for a second failure: when the onion address does not answer
+yet, the Tor the wallet started is started again at once, once per start or
+wake. A Tor started with a directory of the network more than a day old
+could connect out while its own service stayed unpublished. The result of
+the last check is in `getinfo` (`onion.check`: `starting`, `reachable` or
+`unreachable`) and on the page.
+
 Calling a contact (**Private channel** → **Connect**), the page follows the
 call to its end: *Calling this contact…*, then *✓ Connected*, or *This
 contact does not answer* when its onion address does not answer — its

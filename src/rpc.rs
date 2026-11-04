@@ -3242,6 +3242,19 @@ impl RpcContext {
                     .set("known", Json::u64(o.known as u64))
                     .set("peers_out", Json::u64(o.outbound as u64))
                     .set("peers_in", Json::u64(o.inbound as u64))
+                    // Whether this node's own onion service answers, as a
+                    // contact calling it would find: "starting" in the first
+                    // minutes after Tor starts or the computer wakes,
+                    // "reachable" or "unreachable" after a check. Null when
+                    // this node serves no onion.
+                    .set(
+                        "check",
+                        if o.serving {
+                            Json::str(o.check.word())
+                        } else {
+                            Json::Null
+                        },
+                    )
                     .build()
             })
             .set(

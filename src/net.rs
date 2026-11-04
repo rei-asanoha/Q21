@@ -1407,6 +1407,47 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// What this node last learned by calling its own onion service through
+/// Tor, as a contact would (see the onion check of the wallet's node).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OnionCheck {
+    /// Not checked since Tor last started: the service is being published,
+    /// which takes a few minutes after a start or a wake.
+    #[default]
+    Starting,
+    /// The last call went through.
+    Answers,
+    /// The last calls did not go through.
+    Silent,
+}
+
+impl OnionCheck {
+    /// The word the RPC answers.
+    pub fn word(self) -> &'static str {
+        match self {
+            OnionCheck::Starting => "starting",
+            OnionCheck::Answers => "reachable",
+            OnionCheck::Silent => "unreachable",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            OnionCheck::Starting => 0,
+            OnionCheck::Answers => 1,
+            OnionCheck::Silent => 2,
+        }
+    }
+
+    fn from_code(c: u8) -> Self {
+        match c {
+            1 => OnionCheck::Answers,
+            2 => OnionCheck::Silent,
+            _ => OnionCheck::Starting,
+        }
+    }
+}
+
 /// What Tor brings a node, see [`Node::onion_status`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OnionStatus {
@@ -1418,6 +1459,8 @@ pub struct OnionStatus {
     pub outbound: usize,
     /// Established inbound connections from the local Tor.
     pub inbound: usize,
+    /// Whether the own onion service answered its last check.
+    pub check: OnionCheck,
 }
 
 /// Connected peer.
@@ -2106,6 +2149,9 @@ pub struct Node {
     proxy: Arc<std::sync::RwLock<Option<SocketAddr>>>,
     /// This node's own onion service, announced to protocol-4 peers.
     own_onion: Arc<std::sync::RwLock<Option<crate::wire::OnionAddr>>>,
+    /// The last result of the check of that service, an [`OnionCheck`]
+    /// code. Written only by this node's own onion check.
+    own_onion_check: Arc<std::sync::atomic::AtomicU8>,
     /// The wallet identity that signs this node's own reach announcement,
     /// when a wallet runs here; and when it last did.
     reach_signer: Arc<std::sync::RwLock<Option<ReachSigner>>>,
@@ -2245,6 +2291,7 @@ impl Node {
             stats: Arc::new(Stats::default()),
             proxy: Arc::new(std::sync::RwLock::new(None)),
             own_onion: Arc::new(std::sync::RwLock::new(None)),
+            own_onion_check: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             reach_signer: Arc::new(std::sync::RwLock::new(None)),
             reach_announced: Arc::new(Mutex::new(None)),
             configured: Arc::new(std::sync::RwLock::new(HashSet::new())),
@@ -2798,6 +2845,7 @@ impl Node {
         let mut s = OnionStatus {
             serving,
             known: g.onions.len(),
+            check: self.own_onion_check(),
             ..OnionStatus::default()
         };
         for p in g.peers.values().filter(|p| p.handshaked) {
@@ -2831,6 +2879,16 @@ impl Node {
     /// computer slept kept its process alive and its service unreachable for
     /// hours, and nothing showed it: every call of a contact to this wallet
     /// failed without a word. Blocks up to [`crate::socks::TOR_CONNECT_TIMEOUT`].
+    /// Records what the onion check learned. See [`OnionCheck`].
+    pub fn set_own_onion_check(&self, c: OnionCheck) {
+        self.own_onion_check.store(c.code(), Ordering::SeqCst);
+    }
+
+    /// See [`Node::set_own_onion_check`].
+    pub fn own_onion_check(&self) -> OnionCheck {
+        OnionCheck::from_code(self.own_onion_check.load(Ordering::SeqCst))
+    }
+
     pub fn probe_own_onion(&self) -> Option<std::io::Result<()>> {
         let proxy = self.proxy()?;
         let own = self.own_onion()?;
@@ -10407,6 +10465,26 @@ mod tests_handler_review {
         assert!(matches!(n.probe_own_onion(), Some(Ok(()))));
         n.set_proxy(Some(proxy(4)));
         assert!(matches!(n.probe_own_onion(), Some(Err(_))));
+    }
+
+    /// What the onion check learns is reported with the onion status, and
+    /// a node that never checked reads as starting.
+    #[test]
+    fn the_own_onion_check_is_reported() {
+        let n = node();
+        assert_eq!(n.onion_status().check, OnionCheck::Starting);
+        for c in [
+            OnionCheck::Answers,
+            OnionCheck::Silent,
+            OnionCheck::Starting,
+        ] {
+            n.set_own_onion_check(c);
+            assert_eq!(n.onion_status().check, c);
+            assert_eq!(OnionCheck::from_code(c.code()), c);
+        }
+        assert_eq!(OnionCheck::Starting.word(), "starting");
+        assert_eq!(OnionCheck::Answers.word(), "reachable");
+        assert_eq!(OnionCheck::Silent.word(), "unreachable");
     }
 
     /// Through Tor, the second outbound link to the same node (same nonce) is

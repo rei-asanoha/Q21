@@ -5879,25 +5879,42 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // unreachable for hours: every contact's call failed without a word.
     // Twice unreachable in a row, and a Tor this node started is started
     // again (see the loop); a Tor of the system is only reported.
+    //
+    // The first check after Tor starts, or after the computer wakes, is
+    // different (0.5.9): when it fails, a Tor this node started is started
+    // again at once, instead of half an hour later. A Tor started with a
+    // directory of the network more than a day old ran, connected out, and
+    // still left its own service unpublished: the wallet could not be called
+    // until the restart. Once per start or wake only, never in a loop: the
+    // restart it asks for does not arm it again.
     let onion_unreachable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let onion_check_soon = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let onion_check_soon = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ONION_SOON_NONE));
+    let onion_restart_now = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if node.onion_status().serving || managed_tor.as_ref().is_some_and(|t| t.serves_onion()) {
         let node = node.clone();
         let unreachable = onion_unreachable.clone();
         let soon = onion_check_soon.clone();
+        let restart_now = onion_restart_now.clone();
+        let can_restart = managed_tor.as_ref().is_some_and(|t| t.serves_onion());
         std::thread::Builder::new()
             .name("onion-check".into())
             .spawn(move || {
                 let mut next = std::time::Instant::now() + ONION_CHECK_FIRST;
                 let mut failures = 0u32;
+                // The first failure since Tor started restarts it at once.
+                let mut armed = can_restart;
+                node.set_own_onion_check(q21_core::net::OnionCheck::Starting);
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     if q21_core::shutdown::requested() {
                         return;
                     }
-                    if soon.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let why = soon.swap(ONION_SOON_NONE, std::sync::atomic::Ordering::SeqCst);
+                    if why != ONION_SOON_NONE {
                         next = std::time::Instant::now() + ONION_CHECK_FIRST;
                         failures = 0;
+                        armed = can_restart && why == ONION_SOON_FRESH;
+                        node.set_own_onion_check(q21_core::net::OnionCheck::Starting);
                     }
                     if std::time::Instant::now() < next {
                         continue;
@@ -5910,7 +5927,20 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                                 );
                             }
                             failures = 0;
+                            armed = false;
+                            node.set_own_onion_check(q21_core::net::OnionCheck::Answers);
                             next = std::time::Instant::now() + ONION_CHECK_EVERY;
+                        }
+                        Some(Err(e)) if armed => {
+                            // Still "starting" for the page: the restart is
+                            // what usually makes the service answer.
+                            armed = false;
+                            println!(
+                                "  Tor: this node's onion address does not answer yet ({e}): \
+                                 Tor is started again to publish it"
+                            );
+                            restart_now.store(true, std::sync::atomic::Ordering::SeqCst);
+                            next = std::time::Instant::now() + ONION_CHECK_RETRY;
                         }
                         Some(Err(e)) => {
                             failures += 1;
@@ -5920,6 +5950,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                                      contacts cannot call this wallet"
                                 );
                                 unreachable.store(true, std::sync::atomic::Ordering::SeqCst);
+                                node.set_own_onion_check(q21_core::net::OnionCheck::Silent);
                             }
                             // A second try soon, then the usual pace.
                             next = std::time::Instant::now()
@@ -6131,7 +6162,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 match t.restart() {
                     Ok(a) => {
                         node.set_proxy(Some(a));
-                        onion_check_soon.store(true, std::sync::atomic::Ordering::SeqCst);
+                        onion_check_soon
+                            .store(ONION_SOON_FRESH, std::sync::atomic::Ordering::SeqCst);
                         println!(
                             "  the computer slept {} min: Tor started again, fresh",
                             slept / 60
@@ -6139,6 +6171,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     }
                     Err(e) => eprintln!("  Tor could not be started again after the sleep: {e}"),
                 }
+            } else if managed_tor.as_ref().is_some_and(|t| t.serves_onion()) {
+                // A shorter sleep: Tor runs on, but its service is checked
+                // again soon, with one quick restart allowed if it is silent.
+                onion_check_soon.store(ONION_SOON_FRESH, std::sync::atomic::Ordering::SeqCst);
             }
             last_search = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(60))
@@ -6156,6 +6192,20 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // every half hour, so that a network that is down for good does
             // not make it start in a loop.
             if let Some(t) = managed_tor.as_ref().filter(|t| t.serves_onion()) {
+                // The first check after a start or a wake failed: once, at
+                // once (see the onion check).
+                if onion_restart_now.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    last_tor_restart = std::time::Instant::now();
+                    match t.restart() {
+                        Ok(a) => {
+                            node.set_proxy(Some(a));
+                            onion_check_soon
+                                .store(ONION_SOON_AFTER_FIX, std::sync::atomic::Ordering::SeqCst);
+                            println!("  Tor: started again, its onion address is published anew");
+                        }
+                        Err(e) => eprintln!("  Tor could not be started again: {e}"),
+                    }
+                }
                 if onion_unreachable.load(std::sync::atomic::Ordering::SeqCst)
                     && last_tor_restart.elapsed() >= TOR_RESTART_UNREACHABLE_EVERY
                 {
@@ -6164,7 +6214,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     match t.restart() {
                         Ok(a) => {
                             node.set_proxy(Some(a));
-                            onion_check_soon.store(true, std::sync::atomic::Ordering::SeqCst);
+                            onion_check_soon
+                                .store(ONION_SOON_AFTER_FIX, std::sync::atomic::Ordering::SeqCst);
                             println!("  Tor: started again so that this node can be called");
                         }
                         Err(e) => eprintln!("  Tor could not be started again: {e}"),
@@ -6178,7 +6229,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     match t.restart() {
                         Ok(a) => {
                             node.set_proxy(Some(a));
-                            onion_check_soon.store(true, std::sync::atomic::Ordering::SeqCst);
+                            onion_check_soon
+                                .store(ONION_SOON_AFTER_FIX, std::sync::atomic::Ordering::SeqCst);
                             println!(
                                 "  Tor had stopped{}; started again",
                                 if why.is_empty() {
@@ -7481,6 +7533,14 @@ const ONION_CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30
 const TOR_RESTART_AFTER_SLEEP: u64 = 20 * 60;
 /// At most one restart of Tor for an onion service that does not answer.
 const TOR_RESTART_UNREACHABLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1800);
+/// What the onion check is told, see `onion_check_soon`: nothing new.
+const ONION_SOON_NONE: u8 = 0;
+/// Tor was started again to repair its service: check soon, and do not ask
+/// for another quick restart.
+const ONION_SOON_AFTER_FIX: u8 = 1;
+/// Tor started afresh, or the computer woke: check soon, and allow one quick
+/// restart if the service is silent.
+const ONION_SOON_FRESH: u8 = 2;
 
 const QUIET_STATUS_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -8538,5 +8598,38 @@ mod tests {
         assert!(read_rpc_token(&f).is_err(), "an empty file is not a token");
         assert!(read_rpc_token(&d.join("absent")).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// After a start or a wake, the first silent check of this node's own
+    /// onion service restarts Tor at once (0.5.9); the restarts that repair
+    /// it, or follow a crash, never arm that quick restart again, so it
+    /// cannot loop. Only the start and the wake are "fresh".
+    #[test]
+    fn the_quick_tor_restart_is_armed_by_a_start_or_a_wake_only() {
+        let s = include_str!("q21.rs");
+        // The program only, not these tests that name what they look for.
+        let s = &s[..s.find("\nmod tests {").expect("tests")];
+        let body = &s[s
+            .find("let mut armed = can_restart;")
+            .expect("armed at start")..];
+        let body = &body[..body
+            .find("map_err(|e| format!(\"onion-check thread")
+            .expect("end")];
+        assert!(body.contains("armed = can_restart && why == ONION_SOON_FRESH;"));
+        assert!(body.contains("Some(Err(e)) if armed => {"));
+        let quick = &body[body.find("Some(Err(e)) if armed => {").unwrap()..];
+        let quick = &quick[..quick.find("Some(Err(e)) => {").unwrap()];
+        assert!(quick.contains("armed = false;"), "once per start or wake");
+        assert!(body.contains("armed = false;\n                            node.set_own_onion_check(q21_core::net::OnionCheck::Answers);"));
+        let fresh = "onion_check_soon\n                            .store(ONION_SOON_FRESH";
+        let fix = ".store(ONION_SOON_AFTER_FIX, std::sync::atomic::Ordering::SeqCst);";
+        // The sleep restart, and the shorter wake, are fresh.
+        assert_eq!(s.matches(fresh).count(), 1, "the restart after a sleep");
+        assert!(s.contains(
+            "onion_check_soon.store(ONION_SOON_FRESH, std::sync::atomic::Ordering::SeqCst);"
+        ));
+        // The quick restart, the half-hourly one and the crash one are not.
+        assert_eq!(s.matches(fix).count(), 3);
+        assert!(!s.contains("onion_check_soon.store(true"));
     }
 }
