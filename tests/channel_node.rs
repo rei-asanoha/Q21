@@ -3574,6 +3574,19 @@ fn two_sessions_opened_together_are_one_sighting() {
     {
         assert_eq!(p.acceptor.deliver(F4, &f).penalize, 0);
     }
+    // Still nothing: the holder closes, once they confirm that this wallet
+    // was not restored from a backup (red-team campaign 8).
+    assert_eq!(
+        chain.lock().unwrap().height(),
+        h0,
+        "never closed alone by itself"
+    );
+    assert!(p.acceptor.info(cid).unwrap().peer_behind);
+    assert!(
+        p.acceptor.force_close_with(cid, false).is_err(),
+        "not without the holder's word"
+    );
+    p.acceptor.force_close_with(cid, true).unwrap();
     assert!(
         chain.lock().unwrap().height() > h0,
         "closed with the latest state"
@@ -3638,8 +3651,18 @@ fn a_channel_restored_from_an_older_copy_is_closed_by_the_peer_and_loses_nothing
     );
     assert!(p.acceptor.info(cid).unwrap().peer_behind);
     assert!(!p.funder.info(cid).unwrap().peer_behind);
-    // The next session shows the same: the peer closes with the latest state.
+    // The next session shows the same: nothing is closed by itself (red-team
+    // campaign 8); the peer's holder, told on the page, closes with the
+    // latest state once they confirm this wallet was not restored.
     reconnect(&mut p);
+    assert_eq!(
+        chain.lock().unwrap().height(),
+        h0,
+        "never closed alone by itself"
+    );
+    let refused = p.acceptor.force_close_with(cid, false).unwrap_err();
+    assert!(refused.contains("restored from a backup"), "{refused}");
+    p.acceptor.force_close_with(cid, true).unwrap();
     assert!(
         chain.lock().unwrap().height() > h0,
         "the peer's commitment is on chain"
@@ -4029,4 +4052,76 @@ fn an_unproven_claim_cannot_be_rearmed_by_an_in_step_reestablish() {
     }
     // Confirmed by the holder, the close alone goes through.
     assert!(p.funder.force_close_with(cid, true).is_ok());
+}
+
+/// Red-team campaign 8 (innov1): a wallet restored from a backup (its latest
+/// state revoked) met a peer running an even older copy of its own journal.
+/// It saw "the peer is behind", and at the second session closed alone with
+/// its revoked state; the peer's current copy took the whole channel by
+/// penalty. A close on that verdict is now the holder's, after they confirm
+/// this wallet was not restored from a backup.
+#[test]
+fn an_older_twin_of_the_peer_cannot_make_a_restored_wallet_close_with_a_revoked_state() {
+    let funder_seed = [0xe1u8; 32];
+    let acceptor_seed = [0xe2u8; 32];
+    let (mut p, wallet, chain, dir, cid, capacity) =
+        open_channel(funder_seed, acceptor_seed, "innov1-older-twin");
+    fn pay(p: &mut Pair, cid: Hash256, amt: u64) {
+        let m = p.funder.pay(cid, amt).unwrap();
+        p.queue.push_back((1, m));
+        p.pump();
+    }
+    pay(&mut p, cid, 1_000_000); // state 1
+                                 // The cheater (acceptor) keeps a copy of its journal at state 1.
+    let acc_old = dir.join("acceptor-old");
+    restore_dir(&dir.join("acceptor"), &acc_old);
+    pay(&mut p, cid, 1_000_000); // state 2
+    pay(&mut p, cid, 1_000_000); // state 3
+                                 // The victim's (funder's) ordinary backup, taken at state 3.
+    let backup = dir.join("funder-backup");
+    restore_dir(&dir.join("funder"), &backup);
+    pay(&mut p, cid, 1_000_000); // state 4: the funder revokes 3
+    pay(&mut p, cid, 1_000_000); // state 5
+    let victim_latest = p.funder.info(cid).unwrap().local_balance;
+    assert_eq!(victim_latest, capacity - 5_000_000);
+    // The cheater's current copy (holds the funder's secrets of 0..=4).
+    let acc_now = dir.join("acceptor-now");
+    restore_dir(&dir.join("acceptor"), &acc_now);
+
+    // The victim's disk fails; it restores the backup and restarts.
+    restore_dir(&backup, &dir.join("funder"));
+    p.reload_funder(funder_seed, wallet.clone(), chain.clone(), &dir);
+    // The cheater comes back running its OLD copy, under the same seed.
+    restore_dir(&acc_old, &dir.join("acceptor"));
+    p.acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("acceptor"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+    );
+
+    let h0 = chain.lock().unwrap().height();
+    reconnect(&mut p);
+    let i = p.funder.info(cid).unwrap();
+    assert!(
+        i.peer_behind,
+        "the restored wallet believes the peer is behind"
+    );
+    // However often the older twin comes back, nothing is closed by itself:
+    // the restored wallet's "latest" state is revoked.
+    for _ in 0..3 {
+        reconnect(&mut p);
+    }
+    assert_eq!(
+        chain.lock().unwrap().height(),
+        h0,
+        "nothing broadcast by itself"
+    );
+    // And the holder is asked before any close alone.
+    let refused = p.funder.force_close_with(cid, false).unwrap_err();
+    assert!(refused.contains("restored from a backup"), "{refused}");
+    let _ = (capacity, victim_latest, acc_now);
 }

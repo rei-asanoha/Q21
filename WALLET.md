@@ -52,10 +52,11 @@ journal, beside the wallet in the data folder, and the code does not hold it:
   further). Ask the other person to close the channel;
 - a data folder restored from an **older copy** is recognised the first time
   the channel reconnects: the copy refuses to pay or to close, and says why.
-  The other side, which holds the latest state, closes with it once a second
-  connection shows the same (one sighting could be a message held up in
-  transit), or sooner if its holder closes from the page; our side then comes
-  back to the wallet. Closing such a copy alone would have broadcast a state
+  The other side, which holds the latest state, is told, and its holder
+  closes from the page, once they confirm that their own wallet was not
+  restored from a backup either (since 0.5.9: a node that closed by itself
+  could be led by a peer showing an even older copy to broadcast a revoked
+  state); our side then comes back to the wallet. Closing such a copy alone would have broadcast a state
   it had already revoked, and lost the whole channel to the penalty. Since
   0.5.5 the other side proves it: it sends back our own revocation secret of
   the latest state the copy holds, which only we could have revealed. The

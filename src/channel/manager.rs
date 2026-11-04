@@ -423,10 +423,9 @@ struct Chan {
     /// only: nothing the channel accepts depends on it.
     peer_owner: Option<Hash256>,
     /// A reestablish that showed the peer's copy older than ours: its
-    /// counters, ours then, and the last session established by then. A
-    /// session established after it showing the same, with nothing moved in
-    /// between, closes the channel: two opened at the same moment could
-    /// both carry a reestablish held up in transit.
+    /// counters, ours then, and the last session established by then. The
+    /// holder is told; the node never closes on it by itself (red-team
+    /// campaign 8).
     peer_behind: Option<([u64; 4], [u64; 4], u64)>,
     /// The height the transaction that ends the channel confirmed at, and
     /// when this node first saw it there: the date the archives give the
@@ -597,6 +596,13 @@ pub const UNPROVEN_CLAIM: &str = "the other side said this copy of the channel i
 its own, without proving it: if this wallet was restored from a backup, closing alone could \
 lose the whole channel. Confirm the close alone to go on";
 
+/// The refusal of a close alone while the peer seems to run an older copy:
+/// the holder confirms first that this wallet was not restored from a backup
+/// ([`ChannelManager::force_close_with`]).
+pub const PEER_OLDER: &str = "the other side seems to run an older copy of the channel: \
+if this wallet was restored from a backup, closing alone could lose the whole channel. \
+Confirm the close alone to go on";
+
 const BEHIND: &str =
     "this copy of the channel is older than your contact's (restored from a backup?): \
      it can no longer be operated from here. Ask your contact to close it: your side \
@@ -656,9 +662,6 @@ struct Link {
     /// owns the peer's names, and what a contact pins. Set right after the
     /// session is recorded ([`ChannelManager::set_session_owner`]).
     owner: Option<Hash256>,
-    /// When the session was established, in the order of all sessions: a
-    /// later one is told apart from one opened at the same moment.
-    seq: u64,
     /// The peer announced splices and the proof of an older copy
     /// ([`crate::wire::SPLICE_CAPABILITY`]).
     splices: bool,
@@ -1868,7 +1871,6 @@ impl ChannelManager {
             return Vec::new();
         }
         g.session_seq += 1;
-        let seq = g.session_seq;
         let splices = g.splice_peers.contains(&peer);
         g.links.insert(
             peer,
@@ -1877,7 +1879,6 @@ impl ChannelManager {
                 legacy: legacy.to_string(),
                 binding,
                 owner: None,
-                seq,
                 splices,
             },
         );
@@ -2229,7 +2230,7 @@ impl ChannelManager {
         } else {
             Vec::new()
         };
-        let (from_seq, seq_now) = (g.links.get(&peer).map_or(0, |l| l.seq), g.session_seq);
+        let seq_now = g.session_seq;
         // The peer proves an older copy and takes splices (0.5.5 and later).
         let peer_proves = Self::peer_splices(&g, peer);
         let Some(chan) = g.channels.get_mut(&cid) else {
@@ -2464,13 +2465,8 @@ impl ChannelManager {
                     }
                     // The peer's copy is older: its latest commitment may be
                     // revoked, and broadcasting it would lose it the whole
-                    // channel. Once is not proof enough — a reestablish held
-                    // up in transit looks the same — so the first time it is
-                    // noted, and the holder can close; a second session that
-                    // shows the same, with nothing moved on either side in
-                    // between, closes the channel with the latest state: the
-                    // peer's side comes back to it at once, ours after the
-                    // delay.
+                    // channel. It is noted, the holder is told, and the
+                    // channel stays as it is until they close it.
                     SyncVerdict::PeerIsBehind => {
                         // Its own secret of its latest commitment: the proof.
                         if peer_proves {
@@ -2478,43 +2474,26 @@ impl ChannelManager {
                                 out.push(write_frame(cid, KIND_ENGINE, &p.encode()));
                             }
                         }
+                        // Never closed alone on this verdict (red-team
+                        // campaign 8): it rests on our copy being the latest,
+                        // and only the holder knows whether this wallet was
+                        // restored from a backup. A peer that kept an older
+                        // copy of its own could otherwise make a restored
+                        // wallet broadcast a revoked state, and take the whole
+                        // channel by penalty. The holder is told, and closes
+                        // from the page once they confirm.
                         let ours = chan.machine.sync_counters();
-                        let confirmed = chan.peer_behind.is_some_and(|(t, o, mark)| {
-                            t == theirs && o == ours && from_seq > mark
-                        });
-                        if !confirmed {
-                            if chan
-                                .peer_behind
-                                .map_or(true, |(t, o, _)| t != theirs || o != ours)
-                            {
-                                eprintln!(
-                                    "ALERT: channel {}: the peer seems to run an older copy of \
-                                     the channel; closed with the latest state if its next \
-                                     session shows the same",
-                                    cid.to_hex()
-                                );
-                            }
-                            chan.peer_behind = Some((theirs, ours, seq_now));
-                        } else if chan.machine.phase() == Phase::Open
-                            || chan.machine.phase() == Phase::Closing
+                        if chan
+                            .peer_behind
+                            .map_or(true, |(t, o, _)| t != theirs || o != ours)
                         {
-                            chan.peer_behind = None;
-                            match chan.machine.force_close(FORCE_CLOSE_TIER) {
-                                Ok(tx) => {
-                                    eprintln!(
-                                        "ALERT: channel {}: the peer runs an older copy of the \
-                                         channel; closed with the latest state so that it \
-                                         gets its funds back",
-                                        cid.to_hex()
-                                    );
-                                    self.to_broadcast.lock().unwrap().push((tx, "commitment"));
-                                }
-                                Err(e) => eprintln!(
-                                    "ALERT: channel {}: the peer runs an older copy of the \
-                                     channel, and the close failed: {e:?}",
-                                    cid.to_hex()
-                                ),
-                            }
+                            eprintln!(
+                                "ALERT: channel {}: the peer seems to run an older copy of \
+                                 the channel; if this wallet was not restored from a backup, \
+                                 close it from the page",
+                                cid.to_hex()
+                            );
+                            chan.peer_behind = Some((theirs, ours, seq_now));
                         }
                     }
                 }
@@ -3735,6 +3714,11 @@ impl ChannelManager {
         }
         if chan.behind && !chan.behind_proven && !despite_claim {
             return Err(UNPROVEN_CLAIM.into());
+        }
+        // The peer showed an older copy: our "latest" state is the latest
+        // only if this wallet was not restored from a backup.
+        if chan.peer_behind.is_some() && !despite_claim {
+            return Err(PEER_OLDER.into());
         }
         let splicing = chan.machine.splicing();
         let tx = chan.machine.force_close(FORCE_CLOSE_TIER).map_err(err)?;
