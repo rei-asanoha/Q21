@@ -5872,6 +5872,8 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("sleep-watch thread: {e}"))?;
     }
     let mut last_tor_restart = std::time::Instant::now();
+    // Restarts for a silent onion service since it last answered.
+    let mut unreachable_restarts: u32 = 0;
     // --- Is this node's own onion service reachable? Called through Tor, as
     // a contact calling this wallet would, a few minutes after Tor starts,
     // then every twenty minutes. A Tor whose process kept running after the
@@ -5885,7 +5887,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // again at once, instead of half an hour later. A Tor started with a
     // directory of the network more than a day old ran, connected out, and
     // still left its own service unpublished: the wallet could not be called
-    // until the restart. Once per start or wake only, never in a loop: the
+    // until the restart. Once per start or long sleep only, never in a loop: the
     // restart it asks for does not arm it again.
     let onion_unreachable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let onion_check_soon = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ONION_SOON_NONE));
@@ -6172,9 +6174,12 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                     Err(e) => eprintln!("  Tor could not be started again after the sleep: {e}"),
                 }
             } else if managed_tor.as_ref().is_some_and(|t| t.serves_onion()) {
-                // A shorter sleep: Tor runs on, but its service is checked
-                // again soon, with one quick restart allowed if it is silent.
-                onion_check_soon.store(ONION_SOON_FRESH, std::sync::atomic::Ordering::SeqCst);
+                // A shorter sleep: Tor runs on, and its service is checked
+                // again soon — but a short gap does not allow a quick
+                // restart: a pause of a minute (a loaded machine, a peer
+                // keeping it busy) would otherwise restart Tor at will
+                // (red-team campaign 8).
+                onion_check_soon.store(ONION_SOON_AFTER_FIX, std::sync::atomic::Ordering::SeqCst);
             }
             last_search = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(60))
@@ -6192,9 +6197,16 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             // every half hour, so that a network that is down for good does
             // not make it start in a loop.
             if let Some(t) = managed_tor.as_ref().filter(|t| t.serves_onion()) {
-                // The first check after a start or a wake failed: once, at
-                // once (see the onion check).
-                if onion_restart_now.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // A service that answered resets the spacing of restarts.
+                if node.own_onion_check() == q21_core::net::OnionCheck::Answers {
+                    unreachable_restarts = 0;
+                }
+                // Never while Tor is still connecting: restarting it then
+                // only starts the wait over.
+                let ready = t.progress() >= 100;
+                // The first check after a start or a long sleep failed: once,
+                // at once (see the onion check).
+                if ready && onion_restart_now.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     last_tor_restart = std::time::Instant::now();
                     match t.restart() {
                         Ok(a) => {
@@ -6206,10 +6218,19 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                         Err(e) => eprintln!("  Tor could not be started again: {e}"),
                     }
                 }
-                if onion_unreachable.load(std::sync::atomic::Ordering::SeqCst)
-                    && last_tor_restart.elapsed() >= TOR_RESTART_UNREACHABLE_EVERY
+                // Half an hour, then twice as long after each restart that
+                // did not help, up to four hours: a service kept silent from
+                // outside does not make the wallet drop all its connections
+                // every half hour (red-team campaign 8).
+                let spacing = TOR_RESTART_UNREACHABLE_EVERY
+                    .saturating_mul(1 << unreachable_restarts.min(3))
+                    .min(TOR_RESTART_UNREACHABLE_MAX);
+                if ready
+                    && onion_unreachable.load(std::sync::atomic::Ordering::SeqCst)
+                    && last_tor_restart.elapsed() >= spacing
                 {
                     onion_unreachable.store(false, std::sync::atomic::Ordering::SeqCst);
+                    unreachable_restarts = unreachable_restarts.saturating_add(1);
                     last_tor_restart = std::time::Instant::now();
                     match t.restart() {
                         Ok(a) => {
@@ -7548,6 +7569,8 @@ const ONION_CHECK_RETRY: std::time::Duration = std::time::Duration::from_secs(30
 const TOR_RESTART_AFTER_SLEEP: u64 = 20 * 60;
 /// At most one restart of Tor for an onion service that does not answer.
 const TOR_RESTART_UNREACHABLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1800);
+/// The longest spacing of those restarts, once several did not help.
+const TOR_RESTART_UNREACHABLE_MAX: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
 /// What the onion check is told, see `onion_check_soon`: nothing new.
 const ONION_SOON_NONE: u8 = 0;
 /// Tor was started again to repair its service: check soon, and do not ask
@@ -8633,13 +8656,22 @@ mod tests {
         assert!(body.contains("armed = false;\n                            node.set_own_onion_check(q21_core::net::OnionCheck::Answers);"));
         let fresh = "onion_check_soon\n                            .store(ONION_SOON_FRESH";
         let fix = ".store(ONION_SOON_AFTER_FIX, std::sync::atomic::Ordering::SeqCst);";
-        // The sleep restart, and the shorter wake, are fresh.
+        // The restart after a long sleep is fresh; a shorter wake is not
+        // (red-team campaign 8: a gap of a minute must not allow a restart).
         assert_eq!(s.matches(fresh).count(), 1, "the restart after a sleep");
-        assert!(s.contains(
+        assert!(!s.contains(
             "onion_check_soon.store(ONION_SOON_FRESH, std::sync::atomic::Ordering::SeqCst);"
         ));
-        // The quick restart, the half-hourly one and the crash one are not.
-        assert_eq!(s.matches(fix).count(), 3);
+        assert!(s.contains(
+            "onion_check_soon.store(ONION_SOON_AFTER_FIX, std::sync::atomic::Ordering::SeqCst);"
+        ));
+        // The short wake, the quick restart, the half-hourly one and the
+        // crash one are not.
+        assert_eq!(s.matches(fix).count(), 4);
+        // Never while Tor connects, and spaced further after each restart
+        // that did not help.
+        assert!(s.contains("if ready && onion_restart_now.swap(false"));
+        assert!(s.contains(".min(TOR_RESTART_UNREACHABLE_MAX);"));
         assert!(!s.contains("onion_check_soon.store(true"));
     }
 }
