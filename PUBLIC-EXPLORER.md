@@ -388,6 +388,7 @@ empty — then paste exactly this (**right-click** to paste):
 		timeouts {
 			read_header 5s
 			read_body   10s
+			write       60s
 			idle        30s
 		}
 	}
@@ -413,9 +414,7 @@ explorer.example.org {
 	encode gzip
 	reverse_proxy 127.0.0.1:21080 {
 		request_buffers 1MB
-		transport http {
-			max_conns_per_host 48
-		}
+		response_buffers 4MB
 	}
 }
 ```
@@ -434,7 +433,8 @@ Each block, and why it is there:
 | `max_size 1MB` | The same limit as the node's, one step earlier |
 | `@blocked … 404` | A second lock on the wallet's door |
 | `request_buffers 1MB` | Caddy reads a request's whole body before it passes it on: a visitor announcing a body it never sends holds a Caddy buffer, not one of the node's threads |
-| `max_conns_per_host 48` | Never more than 48 requests at once to the node, below its own limit of 64: visitors wait at Caddy's door rather than fill the node's |
+| `response_buffers 4MB` | Caddy reads the node's whole answer before it sends it on: a visitor that reads slowly, or not at all, holds a Caddy buffer, not a connection to the node. Until 0.5.9 this file capped the connections to the node at 48 (`max_conns_per_host`): one HTTP/2 connection that granted no window to its 48 answers then held all of them, and the explorer stopped answering everyone (red-team campaign 8, reproduced against Caddy 2.10) |
+| `write 60s` | An answer still not delivered after a minute is dropped |
 
 The reverse proxy passes each visitor's address to the node in the
 `X-Forwarded-For` header — that is its default behavior, and it erases
@@ -546,6 +546,7 @@ it one in the global block, then place it in the site:
 		timeouts {
 			read_header 5s
 			read_body   10s
+			write       60s
 			idle        30s
 		}
 	}
