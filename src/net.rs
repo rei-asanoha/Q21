@@ -634,6 +634,21 @@ pub const ADDR_BUCKET_MAX: u64 = crate::wire::MAX_ADDR as u64;
 /// addresses are ignored, without penalty.
 pub const ADDR_RATE_PER_SEC: u64 = 10;
 
+/// New addresses one inbound connection can write into the address book,
+/// and one address group of inbound connections within an hour.
+///
+/// # The defect this closes
+///
+/// An entry point proves few address groups itself (it mostly receives
+/// connections), and a group it never proved gives way to a fresher one when
+/// the book is full: one inbound peer announcing two thousand fresh addresses
+/// in two minutes replaced the whole book, and every newcomer's `getaddr` was
+/// then answered with the attacker's addresses (red-team campaign 8). What a
+/// stranger who called us can write is now bounded; what our own outbound
+/// peers tell us is not.
+pub const ADDR_NEW_PER_INBOUND: u32 = 128;
+pub const ADDR_NEW_PER_INBOUND_GROUP_HOUR: u32 = 512;
+
 /// Cost of a batch of headers nobody requested. No honest node sends one: only
 /// the reply to a request produces one.
 pub const MISCONDUCT_UNREQUESTED_HEADERS: u32 = 10;
@@ -1576,6 +1591,9 @@ struct Peer {
     /// The addresses this peer can still make us record. See
     /// [`ADDR_RATE_PER_SEC`].
     addr_bucket: TokenBucket,
+    /// New addresses this peer wrote into the book. See
+    /// [`ADDR_NEW_PER_INBOUND`].
+    addr_added: u32,
     /// Header replies we expect from this peer. See
     /// [`MAX_EXPECTED_HEADERS`].
     expected_headers: u8,
@@ -1930,6 +1948,9 @@ struct Shared {
     /// When each inbound address group last arrived, within the window of
     /// [`INBOUND_ARRIVALS_PER_GROUP`].
     inbound_arrivals: HashMap<NetGroup, Vec<Instant>>,
+    /// New addresses written by inbound peers, per address group (loopback
+    /// is one), within the current hour. See [`ADDR_NEW_PER_INBOUND`].
+    addr_from_inbound: HashMap<(Option<NetGroup>, bool), (Instant, u32)>,
     /// The announcements this node will still verify: a signature costs a
     /// post-quantum verification. See [`REACH_RATE_PER_SEC`].
     reach_bucket: TokenBucket,
@@ -2328,6 +2349,7 @@ impl Node {
                 reach_kept_at: HashMap::new(),
                 reach_deferred: HashMap::new(),
                 inbound_arrivals: HashMap::new(),
+                addr_from_inbound: HashMap::new(),
                 reach_bucket: TokenBucket {
                     tokens: REACH_BUCKET_MAX,
                     last: Instant::now(),
@@ -3751,6 +3773,7 @@ impl Node {
                     cmpct_bucket: TokenBucket::for_compact_announcements(Instant::now()),
                     headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                     addr_bucket: TokenBucket::for_addresses(Instant::now()),
+                    addr_added: 0,
                     expected_headers: 0,
                     requested_bodies: HashMap::new(),
                     bodies_to_request: VecDeque::new(),
@@ -5315,20 +5338,50 @@ impl Node {
                     let Shared {
                         ref mut book,
                         ref mut peers,
+                        ref mut addr_from_inbound,
                         ..
                     } = *g;
-                    let bucket = peers.get_mut(&id).map(|p| &mut p.addr_bucket);
-                    if let Some(bucket) = bucket {
+                    if let Some(peer) = peers.get_mut(&id) {
+                        let source = (inbound_group(peer.addr), is_loopback(peer.addr));
+                        if addr_from_inbound.len() > 4096 {
+                            addr_from_inbound.retain(|_, (t, _)| {
+                                instant.saturating_duration_since(*t) < Duration::from_secs(3600)
+                            });
+                        }
                         for a in v.into_iter().take(crate::wire::MAX_ADDR) {
-                            if !bucket.allow_with(1, instant, ADDR_BUCKET_MAX, ADDR_RATE_PER_SEC) {
+                            if !peer.addr_bucket.allow_with(
+                                1,
+                                instant,
+                                ADDR_BUCKET_MAX,
+                                ADDR_RATE_PER_SEC,
+                            ) {
                                 self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
                                 break;
+                            }
+                            if !peer.outbound {
+                                let hour = addr_from_inbound.entry(source).or_insert((instant, 0));
+                                if instant.saturating_duration_since(hour.0)
+                                    >= Duration::from_secs(3600)
+                                {
+                                    *hour = (instant, 0);
+                                }
+                                if peer.addr_added >= ADDR_NEW_PER_INBOUND
+                                    || hour.1 >= ADDR_NEW_PER_INBOUND_GROUP_HOUR
+                                {
+                                    self.stats.addresses_ignored.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
                             }
                             // An address announced as seen in the future would
                             // be a way to get ahead of all the others.
                             let mut a = a;
                             a.last_seen = a.last_seen.min(now);
-                            book.add(a, now);
+                            if book.add(a, now) && !peer.outbound {
+                                peer.addr_added += 1;
+                                if let Some(hour) = addr_from_inbound.get_mut(&source) {
+                                    hour.1 += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -7098,6 +7151,7 @@ mod tests {
                 deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
+                addr_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -7896,6 +7950,7 @@ mod tests_hardening {
                 deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(Instant::now()),
                 addr_bucket: TokenBucket::for_addresses(Instant::now()),
+                addr_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -9563,6 +9618,7 @@ mod tests_handler_fuzz {
                 deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
+                addr_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -10427,6 +10483,7 @@ mod tests_handler_review {
                 deep_forks: 0,
                 headers_bucket: TokenBucket::for_header_requests(now),
                 addr_bucket: TokenBucket::for_addresses(now),
+                addr_added: 0,
                 expected_headers: 0,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
@@ -11090,6 +11147,26 @@ mod tests_handler_review {
         );
     }
 
+    /// Red-team campaign 8 (arch2): one inbound peer replaced an entry
+    /// point's whole address book with fresh addresses of its own, which every
+    /// newcomer's `getaddr` then received. What a stranger who called us can
+    /// write into the book is bounded, per connection and per group per hour.
+    #[test]
+    fn an_inbound_peer_writes_a_bounded_share_of_the_address_book() {
+        let n = node();
+        let _e = anonymous_peer(&n, 9);
+        establish(&n, 9);
+        for k in 0..4u32 {
+            assert!(n.handle(9, Message::Addr(group_batch(k * 1000))));
+        }
+        assert!(
+            n.address_count() <= ADDR_NEW_PER_INBOUND as usize,
+            "{} addresses from one inbound peer",
+            n.address_count()
+        );
+        assert!(n.address_count() > 0, "but some are taken");
+    }
+
     fn establish(n: &Node, id: u64) {
         let mut g = n.shared.lock().unwrap();
         let p = g.peers.get_mut(&id).unwrap();
@@ -11289,7 +11366,8 @@ mod tests_handler_review {
         assert_eq!(n.shared.lock().unwrap().peers[&1].ban_score, 0);
     }
 
-    /// The same `Addr`, after the handshake, is read as before.
+    /// The same `Addr`, after the handshake, is read as before — whole from a
+    /// peer we dialed ([`ADDR_NEW_PER_INBOUND`] for one that called us).
     #[test]
     fn an_addr_after_the_handshake_is_read() {
         let n = node();
@@ -11299,6 +11377,7 @@ mod tests_handler_review {
             let p = g.peers.get_mut(&9).unwrap();
             p.version_received = true;
             p.handshaked = true;
+            p.outbound = true;
         }
         assert!(n.handle(9, Message::Addr(group_batch(0))));
         assert_eq!(n.address_count(), crate::addr::MAX_GROUPS);
