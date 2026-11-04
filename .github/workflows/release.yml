@@ -598,7 +598,7 @@ jobs:
                   # line naming no file fails: neither slips past the check.
                   # Each line is a full hash and a name; the platform's own
                   # binary is among them, or the file is refused.
-                  seen=0
+                  seen=0 wseen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$_hash" in
@@ -606,8 +606,12 @@ jobs:
                     esac
                     [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem") seen=1 ;;
-                      "q21-wallet-${stem#q21-}") ;;
+                      "$stem")
+                        [ "$seen" = 0 ] || { echo "::error::$name names $stem twice"; exit 1; }
+                        seen=1 ;;
+                      "q21-wallet-${stem#q21-}")
+                        [ "$wseen" = 0 ] || { echo "::error::$name names $file twice"; exit 1; }
+                        wseen=1 ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"
@@ -666,7 +670,7 @@ jobs:
                   # line naming no file fails: neither slips past the check.
                   # Each line is a full hash and a name; the platform's own
                   # binary is among them, or the file is refused.
-                  seen=0
+                  seen=0 wseen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$_hash" in
@@ -674,8 +678,12 @@ jobs:
                     esac
                     [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem") seen=1 ;;
-                      "q21-wallet-${stem#q21-}") ;;
+                      "$stem")
+                        [ "$seen" = 0 ] || { echo "::error::$name names $stem twice"; exit 1; }
+                        seen=1 ;;
+                      "q21-wallet-${stem#q21-}")
+                        [ "$wseen" = 0 ] || { echo "::error::$name names $file twice"; exit 1; }
+                        wseen=1 ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"
@@ -713,6 +721,10 @@ jobs:
             echo "# Same commit + same platform + same toolchain = same hash."
             cat ./*.bin.sha256
           } > SHA256SUMS
+          # One line per name: verify-release.sh refuses a SHA256SUMS that
+          # names a file twice, and so does this step, before anyone signs.
+          TWICE=$(awk 'NF && $1 !~ /^#/ {print $2}' SHA256SUMS | sort | uniq -d)
+          if [ -n "$TWICE" ]; then echo "::error::SHA256SUMS names some files more than once: $TWICE"; exit 1; fi
           cat SHA256SUMS
 
       # The exact command to sign with, ready to copy. The trusted comment
@@ -777,7 +789,7 @@ jobs:
                   # line naming no file fails: neither slips past the check.
                   # Each line is a full hash and a name; the platform's own
                   # binary is among them, or the file is refused.
-                  seen=0
+                  seen=0 wseen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$_hash" in
@@ -785,8 +797,12 @@ jobs:
                     esac
                     [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem") seen=1 ;;
-                      "q21-wallet-${stem#q21-}") ;;
+                      "$stem")
+                        [ "$seen" = 0 ] || { echo "::error::$name names $stem twice"; exit 1; }
+                        seen=1 ;;
+                      "q21-wallet-${stem#q21-}")
+                        [ "$wseen" = 0 ] || { echo "::error::$name names $file twice"; exit 1; }
+                        wseen=1 ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"
@@ -879,7 +895,7 @@ jobs:
                   # line naming no file fails: neither slips past the check.
                   # Each line is a full hash and a name; the platform's own
                   # binary is among them, or the file is refused.
-                  seen=0
+                  seen=0 wseen=0
                   while read -r _hash file || [ -n "${_hash}${file}" ]; do
                     [ -n "$file" ] || { echo "::error::$name malformed"; exit 1; }
                     case "$_hash" in
@@ -887,8 +903,12 @@ jobs:
                     esac
                     [ "${#_hash}" -eq 64 ] || { echo "::error::$name malformed"; exit 1; }
                     case "$file" in
-                      "$stem") seen=1 ;;
-                      "q21-wallet-${stem#q21-}") ;;
+                      "$stem")
+                        [ "$seen" = 0 ] || { echo "::error::$name names $stem twice"; exit 1; }
+                        seen=1 ;;
+                      "q21-wallet-${stem#q21-}")
+                        [ "$wseen" = 0 ] || { echo "::error::$name names $file twice"; exit 1; }
+                        wseen=1 ;;
                       *) echo "::error::$name names another platform's file: $file"; exit 1 ;;
                     esac
                   done < "$f"

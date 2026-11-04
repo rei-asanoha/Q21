@@ -15,16 +15,16 @@
 # arguments. Exit status 0 only if everything holds:
 #
 # 1. the folder holds exactly the expected files;
-# 2. SHA256SUMS is signed by the key, and the trusted comment names this tag
-#    and this commit;
+# 2. SHA256SUMS is signed by the key, the trusted comment names this tag
+#    and this commit, and no file is named twice;
 # 3. every archive has the hash SHA256SUMS gives it;
 # 4. inside every archive: the program is the binary SHA256SUMS names for its
 #    platform — the one independent builders rebuild — and so is the Windows
 #    launcher; every file that comes from the repository (documents,
 #    bootstrap.txt, launcher scripts, Info.plist) is byte for byte the one of
 #    the tagged commit; nothing else is there but Tor and the macOS bundle's
-#    signature; no entry is a link, a duplicate (case ignored), an absolute
-#    path or a `..`;
+#    signature; no entry is a link, an extended header (pax, GNU long
+#    name), a duplicate (case ignored), an absolute path or a `..`;
 # 5. for every program, at least `threshold` independent attestations agree
 #    with its hash, and none disagrees.
 #
@@ -37,7 +37,8 @@
 # files that come from the repository are compared with what a checkout of
 # the tagged commit holds (`git cat-file --filters`).
 #
-# Needs bash, git, minisign, tar, unzip, zipinfo, and sha256sum or shasum.
+# Needs bash, git, minisign, tar, gzip, od, dd, unzip, zipinfo, and sha256sum
+# or shasum.
 set -euo pipefail
 
 if [ "$#" -ne 5 ]; then
@@ -56,6 +57,31 @@ sha() {
 }
 # The hash SHA256SUMS gives to a name, CR stripped; empty if none.
 listed() { tr -d '\r' < "$REL/SHA256SUMS" | awk -v n="$1" '$2 == n {print $1; exit}'; }
+# Every entry of a tar archive is a plain file ('0', or NUL in old archives)
+# or a folder ('5'), read from the raw headers. Extended headers (pax 'x' and
+# 'g', GNU 'L', 'K', 'N', 'V'...) are refused: tar programs do not all read
+# them the same way, so the same archive could unpack one program for this
+# check and another one on a user's Mac.
+plain_tar() {
+  local T=$1 OFF=0 N=0 TYPE SIZE
+  local LEN
+  LEN=$(wc -c < "$T" | tr -d ' ')
+  while [ $((OFF + 512)) -le "$LEN" ]; do
+    N=$((N + 1))
+    [ "$N" -le 100000 ] || return 1
+    if [ "$(od -An -tx1 -j "$OFF" -N1 "$T" | tr -d ' \n')" = 00 ]; then
+      # The end: two zero blocks, nothing after but zeros.
+      [ -z "$(tail -c +$((OFF + 1)) "$T" | tr -d '\000' | head -c 1)" ] || return 1
+      return 0
+    fi
+    TYPE=$(od -An -tx1 -j $((OFF + 156)) -N1 "$T" | tr -d ' \n')
+    case "$TYPE" in 30|00|35) ;; *) return 1 ;; esac
+    SIZE=$(dd if="$T" bs=1 skip=$((OFF + 124)) count=12 2>/dev/null | tr -d '\000 ')
+    case "$SIZE" in ''|*[!0-7]*) return 1 ;; esac
+    OFF=$((OFF + 512 + (8#$SIZE + 511) / 512 * 512))
+  done
+  return 1
+}
 
 PLATFORMS="linux-x86_64 linux-arm64 macos-arm64 macos-x86_64 windows-x86_64"
 archive_of() { case "$1" in windows-*) echo "q21-$1.zip" ;; *) echo "q21-$1.tar.gz" ;; esac; }
@@ -86,6 +112,10 @@ COMMENT=$(printf '%s\n' "$OUT" | sed -n 's/^Trusted comment: //p')
 WANTED="Q21 ${TAG} ${COMMIT} -- Rei Asanoha"
 [ "$COMMENT" = "$WANTED" ] || fail "trusted comment \"$COMMENT\", expected \"$WANTED\""
 echo "signature: valid — $COMMENT"
+# One line per name: a second line for a program would let a check read the
+# first and a rebuild match the second.
+TWICE=$(tr -d '\r' < "$REL/SHA256SUMS" | awk 'NF && $1 !~ /^#/ {print $2}' | sort | uniq -d)
+[ -z "$TWICE" ] || fail "SHA256SUMS names some files more than once: $TWICE"
 
 # --- 3 and 4. Every archive, and the programs inside it.
 WORK=$(mktemp -d)
@@ -108,6 +138,10 @@ for P in $PLATFORMS; do
       if grep -q '^l' <<<"$LONG"; then fail "$A holds a symbolic link"; fi
       ;;
     *)
+      gzip -dc < "$REL/$A" > "$WORK/raw.tar" || fail "$A is not a gzip archive"
+      plain_tar "$WORK/raw.tar" \
+        || fail "$A holds an entry that is neither a plain file nor a folder (extended or link header)"
+      rm -f "$WORK/raw.tar"
       NAMES=$(tar -tzf "$REL/$A")
       LONG=$(tar -tvzf "$REL/$A")
       if grep -q '^[lh]' <<<"$LONG"; then fail "$A holds a link"; fi
