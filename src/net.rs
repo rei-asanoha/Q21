@@ -2945,12 +2945,22 @@ impl Node {
     /// Pours onion names back into the book: from `onions.dat` at startup,
     /// with the names that answered before.
     pub fn seed_onions(&self, v: Vec<(crate::wire::OnionAddr, u64)>) -> usize {
+        self.seed_onion_file(
+            v.into_iter()
+                .map(|(a, answered)| (a, answered, crate::addr::ONION_SOURCE_LOCAL))
+                .collect(),
+        )
+    }
+
+    /// [`Self::seed_onions`], each name under the source that wrote it, as
+    /// `onions.dat` keeps it: its share of the book is counted again.
+    pub fn seed_onion_file(&self, v: Vec<(crate::wire::OnionAddr, u64, u64)>) -> usize {
         let mut g = self.shared.lock().unwrap();
         let now = unix_now();
         let before = g.onions.len();
-        for (a, answered) in v {
+        for (a, answered, source) in v {
             let (name, port) = (a.name.clone(), a.port);
-            g.onions.add(a, now);
+            g.onions.add_from(a, now, source);
             if answered > 0 {
                 g.onions.mark_answered(&name, port, answered);
             }
@@ -3065,6 +3075,22 @@ impl Node {
         v.iter().filter(|a| g.book.add(**a, n)).count()
     }
 
+    /// Pours this node's own saved entries back into the address book, with
+    /// what each had earned: whether it answered, its failures.
+    pub fn seed_address_entries(&self, v: &[crate::addr::AddrEntry]) -> usize {
+        let mut g = self.shared.lock().unwrap();
+        let n = unix_now();
+        v.iter()
+            .filter(|e| {
+                let added = g.book.add(e.addr, n);
+                if added {
+                    g.book.restore_stats(e);
+                }
+                added
+            })
+            .count()
+    }
+
     /// Addresses to try, all from distinct network groups and distinct from
     /// those of the peers already connected.
     pub fn addresses_to_try(&self, count: usize) -> Vec<crate::wire::NetAddr> {
@@ -3106,6 +3132,9 @@ impl Node {
         self.shared.lock().unwrap().book.all()
     }
 
+    /// An address answered as a Q21 node: its handshake completed (see the
+    /// `VerAck` handler). A TCP connection alone, which any listener gives,
+    /// no longer proves it (red-team campaign 9).
     pub fn note_connect_success(&self, ip: [u8; 4], port: u16) {
         let mut g = self.shared.lock().unwrap();
         g.book.add(
@@ -4394,6 +4423,7 @@ impl Node {
 
                 Message::VerAck => {
                     let mut onion_answered: Option<SocketAddr> = None;
+                    let mut v4_answered: Option<([u8; 4], u16)> = None;
                     let (behind, locator) = {
                         let height = g.chain.height();
                         let p = g.peers.get_mut(&id);
@@ -4410,6 +4440,13 @@ impl Node {
                                 // proved it, which any listener gives).
                                 if p.outbound && is_onion_label(p.addr) {
                                     onion_answered = Some(p.addr);
+                                }
+                                // A dialed address that answered as a Q21
+                                // node is proven, and only then.
+                                if p.outbound {
+                                    if let SocketAddr::V4(a) = p.addr {
+                                        v4_answered = Some((a.ip().octets(), a.port()));
+                                    }
                                 }
                                 if channel_link(network, p) {
                                     channel_peer_ready = Some(ChannelLink {
@@ -4430,6 +4467,11 @@ impl Node {
                         if let Some((name, port)) = g.onions.name_of_label(label) {
                             g.onions.note_handshake(&name, port, unix_now());
                         }
+                    }
+                    if let Some((ip, port)) = v4_answered {
+                        // Only an address already in the book: one given by
+                        // hand, or a private one, is not added here.
+                        g.book.mark_success(ip, port, unix_now());
                     }
                     if behind {
                         outgoing.push(Outgoing {
@@ -7804,6 +7846,46 @@ mod tests {
         let book = m.onion_entries();
         assert!(book.iter().any(|e| e.addr.name == E && e.answered));
         assert!(book.iter().any(|e| e.addr.name == X && !e.answered));
+        n.shutdown();
+        m.shutdown();
+    }
+
+    /// Red-team campaign 9: an address was proven by a bare TCP connection,
+    /// which any listener gives, and its proof was lost at every reload. It
+    /// is proven by a completed Q21 handshake, and kept across reloads.
+    #[test]
+    fn an_address_is_proven_by_a_handshake_and_keeps_it_across_a_reload() {
+        let version = Message::Version {
+            version: PROTOCOL_VERSION,
+            timestamp: unix_now(),
+            nonce: 0x5151,
+            user_agent: String::new(),
+            start_height: 0,
+        };
+        let a = crate::wire::NetAddr {
+            ip: [93, 184, 216, 34],
+            port: 21121,
+            last_seen: unix_now(),
+        };
+        let n = node();
+        assert_eq!(n.seed_addresses(&[a]), 1);
+        let proven = |n: &Node| {
+            n.address_entries()
+                .iter()
+                .find(|e| e.addr.ip == a.ip)
+                .map_or(0, |e| e.last_success)
+        };
+        fake_peer(&n, 7, SocketAddr::from((a.ip, a.port)), true);
+        assert!(n.handle(7, version));
+        assert_eq!(proven(&n), 0, "a Version alone proves nothing");
+        assert!(n.handle(7, Message::VerAck));
+        let earned = proven(&n);
+        assert!(earned > 0, "proven by the handshake");
+        // Written, then reloaded by the next run: still proven.
+        let saved = n.address_entries();
+        let m = node();
+        assert_eq!(m.seed_address_entries(&saved), 1);
+        assert_eq!(proven(&m), earned);
         n.shutdown();
         m.shutdown();
     }

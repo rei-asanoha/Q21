@@ -5638,21 +5638,18 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     }
     // Address book: what was learned during previous sessions.
     let address_book = AddrStore::new(peers_path(datadir));
-    let learned: Vec<q21_core::wire::NetAddr> = address_book
+    let learned: Vec<q21_core::addr::AddrEntry> = address_book
         .load(network != Network::Mainnet, unix_now())
-        .all()
-        .iter()
-        .map(|e| e.addr)
-        .collect();
+        .all();
     if !learned.is_empty() {
-        let n = node.seed_addresses(&learned);
+        let n = node.seed_address_entries(&learned);
         println!("  address book: {n} addresses reloaded");
     }
     // The onion names learned before: a node through Tor finds the onion
     // services again even when the entry points are down.
     let onions = q21_core::addr::load_onion_entries(&onions_path(datadir), unix_now());
     if !onions.is_empty() {
-        let n = node.seed_onions(onions);
+        let n = node.seed_onion_file(onions);
         println!("  onion addresses: {n} reloaded");
     }
     // The mining switch. It starts from the value of the `--mine` flag, but
@@ -8121,9 +8118,9 @@ fn dial_missing(
     let missing = target_peers.saturating_sub(node.peer_count_outbound());
     for a in node.addresses_to_try(missing) {
         let sa = std::net::SocketAddr::from((a.ip, a.port));
-        match node.connect(sa) {
-            Ok(_) => node.note_connect_success(a.ip, a.port),
-            Err(_) => node.note_connect_failure(a.ip, a.port),
+        // Proven once its handshake completes, not at the connection.
+        if node.connect(sa).is_err() {
+            node.note_connect_failure(a.ip, a.port);
         }
     }
 }

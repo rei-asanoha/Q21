@@ -298,6 +298,16 @@ impl AddrBook {
         }
     }
 
+    /// Puts back what an entry had earned, read from this node's own file:
+    /// reloaded through [`Self::add`], every address had lost whether it
+    /// ever answered, and the groups it proved with it (red-team campaign 9).
+    pub fn restore_stats(&mut self, e: &AddrEntry) {
+        if let Some(mine) = self.find(e.addr.ip, e.addr.port) {
+            mine.failures = e.failures;
+            mine.last_success = e.last_success;
+        }
+    }
+
     pub fn mark_failure(&mut self, ip: [u8; 4], port: u16) {
         if let Some(e) = self.find(ip, port) {
             e.failures = e.failures.saturating_add(1);
@@ -790,17 +800,21 @@ pub fn save_onions(path: &Path, names: &[crate::wire::OnionAddr]) -> std::io::Re
 }
 
 /// Writes the entries to `path`, as [`save_onions`], with a fourth field:
-/// when the name last answered, by this node's clock (`0`: it has not). A
-/// 0.5.8 node reads the first three.
+/// when the name last answered, by this node's clock (`0`: it has not), and
+/// a fifth: who wrote it (see [`OnionEntry::source`]). Without the fifth, a
+/// restart made every name this node's own, and one source took its share
+/// of the book again at each restart (red-team campaign 9). A 0.5.8 node
+/// reads the first three fields, a 0.5.9 node the first four.
 pub fn save_onion_entries(path: &Path, entries: &[OnionEntry]) -> std::io::Result<()> {
-    let mut text = String::from("# q21 onion addresses: name port last_seen answered\n");
+    let mut text = String::from("# q21 onion addresses: name port last_seen answered source\n");
     for e in entries.iter().take(MAX_ONIONS) {
         text.push_str(&format!(
-            "{} {} {} {}\n",
+            "{} {} {} {} {}\n",
             e.addr.host(),
             e.addr.port,
             e.addr.last_seen,
-            if e.answered { e.last_success.max(1) } else { 0 }
+            if e.answered { e.last_success.max(1) } else { 0 },
+            e.source
         ));
     }
     let tmp = path.with_extension("tmp");
@@ -809,8 +823,9 @@ pub fn save_onion_entries(path: &Path, entries: &[OnionEntry]) -> std::io::Resul
 }
 
 /// Reads what [`save_onion_entries`] (or [`save_onions`]) wrote, with the
-/// time each name last answered (`0`: it has not): see [`load_onions`].
-pub fn load_onion_entries(path: &Path, now: u64) -> Vec<(crate::wire::OnionAddr, u64)> {
+/// time each name last answered (`0`: it has not) and who wrote it
+/// ([`ONION_SOURCE_LOCAL`] when the file does not say): see [`load_onions`].
+pub fn load_onion_entries(path: &Path, now: u64) -> Vec<(crate::wire::OnionAddr, u64, u64)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -822,13 +837,17 @@ pub fn load_onion_entries(path: &Path, now: u64) -> Vec<(crate::wire::OnionAddr,
             let port: u16 = it.next()?.parse().ok()?;
             let seen: u64 = it.next()?.parse().ok()?;
             let answered: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0).min(now);
+            let source: u64 = it
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(ONION_SOURCE_LOCAL);
             let mut a = crate::wire::OnionAddr::parse(name, port)?;
             if port == 0 {
                 return None;
             }
             a.port = port;
             a.last_seen = seen.min(now);
-            Some((a, answered))
+            Some((a, answered, source))
         })
         .take(MAX_ONIONS)
         .collect()
@@ -1094,6 +1113,10 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!((back[0].0.port, back[0].1), (21121, 900));
         assert_eq!((back[1].0.port, back[1].1), (21500, 0));
+        assert_eq!(
+            (back[0].2, back[1].2),
+            (ONION_SOURCE_LOCAL, ONION_SOURCE_LOCAL)
+        );
         assert_eq!(load_onions(&p, 1_000).len(), 2);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1172,6 +1195,53 @@ mod tests {
             .entries()
             .iter()
             .any(|e| e.addr.name == a0 && !e.answered));
+    }
+
+    /// Red-team campaign 9: a restart made every name of `onions.dat` this
+    /// node's own, and one source took its share of the book again at each
+    /// restart, the whole book after eight. The source is kept: its share
+    /// holds across restarts.
+    #[test]
+    fn a_restart_keeps_each_source_to_its_share() {
+        let dir = std::env::temp_dir().join(format!("q21-onion-share-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("onions.dat");
+        let mut now = 1_900_000_000u64;
+        let start = now;
+        let name = |tag: char, k: u32| {
+            let mut o = onion(tag, 21121, start - 86_400);
+            o.name = format!("{}{:0>5}d", &onion(tag, 0, 0).name[..50], to_b32(k));
+            o
+        };
+        let mut book = OnionBook::default();
+        for k in 0..MAX_ONIONS as u32 {
+            book.add_from(name('h', k), now, 1000 + u64::from(k % 40));
+        }
+        let attacker = 7u64;
+        let count = |b: &OnionBook| b.entries().iter().filter(|e| e.source == attacker).count();
+        let mut k = 0u32;
+        for _session in 0..9 {
+            for _ in 0..400 {
+                let mut a = name('x', k);
+                a.last_seen = now;
+                k += 1;
+                book.add_from(a, now, attacker);
+            }
+            assert_eq!(count(&book), ONION_SHARE_PER_SOURCE);
+            now += 3600;
+            save_onion_entries(&p, &book.entries()).unwrap();
+            let mut fresh = OnionBook::default();
+            for (a, answered, source) in load_onion_entries(&p, now) {
+                let (n, port) = (a.name.clone(), a.port);
+                fresh.add_from(a, now, source);
+                if answered > 0 {
+                    fresh.mark_answered(&n, port, answered);
+                }
+            }
+            book = fresh;
+            assert_eq!(count(&book), ONION_SHARE_PER_SOURCE, "after the restart");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn to_b32(mut k: u32) -> String {
