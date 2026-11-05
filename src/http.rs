@@ -950,7 +950,13 @@ fn handle_connection<F>(
                             r
                         }
                     } else {
-                        handler(req)
+                        // A loopback service without a token (`--rpc` alone)
+                        // names its run too, so that the wallet page it
+                        // serves does not stop at its first answer. The
+                        // public explorer, read by anyone, does not.
+                        let mut r = handler(req);
+                        r.run = token.is_none() && public_host.is_none() && !public;
+                        r
                     }
                 }
             }
@@ -2091,6 +2097,27 @@ mod tests {
             "{refused}"
         );
         h.shutdown();
+
+        // A loopback service without a token names its run as well: the
+        // wallet page it serves must not stop at its first answer.
+        let open = serve("127.0.0.1:0", None, echo()).expect("startup");
+        let r = get(open.addr, "/status");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert_eq!(header(&r).as_deref(), Some(run_id()), "{r}");
+        open.shutdown();
+
+        // The public explorer, read by anyone, does not.
+        let public = serve_public_web("127.0.0.1:0", "explorer.example.org".to_string(), echo())
+            .expect("startup");
+        let r = request(
+            public.addr,
+            "POST /rpc HTTP/1.1\r\nHost: explorer.example.org\r\n\
+             Content-Type: application/json\r\nContent-Length: 2\r\n\
+             Connection: close\r\n\r\n{}",
+        );
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert_eq!(header(&r), None, "{r}");
+        public.shutdown();
     }
 
     /// The most important safeguard in this file.
