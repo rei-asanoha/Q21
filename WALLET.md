@@ -245,10 +245,11 @@ Both wallets need 0.5.5 or later; the button shows only then.
   neither loaded nor watched again, and the log said `ALERT … this channel is
   not loaded`.
 - **A reorganization that takes a channel's funding off the chain** (rare,
-  six blocks or more): the channel pays nothing and signs nothing until its
-  funding confirms again, and the page says so. The side that funded it
-  holds its coins and announces the funding transaction again; nothing is
-  lost.
+  six blocks or more): the channel pays, signs and closes nothing until its
+  funding is buried again to the depth agreed at the opening, and the page
+  says so. The side that funded it holds its coins and announces the funding
+  transaction again; a payment sent meanwhile goes through once it is back.
+  Nothing is lost.
 - **A channel asked to wait for more confirmations than the longest delay**
   (a contact asking for 65,535 blocks, three months) is refused at the
   opening: such a channel never opened and blocked new ones meanwhile.
