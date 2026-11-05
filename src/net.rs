@@ -1052,6 +1052,16 @@ fn reach_too_soon(g: &Shared, owner: &Hash256, r: &crate::wire::Reach, now: u64)
     !(recent(r.time) && !recent(signed) && r.time > signed)
 }
 
+/// The announcement held for `owner`, while it still owns a name on this
+/// node's chain. A reorganization that takes its last name away left it
+/// served and relayed, for a key that no longer names anyone (red-team
+/// campaign 9); it is checked again at each read, as on arrival.
+fn held_reach<'a>(g: &'a Shared, owner: &Hash256) -> Option<&'a crate::wire::Reach> {
+    g.reach
+        .get(owner)
+        .filter(|_| g.chain.utxo.names().owned(owner) > 0)
+}
+
 /// Keeps the verified announcement `r` of `owner`, evicting the oldest held
 /// one from a full table, and returns the peers to relay it to: every
 /// handshaked protocol 6 peer but `from`.
@@ -2865,7 +2875,7 @@ impl Node {
     /// Where the owner `owner` said it can be reached, if this node knows.
     pub fn reach_of(&self, owner: &Hash256) -> Option<crate::wire::ReachTarget> {
         let g = self.shared.lock().unwrap();
-        g.reach.get(owner).map(|r| r.target.clone())
+        held_reach(&g, owner).map(|r| r.target.clone())
     }
 
     /// Asks every peer that speaks protocol 6 where `owner` can be reached.
@@ -4599,7 +4609,7 @@ impl Node {
                             .ok()
                             .and_then(|s| s.as_ref().map(|s| s.pubkey.clone()))
                             .map(|pk| crate::sig::pubkey_hash(crate::sig::SchemeId::MlDsa87, &pk))
-                            .and_then(|o| g.reach.get(&o).cloned());
+                            .and_then(|o| held_reach(&g, &o).cloned());
                         if let Some(r) = own {
                             outgoing.push(Outgoing {
                                 peer: id,
@@ -5697,7 +5707,7 @@ impl Node {
                 }
                 Message::GetReach(owner) => {
                     if reach_budget(&mut g, id) {
-                        if let Some(r) = g.reach.get(&owner) {
+                        if let Some(r) = held_reach(&g, &owner) {
                             outgoing.push(Outgoing {
                                 peer: id,
                                 message: Message::Reach(Box::new(r.clone())),

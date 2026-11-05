@@ -7182,6 +7182,42 @@ mod tests {
         }
     }
 
+    /// Red-team campaign 9: an announcement stayed served after its owner's
+    /// name left the chain in a reorganization. It is held only while the
+    /// key still owns a name, and serves again if the name comes back.
+    #[cfg(feature = "mldsa")]
+    #[test]
+    fn an_announcement_whose_name_left_the_chain_is_no_longer_served() {
+        use crate::net::ReachVerdict;
+        use crate::wire::ReachTarget;
+        let (c, _, owner_key) = two_named_owners();
+        let owner = crate::sig::pubkey_hash(SchemeId::MlDsa87, owner_key.pubkey());
+        let target = ReachTarget::Onion {
+            name: format!("{}d", "e".repeat(55)),
+            port: 21121,
+        };
+        let now = crate::net::unix_now();
+        assert_eq!(
+            c.node
+                .accept_reach(reach_signed(&owner_key, &target, now), Some(1)),
+            ReachVerdict::Kept
+        );
+        assert_eq!(c.node.reach_of(&owner), Some(target.clone()));
+        // The block that registered "honest" leaves the chain.
+        let tip = c.node.with_chain(|ch| {
+            let b = ch.block_at(ch.height()).unwrap();
+            assert!(ch.disconnect());
+            assert_eq!(ch.utxo.names().owned(&owner), 0, "the name is gone");
+            b
+        });
+        assert_eq!(c.node.reach_of(&owner), None);
+        // It comes back: so does the announcement.
+        c.node.with_chain(|ch| {
+            ch.connect(&tip, tip.header.time + 1).expect("connect");
+        });
+        assert_eq!(c.node.reach_of(&owner), Some(target));
+    }
+
     /// A stale but genuine announcement replayed first does not hold the
     /// owner's current one back: a recent one, ten minutes newer, always
     /// gets through (second re-check of R1).
