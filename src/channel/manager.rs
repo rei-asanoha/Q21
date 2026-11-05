@@ -2798,12 +2798,7 @@ impl ChannelManager {
                 // confirmed output of the active chain, with no spend of it
                 // seen and no splice under way: a reorganization took it
                 // away (red-team campaign 9).
-                let gone = c.machine.phase() == Phase::Open
-                    && c.spend.is_none()
-                    && c.machine.splice_status().is_none()
-                    && c.machine
-                        .funding_outpoint()
-                        .is_some_and(|op| depth_of(&op).is_none());
+                let gone = funding_left(c, depth_of);
                 if gone != c.funding_gone {
                     c.funding_gone = gone;
                     eprintln!(
@@ -3070,6 +3065,10 @@ impl ChannelManager {
         {
             let mut g = self.inner.lock().unwrap();
             for c in g.channels.values_mut() {
+                // A funding that left the chain while the node was down
+                // holds the channel from the start, not from the next block;
+                // the next block holds its coins and announces it again.
+                c.funding_gone = funding_left(c, depth_of);
                 // A splice in progress: where it stands on chain; ours, not
                 // yet there, holds its coins back again and goes out again
                 // once signed.
@@ -3879,6 +3878,18 @@ impl ChannelManager {
 /// The `Close` of a cooperative close agreed while an update was still in
 /// flight, once that update has settled: the close could not be signed over
 /// balances the two sides did not yet share, so it follows the update.
+/// An open channel whose funding is no longer an unspent, confirmed output
+/// of the active chain, with no spend of it seen and no splice under way: a
+/// reorganization took it away (red-team campaign 9).
+fn funding_left(c: &Chan, depth_of: &DepthOf) -> bool {
+    c.machine.phase() == Phase::Open
+        && c.spend.is_none()
+        && c.machine.splice_status().is_none()
+        && c.machine
+            .funding_outpoint()
+            .is_some_and(|op| depth_of(&op).is_none())
+}
+
 fn pending_close(chan: &mut Chan, cid: Hash256) -> Option<Vec<u8>> {
     let msg = chan.machine.close_after_update().ok()??;
     Some(write_frame(cid, KIND_ENGINE, &msg.encode()))

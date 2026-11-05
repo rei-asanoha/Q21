@@ -4170,6 +4170,42 @@ fn a_channel_whose_funding_left_the_chain_signs_nothing_until_it_confirms_again(
     assert_eq!(p.funder.info(cid).unwrap().remote_balance, 3_000_000);
 }
 
+/// A funding that left the chain while the node was down holds the channel
+/// from the restart on, not only from the next block.
+#[test]
+fn a_funding_gone_while_down_holds_the_channel_from_the_restart() {
+    use q21_core::channel::manager::FUNDING_GONE;
+    let acceptor_seed = [0xaau8; 32];
+    let (p, _wallet, chain, dir, cid, _capacity) =
+        open_channel([0xa9u8; 32], acceptor_seed, "funding-gone-restart");
+    let Pair { acceptor, .. } = p;
+    drop(acceptor);
+    let back = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir.join("acceptor"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), Hash256([0x7du8; 32])),
+    );
+    let tip = chain.lock().unwrap().height();
+    let c1 = chain.clone();
+    let txs_at = move |h: u64| c1.lock().unwrap().chain.block_at(h).map(|b| b.transactions);
+    back.rescan(tip, &txs_at, &|_: &OutPoint| None);
+    assert!(back.info(cid).unwrap().funding_gone);
+    assert_eq!(back.pay(cid, 1).unwrap_err(), FUNDING_GONE);
+    // Where the funding is still there, the restart holds nothing.
+    drop(back);
+    let again = restart_and_rescan(
+        acceptor_seed,
+        &dir.join("acceptor"),
+        acceptor_hooks(chain.clone(), Hash256([0x7du8; 32])),
+        &chain,
+    );
+    assert!(!again.info(cid).unwrap().funding_gone);
+}
+
 /// 0.5.10: a channel whose close confirmed is closed for its owner. Watched
 /// until the close is buried, it no longer counts toward the channels a peer
 /// may hold: eight closes with one contact refused a ninth channel with it
