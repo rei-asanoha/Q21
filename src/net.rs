@@ -7635,6 +7635,12 @@ mod tests {
         let a = Node::new(net, Chain::new(net, genesis_block(net)));
         let inbound = (MAX_PEERS - RESERVED_OUTBOUND_SLOTS) as u64;
         let now = Instant::now();
+        // The clock of a machine started less than half an hour ago (a
+        // Windows runner) cannot go that far back.
+        if now.checked_sub(Duration::from_secs(1800)).is_none() {
+            a.shutdown();
+            return;
+        }
         for id in 1..inbound {
             let addr: SocketAddr = format!("51.{id}.0.1:21121").parse().unwrap();
             fake_peer(&a, id, addr, false);
