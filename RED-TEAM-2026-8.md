@@ -97,9 +97,12 @@ twelve address groups, one young seat each, redialed every minute.
 **Fix.** Protection is shared out per address group; when every seat is
 young, the most crowded group gives up one; a group whose callers hung up
 twice within their first minute, in ten minutes, loses the newcomer's
-first-minute grace. Only a caller's own hang-ups count: counting arrivals,
-as the round-2 fix did, took the grace from an honest wallet the node had
-let go twice (round 3). Tor arrivals are not a group and keep it.
+first-minute grace. Only a caller's own hang-ups count, and its group
+replacing its own seat under two minutes old: counting arrivals, as the
+round-2 fix did, took the grace from an honest wallet the node had let go
+twice (round 3), and an occupant that never hung up, its group arriving
+again as each seat turned a minute, was never counted (round 3b). Tor
+arrivals are not a group and keep it.
 **Residual:** with every Tor seat held, about twenty address groups pacing
 their hang-ups still keep clear newcomers out (sixty without the Tor seats).
 
@@ -108,10 +111,15 @@ an address group 512 an hour, a peer we dialed one reply's worth; an
 address already known, passed on again, counts for nothing (round 3: a
 hidden node's own onion name, sent after addresses the node knew, was
 refused). The onion book was bypassed in round 3: two address groups, or
-one peer we dialed, still replaced every name. **Fix.** A name that answered
-is never pushed out by a name nobody tried, and is dialed and passed on
-first; the names of one source hold at most an eighth of the book; a peer
-we dialed writes 64 names per request. **Residual:** an entry point that
+one peer we dialed, still replaced every name. **Fix.** A name whose node
+completed a handshake with us is never pushed out by a name nobody tried,
+and is passed on first; three failed calls in a row and it is untried
+again. When dialing, one place in four goes to an untried name, one source
+after the other. The names of one source hold at most an eighth of the
+book, every peer reached at an onion name counting as one source with Tor;
+a peer we dialed writes 64 names per request. Round 3b had found that a
+mere SOCKS connection, which any listener gives, counted as an answer, and
+that each onion service of one attacker was a source of its own. **Residual:** an entry point that
 never dials an onion proves none, and eight address groups can still
 replace its untried names; every Tor caller shares one hourly budget.
 

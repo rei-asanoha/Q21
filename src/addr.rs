@@ -518,10 +518,14 @@ impl AddrStore {
 /// restarts while the entry points are down still knows where the onion
 /// services are.
 ///
-/// A name that answered once is never pushed out by a name nobody tried,
-/// and is dialed and passed on first; the names one source wrote, and that
-/// never answered, hold at most [`ONION_SHARE_PER_SOURCE`] places, its newer
-/// names then replacing its older ones. Until 0.5.9 the stalest name went,
+/// A name whose node completed a handshake with us (answered) is never
+/// pushed out by a name nobody tried, and is passed on first; three failed
+/// calls in a row and it is an untried name again. Dialing mixes the two:
+/// one place in [`ONION_UNTRIED_EVERY`] goes to an untried name, of a
+/// different source each time, so that names which answered once cannot
+/// keep a node to themselves. The names one source wrote, and that never
+/// answered, hold at most [`ONION_SHARE_PER_SOURCE`] places, its newer names
+/// then replacing its older ones. Until 0.5.9 the stalest name went,
 /// whoever had vouched for it: two address groups, or one peer we dialed,
 /// replaced the whole book with names of their own, which the node then
 /// dialed first and passed on to every peer (red-team campaign 8).
@@ -534,8 +538,11 @@ pub struct OnionBook {
 pub struct OnionEntry {
     pub addr: crate::wire::OnionAddr,
     pub failures: u32,
-    /// The name answered a call of ours at least once.
+    /// A node completed a handshake with us at this name, and has not failed
+    /// [`ONION_ANSWERED_FAILURES`] calls in a row since.
     pub answered: bool,
+    /// When it last did, by our clock (0: never). Not a date a peer wrote.
+    pub last_success: u64,
     /// Who wrote it: a key of the peer's address group, or
     /// [`ONION_SOURCE_LOCAL`] for this node's own file.
     pub source: u64,
@@ -546,6 +553,12 @@ pub const ONION_SHARE_PER_SOURCE: usize = MAX_ONIONS / 8;
 
 /// The source of names read from this node's own `onions.dat`: no share.
 pub const ONION_SOURCE_LOCAL: u64 = 0;
+
+/// Failed calls in a row after which a name that answered is untried again.
+pub const ONION_ANSWERED_FAILURES: u32 = 3;
+
+/// One place in this many, in the order of dialing, goes to an untried name.
+pub const ONION_UNTRIED_EVERY: usize = 4;
 
 /// Onion names kept at most.
 pub const MAX_ONIONS: usize = 1_000;
@@ -620,6 +633,7 @@ impl OnionBook {
             addr: a,
             failures: 0,
             answered: false,
+            last_success: 0,
             source,
         });
         true
@@ -632,6 +646,7 @@ impl OnionBook {
         v.sort_by(|a, b| {
             b.answered
                 .cmp(&a.answered)
+                .then(b.last_success.cmp(&a.last_success))
                 .then(b.addr.last_seen.cmp(&a.addr.last_seen))
                 .then(a.addr.name.cmp(&b.addr.name))
         });
@@ -646,7 +661,30 @@ impl OnionBook {
             .find(|e| e.addr.name == name && e.addr.port == port)
         {
             e.answered = true;
+            e.last_success = e.addr.last_seen;
         }
+    }
+
+    /// A node completed a handshake with us at this name.
+    pub fn note_handshake(&mut self, name: &str, port: u16, now: u64) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.addr.name == name && e.addr.port == port)
+        {
+            e.failures = 0;
+            e.answered = true;
+            e.last_success = now;
+        }
+    }
+
+    /// The names whose stand-in address (see
+    /// [`crate::socks::Target::label`]) is `label`.
+    pub fn name_of_label(&self, label: std::net::SocketAddr) -> Option<(String, u16)> {
+        self.entries
+            .iter()
+            .find(|e| crate::socks::Target::Name(e.addr.host(), e.addr.port).label() == label)
+            .map(|e| (e.addr.name.clone(), e.addr.port))
     }
 
     /// The names that answered first, then the freshest, at most `count`.
@@ -666,6 +704,9 @@ impl OnionBook {
         {
             let e = &mut self.entries[pos];
             e.failures = e.failures.saturating_add(1);
+            if e.failures >= ONION_ANSWERED_FAILURES {
+                e.answered = false;
+            }
             if e.failures >= MAX_ONION_FAILURES
                 && now.saturating_sub(e.addr.last_seen) > ONION_FORGET_AFTER
             {
@@ -674,17 +715,52 @@ impl OnionBook {
         }
     }
 
-    /// The names to dial first: those that answered, then the freshest.
+    /// The names to dial, in order: those that answered, most recently
+    /// first, with one place in [`ONION_UNTRIED_EVERY`] given to an untried
+    /// name — the fewest failures, then the freshest, one source after the
+    /// other.
     pub fn to_try(&self) -> Vec<crate::wire::OnionAddr> {
-        let mut v: Vec<&OnionEntry> = self.entries.iter().collect();
-        v.sort_by(|a, b| {
-            b.answered
-                .cmp(&a.answered)
-                .then(a.failures.cmp(&b.failures))
+        let mut answered: Vec<&OnionEntry> = self.entries.iter().filter(|e| e.answered).collect();
+        answered.sort_by(|a, b| {
+            b.last_success
+                .cmp(&a.last_success)
+                .then(a.addr.name.cmp(&b.addr.name))
+        });
+        let mut untried: Vec<&OnionEntry> = self.entries.iter().filter(|e| !e.answered).collect();
+        untried.sort_by(|a, b| {
+            a.failures
+                .cmp(&b.failures)
                 .then(b.addr.last_seen.cmp(&a.addr.last_seen))
                 .then(a.addr.name.cmp(&b.addr.name))
         });
-        v.into_iter().map(|e| e.addr.clone()).collect()
+        // One source after the other: the first of each, then the second...
+        let mut rank: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let mut keyed: Vec<(usize, usize, &OnionEntry)> = untried
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let r = rank.entry(e.source).or_insert(0);
+                *r += 1;
+                (*r, i, e)
+            })
+            .collect();
+        keyed.sort_by_key(|(r, i, _)| (*r, *i));
+        let mut untried = keyed.into_iter().map(|(_, _, e)| e);
+        let mut answered = answered.into_iter();
+        let mut out = Vec::with_capacity(self.entries.len());
+        loop {
+            let slot_untried = out.len() % ONION_UNTRIED_EVERY == ONION_UNTRIED_EVERY - 1;
+            let next = if slot_untried {
+                untried.next().or_else(|| answered.next())
+            } else {
+                answered.next().or_else(|| untried.next())
+            };
+            match next {
+                Some(e) => out.push(e.addr.clone()),
+                None => break,
+            }
+        }
+        out
     }
 
     pub fn note_success(&mut self, name: &str, port: u16, now: u64) {
@@ -694,7 +770,6 @@ impl OnionBook {
             .find(|e| e.addr.name == name && e.addr.port == port)
         {
             e.failures = 0;
-            e.answered = true;
             e.addr.last_seen = now;
         }
     }
@@ -1011,7 +1086,7 @@ mod tests {
         let mut book = OnionBook::default();
         book.add(onion('a', 21121, 50), 1_000);
         book.add(onion('b', 21500, 70), 1_000);
-        book.note_success(&onion('a', 0, 0).name, 21121, 900);
+        book.note_handshake(&onion('a', 0, 0).name, 21121, 900);
         save_onion_entries(&p, &book.entries()).expect("write");
         let back = load_onion_entries(&p, 1_000);
         assert_eq!(back.len(), 2);
@@ -1034,7 +1109,7 @@ mod tests {
         }
         assert_eq!(book.len(), ONION_SHARE_PER_SOURCE, "one source, one share");
         let kept: Vec<String> = book.entries().iter().map(|e| e.addr.name.clone()).collect();
-        book.note_success(&kept[0], 21121, 1_000);
+        book.note_handshake(&kept[0], 21121, 1_000);
         for k in 0..MAX_ONIONS as u32 {
             let mut o = onion('b', 21121, 999);
             o.name = format!("{}{:0>5}d", &onion('b', 0, 0).name[..50], to_b32(k));
@@ -1046,6 +1121,55 @@ mod tests {
             .iter()
             .any(|e| e.addr.name == kept[0] && e.answered));
         assert_eq!(book.to_try()[0].name, kept[0], "dialed first");
+    }
+
+    /// Round 3b: a SOCKS connection proves nothing (any listener gives
+    /// one); only a handshake makes a name answered, three failures in a row
+    /// make it untried again, and one place in four goes to an untried name,
+    /// one source after the other.
+    #[test]
+    fn only_a_handshake_proves_an_onion_name_and_untried_names_keep_a_place() {
+        let mut book = OnionBook::default();
+        let name = |c: char, k: u32| {
+            let mut o = onion(c, 21121, 100);
+            o.name = format!("{}{:0>5}d", &onion(c, 0, 0).name[..50], to_b32(k));
+            o
+        };
+        for k in 0..6 {
+            book.add_from(name('a', k), 1_000, 1);
+        }
+        for k in 0..3 {
+            book.add_from(name('b', k), 1_000, 2);
+            book.add_from(name('c', k), 1_000, 3);
+        }
+        let a0 = name('a', 0).name;
+        book.note_success(&a0, 21121, 900);
+        assert!(
+            !book.entries().iter().any(|e| e.answered),
+            "a connection is not a handshake"
+        );
+        for k in 0..6 {
+            book.note_handshake(&name('a', k).name, 21121, 900 + u64::from(k));
+        }
+        let order: Vec<String> = book.to_try().into_iter().map(|a| a.name).collect();
+        assert!(
+            order[3].starts_with('b') || order[3].starts_with('c'),
+            "{order:?}"
+        );
+        assert!(order[7].starts_with('b') || order[7].starts_with('c'));
+        assert_ne!(
+            order[3].chars().next(),
+            order[7].chars().next(),
+            "two sources"
+        );
+        assert_eq!(order[0], name('a', 5).name, "the latest handshake first");
+        for _ in 0..ONION_ANSWERED_FAILURES {
+            book.note_failure(&a0, 21121, 1_000);
+        }
+        assert!(book
+            .entries()
+            .iter()
+            .any(|e| e.addr.name == a0 && !e.answered));
     }
 
     fn to_b32(mut k: u32) -> String {

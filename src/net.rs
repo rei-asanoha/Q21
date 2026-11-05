@@ -186,10 +186,23 @@ pub enum NetGroup {
 /// (see [`crate::addr::ONION_SHARE_PER_SOURCE`]): the peer's address group,
 /// every Tor peer being one. Never [`crate::addr::ONION_SOURCE_LOCAL`].
 fn onion_source(source: (Option<NetGroup>, bool)) -> u64 {
+    // Every peer we reached through Tor, at its onion name's stand-in, is
+    // the Tor source too: each name has a stand-in of its own, and eight
+    // onion services of one attacker were eight sources (third round).
+    let source = match source {
+        (Some(NetGroup::V4([a, _])), false) if a & 0xf0 == 240 => (None, true),
+        other => other,
+    };
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut h);
     h.finish().max(1)
+}
+
+/// The stand-in address of a peer dialed at an onion name (see
+/// [`crate::socks::Target::label`]).
+fn is_onion_label(a: SocketAddr) -> bool {
+    matches!(a, SocketAddr::V4(v) if v.ip().octets()[0] & 0xf0 == 240)
 }
 
 /// Loopback is not a group: several nodes on the same machine (regtest,
@@ -3253,6 +3266,30 @@ impl Node {
     }
 
     fn inbound_decision(&self, address: Option<SocketAddr>) -> InboundDecision {
+        let d = self.inbound_decision_now(address);
+        // A group that replaces its own seat, just past its first minute, is
+        // keeping a seat young without ever hanging up: counted as a hang-up
+        // (red-team campaign 8, third round).
+        if let (InboundDecision::Evict(id), Some(gr)) = (&d, address.and_then(inbound_group)) {
+            let mut g = self.shared.lock().unwrap();
+            let now = Instant::now();
+            let renewed = g.peers.get(id).is_some_and(|p| {
+                !p.outbound
+                    && inbound_group(p.addr) == Some(gr)
+                    && now.saturating_duration_since(p.connected_at) < 2 * EVICTION_NEWCOMER_GRACE
+            });
+            if renewed {
+                let seen = g.inbound_hangups.entry(gr).or_default();
+                seen.retain(|t| now.saturating_duration_since(*t) < INBOUND_REDIAL_WINDOW);
+                if seen.len() < 4 * INBOUND_REDIALS {
+                    seen.push(now);
+                }
+            }
+        }
+        d
+    }
+
+    fn inbound_decision_now(&self, address: Option<SocketAddr>) -> InboundDecision {
         let g = self.shared.lock().unwrap();
         if let Some(gr) = address.and_then(inbound_group) {
             let same = g
@@ -4355,6 +4392,7 @@ impl Node {
                 }
 
                 Message::VerAck => {
+                    let mut onion_answered: Option<SocketAddr> = None;
                     let (behind, locator) = {
                         let height = g.chain.height();
                         let p = g.peers.get_mut(&id);
@@ -4365,6 +4403,13 @@ impl Node {
                             // (connection to oneself) is not bypassed.
                             Some(p) if p.version_received => {
                                 p.handshaked = true;
+                                // A node answered at an onion name we dialed:
+                                // the name is proven (red-team campaign 8,
+                                // third round: a SOCKS connection alone
+                                // proved it, which any listener gives).
+                                if p.outbound && is_onion_label(p.addr) {
+                                    onion_answered = Some(p.addr);
+                                }
                                 if channel_link(network, p) {
                                     channel_peer_ready = Some(ChannelLink {
                                         outbound: p.outbound,
@@ -4380,6 +4425,11 @@ impl Node {
                             _ => (false, Vec::new()),
                         }
                     };
+                    if let Some(label) = onion_answered {
+                        if let Some((name, port)) = g.onions.name_of_label(label) {
+                            g.onions.note_handshake(&name, port, unix_now());
+                        }
+                    }
                     if behind {
                         outgoing.push(Outgoing {
                             peer: id,
@@ -7618,6 +7668,83 @@ mod tests {
             a.inbound_decision(Some(other)),
             InboundDecision::Evict(inbound),
             "the honest wallet lost its seat one second after its handshake"
+        );
+        a.shutdown();
+    }
+
+    /// Red-team campaign 8, round 3b: an occupant that never hangs up, and
+    /// whose group arrives again as its seat turns a minute old, made the
+    /// node close the old seat itself: no hang-up was ever counted. Its own
+    /// group replacing a seat under two minutes old now counts as one.
+    #[test]
+    fn a_group_renewing_its_own_young_seat_loses_the_grace() {
+        let net = Network::Testnet;
+        let a = Node::new(net, Chain::new(net, genesis_block(net)));
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(Duration::from_secs(3600)) else {
+            return;
+        };
+        let mut id = 0u64;
+        for k in 0..INBOUND_LOOPBACK_MAX as u64 {
+            id += 1;
+            fake_peer(
+                &a,
+                id,
+                format!("127.0.0.1:{}", 40000 + k).parse().unwrap(),
+                false,
+            );
+            settle_peer(&a, id, long_ago + Duration::from_millis(id), None);
+        }
+        for g in 1..=4u8 {
+            for s in 1..=2u8 {
+                id += 1;
+                fake_peer(
+                    &a,
+                    id,
+                    format!("46.{g}.0.{s}:21121").parse().unwrap(),
+                    false,
+                );
+                settle_peer(
+                    &a,
+                    id,
+                    long_ago + Duration::from_secs(60) + Duration::from_millis(id),
+                    None,
+                );
+            }
+        }
+        let mut young = 0u64;
+        for g in 1..=4u8 {
+            id += 1;
+            fake_peer(&a, id, format!("46.{g}.0.10:21121").parse().unwrap(), false);
+            settle_peer(&a, id, now - Duration::from_secs(10 * u64::from(g)), None);
+            if g == 1 {
+                young = id;
+            }
+        }
+        assert_eq!(id as usize, MAX_PEERS - RESERVED_OUTBOUND_SLOTS);
+        let honest: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        assert!(matches!(
+            a.inbound_decision(Some(honest)),
+            InboundDecision::Refuse(_)
+        ));
+        // Group 46.1 renews its seat twice, each time as it turns a minute.
+        for round in 0..2u64 {
+            settle_peer(&a, young, now - Duration::from_secs(61), None);
+            let again: SocketAddr = format!("46.1.0.{}:21121", 11 + round).parse().unwrap();
+            assert_eq!(
+                a.inbound_decision(Some(again)),
+                InboundDecision::Evict(young)
+            );
+            a.disconnect(young);
+            id += 1;
+            fake_peer(&a, id, again, false);
+            settle_peer(&a, id, Instant::now(), None);
+            young = id;
+        }
+        assert_eq!(
+            a.inbound_decision(Some(honest)),
+            InboundDecision::Evict(young),
+            "the renewed seat has no grace left"
         );
         a.shutdown();
     }
@@ -11592,8 +11719,49 @@ mod tests_handler_review {
                 "{name} pushed out"
             );
         }
+        // Six places in eight to names that answered; two to untried names,
+        // of two different sources.
         let first: Vec<String> = m.onions_to_try(8).into_iter().map(|a| a.name).collect();
-        assert!(first.iter().all(|f| answered.contains(f)), "{first:?}");
+        assert_eq!(
+            first.iter().filter(|f| answered.contains(f)).count(),
+            6,
+            "{first:?}"
+        );
+    }
+
+    /// Round 3b: a name is proven by a handshake with the node dialed at
+    /// it, not by a SOCKS connection; every peer dialed at an onion name is
+    /// one source with Tor.
+    #[test]
+    fn an_onion_name_is_proven_by_a_handshake() {
+        let n = node();
+        let now = unix_now();
+        let names = onion_names(6, 2, now);
+        n.seed_onions(names.iter().cloned().map(|a| (a, false)).collect());
+        let label = crate::socks::Target::Name(names[0].host(), names[0].port).label();
+        let _l = anonymous_peer(&n, 9);
+        {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&9).unwrap();
+            p.addr = label;
+            p.outbound = true;
+            p.version_received = true;
+        }
+        n.note_onion_result(&names[0], true);
+        assert!(
+            !n.onion_entries().iter().any(|e| e.answered),
+            "a SOCKS connection"
+        );
+        assert!(n.handle(9, Message::VerAck));
+        let e = n.onion_entries();
+        assert!(e.iter().any(|e| e.addr.name == names[0].name && e.answered));
+        assert!(e
+            .iter()
+            .any(|e| e.addr.name == names[1].name && !e.answered));
+        assert_eq!(
+            onion_source((inbound_group(label), false)),
+            onion_source((None, true))
+        );
     }
 
     /// Red-team campaign 8, third round: addresses already known, passed on
