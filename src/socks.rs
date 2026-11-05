@@ -130,6 +130,17 @@ pub fn connect(
     timeout: Duration,
 ) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect_timeout(&proxy, timeout)?;
+    // A proxy on this computer must still be this account's or the
+    // system's, at every connection: chosen once at startup, its port could
+    // be taken later by another account (a system Tor restarting), or held
+    // from the start by one, the node then waiting on it for a Tor
+    // (round 2 of red-team campaign 9). Only on Linux, see
+    // [`listener_owner_trusted`].
+    if foreign_proxy(proxy, listener_owner_trusted) {
+        drop(s);
+        note_foreign_proxy(proxy);
+        return Err(failure(FOREIGN_PROXY));
+    }
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
 
@@ -261,6 +272,37 @@ fn own_uid() -> Option<u32> {
         .and_then(|v| v.parse().ok())
 }
 
+/// Whether `proxy` is on this computer and its port held by a program of
+/// another account, as `trusted` tells.
+fn foreign_proxy(proxy: SocketAddr, trusted: impl Fn(u16) -> bool) -> bool {
+    proxy.ip().is_loopback() && !trusted(proxy.port())
+}
+
+/// Why a connection through a local proxy was not made.
+pub const FOREIGN_PROXY: &str =
+    "the proxy's port on this computer is held by a program of another account: nothing is sent through it";
+
+/// Says so on the console, at most every ten minutes.
+fn note_foreign_proxy(proxy: SocketAddr) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 600
+        && LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        eprintln!(
+            "warning: {proxy}: {FOREIGN_PROXY}. Start Tor under your own account, or use the \
+             Tor in the tor/ folder next to the program."
+        );
+    }
+}
+
 fn failure(msg: &str) -> std::io::Error {
     std::io::Error::other(msg.to_string())
 }
@@ -283,6 +325,24 @@ fn reply_text(code: u8) -> &'static str {
 pub mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// Round 2 of red-team campaign 9: a node with no Tor waited on
+    /// 127.0.0.1:9050 whoever listened there, and a port chosen at startup
+    /// could change hands later. Every connection through a local proxy
+    /// checks its owner; a proxy elsewhere is the user's own choice.
+    #[test]
+    fn every_connection_through_a_local_proxy_checks_its_owner() {
+        let local: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let elsewhere: SocketAddr = "192.0.2.7:9050".parse().unwrap();
+        assert!(foreign_proxy(local, |_| false));
+        assert!(!foreign_proxy(local, |_| true));
+        assert!(!foreign_proxy(elsewhere, |_| false));
+        assert!(foreign_proxy("[::1]:9150".parse().unwrap(), |p| p != 9150));
+        // The real check passes for a port of this account.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        assert!(!foreign_proxy(addr, listener_owner_trusted));
+    }
 
     /// The owner of a listening port is read from `/proc/net/tcp`; another
     /// person's account is not trusted, a system one is (red-team campaign

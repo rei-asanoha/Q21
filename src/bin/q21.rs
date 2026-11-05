@@ -5230,9 +5230,9 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 }
             } else {
                 eprintln!(
-                    "  Tor not found: no tor/ folder next to the program, nothing listening on \
-                     127.0.0.1:9050 nor 9150, no tor on the PATH. This node will not connect \
-                     in the clear: it waits for Tor."
+                    "  Tor not found: no tor/ folder next to the program, no Tor of this account \
+                     or of the system listening on 127.0.0.1:9050 nor 9150, no tor on the PATH. \
+                     This node will not connect in the clear: it waits for Tor on 127.0.0.1:9050."
                 );
                 Some(tor_unreachable)
             }
