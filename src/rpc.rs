@@ -886,6 +886,7 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
         .set("behind_claimed", Json::Bool(s.behind_claimed))
         .set("splices", Json::Bool(s.splices))
         .set("splice_refused", Json::Bool(s.splice_refused))
+        .set("funding_gone", Json::Bool(s.funding_gone))
         .set(
             "splice",
             match s.splice {
@@ -6673,6 +6674,7 @@ mod tests {
             splice: None,
             splices: true,
             splice_refused: false,
+            funding_gone: false,
         };
         let j = channel_json(s);
         for field in [

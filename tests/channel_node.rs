@@ -4125,3 +4125,125 @@ fn an_older_twin_of_the_peer_cannot_make_a_restored_wallet_close_with_a_revoked_
     assert!(refused.contains("restored from a backup"), "{refused}");
     let _ = (capacity, victim_latest, acc_now);
 }
+
+/// Red-team campaign 9: a reorganization took a channel's funding off the
+/// chain, and both ends kept paying on it, the payee holding a balance
+/// nothing backed. Nothing is signed on such a channel — neither a payment of
+/// ours nor one of the peer's — until its funding confirms again; then the
+/// peer's waiting payment goes through at the next reestablish.
+#[test]
+fn a_channel_whose_funding_left_the_chain_signs_nothing_until_it_confirms_again() {
+    use q21_core::channel::manager::FUNDING_GONE;
+    let (mut p, _wallet, chain, _dir, cid, _capacity) =
+        open_channel([0xa7u8; 32], [0xa8u8; 32], "funding-gone");
+    let m = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 1_000_000);
+
+    // The funding is no longer an output of the active chain.
+    let h = chain.lock().unwrap().height();
+    let no_depth = |_: &OutPoint| None;
+    p.funder.on_connected_block(&[], h, &no_depth);
+    p.acceptor.on_connected_block(&[], h, &no_depth);
+    assert!(p.funder.info(cid).unwrap().funding_gone);
+    assert!(p.acceptor.info(cid).unwrap().funding_gone);
+    assert_eq!(p.funder.pay(cid, 1_000_000).unwrap_err(), FUNDING_GONE);
+    assert_eq!(p.acceptor.pay(cid, 1).unwrap_err(), FUNDING_GONE);
+    assert_eq!(p.funder.splice(cid, 1_000_000).unwrap_err(), FUNDING_GONE);
+
+    // Back on the chain for the funder only: its payment reaches an acceptor
+    // that still sees the funding gone, and signs nothing.
+    drive(&p.funder, &chain);
+    assert!(!p.funder.info(cid).unwrap().funding_gone);
+    let m = p.funder.pay(cid, 2_000_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 1_000_000);
+
+    // Confirmed again for the acceptor: the payment goes through once both
+    // ends resynchronize.
+    drive(&p.acceptor, &chain);
+    assert!(!p.acceptor.info(cid).unwrap().funding_gone);
+    reconnect(&mut p);
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 3_000_000);
+    assert_eq!(p.funder.info(cid).unwrap().remote_balance, 3_000_000);
+}
+
+/// 0.5.10: a channel whose close confirmed is closed for its owner. Watched
+/// until the close is buried, it no longer counts toward the channels a peer
+/// may hold: eight closes with one contact refused a ninth channel with it
+/// until they were buried, a day on testnet.
+#[test]
+fn closed_channels_still_watched_do_not_hold_a_peers_slots() {
+    use q21_core::channel::manager::MAX_CHANNELS_PER_PEER;
+    let funder_seed = [0xb3u8; 32];
+    let acceptor_seed = [0xb4u8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("closed-is-closed");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet,
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let capacity = 4 * MIN_OUTPUT_VALUE;
+    // Buried at 20 blocks: on regtest a close is watched as long as the
+    // funding was buried, so all eight stay watched below.
+    let depth = 20u16;
+    // Four at a time: opens not yet funded have a budget of their own.
+    for _ in 0..2 {
+        for _ in 0..MAX_CHANNELS_PER_PEER / 2 {
+            let hello = p.funder.open(A_PEER, capacity, None, Some(depth)).unwrap();
+            p.queue.push_back((1, hello));
+            p.pump();
+        }
+        for _ in 0..depth {
+            chain.lock().unwrap().mine(&[]);
+        }
+        for (_, f) in drive(&p.funder, &chain) {
+            p.queue.push_back((1, f));
+        }
+        for (_, f) in drive(&p.acceptor, &chain) {
+            p.queue.push_back((0, f));
+        }
+        p.pump();
+    }
+    let cids: Vec<Hash256> = p.funder.list().iter().map(|s| s.channel_id).collect();
+    assert_eq!(cids.len(), MAX_CHANNELS_PER_PEER);
+    assert!(
+        p.funder.open(A_PEER, capacity, None, Some(depth)).is_err(),
+        "eight channels in progress"
+    );
+    for cid in &cids {
+        assert_eq!(p.funder.info(*cid).unwrap().phase, Phase::Open);
+        let close = p.funder.close(*cid).unwrap().expect("a close frame");
+        p.queue.push_back((1, close));
+        p.pump();
+        // Its block, seen by both.
+        drive(&p.funder, &chain);
+        drive(&p.acceptor, &chain);
+    }
+    // Every close confirmed; none buried yet: all still watched.
+    for cid in &cids {
+        let s = p.funder.info(*cid).unwrap();
+        assert!(s.close_height.is_some(), "close confirmed");
+        assert_ne!(s.phase, Phase::Closed, "still watched");
+    }
+    // A ninth channel with the same contact: opened, and accepted.
+    let hello = p.funder.open(A_PEER, capacity, None, Some(depth)).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    assert_eq!(p.acceptor.pending_opens().1, 0);
+    assert_eq!(
+        p.acceptor
+            .list()
+            .iter()
+            .filter(|s| !cids.contains(&s.channel_id))
+            .count(),
+        1,
+        "the acceptor took the ninth channel"
+    );
+}

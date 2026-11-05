@@ -261,6 +261,9 @@ pub struct ChannelSummary {
     pub splices: bool,
     /// Our last splice was refused: a payment of the peer crossed it.
     pub splice_refused: bool,
+    /// The funding left the chain in a reorganization: nothing is signed on
+    /// the channel until it confirms again.
+    pub funding_gone: bool,
 }
 
 /// How a channel ended, as its last phase before it was marked closed tells.
@@ -472,6 +475,12 @@ struct Chan {
     splice_held: Option<Transaction>,
     /// Our last splice was refused (see [`ChannelSummary::splice_refused`]).
     splice_refused: bool,
+    /// The funding of this open channel is no longer confirmed on the active
+    /// chain: a reorganization took it away. Nothing is signed on the
+    /// channel until it confirms again (red-team campaign 9: both ends kept
+    /// paying on a channel whose funding no longer existed). Kept in memory
+    /// only, and checked again at every block.
+    funding_gone: bool,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -577,6 +586,12 @@ impl Chan {
     /// Whether nothing may be signed nor broadcast on this channel: our copy
     /// is proven older, or the peer has just claimed it and may still prove
     /// it.
+    /// The transaction that ends the channel confirmed: closed for its owner,
+    /// watched until it is buried.
+    fn settling(&self) -> bool {
+        matches!(self.close, Some(CloseTracker::Settling { .. }))
+    }
+
     fn refuses(&self) -> bool {
         self.behind
             && (self.behind_proven
@@ -589,6 +604,11 @@ impl Chan {
 /// Why a wallet off the channel scheme closes its channels alone.
 const NO_COOPERATIVE_CLOSE: &str = "this wallet cannot receive a cooperative close: close the \
      channel alone, and your share comes back to the identity address";
+
+/// The refusal of anything signed on a channel whose funding a
+/// reorganization took off the chain, until it confirms again.
+pub const FUNDING_GONE: &str = "the channel's funding is no longer confirmed on the chain (a \
+     reorganization took it away): payments wait until it confirms again";
 
 /// The refusal of a close alone after an unproven claim of an older copy has
 /// lapsed: the holder confirms it first ([`ChannelManager::force_close_with`]).
@@ -620,6 +640,15 @@ pub const FORCE_CLOSE_TIER: crate::channel::txbuild::FeeTier =
 
 /// Channels one peer may hold with this node at once, settled ones aside.
 pub const MAX_CHANNELS_PER_PEER: usize = 8;
+/// Channels with one peer whose close confirmed and that are still watched,
+/// at most: each costs its owner an opening and a close on the chain, and a
+/// peer that piles them up is refused a new channel until they are buried.
+pub const MAX_SETTLING_PER_PEER: usize = 32;
+
+/// The refusal of a new channel with a peer holding
+/// [`MAX_SETTLING_PER_PEER`] recently closed channels.
+pub const MANY_RECENT_CHANNELS: &str = "many recent channels with this contact: closed channels \
+     stay watched for about a day for your safety; a new one can be opened tomorrow";
 /// Channel opens waiting for the peer's next message, across all peers, on
 /// each side of the handshake.
 pub const MAX_PENDING_OPENS: usize = 16;
@@ -786,11 +815,25 @@ impl Inner {
     }
 
     /// Channels held with a peer, known by its connection id or its durable
-    /// identity, settled ones aside.
+    /// identity: those in progress, open or still closing. A channel whose
+    /// close confirmed is closed for its owner, and no longer counts here,
+    /// though it is watched until its close is buried (see
+    /// [`Self::settling_with`]): eight closes in a day with one contact
+    /// refused a ninth channel with it for a day (0.5.10).
     fn channels_with(&self, peer: u64, identity: &str) -> usize {
         self.channels
             .values()
-            .filter(|c| c.machine.phase() != Phase::Closed)
+            .filter(|c| c.machine.phase() != Phase::Closed && !c.settling())
+            .filter(|c| c.peer == peer || (!identity.is_empty() && c.peer_identity == identity))
+            .count()
+    }
+
+    /// Channels with a peer whose close confirmed, still watched until it is
+    /// buried past any reorganization (see [`settle_depth`]).
+    fn settling_with(&self, peer: u64, identity: &str) -> usize {
+        self.channels
+            .values()
+            .filter(|c| c.machine.phase() != Phase::Closed && c.settling())
             .filter(|c| c.peer == peer || (!identity.is_empty() && c.peer_identity == identity))
             .count()
     }
@@ -1015,6 +1058,7 @@ impl ChannelManager {
                         close: None,
                         spend: None,
                         reserved: false,
+                        funding_gone: false,
                         conflict: None,
                         logged: None,
                         behind,
@@ -1621,6 +1665,9 @@ impl ChannelManager {
         if g.channels_with(peer, peer_identity) >= MAX_CHANNELS_PER_PEER {
             return Err("too many channels with this peer".into());
         }
+        if g.settling_with(peer, peer_identity) >= MAX_SETTLING_PER_PEER {
+            return Err(MANY_RECENT_CHANNELS.into());
+        }
         if g.unfunded(false) >= MAX_UNFUNDED_OUTBOUND {
             return Err("too many channels waiting for their funding".into());
         }
@@ -1666,6 +1713,9 @@ impl ChannelManager {
         }
         if chan.machine.phase() != Phase::Open {
             return Err("channel not open".into());
+        }
+        if chan.funding_gone {
+            return Err(FUNDING_GONE.into());
         }
         if !chan.synced {
             return Err("channel is not yet resynchronized with its peer".into());
@@ -1717,6 +1767,9 @@ impl ChannelManager {
             }
             if chan.machine.phase() != Phase::Open {
                 return Err("channel not open".into());
+            }
+            if chan.funding_gone {
+                return Err(FUNDING_GONE.into());
             }
             if !chan.synced {
                 return Err("channel is not yet resynchronized with its peer".into());
@@ -2100,6 +2153,7 @@ impl ChannelManager {
             !full
                 && !same_identity
                 && g.channels_with(peer, peer_identity) < MAX_CHANNELS_PER_PEER
+                && g.settling_with(peer, peer_identity) < MAX_SETTLING_PER_PEER
                 && g.inbound_room(peer, peer_identity)
         };
         if !admitted(&mut self.inner.lock().unwrap()) {
@@ -2202,6 +2256,7 @@ impl ChannelManager {
                 close: None,
                 spend: None,
                 reserved: false,
+                funding_gone: false,
                 conflict: None,
                 logged: None,
                 behind: false,
@@ -2331,6 +2386,9 @@ impl ChannelManager {
             ChMsg::Ready { .. } => {
                 fresh(chan.machine.on_ready(&msg))?;
             }
+            // Nothing is signed on a channel whose funding left the chain:
+            // the peer's update waits, and is resent at the next reestablish.
+            ChMsg::Update { .. } | ChMsg::Splice { .. } if chan.funding_gone => {}
             ChMsg::Update { .. } => {
                 // An ordinary update, one crossing our own proposal (both ends
                 // paid at once: the two are merged into the next state), or a
@@ -2631,6 +2689,7 @@ impl ChannelManager {
                 close: None,
                 spend: None,
                 reserved: false,
+                funding_gone: false,
                 conflict: None,
                 logged: None,
                 behind: false,
@@ -2731,12 +2790,50 @@ impl ChannelManager {
     fn tend_fundings(&self, depth_of: &DepthOf) {
         let mut again = Vec::new();
         let mut release = Vec::new();
+        let mut hold = Vec::new();
         {
             let mut g = self.inner.lock().unwrap();
             for c in g.channels.values_mut() {
+                // An open channel whose funding is no longer an unspent,
+                // confirmed output of the active chain, with no spend of it
+                // seen and no splice under way: a reorganization took it
+                // away (red-team campaign 9).
+                let gone = c.machine.phase() == Phase::Open
+                    && c.spend.is_none()
+                    && c.machine.splice_status().is_none()
+                    && c.machine
+                        .funding_outpoint()
+                        .is_some_and(|op| depth_of(&op).is_none());
+                if gone != c.funding_gone {
+                    c.funding_gone = gone;
+                    eprintln!(
+                        "{}: channel {}: its funding {}",
+                        if gone { "ALERT" } else { "notice" },
+                        c.machine.channel_id().to_hex(),
+                        if gone {
+                            "left the chain in a reorganization; nothing is signed on it \
+                             until it confirms again"
+                        } else {
+                            "is confirmed again"
+                        }
+                    );
+                }
                 let Some(tx) = c.machine.funding_tx().cloned() else {
                     continue;
                 };
+                // Our funding gone: its coins are held back again, so the
+                // wallet spends them nowhere else, and it is announced again
+                // while every coin it spends is still unspent.
+                if gone {
+                    if !c.reserved {
+                        c.reserved = true;
+                        hold.push(tx.clone());
+                    }
+                    if tx.inputs.iter().all(|i| depth_of(&i.prev_out).is_some()) {
+                        again.push(tx);
+                    }
+                    continue;
+                }
                 let opening = matches!(c.machine.phase(), Phase::Opening | Phase::Funded);
                 if c.reserved && (!opening || c.spend.is_some()) {
                     c.reserved = false;
@@ -2776,6 +2873,9 @@ impl ChannelManager {
                     }
                 }
             }
+        }
+        for tx in hold {
+            (self.hooks.reserve)(&tx, true);
         }
         for tx in release {
             (self.hooks.reserve)(&tx, false);
@@ -3926,6 +4026,7 @@ fn summary(c: &Chan, splices: bool) -> ChannelSummary {
         splice: c.machine.splice_status(),
         splices: splices && c.synced,
         splice_refused: c.splice_refused,
+        funding_gone: c.funding_gone,
     }
 }
 

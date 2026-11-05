@@ -13,9 +13,10 @@
 //! # Surviving a torn write
 //!
 //! A crash can stop a write anywhere, but only in the last frame. Opening reads
-//! records in order; a frame that runs past the end of the file, or a bad
-//! checksum on the very last frame, is the half-written tail of the
-//! interrupted append, cut off before anything is appended after it. Anything
+//! records in order; a frame that runs past the end of the file, a bad
+//! checksum on the very last frame, or zeros running to the end of the file
+//! (what a power cut leaves on many file systems) is the half-written tail of
+//! the interrupted append, cut off before anything is appended after it. Anything
 //! else — a bad checksum with frames after it, or a record that passes its
 //! checksum but does not decode — is corruption or a newer version's record:
 //! the journal is refused and left untouched (see [`scan`]). The truncation
@@ -625,14 +626,28 @@ impl std::fmt::Display for Corruption {
     }
 }
 
+/// Whether every byte of `raw` from `from` on is zero.
+fn zeros_to_end(raw: &[u8], from: usize) -> bool {
+    raw.get(from..)
+        .is_some_and(|rest| rest.iter().all(|b| *b == 0))
+}
+
 /// The records of a journal and the length of the bytes they occupy; what
 /// follows is a torn tail. Only an append cut short can tear: a frame running
-/// past the end of the file, or a bad checksum on the very last frame. Any
-/// other fault is [`Corruption`].
+/// past the end of the file, a bad checksum on the very last frame, or zeros
+/// running to the end of the file — a power cut during an append leaves the
+/// file extended with zeros on many file systems (NTFS, APFS, ext4 with
+/// delayed allocation), which refused the whole journal, and the channel with
+/// it, for good (red-team campaign 9). Any other fault is [`Corruption`].
 pub fn scan(raw: &[u8]) -> Result<(Vec<Record>, usize), Corruption> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + 8 <= raw.len() {
+        // No record starts with eight zeros (a frame holds at least a tag):
+        // zeros from here to the end are what an interrupted append left.
+        if zeros_to_end(raw, pos) {
+            break;
+        }
         let len = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
         let crc: [u8; 4] = raw[pos + 4..pos + 8].try_into().unwrap();
         let body_start = pos + 8;
@@ -642,7 +657,9 @@ pub fn scan(raw: &[u8]) -> Result<(Vec<Record>, usize), Corruption> {
         };
         let body = &raw[body_start..body_end];
         if checksum(body) != crc {
-            if body_end == raw.len() {
+            // The last frame, torn: alone at the end, or followed by zeros
+            // only.
+            if body_end == raw.len() || zeros_to_end(raw, body_end) {
                 break;
             }
             return Err(Corruption::BadChecksum { offset: pos });
@@ -775,6 +792,53 @@ mod tests {
         std::fs::write(&path, &last).unwrap();
         assert!(Journal::open(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), last);
+    }
+
+    /// A power cut during an append leaves the file extended with zeros on
+    /// many file systems (NTFS, APFS, ext4 with delayed allocation), alone or
+    /// after part of the frame. Until 0.5.10 nine zeros or more refused the
+    /// journal for good, and the channel was neither loaded nor watched
+    /// (red-team campaign 9). They are a torn tail, cut like any other.
+    #[test]
+    fn zeros_left_by_a_power_cut_are_a_torn_tail() {
+        let path = tmp("zeros");
+        {
+            let (mut j, _) = Journal::open(&path).unwrap();
+            j.append(&Record::Ready).unwrap();
+            j.append(&Record::ClosingCoop { fee: 7 }).unwrap();
+        }
+        let good = std::fs::read(&path).unwrap();
+        let second = frame(&Record::ClosingCoop { fee: 7 }).len();
+        for zeros in [1usize, 8, 9, 512, 4096] {
+            // The whole frame written, then zeros.
+            let mut z = good.clone();
+            z.extend(std::iter::repeat(0u8).take(zeros));
+            std::fs::write(&path, &z).unwrap();
+            let (_, recs) = Journal::open(&path).unwrap();
+            assert_eq!(recs.len(), 2, "{zeros} zeros after the frame");
+            assert_eq!(std::fs::read(&path).unwrap(), good, "cut back");
+            // Part of the frame, then zeros where the rest should be.
+            let mut p = good.clone();
+            let keep = p.len() - second + 5;
+            p.truncate(keep);
+            p.extend(std::iter::repeat(0u8).take(zeros + second));
+            std::fs::write(&path, &p).unwrap();
+            let (_, recs) = Journal::open(&path).unwrap();
+            assert_eq!(recs, vec![Record::Ready], "{zeros} zeros in the frame");
+            assert_eq!(
+                std::fs::read(&path).unwrap().len(),
+                good.len() - second,
+                "the torn frame cut"
+            );
+            std::fs::write(&path, &good).unwrap();
+        }
+        // Zeros followed by anything else are still corruption.
+        let mut rot = good.clone();
+        rot.extend([0u8; 16]);
+        rot.extend(frame(&Record::Forcing));
+        std::fs::write(&path, &rot).unwrap();
+        assert!(Journal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), rot, "nothing written");
     }
 
     /// A bad checksum in the middle of the file is not a torn append: bit rot

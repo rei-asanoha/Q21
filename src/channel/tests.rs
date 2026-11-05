@@ -1494,6 +1494,10 @@ fn a_testnet_acceptor_applies_the_testnet_bounds() {
         (t.default_delay, DEPTH),
         (t.default_delay, t.funding_depth - 1),
         (MAX_DELAY + 1, t.funding_depth),
+        // A depth beyond the longest delay: confirmed, it never opened and
+        // never expired (red-team campaign 9).
+        (t.default_delay, MAX_DELAY + 1),
+        (t.default_delay, u16::MAX),
     ] {
         assert_eq!(
             try_open(delay, depth),
@@ -1505,6 +1509,7 @@ fn a_testnet_acceptor_applies_the_testnet_bounds() {
         (MIN_DELAY_TESTNET, t.funding_depth),
         (t.default_delay, t.funding_depth),
         (MAX_DELAY, t.funding_depth + 4),
+        (t.default_delay, MAX_DELAY),
     ] {
         assert_eq!(
             try_open(delay, depth),

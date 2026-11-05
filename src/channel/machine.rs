@@ -501,9 +501,14 @@ impl Machine {
         // The bounds are the network's (`crate::channel::terms`): a delay or a
         // depth fit for regtest is no protection on a public chain.
         let terms = crate::channel::terms(network);
+        // A funding depth beyond the longest delay is refused too: a channel
+        // whose funding confirmed but that would only open after 65,535
+        // blocks never opened and never expired, and held a slot for months
+        // (red-team campaign 9).
         if *delay < terms.min_delay
             || *delay > terms.max_delay
             || *funding_depth < terms.funding_depth
+            || *funding_depth > terms.max_delay
             || *capacity < crate::channel::MIN_CAPACITY
             || *capacity > crate::channel::MAX_CAPACITY
         {
