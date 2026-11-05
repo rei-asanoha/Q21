@@ -212,8 +212,11 @@ pub fn find_local_tor() -> Option<SocketAddr> {
         .into_iter()
         .map(|p| SocketAddr::from(([127, 0, 0, 1], p)))
         .find(|a| {
-            TcpStream::connect_timeout(a, Duration::from_millis(500)).is_ok()
-                && listener_owner_trusted(a.port())
+            TcpStream::connect_timeout(a, Duration::from_millis(500)).is_ok_and(|s| {
+                listener_owner_trusted(a.port())
+                    && s.local_addr()
+                        .map_or(true, |ours| connection_owner_trusted(*a, ours))
+            })
         })
 }
 

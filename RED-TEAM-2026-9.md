@@ -160,7 +160,7 @@ third round checked the second's fixes. What they found, all fixed in 0.5.10:
   longer than an append can leave, or a journal of zeros only, refuse the
   journal instead of emptying it, and every cut is said on the console.
 - **Public explorer (MEDIUM).** Four answers built at a time bounded how
-  many, not how large: an answer is now at most 4 MiB, what the documented
+  many, not how large: an answer is now at most 4 MB, what the documented
   Caddy reads whole at once, and the error replacing a larger one has a fixed
   size (a first version echoed the visitor's id, six times larger once
   encoded).

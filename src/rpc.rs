@@ -184,10 +184,12 @@ pub const MAX_BATCH_RESPONSE: usize = 8 * 1024 * 1024;
 /// Four answers built at a time bounded how many, not how large: sixty-four
 /// connections reading slowly a large block each held sixty-four copies
 /// (round 2 of red-team campaign 9).
-pub const MAX_PUBLIC_ANSWER: usize = 4 * 1024 * 1024;
+pub const MAX_PUBLIC_ANSWER: usize = 4_000_000;
 
-// Caddy's `response_buffers 4MB`, and never more than a batch may hold.
-const _: () = assert!(MAX_PUBLIC_ANSWER <= 4 * 1024 * 1024);
+// Caddy's `response_buffers 4MB`, four million bytes (round 4: 4 MiB let
+// answers of up to 194,304 bytes more through), and never more than a batch
+// may hold.
+const _: () = assert!(MAX_PUBLIC_ANSWER <= 4_000_000);
 const _: () = assert!(MAX_PUBLIC_ANSWER <= MAX_BATCH_RESPONSE);
 
 /// What a public explorer answers in place of a larger one.

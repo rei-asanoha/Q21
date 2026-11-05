@@ -3518,9 +3518,14 @@ impl Node {
                 .iter()
                 .map(|(id, _)| *id)
                 .filter(|id| {
-                    g.peers
-                        .get(id)
-                        .is_some_and(|p| p.handshaked && p.may_ask_headers(now))
+                    // Renewed at most once per wait, answered or not: the
+                    // maintenance loop calls this several times a second.
+                    g.peers.get(id).is_some_and(|p| {
+                        p.handshaked
+                            && p.headers_renewed.map_or(true, |t| {
+                                now.saturating_duration_since(t) > HEADERS_ANSWER_WAIT
+                            })
+                    })
                 })
                 .collect();
             ids.sort_unstable();
@@ -3716,6 +3721,12 @@ impl Node {
                     }
                     let delivered_nothing =
                         now.duration_since(p.last_delivered) >= BODY_TIMEOUT || no_body;
+                    // Headers it announced and no body behind them: they back
+                    // no height (round 4 of red-team campaign 9: one invented
+                    // header after our tip kept a claimed height counted).
+                    if delivered_nothing {
+                        p.start_height = p.start_height.min(chain.height());
+                    }
                     holders.push((*id, delivered_nothing));
                 }
             }
@@ -10178,6 +10189,40 @@ mod tests_hardening {
             !g.peers[&7].requested_bodies.contains_key(&overdue),
             "the overdue body left its in-flight set, to be asked elsewhere"
         );
+    }
+
+    /// Round 4 of red-team campaign 9: headers announced past our tip with
+    /// no body ever delivered behind them back no height; a peer that keeps
+    /// delivering keeps its claim.
+    #[test]
+    fn a_claim_with_no_body_behind_it_falls_at_the_body_deadline() {
+        let (_a, b) = node_pair();
+        let _liar = established_peer(&b, 7);
+        let _slow = established_peer(&b, 8);
+        // A machine started less than a minute ago cannot go back that far
+        // (Windows: an instant counts from the boot).
+        let Some(long_ago) = Instant::now().checked_sub(BODY_TIMEOUT + Duration::from_secs(1))
+        else {
+            return;
+        };
+        {
+            let mut g = b.shared.lock().unwrap();
+            for (id, h) in [(7u64, 3u8), (8, 4)] {
+                let p = g.peers.get_mut(&id).unwrap();
+                p.start_height = 1_000_000;
+                p.requested_bodies.insert(Hash256([h; 32]), long_ago);
+            }
+            g.peers.get_mut(&7).unwrap().last_delivered = long_ago;
+            g.peers.get_mut(&8).unwrap().last_delivered = Instant::now();
+        }
+        b.maintain_peers();
+        let g = b.shared.lock().unwrap();
+        assert_eq!(
+            g.peers[&7].start_height,
+            g.chain.height(),
+            "nothing delivered"
+        );
+        assert_eq!(g.peers[&8].start_height, 1_000_000, "still delivering");
     }
 
     /// Finding 12: a peer that answers every transaction we ask for but never

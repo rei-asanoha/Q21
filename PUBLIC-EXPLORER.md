@@ -853,9 +853,9 @@ they are, all visitors together (0.5.10): a request waits up to ten seconds
 for its turn, then reads the same "too many requests". Before, six addresses
 asking for a large block in a loop, each within its budget, made the node
 exceed its memory limit and be stopped (red-team campaign 9). And no
-answer is larger than 4 MiB, the `response_buffers` below, so that Caddy
-always reads it whole at once: a larger one (a very large block) reads
-"answer too large for this public service".
+answer is larger than 4 MB (four million bytes), the `response_buffers`
+below, so that Caddy always reads it whole at once: a larger one (a very
+large block) reads "answer too large for this public service".
 
 A visitor address is held to **eight requests under way at once** only while
 their bodies arrive (0.5.8): behind Caddy, which passes each request complete,
