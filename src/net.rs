@@ -185,19 +185,44 @@ pub enum NetGroup {
 /// The key under which the onion book counts the names one source wrote
 /// (see [`crate::addr::ONION_SHARE_PER_SOURCE`]): the peer's address group,
 /// every Tor peer being one. Never [`crate::addr::ONION_SOURCE_LOCAL`].
+///
+/// Written to `onions.dat`, so computed the same way by every build: a
+/// SipHash with fixed keys over fixed bytes, not the standard library's
+/// hasher, whose algorithm may change from one Rust release to the next.
 fn onion_source(source: (Option<NetGroup>, bool)) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut h);
-    h.finish().max(1)
+    let mut b = Vec::with_capacity(10);
+    match source.0 {
+        None => b.push(0),
+        Some(NetGroup::V4(g)) => {
+            b.push(4);
+            b.extend_from_slice(&g);
+        }
+        Some(NetGroup::V6(g)) => {
+            b.push(6);
+            b.extend_from_slice(&g);
+        }
+    }
+    b.push(u8::from(source.1));
+    source_key(b"group", &b)
 }
 
 /// The source key of a peer reached at an onion name: its stand-in itself.
 fn onion_source_of_label(a: SocketAddr) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    a.hash(&mut h);
-    h.finish().max(1)
+    let mut b = match a.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    b.extend_from_slice(&a.port().to_be_bytes());
+    source_key(b"label", &b)
+}
+
+/// A source key, never [`crate::addr::ONION_SOURCE_LOCAL`] (zero).
+fn source_key(domain: &[u8], data: &[u8]) -> u64 {
+    let mut h = crate::siphash::SipHasher::new(0x5132_315f_6f6e_696f, 0x6e5f_736f_7572_6365);
+    h.update(domain);
+    h.update(&[0]);
+    h.update(data);
+    h.finalize().max(1)
 }
 
 /// The stand-in address of a peer dialed at an onion name (see
@@ -1868,6 +1893,18 @@ impl Peer {
         }
     }
 
+    /// May this peer be asked for headers again? When no request is
+    /// outstanding, or when the oldest has gone unanswered past
+    /// [`HEADERS_ANSWER_WAIT`]: a peer with nothing new sends no answer at
+    /// all, and its slot stayed taken for good, so that a reorganization it
+    /// made later was never asked for (round 2 of red-team campaign 9).
+    fn may_ask_headers(&self, now: Instant) -> bool {
+        self.expected_headers == 0
+            || self.headers_asked.map_or(true, |t| {
+                now.saturating_duration_since(t) > HEADERS_ANSWER_WAIT
+            })
+    }
+
     /// Stores a body to request later, if the queue has room.
     fn queue_body(&mut self, h: Hash256) {
         if self.bodies_to_request.len() < MAX_PENDING_BODIES {
@@ -3454,18 +3491,21 @@ impl Node {
     /// chain again at the next one. In the endurance test, a wallet stayed at
     /// one height while the network moved on. One `getheaders` per peer
     /// costs a few hundred bytes; a peer with nothing new sends nothing back,
-    /// and is not asked again while that request is outstanding. Returns the
+    /// and is asked again only once that request has waited
+    /// [`HEADERS_ANSWER_WAIT`] (see [`Peer::may_ask_headers`]). Returns the
     /// number of peers asked.
     pub fn ask_headers_from_all(&self) -> usize {
+        let now = Instant::now();
         let (ids, locator): (Vec<u64>, Vec<Hash256>) = {
             let g = self.shared.lock().unwrap();
             (
-                // Only peers with no header request outstanding: a peer with
-                // nothing new sends no answer, and asking again would pile up
-                // expected answers that never come.
+                // Only peers with no header request outstanding, or one
+                // unanswered past its wait: a peer with nothing new sends no
+                // answer, and asking at once again would pile up expected
+                // answers that never come.
                 g.peers
                     .iter()
-                    .filter(|(_, p)| p.handshaked && p.expected_headers == 0)
+                    .filter(|(_, p)| p.handshaked && p.may_ask_headers(now))
                     .map(|(id, _)| *id)
                     .collect(),
                 g.chain.locator(),
@@ -4725,7 +4765,6 @@ impl Node {
                 Message::Headers(v) => {
                     if let Some(p) = g.peers.get_mut(&id) {
                         p.expected_headers = p.expected_headers.saturating_sub(1);
-                        p.headers_asked = None;
                     }
                     // --- Header-based synchronization, strict on chaining.
                     //
@@ -4758,10 +4797,17 @@ impl Node {
                     }
 
                     if !contiguous {
+                        // An answer that does not connect backs no height:
+                        // whatever it announced, this peer counts for ours
+                        // (round 2 of red-team campaign 9: one orphan header
+                        // per request kept a trillion counted).
+                        let height = g.chain.height();
                         let incompatible = {
                             let p = g.peers.get_mut(&id);
                             match p {
                                 Some(p) => {
+                                    p.start_height = p.start_height.min(height);
+                                    p.headers_asked = None;
                                     p.consecutive_orphans += 1;
                                     p.consecutive_orphans >= 3
                                 }
@@ -4790,6 +4836,7 @@ impl Node {
                             if let Some(end) = end {
                                 p.start_height = p.start_height.min(end);
                             }
+                            p.headers_asked = None;
                             p.consecutive_orphans = 0;
                             // The batch replaces the queue: a peer only replies
                             // with headers to our request, and we only ask for
@@ -5040,7 +5087,10 @@ impl Node {
                         // (`resume_parked`). Without this, each half parked the
                         // other's blocks waiting for a parent it never asked
                         // for — a split that did not heal.
-                        if g.peers.get(&id).is_some_and(|p| p.expected_headers == 0) {
+                        if g.peers
+                            .get(&id)
+                            .is_some_and(|p| p.may_ask_headers(Instant::now()))
+                        {
                             outgoing.push(Outgoing {
                                 peer: id,
                                 message: Message::GetHeaders {
@@ -5664,7 +5714,7 @@ impl Node {
                         let source = (inbound_group(peer.addr), is_loopback(peer.addr));
                         // A peer reached at an onion name is a source of its
                         // own: every stand-in shares one IPv6 prefix.
-                        let onion_key = if is_onion_label(peer.addr) {
+                        let onion_key = if peer.outbound && is_onion_label(peer.addr) {
                             onion_source_of_label(peer.addr)
                         } else {
                             onion_source(source)
@@ -9794,6 +9844,66 @@ mod tests_hardening {
         let _h = established_peer(&d, 7);
         claim(&d, 7, 2);
         assert_eq!(d.max_announced_height(), 2);
+    }
+
+    /// Round 2 of red-team campaign 9: one orphan header in answer to each
+    /// request kept a claim of a trillion counted, and a peer with nothing
+    /// new, which sends no answer, was never asked for headers again.
+    #[test]
+    fn an_orphan_answer_backs_no_height_and_a_silent_peer_is_asked_again() {
+        let (a, b) = node_pair();
+        crate::net::tests_util::mine_locally(&a, 3);
+        let _e = established_peer(&b, 7);
+        b.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&7)
+            .unwrap()
+            .start_height = 1_000_000_000_000;
+        let ask = || {
+            b.send_to(
+                7,
+                &Message::GetHeaders {
+                    locator: vec![],
+                    stop: Hash256::ZERO,
+                },
+            )
+        };
+        ask();
+        let mut orphan = a.with_chain(|c| c.headers_from(&[], Hash256::ZERO, 10))[2];
+        orphan.prev_block = Hash256([0x33; 32]);
+        let _ = b.handle(7, Message::Headers(vec![orphan]));
+        assert_eq!(
+            b.max_announced_height(),
+            b.height(),
+            "an orphan backs nothing"
+        );
+
+        // Asked, never answered: not asked again at once, but once the
+        // request has waited its time.
+        let now = Instant::now();
+        ask();
+        {
+            let g = b.shared.lock().unwrap();
+            let p = &g.peers[&7];
+            assert!(p.expected_headers > 0);
+            assert!(!p.may_ask_headers(now));
+            assert!(p.may_ask_headers(now + HEADERS_ANSWER_WAIT + Duration::from_secs(1)));
+        }
+    }
+
+    const PINNED_LABEL_KEY: u64 = 11_777_873_454_316_842_311;
+    const PINNED_GROUP_KEY: u64 = 9_893_466_556_856_650_762;
+
+    /// The source keys written to `onions.dat` are the same for every build.
+    #[test]
+    fn onion_source_keys_are_pinned() {
+        let label: SocketAddr = "[100::1234:5678:9abc:def0]:21121".parse().unwrap();
+        let group = (Some(NetGroup::V4([198, 51])), false);
+        assert_eq!(onion_source_of_label(label), PINNED_LABEL_KEY);
+        assert_eq!(onion_source(group), PINNED_GROUP_KEY);
+        assert_ne!(onion_source((None, true)), crate::addr::ONION_SOURCE_LOCAL);
     }
 
     /// Red-team campaign 9: two connections calling in showed the "clock
