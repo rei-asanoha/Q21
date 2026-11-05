@@ -589,10 +589,15 @@ struct Bucket {
 pub const SCAN_BURST: u32 = 30;
 /// Scans regained per minute, per client.
 pub const SCANS_PER_MINUTE: u32 = 12;
-/// Burst of the global net: five full clients at once.
-pub const GLOBAL_SCAN_BURST: u32 = 150;
-/// Refill of the global net per minute: one scan per second, sustained.
-pub const GLOBAL_SCANS_PER_MINUTE: u32 = 60;
+/// Burst of the global net: twenty full clients at once.
+///
+/// Five were enough to empty it for everyone else (red-team campaign 9).
+/// What bounds the machine is no longer this net alone: a public node builds
+/// at most [`PUBLIC_ANSWERS_AT_ONCE`] answers at a time, whatever they cost.
+pub const GLOBAL_SCAN_BURST: u32 = 600;
+/// Refill of the global net per minute: four scans per second, sustained,
+/// twenty clients' refill.
+pub const GLOBAL_SCANS_PER_MINUTE: u32 = 240;
 /// Clients tracked at once. Beyond that, the least recently seen gives up its
 /// place - it then starts again with a fresh burst, which costs the net
 /// nothing.
@@ -3654,6 +3659,14 @@ impl RpcContext {
             }
         }
 
+        // An index up to date with the tip, over the whole window a scan
+        // would read, has answered: the transaction is in none of these
+        // blocks, and reading them again would only spend the search budget
+        // all visitors share (red-team campaign 9).
+        if self.index_covers_the_window() {
+            return Err(rpc_error(ERR_NOT_FOUND, "transaction not found"));
+        }
+
         // Otherwise, in the chain. Backward scan: a transaction being looked
         // up is almost always recent. Without an index, we stay honest about
         // the cost - and about the bound.
@@ -4007,6 +4020,21 @@ impl RpcContext {
     // -----------------------------------------------------------------------
 
     /// Where this transaction is, without scanning if the index is there.
+    /// Is there an index up to date with the tip that also holds the oldest
+    /// block a bounded scan would read ([`MAX_SCANNED_BLOCKS`])?
+    fn index_covers_the_window(&self) -> bool {
+        let Some(index) = &self.index else {
+            return false;
+        };
+        let (height, tip) = self
+            .node
+            .with_chain(|c| (c.height(), c.active_at(c.height())));
+        let floor = height.saturating_sub(MAX_SCANNED_BLOCKS);
+        index.lock().is_ok_and(|i| {
+            tip.is_some() && i.block_id(height) == tip && i.block_id(floor).is_some()
+        })
+    }
+
     fn locate_transaction(&self, txid: &Hash256) -> Option<(u64, u32)> {
         if let Some(index) = &self.index {
             if let Ok(i) = index.lock() {
@@ -4272,7 +4300,13 @@ impl RpcContext {
                 hits.push(("transaction", t));
             }
         }
-        self.allow_scan(client)?;
+        // Only the bounded scan below, without an index, reads blocks: with
+        // one, everything here is read from memory, and the call budget is
+        // enough. Charged even then, it let five addresses empty the search
+        // budget all visitors share (red-team campaign 9).
+        if self.index.is_none() {
+            self.allow_scan(client)?;
+        }
         self.node.with_chain(|c| {
             for h in 0..=c.height() {
                 if let Some(id) = c.active_at(h) {
@@ -9486,6 +9520,43 @@ mod tests {
             c.index = Some(Arc::new(Mutex::new(index)));
         }
         (c, txid)
+    }
+
+    /// Red-team campaign 9: five addresses, each within its own budget,
+    /// emptied the search budget all visitors share, with lookups an index
+    /// answers from memory. With an index up to date, an unknown
+    /// transaction and an identifier's beginning no longer spend it.
+    #[test]
+    fn with_an_index_unknown_lookups_leave_the_shared_search_budget_alone() {
+        let (mut c, txid) = context_send_then_mine(5, true);
+        c.scans = Some(Arc::new(Mutex::new(ScanBucket::new())));
+        // Past each visitor's own reserve, and as many as the old net held.
+        let lookups = 5 * (SCAN_BURST + 5);
+        for i in 0..lookups {
+            let client = ip(&format!("198.51.100.{}", i % 5 + 1));
+            let unknown = Hash256([(i % 251) as u8 + 1; 32]).to_hex();
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"gettransaction","params":{{"txid":"{unknown}"}}}}"#
+            );
+            let out = c.handle_from(&body, client);
+            assert!(out.contains("transaction not found"), "{out}");
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"search","params":{{"q":"{}"}}}}"#,
+                &unknown[..12]
+            );
+            let out = c.handle_from(&body, client);
+            assert!(!out.contains("too many searches"), "{out}");
+        }
+        // A sixth visitor still has its searches, and so do the five.
+        assert!(!scan_refused(&c, ip("198.51.100.6")));
+        assert!(!scan_refused(&c, ip("198.51.100.1")));
+        // A known transaction is still found through the index.
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"gettransaction","params":{{"txid":"{txid}"}}}}"#
+        );
+        assert!(c
+            .handle_from(&body, ip("198.51.100.7"))
+            .contains("\"confirmed\":true"));
     }
 
     fn rows(r: &Json) -> Vec<Json> {
