@@ -653,15 +653,16 @@ impl OnionBook {
         v
     }
 
-    /// Marks a name read back from this node's own file as having answered.
-    pub fn mark_answered(&mut self, name: &str, port: u16) {
+    /// Marks a name read back from this node's own file as having answered,
+    /// last at `last_success`.
+    pub fn mark_answered(&mut self, name: &str, port: u16, last_success: u64) {
         if let Some(e) = self
             .entries
             .iter_mut()
             .find(|e| e.addr.name == name && e.addr.port == port)
         {
             e.answered = true;
-            e.last_success = e.addr.last_seen;
+            e.last_success = last_success;
         }
     }
 
@@ -789,7 +790,8 @@ pub fn save_onions(path: &Path, names: &[crate::wire::OnionAddr]) -> std::io::Re
 }
 
 /// Writes the entries to `path`, as [`save_onions`], with a fourth field:
-/// `1` for a name that answered. A 0.5.8 node reads the first three.
+/// when the name last answered, by this node's clock (`0`: it has not). A
+/// 0.5.8 node reads the first three.
 pub fn save_onion_entries(path: &Path, entries: &[OnionEntry]) -> std::io::Result<()> {
     let mut text = String::from("# q21 onion addresses: name port last_seen answered\n");
     for e in entries.iter().take(MAX_ONIONS) {
@@ -798,7 +800,7 @@ pub fn save_onion_entries(path: &Path, entries: &[OnionEntry]) -> std::io::Resul
             e.addr.host(),
             e.addr.port,
             e.addr.last_seen,
-            u8::from(e.answered)
+            if e.answered { e.last_success.max(1) } else { 0 }
         ));
     }
     let tmp = path.with_extension("tmp");
@@ -807,8 +809,8 @@ pub fn save_onion_entries(path: &Path, entries: &[OnionEntry]) -> std::io::Resul
 }
 
 /// Reads what [`save_onion_entries`] (or [`save_onions`]) wrote, with the
-/// names that answered: see [`load_onions`].
-pub fn load_onion_entries(path: &Path, now: u64) -> Vec<(crate::wire::OnionAddr, bool)> {
+/// time each name last answered (`0`: it has not): see [`load_onions`].
+pub fn load_onion_entries(path: &Path, now: u64) -> Vec<(crate::wire::OnionAddr, u64)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -819,7 +821,7 @@ pub fn load_onion_entries(path: &Path, now: u64) -> Vec<(crate::wire::OnionAddr,
             let name = it.next()?;
             let port: u16 = it.next()?.parse().ok()?;
             let seen: u64 = it.next()?.parse().ok()?;
-            let answered = it.next() == Some("1");
+            let answered: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0).min(now);
             let mut a = crate::wire::OnionAddr::parse(name, port)?;
             if port == 0 {
                 return None;
@@ -1090,8 +1092,8 @@ mod tests {
         save_onion_entries(&p, &book.entries()).expect("write");
         let back = load_onion_entries(&p, 1_000);
         assert_eq!(back.len(), 2);
-        assert_eq!((back[0].0.port, back[0].1), (21121, true));
-        assert_eq!((back[1].0.port, back[1].1), (21500, false));
+        assert_eq!((back[0].0.port, back[0].1), (21121, 900));
+        assert_eq!((back[1].0.port, back[1].1), (21500, 0));
         assert_eq!(load_onions(&p, 1_000).len(), 2);
         let _ = std::fs::remove_dir_all(&d);
     }

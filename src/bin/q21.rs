@@ -5548,13 +5548,13 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     // they are then counted, kept in `onions.dat`, and passed on to peers
     // like those learned from the network.
     let port = q21_core::bootstrap::default_port(network);
-    let from_file: Vec<(q21_core::wire::OnionAddr, bool)> = targets
+    let from_file: Vec<(q21_core::wire::OnionAddr, u64)> = targets
         .iter()
         .filter(|a| is_onion_target(a))
         .filter_map(|a| q21_core::wire::OnionAddr::parse(a, port))
         .map(|mut o| {
             o.last_seen = unix_now();
-            (o, false)
+            (o, 0)
         })
         .collect();
     if !from_file.is_empty() {

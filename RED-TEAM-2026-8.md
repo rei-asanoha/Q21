@@ -116,12 +116,14 @@ completed a handshake with us is never pushed out by a name nobody tried,
 and is passed on first; three failed calls in a row and it is untried
 again. When dialing, one place in four goes to an untried name, one source
 after the other. The names of one source hold at most an eighth of the
-book, every peer reached at an onion name counting as one source with Tor;
-a peer we dialed writes 64 names per request. Round 3b had found that a
-mere SOCKS connection, which any listener gives, counted as an answer, and
-that each onion service of one attacker was a source of its own. **Residual:** an entry point that
+book; a peer we dialed writes 64 names per request. Round 3b had found that
+a mere SOCKS connection, which any listener gives, counted as an answer. **Residual:** an entry point that
 never dials an onion proves none, and eight address groups can still
-replace its untried names; every Tor caller shares one hourly budget.
+replace its untried names; every Tor caller shares one hourly budget; and a
+node that goes through Tor only can still see most of its connections go to
+one operator running many onion services, each a node that answers (the
+final check): a defense of its own, such as connections kept to its entry
+points, is for the next campaign.
 
 ## N3. Blocks of a deep reorganization
 

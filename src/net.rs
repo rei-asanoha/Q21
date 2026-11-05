@@ -186,13 +186,6 @@ pub enum NetGroup {
 /// (see [`crate::addr::ONION_SHARE_PER_SOURCE`]): the peer's address group,
 /// every Tor peer being one. Never [`crate::addr::ONION_SOURCE_LOCAL`].
 fn onion_source(source: (Option<NetGroup>, bool)) -> u64 {
-    // Every peer we reached through Tor, at its onion name's stand-in, is
-    // the Tor source too: each name has a stand-in of its own, and eight
-    // onion services of one attacker were eight sources (third round).
-    let source = match source {
-        (Some(NetGroup::V4([a, _])), false) if a & 0xf0 == 240 => (None, true),
-        other => other,
-    };
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut h);
@@ -2943,15 +2936,15 @@ impl Node {
 
     /// Pours onion names back into the book: from `onions.dat` at startup,
     /// with the names that answered before.
-    pub fn seed_onions(&self, v: Vec<(crate::wire::OnionAddr, bool)>) -> usize {
+    pub fn seed_onions(&self, v: Vec<(crate::wire::OnionAddr, u64)>) -> usize {
         let mut g = self.shared.lock().unwrap();
         let now = unix_now();
         let before = g.onions.len();
         for (a, answered) in v {
             let (name, port) = (a.name.clone(), a.port);
             g.onions.add(a, now);
-            if answered {
-                g.onions.mark_answered(&name, port);
+            if answered > 0 {
+                g.onions.mark_answered(&name, port, answered);
             }
         }
         g.onions.len() - before
@@ -11616,7 +11609,7 @@ mod tests_handler_review {
         let n = node();
         let now = unix_now();
         let honest = onion_names(1, crate::addr::MAX_ONIONS as u32, now - 3600);
-        n.seed_onions(honest.iter().cloned().map(|a| (a, false)).collect());
+        n.seed_onions(honest.iter().cloned().map(|a| (a, 0)).collect());
         assert_eq!(n.onion_count(), crate::addr::MAX_ONIONS);
         let _l = anonymous_peer(&n, 9);
         establish(&n, 9);
@@ -11661,7 +11654,7 @@ mod tests_handler_review {
         let now = unix_now();
         let honest = onion_names(1, 30, now - 60);
         assert_eq!(
-            n.seed_onions(honest.iter().cloned().map(|a| (a, false)).collect()),
+            n.seed_onions(honest.iter().cloned().map(|a| (a, 0)).collect()),
             30
         );
         let mut id = 100u64;
@@ -11694,7 +11687,7 @@ mod tests_handler_review {
             all.iter()
                 .cloned()
                 .enumerate()
-                .map(|(k, a)| (a, k < 8))
+                .map(|(k, a)| (a, if k < 8 { now - 60 + k as u64 } else { 0 }))
                 .collect(),
         );
         let answered: Vec<String> = all.iter().take(8).map(|a| a.name.clone()).collect();
@@ -11730,14 +11723,13 @@ mod tests_handler_review {
     }
 
     /// Round 3b: a name is proven by a handshake with the node dialed at
-    /// it, not by a SOCKS connection; every peer dialed at an onion name is
-    /// one source with Tor.
+    /// it, not by a SOCKS connection.
     #[test]
     fn an_onion_name_is_proven_by_a_handshake() {
         let n = node();
         let now = unix_now();
         let names = onion_names(6, 2, now);
-        n.seed_onions(names.iter().cloned().map(|a| (a, false)).collect());
+        n.seed_onions(names.iter().cloned().map(|a| (a, 0)).collect());
         let label = crate::socks::Target::Name(names[0].host(), names[0].port).label();
         let _l = anonymous_peer(&n, 9);
         {
@@ -11758,10 +11750,6 @@ mod tests_handler_review {
         assert!(e
             .iter()
             .any(|e| e.addr.name == names[1].name && !e.answered));
-        assert_eq!(
-            onion_source((inbound_group(label), false)),
-            onion_source((None, true))
-        );
     }
 
     /// Red-team campaign 8, third round: addresses already known, passed on
