@@ -122,11 +122,11 @@ neither.
 ### On the server
 
 The program comes from the **signed release** of the version you install
-(replace `v0.5.9`); a build of the **Actions** tab is never signed, and is
+(replace `v0.5.10`); a build of the **Actions** tab is never signed, and is
 never installed:
 
 ```bash
-cd ~ && V=v0.5.9 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
+cd ~ && V=v0.5.10 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
 ```
 
 Check the signature **before** installing (`sudo apt install -y minisign`
@@ -827,24 +827,35 @@ minute, for each address the reverse proxy passes in `X-Forwarded-For` (a
 whole one, and each of its 65,536 `/64` blocks counted as a visitor of its
 own). The first version kept only one
 count for everyone: a single visitor in a loop emptied it, and all the others
-read "try again in a minute". A global safety net remains — a hundred and
-fifty at once, then sixty per minute, all addresses combined — so that a
-thousand coordinated addresses cannot do to the lock what a single one no
-longer can. The node only trusts this header on a connection coming from the
+read "try again in a minute". A global safety net remains — six hundred at
+once, then two hundred and forty per minute, all addresses combined, twenty
+visitors' worth (0.5.10: it was five visitors' worth, and five addresses
+within their own budgets emptied it for everyone). With an address index up
+to date, looking up an unknown transaction or completing the beginning of an
+identifier reads no block and spends nothing of this budget; a search by
+amount always does. The node only trusts this header on a connection coming from the
 loopback, that is, from the reverse proxy: a visitor who wrote it themselves
 would not change their budget.
 
 Every call is counted the same way, scans or not: a reserve of a hundred and
 twenty per visitor address, then twenty per second, and a net of six hundred
-per second for all addresses combined. A page of the explorer makes a
+per second for all addresses combined. A large answer counts for its size: one
+call more per 64 KiB (0.5.10), so that a full block asked for again and again
+costs its visitor what it costs the node. A page of the explorer makes a
 handful; a visitor beyond it reads "too many requests on this public service:
 slow down a little", and the explorer page waits a moment and tries again by
 itself.
 
-The node also holds each visitor address to **eight requests under way at
-once** (0.5.8): a visitor opening many requests and never finishing them
-holds eight of its threads, not all sixty-four, and every other visitor is
-still served.
+The node builds **at most four answers at once** for the public, whatever
+they are, all visitors together (0.5.10): a request waits up to ten seconds
+for its turn, then reads the same "too many requests". Before, six addresses
+asking for a large block in a loop, each within its budget, made the node
+exceed its memory limit and be stopped (red-team campaign 9).
+
+A visitor address is held to **eight requests under way at once** only while
+their bodies arrive (0.5.8): behind Caddy, which passes each request complete,
+that limit does not apply, and the four answers at once above are what bounds
+the node.
 
 What this budget does not do: bound the number of connections of an address.
 That is the purpose of step 4.2a.

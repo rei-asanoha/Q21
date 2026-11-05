@@ -61,7 +61,9 @@ With `--tor` (or the switch in the wallet), the node takes, in this order:
 2. a Tor already running on this computer: the Tor service on port 9050,
    Tor Browser on 9150. On Linux, only one run by your own account or by
    the system (0.5.9): a program of another person's account listening
-   there is not taken for Tor. On macOS and Windows the port alone is
+   there is not taken for Tor, whatever address it listens on, `127.0.0.1`,
+   every address of the computer, IPv4 or IPv6 (0.5.10: one listening on
+   every address was taken for Tor). On macOS and Windows the port alone is
    checked: on a computer shared with other accounts, prefer the bundled
    Tor;
 3. a `tor` on the PATH, started the same way as the bundled one.

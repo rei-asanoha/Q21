@@ -67,6 +67,52 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.5.9 to 0.5.10
+
+0.5.10 changes no rule of the chain and nothing in a channel's protocol: a
+0.5.9 node and a 0.5.10 node accept the same blocks and keep the same
+channels. Mining does not need to stop. It brings the fixes of the ninth
+red-team campaign (RED-TEAM-2026-9.md), and a closed channel no longer
+counts toward the limit of eight per contact.
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, and block timestamps strictly after their parent's
+from block 5,950.
+
+## What changes
+
+| | 0.5.9 | 0.5.10 |
+|---|---|---|
+| A channel's journal after a power cut | Zeros left at its end made the channel neither loaded nor watched again (`ALERT … this channel is not loaded`) | Read as an unfinished last write: the channel loads and is watched |
+| A closed channel | Counted toward the eight per contact until buried, about a day: "too many channels with this peer" | No longer counts once its close is confirmed; at most 32 closed channels per contact are watched at once, beyond which the page says to open a new one tomorrow |
+| A channel's funding taken off the chain by a reorganization | The channel kept paying, backed by nothing | It pays and signs nothing until its funding confirms again; its funder holds the coins and announces the funding again |
+| Confirmations asked for at an opening | Any number up to 65,535 (three months) | At most the longest delay; a contact asking for more is refused |
+| Public explorer | Six addresses asking for a large block in a loop made the node exceed its memory and be stopped; five addresses emptied the search budget; `getpeers` listed every seat without its address | At most four answers built at once; a large answer counts for its size; with an index, an unknown transaction or an identifier's beginning costs no search; the search net is twenty visitors' worth; `getpeers` gives counts only; a block off the main chain shows no confirmation |
+| Onion names, inside the node | Filed under a 28-bit stand-in: a name alike in those bits, made in minutes, took an entry point's place | Filed under a 64-bit stand-in, each name a source of its own |
+| A Tor of another account, on Linux | Taken for Tor if it listened on every address instead of 127.0.0.1 | Refused whatever address it listens on, IPv4 or IPv6 |
+| `onions.dat` | Who wrote each name was lost at each restart: one source regained its eighth of the book | A fifth field keeps the source |
+| An IPv4 address "proven" | By any TCP connection, and forgotten at each restart | By a completed Q21 handshake, and kept |
+| A wallet page left open after the wallet stopped | Kept calling its port, whatever listened there next | Says "The wallet has stopped" and asks nothing more |
+| The network's height | One peer announcing a trillion was believed | A height a peer does not back with headers within two minutes counts for ours |
+| The "clock late" warning | Two connections calling in were enough | Only from peers this node dialed, once per address group |
+| A fast-sync adoption | Wrote every header it was sent, past the tip too | Writes only the path to the tip |
+| `tools/verify-release.sh` | — | Also checks the local sizes of a zip entry and refuses a name that is not printable ASCII |
+
+## Who should upgrade, and when
+
+Everyone, when convenient. Wallets with channels first, for the power cut
+and the closed channels; the public explorer, for its memory. A server
+updates from the signed release only (SERVER.md); the guides now check the
+signed comment by script as well as by eye. Nothing changes in Caddy.
+
+## The data folder
+
+Unchanged, except `onions.dat`, which gains a fifth field: the source that
+wrote each name. Going back to 0.5.9 with the same folder loses nothing:
+0.5.9 reads the first four fields and ignores the fifth.
+
+---
+
 # Upgrading from 0.5.8 to 0.5.9
 
 0.5.9 changes no rule of the chain and nothing in a channel's protocol: a

@@ -231,6 +231,39 @@ Both wallets need 0.5.5 or later; the button shows only then.
 
 ---
 
+## Channels, closings and accidents (0.5.10)
+
+- **A closed channel is closed.** Once its close is confirmed on the chain, a
+  channel no longer counts toward the eight a contact may have open or in
+  progress with you: a new one opens with the same person right away. It
+  stays watched for about a day for your safety (a revoked state could still
+  appear), and at most 32 closed channels per contact are watched at once;
+  past that, the page says "you can open a new one tomorrow".
+- **A power cut during a payment** can leave zeros at the end of a channel's
+  journal. They are read as an unfinished last write, like the end of the
+  block file: the channel loads and is watched as before. Until 0.5.9 it was
+  neither loaded nor watched again, and the log said `ALERT … this channel is
+  not loaded`.
+- **A reorganization that takes a channel's funding off the chain** (rare,
+  six blocks or more): the channel pays nothing and signs nothing until its
+  funding confirms again, and the page says so. The side that funded it
+  holds its coins and announces the funding transaction again; nothing is
+  lost.
+- **A channel asked to wait for more confirmations than the longest delay**
+  (a contact asking for 65,535 blocks, three months) is refused at the
+  opening: such a channel never opened and blocked new ones meanwhile.
+
+## The wallet page after the wallet stops
+
+Each answer of the wallet to its page names the run of the program. A page
+left open after the wallet stopped says **The wallet has stopped** and asks
+nothing more: before 0.5.10 it kept calling its port, and another program of
+another account listening there next could show its own receiving address in
+it, or receive the backup code typed to check it. Start Q21 Wallet again: it
+opens a new page; close the old one.
+
+---
+
 ## My contacts
 
 The Send page keeps the addresses you send to under a name of your own —
