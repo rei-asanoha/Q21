@@ -833,9 +833,11 @@ visitors' worth (0.5.10: it was five visitors' worth, and five addresses
 within their own budgets emptied it for everyone). With an address index up
 to date, looking up an unknown transaction or completing the beginning of an
 identifier reads no block and spends nothing of this budget; a search by
-amount always does. The node only trusts this header on a connection coming from the
-loopback, that is, from the reverse proxy: a visitor who wrote it themselves
-would not change their budget.
+amount always does. Without an index, each such lookup is a scan: twenty
+addresses can then keep the searches of everyone else waiting. Run a public
+explorer with `--address-index`, as above. The node only trusts this
+header on a connection coming from the loopback, that is, from the reverse
+proxy: a visitor who wrote it themselves would not change their budget.
 
 Every call is counted the same way, scans or not: a reserve of a hundred and
 twenty per visitor address, then twenty per second, and a net of six hundred
@@ -850,7 +852,10 @@ The node builds **at most four answers at once** for the public, whatever
 they are, all visitors together (0.5.10): a request waits up to ten seconds
 for its turn, then reads the same "too many requests". Before, six addresses
 asking for a large block in a loop, each within its budget, made the node
-exceed its memory limit and be stopped (red-team campaign 9).
+exceed its memory limit and be stopped (red-team campaign 9). And no
+answer is larger than 4 MiB, the `response_buffers` below, so that Caddy
+always reads it whole at once: a larger one (a very large block) reads
+"answer too large for this public service".
 
 A visitor address is held to **eight requests under way at once** only while
 their bodies arrive (0.5.8): behind Caddy, which passes each request complete,

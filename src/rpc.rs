@@ -177,6 +177,36 @@ pub const PACE_BLOCKS: u64 = 30;
 /// heap.
 pub const MAX_BATCH_RESPONSE: usize = 8 * 1024 * 1024;
 
+/// Largest answer a public explorer sends, a batch included: the
+/// `response_buffers 4MB` of the documented Caddy, which then reads every
+/// answer whole at once, so that a visitor reading slowly never holds the
+/// node's writing thread, nor its copy of the answer, for its 30 seconds.
+/// Four answers built at a time bounded how many, not how large: sixty-four
+/// connections reading slowly a large block each held sixty-four copies
+/// (round 2 of red-team campaign 9).
+pub const MAX_PUBLIC_ANSWER: usize = 4 * 1024 * 1024;
+
+// Caddy's `response_buffers 4MB`, and never more than a batch may hold.
+const _: () = assert!(MAX_PUBLIC_ANSWER <= 4 * 1024 * 1024);
+const _: () = assert!(MAX_PUBLIC_ANSWER <= MAX_BATCH_RESPONSE);
+
+/// What a public explorer answers in place of a larger one.
+pub const ANSWER_TOO_LARGE: &str = "answer too large for this public service";
+
+/// `answer`, or the [`ANSWER_TOO_LARGE`] error to call `id` past
+/// [`MAX_PUBLIC_ANSWER`].
+fn capped_public_answer(answer: String, id: Json) -> String {
+    if answer.len() <= MAX_PUBLIC_ANSWER {
+        return answer;
+    }
+    Json::obj()
+        .set("jsonrpc", Json::str("2.0"))
+        .set("id", id)
+        .set("error", rpc_error(ERR_REQUEST, ANSWER_TOO_LARGE))
+        .build()
+        .encode()
+}
+
 /// Maximum number of blocks walked back by `gettransaction` without an index.
 ///
 /// Scanning the whole chain backward, under the node's global lock, is a work
@@ -1410,6 +1440,11 @@ impl RpcContext {
                     .build()
                     .encode();
             }
+            let limit = if self.scans.is_some() {
+                MAX_PUBLIC_ANSWER
+            } else {
+                MAX_BATCH_RESPONSE
+            };
             let mut responses: Vec<Json> = Vec::with_capacity(batch.len());
             let mut bytes = 0usize;
             for r in batch {
@@ -1417,7 +1452,7 @@ impl RpcContext {
                 let size = resp.encode().len();
                 self.charge_answer(client, size);
                 bytes += size;
-                if bytes > MAX_BATCH_RESPONSE {
+                if bytes > limit {
                     responses.push(
                         Json::obj()
                             .set("jsonrpc", Json::str("2.0"))
@@ -1436,6 +1471,9 @@ impl RpcContext {
         }
         let answer = self.handle_one(&request, client).encode();
         self.charge_answer(client, answer.len());
+        if self.scans.is_some() {
+            return capped_public_answer(answer, request.get("id").cloned().unwrap_or(Json::Null));
+        }
         answer
     }
 
@@ -8264,6 +8302,17 @@ mod tests {
         assert_eq!(left as u32, CALL_BURST - 1);
         // Through the context: a local node counts nothing.
         context(false).charge_answer(a, usize::MAX);
+    }
+
+    /// Round 2 of red-team campaign 9: a public explorer sends no answer
+    /// larger than what Caddy reads whole at once, a batch included.
+    #[test]
+    fn a_public_answer_is_never_larger_than_caddy_reads_at_once() {
+        let small = "x".repeat(MAX_PUBLIC_ANSWER);
+        assert_eq!(capped_public_answer(small.clone(), Json::u64(7)), small);
+        let large = capped_public_answer("x".repeat(MAX_PUBLIC_ANSWER + 1), Json::u64(7));
+        assert!(large.contains(ANSWER_TOO_LARGE), "{large}");
+        assert!(large.contains("\"id\":7"), "{large}");
     }
 
     /// Red-team campaign 6, O1: a public explorer takes short batches only,
