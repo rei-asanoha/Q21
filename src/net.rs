@@ -665,6 +665,19 @@ pub const HEADERS_RATE_PER_SEC: u64 = 1;
 /// slot is not read.
 pub const MAX_EXPECTED_HEADERS: u8 = 4;
 
+/// How long a peer that announced a height above ours may leave our request
+/// for headers unanswered before that height stops counting.
+///
+/// # The defect this closes
+///
+/// The height a peer announces at the handshake was taken as is for the
+/// network's: one peer announcing a trillion made every wallet connected to
+/// it read "catching up", and paused mining, for as long as it stayed
+/// connected (red-team campaign 9). A peer ahead of us answers our request
+/// within seconds, through Tor as well; one that has nothing beyond our tip
+/// does not answer at all, and its height is then ours anyway.
+pub const HEADERS_ANSWER_WAIT: Duration = Duration::from_secs(120);
+
 /// Addresses a peer can make us record right away: a full reply to our
 /// `getaddr`, which we send to every new peer.
 pub const ADDR_BUCKET_MAX: u64 = crate::wire::MAX_ADDR as u64;
@@ -1656,6 +1669,11 @@ struct Peer {
     /// Header replies we expect from this peer. See
     /// [`MAX_EXPECTED_HEADERS`].
     expected_headers: u8,
+    /// When we asked this peer for headers it has not answered yet. A height
+    /// announced at the handshake is only a claim: a peer that leaves our
+    /// request unanswered past [`HEADERS_ANSWER_WAIT`] no longer counts
+    /// above our own height. See [`Node::max_announced_height`].
+    headers_asked: Option<Instant>,
     /// Block bodies requested from this peer, and when. See [`BODY_TIMEOUT`].
     /// Never more than [`MAX_BODIES_IN_FLIGHT`] entries: see
     /// [`Peer::note_body_requested`].
@@ -1807,6 +1825,9 @@ impl Peer {
                     .expected_headers
                     .saturating_add(1)
                     .min(MAX_EXPECTED_HEADERS);
+                if self.headers_asked.is_none() {
+                    self.headers_asked = Some(now);
+                }
             }
             _ => {}
         }
@@ -3162,12 +3183,26 @@ impl Node {
     /// worth what the peers are worth: an eclipsed node will see the height its
     /// adversary shows it. The address book is what makes this situation
     /// expensive to produce.
+    ///
+    /// A peer that leaves our request for headers unanswered past
+    /// [`HEADERS_ANSWER_WAIT`] counts for our own height, no more; one whose
+    /// answer showed where its chain ends counts for that end.
     pub fn max_announced_height(&self) -> u64 {
+        self.max_announced_height_at(Instant::now())
+    }
+
+    fn max_announced_height_at(&self, now: Instant) -> u64 {
         let g = self.shared.lock().unwrap();
+        let height = g.chain.height();
         g.peers
             .values()
             .filter(|p| p.handshaked)
-            .map(|p| p.start_height)
+            .map(|p| match p.headers_asked {
+                Some(t) if now.saturating_duration_since(t) > HEADERS_ANSWER_WAIT => {
+                    p.start_height.min(height)
+                }
+                _ => p.start_height,
+            })
             .max()
             .unwrap_or(0)
     }
@@ -3925,6 +3960,7 @@ impl Node {
                     addr_added: 0,
                     onion_added: 0,
                     expected_headers: 0,
+                    headers_asked: None,
                     requested_bodies: HashMap::new(),
                     bodies_to_request: VecDeque::new(),
                     more_expected: false,
@@ -4612,7 +4648,16 @@ impl Node {
                     }
                 }
 
-                Message::Headers(v) if v.is_empty() => {}
+                Message::Headers(v) if v.is_empty() => {
+                    // Nothing beyond our tip: whatever it announced, this
+                    // peer's chain ends at our height or below. Read only in
+                    // reply to a request of ours.
+                    let height = g.chain.height();
+                    if let Some(p) = g.peers.get_mut(&id).filter(|p| p.expected_headers > 0) {
+                        p.headers_asked = None;
+                        p.start_height = p.start_height.min(height);
+                    }
+                }
 
                 Message::Headers(v) if !handshaked => {
                     // Same rule as `getheaders`: synchronization only receives
@@ -4645,6 +4690,7 @@ impl Node {
                 Message::Headers(v) => {
                     if let Some(p) = g.peers.get_mut(&id) {
                         p.expected_headers = p.expected_headers.saturating_sub(1);
+                        p.headers_asked = None;
                     }
                     // --- Header-based synchronization, strict on chaining.
                     //
@@ -4698,7 +4744,17 @@ impl Node {
                             ref mut peers,
                             ..
                         } = *g;
+                        // A batch that is not full is the end of this
+                        // peer's chain: its height is no more than that,
+                        // whatever it announced at the handshake.
+                        let end = (v.len() < crate::wire::MAX_HEADERS)
+                            .then(|| chain.header_of(&v[0].prev_block))
+                            .flatten()
+                            .map(|parent| parent.height.saturating_add(v.len() as u64));
                         if let Some(p) = peers.get_mut(&id) {
+                            if let Some(end) = end {
+                                p.start_height = p.start_height.min(end);
+                            }
                             p.consecutive_orphans = 0;
                             // The batch replaces the queue: a peer only replies
                             // with headers to our request, and we only ask for
@@ -7395,6 +7451,7 @@ mod tests {
                 addr_added: 0,
                 onion_added: 0,
                 expected_headers: 0,
+                headers_asked: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,
@@ -8469,6 +8526,7 @@ mod tests_hardening {
                 addr_added: 0,
                 onion_added: 0,
                 expected_headers: 0,
+                headers_asked: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,
@@ -9630,6 +9688,72 @@ mod tests_hardening {
         );
     }
 
+    /// Red-team campaign 9: one peer announcing a trillion at the handshake
+    /// was the network's height. Its claim now stands only while it answers.
+    #[test]
+    fn a_height_announced_but_never_backed_stops_counting() {
+        let (a, b) = node_pair();
+        crate::net::tests_util::mine_locally(&a, 3);
+        let ask = |n: &Node, id| {
+            n.send_to(
+                id,
+                &Message::GetHeaders {
+                    locator: vec![],
+                    stop: Hash256::ZERO,
+                },
+            )
+        };
+        let claim = |n: &Node, id, h| {
+            n.shared
+                .lock()
+                .unwrap()
+                .peers
+                .get_mut(&id)
+                .unwrap()
+                .start_height = h
+        };
+
+        // 1. Silent: counted while it may still answer, then no longer.
+        let _e = established_peer(&b, 7);
+        claim(&b, 7, 1_000_000_000_000);
+        ask(&b, 7);
+        let now = Instant::now();
+        assert_eq!(b.max_announced_height_at(now), 1_000_000_000_000);
+        let later = now + HEADERS_ANSWER_WAIT + Duration::from_secs(1);
+        assert_eq!(b.max_announced_height_at(later), b.height());
+
+        // 2. An empty answer: its chain ends at ours.
+        let _f = established_peer(&b, 8);
+        b.shared.lock().unwrap().peers.remove(&7);
+        claim(&b, 8, 1_000_000_000_000);
+        ask(&b, 8);
+        let _ = b.handle(8, Message::Headers(vec![]));
+        assert_eq!(b.max_announced_height(), b.height());
+
+        // 3. A batch that is not full: its chain ends with it. The three real
+        //    headers are read and their bodies asked for as before.
+        b.shared.lock().unwrap().peers.remove(&8);
+        let _g = established_peer(&b, 9);
+        claim(&b, 9, 1_000_000_000_000);
+        ask(&b, 9);
+        let headers = a.with_chain(|c| c.headers_from(&[], Hash256::ZERO, 10));
+        assert_eq!(headers.len(), 3);
+        let _ = b.handle(9, Message::Headers(headers));
+        assert_eq!(b.max_announced_height(), 3);
+        let g = b.shared.lock().unwrap();
+        let p = &g.peers[&9];
+        assert_eq!(p.requested_bodies.len() + p.bodies_to_request.len(), 3);
+        assert_eq!(p.headers_asked, None, "answered");
+        drop(g);
+
+        // 4. An honest claim, answered, is counted as before.
+        let (c, d) = node_pair();
+        crate::net::tests_util::mine_locally(&c, 2);
+        let _h = established_peer(&d, 7);
+        claim(&d, 7, 2);
+        assert_eq!(d.max_announced_height(), 2);
+    }
+
     /// Reply slots do not accumulate beyond the bound.
     #[test]
     fn reply_slots_are_bounded() {
@@ -10138,6 +10262,7 @@ mod tests_handler_fuzz {
                 addr_added: 0,
                 onion_added: 0,
                 expected_headers: 0,
+                headers_asked: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,
@@ -11004,6 +11129,7 @@ mod tests_handler_review {
                 addr_added: 0,
                 onion_added: 0,
                 expected_headers: 0,
+                headers_asked: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,
