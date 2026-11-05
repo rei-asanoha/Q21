@@ -6734,6 +6734,10 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
         }
 
+        // --- A block waiting for a parent: its peer is asked for headers
+        // again as soon as its last request may be renewed.
+        node.ask_headers_where_parked();
+
         // --- A tip that no longer moves.
         //
         // Ten minutes is five blocks on average. The peers are asked for

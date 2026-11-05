@@ -1734,6 +1734,11 @@ struct Peer {
     /// request unanswered past [`HEADERS_ANSWER_WAIT`] no longer counts
     /// above our own height. See [`Node::max_announced_height`].
     headers_asked: Option<Instant>,
+    /// When we last asked this peer for headers: a request is renewed no
+    /// sooner than [`HEADERS_ANSWER_WAIT`] after it (see
+    /// [`Peer::may_ask_headers`]), while the claim keeps the time of the
+    /// oldest one unanswered.
+    headers_renewed: Option<Instant>,
     /// Block bodies requested from this peer, and when. See [`BODY_TIMEOUT`].
     /// Never more than [`MAX_BODIES_IN_FLIGHT`] entries: see
     /// [`Peer::note_body_requested`].
@@ -1888,19 +1893,20 @@ impl Peer {
                 if self.headers_asked.is_none() {
                     self.headers_asked = Some(now);
                 }
+                self.headers_renewed = Some(now);
             }
             _ => {}
         }
     }
 
     /// May this peer be asked for headers again? When no request is
-    /// outstanding, or when the oldest has gone unanswered past
+    /// outstanding, or when the last has gone unanswered past
     /// [`HEADERS_ANSWER_WAIT`]: a peer with nothing new sends no answer at
     /// all, and its slot stayed taken for good, so that a reorganization it
     /// made later was never asked for (round 2 of red-team campaign 9).
     fn may_ask_headers(&self, now: Instant) -> bool {
         self.expected_headers == 0
-            || self.headers_asked.map_or(true, |t| {
+            || self.headers_renewed.map_or(true, |t| {
                 now.saturating_duration_since(t) > HEADERS_ANSWER_WAIT
             })
     }
@@ -3494,6 +3500,43 @@ impl Node {
     /// and is asked again only once that request has waited
     /// [`HEADERS_ANSWER_WAIT`] (see [`Peer::may_ask_headers`]). Returns the
     /// number of peers asked.
+    /// Asks for headers every peer whose block waits here for a parent we
+    /// never saw, once its last request may be renewed
+    /// ([`Peer::may_ask_headers`]). A block parked while a request was still
+    /// outstanding was asked for only at the stale-tip probe, ten minutes
+    /// later: a reorganization of that peer waited as long (round 3 of
+    /// red-team campaign 9). Returns the number of peers asked.
+    pub fn ask_headers_where_parked(&self) -> usize {
+        let now = Instant::now();
+        let (ids, locator): (Vec<u64>, Vec<Hash256>) = {
+            let g = self.shared.lock().unwrap();
+            if g.parked.is_empty() {
+                return 0;
+            }
+            let mut ids: Vec<u64> = g
+                .parked
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| {
+                    g.peers
+                        .get(id)
+                        .is_some_and(|p| p.handshaked && p.may_ask_headers(now))
+                })
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            (ids, g.chain.locator())
+        };
+        let m = Message::GetHeaders {
+            locator,
+            stop: Hash256::ZERO,
+        };
+        for id in &ids {
+            self.send_to(*id, &m);
+        }
+        ids.len()
+    }
+
     pub fn ask_headers_from_all(&self) -> usize {
         let now = Instant::now();
         let (ids, locator): (Vec<u64>, Vec<Hash256>) = {
@@ -4036,6 +4079,7 @@ impl Node {
                     onion_added: 0,
                     expected_headers: 0,
                     headers_asked: None,
+                    headers_renewed: None,
                     requested_bodies: HashMap::new(),
                     bodies_to_request: VecDeque::new(),
                     more_expected: false,
@@ -4832,7 +4876,15 @@ impl Node {
                             .then(|| chain.header_of(&v[0].prev_block))
                             .flatten()
                             .map(|parent| parent.height.saturating_add(v.len() as u64));
-                        if let Some(p) = peers.get_mut(&id) {
+                        // A batch bringing nothing we lack backs no height
+                        // and answers nothing: the same old full batch sent
+                        // back to every request kept a claimed trillion
+                        // counted (round 3 of red-team campaign 9).
+                        let fresh = v.iter().any(|h| !chain.has_block(&h.block_id()));
+                        if let (false, Some(p)) = (fresh, peers.get_mut(&id)) {
+                            p.start_height = p.start_height.min(chain.height());
+                            p.more_expected = false;
+                        } else if let Some(p) = peers.get_mut(&id) {
                             if let Some(end) = end {
                                 p.start_height = p.start_height.min(end);
                             }
@@ -7542,6 +7594,7 @@ mod tests {
                 onion_added: 0,
                 expected_headers: 0,
                 headers_asked: None,
+                headers_renewed: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,
@@ -8619,6 +8672,7 @@ mod tests_hardening {
                 onion_added: 0,
                 expected_headers: 0,
                 headers_asked: None,
+                headers_renewed: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,
@@ -9880,6 +9934,27 @@ mod tests_hardening {
             "an orphan backs nothing"
         );
 
+        // Round 3: headers we already hold, sent back to every request, back
+        // nothing either, and answer nothing.
+        crate::net::tests_util::mine_locally(&b, 2);
+        let known = b.with_chain(|c| c.headers_from(&[], Hash256::ZERO, 10));
+        assert_eq!(known.len(), 2);
+        b.shared
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&7)
+            .unwrap()
+            .start_height = 1_000_000_000_000;
+        ask();
+        let _ = b.handle(7, Message::Headers(known));
+        assert_eq!(
+            b.max_announced_height(),
+            b.height(),
+            "nothing new backs nothing"
+        );
+        assert!(b.shared.lock().unwrap().peers[&7].headers_asked.is_some());
+
         // Asked, never answered: not asked again at once, but once the
         // request has waited its time.
         let now = Instant::now();
@@ -9891,6 +9966,29 @@ mod tests_hardening {
             assert!(!p.may_ask_headers(now));
             assert!(p.may_ask_headers(now + HEADERS_ANSWER_WAIT + Duration::from_secs(1)));
         }
+    }
+
+    /// Round 3: a peer whose block waits for a parent is asked for headers
+    /// as soon as it may be, not at the stale-tip probe ten minutes later,
+    /// and no more often than its renewal allows.
+    #[test]
+    fn a_parked_block_gets_its_peer_asked_for_headers() {
+        let (a, b) = node_pair();
+        crate::net::tests_util::mine_locally(&a, 2);
+        let _e = established_peer(&b, 7);
+        assert_eq!(b.ask_headers_where_parked(), 0, "nothing parked");
+        let block = a.with_chain(|c| c.block_at(2).unwrap());
+        b.shared
+            .lock()
+            .unwrap()
+            .parked
+            .push((7, Box::new(CompactBlock::from_block(&block, 1))));
+        assert_eq!(b.ask_headers_where_parked(), 1);
+        assert_eq!(b.ask_headers_where_parked(), 0, "not again at once");
+        let g = b.shared.lock().unwrap();
+        let p = &g.peers[&7];
+        assert!(!p.may_ask_headers(Instant::now()));
+        assert!(p.may_ask_headers(Instant::now() + HEADERS_ANSWER_WAIT + Duration::from_secs(1)));
     }
 
     const PINNED_LABEL_KEY: u64 = 11_777_873_454_316_842_311;
@@ -10449,6 +10547,7 @@ mod tests_handler_fuzz {
                 onion_added: 0,
                 expected_headers: 0,
                 headers_asked: None,
+                headers_renewed: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,
@@ -11316,6 +11415,7 @@ mod tests_handler_review {
                 onion_added: 0,
                 expected_headers: 0,
                 headers_asked: None,
+                headers_renewed: None,
                 requested_bodies: HashMap::new(),
                 bodies_to_request: VecDeque::new(),
                 more_expected: false,

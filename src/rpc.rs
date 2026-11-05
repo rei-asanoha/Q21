@@ -193,15 +193,17 @@ const _: () = assert!(MAX_PUBLIC_ANSWER <= MAX_BATCH_RESPONSE);
 /// What a public explorer answers in place of a larger one.
 pub const ANSWER_TOO_LARGE: &str = "answer too large for this public service";
 
-/// `answer`, or the [`ANSWER_TOO_LARGE`] error to call `id` past
-/// [`MAX_PUBLIC_ANSWER`].
-fn capped_public_answer(answer: String, id: Json) -> String {
+/// `answer`, or past [`MAX_PUBLIC_ANSWER`] the [`ANSWER_TOO_LARGE`] error,
+/// of a fixed size: without the call's id, which a visitor chooses, and which
+/// encoded again made the error itself six times larger than the request
+/// (round 3 of red-team campaign 9).
+fn capped_public_answer(answer: String) -> String {
     if answer.len() <= MAX_PUBLIC_ANSWER {
         return answer;
     }
     Json::obj()
         .set("jsonrpc", Json::str("2.0"))
-        .set("id", id)
+        .set("id", Json::Null)
         .set("error", rpc_error(ERR_REQUEST, ANSWER_TOO_LARGE))
         .build()
         .encode()
@@ -1472,7 +1474,7 @@ impl RpcContext {
         let answer = self.handle_one(&request, client).encode();
         self.charge_answer(client, answer.len());
         if self.scans.is_some() {
-            return capped_public_answer(answer, request.get("id").cloned().unwrap_or(Json::Null));
+            return capped_public_answer(answer);
         }
         answer
     }
@@ -8309,10 +8311,22 @@ mod tests {
     #[test]
     fn a_public_answer_is_never_larger_than_caddy_reads_at_once() {
         let small = "x".repeat(MAX_PUBLIC_ANSWER);
-        assert_eq!(capped_public_answer(small.clone(), Json::u64(7)), small);
-        let large = capped_public_answer("x".repeat(MAX_PUBLIC_ANSWER + 1), Json::u64(7));
+        assert_eq!(capped_public_answer(small.clone()), small);
+        let large = capped_public_answer("x".repeat(MAX_PUBLIC_ANSWER + 1));
         assert!(large.contains(ANSWER_TOO_LARGE), "{large}");
-        assert!(large.contains("\"id\":7"), "{large}");
+        assert!(large.len() < 200, "a fixed size: {large}");
+        // Through the node: an id of a megabyte that encodes six times
+        // larger gets the fixed-size error, not an answer past the cap.
+        let c = public_context();
+        let id = "<".repeat(1024 * 1024 - 100);
+        let body = format!(r#"{{"jsonrpc":"2.0","id":"{id}","method":"getinfo","params":{{}}}}"#);
+        let out = c.handle_from(&body, ip("198.51.100.40"));
+        assert!(out.len() <= MAX_PUBLIC_ANSWER, "{} bytes", out.len());
+        assert!(
+            out.contains(ANSWER_TOO_LARGE),
+            "{}",
+            &out[..200.min(out.len())]
+        );
     }
 
     /// Red-team campaign 6, O1: a public explorer takes short batches only,

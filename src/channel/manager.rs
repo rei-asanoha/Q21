@@ -481,6 +481,11 @@ struct Chan {
     /// paying on a channel whose funding no longer existed). Kept in memory
     /// only, and checked again at every block.
     funding_gone: bool,
+    /// The peer's last update or splice, left unsigned while the funding was
+    /// gone, as it arrived (connection, frame): handled once the funding is
+    /// back, so that neither side waits on a payment in flight until the
+    /// next reconnection (round 2 of red-team campaign 9).
+    held_frame: Option<(u64, Vec<u8>)>,
 }
 
 /// What a closing channel is waiting for on chain, so the block hook can finish
@@ -1059,6 +1064,7 @@ impl ChannelManager {
                         spend: None,
                         reserved: false,
                         funding_gone: false,
+                        held_frame: None,
                         conflict: None,
                         logged: None,
                         behind,
@@ -2263,6 +2269,7 @@ impl ChannelManager {
                 spend: None,
                 reserved: false,
                 funding_gone: false,
+                held_frame: None,
                 conflict: None,
                 logged: None,
                 behind: false,
@@ -2394,7 +2401,9 @@ impl ChannelManager {
             }
             // Nothing is signed on a channel whose funding left the chain:
             // the peer's update waits, and is resent at the next reestablish.
-            ChMsg::Update { .. } | ChMsg::Splice { .. } if chan.funding_gone => {}
+            ChMsg::Update { .. } | ChMsg::Splice { .. } if chan.funding_gone => {
+                chan.held_frame = Some((peer, write_frame(cid, KIND_ENGINE, &msg.encode())));
+            }
             ChMsg::Update { .. } => {
                 // An ordinary update, one crossing our own proposal (both ends
                 // paid at once: the two are merged into the next state), or a
@@ -2696,6 +2705,7 @@ impl ChannelManager {
                 spend: None,
                 reserved: false,
                 funding_gone: false,
+                held_frame: None,
                 conflict: None,
                 logged: None,
                 behind: false,
@@ -2798,10 +2808,9 @@ impl ChannelManager {
         let mut release = Vec::new();
         let mut hold = Vec::new();
         let mut frames = Vec::new();
+        let mut held = Vec::new();
         {
             let mut g = self.inner.lock().unwrap();
-            let bindings: HashMap<u64, [u8; 32]> =
-                g.links.iter().map(|(p, l)| (*p, l.binding)).collect();
             for c in g.channels.values_mut() {
                 // An open channel whose funding is no longer an unspent,
                 // confirmed output of the active chain, with no spend of it
@@ -2810,19 +2819,13 @@ impl ChannelManager {
                 let gone = funding_left(c, depth_of);
                 if gone != c.funding_gone {
                     c.funding_gone = gone;
-                    // Back: what either side sent meanwhile was not signed.
-                    // A reestablish gets the peer to send its own again, as
-                    // after a reconnection; until then both sides read "a
-                    // payment is already in flight" (round 2).
-                    if let (false, Some(binding)) = (gone, bindings.get(&c.peer)) {
-                        frames.push((
-                            c.peer,
-                            write_frame(
-                                c.machine.channel_id(),
-                                KIND_ENGINE,
-                                &c.machine.reestablish_for(*binding).encode(),
-                            ),
-                        ));
+                    // Back: the peer's update left unsigned meanwhile is
+                    // handled now, as if it had just arrived; until then both
+                    // sides read "a payment is already in flight" (round 2).
+                    // A reestablish would not do: its nonce is the session's,
+                    // already seen, and a replay is penalized.
+                    if !gone {
+                        held.extend(c.held_frame.take());
                     }
                     eprintln!(
                         "{}: channel {}: its funding {}",
@@ -2916,6 +2919,13 @@ impl ChannelManager {
         }
         for tx in again {
             self.broadcast_or_warn(&tx, "funding or close");
+        }
+        // Over the connection it came on, if still up: else the reestablish
+        // of the next session sends it again. A failure is ours to ignore,
+        // not the peer's to pay for.
+        for (peer, frame) in held {
+            let r = self.deliver(peer, &frame);
+            frames.extend(r.frames.into_iter().map(|f| (peer, f)));
         }
         frames
     }

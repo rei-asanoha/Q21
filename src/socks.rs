@@ -136,7 +136,10 @@ pub fn connect(
     // from the start by one, the node then waiting on it for a Tor
     // (round 2 of red-team campaign 9). Only on Linux, see
     // [`listener_owner_trusted`].
-    if foreign_proxy(proxy, listener_owner_trusted) {
+    let ours = s.local_addr().ok();
+    if foreign_proxy(proxy, |port| {
+        listener_owner_trusted(port) && ours.map_or(true, |o| connection_owner_trusted(proxy, o))
+    }) {
         drop(s);
         note_foreign_proxy(proxy);
         return Err(failure(FOREIGN_PROXY));
@@ -278,6 +281,74 @@ fn foreign_proxy(proxy: SocketAddr, trusted: impl Fn(u16) -> bool) -> bool {
     proxy.ip().is_loopback() && !trusted(proxy.port())
 }
 
+/// Whether the socket that accepted our connection `ours` → `proxy` runs as
+/// this account or a system one. The listener alone is not enough: a
+/// program of another account that closes its listening socket at once after
+/// each connection it accepts is no listener when we look (round 3 of
+/// red-team campaign 9). Read from `/proc/net/tcp` and `/proc/net/tcp6`, an
+/// IPv4 connection to a listener on every address being listed there as
+/// IPv4 mapped into IPv6. Not known (not Linux, or our own end of the
+/// connection not listed, as on systems where `/proc/net` says nothing):
+/// trusted, as before; our end listed and not the other: not trusted.
+fn connection_owner_trusted(proxy: SocketAddr, ours: SocketAddr) -> bool {
+    let Some(me) = own_uid() else {
+        return true;
+    };
+    let mut seen = false;
+    let mut owners = Vec::new();
+    for f in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(text) = std::fs::read_to_string(f) {
+            let (s, o) = connection_owners_in(&text, proxy, ours);
+            seen |= s;
+            owners.extend(o);
+        }
+    }
+    if !seen {
+        return true;
+    }
+    !owners.is_empty() && owners.into_iter().all(|o| owner_trusted(o, me))
+}
+
+/// The parsing half of [`connection_owner_trusted`]: whether our end of the
+/// connection is listed, and the accounts of the other end.
+fn connection_owners_in(text: &str, proxy: SocketAddr, ours: SocketAddr) -> (bool, Vec<u32>) {
+    let (p, o) = (proc_forms(proxy), proc_forms(ours));
+    let mut seen = false;
+    let mut owners = Vec::new();
+    for l in text.lines().skip(1) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() <= 7 {
+            continue;
+        }
+        let (local, remote) = (f[1].to_ascii_uppercase(), f[2].to_ascii_uppercase());
+        if o.contains(&local) && p.contains(&remote) {
+            seen = true;
+        }
+        if p.contains(&local) && o.contains(&remote) {
+            if let Ok(uid) = f[7].parse() {
+                owners.push(uid);
+            }
+        }
+    }
+    (seen, owners)
+}
+
+/// How `/proc/net/tcp` and `tcp6` write `a`: each 32-bit word of the address
+/// in this machine's byte order, in hexadecimal, then `:` and the port; an
+/// IPv4 address also as mapped into IPv6.
+fn proc_forms(a: SocketAddr) -> Vec<String> {
+    let word = |b: &[u8]| format!("{:08X}", u32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+    let v6 = |o: [u8; 16]| o.chunks(4).map(word).collect::<String>();
+    let port = format!(":{:04X}", a.port());
+    match a.ip() {
+        std::net::IpAddr::V4(ip) => vec![
+            word(&ip.octets()) + &port,
+            v6(ip.to_ipv6_mapped().octets()) + &port,
+        ],
+        std::net::IpAddr::V6(ip) => vec![v6(ip.octets()) + &port],
+    }
+}
+
 /// Why a connection through a local proxy was not made.
 pub const FOREIGN_PROXY: &str =
     "the proxy's port on this computer is held by a program of another account: nothing is sent through it";
@@ -342,6 +413,51 @@ pub mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         assert!(!foreign_proxy(addr, listener_owner_trusted));
+    }
+
+    /// Round 3 of red-team campaign 9: a program of another account that
+    /// closes its listener right after accepting was no listener when we
+    /// looked. The socket that accepted our very connection is checked.
+    #[test]
+    fn the_socket_that_accepted_our_connection_is_checked() {
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let ours: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        // 127.0.0.1:9050 is 0100007F:235A, port 41000 is A028 (little-endian
+        // words, as on the machines this runs on).
+        let row = |local: &str, remote: &str, uid: u32| {
+            format!("   0: {local} {remote} 01 00000000:00000000 00:00000000 00000000 {uid:>5}        0 1 1\n")
+        };
+        let head =
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid\n";
+        if cfg!(target_endian = "little") {
+            let both = format!(
+                "{head}{}{}",
+                row("0100007F:A028", "0100007F:235A", 1000),
+                row("0100007F:235A", "0100007F:A028", 1001)
+            );
+            assert_eq!(connection_owners_in(&both, proxy, ours), (true, vec![1001]));
+            // Ours listed, the other end not: seen, no owner.
+            let alone = format!("{head}{}", row("0100007F:A028", "0100007F:235A", 1000));
+            assert_eq!(connection_owners_in(&alone, proxy, ours), (true, vec![]));
+            // A listener on every address: IPv4 mapped into IPv6.
+            let mapped = format!(
+                "{head}{}",
+                row(
+                    "0000000000000000FFFF00000100007F:235A",
+                    "0000000000000000FFFF00000100007F:A028",
+                    0
+                )
+            );
+            assert_eq!(connection_owners_in(&mapped, proxy, ours), (false, vec![0]));
+        }
+        // Live: a connection of this account to itself is trusted.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = TcpStream::connect(addr).unwrap();
+        let _accepted = l.accept().unwrap();
+        assert!(connection_owner_trusted(addr, c.local_addr().unwrap()));
+        assert!(!foreign_proxy(addr, |port| listener_owner_trusted(port)
+            && connection_owner_trusted(addr, c.local_addr().unwrap())));
     }
 
     /// The owner of a listening port is read from `/proc/net/tcp`; another

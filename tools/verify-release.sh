@@ -126,7 +126,7 @@ strict_tar_names() {
 # reading the local headers would otherwise cut the data elsewhere
 # (red-team campaign 9).
 strict_zip() {
-  local Z=$1 EXPECT=0 COUNT=0 OFFSET NAME CSIZE DESC LNAME NLEN XLEN SIG LCSIZE
+  local Z=$1 EXPECT=0 COUNT=0 OFFSET NAME CSIZE DESC LNAME NLEN XLEN SIG LCSIZE LFLAG
   while IFS='|' read -r OFFSET CSIZE DESC NAME; do
     COUNT=$((COUNT + 1))
     [ "$OFFSET" = "$EXPECT" ] || return 1
@@ -141,6 +141,11 @@ strict_zip() {
     # reading the local headers cannot check them first. A release archive,
     # written to a file, never uses one (round 2 of red-team campaign 9).
     [ "$DESC" = no ] || return 1
+    # ... in the local header as well, where the central directory may say
+    # otherwise (round 3 of red-team campaign 9).
+    LFLAG=$(od -An -tu1 -j $((OFFSET + 6)) -N 1 "$Z" | tr -d ' \n')
+    case $LFLAG in ""|*[!0-9]*) return 1 ;; esac
+    [ $((LFLAG & 8)) -eq 0 ] || return 1
     LCSIZE=$(od -An -tu1 -j $((OFFSET + 18)) -N 4 "$Z" \
       | awk '{print $1 + 256 * $2 + 65536 * $3 + 16777216 * $4}')
     [ "$LCSIZE" = "$CSIZE" ] || return 1
