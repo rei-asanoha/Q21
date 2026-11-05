@@ -143,6 +143,16 @@ naming `main` (an old build signed by CI), a version older than the one
 running, a commit other than the one the release page shows: **do not
 install** (see [SIGNING.md](SIGNING.md)).
 
+The same check of the comment, made by the machine rather than by eye
+(`$V` is the version you set when downloading, in the same session):
+
+```bash
+minisign -Vm ~/SHA256SUMS -P 'RW…' | grep -Ex "Trusted comment: Q21 $V [0-9a-f]{40} -- Rei Asanoha" || echo "REFUSE: the signed comment does not name $V"
+```
+
+**You should see** the comment line again, naming `$V`. If you read
+`REFUSE`, do not install.
+
 ```bash
 tar -xzf ~/q21-linux-x86_64.tar.gz && sudo systemctl stop q21
 ```

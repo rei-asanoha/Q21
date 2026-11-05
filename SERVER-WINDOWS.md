@@ -499,6 +499,16 @@ signed old release replayed under a new name), or if the commit is not the
 one the release page shows. A valid signature of something you did not want
 is still something you did not want.
 
+The same check of the comment, made by the machine rather than by eye
+(`$V` is the version you set when downloading, in the same session):
+
+```bash
+minisign -Vm ~/SHA256SUMS -P 'RW…' | grep -Ex "Trusted comment: Q21 $V [0-9a-f]{40} -- Rei Asanoha" || echo "REFUSE: the signed comment does not name $V"
+```
+
+**You should see** the comment line again, naming `$V`. If you read
+`REFUSE`, do not install.
+
 Then, and only then:
 
 ```bash
