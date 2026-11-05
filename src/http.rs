@@ -183,6 +183,27 @@ pub struct Response {
     /// See [`Response::html`]: it replaces `'unsafe-inline'` in the content
     /// security policy.
     pub nonce: Option<String>,
+    /// Carries this process's run id ([`run_id`]): set on the answers to an
+    /// authorized request only.
+    pub run: bool,
+}
+
+/// A random id drawn once per run of the program, sent with every answer to
+/// an authorized request (`X-Q21-Run`). The wallet page keeps the first it
+/// sees and stops at an answer without it, or with another: a tab left open
+/// after the wallet stopped kept calling whatever listened next on its port,
+/// another account's program included, and showed its answers (red-team
+/// campaign 9). A program without the session token never sees it. Empty
+/// without secure randomness: the page then stops at once, as it should.
+pub fn run_id() -> &'static str {
+    static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| {
+        let mut raw = [0u8; 16];
+        match crate::rng::fill(&mut raw) {
+            Ok(()) => raw.iter().map(|o| format!("{o:02x}")).collect(),
+            Err(_) => String::new(),
+        }
+    })
 }
 
 impl Response {
@@ -192,6 +213,7 @@ impl Response {
             content_type: "application/json; charset=utf-8".into(),
             body,
             nonce: None,
+            run: false,
         }
     }
 
@@ -234,6 +256,7 @@ impl Response {
             content_type: "text/html; charset=utf-8".into(),
             body,
             nonce,
+            run: false,
         }
     }
     pub fn text(status: u16, body: &str) -> Response {
@@ -242,6 +265,7 @@ impl Response {
             content_type: "text/plain; charset=utf-8".into(),
             body: body.into(),
             nonce: None,
+            run: false,
         }
     }
     pub fn not_found() -> Response {
@@ -921,7 +945,9 @@ fn handle_connection<F>(
                         if !authorized(&req, expected) {
                             Response::text(401, "missing or invalid access token")
                         } else {
-                            handler(req)
+                            let mut r = handler(req);
+                            r.run = true;
+                            r
                         }
                     } else {
                         handler(req)
@@ -1066,12 +1092,14 @@ fn exchange_launch_token(
         return deny();
     }
     *guard = None;
-    Response::json(
+    let mut r = Response::json(
         crate::json::Json::obj()
             .set("token", crate::json::Json::str(token))
             .build()
             .encode(),
-    )
+    );
+    r.run = true;
+    r
 }
 
 /// Refuses what a browser should never be able to send here.
@@ -1561,13 +1589,20 @@ fn write_response(stream: &mut TcpStream, r: &Response) -> std::io::Result<()> {
          X-Frame-Options: DENY\r\n\
          Referrer-Policy: no-referrer\r\n\
          Cache-Control: no-store\r\n\
+         Cross-Origin-Opener-Policy: same-origin\r\n\
          Content-Security-Policy: {}\r\n\
+         {}\
          \r\n",
         r.status,
         reason_phrase,
         r.content_type,
         r.body.len(),
-        csp_policy(r)
+        csp_policy(r),
+        if r.run {
+            format!("X-Q21-Run: {}\r\n", run_id())
+        } else {
+            String::new()
+        }
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(r.body.as_bytes())?;
@@ -2013,6 +2048,48 @@ mod tests {
              Authorization: Bearer secret\r\nConnection: close\r\n\r\n",
         );
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        h.shutdown();
+    }
+
+    /// Red-team campaign 9: a wallet tab left open after the wallet stopped
+    /// kept calling its port, whoever listened there next. Every authorized
+    /// answer names this run, always the same one; a refused request learns
+    /// nothing of it.
+    #[test]
+    fn an_authorized_answer_names_the_run_and_a_refused_one_does_not() {
+        let h = serve("127.0.0.1:0", Some("secret".into()), echo()).expect("startup");
+        let authorized = || {
+            request(
+                h.addr,
+                "GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                 Authorization: Bearer secret\r\nConnection: close\r\n\r\n",
+            )
+        };
+        let header = |r: &str| -> Option<String> {
+            r.split("\r\n\r\n")
+                .next()
+                .unwrap_or("")
+                .lines()
+                .find_map(|l| l.strip_prefix("X-Q21-Run: ").map(str::to_string))
+        };
+        let first = authorized();
+        let second = authorized();
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert_eq!(header(&first).as_deref(), Some(run_id()), "{first}");
+        assert_eq!(header(&second), header(&first));
+        assert_eq!(run_id().len(), 32, "16 random bytes in hexadecimal");
+        assert!(
+            first.contains("\r\nCross-Origin-Opener-Policy: same-origin\r\n"),
+            "{first}"
+        );
+
+        let refused = get(h.addr, "/status");
+        assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+        assert_eq!(header(&refused), None, "{refused}");
+        assert!(
+            refused.contains("\r\nCross-Origin-Opener-Policy: same-origin\r\n"),
+            "{refused}"
+        );
         h.shutdown();
     }
 
