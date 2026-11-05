@@ -1307,6 +1307,17 @@ fn amount_to_units(s: &str) -> Option<u64> {
     e.checked_mul(UNITS_PER_COIN)?.checked_add(f)
 }
 
+/// `j` with an `active` field: whether the block is on the main chain.
+fn with_active(j: Json, active: bool) -> Json {
+    match j {
+        Json::Object(mut m) => {
+            m.insert("active".to_string(), Json::Bool(active));
+            Json::Object(m)
+        }
+        other => other,
+    }
+}
+
 fn block_json(b: &Block, network: Network) -> Json {
     let txs: Vec<Json> = b.transactions.iter().map(|t| tx_json(t, network)).collect();
     let uncles: Vec<Json> = b.uncles.iter().map(header_json).collect();
@@ -3569,23 +3580,38 @@ impl RpcContext {
         json
     }
 
+    /// Answers `active: false` for a block no longer on the main chain.
+    ///
+    /// # The defect this closes
+    ///
+    /// A block a reorganization left aside was shown by its id like any
+    /// other, with confirmations counted from its height: a payment it
+    /// carried, undone since, read as confirmed thirty times on the explorer
+    /// (red-team campaign 9). And a side branch's transactions are never
+    /// validated, only its shape and its work.
     fn getblock(&self, params: &Json, full: bool) -> Result<Json, Json> {
         let block = self.node.with_chain(|c| {
-            if let Some(h) = params.get("height").and_then(|v| v.as_u64()) {
-                return c.block_at(h);
-            }
-            if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
-                if let Some(h) = Hash256::from_hex(id) {
-                    return c.block_by_id(&h);
-                }
-            }
-            // Without a parameter: the tip block.
-            c.block_at(c.height())
+            let b = if let Some(h) = params.get("height").and_then(|v| v.as_u64()) {
+                c.block_at(h)
+            } else if let Some(id) = params
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(Hash256::from_hex)
+            {
+                c.block_by_id(&id)
+            } else {
+                // Without a parameter: the tip block.
+                c.block_at(c.height())
+            };
+            b.map(|b| {
+                let active = c.active_at(b.header.height) == Some(b.header.block_id());
+                (b, active)
+            })
         });
 
         match block {
-            Some(b) if full => Ok(block_json(&b, self.network)),
-            Some(b) => Ok(header_json(&b.header)),
+            Some((b, active)) if full => Ok(with_active(block_json(&b, self.network), active)),
+            Some((b, active)) => Ok(with_active(header_json(&b.header), active)),
             None => Err(rpc_error(ERR_NOT_FOUND, "block not found")),
         }
     }
@@ -7868,6 +7894,60 @@ mod tests {
         // The genesis coinbase issues exactly the coin.
         let txs = r.get("transactions").and_then(|v| v.as_array()).unwrap();
         assert!(txs[0].get("coinbase") == Some(&Json::Bool(true)));
+    }
+
+    /// Red-team campaign 9: a block a reorganization left aside was shown by
+    /// its id like any other, and the explorer counted its confirmations.
+    #[test]
+    fn getblock_says_when_a_block_is_off_the_main_chain() {
+        let g = genesis_block(NETWORK);
+        let branch = |miner: u8, n: u64| {
+            let mut c = Chain::new(NETWORK, g.clone());
+            let mut blocks = Vec::new();
+            for _ in 0..n {
+                let t = c.tip().time + crate::consensus::TARGET_BLOCK_SECS + miner as u64;
+                let b = c
+                    .mine_block(
+                        Hash256([miner; 32]),
+                        SchemeId::LamportOts,
+                        &[],
+                        t,
+                        50_000_000,
+                    )
+                    .expect("mining");
+                c.connect(&b, t + 1).expect("connect");
+                blocks.push(b);
+            }
+            blocks
+        };
+        let short = branch(0x11, 1);
+        let long = branch(0x22, 2);
+        let mut chain = Chain::new(NETWORK, g.clone());
+        for b in short.iter().chain(long.iter()) {
+            chain.submit(b, b.header.time + 100_000).expect("submit");
+        }
+        assert_eq!(
+            chain.tip_id(),
+            long[1].header.block_id(),
+            "the longer branch won"
+        );
+        let c = context(false);
+        let c = RpcContext {
+            node: Arc::new(Node::new(NETWORK, chain)),
+            ..c
+        };
+        let aside = short[0].header.block_id().to_hex();
+        let r = call_ok(&c, "getblock", &format!(r#"{{"id":"{aside}"}}"#));
+        assert_eq!(r.get("active"), Some(&Json::Bool(false)), "{}", r.encode());
+        let r = call_ok(&c, "getblockheader", &format!(r#"{{"id":"{aside}"}}"#));
+        assert_eq!(r.get("active"), Some(&Json::Bool(false)));
+        let main = long[0].header.block_id().to_hex();
+        let r = call_ok(&c, "getblock", &format!(r#"{{"id":"{main}"}}"#));
+        assert_eq!(r.get("active"), Some(&Json::Bool(true)));
+        let r = call_ok(&c, "getblock", r#"{"height":1}"#);
+        assert_eq!(r.get("active"), Some(&Json::Bool(true)));
+        let tip = call_ok(&c, "getblock", "{}");
+        assert_eq!(tip.get("active"), Some(&Json::Bool(true)));
     }
 
     #[test]
