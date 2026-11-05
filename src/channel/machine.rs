@@ -2183,7 +2183,12 @@ impl Machine {
                 seq: self.control_recv,
             });
         }
-        if let (Some(tx), Phase::Opening | Phase::Funded) = (&self.funding_tx, self.phase) {
+        // Kept in every phase: a reorganization can take the funding off the
+        // chain long after the opening, and the funder then holds its coins
+        // and announces it again. Dropped at the first compaction, it was
+        // neither, and the wallet spent the coins elsewhere (round 2 of
+        // red-team campaign 9).
+        if let Some(tx) = &self.funding_tx {
             out.push(Record::FundingTx { tx: tx.encode() });
         }
         if let Some(fee) = self.close_fee {

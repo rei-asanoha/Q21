@@ -4161,13 +4161,33 @@ fn a_channel_whose_funding_left_the_chain_signs_nothing_until_it_confirms_again(
     p.pump();
     assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 1_000_000);
 
-    // Confirmed again for the acceptor: the payment goes through once both
-    // ends resynchronize.
-    drive(&p.acceptor, &chain);
+    // Back at one block only, for the acceptor: still held, as at the
+    // opening, until buried to the agreed depth (round 2).
+    let shallow = {
+        let c = chain.clone();
+        move |op: &OutPoint| chain_depth(&c, op).map(|(_, out)| (1, out))
+    };
+    p.acceptor.on_connected_block(&[], h, &shallow);
+    assert!(p.acceptor.info(cid).unwrap().funding_gone);
+    // Nothing that spends the funding goes out meanwhile: neither close.
+    assert_eq!(p.acceptor.close(cid).unwrap_err(), FUNDING_GONE);
+    assert_eq!(p.acceptor.force_close(cid).unwrap_err(), FUNDING_GONE);
+
+    // Buried again for the acceptor: it sends its reestablish, the funder
+    // sends the payment again, and it goes through with no reconnection
+    // (round 2: both ends read "a payment is already in flight" until one).
+    for (_, f) in drive(&p.acceptor, &chain) {
+        p.queue.push_back((0, f));
+    }
     assert!(!p.acceptor.info(cid).unwrap().funding_gone);
-    reconnect(&mut p);
+    p.pump();
     assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 3_000_000);
     assert_eq!(p.funder.info(cid).unwrap().remote_balance, 3_000_000);
+    // And the channel pays on.
+    let m = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, m));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().local_balance, 4_000_000);
 }
 
 /// A funding that left the chain while the node was down holds the channel

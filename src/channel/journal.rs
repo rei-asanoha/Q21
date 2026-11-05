@@ -550,6 +550,13 @@ impl Journal {
             let f = OpenOptions::new().write(true).open(&path)?;
             f.set_len(good as u64)?;
             f.sync_all()?;
+            eprintln!(
+                "notice: channel journal {}: the last {} bytes, an interrupted write, were cut; \
+                 {} records kept",
+                path.display(),
+                raw.len() - good,
+                records.len()
+            );
         }
         let count = records.len();
         Ok((
@@ -632,6 +639,24 @@ fn zeros_to_end(raw: &[u8], from: usize) -> bool {
         .is_some_and(|rest| rest.iter().all(|b| *b == 0))
 }
 
+/// The longest run of zeros an interrupted append can leave: its frame, at
+/// most a block's size, rounded up by the file system. Longer, the zeros
+/// cover records that were written: the journal is refused, not cut back to
+/// an older copy of the channel (round 2 of red-team campaign 9).
+pub const TORN_ZEROS_MAX: usize = crate::consensus::MAX_BLOCK_SIZE + 64 * 1024;
+
+/// Zeros from `from` to the end of `raw`, no more than an interrupted append
+/// leaves: `Ok(true)`; more: corruption; not only zeros: `Ok(false)`.
+fn torn_zeros(raw: &[u8], from: usize) -> Result<bool, Corruption> {
+    if !zeros_to_end(raw, from) {
+        return Ok(false);
+    }
+    if raw.len() - from > TORN_ZEROS_MAX {
+        return Err(Corruption::BadChecksum { offset: from });
+    }
+    Ok(true)
+}
+
 /// The records of a journal and the length of the bytes they occupy; what
 /// follows is a torn tail. Only an append cut short can tear: a frame running
 /// past the end of the file, a bad checksum on the very last frame, or zeros
@@ -645,7 +670,7 @@ pub fn scan(raw: &[u8]) -> Result<(Vec<Record>, usize), Corruption> {
     while pos + 8 <= raw.len() {
         // No record starts with eight zeros (a frame holds at least a tag):
         // zeros from here to the end are what an interrupted append left.
-        if zeros_to_end(raw, pos) {
+        if torn_zeros(raw, pos)? {
             break;
         }
         let len = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
@@ -659,7 +684,7 @@ pub fn scan(raw: &[u8]) -> Result<(Vec<Record>, usize), Corruption> {
         if checksum(body) != crc {
             // The last frame, torn: alone at the end, or followed by zeros
             // only.
-            if body_end == raw.len() || zeros_to_end(raw, body_end) {
+            if body_end == raw.len() || torn_zeros(raw, body_end)? {
                 break;
             }
             return Err(Corruption::BadChecksum { offset: pos });
@@ -669,6 +694,12 @@ pub fn scan(raw: &[u8]) -> Result<(Vec<Record>, usize), Corruption> {
             Err(_) => return Err(Corruption::Undecodable { offset: pos }),
         }
         pos = body_end;
+    }
+    // Zeros where not a single record survives: the journal of a channel
+    // was there, and nothing of it is left to load. Refused, so that the
+    // holder is told, rather than the channel silently gone.
+    if out.is_empty() && pos < raw.len() && zeros_to_end(raw, pos) {
+        return Err(Corruption::BadChecksum { offset: 0 });
     }
     Ok((out, pos))
 }
@@ -839,6 +870,51 @@ mod tests {
         std::fs::write(&path, &rot).unwrap();
         assert!(Journal::open(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), rot, "nothing written");
+    }
+
+    /// Round 2 of red-team campaign 9: zeros of any length were cut, a
+    /// journal of zeros only was emptied without a word, and committed
+    /// records replaced by zeros loaded an older copy of the channel. Zeros
+    /// longer than an append can leave, or where no record survives, refuse
+    /// the journal and leave it as it is.
+    #[test]
+    fn zeros_beyond_an_append_or_with_no_record_left_are_refused() {
+        let path = tmp("zeros-bound");
+        {
+            let (mut j, _) = Journal::open(&path).unwrap();
+            j.append(&Record::Ready).unwrap();
+        }
+        let good = std::fs::read(&path).unwrap();
+        // As long as an append can leave: cut.
+        let mut z = good.clone();
+        z.resize(good.len() + TORN_ZEROS_MAX, 0);
+        std::fs::write(&path, &z).unwrap();
+        let (_, recs) = Journal::open(&path).unwrap();
+        assert_eq!(recs, vec![Record::Ready]);
+        // Longer: refused, untouched.
+        let mut z = good.clone();
+        z.resize(good.len() + TORN_ZEROS_MAX + 1, 0);
+        std::fs::write(&path, &z).unwrap();
+        assert!(Journal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), z, "nothing written");
+        // Only zeros, short or long: refused, untouched.
+        for n in [5usize, 9, 4096] {
+            let zeros = vec![0u8; n];
+            std::fs::write(&path, &zeros).unwrap();
+            assert!(Journal::open(&path).is_err(), "{n} zeros");
+            assert_eq!(std::fs::read(&path).unwrap(), zeros);
+        }
+        // A first append torn before any zero: nothing was ever kept, as
+        // before.
+        let mut torn = frame(&Record::Ready);
+        torn.truncate(torn.len() - 1);
+        std::fs::write(&path, &torn).unwrap();
+        let (_, recs) = Journal::open(&path).unwrap();
+        assert!(recs.is_empty());
+        // A new journal is empty, not refused.
+        let fresh = tmp("zeros-fresh");
+        let _ = std::fs::remove_file(&fresh);
+        assert!(Journal::open(&fresh).unwrap().1.is_empty());
     }
 
     /// A bad checksum in the middle of the file is not a torn append: bit rot

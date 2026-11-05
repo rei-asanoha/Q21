@@ -1940,6 +1940,29 @@ fn a_long_channel_keeps_its_maps_and_journal_bounded() {
     // Without compaction the funder's journal would hold some 150 commitments
     // of three ML-DSA-87 signatures each, about 2 MB.
     assert!(biggest < 1_200_000, "journal reached {biggest} bytes");
+    // The funder's funding transaction survives every compaction: a
+    // reorganization can take the funding off the chain long after the
+    // opening, and the funder announces it again (round 2 of red-team
+    // campaign 9: it was dropped at the first compaction).
+    drop(f);
+    {
+        // A funder that built its funding itself holds this record (here,
+        // any transaction stands for it).
+        let (mut j, _) = super::journal::Journal::open(dir.join("f.jrnl")).unwrap();
+        j.append(&super::journal::Record::FundingTx { tx: old.encode() })
+            .unwrap();
+    }
+    let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+    assert_eq!(f.phase(), Phase::Open);
+    assert_eq!(f.funding_tx().map(|t| t.txid()), Some(old.txid()));
+    f.compact().unwrap();
+    drop(f);
+    let f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+    assert_eq!(
+        f.funding_tx().map(|t| t.txid()),
+        Some(old.txid()),
+        "kept by the compaction of an open channel"
+    );
     // The oldest revoked state is still recognised and punishable after the
     // journal was compacted many times and reopened.
     drop(a);

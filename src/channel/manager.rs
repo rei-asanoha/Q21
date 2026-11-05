@@ -1875,6 +1875,12 @@ impl ChannelManager {
         if chan.refuses() {
             return Err(BEHIND.into());
         }
+        // A close spends the funding: while it is off the chain, the close
+        // could not confirm, and the channel stayed closing (round 2 of
+        // red-team campaign 9).
+        if chan.funding_gone {
+            return Err(FUNDING_GONE.into());
+        }
         if !chan.synced {
             return Err("channel is not yet resynchronized with its peer".into());
         }
@@ -2753,10 +2759,10 @@ impl ChannelManager {
     ) -> Vec<(u64, Vec<u8>)> {
         self.watch_fundings(txs, height);
         self.react_to_spends(txs, height);
-        let frames = self.confirm_buried(height, depth_of);
+        let mut frames = self.confirm_buried(height, depth_of);
         self.advance_closes(txs, height);
         self.expire_unfunded(height, depth_of);
-        self.tend_fundings(depth_of);
+        frames.extend(self.tend_fundings(depth_of));
         frames
     }
 
@@ -2787,12 +2793,15 @@ impl ChannelManager {
     /// Each block: our funding, signed for by the acceptor and still in no
     /// block, is announced again — a pool may have dropped it — and the coins
     /// of a channel past its opening are released.
-    fn tend_fundings(&self, depth_of: &DepthOf) {
+    fn tend_fundings(&self, depth_of: &DepthOf) -> Vec<(u64, Vec<u8>)> {
         let mut again = Vec::new();
         let mut release = Vec::new();
         let mut hold = Vec::new();
+        let mut frames = Vec::new();
         {
             let mut g = self.inner.lock().unwrap();
+            let bindings: HashMap<u64, [u8; 32]> =
+                g.links.iter().map(|(p, l)| (*p, l.binding)).collect();
             for c in g.channels.values_mut() {
                 // An open channel whose funding is no longer an unspent,
                 // confirmed output of the active chain, with no spend of it
@@ -2801,6 +2810,20 @@ impl ChannelManager {
                 let gone = funding_left(c, depth_of);
                 if gone != c.funding_gone {
                     c.funding_gone = gone;
+                    // Back: what either side sent meanwhile was not signed.
+                    // A reestablish gets the peer to send its own again, as
+                    // after a reconnection; until then both sides read "a
+                    // payment is already in flight" (round 2).
+                    if let (false, Some(binding)) = (gone, bindings.get(&c.peer)) {
+                        frames.push((
+                            c.peer,
+                            write_frame(
+                                c.machine.channel_id(),
+                                KIND_ENGINE,
+                                &c.machine.reestablish_for(*binding).encode(),
+                            ),
+                        ));
+                    }
                     eprintln!(
                         "{}: channel {}: its funding {}",
                         if gone { "ALERT" } else { "notice" },
@@ -2812,6 +2835,22 @@ impl ChannelManager {
                             "is confirmed again"
                         }
                     );
+                }
+                // A close alone not yet in a block, its funding unspent: it
+                // is announced again, as after a restart. A reorganization
+                // that took it back with its block left it in no pool, and
+                // the channel waited for a restart (round 2 of red-team
+                // campaign 9). During a splice, see below.
+                if c.machine.phase() == Phase::Forcing
+                    && c.spend.is_none()
+                    && !c.refuses()
+                    && c.machine.splice_status().is_none()
+                {
+                    if let Ok(tx) = c.machine.closing_commitment(FORCE_CLOSE_TIER) {
+                        if depth_of(&tx.inputs[0].prev_out).is_some() {
+                            again.push(tx);
+                        }
+                    }
                 }
                 let Some(tx) = c.machine.funding_tx().cloned() else {
                     continue;
@@ -2876,8 +2915,9 @@ impl ChannelManager {
             (self.hooks.reserve)(&tx, false);
         }
         for tx in again {
-            self.broadcast_or_warn(&tx, "funding");
+            self.broadcast_or_warn(&tx, "funding or close");
         }
+        frames
     }
 
     /// Shortens how long a channel may wait for its funding (see
@@ -3809,6 +3849,13 @@ impl ChannelManager {
     ) -> Result<Transaction, String> {
         let mut g = self.inner.lock().unwrap();
         let chan = g.channels.get_mut(&cid).ok_or("unknown channel")?;
+        // Its commitment spends the funding: while the funding is off the
+        // chain, nothing could confirm it, and the channel stayed forcing
+        // with nothing announced once the funding came back (round 2 of
+        // red-team campaign 9).
+        if chan.funding_gone {
+            return Err(FUNDING_GONE.into());
+        }
         // An older copy's latest commitment may be revoked: broadcasting it
         // would lose the whole channel to a penalty. A claim never proved is
         // the holder's to judge: once they confirm that this wallet was not
@@ -3878,16 +3925,19 @@ impl ChannelManager {
 /// The `Close` of a cooperative close agreed while an update was still in
 /// flight, once that update has settled: the close could not be signed over
 /// balances the two sides did not yet share, so it follows the update.
-/// An open channel whose funding is no longer an unspent, confirmed output
-/// of the active chain, with no spend of it seen and no splice under way: a
-/// reorganization took it away (red-team campaign 9).
+/// An open channel whose funding is no longer an unspent output of the
+/// active chain buried to the agreed depth, with no spend of it seen and no
+/// splice under way: a reorganization took it away (red-team campaign 9).
+/// Back on the chain, it holds the channel until buried to that depth again,
+/// as at the opening: at one block, a payment rested on a funding one block
+/// deep (round 2).
 fn funding_left(c: &Chan, depth_of: &DepthOf) -> bool {
     c.machine.phase() == Phase::Open
         && c.spend.is_none()
         && c.machine.splice_status().is_none()
-        && c.machine
-            .funding_outpoint()
-            .is_some_and(|op| depth_of(&op).is_none())
+        && c.machine.funding_outpoint().is_some_and(|op| {
+            depth_of(&op).map_or(0, |(depth, _)| depth) < u64::from(c.machine.funding_depth())
+        })
 }
 
 fn pending_close(chan: &mut Chan, cid: Hash256) -> Option<Vec<u8>> {
