@@ -3724,15 +3724,23 @@ fn cmd_snapshot(datadir: &Path, args: &[String]) -> Result<(), String> {
                     "adoption refused: the body file is incomplete or damaged ({s})"
                 ));
             }
+            // Only the authenticated path, and the bodies up to its tip: see
+            // `adopted_part`. Written anew rather than copied, so that
+            // nothing past the tip comes along.
+            let (headers, bodies) = q21_core::fast_sync::adopted_part(&headers, &bodies, tip);
             q21_core::fast_sync::check_bodies(network, &headers, &bodies)
                 .map_err(|e| format!("adoption refused: {e}"))?;
 
             // Set up the adopted folder.
             std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
-            std::fs::copy(d.join("bodies.dat"), blocks_path(datadir))
-                .map_err(|e| format!("copying the block bodies: {e}"))?;
-            std::fs::copy(d.join("headers.q21hdr"), headers_path(datadir))
-                .map_err(|e| format!("copying the headers: {e}"))?;
+            let bs = BlockStore::new(blocks_path(datadir));
+            for b in &bodies {
+                bs.append(b)
+                    .map_err(|e| format!("writing the block bodies: {e}"))?;
+            }
+            HeaderStore::new(headers_path(datadir))
+                .append(&headers)
+                .map_err(|e| format!("writing the headers: {e}"))?;
             let key = q21_core::state::datadir_key(datadir).map_err(|e| e.to_string())?;
             StateStore::new_sealed(state_path(datadir), key)
                 .save(&snap)
@@ -4256,9 +4264,12 @@ fn stage_adopted_snapshot(
         .map_err(|e| format!("invalid snapshot: {e}"))?;
     Chain::adopt_snapshot(network, snap.clone(), headers, tip, commitment)
         .map_err(|e| format!("adoption refused: {e}"))?;
+    // Only the authenticated path is kept, and the bodies up to its tip: see
+    // `adopted_part`.
+    let (headers, bodies) = q21_core::fast_sync::adopted_part(headers, bodies, tip);
     // The block bodies too, before the slightest byte on disk: a snapshot
     // server could deliver the real headers and arbitrary bodies.
-    q21_core::fast_sync::check_bodies(network, headers, bodies)
+    q21_core::fast_sync::check_bodies(network, &headers, &bodies)
         .map_err(|e| format!("adoption refused: {e}"))?;
 
     if blocks_path(datadir).exists()
@@ -4273,10 +4284,10 @@ fn stage_adopted_snapshot(
     }
     std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
     HeaderStore::new(headers_path(datadir))
-        .append(headers)
+        .append(&headers)
         .map_err(|e| e.to_string())?;
     let bs = BlockStore::new(blocks_path(datadir));
-    for b in bodies {
+    for b in &bodies {
         bs.append(b).map_err(|e| e.to_string())?;
     }
     let key = q21_core::state::datadir_key(datadir).map_err(|e| e.to_string())?;

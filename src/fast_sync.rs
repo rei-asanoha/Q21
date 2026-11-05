@@ -130,6 +130,45 @@ pub fn builtin_anchors(network: Network) -> &'static [Anchor] {
 /// carry the identifier of the header at the same height in the list, and the
 /// genesis must be that of the network. Two bodies for the same height are
 /// refused.
+/// The headers from genesis to `tip`, walked back from `tip` through
+/// `headers`, and the bodies of `bodies` at heights up to it: what an
+/// adoption keeps of what it was sent, once
+/// [`crate::chain::Chain::adopt_snapshot`] has authenticated that path.
+///
+/// # The defect this closes
+///
+/// Every header sent was written to the new folder, those past the tip
+/// included, which nothing authenticated: a header past the tip claiming
+/// any difficulty became the best tip at the next start, which found no
+/// body for it and cut every block received since the adoption (red-team
+/// campaign 9). Bodies past the tip are dropped too: the node asks for them
+/// again like any block.
+pub fn adopted_part(
+    headers: &[BlockHeader],
+    bodies: &[Block],
+    tip: Hash256,
+) -> (Vec<BlockHeader>, Vec<Block>) {
+    let by_id: std::collections::HashMap<Hash256, &BlockHeader> =
+        headers.iter().map(|h| (h.block_id(), h)).collect();
+    let mut path: Vec<BlockHeader> = Vec::with_capacity(headers.len());
+    let mut current = tip;
+    while let Some(h) = by_id.get(&current) {
+        path.push(**h);
+        if h.height == 0 || path.len() > headers.len() {
+            break;
+        }
+        current = h.prev_block;
+    }
+    path.reverse();
+    let top = path.last().map(|h| h.height);
+    let kept = bodies
+        .iter()
+        .filter(|b| top.is_some_and(|t| b.header.height <= t))
+        .cloned()
+        .collect();
+    (path, kept)
+}
+
 pub fn check_bodies(
     network: Network,
     headers: &[BlockHeader],
@@ -580,6 +619,44 @@ mod tests {
             headers: (0..5).map(header).collect(),
             bodies: vec![genesis_block(Network::Regtest)],
         }
+    }
+
+    /// Red-team campaign 9: a header past the adopted tip, claiming any
+    /// difficulty, was written with the rest. Only the path from genesis to
+    /// the tip is kept, and the bodies up to it.
+    #[test]
+    fn an_adoption_keeps_the_path_to_its_tip_and_nothing_past_it() {
+        use crate::chain::Chain;
+        use crate::consensus::TARGET_BLOCK_SECS;
+        use crate::sig::SchemeId;
+
+        let network = Network::Regtest;
+        let mut c = Chain::new(network, genesis_block(network));
+        for _ in 0..4 {
+            let t = c.tip().time + TARGET_BLOCK_SECS;
+            let b = c
+                .mine_block(Hash256([2u8; 32]), SchemeId::LamportOts, &[], t, 5_000_000)
+                .expect("mining");
+            c.connect(&b, t + 1).expect("connect");
+        }
+        let all = c.headers();
+        let bodies: Vec<Block> = (0..=4).map(|h| c.block_at(h).unwrap()).collect();
+        let tip = all[3].block_id();
+        // Past the tip: the real block 4, and a header claiming the easiest
+        // difficulty there is, never mined.
+        let mut forged = all[3];
+        forged.height = 4;
+        forged.prev_block = tip;
+        forged.bits = 0x2100_ffff;
+        let mut sent = all.clone();
+        sent.push(forged);
+        let (path, kept) = adopted_part(&sent, &bodies, tip);
+        assert_eq!(path, all[..=3].to_vec());
+        assert_eq!(kept, bodies[..=3].to_vec());
+        check_bodies(network, &path, &kept).expect("what is kept checks out");
+        // An unknown tip keeps nothing.
+        let (path, kept) = adopted_part(&sent, &bodies, Hash256([7; 32]));
+        assert!(path.is_empty() && kept.is_empty());
     }
 
     /// The bodies are checked against the headers before any write: a foreign
