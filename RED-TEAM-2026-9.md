@@ -8,7 +8,7 @@ technicians (the release, Tor, the servers, the local machine). They worked
 as a team on one board, each finding reproduced by its finder and verified
 by another reviewer or by compiling the proof against the real code. The
 fixes, in 0.5.10, were then attacked again by four reviewers, one per area,
-in two more rounds.
+in three more rounds.
 Rules: nothing that creates money, takes control of anything, or slows the
 real network — every attack ran in a local lab.*
 
@@ -139,8 +139,8 @@ about a day, at most 32 per contact.
 
 ## Round 2
 
-Four reviewers, one per area, attacked the fixes on the release build, and a
-third round checked the second's fixes. What they found, all fixed in 0.5.10:
+Four reviewers, one per area, attacked the fixes on the release build; a
+third and a fourth round checked the fixes of the round before. What they found, all fixed in 0.5.10:
 
 - **Tor on this computer (HIGH).** With no Tor of its own, a node waited on
   127.0.0.1:9050, whoever listened there; a system Tor's port could change
@@ -160,13 +160,15 @@ third round checked the second's fixes. What they found, all fixed in 0.5.10:
   longer than an append can leave, or a journal of zeros only, refuse the
   journal instead of emptying it, and every cut is said on the console.
 - **Public explorer (MEDIUM).** Four answers built at a time bounded how
-  many, not how large: an answer is now at most 4 MB, what the documented
-  Caddy reads whole at once, and the error replacing a larger one has a fixed
-  size (a first version echoed the visitor's id, six times larger once
-  encoded).
+  many, not how large: an answer is now at most 4 MB (four million bytes,
+  not 4 MiB), what the documented Caddy reads whole at once, and the error
+  replacing a larger one has a fixed size (a first version echoed the
+  visitor's id, six times larger once encoded).
 - **Network height (LOW).** One orphan header per request, then the same old
-  full batch sent back to every request, kept a claimed height counted; an
-  answer that does not connect, or brings nothing new, now backs nothing. A
+  full batch sent back to every request, then one invented header after our
+  tip with no body behind it, kept a claimed height counted; an answer that
+  does not connect, or brings nothing new, now backs nothing, and a peer that
+  delivers no body by the deadline counts for our own height. A
   peer with nothing new, which sends no answer, was never asked for headers
   again, and its later reorganization was followed only at the next restart;
   it is asked again once its request has waited two minutes, and at once when
