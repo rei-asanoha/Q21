@@ -515,15 +515,40 @@ fn eviction_candidate(
 /// the one sign of a node bound to the wrong chain (see NETWORK.md, "A new
 /// node's first hour").
 /// Blocks refused because their time lies beyond our clock's tolerance, by
-/// peer: when it was seen and by how many seconds it was ahead. Two peers
-/// within the last hour, and the likeliest explanation is our own clock.
+/// source (see [`clock_sign_source`]): when it was seen and by how many
+/// seconds it was ahead. Two sources within the last hour, and the likeliest
+/// explanation is our own clock.
 static CLOCK_SIGNS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// How long a sign of a slow clock is remembered.
 const CLOCK_SIGN_TTL: u64 = 3600;
 
-/// Notes a block refused for lying in our future, from `peer`.
-fn note_future_block(e: &crate::chain::ChainError, peer: u64) {
+/// Who a sign of a slow clock is counted for, or `None` if it is no sign.
+///
+/// Only a peer this node chose to dial: two connections calling in were
+/// enough to show any computer the banner, by sending a block dated ahead,
+/// with no proof of work (red-team campaign 9). And by address group, every
+/// onion name and every peer on this machine being one of its own: one
+/// operator holding two addresses side by side is one sign.
+fn clock_sign_source(peer: &Peer, id: u64) -> Option<u64> {
+    if !peer.outbound {
+        return None;
+    }
+    Some(if is_onion_label(peer.addr) {
+        onion_source_of_label(peer.addr)
+    } else if is_loopback(peer.addr) {
+        id.max(1)
+    } else {
+        onion_source((inbound_group(peer.addr), false))
+    })
+}
+
+/// Notes a block refused for lying in our future, from `source` (see
+/// [`clock_sign_source`]).
+fn note_future_block(e: &crate::chain::ChainError, source: Option<u64>) {
+    let Some(peer) = source else {
+        return;
+    };
     let crate::chain::ChainError::Validation(crate::validate::ValidationError::TimestampInFuture {
         limit,
         received,
@@ -6081,7 +6106,7 @@ impl Node {
                 // `refusal_is_contextual`.
                 e if refusal_is_contextual(&e) => {
                     report_beyond_finality(&e);
-                    note_future_block(&e, id);
+                    note_future_block(&e, g.peers.get(&id).and_then(|p| clock_sign_source(p, id)));
                     if let Some(p) = g.peers.get_mut(&id) {
                         p.requested_bodies.remove(&bid);
                     }
@@ -6354,7 +6379,12 @@ impl Node {
             // on a block we did not take, is not asked for.
             Err(e) if refusal_is_contextual(&e) => {
                 report_beyond_finality(&e);
-                note_future_block(&e, source);
+                note_future_block(
+                    &e,
+                    g.peers
+                        .get(&source)
+                        .and_then(|p| clock_sign_source(p, source)),
+                );
                 if let Some(p) = g.peers.get_mut(&source) {
                     if p.requested_bodies.remove(&bid).is_some() {
                         p.bodies_to_request.clear();
@@ -7574,12 +7604,14 @@ mod tests {
                 received: 1_000 + secs,
             })
         };
-        note_future_block(&ahead(400), 900_001);
-        note_future_block(&ahead(500), 900_001);
+        note_future_block(&ahead(400), Some(900_001));
+        note_future_block(&ahead(500), Some(900_001));
         assert_eq!(clock_behind(), None, "the same peer twice is one sign");
-        note_future_block(&ahead(300), 900_002);
+        note_future_block(&ahead(600), None);
+        assert_eq!(clock_behind(), None, "a peer that called in is no sign");
+        note_future_block(&ahead(300), Some(900_002));
         assert_eq!(clock_behind(), Some(300));
-        note_future_block(&E::Validation(V::BadParent), 900_003);
+        note_future_block(&E::Validation(V::BadParent), Some(900_003));
         assert_eq!(clock_behind(), Some(300), "other refusals are no sign");
         CLOCK_SIGNS.lock().unwrap().clear();
         assert!(!refusal_is_contextual(&E::Validation(V::BadParent)));
@@ -9752,6 +9784,40 @@ mod tests_hardening {
         let _h = established_peer(&d, 7);
         claim(&d, 7, 2);
         assert_eq!(d.max_announced_height(), 2);
+    }
+
+    /// Red-team campaign 9: two connections calling in showed the "clock
+    /// late" banner. A sign now comes only from a peer this node dialed, and
+    /// counts once per address group.
+    #[test]
+    fn a_clock_sign_comes_from_a_dialed_peer_once_per_group() {
+        let a = Node::new(NETWORK, Chain::new(NETWORK, genesis_block(NETWORK)));
+        let _l: Vec<TcpListener> = (1..=6).map(|id| established_peer(&a, id)).collect();
+        let mut g = a.shared.lock().unwrap();
+        let set = |g: &mut Shared, id: u64, addr: &str, outbound: bool| {
+            let p = g.peers.get_mut(&id).unwrap();
+            p.addr = addr.parse().unwrap();
+            p.outbound = outbound;
+        };
+        set(&mut g, 1, "198.51.100.7:21121", true);
+        set(&mut g, 2, "198.51.200.9:21121", true);
+        set(&mut g, 3, "203.0.113.5:21121", true);
+        set(&mut g, 4, "203.0.114.5:21121", false);
+        let one = crate::socks::Target::Name("a".repeat(56) + ".onion", 21121).label();
+        let two = crate::socks::Target::Name("b".repeat(56) + ".onion", 21121).label();
+        set(&mut g, 5, &one.to_string(), true);
+        set(&mut g, 6, &two.to_string(), true);
+        let source = |g: &Shared, id| clock_sign_source(&g.peers[&id], id);
+        assert_eq!(source(&g, 1), source(&g, 2), "one /16, one sign");
+        assert_ne!(source(&g, 1), source(&g, 3));
+        assert_eq!(source(&g, 4), None, "it called in");
+        assert!(source(&g, 5).is_some());
+        assert_ne!(source(&g, 5), source(&g, 6), "each onion name is its own");
+        // Peers on this machine (tests, a laboratory) are each their own.
+        set(&mut g, 1, "127.0.0.1:1", true);
+        set(&mut g, 2, "127.0.0.1:2", true);
+        assert_ne!(source(&g, 1), source(&g, 2));
+        drop(g);
     }
 
     /// Reply slots do not accumulate beyond the bound.
