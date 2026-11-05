@@ -121,9 +121,10 @@ strict_tar_names() {
 # names, at the offsets it gives, with nothing between the entries: unzip
 # reads the central directory, other programs (the tar of Windows) the local
 # headers; both must see the same files (red-team campaign 8). Its names are
-# printable ASCII, as in the tar archives, and a local header that gives its
-# sizes gives the central directory's: a program reading the local headers
-# would otherwise cut the data elsewhere (red-team campaign 9).
+# printable ASCII, as in the tar archives, and every local header gives the
+# central directory's compressed size, never a data descriptor: a program
+# reading the local headers would otherwise cut the data elsewhere
+# (red-team campaign 9).
 strict_zip() {
   local Z=$1 EXPECT=0 COUNT=0 OFFSET NAME CSIZE DESC LNAME NLEN XLEN SIG LCSIZE
   while IFS='|' read -r OFFSET CSIZE DESC NAME; do
@@ -136,19 +137,14 @@ strict_zip() {
     LNAME=$(dd if="$Z" bs=1 skip=$((OFFSET + 30)) count="$NLEN" 2>/dev/null)
     [ "$LNAME" = "$NAME" ] || return 1
     if LC_ALL=C grep -q '[^ -~]' <<<"$LNAME"; then return 1; fi
-    if [ "$DESC" != yes ]; then
-      LCSIZE=$(od -An -tu1 -j $((OFFSET + 18)) -N 4 "$Z" \
-        | awk '{print $1 + 256 * $2 + 65536 * $3 + 16777216 * $4}')
-      [ "$LCSIZE" = "$CSIZE" ] || return 1
-    fi
+    # No data descriptor: its sizes come after the data, where a program
+    # reading the local headers cannot check them first. A release archive,
+    # written to a file, never uses one (round 2 of red-team campaign 9).
+    [ "$DESC" = no ] || return 1
+    LCSIZE=$(od -An -tu1 -j $((OFFSET + 18)) -N 4 "$Z" \
+      | awk '{print $1 + 256 * $2 + 65536 * $3 + 16777216 * $4}')
+    [ "$LCSIZE" = "$CSIZE" ] || return 1
     EXPECT=$((OFFSET + 30 + NLEN + XLEN + CSIZE))
-    if [ "$DESC" = yes ]; then
-      if [ "$(od -An -tx1 -j "$EXPECT" -N 4 "$Z" | tr -d ' \n')" = 504b0708 ]; then
-        EXPECT=$((EXPECT + 16))
-      else
-        EXPECT=$((EXPECT + 12))
-      fi
-    fi
   done < <(zipinfo -v "$Z" | awk '
     /^Central directory entry #/ { if (have) print off "|" cs "|" ds "|" nm; have = 1; nm = ""; getline; getline; getline; while ($0 ~ /^  There are an extra/ || $0 == "") getline; sub(/^  /, ""); nm = $0 }
     /offset of local header from start of archive:/ { off = $NF }

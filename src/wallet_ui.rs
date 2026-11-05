@@ -1798,13 +1798,16 @@ function requestBody(method, params){
 // shown in it as the wallet: its receiving address, its balance, the backup
 // code typed to check it (red-team campaign 9). The page now keeps the first
 // run it sees, and stops for good at an answer from another run, or from no
-// run at all, and after two calls in a row that reach nothing (one alone may
-// be a passing failure; the refresh calls again within seconds). A failed
-// call is never sent again: it may have been carried out.
+// run at all, and when calls have reached nothing for four seconds in a row
+// (one failure may be a passing one; the refresh, three calls at once, calls
+// again within six seconds, so a count of failures would have been met by a
+// single passing one). A failed call is never sent again: it may have been
+// carried out.
 let runId = null;
 let pageEnded = false;
 let closing = false;
-let unreached = 0;
+let unreachedSince = null;
+const UNREACHED_FOR_MS = 4000;
 
 function endPage(){
   if (pageEnded) return;
@@ -1824,14 +1827,15 @@ async function call(method, params){
   try{
     r = await fetch(RPC, {method:"POST", headers: headers(), body: requestBody(method, params)});
   }catch(e){
-    unreached += 1;
-    if (unreached >= 2 || closing){
+    const now = Date.now();
+    if (unreachedSince === null) unreachedSince = now;
+    if (closing || now - unreachedSince >= UNREACHED_FOR_MS){
       endPage();
       throw new Error("the wallet has stopped");
     }
     throw new Error("the wallet does not answer");
   }
-  unreached = 0;
+  unreachedSince = null;
   // A 401 returns plain text, not JSON: reading it as JSON would hide the
   // real cause behind a parse error.
   if (r.status === 401){
@@ -6430,7 +6434,14 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("if (pageEnded) throw"), "{body}");
-        assert!(body.contains("if (unreached >= 2 || closing){"), "{body}");
+        assert!(
+            body.contains("if (closing || now - unreachedSince >= UNREACHED_FOR_MS){"),
+            "{body}"
+        );
+        // A failure streak is measured in time, not counted: the refresh
+        // makes three calls at once (round 2 of red-team campaign 9).
+        assert!(s.contains("const UNREACHED_FOR_MS = 4000;"));
+        assert!(body.contains("unreachedSince = null;"), "{body}");
         assert_eq!(
             body.matches("await fetch(RPC").count(),
             1,
