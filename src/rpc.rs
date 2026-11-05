@@ -3741,6 +3741,21 @@ impl RpcContext {
     fn getpeers(&self) -> Json {
         let public = self.scans.is_some();
         let peers = self.node.peer_list();
+        // A public explorer gives counts only. Listing each seat, even
+        // without its address (its number, its direction, its height, whether
+        // it carries channels), told anyone when a seat was taken or freed,
+        // and when a wallet joined (red-team campaign 9).
+        if public {
+            let outbound = peers.iter().filter(|p| p.outbound).count() as u64;
+            let inbound = peers.len() as u64 - outbound;
+            return Json::obj()
+                .set("peer_count", Json::u64(self.node.peer_count() as u64))
+                .set("maximum", Json::u64(crate::net::MAX_PEERS as u64))
+                .set("outbound", Json::u64(outbound))
+                .set("inbound", Json::u64(inbound))
+                .set("peers", Json::array(Vec::new()))
+                .build();
+        }
         // The node id a peer's channel session authenticated, unlike the
         // `channel_id` it advertises.
         let session_of = |_id: u64| -> Json {
@@ -8109,8 +8124,21 @@ mod tests {
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"getpeers","params":{}}"#;
         let out = c.handle_from(body, ip("198.51.100.9"));
         assert!(out.contains("\"peers\""), "{out}");
-        assert!(out.contains("\"address\":null"), "{out}");
+        // Counts only (red-team campaign 9): no seat, not even without its
+        // address.
+        assert!(out.contains("\"peers\":[]"), "{out}");
+        assert!(out.contains("\"outbound\":1"), "{out}");
+        assert!(!out.contains("\"height\""), "{out}");
         assert!(!out.contains("127.0.0.1"), "{out}");
+        // Locally, the list is whole.
+        let local = context(false);
+        let local = RpcContext {
+            node: c.node.clone(),
+            ..local
+        };
+        let out = local.handle_from(body, None);
+        assert!(out.contains("127.0.0.1"), "{out}");
+        assert!(out.contains("\"supports_channels\""), "{out}");
         peer.shutdown();
     }
 
