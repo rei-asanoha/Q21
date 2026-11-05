@@ -110,6 +110,34 @@ fn post_rpc(addr: SocketAddr, body: &str) -> String {
     post_rpc_with(addr, "Content-Type: application/json\r\n", body)
 }
 
+/// `post_rpc`, sent again while the server answers 429 or cuts the request
+/// short. The requests waiting for their body are counted for the whole
+/// process, and the tests of this file that hold many of them run at the
+/// same time as the others: on a slow machine (the macOS runner) a large
+/// body could find them all taken. Gives up after a minute.
+fn post_rpc_patient(addr: SocketAddr, body: &str) -> String {
+    let request = format!(
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let until = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut r = Vec::new();
+        if let Ok(mut s) = TcpStream::connect(addr) {
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            // A 429 may close the connection before the body is all sent.
+            let _ = s.write_all(request.as_bytes());
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            let _ = s.read_to_end(&mut r);
+        }
+        let r = String::from_utf8_lossy(&r).into_owned();
+        if !(r.is_empty() || r.starts_with("HTTP/1.1 429")) || std::time::Instant::now() >= until {
+            return r;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn body_of(response: &str) -> &str {
     response
         .split_once("\r\n\r\n")
@@ -1525,7 +1553,7 @@ fn ok_deep_nesting_is_cleanly_refused() {
     let h = server(false, None);
     for n in [40usize, 5_000, 200_000] {
         let body = format!("{}{}", "[".repeat(n), "]".repeat(n));
-        let r = post_rpc(h.addr, &body);
+        let r = post_rpc_patient(h.addr, &body);
         assert!(
             r.starts_with("HTTP/1.1 200") || r.starts_with("HTTP/1.1 400"),
             "depth {n}: {}",
@@ -1557,7 +1585,7 @@ fn ok_pathological_json_does_not_cause_a_panic() {
         "\u{feff}{\"method\":\"getinfo\"}".into(),
     ];
     for c in &cases {
-        let r = post_rpc(h.addr, c);
+        let r = post_rpc_patient(h.addr, c);
         assert!(
             !r.is_empty(),
             "no response (panic?) for: {}",
