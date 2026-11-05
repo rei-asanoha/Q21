@@ -515,6 +515,56 @@ fn calls() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<Hash256,
     g
 }
 
+/// Bytes of an answer one call pays for, on a public explorer: an answer
+/// larger costs its client one more call per this many bytes.
+pub const ANSWER_BYTES_PER_CALL: usize = 64 * 1024;
+
+/// Calls of a public explorer answered at once, the whole node together:
+/// each holds its answer in memory while it is built (tens of megabytes for
+/// a full block). Beyond, a call waits its turn, then is told to slow down.
+pub const PUBLIC_ANSWERS_AT_ONCE: usize = 4;
+
+/// How long a call of a public explorer waits for its turn.
+pub const PUBLIC_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The calls of a public explorer being answered now (see
+/// [`PUBLIC_ANSWERS_AT_ONCE`]).
+static PUBLIC_ANSWERING: (Mutex<usize>, std::sync::Condvar) =
+    (Mutex::new(0), std::sync::Condvar::new());
+
+/// A turn to answer a public call, given back when dropped.
+struct PublicTurn;
+
+impl PublicTurn {
+    /// Waits for a turn, at most [`PUBLIC_ANSWER_WAIT`].
+    fn take() -> Option<PublicTurn> {
+        let (lock, cv) = &PUBLIC_ANSWERING;
+        let deadline = std::time::Instant::now() + PUBLIC_ANSWER_WAIT;
+        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= PUBLIC_ANSWERS_AT_ONCE {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            n = cv
+                .wait_timeout(n, left)
+                .map(|(g, _)| g)
+                .unwrap_or_else(|e| e.into_inner().0);
+        }
+        *n += 1;
+        Some(PublicTurn)
+    }
+}
+
+impl Drop for PublicTurn {
+    fn drop(&mut self) {
+        let (lock, cv) = &PUBLIC_ANSWERING;
+        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        cv.notify_one();
+    }
+}
+
 /// Calls granted up front to each client of a public explorer.
 pub const CALL_BURST: u32 = 120;
 /// Calls regained per second, per client: a page of the explorer makes a
@@ -729,6 +779,26 @@ impl ScanBucket {
         }
         self.calls_global
             .allow_per_second(GLOBAL_CALL_BURST, GLOBAL_CALLS_PER_SECOND, now)
+    }
+
+    /// Charges a client for the size of an answer it was served: one call
+    /// per [`ANSWER_BYTES_PER_CALL`], down to nothing left.
+    /// A multi-megabyte block cost what a `getinfo` cost, and six addresses
+    /// within their own budgets got a public node killed for its memory
+    /// (red-team campaign 9).
+    pub fn charge_answer(&mut self, client: Option<std::net::IpAddr>, bytes: usize) {
+        let extra = (bytes / ANSWER_BYTES_PER_CALL).min(u32::MAX as usize) as u32;
+        if extra == 0 {
+            return;
+        }
+        if let Some(ip) = client {
+            let key = ClientKey::from_ip(ip);
+            if let Some(entry) = self.calls.iter_mut().find(|(c, _, _)| *c == key) {
+                entry.1.tokens = entry.1.tokens.saturating_sub(extra);
+            }
+        }
+        // Not the global net: draining it by size would let a few large
+        // answers turn everyone away.
     }
 
     /// Number of clients tracked right now. For tests.
@@ -1328,7 +1398,9 @@ impl RpcContext {
             let mut bytes = 0usize;
             for r in batch {
                 let resp = self.handle_one(r, client);
-                bytes += resp.encode().len();
+                let size = resp.encode().len();
+                self.charge_answer(client, size);
+                bytes += size;
                 if bytes > MAX_BATCH_RESPONSE {
                     responses.push(
                         Json::obj()
@@ -1346,7 +1418,19 @@ impl RpcContext {
             }
             return Json::array(responses).encode();
         }
-        self.handle_one(&request, client).encode()
+        let answer = self.handle_one(&request, client).encode();
+        self.charge_answer(client, answer.len());
+        answer
+    }
+
+    /// On a public explorer, charges `client` for an answer of `bytes` (see
+    /// [`ScanBucket::charge_answer`]).
+    fn charge_answer(&self, client: Option<std::net::IpAddr>, bytes: usize) {
+        if let Some(bucket) = &self.scans {
+            if let Ok(mut s) = bucket.lock() {
+                s.charge_answer(client, bytes);
+            }
+        }
     }
 
     fn handle_one(&self, request: &Json, client: Option<std::net::IpAddr>) -> Json {
@@ -1384,6 +1468,28 @@ impl RpcContext {
             }
         }
 
+        // And answers a few at once, whoever asks (see
+        // [`PUBLIC_ANSWERS_AT_ONCE`]).
+        let _turn = if self.scans.is_some() {
+            match PublicTurn::take() {
+                Some(t) => Some(t),
+                None => {
+                    return Json::obj()
+                        .set("jsonrpc", Json::str("2.0"))
+                        .set("id", id)
+                        .set(
+                            "error",
+                            rpc_error(
+                                ERR_REQUEST,
+                                "too many requests on this public service: slow down a little",
+                            ),
+                        )
+                        .build()
+                }
+            }
+        } else {
+            None
+        };
         match self.dispatch(&method, &params, client) {
             Ok(r) => Json::obj()
                 .set("jsonrpc", Json::str("2.0"))
@@ -7954,6 +8060,32 @@ mod tests {
         for _ in 0..(CALL_BURST + 30) {
             assert!(!local.handle(one).contains("too many requests"));
         }
+    }
+
+    /// Red-team campaign 9: a multi-megabyte answer cost what a `getinfo`
+    /// cost, and six addresses within their budgets got a public node killed
+    /// for its memory. A large answer now costs its client one call per
+    /// [`ANSWER_BYTES_PER_CALL`]; nobody else pays for it.
+    #[test]
+    fn a_large_answer_costs_its_client_by_its_size() {
+        let mut s = ScanBucket::new();
+        let (a, b) = (ip("198.51.100.30"), ip("203.0.113.30"));
+        let t0 = std::time::Instant::now();
+        assert!(s.allow_call(a, t0));
+        assert!(s.allow_call(b, t0));
+        // A hundred calls' worth of answer: what is left of A's burst.
+        s.charge_answer(a, 100 * ANSWER_BYTES_PER_CALL);
+        let left = (0..CALL_BURST).take_while(|_| s.allow_call(a, t0)).count();
+        assert_eq!(left as u32, CALL_BURST - 1 - 100);
+        // More than the burst: nothing left, and no wrap.
+        s.charge_answer(a, usize::MAX);
+        assert!(!s.allow_call(a, t0));
+        // B is untouched; a small answer costs nothing more.
+        s.charge_answer(b, ANSWER_BYTES_PER_CALL - 1);
+        let left = (0..CALL_BURST).take_while(|_| s.allow_call(b, t0)).count();
+        assert_eq!(left as u32, CALL_BURST - 1);
+        // Through the context: a local node counts nothing.
+        context(false).charge_answer(a, usize::MAX);
     }
 
     /// Red-team campaign 6, O1: a public explorer takes short batches only,

@@ -192,10 +192,18 @@ fn onion_source(source: (Option<NetGroup>, bool)) -> u64 {
     h.finish().max(1)
 }
 
+/// The source key of a peer reached at an onion name: its stand-in itself.
+fn onion_source_of_label(a: SocketAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    a.hash(&mut h);
+    h.finish().max(1)
+}
+
 /// The stand-in address of a peer dialed at an onion name (see
 /// [`crate::socks::Target::label`]).
 fn is_onion_label(a: SocketAddr) -> bool {
-    matches!(a, SocketAddr::V4(v) if v.ip().octets()[0] & 0xf0 == 240)
+    crate::socks::Target::is_label(a)
 }
 
 /// Loopback is not a group: several nodes on the same machine (regtest,
@@ -5521,6 +5529,13 @@ impl Node {
                     } = *g;
                     if let Some(peer) = peers.get_mut(&id) {
                         let source = (inbound_group(peer.addr), is_loopback(peer.addr));
+                        // A peer reached at an onion name is a source of its
+                        // own: every stand-in shares one IPv6 prefix.
+                        let onion_key = if is_onion_label(peer.addr) {
+                            onion_source_of_label(peer.addr)
+                        } else {
+                            onion_source(source)
+                        };
                         for a in v.into_iter().take(crate::wire::MAX_ADDR) {
                             if !peer.addr_bucket.allow_with(
                                 1,
@@ -5539,7 +5554,7 @@ impl Node {
                             }
                             let mut a = a;
                             a.last_seen = a.last_seen.min(now);
-                            if onions.add_from(a, now, onion_source(source)) {
+                            if onions.add_from(a, now, onion_key) {
                                 Self::wrote_address(peer, addr_from_inbound, source);
                                 peer.onion_added = peer.onion_added.saturating_add(1);
                             }
@@ -7746,6 +7761,51 @@ mod tests {
             "the renewed seat has no grace left"
         );
         a.shutdown();
+    }
+
+    /// Red-team campaign 9: two onion names alike in the 28 bits of the
+    /// former stand-in, one an entry point, the other an attacker's. The
+    /// attacker's no longer counts as the entry point, nor passes for it in
+    /// the nonce rule, nor takes its handshake.
+    #[test]
+    fn an_onion_name_alike_in_28_bits_no_longer_takes_an_entry_point_s_place() {
+        const E: &str = "sxm4dtvws3po2jlygseb5bqrnpeseulqduksvkad4hv6pdfeprxr5nsd";
+        const X: &str = "a2xkz4jamqrsypkyosizxpl6ms7yz4rku4rr4f2pp7rjaq7nyxwn66od";
+        let label = |n: &str| crate::socks::Target::Name(format!("{n}.onion"), 21121).label();
+        let version = |nonce: u64| Message::Version {
+            version: PROTOCOL_VERSION,
+            timestamp: unix_now(),
+            nonce,
+            user_agent: String::new(),
+            start_height: 0,
+        };
+        let (le, lx) = (label(E), label(X));
+        assert_ne!(le, lx);
+        let n = node();
+        n.set_proxy(Some("127.0.0.1:9".parse().unwrap()));
+        n.set_configured_targets(vec![le]);
+        fake_peer(&n, 7, lx, true);
+        assert!(n.handle(7, version(0xE0E0)));
+        assert!(!n.is_connected_to(le), "the entry point is still dialed");
+        fake_peer(&n, 8, le, true);
+        // X copied E's nonce: the duplicate dropped is X, not E.
+        assert!(n.handle(8, version(0xE0E0)), "the entry point is kept");
+        // The handshake at E is E's.
+        let mk = |name: &str| crate::wire::OnionAddr {
+            name: name.to_string(),
+            port: 21121,
+            last_seen: unix_now(),
+        };
+        let m = node();
+        m.seed_onions(vec![(mk(X), 0), (mk(E), 0)]);
+        fake_peer(&m, 9, le, true);
+        assert!(m.handle(9, version(0x1234)));
+        assert!(m.handle(9, Message::VerAck));
+        let book = m.onion_entries();
+        assert!(book.iter().any(|e| e.addr.name == E && e.answered));
+        assert!(book.iter().any(|e| e.addr.name == X && !e.answered));
+        n.shutdown();
+        m.shutdown();
     }
 
     /// A caller's hang-up within its first minute is counted for its group;

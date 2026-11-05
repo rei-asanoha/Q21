@@ -88,19 +88,29 @@ impl Target {
     ///
     /// An IPv4 destination is itself. A name has no address of its own (an
     /// onion service has none at all), so it gets a stable stand-in in
-    /// 240.0.0.0/4, a reserved range that no real peer uses and that the node
-    /// never hands out ([`crate::addr::routable`]). Distinct names get
-    /// distinct stand-ins, which keeps two onion peers from being taken for
-    /// the same machine.
+    /// `100::/64`, the IPv6 block reserved for discarding traffic (RFC 6666):
+    /// no real peer has one, and the address book holds IPv4 only. The 64
+    /// bits after the prefix are the first of the name's SHA-256. Distinct
+    /// names get distinct stand-ins, which keeps two onion peers from being
+    /// taken for the same machine. Until 0.5.10 the stand-in was in
+    /// 240.0.0.0/4, 28 bits: a name sharing an entry point's stand-in was
+    /// found in minutes, and took its place (red-team campaign 9).
     pub fn label(&self) -> SocketAddr {
         match self {
             Target::V4(ip, p) => SocketAddr::from((*ip, *p)),
             Target::Name(h, p) => {
                 let d = crate::sha256::sha256(h.as_bytes());
-                let b = &d;
-                SocketAddr::from(([240 | (b[0] & 0x0f), b[1], b[2], b[3]], *p))
+                let mut o = [0u8; 16];
+                o[0] = 0x01;
+                o[8..].copy_from_slice(&d[..8]);
+                SocketAddr::from((std::net::Ipv6Addr::from(o), *p))
             }
         }
+    }
+
+    /// Whether `a` is the stand-in of a name (see [`Target::label`]).
+    pub fn is_label(a: SocketAddr) -> bool {
+        matches!(a, SocketAddr::V6(v) if v.ip().octets()[..8] == [1, 0, 0, 0, 0, 0, 0, 0])
     }
 }
 
@@ -196,14 +206,19 @@ pub fn find_local_tor() -> Option<SocketAddr> {
 /// Below this, a Linux account is a system one (`SYS_UID_MAX` is 999).
 const FIRST_PERSON_UID: u32 = 1000;
 
-/// Whether the program listening on 127.0.0.1:`port` runs as this account
-/// or a system one. Not known (not Linux, `/proc` unreadable): trusted, as
-/// before 0.5.9.
+/// Whether every program listening on `port`, on any address and in IPv4
+/// or IPv6, runs as this account or a system one: a connection to
+/// 127.0.0.1 also reaches a listener on all addresses (`0.0.0.0`, `::`),
+/// which the check of 0.5.9 did not see (red-team campaign 9). Not known
+/// (not Linux, `/proc` unreadable, no listener found): trusted, as before
+/// 0.5.9.
 fn listener_owner_trusted(port: u16) -> bool {
-    let (Some(owner), Some(me)) = (listener_uid(port), own_uid()) else {
+    let Some(me) = own_uid() else {
         return true;
     };
-    owner_trusted(owner, me)
+    listener_uids(port)
+        .into_iter()
+        .all(|owner| owner_trusted(owner, me))
 }
 
 /// This account, or a system one.
@@ -211,23 +226,30 @@ fn owner_trusted(owner: u32, me: u32) -> bool {
     owner == me || owner < FIRST_PERSON_UID
 }
 
-/// The account of the socket listening on 127.0.0.1:`port`, from
-/// `/proc/net/tcp`.
-fn listener_uid(port: u16) -> Option<u32> {
-    let text = std::fs::read_to_string("/proc/net/tcp").ok()?;
-    listener_uid_in(&text, port)
+/// The accounts of the sockets listening on `port`, whatever their
+/// address, from `/proc/net/tcp` and `/proc/net/tcp6`.
+fn listener_uids(port: u16) -> Vec<u32> {
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .flat_map(|text| listener_uids_in(&text, port))
+        .collect()
 }
 
-/// The parsing half of [`listener_uid`]: `local_address` is `0100007F:PORT`
-/// in hexadecimal, state `0A` is listening, the eighth field the account.
-fn listener_uid_in(text: &str, port: u16) -> Option<u32> {
-    let wanted = format!("0100007F:{port:04X}");
-    text.lines().skip(1).find_map(|l| {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        (f.len() > 7 && f[1] == wanted && f[3] == "0A")
-            .then(|| f[7].parse().ok())
-            .flatten()
-    })
+/// The parsing half of [`listener_uids`]: `local_address` is the address,
+/// then `:` and the port, in hexadecimal; state `0A` is listening; the
+/// eighth field the account.
+fn listener_uids_in(text: &str, port: u16) -> Vec<u32> {
+    let wanted = format!(":{port:04X}");
+    text.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() > 7 && f[1].ends_with(&wanted) && f[3] == "0A")
+                .then(|| f[7].parse().ok())
+                .flatten()
+        })
+        .collect()
 }
 
 /// This process's account, from `/proc/self/status`.
@@ -271,9 +293,22 @@ pub mod tests {
              0: 0100007F:235A 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 1 1 0000000000000000 100 0 0 10 0\n   \
              1: 0100007F:23BE 00000000:0000 0A 00000000:00000000 00:00000000 00000000   108        0 2 1 0000000000000000 100 0 0 10 0\n   \
              2: 0100007F:2382 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1001        0 3 1 0000000000000000 100 0 0 10 0\n";
-        assert_eq!(listener_uid_in(text, TOR_SERVICE_PORT), Some(1001));
-        assert_eq!(listener_uid_in(text, TOR_BROWSER_PORT), Some(108));
-        assert_eq!(listener_uid_in(text, 0x2382), None, "not listening");
+        assert_eq!(listener_uids_in(text, TOR_SERVICE_PORT), vec![1001]);
+        assert_eq!(listener_uids_in(text, TOR_BROWSER_PORT), vec![108]);
+        assert!(listener_uids_in(text, 0x2382).is_empty(), "not listening");
+        // Red-team campaign 9: on all addresses, IPv4 or IPv6, a listener of
+        // another account is seen too.
+        let wild = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   \
+             0: 00000000:235A 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1500        0 1 1 0000000000000000 100 0 0 10 0\n";
+        assert_eq!(listener_uids_in(wild, TOR_SERVICE_PORT), vec![1500]);
+        let wild6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   \
+             0: 00000000000000000000000000000000:23BE 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1500        0 2 1 0000000000000000 100 0 0 10 0\n   \
+             1: 00000000000000000000000001000000:23BE 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000   108        0 3 1 0000000000000000 100 0 0 10 0\n";
+        assert_eq!(listener_uids_in(wild6, TOR_BROWSER_PORT), vec![1500, 108]);
+        // One foreign listener among trusted ones: not trusted.
+        assert!(!listener_uids_in(wild6, TOR_BROWSER_PORT)
+            .into_iter()
+            .all(|o| owner_trusted(o, 1000)));
         assert!(owner_trusted(108, 1000), "the Tor service's account");
         assert!(owner_trusted(1000, 1000), "this account");
         assert!(!owner_trusted(1001, 1000), "another person's");
@@ -376,12 +411,25 @@ pub mod tests {
         assert_eq!(a.label(), a.label());
         assert_ne!(a.label(), b.label());
         match a.label() {
-            SocketAddr::V4(v) => {
-                assert!(v.ip().octets()[0] >= 240, "in 240.0.0.0/4");
-                assert!(!crate::addr::routable(v.ip().octets(), true));
+            SocketAddr::V6(v) => {
+                assert_eq!(v.ip().segments()[..4], [0x100, 0, 0, 0], "in 100::/64");
+                assert_eq!(v.port(), 21121);
             }
-            _ => panic!("IPv4 stand-in expected"),
+            _ => panic!("IPv6 stand-in expected"),
         }
+        assert!(Target::is_label(a.label()));
+        assert!(!Target::is_label(
+            Target::V4([203, 0, 113, 7], 21121).label()
+        ));
+        assert!(!Target::is_label("[::1]:21121".parse().unwrap()));
+        // The two names of red-team campaign 9, alike in the 28 bits of the
+        // former stand-in, differ now.
+        let e = "sxm4dtvws3po2jlygseb5bqrnpeseulqduksvkad4hv6pdfeprxr5nsd";
+        let x = "a2xkz4jamqrsypkyosizxpl6ms7yz4rku4rr4f2pp7rjaq7nyxwn66od";
+        assert_ne!(
+            Target::Name(format!("{e}.onion"), 21121).label(),
+            Target::Name(format!("{x}.onion"), 21121).label()
+        );
     }
 
     /// A name goes to the proxy as a name: no lookup on this machine.

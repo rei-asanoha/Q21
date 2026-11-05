@@ -5441,6 +5441,7 @@ function peerPlace(address, outbound){
   const a = String(address);
   const v4 = /^(\d+)\.\d+\.\d+\.\d+:\d+$/.exec(a);
   if (v4 && Number(v4[1]) >= 240) return "via Tor";
+  if (/^\[100::/.test(a) || /^\[100:0:0:0:/.test(a)) return "via Tor";
   if (outbound !== true && (/^127\./.test(a) || /^\[::1\]:/.test(a))) return "via Tor";
   return a;
 }
