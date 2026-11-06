@@ -207,6 +207,9 @@ pub struct ChannelSummary {
     /// The confirmations a funding waits for, also the depth a close is
     /// shown done at.
     pub funding_depth: u16,
+    /// The confirmations an addition (a splice) waits for before payments
+    /// resume: see [`splice_lock_depth`].
+    pub splice_depth: u64,
     /// The to-self delay of a forced close, in blocks: how long the side
     /// that closes alone waits for its own funds, and how long the other side
     /// has to come back online and punish a revoked state.
@@ -2790,7 +2793,10 @@ impl ChannelManager {
             if phase == Phase::Closed {
                 continue;
             }
-            if phase == Phase::Opening && c.machine.funding_tx().is_none() {
+            // Before the channel opens, never after: a channel open may have
+            // been added to, and a splice is no funding to keep. A restarted
+            // acceptor replays into `Funded` (campaign 10, `perse`).
+            if matches!(phase, Phase::Opening | Phase::Funded) && c.machine.funding_tx().is_none() {
                 if let Some(op) = c.machine.funding_outpoint() {
                     if let Some(t) = txs.iter().find(|t| t.txid() == op.txid) {
                         let _ = c.machine.keep_funding_tx(t);
@@ -2938,6 +2944,18 @@ impl ChannelManager {
                 if let (0, Some(tx)) = (depth, tx) {
                     if depth_of(&old).is_some() && c.spend.is_none() {
                         again.push(tx.clone());
+                        // Its coins held back again: spent by the wallet
+                        // elsewhere, they would keep it out for good, and
+                        // the channel with it, every old state revoked
+                        // (campaign 10, `tact`).
+                        if c.splice_held.is_none() {
+                            c.splice_held = Some(tx.clone());
+                            hold.push(tx.clone());
+                        }
+                    }
+                } else if depth > 0 {
+                    if let Some(tx) = c.splice_held.take() {
+                        release.push(tx);
                     }
                 }
             }
@@ -3127,8 +3145,9 @@ impl ChannelManager {
     /// down or before a crash: the close and penalty tracking lives in memory.
     ///
     /// For every reloaded channel whose funding output is spent at the tip,
-    /// the blocks from the funding's confirmation height (journaled; without
-    /// it, the last [`MAX_RESCAN_BLOCKS`]) up to the tip are replayed through
+    /// the blocks from the funding's confirmation height (journaled), less
+    /// the deepest reorganization, (without it, the last
+    /// [`MAX_RESCAN_BLOCKS`]) up to the tip are replayed through
     /// the same reactions as live blocks: a revoked commitment is punished
     /// (and our own balance in it claimed), our
     /// own commitment's delayed sweep is scheduled, and a cooperative close, or
@@ -3145,6 +3164,39 @@ impl ChannelManager {
         txs_at: &dyn Fn(u64) -> Option<Vec<Transaction>>,
         depth_of: &DepthOf,
     ) {
+        // An acceptor down when its funding confirmed never saw the block:
+        // the funding is fetched from where it stands now, so that a spend
+        // of its coins elsewhere is followed (campaign 10, `perse`; see
+        // `Machine::keep_funding_tx`).
+        let unkept: Vec<(Hash256, OutPoint, u64)> = {
+            let g = self.inner.lock().unwrap();
+            g.channels
+                .values()
+                .filter(|c| {
+                    matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
+                        && c.machine.funding_tx().is_none()
+                })
+                .filter_map(|c| {
+                    let op = c.machine.funding_outpoint()?;
+                    let (depth, _) = depth_of(&op)?;
+                    Some((
+                        c.machine.channel_id(),
+                        op,
+                        tip.saturating_add(1).saturating_sub(depth),
+                    ))
+                })
+                .collect()
+        };
+        for (cid, op, h) in unkept {
+            let Some(tx) = txs_at(h).and_then(|txs| txs.into_iter().find(|t| t.txid() == op.txid))
+            else {
+                continue;
+            };
+            let mut g = self.inner.lock().unwrap();
+            if let Some(c) = g.channels.get_mut(&cid) {
+                let _ = c.machine.keep_funding_tx(&tx);
+            }
+        }
         let start = {
             let g = self.inner.lock().unwrap();
             g.channels
@@ -3166,10 +3218,16 @@ impl ChannelManager {
                             || !matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
                             || coin_spent)
                 })
-                .map(|c| {
-                    c.machine
-                        .funding_height()
-                        .unwrap_or_else(|| tip.saturating_sub(MAX_RESCAN_BLOCKS))
+                // From below the journaled height by the deepest
+                // reorganization: one that took the funding (or the splice
+                // that made it) away may have mined a spend of it, or of the
+                // old funding a splice spent, lower than where we saw it
+                // confirm. Scanned from that height, a revoked state mined
+                // below it went unpunished after a restart (campaign 10,
+                // `perse`).
+                .map(|c| match c.machine.funding_height() {
+                    Some(h) => h.saturating_sub(crate::consensus::MAX_REORG_DEPTH + 1),
+                    None => tip.saturating_sub(MAX_RESCAN_BLOCKS),
                 })
                 .min()
         };
@@ -3523,8 +3581,9 @@ impl ChannelManager {
             );
             let _ = self.forget(&mut g, cid);
         }
-        // Splices buried to the funding depth: the last old state is revoked
+        // Splices buried to their lock depth: the last old state is revoked
         // on both sides, and the old funding forgotten.
+        let network = self.network;
         let mut frames = Vec::new();
         for c in g.channels.values_mut() {
             let Some(st) = c.machine.splice_status() else {
@@ -3542,7 +3601,10 @@ impl ChannelManager {
             if let Some(tx) = c.splice_held.take() {
                 confirmed.push(tx);
             }
-            if !st.locked && st.signed && depth >= u64::from(c.machine.funding_depth()) {
+            if !st.locked
+                && st.signed
+                && depth >= splice_lock_depth(network, c.machine.funding_depth())
+            {
                 if let Ok(m) = c.machine.splice_locked() {
                     frames.push((
                         c.peer,
@@ -3904,7 +3966,7 @@ impl ChannelManager {
         let g = &*g;
         g.channels
             .values()
-            .map(|c| summary(c, Self::peer_splices(g, c.peer)))
+            .map(|c| summary(c, Self::peer_splices(g, c.peer), self.network))
             .collect()
     }
 
@@ -3912,7 +3974,7 @@ impl ChannelManager {
         let g = self.inner.lock().unwrap();
         g.channels
             .get(&cid)
-            .map(|c| summary(c, Self::peer_splices(&g, c.peer)))
+            .map(|c| summary(c, Self::peer_splices(&g, c.peer), self.network))
     }
 
     /// The funding output a channel expects on chain: the 2-of-2 policy for
@@ -4096,6 +4158,34 @@ fn settle_all(chan: &mut Chan, by: Vec<Hash256>, height: u64) {
     chan.close = Some(CloseTracker::Settling { by, height, prior });
 }
 
+/// The confirmations past which an addition (a splice) is locked: the last
+/// state on the old funding revoked on both sides, payments resumed.
+///
+/// # The defect this narrows (campaign 10, `tact`)
+///
+/// Once locked, every state on the old funding is revoked. A reorganization
+/// that takes the splice away while its adder spends the coin it added
+/// elsewhere leaves the old funding unspent with only revoked states on it:
+/// the other side can never close, and its whole balance is frozen. Locked
+/// at the funding depth, six blocks on the test network, that reorganization
+/// cost no surcharge (see `REORG_PENALTY_FROM_DEPTH`). Six blocks more put it
+/// past the surcharge's threshold, at the price of an hour more without
+/// payments after an addition. What remains is a majority of the hash power
+/// rewriting twelve blocks, the model's own limit.
+///
+/// On regtest, the funding depth, as everywhere in the labs.
+pub fn splice_lock_depth(network: Network, funding_depth: u16) -> u64 {
+    let funding = u64::from(funding_depth.max(1));
+    match network {
+        Network::Regtest => funding,
+        _ => funding.saturating_add(SPLICE_LOCK_EXTRA),
+    }
+}
+
+/// Blocks an addition waits for beyond the funding depth: see
+/// [`splice_lock_depth`].
+pub const SPLICE_LOCK_EXTRA: u64 = 6;
+
 /// How deep the transaction that ends a channel must be buried before the
 /// channel is marked closed and no longer watched or reloaded. On regtest,
 /// the funding depth, as a funding is buried to open the channel; elsewhere,
@@ -4134,7 +4224,7 @@ fn finish_settling(chan: &mut Chan, height: u64, network: Network) -> Option<(u6
     None
 }
 
-fn summary(c: &Chan, splices: bool) -> ChannelSummary {
+fn summary(c: &Chan, splices: bool, network: Network) -> ChannelSummary {
     let bal = c.machine.latest_balances();
     let us = c.machine.our_index();
     let sure = c.machine.irrevocable_balance().min(bal[us]);
@@ -4159,6 +4249,7 @@ fn summary(c: &Chan, splices: bool) -> ChannelSummary {
             _ => None,
         },
         funding_depth: c.machine.funding_depth(),
+        splice_depth: splice_lock_depth(network, c.machine.funding_depth()),
         delay: c.machine.params().delay,
         we_funded: us == crate::channel::txbuild::FUNDER,
         force_close_fee: c.machine.commit_fee(FORCE_CLOSE_TIER),
@@ -4239,6 +4330,20 @@ fn bound_to(chan: &Chan, identity: &str, legacy: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Campaign 10 (`tact`): an addition locks six blocks past the funding
+    /// depth, beyond the depth a reorganization costs no surcharge; on
+    /// regtest, at the funding depth as before.
+    #[test]
+    fn an_addition_locks_past_the_reorganization_surcharge() {
+        assert_eq!(splice_lock_depth(Network::Testnet, 6), 12);
+        assert_eq!(splice_lock_depth(Network::Mainnet, 6), 12);
+        assert_eq!(splice_lock_depth(Network::Regtest, 2), 2);
+        assert_eq!(splice_lock_depth(Network::Testnet, 0), 7);
+        assert!(
+            splice_lock_depth(Network::Testnet, 6) > crate::consensus::REORG_PENALTY_FROM_DEPTH
+        );
+    }
 
     /// A verification left waiting by the other wallet — it declared a
     /// mismatch, closed, or never answered — is dropped after

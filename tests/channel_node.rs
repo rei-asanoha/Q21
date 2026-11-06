@@ -4377,3 +4377,102 @@ fn closed_channels_still_watched_do_not_hold_a_peers_slots() {
         "the acceptor took the ninth channel"
     );
 }
+
+/// Campaign 10 (`perse`): an acceptor that restarted after signing, or was
+/// down while its funding confirmed, never kept the funding: it replays into
+/// `Funded`, or never sees the block. A spend of the funding's coins
+/// elsewhere after a reorganization went unseen, and the channel was held
+/// for good on its side.
+#[test]
+fn an_acceptor_restarted_or_down_when_its_funding_confirmed_still_gives_up_a_funding_gone_for_good()
+{
+    for down_at_confirmation in [false, true] {
+        let (funder_seed, acceptor_seed) = ([0xd1u8; 32], [0xd2u8; 32]);
+        let (wallet, chain) = setup(funder_seed);
+        let dir = tmpdir(&format!("perse-c7-{down_at_confirmation}"));
+        let mut p = managers(
+            funder_seed,
+            acceptor_seed,
+            wallet,
+            chain.clone(),
+            Hash256([0x5e; 32]),
+            &dir,
+        );
+        let hello = p
+            .funder
+            .open(A_PEER, 4 * MIN_OUTPUT_VALUE, None, None)
+            .unwrap();
+        p.queue.push_back((1, hello));
+        p.pump();
+        let cid = p.funder.list()[0].channel_id;
+        // The acceptor restarts after signing, before the funding's block is
+        // handed to it (a laptop closed, a crash, an upgrade).
+        let restart = |chain: &Arc<Mutex<SharedChain>>| {
+            restart_and_rescan(
+                acceptor_seed,
+                &dir.join("acceptor"),
+                acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+                chain,
+            )
+        };
+        if down_at_confirmation {
+            // Down while the funding confirms and is buried.
+            for _ in 0..DEPTH {
+                chain.lock().unwrap().mine(&[]);
+            }
+            p.acceptor = restart(&chain);
+        } else {
+            p.acceptor = restart(&chain);
+            assert_eq!(
+                p.acceptor.info(cid).unwrap().phase,
+                Phase::Funded,
+                "replay made the acceptor Funded"
+            );
+            drive(&p.acceptor, &chain); // the funding's block: kept in `Funded` too
+            for _ in 0..DEPTH {
+                chain.lock().unwrap().mine(&[]);
+            }
+        }
+        p.reconnect();
+        p.pump();
+        let rf = p.funder.funding_confirmed(cid).unwrap();
+        let ra = p.acceptor.funding_confirmed(cid).unwrap();
+        p.queue.push_back((1, rf));
+        p.queue.push_back((0, ra));
+        p.pump();
+        assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
+        let funding = p.acceptor.info(cid).unwrap().funding.expect("funded");
+        let funding_tx = {
+            let c = chain.lock().unwrap();
+            (0..=c.height())
+                .rev()
+                .filter_map(|h| c.chain.block_at(h))
+                .flat_map(|b| b.transactions)
+                .find(|t| t.txid() == funding.txid)
+                .expect("the funding on chain")
+        };
+        let mut conflict = funding_tx.clone();
+        conflict.outputs.truncate(1);
+        conflict.outputs[0].value = q21_core::amount::Amount::from_units(1);
+        let h = chain.lock().unwrap().height();
+        let gone = |_: &OutPoint| None;
+        let depth = u64::from(p.acceptor.info(cid).unwrap().funding_depth);
+        for m in [&p.funder, &p.acceptor] {
+            m.on_connected_block(&[], h, &gone);
+            assert!(m.info(cid).unwrap().funding_gone);
+            m.on_connected_block(std::slice::from_ref(&conflict), h + 1, &gone);
+            for k in 2..=depth + 2 {
+                m.on_connected_block(&[], h + k, &gone);
+            }
+        }
+        // Both sides give up, the acceptor too: it kept the funding when it
+        // replayed into `Funded`, or fetched it at startup when it was down
+        // at its confirmation.
+        assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closed);
+        assert_eq!(
+            p.acceptor.info(cid).unwrap().phase,
+            Phase::Closed,
+            "down at confirmation: {down_at_confirmation}"
+        );
+    }
+}

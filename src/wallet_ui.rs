@@ -4512,7 +4512,8 @@ function segments(n, total, open){
 function spliceBlock(ch, sp){
   const amount = channelUnits(sp.amount);
   const title = sp.ours === true ? "Adding Q21 to the channel" : "The other side is adding Q21 to the channel";
-  const depth = Number(ch.funding_depth) || 1;
+  // Its own depth, past the funding's (0.5.11): a 0.5.10 node gave none.
+  const depth = Number(sp.depth) || Number(ch.funding_depth) || 1;
   const h = sp.height === null || sp.height === undefined ? null : Number(sp.height);
   let where;
   if (sp.signed !== true){
