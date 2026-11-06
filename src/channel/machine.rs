@@ -61,7 +61,7 @@
 //! commitment `n` on the new funding; the other side persists it, signs the
 //! adder's, and only then signs the splice's funding input. Neither side
 //! reveals the secret of `n - 1`, the last state on the old funding, until
-//! the splice is buried to the funding depth: until then commitment `n - 1`
+//! the splice is buried to its lock depth (`manager::splice_lock_depth`): until then commitment `n - 1`
 //! is what either side broadcasts to close alone, since the new funding may
 //! never confirm. No payment moves meanwhile: the update is in flight. Once
 //! both secrets of `n - 1` are in, the old funding is forgotten.
@@ -1925,7 +1925,7 @@ impl Machine {
         Ok(sp.tx)
     }
 
-    /// Either side, once the splice is buried to the funding depth: reveals
+    /// Either side, once the splice is buried to its lock depth: reveals
     /// the secret of the last state on the old funding, which nothing can
     /// spend any more, and returns [`Message::SpliceLocked`]. Idempotent.
     pub fn splice_locked(&mut self) -> Result<Message, ChannelError> {

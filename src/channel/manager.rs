@@ -280,6 +280,10 @@ pub enum ClosedHow {
     Forced,
     /// A revoked commitment was broadcast and punished.
     Penalty,
+    /// Given up: its funding left the chain and a coin of it was spent
+    /// elsewhere, buried past any reorganization, so it can never come back
+    /// (red-team campaign 9, C7). Nothing came back from it.
+    Abandoned,
     /// Closed before this was recorded (a journal from 0.5.2 or earlier).
     Unknown,
 }
@@ -290,6 +294,7 @@ impl ClosedHow {
             ClosedHow::Cooperative => "cooperative",
             ClosedHow::Forced => "forced",
             ClosedHow::Penalty => "penalty",
+            ClosedHow::Abandoned => "abandoned",
             ClosedHow::Unknown => "unknown",
         }
     }
@@ -299,6 +304,7 @@ impl ClosedHow {
             "cooperative" => ClosedHow::Cooperative,
             "forced" => ClosedHow::Forced,
             "penalty" => ClosedHow::Penalty,
+            "abandoned" => ClosedHow::Abandoned,
             _ => ClosedHow::Unknown,
         }
     }
@@ -3139,6 +3145,7 @@ impl ChannelManager {
         // peer's channels, and could never pay nor close (red-team campaign
         // 9, C7).
         let network = self.network;
+        let mut abandoned = Vec::new();
         for c in g.channels.values_mut() {
             let Some((_, at)) = c.conflict else {
                 continue;
@@ -3170,6 +3177,9 @@ impl ChannelManager {
                 c.funding_gone = false;
                 c.held_frame = None;
                 if gone_open {
+                    // Archived as given up, not as a close whose share came
+                    // back: nothing did (campaign 10, `regul`).
+                    abandoned.push(c.machine.channel_id());
                     eprintln!(
                         "ALERT: channel {}: its funding left the chain, and a coin it spends was \
                          spent by another transaction, buried past any reorganization; the \
@@ -3186,6 +3196,9 @@ impl ChannelManager {
             }
         }
         drop(g);
+        for cid in abandoned {
+            self.write_end(cid, height, ClosedHow::Abandoned);
+        }
         for tx in release {
             (self.hooks.reserve)(&tx, false);
         }
@@ -4259,7 +4272,7 @@ fn settle_all(chan: &mut Chan, by: Vec<Hash256>, height: u64) {
 /// the other side can never close, and its whole balance is frozen. Locked
 /// at the funding depth, six blocks on the test network, that reorganization
 /// cost no surcharge (see `REORG_PENALTY_FROM_DEPTH`). Six blocks more put it
-/// past the surcharge's threshold, at the price of an hour more without
+/// past the surcharge's threshold, at the price of twelve minutes more without
 /// payments after an addition. What remains is a majority of the hash power
 /// rewriting twelve blocks, the model's own limit.
 ///

@@ -216,12 +216,19 @@ How it stays safe:
   funding; the other side keeps it, signs the adder's, and only then signs
   the splice's input that spends the old funding. Neither can put the splice
   on chain while the other lacks a commitment it can close with;
-- until the splice is buried to the funding depth, neither side revokes the
-  last state on the old funding: a close without the other side broadcasts
-  that state while the splice is not on chain, and the first new one once it
-  is. A revoked older state is punished on either funding;
-- no payment moves meanwhile, a few blocks: the state is in flight until the
-  chain buries it, and both sides then reveal the secret of the old state;
+- until the splice is buried six blocks past the funding depth (twelve
+  blocks on the test network since 0.5.11; the funding depth on regtest),
+  neither side revokes the last state on the old funding: a close without
+  the other side broadcasts that state while the splice is not on chain, and
+  the first new one once it is. A revoked older state is punished on either
+  funding;
+- no payment moves meanwhile, twelve blocks on the test network: the state
+  is in flight until the chain buries it, and both sides then reveal the
+  secret of the old state;
+- if a coin the splice adds is spent elsewhere before it confirms, the
+  addition can never happen: after the funding depth the page says so, and
+  offers to close the channel without the other side, which is safe then
+  (0.5.11);
 - a payment of the other side that crosses the addition wins: the adder
   drops the splice, which nobody can complete without its signature, and the
   page says to add again;
@@ -249,7 +256,11 @@ Both wallets need 0.5.5 or later; the button shows only then.
   funding is buried again to the depth agreed at the opening, and the page
   says so. The side that funded it holds its coins and announces the funding
   transaction again; a payment sent meanwhile goes through once it is back.
-  Nothing is lost.
+  Nothing is lost — unless a coin of the funding is then spent by another
+  transaction, buried past any reorganization: the funding can never come
+  back, the channel is given up, and it is archived as "given up", nothing
+  having come back from it (0.5.11). That takes a reorganization of six
+  blocks or more and the funder spending its coins elsewhere.
 - **A channel asked to wait for more confirmations than the longest delay**
   (a contact asking for 65,535 blocks, three months) is refused at the
   opening: such a channel never opened and blocked new ones meanwhile.

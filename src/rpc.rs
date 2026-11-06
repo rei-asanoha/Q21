@@ -6210,11 +6210,32 @@ impl RpcContext {
         let g = w
             .lock()
             .map_err(|_| rpc_error(ERR_INTERNAL, "wallet locked"))?;
-        let (balance, n_spendable, immature, height, next, frozen, reused) =
-            self.node.with_chain(|c| {
+        let (balance, n_spendable, immature, height, next, frozen, reused, committed) =
+            self.node.with_chain_and_mempool(|c, m| {
                 let height = c.height();
-                let balance = g.balance(&c.utxo, height);
-                let n_spendable = g.spendable(&c.utxo, height).len();
+                // --- What a send can spend now, not what the chain holds.
+                //
+                // A coin a pending send of ours already spends, or one held
+                // back for a channel, still sat in the balance until the next
+                // block: after sending 1 of 15, the page showed 15, let a
+                // send of 14.5 through its check, and the node refused it
+                // (campaign 10, `regul`). The change of our own pending sends
+                // counts, as a send may spend it.
+                let coins = g.spendable(&c.utxo, height);
+                let n_spendable = coins.len();
+                let (free, held): (Vec<_>, Vec<_>) = coins
+                    .iter()
+                    .partition(|(o, _, _)| !m.spends(o) && !g.is_locked(o));
+                let change: u64 = own_pending_coins(&g, c, m)
+                    .iter()
+                    .filter(|(o, _)| !g.is_locked(o))
+                    .map(|(_, out)| out.value.units())
+                    .sum();
+                let balance = Amount::checked_sum(free.iter().map(|(_, o, _)| o.value))
+                    .and_then(|a| a.checked_add(Amount::from_units(change)))
+                    .unwrap_or(Amount::ZERO);
+                let committed = Amount::checked_sum(held.iter().map(|(_, o, _)| o.value))
+                    .unwrap_or(Amount::ZERO);
                 // --- "When?" is the question people ask in front of a locked
                 //     balance.
                 //
@@ -6238,11 +6259,21 @@ impl RpcContext {
                 // vanish without explanation; we name it, with its cause.
                 let frozen = g.frozen_amount(&c.utxo, height);
                 let reused = g.reused_addresses(&c.utxo, height).len();
-                (balance, n_spendable, immature, height, next, frozen, reused)
+                (
+                    balance,
+                    n_spendable,
+                    immature,
+                    height,
+                    next,
+                    frozen,
+                    reused,
+                    committed,
+                )
             });
 
         let mut response = Json::obj()
             .set("spendable", amount_json(balance))
+            .set("committed", amount_json(committed))
             .set("immature", amount_json(Amount::from_units(immature)))
             .set("spendable_outputs", Json::u64(n_spendable as u64))
             .set("derived_addresses", Json::u64(g.next_index() as u64))
@@ -8834,6 +8865,41 @@ mod tests {
             assert!(!s.allow(Some(a), t0));
         }
         assert!(s.allow(Some(b), t0), "A's refusals emptied the net");
+    }
+
+    /// Campaign 10 (`regul`): the balance is what a send can spend now: a
+    /// coin a pending send of ours spends leaves it at once, and the change
+    /// of that send comes back into it.
+    #[test]
+    fn the_balance_leaves_out_what_a_pending_send_spends() {
+        let c = context_with_funds();
+        let units = |r: &Json, k: &str| {
+            r.get(k)
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+                .expect("amount")
+        };
+        let before = call_ok(&c, "getbalance", "{}");
+        let total = units(&before, "spendable");
+        assert_eq!(units(&before, "committed"), 0);
+        let mut other = Wallet::from_seed([0x12; 32], NETWORK);
+        let a = other.new_address().to_string_bech32();
+        let params = format!(r#"{{"destinations":[{{"address":"{a}","units":100000}}]}}"#);
+        let r = call_ok(&c, "sendmany", &params);
+        let fee = r
+            .get("fee")
+            .and_then(|v| v.get("units"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let after = call_ok(&c, "getbalance", "{}");
+        assert!(
+            units(&after, "spendable") <= total - 100_000,
+            "{} after sending from {total}",
+            after.encode()
+        );
+        if fee > 0 {
+            assert_eq!(units(&after, "spendable"), total - 100_000 - fee);
+        }
     }
 
     /// A single send pays several recipients: the transaction does carry all

@@ -4297,6 +4297,14 @@ fn a_funding_whose_coin_was_spent_elsewhere_after_a_reorg_is_given_up_on_both_si
         let i = m.info(cid).unwrap();
         assert_eq!(i.phase, Phase::Closed, "given up");
         assert!(!i.funding_gone);
+        // Archived as given up, not as a close whose share came back
+        // (campaign 10, `regul`).
+        let a = m
+            .archived()
+            .into_iter()
+            .find(|a| a.channel_id == cid)
+            .expect("archived");
+        assert_eq!(a.how, q21_core::channel::manager::ClosedHow::Abandoned);
     }
 }
 
