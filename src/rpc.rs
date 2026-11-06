@@ -556,6 +556,111 @@ fn calls() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<Hash256,
 /// larger costs its client one more call per this many bytes.
 pub const ANSWER_BYTES_PER_CALL: usize = 64 * 1024;
 
+/// Bytes of blocks one public answer may read, to tell what transactions
+/// spent and to list an address's movements.
+///
+/// # The defect this closes (campaign 10, `prag`)
+///
+/// What an input spent was found by reading the whole block of the coin it
+/// spends, once per input, under the node's lock: an address with five
+/// transactions of 242 inputs each, all spending coins of one 1.3 MB block,
+/// cost seven seconds per `getaddress`, charged one call. Six requests from
+/// one address, their sockets closed at once, kept a public explorer at "too
+/// many requests" for everyone and slowed its node's intake of blocks.
+///
+/// A block is now read once per answer, and only its outputs are kept; a
+/// public answer reads at most this many bytes and [`PUBLIC_BLOCK_READS`]
+/// blocks, beyond which an amount reads as unknown and a list of movements
+/// is cut, both said in the answer; and the client is charged for what was
+/// read as for an answer of that size.
+pub const PUBLIC_READ_BYTES: usize = 32 * 1024 * 1024;
+
+/// Blocks one public answer may read: see [`PUBLIC_READ_BYTES`].
+pub const PUBLIC_BLOCK_READS: usize = 400;
+
+/// Waiting transactions one public `getaddress` looks through for the
+/// address's pending movements.
+pub const PUBLIC_MEMPOOL_WALK: usize = 5_000;
+
+/// The blocks one answer reads, each once: only the outputs of each block
+/// are kept, the signatures, most of a block's weight, are not.
+pub(crate) struct BlockReads {
+    outputs: std::collections::HashMap<u64, Option<Vec<Vec<crate::tx::TxOut>>>>,
+    bytes_left: usize,
+    reads_left: usize,
+    /// Bytes read so far, what the client is charged for.
+    pub(crate) bytes: usize,
+    spent: bool,
+}
+
+impl BlockReads {
+    pub(crate) fn bounded(bytes: usize, reads: usize) -> BlockReads {
+        BlockReads {
+            outputs: std::collections::HashMap::new(),
+            bytes_left: bytes,
+            reads_left: reads,
+            bytes: 0,
+            spent: false,
+        }
+    }
+
+    /// Did a read go unmade, the budget spent?
+    pub(crate) fn spent(&self) -> bool {
+        self.spent
+    }
+
+    /// Reads the block at `height`, if the budget allows it, and keeps its
+    /// outputs.
+    fn read(&mut self, node: &Node, height: u64) -> Option<Block> {
+        if self.reads_left == 0 || self.bytes_left == 0 {
+            self.spent = true;
+            return None;
+        }
+        self.reads_left -= 1;
+        let block = node.with_chain(|c| c.block_at(height));
+        let size = block.as_ref().map_or(0, |b| b.encode().len());
+        self.bytes = self.bytes.saturating_add(size);
+        self.bytes_left = self.bytes_left.saturating_sub(size);
+        self.outputs.insert(
+            height,
+            block
+                .as_ref()
+                .map(|b| b.transactions.iter().map(|t| t.outputs.clone()).collect()),
+        );
+        block
+    }
+
+    /// One output of a transaction of the block at `height`.
+    fn output(
+        &mut self,
+        node: &Node,
+        height: u64,
+        rank: u32,
+        index: u32,
+    ) -> Option<crate::tx::TxOut> {
+        if !self.outputs.contains_key(&height) {
+            self.read(node, height)?;
+        }
+        self.outputs
+            .get(&height)?
+            .as_ref()?
+            .get(rank as usize)?
+            .get(index as usize)
+            .cloned()
+    }
+
+    /// A whole transaction of the block at `height`, with the block's time.
+    /// Always a read: what is kept of a block is its outputs only.
+    fn transaction(&mut self, node: &Node, height: u64, rank: u32) -> Option<(u64, Transaction)> {
+        let b = self.read(node, height)?;
+        let time = b.header.time;
+        b.transactions
+            .into_iter()
+            .nth(rank as usize)
+            .map(|t| (time, t))
+    }
+}
+
 /// Calls of a public explorer answered at once, the whole node together:
 /// each holds its answer in memory while it is built (tens of megabytes for
 /// a full block). Beyond, a call waits its turn, then is told to slow down.
@@ -3640,6 +3745,29 @@ impl RpcContext {
     /// (red-team campaign 9). And a side branch's transactions are never
     /// validated, only its shape and its work.
     fn getblock(&self, params: &Json, full: bool) -> Result<Json, Json> {
+        // A header alone is read from the index, never from the body: a
+        // five-hundred-byte answer read four megabytes (campaign 10).
+        if !full {
+            let header = self.node.with_chain(|c| {
+                let id = if let Some(h) = params.get("height").and_then(|v| v.as_u64()) {
+                    c.active_at(h)
+                } else if let Some(id) = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(Hash256::from_hex)
+                {
+                    Some(id)
+                } else {
+                    Some(c.tip_id())
+                }?;
+                let h = c.header_of(&id)?;
+                Some((h, c.active_at(h.height) == Some(id)))
+            });
+            return match header {
+                Some((h, active)) => Ok(with_active(header_json(&h), active)),
+                None => Err(rpc_error(ERR_NOT_FOUND, "block not found")),
+            };
+        }
         let block = self.node.with_chain(|c| {
             let b = if let Some(h) = params.get("height").and_then(|v| v.as_u64()) {
                 c.block_at(h)
@@ -3682,7 +3810,7 @@ impl RpcContext {
             return Ok(Json::obj()
                 .set("confirmed", Json::Bool(false))
                 .set("transaction", tx_json(&t, self.network))
-                .set_all(self.fee_fields(&t))
+                .set_all(self.fee_fields(&t, client))
                 .build());
         }
 
@@ -3699,7 +3827,7 @@ impl RpcContext {
                     .set("height", Json::u64(height))
                     .set("block", Json::str(block.to_hex()))
                     .set("transaction", tx_json(&t, self.network))
-                    .set_all(self.fee_fields(&t))
+                    .set_all(self.fee_fields(&t, client))
                     .build());
             }
         }
@@ -3752,7 +3880,7 @@ impl RpcContext {
                 .set("height", Json::u64(height))
                 .set("block", Json::str(block.to_hex()))
                 .set("transaction", tx_json(&t, self.network))
-                .set_all(self.fee_fields(&t))
+                .set_all(self.fee_fields(&t, client))
                 .build()),
             None => Err(rpc_error(ERR_NOT_FOUND, "transaction not found")),
         }
@@ -4112,13 +4240,32 @@ impl RpcContext {
     /// reference of the output it consumes, not its amount or its owner.
     /// Without an index, we do not search: an answer that costs a full scan per
     /// input is not an answer, and the page then simply says it does not know.
-    fn resolve_output(&self, outpoint: &crate::tx::OutPoint) -> Option<crate::tx::TxOut> {
+    ///
+    /// Each block is read once per answer, through `reads`, which also bounds
+    /// what a public answer may read: see [`BlockReads`].
+    fn resolve_output(
+        &self,
+        outpoint: &crate::tx::OutPoint,
+        reads: &mut BlockReads,
+    ) -> Option<crate::tx::TxOut> {
         let (height, rank) = self.locate_transaction(&outpoint.txid)?;
-        self.node.with_chain(|c| {
-            let b = c.block_at(height)?;
-            let t = b.transactions.get(rank as usize)?;
-            t.outputs.get(outpoint.index as usize).cloned()
-        })
+        reads.output(&self.node, height, rank, outpoint.index)
+    }
+
+    /// The block reads one answer may make: unbounded for the owner, bounded
+    /// on a public explorer. See [`BlockReads`].
+    fn block_reads(&self) -> BlockReads {
+        if self.scans.is_some() {
+            BlockReads::bounded(PUBLIC_READ_BYTES, PUBLIC_BLOCK_READS)
+        } else {
+            BlockReads::bounded(usize::MAX, usize::MAX)
+        }
+    }
+
+    /// Charges `client` for the blocks an answer read, as for an answer of
+    /// that size: see [`ScanBucket::charge_answer`].
+    fn charge_reads(&self, client: Option<std::net::IpAddr>, reads: &BlockReads) {
+        self.charge_answer(client, reads.bytes);
     }
 
     /// The amount of each input, the incoming sum, and whether everything is
@@ -4132,7 +4279,7 @@ impl RpcContext {
     ///
     /// Returns `(inputs, amount_in, known)`: `inputs` is aligned with the
     /// transaction's inputs, each element carrying `value` when it is known.
-    fn resolve_inputs(&self, t: &Transaction) -> (Vec<Json>, u64, bool) {
+    fn resolve_inputs(&self, t: &Transaction, reads: &mut BlockReads) -> (Vec<Json>, u64, bool) {
         let mut inputs = Vec::with_capacity(t.inputs.len());
         let mut amount_in = 0u64;
         let mut known = true;
@@ -4141,7 +4288,7 @@ impl RpcContext {
                 inputs.push(Json::obj().set("known", Json::Bool(true)).build());
                 continue;
             }
-            match self.resolve_output(&e.prev_out) {
+            match self.resolve_output(&e.prev_out, reads) {
                 Some(o) => {
                     amount_in = amount_in.saturating_add(o.value.units());
                     inputs.push(
@@ -4165,8 +4312,14 @@ impl RpcContext {
     ///
     /// The fee of a coinbase makes no sense - it *collects* the block's fees,
     /// it pays none - so we do not show it for one.
-    fn fee_fields(&self, t: &Transaction) -> Vec<(&'static str, Json)> {
-        let (inputs, amount_in, known) = self.resolve_inputs(t);
+    fn fee_fields(
+        &self,
+        t: &Transaction,
+        client: Option<std::net::IpAddr>,
+    ) -> Vec<(&'static str, Json)> {
+        let mut reads = self.block_reads();
+        let (inputs, amount_in, known) = self.resolve_inputs(t, &mut reads);
+        self.charge_reads(client, &reads);
         let coinbase = t.is_coinbase();
         let amount_out: u64 = t.outputs.iter().map(|o| o.value.units()).sum();
         let fee_known = known && !coinbase;
@@ -4295,7 +4448,7 @@ impl RpcContext {
         // Sixty-four hexadecimal characters: a block or a transaction. Blocks
         // are checked first, since their table is immediate.
         if let Some(h) = Hash256::from_hex(&lower) {
-            if self.node.with_chain(|c| c.block_by_id(&h).is_some()) {
+            if self.node.with_chain(|c| c.has_block(&h)) {
                 return found("block-id", h.to_hex());
             }
             if self.node.with_mempool(|m| m.get(&h).is_some()) {
@@ -4496,10 +4649,20 @@ impl RpcContext {
         // Read in place, under the one lock both live under. Up to v0.4.8 the
         // whole mempool was copied first: at its 64 MiB cap, every look-up of
         // an address copied 64 MiB while holding the node's lock.
+        //
+        // On a public explorer, at most [`PUBLIC_MEMPOOL_WALK`] of them: a
+        // backlog of tens of thousands, walked under that lock for every
+        // look-up, was a visitor's to order (campaign 10).
         let now = now_utc();
+        let walk = if self.scans.is_some() {
+            PUBLIC_MEMPOOL_WALK
+        } else {
+            usize::MAX
+        };
         let pending: Vec<Json> = self.node.with_chain_and_mempool(|c, m| {
             m.txids()
                 .iter()
+                .take(walk)
                 .filter_map(|id| m.get(id))
                 .filter_map(|tx| {
                     let received: u64 = tx
@@ -4545,11 +4708,16 @@ impl RpcContext {
         let mut movements = pending;
         let mut all_out_resolved = true;
         let mut not_ours = 0usize;
+        let mut reads = self.block_reads();
+        let mut cut = false;
         for (h, rank) in positions {
-            let Some(block) = self.node.with_chain(|c| c.block_at(h)) else {
-                continue;
-            };
-            let Some(tx) = block.transactions.get(rank as usize).cloned() else {
+            let Some((time, tx)) = reads.transaction(&self.node, h, rank) else {
+                if reads.spent() {
+                    // The answer's reads are spent: what is listed is what
+                    // could be read, and the answer says so.
+                    cut = true;
+                    break;
+                }
                 continue;
             };
             let received: u64 = tx
@@ -4564,7 +4732,7 @@ impl RpcContext {
                 if input.prev_out.is_coinbase() {
                     continue;
                 }
-                match self.resolve_output(&input.prev_out) {
+                match self.resolve_output(&input.prev_out, &mut reads) {
                     Some(o) if mine(&o) => sent += o.value.units(),
                     Some(_) => {}
                     None => known = false,
@@ -4583,7 +4751,7 @@ impl RpcContext {
                 Json::obj()
                     .set("txid", Json::str(tx.txid().to_hex()))
                     .set("height", Json::u64(h))
-                    .set("timestamp", Json::u64(block.header.time))
+                    .set("timestamp", Json::u64(time))
                     .set("confirmations", Json::u64(height.saturating_sub(h) + 1))
                     .set("coinbase", Json::Bool(tx.is_coinbase()))
                     .set("received", amount_json(Amount::from_units(received)))
@@ -4592,6 +4760,8 @@ impl RpcContext {
                     .build(),
             );
         }
+
+        self.charge_reads(client, &reads);
 
         // --- The balance: what the UTXO set holds for this key hash.
         //
@@ -4617,6 +4787,7 @@ impl RpcContext {
             )
             .set("via_index", Json::Bool(via_index))
             .set("amounts_out_all_resolved", Json::Bool(all_out_resolved))
+            .set("movements_cut", Json::Bool(cut))
             .set("complete_history", Json::Bool(via_index || floor == 0))
             .set("floor", Json::u64(floor))
             .set("height", Json::u64(height))
@@ -8168,6 +8339,35 @@ mod tests {
                 == Some(val.as_str())),
             "every output returned must be worth exactly the amount searched"
         );
+    }
+
+    /// Campaign 10 (`prag`): one answer reads a block once, keeps only its
+    /// outputs, and stops at its budget, in blocks or in bytes.
+    #[test]
+    fn an_answer_reads_each_block_once_and_within_its_budget() {
+        let c = context_with_funds();
+        let mut r = BlockReads::bounded(usize::MAX, 1);
+        let first = r.output(&c.node, 1, 0, 0);
+        assert!(first.is_some());
+        let bytes = r.bytes;
+        assert!(bytes > 0);
+        assert_eq!(r.output(&c.node, 1, 0, 0), first, "from what was kept");
+        assert_eq!(r.output(&c.node, 1, 0, 9), None, "no such output");
+        assert!(!r.spent());
+        assert_eq!(r.output(&c.node, 2, 0, 0), None, "one block only");
+        assert!(r.spent());
+        assert_eq!(r.bytes, bytes);
+        let mut r = BlockReads::bounded(1, usize::MAX);
+        assert!(r.output(&c.node, 1, 0, 0).is_some());
+        assert_eq!(r.output(&c.node, 2, 0, 0), None, "the bytes are spent");
+        assert!(r.spent());
+        // The owner's answers are bounded by nothing; a public one is.
+        assert_eq!(c.block_reads().reads_left, usize::MAX);
+        assert_eq!(
+            public_context().block_reads().reads_left,
+            PUBLIC_BLOCK_READS
+        );
+        assert_eq!(public_context().block_reads().bytes_left, PUBLIC_READ_BYTES);
     }
 
     /// A public context: no wallet, with the scan budget.
