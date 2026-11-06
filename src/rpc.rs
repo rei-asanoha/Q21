@@ -4005,7 +4005,10 @@ impl RpcContext {
             .set("cap", amount_json(Amount::from_units(MAX_SUPPLY)))
             .set(
                 "permille_of_cap",
-                Json::u64(cumulative.units().saturating_mul(100_000) / MAX_SUPPLY),
+                // Thousandths, in 128 bits: it multiplied by a hundred
+                // thousand in 64, saturated past a tenth of the supply and
+                // read a hundred times too high below it (campaign 10).
+                Json::u64((u128::from(cumulative.units()) * 1_000 / u128::from(MAX_SUPPLY)) as u64),
             )
             .build())
     }
@@ -10291,6 +10294,19 @@ mod tests {
             .and_then(|v| v.as_u64())
             .unwrap();
         assert!(cumulative <= MAX_SUPPLY, "the cap must never be exceeded");
+        // Thousandths of the cap, the figure the name says.
+        let permille = r.get("permille_of_cap").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(
+            permille,
+            (u128::from(cumulative) * 1_000 / u128::from(MAX_SUPPLY)) as u64
+        );
+        assert!(permille <= 1_000);
+        let late = call_ok(&c, "getemission", r#"{"height":100000000}"#);
+        let p = late
+            .get("permille_of_cap")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert!((990..=1_000).contains(&p), "{p}");
     }
 
     /// Search recognizes a height.

@@ -2234,7 +2234,7 @@ fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<Di
         }
     }
     if !blocks_path(datadir).exists() {
-        std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
+        create_private_dir(datadir)?;
         let genesis = genesis_block(network);
         q21_core::store::BlockStore::new(blocks_path(datadir))
             .append(&genesis)
@@ -3732,7 +3732,7 @@ fn cmd_snapshot(datadir: &Path, args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("adoption refused: {e}"))?;
 
             // Set up the adopted folder.
-            std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
+            create_private_dir(datadir)?;
             let bs = BlockStore::new(blocks_path(datadir));
             for b in &bodies {
                 bs.append(b)
@@ -4282,7 +4282,7 @@ fn stage_adopted_snapshot(
             datadir.display()
         ));
     }
-    std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
+    create_private_dir(datadir)?;
     HeaderStore::new(headers_path(datadir))
         .append(&headers)
         .map_err(|e| e.to_string())?;
@@ -4884,7 +4884,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
                 q21_core::channel::keys::NodeIdentity::derive(&seed).pubkey(),
             );
             let jdir = datadir.join("channels");
-            let _ = std::fs::create_dir_all(&jdir);
+            let _ = create_private_dir(&jdir);
 
             let w_fund = wallet.clone();
             let n_fund = node.clone();
