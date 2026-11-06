@@ -552,9 +552,16 @@ another machine** preferably — the host server does not need a compiler. Then,
 on the server, the Debian package provides for substituting a binary without
 breaking updates:
 
+Pin both versions: the Caddy release the server's package runs
+(`caddy version`), and the module's commit you looked at. Without a pin,
+`xcaddy` takes whatever the module's repository holds that day, and the
+binary that holds the explorer's TLS key is whatever that was.
+
 ```bash
-xcaddy build --with github.com/mholt/caddy-ratelimit
+xcaddy build v2.X.Y --with github.com/mholt/caddy-ratelimit@COMMIT
 ```
+
+(`v2.X.Y` and `COMMIT` are yours to fill in.)
 
 ```bash
 sudo dpkg-divert --divert /usr/bin/caddy.default --rename /usr/bin/caddy
@@ -725,7 +732,10 @@ sudo journalctl -u q21 -f        # the chain, live
 ```
 
 Keep Caddy up to date, and only Caddy — the rest of the system follows its
-own rhythm:
+own rhythm. With way B, the package updates only the set-aside
+`/usr/bin/caddy.default`: the Caddy that runs, `caddy.custom`, is never
+updated by `apt`. Rebuild it with the new version (same pins, the new
+`v2.X.Y`) at every Caddy update, and put it in place as above.
 
 ```bash
 apt list --upgradable 2>/dev/null | grep caddy

@@ -704,6 +704,7 @@ fn create_private_temp(tmp: &Path) -> Result<std::fs::File, String> {
 /// ordinary permissions: they are not ours.
 fn create_private_dir(d: &Path) -> Result<(), String> {
     if d.is_dir() {
+        check_own_dir(d)?;
         tighten_dir(d);
         return Ok(());
     }
@@ -724,6 +725,51 @@ fn create_private_dir(d: &Path) -> Result<(), String> {
     {
         std::fs::create_dir(d).map_err(|e| e.to_string())
     }
+}
+
+/// Refuses a data directory another account owns, or reached through a
+/// link another account owns. `root` may use any.
+///
+/// # The defect this closes (campaign 10, round 2, `compl`)
+///
+/// A directory created first by another account — in `/tmp`, a shared
+/// folder, a USB drive — was used after a warning only: its owner could not
+/// be kept out by permissions it set itself, replaced the files the node
+/// reads back at startup (`bootstrap.txt`, chosen peers; `settings.txt`;
+/// `onions.dat`), moved the wallet away, or held the lock. A link to one's
+/// own directory, on an external disk say, is still followed.
+fn check_own_dir(d: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Safe: `geteuid` cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            return Ok(());
+        }
+        if let Ok(link) = std::fs::symlink_metadata(d) {
+            if link.file_type().is_symlink() && link.uid() != me && link.uid() != 0 {
+                return Err(format!(
+                    "the data directory {} is a link that belongs to another account: \
+                     refused. Use a directory of your own.",
+                    d.display()
+                ));
+            }
+        }
+        if let Ok(m) = std::fs::metadata(d) {
+            if m.uid() != me {
+                return Err(format!(
+                    "the data directory {} belongs to another account: refused. \
+                     Its owner could replace what this node reads back at startup. \
+                     Use a directory of your own.",
+                    d.display()
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = d;
+    Ok(())
 }
 
 /// Tightens a data directory that is wider than 0700, and says so.
@@ -757,6 +803,22 @@ fn tighten_dir(d: &Path) {
     }
     #[cfg(not(unix))]
     let _ = d;
+}
+
+/// Restricts a file wider than 0600 to its owner, quietly: the directory
+/// above it already keeps others out (see [`tighten_dir`]).
+fn tighten_file(f: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(f) {
+            if m.is_file() && m.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = f;
 }
 
 /// The directory anchor: what it has known of its wallet.
@@ -908,6 +970,14 @@ fn write_finality(d: &Path, bound: bool) -> bool {
     q21_core::channel::journal::atomic_write(&finality_path(d), word).is_ok()
 }
 
+/// Records a node still catching up with the seconds its tip has been
+/// recent so far (see `Chain::held_secs`): `catching-up <seconds>`. A 0.5.10
+/// reading it binds, the safe side.
+fn write_finality_held(d: &Path, secs: u64) -> bool {
+    let text = format!("catching-up {secs}");
+    q21_core::channel::journal::atomic_write(&finality_path(d), text.as_bytes()).is_ok()
+}
+
 /// Applies what the directory recorded about finality.
 ///
 /// A directory without the record was used by an earlier version: if its
@@ -921,6 +991,18 @@ fn write_finality(d: &Path, bound: bool) -> bool {
 fn apply_finality_record(d: &Path, chain: &q21_core::chain::Chain) {
     match std::fs::read_to_string(finality_path(d)) {
         Ok(text) if text.trim() == "catching-up" => {}
+        // The seconds earlier runs held a recent tip.
+        Ok(text)
+            if text
+                .trim()
+                .strip_prefix("catching-up ")
+                .is_some_and(|n| n.parse::<u64>().is_ok()) =>
+        {
+            let n = text.trim()["catching-up ".len()..]
+                .parse::<u64>()
+                .unwrap_or(0);
+            chain.set_held_before(n);
+        }
         Ok(_) => chain.bind_finality(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let followed = chain.height() > q21_core::consensus::MAX_REORG_DEPTH;
@@ -1392,8 +1474,10 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
         .map_err(|_| "no wallet here. Run `q21 init` first.".to_string())?;
     // The directory that carries the wallet belongs to its owner, and to them
     // alone. A wider directory — earlier version, manual `mkdir` — is
-    // tightened here, on the first pass.
+    // tightened here, on the first pass; so is the file.
+    check_own_dir(d)?;
     tighten_dir(d);
+    tighten_file(&wallet_path(d));
 
     // --- The directory anchor, BEFORE believing the file.
     //
@@ -2168,6 +2252,12 @@ fn scheme_guard_with(network: Network, mldsa_available: bool) -> Result<Option<S
 fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<DiskState, String> {
     let timing = std::env::var("Q21_TIMING").is_ok();
     let t0 = std::time::Instant::now();
+    // Every data directory, a wallet in it or not: a node's alone kept the
+    // 0755 of a `sudo mkdir` or of an earlier version (campaign 10, round 2).
+    if datadir.is_dir() {
+        check_own_dir(datadir)?;
+        tighten_dir(datadir);
+    }
 
     let has_wallet = wallet_path(datadir).exists();
     let (mut wallet, wallet_less) = if has_wallet {
@@ -6093,6 +6183,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
     let mut recorded_tip = node.with_chain(|c| c.tip_id());
     // Recorded once, when the node becomes bound: see `finality_path`.
     let mut finality_recorded = node.with_chain(|c| c.finality_binds());
+    let mut held_recorded = node.with_chain(|c| c.held_secs());
     loop {
         if duration > 0 && start.elapsed().as_secs() >= duration {
             break;
@@ -6108,6 +6199,14 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         // bound must not start again as one catching up.
         if !finality_recorded && node.with_chain(|c| c.finality_binds()) {
             finality_recorded = write_finality(datadir, true);
+        }
+        // Until then, the seconds held, about once a minute: a node run in
+        // short sessions binds all the same (campaign 10, `arch`).
+        if !finality_recorded {
+            let held = node.with_chain(|c| c.held_secs());
+            if held / 60 != held_recorded / 60 && write_finality_held(datadir, held) {
+                held_recorded = held;
+            }
         }
         if last_snapshot.elapsed() >= SNAPSHOT_PERIOD {
             // Holes first: a body of the active chain that never reached the
@@ -8168,6 +8267,12 @@ mod tests {
         let again = Chain::new(net, genesis_block(net));
         super::apply_finality_record(&d, &again);
         assert!(!again.finality_binds());
+        // The seconds held in earlier runs come back (campaign 10, `arch`).
+        assert!(super::write_finality_held(&d, 2_400));
+        let held = Chain::new(net, genesis_block(net));
+        super::apply_finality_record(&d, &held);
+        assert!(!held.finality_bound_on_record());
+        assert!(held.held_secs() >= 2_400);
         // Unknown content: the safe side, bound — once past the last anchor.
         std::fs::write(super::finality_path(&d), b"?").unwrap();
         let odd = Chain::new(net, genesis_block(net));

@@ -618,6 +618,9 @@ pub struct Chain {
     /// recent without interruption; `None`: it is not. See
     /// [`Chain::note_live`].
     recent_since: Cell<Option<std::time::Instant>>,
+    /// Seconds the tip was recent in earlier runs, without the tip seen old
+    /// since: what the data directory recorded. See [`Chain::held_secs`].
+    held_before: Cell<u64>,
     /// Finality binds this node, for good: set once the hold has passed, or
     /// at startup from what the data directory recorded. Never unset.
     bound: Cell<bool>,
@@ -733,6 +736,7 @@ impl Chain {
             disconnected_txids: Vec::new(),
             finality_hold: default_finality_hold(network),
             recent_since: Cell::new(None),
+            held_before: Cell::new(0),
             bound: Cell::new(false),
         }
     }
@@ -1262,6 +1266,7 @@ impl Chain {
                 disconnected_txids: Vec::new(),
                 finality_hold: default_finality_hold(network),
                 recent_since: Cell::new(None),
+                held_before: Cell::new(0),
                 bound: Cell::new(false),
             },
             to_replay,
@@ -1953,6 +1958,26 @@ impl Chain {
         self.bound.set(true);
     }
 
+    /// Seconds the tip has been recent, this run's streak and the earlier
+    /// runs' together: what the data directory records, so that a node run
+    /// in sessions shorter than the hold still binds.
+    ///
+    /// # The defect this closes (campaign 10, `arch`)
+    ///
+    /// The hold counted one uninterrupted stretch of one process: a wallet
+    /// opened forty minutes a day never bound, and followed a branch of any
+    /// depth for good, with no surcharge; the settle depth of its channels
+    /// assumed the limit it never had.
+    pub fn held_secs(&self) -> u64 {
+        let streak = self.recent_since.get().map_or(0, |t| t.elapsed().as_secs());
+        self.held_before.get().saturating_add(streak)
+    }
+
+    /// Takes the seconds earlier runs held (see [`Chain::held_secs`]).
+    pub fn set_held_before(&self, secs: u64) {
+        self.held_before.set(secs);
+    }
+
     /// Notes, at the node's clock `now` (Unix seconds), whether the tip is
     /// recent, and binds finality once it has been for [`FINALITY_HOLD_SECS`]
     /// without interruption. Returns whether finality binds.
@@ -1972,7 +1997,9 @@ impl Chain {
         }
         let hold = self.finality_hold.unwrap_or(0);
         if now.saturating_sub(self.tip().time) > RECENT_TIP_SECS {
+            // An old tip: catching up again, what was held is lost.
             self.recent_since.set(None);
+            self.held_before.set(0);
             return false;
         }
         let since = match self.recent_since.get() {
@@ -1982,7 +2009,11 @@ impl Chain {
                 at
             }
         };
-        if at.saturating_duration_since(since).as_secs() >= hold {
+        let held = self
+            .held_before
+            .get()
+            .saturating_add(at.saturating_duration_since(since).as_secs());
+        if held >= hold {
             self.bound.set(true);
         }
         // Held long enough, but below the last anchor finality still waits:
@@ -3567,6 +3598,31 @@ mod tests {
         assert!(c.too_easy_for_side(deep, w));
         assert!(!c.too_easy_for_side(c.active[6], w), "on the active chain");
         assert!(!c.too_easy_for_side(Hash256([1u8; 32]), less), "unknown");
+    }
+
+    /// Campaign 10 (`arch`): the seconds a recent tip was held in earlier
+    /// runs count toward the hold; an old tip loses them.
+    #[test]
+    fn a_hold_in_short_sessions_binds_all_the_same() {
+        let mut c = new_chain();
+        mine(&mut c, 5);
+        c.set_finality_hold(Some(FINALITY_HOLD_SECS));
+        let t0 = std::time::Instant::now();
+        let after = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let tip = c.tip().time;
+        c.set_held_before(2_400);
+        assert!(!c.note_live_at(tip + 10, t0));
+        assert!(!c.note_live_at(tip + 10, after(1_199)));
+        assert!(c.note_live_at(tip + 10, after(1_200)), "40 + 20 minutes");
+        // An old tip: what earlier runs held is lost.
+        let mut d = new_chain();
+        mine(&mut d, 5);
+        d.set_finality_hold(Some(FINALITY_HOLD_SECS));
+        d.set_held_before(3_000);
+        let tip = d.tip().time;
+        assert!(!d.note_live_at(tip + RECENT_TIP_SECS + 1, t0));
+        assert_eq!(d.held_secs(), 0);
+        assert!(!d.note_live_at(tip + 10, after(1_000)));
     }
 
     /// Campaign 10, round 2 (`arch`): side bodies have a budget of their

@@ -269,6 +269,10 @@ for P in $PLATFORMS; do
     case "$R" in
       q21|q21.exe|"Q21 Wallet.exe") continue ;;
       README.md|JOIN.md|WHITEPAPER.md|AUDIT.md|WALLET.md|REPRODUCING.md|SUCCESSION.md|TOR.md) SOURCE="$R" ;;
+      server/SERVER.md|server/PUBLIC-EXPLORER.md|server/UPGRADING.md)
+        case "$P" in linux-*) SOURCE=${R#server/} ;; esac ;;
+      server/monitor.sh)
+        case "$P" in linux-*) SOURCE=tools/monitor.sh ;; esac ;;
       bootstrap.txt|q21-data/bootstrap.txt) SOURCE=default-bootstrap.txt ;;
       "Q21 Wallet.command"|"Troubleshooting/Q21 Wallet - Terminal.command") SOURCE="Q21 Wallet.command" ;;
       "Troubleshooting/Q21 Wallet - console.bat") SOURCE="Q21 Wallet.bat" ;;

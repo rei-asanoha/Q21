@@ -341,6 +341,15 @@ jobs:
           # verifying a file are useless if they stay on a web page that the
           # person downloading it will not visit.
           cp README.md JOIN.md WHITEPAPER.md AUDIT.md WALLET.md REPRODUCING.md SUCCESSION.md TOR.md dist/ 2>/dev/null || true
+          # The servers' script and guides travel in the Linux archives,
+          # covered by the signature: monitor.sh runs as root every ten
+          # minutes, and was copied from the repository, which the offline
+          # signature exists not to trust (campaign 10, round 2).
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            mkdir -p dist/server
+            cp SERVER.md PUBLIC-EXPLORER.md UPGRADING.md dist/server/
+            cp tools/monitor.sh dist/server/monitor.sh
+          fi
           # The double-click launcher, specific to each system. Without it,
           # the user has to open a command window and type `wallet`, which no
           # desktop application asks for.
@@ -468,6 +477,11 @@ jobs:
               MISSING=1
             fi
           done
+          # The servers' script, on Linux.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            printf '%s\n' "$LISTING" | grep -qE '(^|/)server/monitor\.sh$' \
+              || { echo "::error::server/monitor.sh is missing from ${{ matrix.archive }}"; MISSING=1; }
+          fi
           # The launcher without a window, on the systems that have one.
           if [ "${{ runner.os }}" = "Windows" ]; then
             printf '%s\n' "$LISTING" | tr -d '\r' | grep -qF "Q21 Wallet.exe" \
@@ -1067,6 +1081,16 @@ jobs:
           done
           command -v minisign >/dev/null
           COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          # The tagged commit must be on main, and the script and the key used
+          # are main's: a tag on a side commit brought its own
+          # verify-release.sh and its own public key (campaign 10, round 2).
+          if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
+            echo "::error::the tagged commit $COMMIT is not on main"
+            exit 1
+          fi
+          git show origin/main:tools/verify-release.sh > tools/verify-main.sh
+          git show origin/main:q21-release.pub > key-main.pub
+          chmod +x tools/verify-main.sh
           # Labels: the page shows an asset's label, the download its name.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
             --jq '.assets[] | select(.label != "" and .label != .name) | .name' > mislabeled.txt
@@ -1080,7 +1104,7 @@ jobs:
           # (`fetch-depth: 0` brought every branch).
           mkdir att
           git archive origin/main attestations | tar -x -C att
-          ./tools/verify-release.sh rel "$TAG" "$COMMIT" q21-release.pub att/attestations
+          ./tools/verify-main.sh rel "$TAG" "$COMMIT" key-main.pub att/attestations
 
   # Back to draft, whatever stopped the check — a failure, a cancellation, a
   # lost runner. Only this job may write.

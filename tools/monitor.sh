@@ -29,6 +29,10 @@
 #                  https://explorer.example.org/ (default: none, no check)
 #   Q21_PROXY      service of the reverse proxy in front of it
 #                  (default: caddy)
+#   Q21_DATADIR    the node's data directory, whose disk is watched
+#                  (default: /opt/q21/data)
+#   Q21_MIN_FREE_MB free space below which a warning is sent, at most once
+#                  an hour (default: 2048)
 #
 # The state file does not live in a shared directory: in /var/tmp, any
 # account on the machine could pre-create it, as a symbolic link to a file
@@ -46,8 +50,12 @@ SILENT="$STATE.silent"
 NTFY="${Q21_NTFY:-}"
 PUBLIC_URL="${Q21_PUBLIC_URL:-}"
 PROXY="${Q21_PROXY:-caddy}"
+DATADIR="${Q21_DATADIR:-/opt/q21/data}"
+MIN_FREE_MB="${Q21_MIN_FREE_MB:-2048}"
+case "$MIN_FREE_MB" in ''|*[!0-9]*) MIN_FREE_MB=2048 ;; esac
+DISK="$STATE.disk"
 
-if [ -L "$STATE" ] || [ -L "$SILENT" ]; then
+if [ -L "$STATE" ] || [ -L "$SILENT" ] || [ -L "$DISK" ]; then
   logger -t q21-monitor "state file $STATE: symbolic link refused"
   exit 1
 fi
@@ -65,6 +73,25 @@ notify() {
     curl -s -m 10 -H "Title: Q21" -d "$1" "https://ntfy.sh/$NTFY" >/dev/null 2>&1
   fi
 }
+
+# The disk, before it is full: a full disk stops the node mid-write, and
+# nothing else here would say why (campaign 10). At most once an hour.
+if [ -d "$DATADIR" ]; then
+  free_kb=$(df -Pk "$DATADIR" 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$free_kb" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$free_kb" -lt $((MIN_FREE_MB * 1024)) ]; then
+        last=$(cat "$DISK" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        if [ $((now - last)) -ge 3600 ]; then
+          notify "disk of $DATADIR nearly full: $((free_kb / 1024)) MB free (warning below $MIN_FREE_MB MB)"
+          printf '%s\n' "$now" > "$DISK"
+        fi
+      fi
+      ;;
+  esac
+fi
 
 # The public explorer, seen from outside: the height can move forward while
 # nobody can read it. In October 2026 the reverse proxy crashed and the public

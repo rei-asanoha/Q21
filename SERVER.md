@@ -682,6 +682,11 @@ log says so about once an hour. [ntfy](https://ntfy.sh) is free and needs
 no account: install the app, subscribe to a topic of your choice (long and
 unpredictable, for example `q21-server-k8s2m7x`), and put the same name below.
 
+Since 0.5.11 it also watches the free space of the disk that holds the
+node's data (`Q21_DATADIR`), and warns at most once an hour below
+`Q21_MIN_FREE_MB`: a full disk stops a node in the middle of a write, and
+nothing else would say why.
+
 The script needs a local RPC: the service must carry `--rpc 127.0.0.1:21080`
 (which is the case for a public explorer, see
 [PUBLIC-EXPLORER.md](PUBLIC-EXPLORER.md)).
@@ -690,12 +695,19 @@ The ntfy topic is a weak shared secret — whoever knows it reads your alerts an
 can publish fake ones. So it does not go in the unit file, which anyone can
 read, but in an environment file readable by `root` alone.
 
+The script comes from the archive you verified above (since 0.5.11 it
+travels in the Linux archives, under `server/`), never from the repository:
+it runs as `root`, and the repository is exactly what the offline signature
+does not trust.
+
 ```bash
-sudo cp tools/monitor.sh /opt/q21/monitor.sh && sudo chmod +x /opt/q21/monitor.sh
+sudo install -o root -g root -m 0755 ~/server/monitor.sh /opt/q21/monitor.sh
 sudo mkdir -p /etc/q21 && sudo tee /etc/q21/monitor.env > /dev/null <<'EOF'
 Q21_RPC=127.0.0.1:21080
 Q21_NTFY=
 Q21_PUBLIC_URL=
+Q21_DATADIR=/opt/q21/data
+Q21_MIN_FREE_MB=2048
 EOF
 sudo chmod 600 /etc/q21/monitor.env
 sudo tee /etc/systemd/system/q21-monitor.service > /dev/null <<'EOF'

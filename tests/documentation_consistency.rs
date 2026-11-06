@@ -518,8 +518,12 @@ fn the_release_is_signed_offline_and_checked_when_published() {
     );
     let workflow = read(".github/workflows/release.yml");
     let verify = &workflow[workflow.find("  verify:").expect("verify job")..];
+    // With main's script and key, on a commit of main (campaign 10).
     assert!(
-        verify.contains("./tools/verify-release.sh") && verify.contains("--draft=true"),
+        verify.contains("git show origin/main:tools/verify-release.sh > tools/verify-main.sh")
+            && verify.contains("./tools/verify-main.sh")
+            && verify.contains("git merge-base --is-ancestor \"$COMMIT\" origin/main")
+            && verify.contains("--draft=true"),
         "a release published by hand is no longer checked, or no longer sent back to draft"
     );
 }
