@@ -1313,6 +1313,22 @@ fn an_update_that_drains_us_is_rejected() {
     );
 }
 
+/// Campaign 10, round 2 (`regul`): a `to_remote` too small to pay a claim the
+/// pools relay is not claimed, and the channel is not left waiting on it.
+#[test]
+fn a_to_remote_too_small_for_a_relayed_claim_is_left_as_dust() {
+    let min_fee = crate::mempool::MIN_FEE_RATE
+        .saturating_mul(txbuild::key_spend_weight())
+        .div_ceil(1000);
+    assert!(min_fee > 40, "the case found: {min_fee}");
+    let edge = MIN_OUTPUT_VALUE + min_fee;
+    assert!(!txbuild::claimable(MIN_OUTPUT_VALUE));
+    assert!(!txbuild::claimable(MIN_OUTPUT_VALUE + 40));
+    assert!(!txbuild::claimable(edge - 1));
+    assert!(txbuild::claimable(edge));
+    assert!(txbuild::claimable(1_000_000));
+}
+
 /// H2: the sweep fee is capped so a penalty (or sweep/claim) output never falls
 /// below the dust floor, and a to_local below dust+fee is never created — so a
 /// cheater cannot pick a revoked balance that makes the victim's penalty

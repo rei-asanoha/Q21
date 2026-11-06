@@ -993,6 +993,14 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         };
         self.check_control(messages::CONTROL_READY, &[], *seq, signature)?;
+        // Before the channel opens on our side, nothing is journaled: each
+        // record refreshed the journal's time, by which an unfunded channel
+        // expires, and a funder that never funded kept one of the bounded
+        // inbound places for good with a Ready now and then (campaign 10,
+        // round 2, `tact`). Nothing follows from a Ready anyway.
+        if matches!(self.phase, Phase::Opening | Phase::Funded) {
+            return Ok(());
+        }
         self.note_control(*seq)
     }
 
@@ -1328,6 +1336,22 @@ impl Machine {
             .as_ref()
             .filter(|sp| sp.complete)
             .map(|sp| &sp.tx)
+    }
+
+    /// The coins a splice in progress spends besides the old funding: what
+    /// its adder adds.
+    pub fn splice_added_coins(&self) -> Vec<OutPoint> {
+        self.splice
+            .as_ref()
+            .map(|sp| {
+                sp.tx
+                    .inputs
+                    .iter()
+                    .map(|i| i.prev_out)
+                    .filter(|op| *op != sp.old_outpoint)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Our own splice transaction, signed or not: its wallet coins are held

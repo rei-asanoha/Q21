@@ -207,6 +207,8 @@ pub struct ChannelSummary {
     /// The confirmations a funding waits for, also the depth a close is
     /// shown done at.
     pub funding_depth: u16,
+    /// The splice in progress can no longer confirm: see [`SPLICE_DEAD`].
+    pub splice_dead: bool,
     /// The confirmations an addition (a splice) waits for before payments
     /// resume: see [`splice_lock_depth`].
     pub splice_depth: u64,
@@ -476,6 +478,9 @@ struct Chan {
     behind_since: Option<std::time::Instant>,
     /// Our splice, while its wallet coins are held back.
     splice_held: Option<Transaction>,
+    /// Blocks in a row a splice in progress was seen unable to confirm: in
+    /// no block, and a coin it adds spent elsewhere. See [`SPLICE_DEAD`].
+    splice_dead_blocks: u32,
     /// Our last splice was refused (see [`ChannelSummary::splice_refused`]).
     splice_refused: bool,
     /// The funding of this open channel is no longer confirmed on the active
@@ -580,6 +585,21 @@ const CLAIM_MEMORY_BLOCKS: u64 = 1_000;
 const SPLICING: &str = "coins are being added to this channel: payments and closes resume \
      once the addition is buried in the chain";
 
+/// Why a payment or a cooperative close waits for good: a coin the splice
+/// in progress adds was spent by another transaction, so the splice can
+/// never confirm, and it was the only way out of the wait.
+///
+/// # The defect this answers (campaign 10, round 2, `tact`)
+///
+/// The adder's wallet spent the coin it added before the splice confirmed:
+/// both sides waited for the splice for good, payments and closes refused,
+/// and nothing said the only way out was a close alone. It is safe: during a
+/// splice not in a block, a close alone broadcasts the last state on the old
+/// funding, which neither side revoked.
+pub const SPLICE_DEAD: &str = "the addition to this channel can no longer happen: a coin it adds \
+     was spent elsewhere. Close the channel without the peer: your share comes back after \
+     the channel's delay";
+
 /// The refusal of a second addition while the last one is still watched:
 /// until it is buried past any reorganization, its old funding is (see
 /// `Machine::retired_splice`), and one at a time.
@@ -597,6 +617,22 @@ pub const SPLICE_RECENT: &str = "the last addition to this channel is still bein
 pub const UNPROVEN_BEHIND: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl Chan {
+    /// The splice in progress can no longer confirm: seen so for the
+    /// funding depth in a row. See [`SPLICE_DEAD`].
+    fn splice_dead(&self) -> bool {
+        self.machine.splicing()
+            && self.splice_dead_blocks >= u32::from(self.machine.funding_depth().max(1))
+    }
+
+    /// Why a payment or a cooperative close waits during a splice.
+    fn splicing_refusal(&self) -> &'static str {
+        if self.splice_dead() {
+            SPLICE_DEAD
+        } else {
+            SPLICING
+        }
+    }
+
     /// Whether nothing may be signed nor broadcast on this channel: our copy
     /// is proven older, or the peer has just claimed it and may still prove
     /// it.
@@ -1068,6 +1104,7 @@ impl ChannelManager {
                         behind_proven: behind,
                         behind_since: None,
                         splice_held: None,
+                        splice_dead_blocks: 0,
                         splice_refused: false,
                     },
                 );
@@ -1724,7 +1761,7 @@ impl ChannelManager {
             return Err("channel is not yet resynchronized with its peer".into());
         }
         if chan.machine.splicing() {
-            return Err(SPLICING.into());
+            return Err(chan.splicing_refusal().into());
         }
         // Derived from the persisted counters, so a proposal reloaded from the
         // journal after a crash still counts until the reestablish settles it.
@@ -1783,7 +1820,7 @@ impl ChannelManager {
                 );
             }
             if chan.machine.splicing() {
-                return Err(SPLICING.into());
+                return Err(chan.splicing_refusal().into());
             }
             if chan.machine.retired_splice().is_some() {
                 return Err(SPLICE_RECENT.into());
@@ -1891,7 +1928,7 @@ impl ChannelManager {
             return Err("channel is not yet resynchronized with its peer".into());
         }
         if chan.machine.splicing() {
-            return Err(SPLICING.into());
+            return Err(chan.splicing_refusal().into());
         }
         if chan.machine.update_in_flight() {
             chan.machine.agree_close(CLOSE_FEE, true).map_err(err)?;
@@ -2276,6 +2313,7 @@ impl ChannelManager {
                 behind_proven: false,
                 behind_since: None,
                 splice_held: None,
+                splice_dead_blocks: 0,
                 splice_refused: false,
             },
         );
@@ -2712,6 +2750,7 @@ impl ChannelManager {
                 behind_proven: false,
                 behind_since: None,
                 splice_held: None,
+                splice_dead_blocks: 0,
                 splice_refused: false,
             },
         );
@@ -2738,7 +2777,7 @@ impl ChannelManager {
             Watch::PeerLatest {
                 to_remote: Some(to_remote),
                 ..
-            } => {
+            } if txbuild::claimable(to_remote.output.value.units()) => {
                 let claim = chan
                     .machine
                     .build_to_remote_claim(&to_remote, sweep_to, CLOSE_FEE);
@@ -2939,6 +2978,15 @@ impl ChannelManager {
                     .map_or(0, |(d, _)| d);
                 if depth >= settle_depth(network, c.machine.funding_depth()) {
                     let _ = c.machine.forget_retired();
+                    release.extend(c.splice_held.take());
+                    continue;
+                }
+                // The old funding spent while the splice is out (a revoked
+                // state punished, a close): the splice can never come back,
+                // and coins held for it go back to the wallet now, not at the
+                // next restart (campaign 10, round 2).
+                if depth == 0 && (depth_of(&old).is_none() || c.spend.is_some()) {
+                    release.extend(c.splice_held.take());
                     continue;
                 }
                 if let (0, Some(tx)) = (depth, tx) {
@@ -2959,12 +3007,26 @@ impl ChannelManager {
                     }
                 }
             }
-            for c in g.channels.values() {
+            for c in g.channels.values_mut() {
                 let Some(st) = c.machine.splice_status() else {
+                    c.splice_dead_blocks = 0;
                     continue;
                 };
                 let on_chain = depth_of(&st.new_funding).is_some();
                 let old_unspent = depth_of(&st.old_funding).is_some();
+                // In no block, its old funding unspent, and a coin it adds
+                // gone from the chain's unspent coins: it can never confirm.
+                let dead = !on_chain
+                    && old_unspent
+                    && c.machine
+                        .splice_added_coins()
+                        .iter()
+                        .any(|op| depth_of(op).is_none());
+                c.splice_dead_blocks = if dead {
+                    c.splice_dead_blocks.saturating_add(1)
+                } else {
+                    0
+                };
                 // Our splice, signed and in no block yet: announced again.
                 if let (false, true, Some(tx)) = (on_chain, old_unspent, c.machine.splice_tx()) {
                     again.push(tx.clone());
@@ -3172,8 +3234,17 @@ impl ChannelManager {
             let g = self.inner.lock().unwrap();
             g.channels
                 .values()
+                // Open too: a channel accepted before 0.5.11 never kept its
+                // funding. Not during a splice, nor while a finished one is
+                // watched: the funding is then the splice's own output.
+                // Once those are past, the transaction that made the funding
+                // is the one to follow, a splice's or not: a spend of one of
+                // its coins elsewhere means it can never come back.
                 .filter(|c| {
-                    matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
+                    let open = c.machine.phase() == Phase::Open
+                        && !c.machine.splicing()
+                        && c.machine.retired_splice().is_none();
+                    (open || matches!(c.machine.phase(), Phase::Opening | Phase::Funded))
                         && c.machine.funding_tx().is_none()
                 })
                 .filter_map(|c| {
@@ -3281,6 +3352,23 @@ impl ChannelManager {
                                 pending.push((tx.clone(), "splice"));
                             }
                         }
+                    }
+                }
+                // Our finished splice, out of the chain by a reorganization
+                // while the node was down, its old funding unspent: held and
+                // announced again from the start, not from the next block,
+                // so that the wallet cannot spend its coins meanwhile
+                // (campaign 10, round 2).
+                if let Some((_, old, Some(tx))) = c.machine.retired_splice() {
+                    let out = c
+                        .machine
+                        .funding_outpoint()
+                        .is_some_and(|op| depth_of(&op).is_none());
+                    if out && depth_of(&old).is_some() && c.spend.is_none() {
+                        let tx = tx.clone();
+                        hold.push(tx.clone());
+                        c.splice_held = Some(tx.clone());
+                        pending.push((tx, "splice"));
                     }
                 }
                 // Our funding, signed and not yet on chain: its coins are held
@@ -3496,6 +3584,7 @@ impl ChannelManager {
             }
             Watch::PeerLatest { to_remote, .. } => {
                 let _ = chan.machine.mark_forcing();
+                let to_remote = to_remote.filter(|r| txbuild::claimable(r.output.value.units()));
                 match to_remote {
                     Some(to_remote) => {
                         let claim = chan
@@ -3507,7 +3596,8 @@ impl ChannelManager {
                         });
                         self.broadcast_or_warn(&claim, "to_remote claim");
                     }
-                    // Our funds were trimmed to dust: nothing to claim, settled.
+                    // Our funds were trimmed to dust, or are too small to pay
+                    // a claim the pools relay: nothing to claim, settled.
                     None => settle(chan, txid, height),
                 }
             }
@@ -3753,7 +3843,7 @@ impl ChannelManager {
             Watch::RevokedByPeer {
                 to_remote: Some(to_remote),
                 ..
-            } => Some(
+            } if txbuild::claimable(to_remote.output.value.units()) => Some(
                 chan.machine
                     .build_to_remote_claim(to_remote, sweep_to, CLOSE_FEE),
             ),
@@ -4276,6 +4366,7 @@ fn summary(c: &Chan, splices: bool, network: Network) -> ChannelSummary {
         funder_reserve: c.machine.funder_reserve(),
         peer_behind: c.peer_behind.is_some(),
         splice: c.machine.splice_status(),
+        splice_dead: c.splice_dead(),
         splices: splices && c.synced,
         splice_refused: c.splice_refused,
         funding_gone: c.funding_gone,

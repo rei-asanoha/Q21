@@ -539,6 +539,25 @@ pub fn to_remote_claim_tx(
     tx
 }
 
+/// Whether a `to_remote` of `value` can be claimed by a transaction the
+/// pools relay: its fee, capped so that the claimed output stays at the dust
+/// floor (see [`capped_fee`]), must still reach the relay minimum for a key
+/// spend.
+///
+/// # The defect this closes (campaign 10, round 2, `regul`)
+///
+/// A share of 10,000 to about 10,080 units, created as an output since it
+/// clears the dust floor, could pay its claim only a few units of fee: the
+/// claim was refused by every pool, again at every block, and the channel
+/// stayed closing for good. Such a share is left on chain as dust, the
+/// channel settled; it is worth less than the claim would cost.
+pub fn claimable(value: u64) -> bool {
+    let minimum = crate::mempool::MIN_FEE_RATE
+        .saturating_mul(key_spend_weight())
+        .div_ceil(1000);
+    capped_fee(value, SWEEP_FEE) >= minimum
+}
+
 /// The weight of a single ML-DSA-87 key spend, the shape of a funding input
 /// and of a `to_remote` claim: base of one input and one output, plus one key
 /// witness.

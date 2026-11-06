@@ -1157,6 +1157,7 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
                     )
                     .set("locked", Json::Bool(sp.locked))
                     .set("depth", Json::u64(s.splice_depth))
+                    .set("dead", Json::Bool(s.splice_dead))
                     .build(),
                 None => Json::Null,
             },
@@ -7143,6 +7144,7 @@ mod tests {
             close_height: Some(12),
             funding_depth: 6,
             splice_depth: 12,
+            splice_dead: false,
             delay: 144,
             we_funded: true,
             force_close_fee: 2_538,
