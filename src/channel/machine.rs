@@ -348,6 +348,15 @@ pub struct Machine {
     peer_counters: Option<[u64; 4]>,
     /// A splice in progress, until both secrets of its last old state are in.
     splice: Option<Splice>,
+    /// The last splice, finished (both secrets of its last old state in),
+    /// kept until the channel's funding is buried past any reorganization:
+    /// its old funding is still watched, a revoked state there still
+    /// punished, and its transaction announced again if a reorganization
+    /// took it away. Forgotten once buried (see [`Machine::forget_retired`]).
+    /// Dropped at once until 0.5.11: a reorganization deeper than the
+    /// splice's burial brought the old funding back unspent, and a revoked
+    /// state on it went unpunished (red-team campaign 9, C1).
+    retired: Option<Splice>,
     /// Where the splice confirmed, as the node last saw the chain. Not
     /// journaled: the node tells it anew at every block and restart.
     splice_height: Option<u64>,
@@ -617,6 +626,7 @@ impl Machine {
             sync: SyncVerdict::InStep,
             peer_counters: None,
             splice: None,
+            retired: None,
             splice_height: None,
         })
     }
@@ -659,7 +669,7 @@ impl Machine {
     /// a state below a splice in progress, the current ones otherwise. Only
     /// the capacity differs.
     fn params_at(&self, n: u64) -> ChannelParams {
-        match &self.splice {
+        match self.splice.as_ref().or(self.retired.as_ref()) {
             Some(sp) if n < sp.state => ChannelParams {
                 capacity: crate::amount::Amount::from_units(sp.old_capacity),
                 ..self.params.clone()
@@ -670,7 +680,7 @@ impl Machine {
 
     /// The funding outpoint a commitment at state `n` spends.
     fn outpoint_at(&self, n: u64) -> Option<OutPoint> {
-        match &self.splice {
+        match self.splice.as_ref().or(self.retired.as_ref()) {
             Some(sp) if n < sp.state => Some(sp.old_outpoint),
             _ => self.funding_outpoint,
         }
@@ -1444,6 +1454,7 @@ impl Machine {
     pub fn propose_splice(&mut self, add: u64, tx: Transaction) -> Result<Message, ChannelError> {
         if self.phase != Phase::Open
             || self.splice.is_some()
+            || self.retired.is_some()
             || self.update_in_flight()
             || self.sync != SyncVerdict::InStep
         {
@@ -1523,6 +1534,12 @@ impl Machine {
             .any(|i| !i.witness.pubkey.is_empty() || !i.witness.signature.is_empty())
         {
             return Err(ChannelError::BadParameters);
+        }
+        // Not while the last splice is still watched (see `retired`): one
+        // old funding at a time. The peer keeps nothing, and may add again
+        // once it is buried.
+        if self.splice.is_none() && self.retired.is_some() {
+            return Ok(vec![Message::SpliceBusy { state: n }]);
         }
         // The same splice again: our answer was lost, or a crash came before
         // we persisted our commitment.
@@ -1942,8 +1959,26 @@ impl Machine {
                 && self.revocations_recv >= Some(sp.state - 1)
         });
         if done {
-            self.splice = None;
+            self.retired = self.splice.take();
             self.splice_height = None;
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// The finished splice still watched (see [`Machine::retired`]): its
+    /// transaction id, the old funding it spent, and the transaction itself
+    /// when we hold it signed whole (the adder), to announce it again.
+    pub fn retired_splice(&self) -> Option<(Hash256, OutPoint, Option<&Transaction>)> {
+        self.retired
+            .as_ref()
+            .map(|sp| (sp.tx.txid(), sp.old_outpoint, sp.complete.then_some(&sp.tx)))
+    }
+
+    /// Forgets the finished splice, once the channel's funding is buried
+    /// past any reorganization: its old funding can no longer come back.
+    pub fn forget_retired(&mut self) -> Result<(), ChannelError> {
+        if self.retired.take().is_some() {
             self.compact()?;
         }
         Ok(())
@@ -2082,7 +2117,9 @@ impl Machine {
     fn snapshot_records(&self) -> Vec<Record> {
         // During a splice the opening and funding records name the old
         // funding; the splice record that follows moves to the new one.
-        let (capacity, funding_outpoint) = match &self.splice {
+        // A finished splice still watched is written the same way: its
+        // records, read again, make it finished, and retired, again.
+        let (capacity, funding_outpoint) = match self.splice.as_ref().or(self.retired.as_ref()) {
             Some(sp) => (sp.old_capacity, Some(sp.old_outpoint)),
             None => (self.params.capacity.units(), self.funding_outpoint),
         };
@@ -2104,7 +2141,7 @@ impl Machine {
                 funding_index: op.index,
             });
         }
-        if let Some(sp) = &self.splice {
+        if let Some(sp) = self.splice.as_ref().or(self.retired.as_ref()) {
             // The adder's own copy keeps its coins' witnesses until the
             // whole transaction is signed.
             let first = if sp.complete {
@@ -2726,6 +2763,7 @@ impl Machine {
             sync: SyncVerdict::InStep,
             peer_counters: None,
             splice: None,
+            retired: None,
             splice_height: None,
         };
         m.replay(&records);
@@ -2869,14 +2907,15 @@ impl Machine {
             }
         }
         // A splice whose both secrets of its last old state are in is over:
-        // the old funding is forgotten (the next compaction drops it).
+        // kept as retired, its old funding still watched, until the funding
+        // is buried past any reorganization (see `retired`).
         let done = self.splice.as_ref().is_some_and(|sp| {
             sp.locked
                 && self.revocations_sent >= Some(sp.state - 1)
                 && self.revocations_recv >= Some(sp.state - 1)
         });
         if done {
-            self.splice = None;
+            self.retired = self.splice.take();
         }
         if self.phase == Phase::Opening && self.local_commit_number == Some(0) {
             self.phase = Phase::Funded;
@@ -3510,7 +3549,7 @@ impl Machine {
     /// current one, and during a splice the one it spends.
     pub fn watched_outpoints(&self) -> Vec<OutPoint> {
         let mut out: Vec<OutPoint> = self.funding_outpoint.into_iter().collect();
-        if let Some(sp) = &self.splice {
+        if let Some(sp) = self.splice.as_ref().or(self.retired.as_ref()) {
             out.push(sp.old_outpoint);
         }
         out
@@ -3546,7 +3585,7 @@ impl Machine {
         };
         // During a splice, a commitment may spend the old funding too.
         let spent = tx.inputs.first().map(|i| i.prev_out);
-        let funding = match &self.splice {
+        let funding = match self.splice.as_ref().or(self.retired.as_ref()) {
             Some(sp) if spent == Some(sp.old_outpoint) => sp.old_outpoint,
             _ => current,
         };

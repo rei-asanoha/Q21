@@ -577,6 +577,12 @@ const CLAIM_MEMORY_BLOCKS: u64 = 1_000;
 const SPLICING: &str = "coins are being added to this channel: payments and closes resume \
      once the addition is buried in the chain";
 
+/// The refusal of a second addition while the last one is still watched:
+/// until it is buried past any reorganization, its old funding is (see
+/// `Machine::retired_splice`), and one at a time.
+pub const SPLICE_RECENT: &str = "the last addition to this channel is still being buried: \
+     another can be added once it is past any reorganization, in about a day";
+
 /// How long a peer's unproven claim that our copy is older holds the channel.
 ///
 /// A peer that really holds a later state proves it (0.5.5 and later) right
@@ -1776,6 +1782,9 @@ impl ChannelManager {
             if chan.machine.splicing() {
                 return Err(SPLICING.into());
             }
+            if chan.machine.retired_splice().is_some() {
+                return Err(SPLICE_RECENT.into());
+            }
             if chan.machine.update_in_flight() {
                 return Err("a payment is still settling: try again in a moment".into());
             }
@@ -2907,6 +2916,31 @@ impl ChannelManager {
                     again.push(tx);
                 }
             }
+            // A finished splice still watched: announced again by its adder
+            // while a reorganization keeps it out of the chain and its old
+            // funding is unspent (a revoked state there is punished
+            // meanwhile); forgotten once the funding it made is buried past
+            // any reorganization (red-team campaign 9, C1).
+            let network = self.network;
+            for c in g.channels.values_mut() {
+                let Some((_, old, tx)) = c.machine.retired_splice() else {
+                    continue;
+                };
+                let depth = c
+                    .machine
+                    .funding_outpoint()
+                    .and_then(|op| depth_of(&op))
+                    .map_or(0, |(d, _)| d);
+                if depth >= settle_depth(network, c.machine.funding_depth()) {
+                    let _ = c.machine.forget_retired();
+                    continue;
+                }
+                if let (0, Some(tx)) = (depth, tx) {
+                    if depth_of(&old).is_some() && c.spend.is_none() {
+                        again.push(tx.clone());
+                    }
+                }
+            }
             for c in g.channels.values() {
                 let Some(st) = c.machine.splice_status() else {
                     continue;
@@ -3356,6 +3390,15 @@ impl ChannelManager {
             .is_some_and(|st| st.txid == txid)
         {
             chan.machine.note_splice_height(Some(height));
+            return;
+        }
+        // Our finished splice, on chain again after a reorganization took
+        // it away, or replayed at startup: not a close either.
+        if chan
+            .machine
+            .retired_splice()
+            .is_some_and(|(splice, _, _)| splice == txid)
+        {
             return;
         }
         // Anything else spending a funding output ends the channel: a splice

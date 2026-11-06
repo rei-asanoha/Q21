@@ -916,3 +916,70 @@ fn a_crash_between_locking_and_revealing_still_journals_the_reveal() {
     let close = f.closing_commitment(FeeTier::High).unwrap();
     assert_eq!(close.inputs[0].prev_out, f.funding_outpoint().unwrap());
 }
+
+/// Red-team campaign 9, C1: once a splice was locked and finished, its old
+/// funding was no longer watched. A reorganization deeper than the splice's
+/// burial brought the old funding back unspent, and a revoked state there,
+/// broadcast then, went unpunished. The finished splice is now kept until
+/// the channel's funding is buried past any reorganization: its old funding
+/// stays watched, a revoked state there is recognized — after a reopen of
+/// the journal too — and a second splice waits until it is forgotten.
+#[test]
+fn a_finished_splice_keeps_its_old_funding_watched_until_forgotten() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]); // state 1
+    let revoked = f.signed_commitment_at(1, FeeTier::Low).unwrap();
+    let old_funding = f.funding_outpoint().unwrap();
+    let c = coin(6);
+    let tx = splice(&mut f, &mut a, &c, ADD); // state 2, by the funder
+    lock(&mut f, &mut a);
+    // Finished: payments go on, the splice is no longer in progress...
+    pay(&mut f, &mut a, [CAP + ADD - 2_000_000, 2_000_000]);
+    // ... but its old funding is still watched, on both sides.
+    for m in [&f, &a] {
+        assert!(m.watched_outpoints().contains(&old_funding));
+        let (txid, old, _) = m.retired_splice().expect("kept");
+        assert_eq!((txid, old), (tx.txid(), old_funding));
+    }
+    // The adder holds the whole splice, to announce it again.
+    assert_eq!(
+        f.retired_splice().unwrap().2.map(|t| t.txid()),
+        Some(tx.txid())
+    );
+    assert!(
+        a.retired_splice().unwrap().2.is_none(),
+        "stripped on the other side"
+    );
+    // A revoked state on the old funding, back after a reorganization:
+    // recognized, and punishable.
+    match a.identify_spend(&revoked) {
+        w @ Watch::RevokedByPeer { state: 1, .. } => {
+            assert!(a.build_penalty(&w, Hash256([5u8; 32]), 20_000).is_ok());
+        }
+        other => panic!("{other:?}"),
+    }
+    // The same after the journal is read again, and after a compaction.
+    a.compact().unwrap();
+    let a2 = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert!(a2.watched_outpoints().contains(&old_funding));
+    assert!(matches!(
+        a2.identify_spend(&revoked),
+        Watch::RevokedByPeer { state: 1, .. }
+    ));
+    drop(a2);
+    // No second splice while the first is watched: the peer keeps nothing.
+    let c2 = coin(7);
+    assert!(f.propose_splice(ADD, splice_tx(&f, &c2, ADD)).is_err());
+    // Forgotten once buried past any reorganization: the old funding with
+    // it, and a second splice may come.
+    for m in [&mut f, &mut a] {
+        m.forget_retired().unwrap();
+        assert!(m.retired_splice().is_none());
+        assert!(!m.watched_outpoints().contains(&old_funding));
+    }
+    let a3 = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert!(a3.retired_splice().is_none(), "forgotten for good");
+    drop(a3);
+    splice(&mut f, &mut a, &c2, ADD);
+}
