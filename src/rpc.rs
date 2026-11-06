@@ -167,8 +167,11 @@ pub const MAX_BATCH: usize = 100;
 /// Calls in one batch on a public explorer (`--rpc-public`).
 pub const MAX_PUBLIC_BATCH: usize = 10;
 
-/// The last blocks the chain's pace is measured over, in `getmining`.
-pub const PACE_BLOCKS: u64 = 30;
+/// The last blocks the chain's pace is measured over, in `getmining`. Ten,
+/// not thirty: after a pause in mining, thirty blocks spread over a day kept
+/// the page at "every 49 minutes" for hours while blocks came every few
+/// minutes again (a user's report, 0.5.10).
+pub const PACE_BLOCKS: u64 = 10;
 
 /// Cumulative size of a batch's responses, in bytes.
 ///
