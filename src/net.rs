@@ -669,6 +669,21 @@ fn deep_fork_refused(g: &Shared, header: &crate::block::BlockHeader, source: u64
 /// the proof of work. A peer that sends such blocks on purpose spends its own
 /// bandwidth for as much of ours, without amplification; what it can make us
 /// request stays bounded by the in-flight slots.
+/// How far behind the active chain, in blocks of the tip's work, a side
+/// branch may stand and still have its blocks written to disk.
+///
+/// # The defect this closes (campaign 10, `arch`)
+///
+/// Every side block was written to `blocks.dat`, for good, after a check of
+/// its shape and its work only. A branch forking deep below the tip, made of
+/// blocks a sixteenth as hard as ours, still lets a peer pile up four
+/// megabytes on our disk for a sixteenth of a block's work, as many times as
+/// it pleases. A branch that close to the tip's work can lead within a few
+/// blocks and must survive a restart; one further behind is kept in memory
+/// only, within `BODY_BUDGET_BYTES`, and if it is evicted and later needed,
+/// the chain forgets it and asks for it again (`Chain::forget_side`).
+pub const SIDE_BRANCH_KEPT_BLOCKS: u64 = 6;
+
 fn refusal_is_contextual(e: &crate::chain::ChainError) -> bool {
     use crate::chain::ChainError;
     use crate::validate::ValidationError;
@@ -678,6 +693,7 @@ fn refusal_is_contextual(e: &crate::chain::ChainError) -> bool {
             | ChainError::InsufficientWorkForDepth { .. }
             | ChainError::UndoWindowTooShort { .. }
             | ChainError::ForkPointNotFound { .. }
+            | ChainError::SideBranchTooEasy { .. }
             | ChainError::Validation(ValidationError::TimestampInFuture { .. })
             | ChainError::Validation(ValidationError::TimestampNotAfterParent { .. })
             | ChainError::Validation(ValidationError::IncompleteHistory)
@@ -6466,8 +6482,15 @@ impl Node {
                 // A side branch is valid work: if it wins later, its bodies
                 // will be needed. Not writing them made any reorg impossible
                 // after a restart.
-                if let Some(j) = &g.journal {
-                    j.record(b);
+                //
+                // Only a branch close to leading, though: see
+                // `SIDE_BRANCH_KEPT_BLOCKS`. Bodies of one further behind
+                // stay in memory, bounded; a reorganization writes the whole
+                // winning branch anyway.
+                if g.chain.side_branch_within(&bid, SIDE_BRANCH_KEPT_BLOCKS) {
+                    if let Some(j) = &g.journal {
+                        j.record(b);
+                    }
                 }
                 Self::body_arrived(g, source, outgoing);
                 Self::resume_parked(g, stats, bid, source, outgoing)
@@ -7699,6 +7722,7 @@ mod tests {
                 available: 2,
             },
             E::ForkPointNotFound { reach: 720 },
+            E::SideBranchTooEasy { height: 9 },
             E::Validation(V::IncompleteHistory),
         ] {
             assert!(refusal_is_contextual(&e), "{e:?}");

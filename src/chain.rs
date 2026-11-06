@@ -488,7 +488,44 @@ pub enum ChainError {
         depth: u64,
         available: u64,
     },
+    /// A side block that leaves its branch behind the active chain and whose
+    /// own work is less than a [`SIDE_BRANCH_EASE_LIMIT`]th of the active
+    /// block at its height: refused before its body is even read. See
+    /// [`SIDE_BRANCH_EASE_LIMIT`].
+    SideBranchTooEasy {
+        height: u64,
+    },
 }
+
+/// How much easier than the active chain a side block may be, at the same
+/// height, while its branch is still behind.
+///
+/// # The defect this closes (campaign 10, `arch`)
+///
+/// A branch forking up to [`MAX_REORG_DEPTH`] blocks below the tip may date
+/// each block four target spacings after its parent until it reaches the
+/// present: every rule on the timestamp holds, and the difficulty along that
+/// branch falls to about a 2,500th of the network's after some two hundred
+/// blocks, for the price of some twenty honest ones. From there on, every
+/// sibling of a block of that branch costs the same 2,500th, and a side block
+/// was stored after its shape and its work only: its transactions are not
+/// checked until it is connected. Forty-eight junk blocks of four megabytes
+/// each, all children of one parent, grew a node's `blocks.dat` by 193 MB.
+///
+/// A block of a branch that does not lead is now refused, without blame,
+/// when its work is less than a sixteenth of the active block at its height
+/// (or of the tip, above it). Its parent's difficulty decides its own, so the
+/// test needs no body and costs nothing. A block that makes its branch lead
+/// is never refused here: the most work still wins.
+///
+/// Honest branches stay well inside the bound: two sides of a split mine at
+/// the difficulty their hash power earns, and the side a node must move to
+/// is the one with more work, whose blocks are harder, not easier. Only the
+/// branch of a side with less than a sixteenth of the other's hash power,
+/// which kept mining for hundreds of blocks and then outgrew a side that
+/// stopped altogether, would be held back: the same kind of prolonged
+/// partition rolling finality already gives up on (see [`MAX_REORG_DEPTH`]).
+pub const SIDE_BRANCH_EASE_LIMIT: u64 = 16;
 
 impl From<ValidationError> for ChainError {
     fn from(e: ValidationError) -> Self {
@@ -1699,6 +1736,70 @@ impl Chain {
         self.active.get(height as usize).copied()
     }
 
+    /// Removes side blocks from the index and memory, with every known
+    /// block built on them. Never touches the active chain.
+    fn forget_side(&mut self, ids: &[Hash256]) {
+        let mut gone: HashSet<Hash256> = ids
+            .iter()
+            .filter(|id| {
+                self.index
+                    .get(id)
+                    .is_some_and(|b| self.active.get(b.header.height as usize) != Some(id))
+            })
+            .copied()
+            .collect();
+        // One pass over the index, then a walk down from what goes.
+        let mut children: HashMap<Hash256, Vec<Hash256>> = HashMap::new();
+        for (id, b) in &self.index {
+            children.entry(b.header.prev_block).or_default().push(*id);
+        }
+        let mut todo: Vec<Hash256> = gone.iter().copied().collect();
+        while let Some(id) = todo.pop() {
+            for c in children.get(&id).into_iter().flatten() {
+                if gone.insert(*c) {
+                    todo.push(*c);
+                }
+            }
+        }
+        for id in &gone {
+            self.index.remove(id);
+            if let Some(b) = self.blocks.remove(id) {
+                self.body_bytes = self.body_bytes.saturating_sub(b.encode().len());
+            }
+        }
+        self.body_order.retain(|id| !gone.contains(id));
+    }
+
+    /// Is `work` less than a [`SIDE_BRANCH_EASE_LIMIT`]th of the work of the
+    /// active block at `height`, or of the tip above it?
+    fn too_easy_for_side(&self, height: u64, work: U256) -> bool {
+        let reference = self.active_at(height).unwrap_or_else(|| self.tip_id());
+        let Some(r) = self.index.get(&reference) else {
+            return false;
+        };
+        match work.checked_mul_u64(SIDE_BRANCH_EASE_LIMIT) {
+            Some(scaled) => scaled < pow::block_work(r.header.bits),
+            None => false,
+        }
+    }
+
+    /// Does the branch ending at `id` stand within `blocks` of the tip's own
+    /// work from the active chain's total, that is close enough to lead
+    /// soon? What a node keeps of a side branch on its disk is measured by
+    /// it: see `net.rs`, `SIDE_BRANCH_KEPT_BLOCKS`.
+    pub fn side_branch_within(&self, id: &Hash256, blocks: u64) -> bool {
+        let Some(b) = self.index.get(id) else {
+            return false;
+        };
+        let margin = pow::block_work(self.tip().bits)
+            .checked_mul_u64(blocks)
+            .unwrap_or(U256::MAX);
+        match b.total_work.checked_add(margin) {
+            Some(reach) => reach >= self.total_work(),
+            None => true,
+        }
+    }
+
     /// Total work a competing branch must reach to supplant the active chain,
     /// if it diverges at index `fork` of it and the reorg covers `depth`
     /// blocks.
@@ -2218,6 +2319,19 @@ impl Chain {
         //    which shares them with the header-only check.
         self.check_context(&block.header, parent_height, now)?;
 
+        // 2b. A branch that does not lead, made of blocks far easier than
+        //     ours: see [`SIDE_BRANCH_EASE_LIMIT`]. Still before the body.
+        let work = pow::block_work(block.header.bits);
+        let total = self.index[&block.header.prev_block]
+            .total_work
+            .checked_add(work)
+            .unwrap_or(self.index[&block.header.prev_block].total_work);
+        if total <= self.total_work() && self.too_easy_for_side(block.header.height, work) {
+            return Err(ChainError::SideBranchTooEasy {
+                height: block.header.height,
+            });
+        }
+
         // 3. Shape and size: the checks that require no context, and that
         //    Bitcoin calls `CheckBlock`.
         //
@@ -2244,12 +2358,6 @@ impl Chain {
         self.pow
             .check(&block.header)
             .map_err(|e| ChainError::Validation(ValidationError::ProofOfWork(e)))?;
-
-        let parent = self.index[&block.header.prev_block];
-        let total = parent
-            .total_work
-            .checked_add(pow::block_work(block.header.bits))
-            .unwrap_or(parent.total_work);
 
         self.index.insert(
             id,
@@ -2345,10 +2453,19 @@ impl Chain {
         // direct index panic, and panicking in the middle of a reorg would
         // leave the chain in an impossible state.
         let mut branch_bodies = Vec::with_capacity(branch.len());
-        for id in &branch {
+        for (i, id) in branch.iter().enumerate() {
             match self.block_by_id(id) {
                 Some(b) => branch_bodies.push(b),
-                None => return Err(ChainError::Validation(ValidationError::IncompleteHistory)),
+                None => {
+                    // A side body kept in memory only, evicted since: the
+                    // branch is forgotten from that block on, so that it can
+                    // be asked for and received again. Kept in the index, it
+                    // read as known forever and was never fetched again: the
+                    // node stayed on its chain until a restart (campaign 10,
+                    // `arch`).
+                    self.forget_side(&branch[i..]);
+                    return Err(ChainError::Validation(ValidationError::IncompleteHistory));
+                }
             }
         }
         let mut old_bodies = Vec::with_capacity(old.len());
@@ -3288,5 +3405,122 @@ mod tests {
         // And one header fewer in the window does change the result: the
         // window is the right one, neither wider nor narrower.
         assert_ne!(next_bits(&headers), next_bits(&headers[n - LWMA_WINDOW..]));
+    }
+
+    /// A copy of `c`'s active chain up to `height`, extended by `n` blocks of
+    /// another miner: a competing branch, with its bodies.
+    fn rival_branch(c: &Chain, height: u64, n: usize) -> Vec<Block> {
+        let mut rival = new_chain();
+        for id in &c.active[1..=height as usize] {
+            let b = c.block_by_id(id).expect("body");
+            rival.connect(&b, b.header.time + 1).expect("same prefix");
+        }
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let t = rival.tip().time + TARGET_BLOCK_SECS + 7;
+            let b = rival
+                .mine_block(Hash256([9u8; 32]), SchemeId::LamportOts, &[], t, TRIES)
+                .expect("rival mining");
+            rival.connect(&b, t + 1).expect("rival connection");
+            out.push(b);
+        }
+        out
+    }
+
+    /// Campaign 10 (`arch`): a side block far easier than the active block at
+    /// its height is refused before its body is read, while its branch does
+    /// not lead; one that stays within the bound is kept as before.
+    #[test]
+    fn a_side_block_far_easier_than_ours_is_refused_while_its_branch_trails() {
+        let mut c = new_chain();
+        mine(&mut c, 10);
+        let side = rival_branch(&c, 4, 1);
+        let now = side[0].header.time + 1;
+        let floor = pow::target_from_compact(c.tip().bits).expect("bits");
+        // The active blocks above the fork are made harder in the index: the
+        // side block's own difficulty, fixed by its parent, does not change.
+        let harden = |c: &mut Chain, by: u64| {
+            let bits = pow::target_to_compact(floor.checked_div_u64(by).expect("div"));
+            for h in 5..=10usize {
+                let id = c.active[h];
+                c.index.get_mut(&id).expect("indexed").header.bits = bits;
+            }
+        };
+        harden(&mut c, 32);
+        assert_eq!(
+            c.submit(&side[0], now),
+            Err(ChainError::SideBranchTooEasy { height: 5 })
+        );
+        assert!(!c.has_block(&side[0].header.block_id()));
+        harden(&mut c, 8);
+        assert_eq!(c.submit(&side[0], now), Ok(Accept::SideBranch));
+    }
+
+    /// The bound itself: a sixteenth of the active block's work, measured at
+    /// the block's height, or against the tip above it.
+    #[test]
+    fn the_side_bound_is_a_sixteenth_of_the_active_work() {
+        let mut c = new_chain();
+        mine(&mut c, 10);
+        let w = pow::block_work(c.tip().bits);
+        let sixteenth = w.checked_div_u64(SIDE_BRANCH_EASE_LIMIT).expect("div");
+        let less = w.checked_div_u64(SIDE_BRANCH_EASE_LIMIT + 1).expect("div");
+        for height in [5u64, 10, 500] {
+            assert!(!c.too_easy_for_side(height, w));
+            assert!(!c.too_easy_for_side(height, sixteenth));
+            assert!(c.too_easy_for_side(height, less));
+        }
+    }
+
+    /// What a node writes of a side branch: only one within a few blocks of
+    /// the tip's work.
+    #[test]
+    fn only_a_side_branch_close_to_leading_counts_as_within_reach() {
+        let mut c = new_chain();
+        mine(&mut c, 10);
+        let side = rival_branch(&c, 2, 2);
+        for b in &side {
+            assert_eq!(c.submit(b, b.header.time + 1), Ok(Accept::SideBranch));
+        }
+        // Height 3: seven blocks behind; height 4: six.
+        assert!(!c.side_branch_within(&side[0].header.block_id(), 6));
+        assert!(c.side_branch_within(&side[1].header.block_id(), 6));
+        assert!(c.side_branch_within(&c.tip_id(), 0));
+        assert!(!c.side_branch_within(&Hash256([1u8; 32]), 6));
+    }
+
+    /// Campaign 10 (`arch`): a side body kept in memory only and evicted
+    /// since is forgotten with what was built on it when the branch is about
+    /// to win, so that it can be received again; it then wins.
+    #[test]
+    fn an_evicted_side_body_is_forgotten_then_received_again() {
+        let mut c = new_chain();
+        mine(&mut c, 10);
+        let side = rival_branch(&c, 7, 4);
+        let ids: Vec<Hash256> = side.iter().map(|b| b.header.block_id()).collect();
+        let now = side[3].header.time + 1;
+        for b in &side[..3] {
+            assert_eq!(c.submit(b, now), Ok(Accept::SideBranch));
+        }
+        let gone = c.blocks.remove(&ids[1]).expect("in memory");
+        c.body_bytes -= gone.encode().len();
+        let tip = c.tip_id();
+        assert_eq!(
+            c.submit(&side[3], now),
+            Err(ChainError::Validation(ValidationError::IncompleteHistory))
+        );
+        assert_eq!(c.tip_id(), tip, "the active chain is untouched");
+        assert!(c.has_block(&ids[0]), "the block before the gap stays");
+        for id in &ids[1..] {
+            assert!(!c.has_block(id), "forgotten, to be asked for again");
+        }
+        assert!(!c.body_order.contains(&ids[2]));
+        assert_eq!(c.submit(&side[1], now), Ok(Accept::SideBranch));
+        assert_eq!(c.submit(&side[2], now), Ok(Accept::SideBranch));
+        assert_eq!(
+            c.submit(&side[3], now),
+            Ok(Accept::Reorganized { depth: 3 })
+        );
+        assert_eq!(c.tip_id(), ids[3]);
     }
 }
