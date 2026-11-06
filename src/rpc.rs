@@ -5790,6 +5790,14 @@ impl RpcContext {
             total,
             rate,
         } = estimate.map_err(|e| rpc_error(ERR_WALLET, wallet_message(&e)))?;
+        // A change below the dust floor is not an output: the send gives it
+        // to the miner. Shown as change, the "exact figures" said a fee of
+        // 0.00001 where 0.00006 was paid (campaign 10, `regul`).
+        let (fee, change) = if change > 0 && change < crate::consensus::MIN_OUTPUT_VALUE {
+            (fee + change, 0)
+        } else {
+            (fee, change)
+        };
 
         Ok(Json::obj()
             .set("address", Json::str(dest.to_string_bech32()))
@@ -5950,6 +5958,31 @@ impl RpcContext {
             (tip.time, mean)
         });
 
+        // A find a reorganization left aside paid nothing: it was counted in
+        // the blocks found and the earnings all the same, nine of twenty in a
+        // race (campaign 10, `regul`). The finds kept are checked against
+        // the active chain; older ones are past any race.
+        let lost: Vec<bool> = self.node.with_chain(|c| {
+            found
+                .iter()
+                .map(|t| c.active_at(t.height) != Some(t.block_id))
+                .collect()
+        });
+        let (lost_blocks, lost_units) = found
+            .iter()
+            .zip(&lost)
+            .filter(|(_, l)| **l)
+            .fold((0u64, 0u64), |(n, u), (t, _)| {
+                (n + 1, u.saturating_add(t.reward))
+            });
+        let blocks = blocks.saturating_sub(lost_blocks);
+        let earned = earned.saturating_sub(lost_units);
+        let found: Vec<_> = found
+            .into_iter()
+            .zip(lost)
+            .filter(|(_, l)| !*l)
+            .map(|(t, _)| t)
+            .collect();
         // The last twenty finds are enough for the screen; the counter and the
         // earnings carry the total since launch.
         let list: Vec<Json> = found
@@ -5980,6 +6013,7 @@ impl RpcContext {
             .set("attempts_per_second", Json::Int(rate as i64))
             .set("total_attempts", Json::u64(total))
             .set("blocks_found", Json::u64(blocks))
+            .set("blocks_lost_to_reorganizations", Json::u64(lost_blocks))
             .set("earned", amount_json(Amount::from_units(earned)))
             // A public explorer does not list the blocks its own node found:
             // they would tie its rewards to it (red-team campaign 6, O7).
@@ -8491,6 +8525,40 @@ mod tests {
             PUBLIC_BLOCK_READS
         );
         assert_eq!(public_context().block_reads().bytes_left, PUBLIC_READ_BYTES);
+    }
+
+    /// Campaign 10 (`regul`): a find a reorganization left aside is not
+    /// counted among the blocks found nor in the earnings.
+    #[test]
+    fn a_block_that_lost_its_race_earns_nothing() {
+        let c = context_with_funds();
+        let m = c.mining.as_ref().expect("mining");
+        let real = c.node.with_chain(|ch| ch.active_at(5)).expect("block 5");
+        m.block_found(crate::mining::FoundBlock {
+            height: 5,
+            block_id: real,
+            reward: 700,
+            timestamp: 1,
+        });
+        m.block_found(crate::mining::FoundBlock {
+            height: 6,
+            block_id: Hash256([0xaa; 32]),
+            reward: 900,
+            timestamp: 2,
+        });
+        let r = call_ok(&c, "getmining", "{}");
+        assert_eq!(r.get("blocks_found").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            r.get("blocks_lost_to_reorganizations")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            r.get("earned")
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64()),
+            Some(700)
+        );
     }
 
     /// A public context: no wallet, with the scan budget.

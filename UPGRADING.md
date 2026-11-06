@@ -231,7 +231,7 @@ from block 5,950.
 | Channel contacts card | "My contacts" | "My verified contacts", so the two books are not confused |
 | The page's words | Protocol words on several pages | Plain words on every page but the balance: the Network page shows Tor first, the Mine page the time of the last block and the pace of the chain, a refused payment is explained before the node's own words |
 | Channel table and archives | The amounts with the opener's close reserve | What can really be sent, as on the panel; the archives as the amount was typed |
-| `getmining` | — | `tip_time`, and `mean_block_seconds` over the last 30 blocks |
+| `getmining` | — | `tip_time`, and `mean_block_seconds` over the last 30 blocks (10 since 0.5.11) |
 | `addressbooklist`, `addressbookadd`, `addressbookupdate`, `addressbookremove` | — | My contacts, over RPC (`name`, `address`, `note`) |
 
 ## Who should upgrade, and when
