@@ -782,18 +782,6 @@ impl Inner {
         self.unfunded_iter(inbound).count()
     }
 
-    fn unfunded_iter_mut(&mut self, inbound: bool) -> impl Iterator<Item = &mut Chan> {
-        let side = if inbound {
-            crate::channel::txbuild::ACCEPTOR
-        } else {
-            crate::channel::txbuild::FUNDER
-        };
-        self.channels.values_mut().filter(move |c| {
-            matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
-                && c.machine.our_index() == side
-        })
-    }
-
     fn unfunded_iter(&self, inbound: bool) -> impl Iterator<Item = &Chan> {
         let side = if inbound {
             crate::channel::txbuild::ACCEPTOR
@@ -2776,20 +2764,49 @@ impl ChannelManager {
         frames
     }
 
-    /// Follows our own fundings not yet open in the block at `height`: the
-    /// funding itself confirming (its height journaled, so a restart scans
-    /// from there), or another transaction spending one of its coins — the
-    /// only conflict there is: the funding spending them is no conflict.
+    /// Follows the fundings in the block at `height`: ours not yet open
+    /// confirming (its height journaled, so a restart scans from there); the
+    /// funding of a channel we accepted, kept when first seen (see
+    /// [`crate::channel::machine::Machine::keep_funding_tx`]); and, for every
+    /// channel whose funding is the transaction it holds, another
+    /// transaction spending one of its coins — the only conflict there is:
+    /// the funding spending them is no conflict. A conflict is followed for
+    /// an open channel too: after a reorganization took its funding away, a
+    /// spend of its coins elsewhere means it can never come back (red-team
+    /// campaign 9, C7).
     fn watch_fundings(&self, txs: &[Transaction], height: u64) {
         let mut g = self.inner.lock().unwrap();
-        for c in g.unfunded_iter_mut(false) {
+        for c in g.channels.values_mut() {
+            let phase = c.machine.phase();
+            if phase == Phase::Closed {
+                continue;
+            }
+            if phase == Phase::Opening && c.machine.funding_tx().is_none() {
+                if let Some(op) = c.machine.funding_outpoint() {
+                    if let Some(t) = txs.iter().find(|t| t.txid() == op.txid) {
+                        let _ = c.machine.keep_funding_tx(t);
+                    }
+                }
+            }
             let Some(funding) = c.machine.funding_tx() else {
                 continue;
             };
             let txid = funding.txid();
+            // After a splice the channel's funding is the splice's output:
+            // the transaction held is no longer its funding.
+            if c.machine
+                .funding_outpoint()
+                .is_some_and(|op| op.txid != txid)
+            {
+                continue;
+            }
             let coins: Vec<OutPoint> = funding.inputs.iter().map(|i| i.prev_out).collect();
+            let ours_unfunded = matches!(phase, Phase::Opening | Phase::Funded)
+                && c.machine.our_index() == crate::channel::txbuild::FUNDER;
             if txs.iter().any(|t| t.txid() == txid) {
-                let _ = c.machine.note_funding_height(height);
+                if ours_unfunded {
+                    let _ = c.machine.note_funding_height(height);
+                }
                 c.conflict = None;
             } else if let Some(t) = txs
                 .iter()
@@ -2862,7 +2879,9 @@ impl ChannelManager {
                 // wallet spends them nowhere else, and it is announced again
                 // while every coin it spends is still unspent.
                 if gone {
-                    if !c.reserved {
+                    // The funder's own coins only: the acceptor holds the
+                    // funder's transaction, not its coins.
+                    if !c.reserved && c.machine.our_index() == crate::channel::txbuild::FUNDER {
                         c.reserved = true;
                         hold.push(tx.clone());
                     }
@@ -2999,18 +3018,34 @@ impl ChannelManager {
         // buried — the coins released, the channel marked abandoned, its
         // journal kept: were the funding on chain after all, its key and
         // commitments are still there to recover the capacity.
+        //
+        // An open channel whose funding a reorganization took away, and a
+        // coin of which another transaction then spent, buried past any
+        // reorganization, likewise: it was held for good, counted among the
+        // peer's channels, and could never pay nor close (red-team campaign
+        // 9, C7).
         let network = self.network;
-        for c in g.unfunded_iter_mut(false) {
+        for c in g.channels.values_mut() {
             let Some((_, at)) = c.conflict else {
                 continue;
             };
+            let phase = c.machine.phase();
+            let ours_unfunded = matches!(phase, Phase::Opening | Phase::Funded)
+                && c.machine.our_index() == crate::channel::txbuild::FUNDER;
+            let gone_open = phase == Phase::Open && c.funding_gone;
+            if !ours_unfunded && !gone_open {
+                continue;
+            }
             let funded = c
                 .machine
                 .funding_outpoint()
                 .is_some_and(|op| depth_of(&op).is_some());
             let buried = height.saturating_add(1).saturating_sub(at)
                 >= settle_depth(network, c.machine.funding_depth());
-            if c.spend.is_some() || funded || c.machine.funding_height().is_some() || !buried {
+            if c.spend.is_some() || funded || !buried {
+                continue;
+            }
+            if ours_unfunded && c.machine.funding_height().is_some() {
                 continue;
             }
             if c.machine.mark_abandoned().is_ok() {
@@ -3018,11 +3053,22 @@ impl ChannelManager {
                     c.reserved = false;
                     release.extend(c.machine.funding_tx().cloned());
                 }
-                eprintln!(
-                    "channel {}: a coin its funding spends was spent by another \
-                     transaction; the funding can never confirm, channel abandoned",
-                    c.machine.channel_id().to_hex()
-                );
+                c.funding_gone = false;
+                c.held_frame = None;
+                if gone_open {
+                    eprintln!(
+                        "ALERT: channel {}: its funding left the chain, and a coin it spends was \
+                         spent by another transaction, buried past any reorganization; the \
+                         funding can never confirm again, channel abandoned",
+                        c.machine.channel_id().to_hex()
+                    );
+                } else {
+                    eprintln!(
+                        "channel {}: a coin its funding spends was spent by another \
+                         transaction; the funding can never confirm, channel abandoned",
+                        c.machine.channel_id().to_hex()
+                    );
+                }
             }
         }
         drop(g);
@@ -3148,6 +3194,7 @@ impl ChannelManager {
                 // Our funding, signed and not yet on chain: its coins are held
                 // back again (the wallet keeps that in memory only).
                 if matches!(c.machine.phase(), Phase::Opening | Phase::Funded)
+                    && c.machine.our_index() == crate::channel::txbuild::FUNDER
                     && c.machine
                         .funding_outpoint()
                         .is_some_and(|op| depth_of(&op).is_none())

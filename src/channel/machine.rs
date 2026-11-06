@@ -830,7 +830,34 @@ impl Machine {
         self.funding_created(outpoint)
     }
 
-    /// The funder's signed funding transaction, kept until the channel opens.
+    /// Either side: keeps the funding transaction `tx` seen in a block, when
+    /// this channel holds none — the acceptor never had it. With it, the
+    /// acceptor too announces the funding again when a reorganization took
+    /// it away, and either side sees a transaction spending one of its coins
+    /// elsewhere: then the funding can never confirm again, and the channel
+    /// is given up once that spend is buried, instead of being held, and
+    /// counted among the peer's, for good (red-team campaign 9, C7).
+    /// Returns whether it was kept.
+    pub fn keep_funding_tx(&mut self, tx: &Transaction) -> Result<bool, ChannelError> {
+        if self.funding_tx.is_some() {
+            return Ok(false);
+        }
+        let Some(op) = self.funding_outpoint else {
+            return Ok(false);
+        };
+        if tx.txid() != op.txid
+            || tx.outputs.get(op.index as usize) != Some(&self.params.funding_output())
+        {
+            return Ok(false);
+        }
+        self.journal
+            .append(&Record::FundingTx { tx: tx.encode() })?;
+        self.funding_tx = Some(tx.clone());
+        Ok(true)
+    }
+
+    /// The signed funding transaction: the funder's own, or the one the
+    /// acceptor saw confirm (see [`Machine::keep_funding_tx`]).
     pub fn funding_tx(&self) -> Option<&Transaction> {
         self.funding_tx.as_ref()
     }

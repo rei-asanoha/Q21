@@ -4226,6 +4226,80 @@ fn a_funding_gone_while_down_holds_the_channel_from_the_restart() {
     assert!(!again.info(cid).unwrap().funding_gone);
 }
 
+/// Red-team campaign 9, C7: a channel whose funding a reorganization took
+/// away, and a coin of which another transaction then spent, can never come
+/// back. Once that spend is buried past any reorganization, both sides give
+/// it up — the acceptor too, which keeps the funding it saw confirm — and it
+/// no longer counts among the peer's channels.
+#[test]
+fn a_funding_whose_coin_was_spent_elsewhere_after_a_reorg_is_given_up_on_both_sides() {
+    let (funder_seed, acceptor_seed) = ([0xabu8; 32], [0xacu8; 32]);
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("zombie");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet,
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let hello = p
+        .funder
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE, None, None)
+        .unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    // The acceptor sees the block its funding confirmed in, as a node sees
+    // every block, while the channel is still opening: it keeps it.
+    drive(&p.acceptor, &chain);
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
+    let funding = p.acceptor.info(cid).unwrap().funding.expect("funded");
+    let funding_tx = {
+        let c = chain.lock().unwrap();
+        (0..=c.height())
+            .rev()
+            .filter_map(|h| c.chain.block_at(h))
+            .flat_map(|b| b.transactions)
+            .find(|t| t.txid() == funding.txid)
+            .expect("the funding on chain")
+    };
+    // Another transaction spending the funding's first coin.
+    let mut conflict = funding_tx.clone();
+    conflict.outputs.truncate(1);
+    conflict.outputs[0].value = q21_core::amount::Amount::from_units(1);
+    assert_ne!(conflict.txid(), funding_tx.txid());
+
+    let h = chain.lock().unwrap().height();
+    let gone = |_: &OutPoint| None;
+    for m in [&p.funder, &p.acceptor] {
+        m.on_connected_block(&[], h, &gone);
+        assert!(m.info(cid).unwrap().funding_gone);
+        m.on_connected_block(std::slice::from_ref(&conflict), h + 1, &gone);
+        // Not yet buried: still held, still counted.
+        assert_eq!(m.info(cid).unwrap().phase, Phase::Open);
+    }
+    // Buried to the channel's settle depth (its funding depth on regtest).
+    let depth = u64::from(p.acceptor.info(cid).unwrap().funding_depth);
+    for m in [&p.funder, &p.acceptor] {
+        m.on_connected_block(&[], h + depth - 1, &gone);
+        assert_eq!(m.info(cid).unwrap().phase, Phase::Open, "not yet buried");
+        m.on_connected_block(&[], h + depth, &gone);
+        let i = m.info(cid).unwrap();
+        assert_eq!(i.phase, Phase::Closed, "given up");
+        assert!(!i.funding_gone);
+    }
+}
+
 /// 0.5.10: a channel whose close confirmed is closed for its owner. Watched
 /// until the close is buried, it no longer counts toward the channels a peer
 /// may hold: eight closes with one contact refused a ninth channel with it
