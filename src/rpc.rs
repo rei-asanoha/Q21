@@ -591,6 +591,7 @@ pub(crate) struct BlockReads {
     /// Bytes read so far, what the client is charged for.
     pub(crate) bytes: usize,
     spent: bool,
+    last: Option<(u64, Block)>,
 }
 
 impl BlockReads {
@@ -601,6 +602,7 @@ impl BlockReads {
             reads_left: reads,
             bytes: 0,
             spent: false,
+            last: None,
         }
     }
 
@@ -611,7 +613,9 @@ impl BlockReads {
 
     /// Reads the block at `height`, if the budget allows it, and keeps its
     /// outputs.
-    fn read(&mut self, node: &Node, height: u64) -> Option<Block> {
+    /// Reads the block at `height`, if the budget allows it, under the
+    /// node's lock for that block only, and keeps nothing of it.
+    pub(crate) fn fetch(&mut self, node: &Node, height: u64) -> Option<Block> {
         if self.reads_left == 0 || self.bytes_left == 0 {
             self.spent = true;
             return None;
@@ -621,6 +625,17 @@ impl BlockReads {
         let size = block.as_ref().map_or(0, |b| b.encode().len());
         self.bytes = self.bytes.saturating_add(size);
         self.bytes_left = self.bytes_left.saturating_sub(size);
+        block
+    }
+
+    fn read(&mut self, node: &Node, height: u64) -> Option<Block> {
+        if self.spent {
+            return None;
+        }
+        let block = self.fetch(node, height);
+        if self.spent {
+            return None;
+        }
         self.outputs.insert(
             height,
             block
@@ -651,13 +666,16 @@ impl BlockReads {
 
     /// A whole transaction of the block at `height`, with the block's time.
     /// Always a read: what is kept of a block is its outputs only.
+    /// The last block read whole is kept, one only: an address's movements
+    /// in one block read it once (campaign 10, round 2).
     fn transaction(&mut self, node: &Node, height: u64, rank: u32) -> Option<(u64, Transaction)> {
-        let b = self.read(node, height)?;
-        let time = b.header.time;
-        b.transactions
-            .into_iter()
-            .nth(rank as usize)
-            .map(|t| (time, t))
+        if self.last.as_ref().map(|(h, _)| *h) != Some(height) {
+            let b = self.read(node, height)?;
+            self.last = Some((height, b));
+        }
+        let (_, b) = self.last.as_ref()?;
+        let t = b.transactions.get(rank as usize)?.clone();
+        Some((b.header.time, t))
     }
 }
 
@@ -724,8 +742,15 @@ pub const GLOBAL_CALLS_PER_SECOND: u32 = 600;
 /// A token bucket: a burst, a refill.
 struct Bucket {
     tokens: u32,
+    /// Tokens owed beyond an empty bucket: an answer that read more than
+    /// the client had left (see [`ScanBucket::charge_answer`]). Paid back
+    /// from the refill before any token is granted.
+    debt: u32,
     last: std::time::Instant,
 }
+
+/// The most a client can owe, in calls: ten minutes of its refill.
+pub const MAX_CALL_DEBT: u32 = CALLS_PER_SECOND * 600;
 
 /// Scans granted up front to each client.
 pub const SCAN_BURST: u32 = 30;
@@ -779,6 +804,7 @@ impl Bucket {
     fn full(burst: u32, now: std::time::Instant) -> Bucket {
         Bucket {
             tokens: burst,
+            debt: 0,
             last: now,
         }
     }
@@ -805,13 +831,16 @@ impl Bucket {
         let elapsed = elapsed.min(86_400 * 1_000_000_000);
         let gain = elapsed * per_period / period_ns;
         if gain > 0 {
-            let room = u128::from(burst.saturating_sub(self.tokens));
+            // A debt is paid back first.
+            let repay = gain.min(u128::from(self.debt));
+            self.debt -= repay as u32;
+            let room = u128::from(burst.saturating_sub(self.tokens)).saturating_add(repay);
             if gain >= room {
                 // Full: nothing more is banked.
                 self.tokens = burst;
                 self.last = now;
             } else {
-                self.tokens += gain as u32;
+                self.tokens += (gain - repay) as u32;
                 let spent = (gain * period_ns).div_ceil(per_period);
                 self.last += std::time::Duration::from_nanos(spent as u64);
             }
@@ -941,7 +970,14 @@ impl ScanBucket {
         if let Some(ip) = client {
             let key = ClientKey::from_ip(ip);
             if let Some(entry) = self.calls.iter_mut().find(|(c, _, _)| *c == key) {
-                entry.1.tokens = entry.1.tokens.saturating_sub(extra);
+                // Beyond what it has left, the client owes the rest: an
+                // empty bucket refilled in fifty milliseconds and granted
+                // another 32 MB answer, the charge a mere pause (campaign
+                // 10, round 2).
+                let b = &mut entry.1;
+                let owed = extra.saturating_sub(b.tokens);
+                b.tokens = b.tokens.saturating_sub(extra);
+                b.debt = b.debt.saturating_add(owed).min(MAX_CALL_DEBT);
             }
         }
         // Not the global net: draining it by size would let a few large
@@ -3846,23 +3882,35 @@ impl RpcContext {
         // the cost - and about the bound.
         self.allow_scan(client)?;
         let mut bottom_reached = false;
-        let found = self.node.with_chain(|c| {
-            let mut h = c.height() as i64;
-            let floor = (c.height().saturating_sub(MAX_SCANNED_BLOCKS)) as i64;
+        // Block by block, the lock taken for each only, and within the reads
+        // of a public answer: see `getamount`.
+        let mut reads = self.scan_reads();
+        let found = {
+            let tip = self.node.with_chain(|c| c.height());
+            let mut h = tip as i64;
+            let floor = (tip.saturating_sub(MAX_SCANNED_BLOCKS)) as i64;
+            let mut found = None;
             while h >= 0 {
                 if h < floor {
                     bottom_reached = true;
-                    return None;
+                    break;
                 }
-                if let Some(b) = c.block_at(h as u64) {
+                let block = reads.fetch(&self.node, h as u64);
+                if reads.spent() {
+                    bottom_reached = true;
+                    break;
+                }
+                if let Some(b) = block {
                     if let Some(t) = b.transactions.iter().find(|t| t.txid() == txid) {
-                        return Some((t.clone(), b.header.height, b.header.block_id()));
+                        found = Some((t.clone(), b.header.height, b.header.block_id()));
+                        break;
                     }
                 }
                 h -= 1;
             }
-            None
-        });
+            found
+        };
+        self.charge_reads(client, &reads);
 
         if found.is_none() && bottom_reached {
             return Err(rpc_error(
@@ -4266,6 +4314,17 @@ impl RpcContext {
         }
     }
 
+    /// The reads of a backward scan over [`MAX_SCANNED_BLOCKS`]: on a public
+    /// explorer, bounded in bytes as any answer, the window itself bounding
+    /// the count.
+    fn scan_reads(&self) -> BlockReads {
+        if self.scans.is_some() {
+            BlockReads::bounded(PUBLIC_READ_BYTES, MAX_SCANNED_BLOCKS as usize + 1)
+        } else {
+            BlockReads::bounded(usize::MAX, usize::MAX)
+        }
+    }
+
     /// Charges `client` for the blocks an answer read, as for an answer of
     /// that size: see [`ScanBucket::charge_answer`].
     fn charge_reads(&self, client: Option<std::net::IpAddr>, reads: &BlockReads) {
@@ -4626,20 +4685,26 @@ impl RpcContext {
             None => {
                 // Bounded backward scan. The response will say so.
                 self.allow_scan(client)?;
-                let floor = height.saturating_sub(MAX_SCANNED_BLOCKS);
-                let v = self.node.with_chain(|c| {
-                    let mut v: Vec<(u64, u32)> = Vec::new();
-                    for h in floor..=height {
-                        if let Some(b) = c.block_at(h) {
-                            for (rank, t) in b.transactions.iter().enumerate() {
-                                if t.outputs.iter().any(mine) {
-                                    v.push((h, rank as u32));
-                                }
+                // Block by block, from the tip down, within the reads of a
+                // public answer: see `getamount`.
+                let mut floor = height.saturating_sub(MAX_SCANNED_BLOCKS);
+                let mut reads = self.scan_reads();
+                let mut v: Vec<(u64, u32)> = Vec::new();
+                for h in (floor..=height).rev() {
+                    let block = reads.fetch(&self.node, h);
+                    if reads.spent() {
+                        floor = h + 1;
+                        break;
+                    }
+                    if let Some(b) = block {
+                        for (rank, t) in b.transactions.iter().enumerate() {
+                            if t.outputs.iter().any(mine) {
+                                v.push((h, rank as u32));
                             }
                         }
                     }
-                    v
-                });
+                }
+                self.charge_reads(client, &reads);
                 (v, false, floor)
             }
         };
@@ -4663,7 +4728,9 @@ impl RpcContext {
         } else {
             usize::MAX
         };
+        let mut pending_complete = true;
         let pending: Vec<Json> = self.node.with_chain_and_mempool(|c, m| {
+            pending_complete = m.len() <= walk;
             m.txids()
                 .iter()
                 .take(walk)
@@ -4792,6 +4859,7 @@ impl RpcContext {
             .set("via_index", Json::Bool(via_index))
             .set("amounts_out_all_resolved", Json::Bool(all_out_resolved))
             .set("movements_cut", Json::Bool(cut))
+            .set("pending_complete", Json::Bool(pending_complete))
             .set("complete_history", Json::Bool(via_index || floor == 0))
             .set("floor", Json::u64(floor))
             .set("height", Json::u64(height))
@@ -4837,10 +4905,15 @@ impl RpcContext {
             .ok_or_else(|| rpc_error(ERR_PARAMS, "parameter 'units' or 'amount' expected"))?;
 
         self.allow_scan(client)?;
+        let walk = if self.scans.is_some() {
+            PUBLIC_MEMPOOL_WALK
+        } else {
+            usize::MAX
+        };
         // The mempool first: an amount just sent is the one looked for.
         let pending: Vec<Json> = self.node.with_mempool(|m| {
             let mut v = Vec::new();
-            for id in m.txids() {
+            for id in m.txids().into_iter().take(walk) {
                 let Some(tx) = m.get(&id) else { continue };
                 for (i, o) in tx.outputs.iter().enumerate() {
                     if o.value.units() == units {
@@ -4870,14 +4943,24 @@ impl RpcContext {
             v.truncate(MAX_RESULTS);
             v
         });
-        let (results, height, since, capped) = self.node.with_chain(|c| {
-            let height = c.height();
-            let since = height.saturating_sub(MAX_SCANNED_BLOCKS);
+        // Block by block, the node's lock taken for each only, within the
+        // reads of a public answer: the whole window was read under one
+        // hold of the lock, uncharged, two seconds a search for a window of
+        // fat blocks (campaign 10, round 2, `prag`).
+        let mut reads = self.scan_reads();
+        let height = self.node.with_chain(|c| c.height());
+        let mut since = height.saturating_sub(MAX_SCANNED_BLOCKS);
+        let (results, capped) = {
             let mut out: Vec<Json> = pending;
             let mut capped = false;
             let mut h = height as i64;
             'blocks: while h >= since as i64 {
-                if let Some(b) = c.block_at(h as u64) {
+                let block = reads.fetch(&self.node, h as u64);
+                if reads.spent() {
+                    since = h as u64 + 1;
+                    break;
+                }
+                if let Some(b) = block {
                     for tx in &b.transactions {
                         let txid = tx.txid();
                         for (i, o) in tx.outputs.iter().enumerate() {
@@ -4912,8 +4995,9 @@ impl RpcContext {
                 }
                 h -= 1;
             }
-            (out, height, since, capped)
-        });
+            (out, capped)
+        };
+        self.charge_reads(client, &reads);
 
         Ok(Json::obj()
             .set("amount", amount_json(Amount::from_units(units)))
@@ -4922,6 +5006,7 @@ impl RpcContext {
             .set("since", Json::u64(since))
             .set("window", Json::u64(MAX_SCANNED_BLOCKS))
             .set("capped", Json::Bool(capped))
+            .set("window_cut", Json::Bool(reads.spent()))
             .build())
     }
 
@@ -8514,6 +8599,28 @@ mod tests {
         assert_eq!(left as u32, CALL_BURST - 1);
         // Through the context: a local node counts nothing.
         context(false).charge_answer(a, usize::MAX);
+    }
+
+    /// Campaign 10, round 2 (`prag`): what an answer read beyond the
+    /// client's bucket is owed, and paid back from the refill before any
+    /// call is granted again; ten minutes of refill at most.
+    #[test]
+    fn an_answer_larger_than_the_bucket_is_owed() {
+        let mut s = ScanBucket::new();
+        let a = ip("198.51.100.31");
+        let t0 = std::time::Instant::now();
+        assert!(s.allow_call(a, t0));
+        // 512 calls' worth: 119 left, 393 owed.
+        s.charge_answer(a, 512 * ANSWER_BYTES_PER_CALL);
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        assert!(!s.allow_call(a, at(50)), "the refill pays the debt first");
+        assert!(!s.allow_call(a, at(19_000)));
+        // 393 owed at 20 a second: paid after 19.65 s, the next call after.
+        assert!(s.allow_call(a, at(19_750)));
+        // The debt is capped.
+        s.charge_answer(a, usize::MAX);
+        let after = 600_000 + 19_750 + 50 + 120 * 50;
+        assert!(s.allow_call(a, at(after)));
     }
 
     /// Round 2 of red-team campaign 9: a public explorer sends no answer
