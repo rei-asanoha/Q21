@@ -992,6 +992,27 @@ pub const GETDATA_BUCKET_MAX: u64 = 32 * 1024 * 1024;
 /// Sustained rate of the `getdata` budget, in bytes per second.
 pub const GETDATA_RATE_PER_SEC: u64 = 4 * 1024 * 1024;
 
+/// What all peers together may have us read to serve them, at once, in
+/// bytes.
+///
+/// # The defect this closes (campaign 10, `prag`)
+///
+/// Each peer had its own budget, 32 MiB then 4 MiB a second, and nothing
+/// bounded them together: the 24 inbound seats of an entry point could have
+/// it read and encode about 96 MB a second under its one lock, without even
+/// reading their own sockets. All peers now share a node-wide budget too;
+/// past it, a request waits, as it does past its own.
+pub const GETDATA_GLOBAL_MAX: u64 = 128 * 1024 * 1024;
+
+/// Sustained rate of the node-wide `getdata` budget, in bytes per second:
+/// eight peers at their full rate, a third of the seats.
+pub const GETDATA_GLOBAL_RATE_PER_SEC: u64 = 32 * 1024 * 1024;
+
+// One peer alone, honest and at its full rate, never waits for the others'
+// budget.
+const _: () = assert!(GETDATA_GLOBAL_MAX >= 2 * GETDATA_BUCKET_MAX);
+const _: () = assert!(GETDATA_GLOBAL_RATE_PER_SEC >= 2 * GETDATA_RATE_PER_SEC);
+
 /// Blocks forking below a node's finality depth that it admits from one
 /// peer while still catching up, at most.
 ///
@@ -2035,6 +2056,9 @@ impl Peer {
 struct Shared {
     chain: Chain,
     mempool: Mempool,
+    /// What all peers together may have us read to serve them, in bytes:
+    /// see [`GETDATA_GLOBAL_MAX`].
+    getdata_global: TokenBucket,
     /// Address book, organized by network group.
     ///
     /// Lives under the same lock as the rest: a peer that announces addresses
@@ -2502,6 +2526,10 @@ impl Node {
             shared: Arc::new(Mutex::new(Shared {
                 chain,
                 mempool: Mempool::new(),
+                getdata_global: TokenBucket {
+                    tokens: GETDATA_GLOBAL_MAX,
+                    last: Instant::now(),
+                },
                 // Loopback and private ranges only make sense on regtest,
                 // where everything runs on a single machine. The testnet is a
                 // public network since 0.4: accepting them there let a home
@@ -4429,13 +4457,19 @@ impl Node {
         loop {
             let wait = {
                 let g = self.shared.lock().unwrap();
+                let now = Instant::now();
+                // Its own budget, and all peers' together (campaign 10).
+                let global = g.getdata_global.ready_in(
+                    now,
+                    GETDATA_GLOBAL_MAX,
+                    GETDATA_GLOBAL_RATE_PER_SEC,
+                    need,
+                );
                 match g.peers.get(&id) {
-                    Some(p) => p.getdata_bucket.ready_in(
-                        Instant::now(),
-                        GETDATA_BUCKET_MAX,
-                        GETDATA_RATE_PER_SEC,
-                        need,
-                    ),
+                    Some(p) => p
+                        .getdata_bucket
+                        .ready_in(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC, need)
+                        .max(global),
                     None => return,
                 }
             };
@@ -5050,10 +5084,21 @@ impl Node {
                         if !seen.insert(i.hash) || budget == 0 {
                             continue;
                         }
-                        let room = g.peers.get(&id).map_or(0, |p| {
-                            p.getdata_bucket
-                                .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
-                        });
+                        let room = g
+                            .peers
+                            .get(&id)
+                            .map_or(0, |p| {
+                                p.getdata_bucket.level(
+                                    now,
+                                    GETDATA_BUCKET_MAX,
+                                    GETDATA_RATE_PER_SEC,
+                                )
+                            })
+                            .min(g.getdata_global.level(
+                                now,
+                                GETDATA_GLOBAL_MAX,
+                                GETDATA_GLOBAL_RATE_PER_SEC,
+                            ));
                         if room == 0 {
                             self.stats.getdata_throttled.fetch_add(1, Ordering::Relaxed);
                             break;
@@ -5098,6 +5143,12 @@ impl Node {
                                     GETDATA_RATE_PER_SEC,
                                 );
                             }
+                            g.getdata_global.spend(
+                                cost as u64,
+                                now,
+                                GETDATA_GLOBAL_MAX,
+                                GETDATA_GLOBAL_RATE_PER_SEC,
+                            );
                         }
                     }
                 }
@@ -5260,10 +5311,18 @@ impl Node {
                     // `getdata`: the block is read only while it is above
                     // zero, and its whole size is taken from it.
                     let now = Instant::now();
-                    let room = g.peers.get(&id).map_or(0, |p| {
-                        p.getdata_bucket
-                            .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
-                    });
+                    let room = g
+                        .peers
+                        .get(&id)
+                        .map_or(0, |p| {
+                            p.getdata_bucket
+                                .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
+                        })
+                        .min(g.getdata_global.level(
+                            now,
+                            GETDATA_GLOBAL_MAX,
+                            GETDATA_GLOBAL_RATE_PER_SEC,
+                        ));
                     if handshaked && room == 0 {
                         self.stats.getdata_throttled.fetch_add(1, Ordering::Relaxed);
                     }
@@ -5281,6 +5340,12 @@ impl Node {
                                     GETDATA_RATE_PER_SEC,
                                 );
                             }
+                            g.getdata_global.spend(
+                                whole,
+                                now,
+                                GETDATA_GLOBAL_MAX,
+                                GETDATA_GLOBAL_RATE_PER_SEC,
+                            );
                             let mut txs = Vec::new();
                             let mut budget = if handshaked { REPLY_BYTE_BUDGET } else { 0 };
                             let mut valid = true;
