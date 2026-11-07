@@ -6526,6 +6526,25 @@ impl Node {
             // body, its slot is free, and the rest of that batch, which builds
             // on a block we did not take, is not asked for.
             Err(e) if refusal_is_contextual(&e) => {
+                // A block that leaves its branch ahead of ours, held back by
+                // the depth surcharge or the undo window only, is kept in
+                // the index: written to disk like a side block close to
+                // leading. Kept in memory only, the large blocks of a deep
+                // branch heavier than ours outgrew the side bodies' budget
+                // before its surcharge was paid, at every attempt (campaign
+                // 10, round 4, `arch`). Heavier than the tip, it is no junk.
+                if matches!(
+                    e,
+                    crate::chain::ChainError::InsufficientWorkForDepth { .. }
+                        | crate::chain::ChainError::UndoWindowTooShort { .. }
+                ) && g.chain.has_block(&bid)
+                    && (g.chain.side_branch_within(&bid, SIDE_BRANCH_KEPT_BLOCKS)
+                        || g.chain.wants_on_disk(&bid))
+                {
+                    if let Some(j) = &g.journal {
+                        j.record(b);
+                    }
+                }
                 report_beyond_finality(&e);
                 note_future_block(
                     &e,

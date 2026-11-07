@@ -983,3 +983,24 @@ fn a_finished_splice_keeps_its_old_funding_watched_until_forgotten() {
     drop(a3);
     splice(&mut f, &mut a, &c2, ADD);
 }
+
+/// Campaign 10, round 4 (`perse`): a channel given up stays given up in its
+/// journal through a restart and a compaction: the archive reads it so even
+/// when its own record was lost in a crash.
+#[test]
+fn a_given_up_channel_stays_given_up_through_a_compaction() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    a.mark_abandoned().unwrap();
+    assert!(a.was_abandoned());
+    assert_eq!(a.phase(), Phase::Closed);
+    drop(a);
+    let mut a1 = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert!(a1.was_abandoned(), "replayed from the Abandoned record");
+    a1.compact().unwrap();
+    drop(a1);
+    let a2 = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert_eq!(a2.phase(), Phase::Closed);
+    assert!(a2.was_abandoned(), "still given up after a compaction");
+}

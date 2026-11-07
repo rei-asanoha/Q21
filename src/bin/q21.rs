@@ -784,14 +784,18 @@ fn check_own_dir(d: &Path) -> Result<(), String> {
         let foreign = |dir: &Path| -> Option<PathBuf> {
             std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
                 let m = std::fs::symlink_metadata(e.path()).ok()?;
-                (m.uid() != me && m.uid() != 0).then(|| e.path())
+                // A second name for one of our files, made while the
+                // directory was open: whoever made it writes through it
+                // still (round 4). The node never makes hard links.
+                let linked = m.is_file() && m.nlink() > 1;
+                ((m.uid() != me && m.uid() != 0) || linked).then(|| e.path())
             })
         };
         if let Some(f) = foreign(d).or_else(|| foreign(&d.join("channels"))) {
             return Err(format!(
-                "{} belongs to another account: refused. Another account could \
-                 write in this data directory; move that file out, check what \
-                 else changed, and start again.",
+                "{} belongs to another account, or has a second name elsewhere: \
+                 refused. Another account could write in this data directory; move \
+                 that file out, check what else changed, and start again.",
                 f.display()
             ));
         }
@@ -2409,6 +2413,7 @@ fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<Di
     }
     chain.set_body_source(archive.clone());
     apply_finality_record(datadir, &chain);
+    chain.note_start(unix_now());
 
     // --- A restore finds its addresses again, or it restores nothing.
     //

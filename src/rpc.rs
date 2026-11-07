@@ -575,6 +575,10 @@ pub const ANSWER_BYTES_PER_CALL: usize = 64 * 1024;
 /// read as for an answer of that size.
 pub const PUBLIC_READ_BYTES: usize = 32 * 1024 * 1024;
 
+/// Blocks a name must be buried under before it is added as a contact:
+/// see `contactadd`.
+pub const NAME_CONTACT_DEPTH: u64 = 6;
+
 /// Blocks one public answer may read: see [`PUBLIC_READ_BYTES`].
 pub const PUBLIC_BLOCK_READS: usize = 400;
 
@@ -692,16 +696,54 @@ pub const PUBLIC_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_se
 static PUBLIC_ANSWERING: (Mutex<usize>, std::sync::Condvar) =
     (Mutex::new(0), std::sync::Condvar::new());
 
+/// Answers that may read many blocks, built at once on a public explorer:
+/// half the turns at most, so that the others always answer what reads
+/// little.
+///
+/// # The defect this closes (campaign 10, round 4, `prag`)
+///
+/// Two hundred addresses, each reading one 32 MB answer as often as its own
+/// debt allowed, kept the four turns busy together: every honest call waited
+/// four to nine seconds. Reads of blocks now hold at most two turns.
+pub const PUBLIC_HEAVY_AT_ONCE: usize = 2;
+
+/// The calls of a public explorer that may read many blocks, being answered
+/// now (see [`PUBLIC_HEAVY_AT_ONCE`]).
+static PUBLIC_HEAVY: (Mutex<usize>, std::sync::Condvar) =
+    (Mutex::new(0), std::sync::Condvar::new());
+
+/// Methods that may read many blocks for one answer.
+fn reads_blocks(method: &str) -> bool {
+    matches!(
+        method,
+        "getaddress" | "getamount" | "gettransaction" | "getblock" | "search"
+    )
+}
+
 /// A turn to answer a public call, given back when dropped.
-struct PublicTurn;
+struct PublicTurn(&'static (Mutex<usize>, std::sync::Condvar));
 
 impl PublicTurn {
     /// Waits for a turn, at most [`PUBLIC_ANSWER_WAIT`].
     fn take() -> Option<PublicTurn> {
-        let (lock, cv) = &PUBLIC_ANSWERING;
+        Self::take_of(&PUBLIC_ANSWERING, PUBLIC_ANSWERS_AT_ONCE)
+    }
+
+    /// Waits for a turn among those that read blocks, at most
+    /// [`PUBLIC_ANSWER_WAIT`]: taken before the ordinary turn, so that a
+    /// call waiting for it holds none of those.
+    fn take_heavy() -> Option<PublicTurn> {
+        Self::take_of(&PUBLIC_HEAVY, PUBLIC_HEAVY_AT_ONCE)
+    }
+
+    fn take_of(
+        pair: &'static (Mutex<usize>, std::sync::Condvar),
+        limit: usize,
+    ) -> Option<PublicTurn> {
+        let (lock, cv) = pair;
         let deadline = std::time::Instant::now() + PUBLIC_ANSWER_WAIT;
         let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while *n >= PUBLIC_ANSWERS_AT_ONCE {
+        while *n >= limit {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 return None;
@@ -712,13 +754,13 @@ impl PublicTurn {
                 .unwrap_or_else(|e| e.into_inner().0);
         }
         *n += 1;
-        Some(PublicTurn)
+        Some(PublicTurn(pair))
     }
 }
 
 impl Drop for PublicTurn {
     fn drop(&mut self) {
-        let (lock, cv) = &PUBLIC_ANSWERING;
+        let (lock, cv) = self.0;
         let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
         *n = n.saturating_sub(1);
         cv.notify_one();
@@ -1680,6 +1722,28 @@ impl RpcContext {
             }
         }
 
+        // What may read many blocks waits for one of its own turns first
+        // (see [`PUBLIC_HEAVY_AT_ONCE`]).
+        let _heavy = if self.scans.is_some() && reads_blocks(&method) {
+            match PublicTurn::take_heavy() {
+                Some(t) => Some(t),
+                None => {
+                    return Json::obj()
+                        .set("jsonrpc", Json::str("2.0"))
+                        .set("id", id)
+                        .set(
+                            "error",
+                            rpc_error(
+                                ERR_REQUEST,
+                                "too many requests on this public service: slow down a little",
+                            ),
+                        )
+                        .build()
+                }
+            }
+        } else {
+            None
+        };
         // And answers a few at once, whoever asks (see
         // [`PUBLIC_ANSWERS_AT_ONCE`]).
         let _turn = if self.scans.is_some() {
@@ -2939,11 +3003,26 @@ impl RpcContext {
     ) -> Json {
         let conn = mgr.and_then(|m| m.connection_of_owner(&c.owner));
         let node_id = conn.and_then(|p| mgr.and_then(|m| m.peer_node_id(p)));
+        // The name is shown only while the registry still gives it to the
+        // contact's key: after a reorganization gave it to someone else, the
+        // contact kept saying it (campaign 10, round 4, `tact`).
+        let holds = c.name.as_ref().map(|n| {
+            self.node
+                .with_chain(|ch| ch.utxo.names().get(n).is_some_and(|r| r.owner == c.owner))
+        });
         Json::obj()
             .set("label", Json::str(c.label.clone()))
             .set("owner", Json::str(c.owner.to_hex()))
             .set("owner_address", Json::str(self.identity_address(&c.owner)))
-            .set("name", c.name.clone().map(Json::str).unwrap_or(Json::Null))
+            .set(
+                "name",
+                c.name
+                    .clone()
+                    .filter(|_| holds == Some(true))
+                    .map(Json::str)
+                    .unwrap_or(Json::Null),
+            )
+            .set("name_moved", Json::Bool(holds == Some(false)))
             .set("verified", Json::Bool(c.is_verified()))
             .set("verified_words", Json::u64(u64::from(c.verified_words)))
             .set("connected", Json::Bool(conn.is_some()))
@@ -2982,12 +3061,31 @@ impl RpcContext {
             .to_string();
         let (owner, name) = if params.get("name").is_some() {
             let name = Self::name_param(params)?;
-            let r = self
+            let (r, tip) = self
                 .node
-                .with_chain(|c| c.utxo.names().get(&name))
-                .ok_or_else(|| {
-                    rpc_error(ERR_NOT_FOUND, &format!("no name {name} is registered"))
-                })?;
+                .with_chain(|c| (c.utxo.names().get(&name), c.height()));
+            let r = r.ok_or_else(|| {
+                rpc_error(ERR_NOT_FOUND, &format!("no name {name} is registered"))
+            })?;
+            // A name just registered can still go to someone else by a
+            // reorganization: a contact added then stayed bound to whoever
+            // held it at that moment (campaign 10, round 4, `tact`).
+            let depth = tip.saturating_add(1).saturating_sub(r.height);
+            // On regtest, a block is enough: the labs' own pace.
+            let wanted = if self.network == Network::Regtest {
+                1
+            } else {
+                NAME_CONTACT_DEPTH
+            };
+            if depth < wanted {
+                return Err(rpc_error(
+                    ERR_REQUEST,
+                    &format!(
+                        "the name {name} was registered {depth} block(s) ago: it can be \
+                         added as a contact once {wanted} blocks deep, in a few minutes"
+                    ),
+                ));
+            }
             (r.owner, Some(name))
         } else if let Some(peer) = params.get("peer").and_then(|v| v.as_u64()) {
             let mgr = self.channels()?;
@@ -3875,9 +3973,12 @@ impl RpcContext {
             let found = self.node.with_chain(|c| {
                 let b = c.block_at(height)?;
                 let t = b.transactions.get(rank as usize)?.clone();
-                Some((t, b.header.block_id()))
+                Some((t, b.header.block_id(), b.encode().len()))
             });
-            if let Some((t, block)) = found {
+            if let Some((t, block, read)) = found {
+                // The whole block was read for one transaction: charged by
+                // its size, as `getblock` is (campaign 10, round 4).
+                self.charge_answer(client, read);
                 return Ok(Json::obj()
                     .set("confirmed", Json::Bool(true))
                     .set("height", Json::u64(height))

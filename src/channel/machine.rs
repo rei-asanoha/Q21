@@ -2297,6 +2297,9 @@ impl Machine {
         match self.phase {
             Phase::Forcing => out.push(Record::Forcing),
             Phase::Penalised => out.push(Record::Penalised),
+            // Given up stays given up through a compaction (campaign 10,
+            // round 4, `perse`).
+            Phase::Closed if self.abandoned => out.push(Record::Abandoned),
             Phase::Closed => out.push(Record::Closed),
             _ => {}
         }

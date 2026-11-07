@@ -629,6 +629,8 @@ pub struct Chain {
     /// Seconds the tip was recent before this run's streak, earlier runs
     /// included: what the data directory recorded. See [`Chain::held_secs`].
     held_before: Cell<u64>,
+    /// Came back with an old tip: see [`Chain::note_start`].
+    returning: Cell<bool>,
     /// Finality binds this node, for good: set once the hold has passed, or
     /// at startup from what the data directory recorded. Never unset.
     bound: Cell<bool>,
@@ -746,6 +748,7 @@ impl Chain {
             finality_hold: default_finality_hold(network),
             recent_since: Cell::new(None),
             held_before: Cell::new(0),
+            returning: Cell::new(false),
             bound: Cell::new(false),
         }
     }
@@ -1277,6 +1280,7 @@ impl Chain {
                 finality_hold: default_finality_hold(network),
                 recent_since: Cell::new(None),
                 held_before: Cell::new(0),
+                returning: Cell::new(false),
                 bound: Cell::new(false),
             },
             to_replay,
@@ -1970,7 +1974,29 @@ impl Chain {
         if self.height() < validate::last_anchor_height(self.network) {
             return false;
         }
+        if self.finality_hold.is_some() && self.returning.get() {
+            return false;
+        }
         self.finality_hold.is_none() || self.bound.get()
+    }
+
+    /// At startup, after the data directory's record: a node whose tip is
+    /// old comes back after a while away, and holds the hold again in this
+    /// run before finality binds it, whatever it held or recorded before.
+    ///
+    /// # The defect this closes (campaign 10, round 4, `arch`)
+    ///
+    /// Finality measured from the tip a node came back with: its first peer
+    /// could extend that old tip by a thousand blocks of lowered difficulty,
+    /// stamped within the last day, for the work of some twenty honest ones;
+    /// the node, bound, followed them, and every real block then forked
+    /// beyond finality, refused for good. Back after a while, a node follows
+    /// the most work for an hour, as a new one does.
+    pub fn note_start(&self, now: u64) {
+        if self.finality_hold.is_some() && now.saturating_sub(self.tip().time) > RECENT_TIP_SECS {
+            self.returning.set(true);
+            self.held_before.set(0);
+        }
     }
 
     /// Whether finality is bound by the hold or the data directory's record,
@@ -2047,6 +2073,7 @@ impl Chain {
             .saturating_add(at.saturating_duration_since(since).as_secs());
         if held >= hold {
             self.bound.set(true);
+            self.returning.set(false);
         }
         // Held long enough, but below the last anchor finality still waits:
         // say what `finality_binds` says.
@@ -3642,6 +3669,35 @@ mod tests {
         assert!(c.too_easy_for_side(deep, w));
         assert!(!c.too_easy_for_side(c.active[6], w), "on the active chain");
         assert!(!c.too_easy_for_side(Hash256([1u8; 32]), less), "unknown");
+    }
+
+    /// Campaign 10, round 4 (`arch`): a node that comes back with an old tip
+    /// is not bound until it holds a recent tip for the hold in this run,
+    /// whatever it recorded: its first peer cannot lock it on a branch built
+    /// on that old tip.
+    #[test]
+    fn a_node_back_with_an_old_tip_holds_the_hold_again() {
+        let mut c = new_chain();
+        mine(&mut c, 5);
+        c.set_finality_hold(Some(FINALITY_HOLD_SECS));
+        c.bind_finality();
+        assert!(c.finality_binds());
+        let tip = c.tip().time;
+        // Started again a day and more later.
+        c.note_start(tip + RECENT_TIP_SECS + 1);
+        assert!(!c.finality_binds(), "back after a while: not bound");
+        let t0 = std::time::Instant::now();
+        let after = |s: u64| t0 + std::time::Duration::from_secs(s);
+        assert!(!c.note_live_at(tip + 10, t0));
+        assert!(!c.note_live_at(tip + 10, after(FINALITY_HOLD_SECS - 1)));
+        assert!(c.note_live_at(tip + 10, after(FINALITY_HOLD_SECS)));
+        // A tip still recent at startup changes nothing.
+        let mut d = new_chain();
+        mine(&mut d, 5);
+        d.set_finality_hold(Some(FINALITY_HOLD_SECS));
+        d.bind_finality();
+        d.note_start(d.tip().time + 60);
+        assert!(d.finality_binds());
     }
 
     /// Campaign 10 (`arch`): the seconds a recent tip was held in earlier

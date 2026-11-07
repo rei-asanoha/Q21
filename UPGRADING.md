@@ -87,17 +87,19 @@ from block 5,950.
 | A side branch made of blocks far easier than ours | Stored after its shape and its work only, on disk for good: a branch forking deep below the tip, its difficulty walked down, let a peer store four megabytes for a 2,500th of a block's work, as often as it liked | Refused without blame while it trails, when a block's work is under a sixteenth of the block its branch forks from; written to disk only within six blocks of the tip's work; bodies in memory under their own 64 MiB; a branch proven heavier is written as it comes again |
 | A side body evicted from memory | Stayed known, never asked for again: the node waited for a restart to follow a heavier branch | Forgotten, asked for again |
 | Rolling finality on a node run in short sessions | Bound only after one uninterrupted hour in one run: a wallet opened forty minutes a day never bound | The seconds held add up across runs (`finality.dat`: `catching-up <seconds>`) |
+| Rolling finality on a node back after more than a day | Bound at once from its record, measured from the old tip it came back with: a first peer extending that tip could lock it out of the real chain for good | Holds a recent tip for an hour again in this run before binding; follows the most work meanwhile |
+| A contact added by its name | Bound to whoever held the name at that moment, its name shown for good even after a reorganization gave it to someone else | Added once the name is six blocks deep (one on regtest); the name is shown only while it still belongs to the contact |
 | An addition to a channel (a splice) | Locked at the funding depth, six blocks on testnet, where a reorganization costs no surcharge | Locked six blocks later, twelve on testnet (regtest: the funding depth); the old funding stays watched until the new one is buried past any reorganization, a revoked state on it punished; the adder holds its coins again and announces the addition again if a reorganization takes it away |
 | An addition whose added coin was spent elsewhere | Waited for good, payments and closes refused | Said so after the funding depth; the page offers to close without the other side, which is safe then |
 | A channel whose funding left the chain and a coin of which was spent elsewhere | Held for good, counted among the contact's channels | Given up once that spend is buried past any reorganization, on both sides; archived as "given up" |
 | A restart after a reorganization | Scanned from the funding's height: a revoked state mined below it went unpunished | Scanned from the deepest reorganization below it |
 | A share of a forced close too small for a claim the pools relay | Claimed again at every block, the channel closing for good | Left on chain as dust, the channel settled |
-| Public explorer | Each input's coin read a whole block, under the node's lock, charged one call; a search by amount read two thousand blocks in one hold; a 32 MB answer cost a pause | Each block read once per answer, at most 32 MB and 400 blocks, charged by size; what exceeds a client's bucket is owed; searches read block by block; the page says when a list is cut |
+| Public explorer | Each input's coin read a whole block, under the node's lock, charged one call; a search by amount read two thousand blocks in one hold; a 32 MB answer cost a pause | Each block read once per answer, at most 32 MB and 400 blocks, charged by size, a whole block read too; what exceeds a client's bucket is owed, and a client that owes is tracked longest; searches read block by block; answers that read blocks take two of the four turns at most; the page says when a list is cut |
 | `getbalance` | Coins already spent by a pending send of ours, and coins held for a channel, still counted | `spendable` is what a send can spend now (the change of our own pending sends included); `committed` gives what is set aside |
 | `getmining` | Blocks that lost their race counted in the blocks found and the earnings | Left out; `blocks_lost_to_reorganizations` says how many |
 | `preparesend` | A change below the dust floor shown as change | Counted in the fee, as the send pays it |
 | `getemission.permille_of_cap` | A hundred times too high, saturated past a tenth of the supply | Thousandths of the cap |
-| The data folder | Created readable by every account; one owned by another account used after a warning | Created 0700, tightened at every start with `wallet.dat`; one owned by another account (not root), or holding a file of another account, is refused |
+| The data folder | Created readable by every account; one owned by another account used after a warning | Created 0700, tightened at every start with `wallet.dat`; one owned by another account (not root), or holding a file of another account or a file with a second name, is refused before anything is opened in it |
 | Windows programs | Their static imports looked for in their own folder first | From `System32` only |
 | `tools/monitor.sh` | Copied from the repository; no disk check | Travels in the Linux archives (`server/`), with the server guides, covered by the signature; warns when the data disk is nearly full |
 | The wallet page's block pace | The mean of the last 30 blocks | The mean of the last 10 |
@@ -111,15 +113,25 @@ lock protects a channel only once both sides run 0.5.11.
 
 ## The servers
 
-Install `monitor.sh` again, this time from the archive you verified, and
-give it the data folder (SERVER.md, "Getting notified without watching"):
+Before restarting on 0.5.11, check that nothing in the data folder belongs
+to another account: 0.5.11 refuses to start on such a folder, and the
+service would restart in a loop. This must print nothing:
+
+```bash
+sudo find /opt/q21/data /opt/q21/data/channels -maxdepth 1 ! -user q21 ! -user root
+```
+
+Then, once the 0.5.11 archive is downloaded, verified and extracted as in
+SERVER.md (step "Then, and only then"), install `monitor.sh` again, this
+time from that archive, and give it the data folder (SERVER.md, "Getting
+notified without watching"):
 
 ```bash
 sudo install -o root -g root -m 0755 ~/server/monitor.sh /opt/q21/monitor.sh
 ```
 
 ```bash
-printf 'Q21_DATADIR=/opt/q21/data\nQ21_MIN_FREE_MB=2048\n' | sudo tee -a /etc/q21/monitor.env > /dev/null
+printf '\nQ21_DATADIR=/opt/q21/data\nQ21_MIN_FREE_MB=2048\n' | sudo tee -a /etc/q21/monitor.env > /dev/null
 ```
 
 Nothing changes in Caddy.
