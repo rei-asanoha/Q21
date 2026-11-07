@@ -834,8 +834,59 @@ fn tighten_dir(d: &Path) {
             }
         }
     }
-    #[cfg(not(unix))]
+    // On Windows, a data directory outside the user's profile — `C:\Q21`, a
+    // USB disk — inherits what its parent lets every account do: it is
+    // restricted to the current account, the files and folders created in
+    // it after that too. Inside the profile, Windows keeps others out
+    // already, and nothing is changed (campaign 10).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let profile = std::env::var("USERPROFILE").ok();
+        let dir = std::fs::canonicalize(d)
+            .ok()
+            .map(|p| p.display().to_string());
+        let account = windows_account_name(
+            std::env::var("USERNAME").ok().as_deref(),
+            std::env::var("USERDOMAIN").ok().as_deref(),
+        );
+        if let (Some(profile), Some(dir), Some(account)) = (profile, dir, account) {
+            if outside_profile(&dir, &profile) {
+                let ok = std::process::Command::new(windows_system32("icacls.exe"))
+                    .arg(d)
+                    .arg("/inheritance:r")
+                    .arg("/grant:r")
+                    .arg(format!("{account}:(OI)(CI)F"))
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                    .map(|s| s.status.success())
+                    .unwrap_or(false);
+                if !ok {
+                    eprintln!(
+                        "warning: the directory {} is outside your profile and could not \
+                         be restricted to your account",
+                        d.display()
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = d;
+}
+
+/// Whether the directory `dir` lies outside the profile `profile`, both as
+/// Windows writes them (a canonical path may start with `\\?\`). Text only:
+/// tested everywhere.
+#[cfg(any(windows, test))]
+fn outside_profile(dir: &str, profile: &str) -> bool {
+    let norm = |s: &str| {
+        let s = s.trim_start_matches(r"\\?\").replace('/', "\\");
+        let s = s.trim_end_matches('\\').to_lowercase();
+        format!("{s}\\")
+    };
+    !norm(dir).starts_with(&norm(profile))
 }
 
 /// Restricts a file wider than 0600 to its owner, quietly: the directory
@@ -8327,6 +8378,23 @@ mod tests {
         super::apply_finality_record(&d, &later);
         assert!(later.finality_bound_on_record());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Campaign 10: a Windows data directory is restricted to its account
+    /// only when it lies outside the user's profile.
+    #[test]
+    fn a_windows_data_directory_outside_the_profile_is_told_apart() {
+        use super::outside_profile;
+        let profile = r"C:\Users\Alice";
+        assert!(!outside_profile(
+            r"C:\Users\Alice\Documents\Q21NEW\v24\q21-data",
+            profile
+        ));
+        assert!(!outside_profile(r"\\?\C:\Users\alice\q21-data", profile));
+        assert!(!outside_profile(r"C:\Users\Alice", profile));
+        assert!(outside_profile(r"C:\Q21\q21-data", profile));
+        assert!(outside_profile(r"C:\Users\Alicia\q21-data", profile));
+        assert!(outside_profile(r"E:\q21-data", profile));
     }
 
     /// The tip record goes through the synced atomic write: it reads back,
