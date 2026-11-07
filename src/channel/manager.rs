@@ -1610,10 +1610,16 @@ impl ChannelManager {
         let mut fields = end.as_deref().unwrap_or("").split_ascii_whitespace();
         let height = fields.next().and_then(|v| v.parse::<u64>().ok());
         let time = fields.next().and_then(|v| v.parse::<u64>().ok());
+        // Given up, its record lost in a crash before it was written: the
+        // journal still says so (campaign 10, round 3).
         let how = fields
             .next()
             .map(ClosedHow::parse)
-            .unwrap_or(ClosedHow::Unknown);
+            .unwrap_or(if machine.was_abandoned() {
+                ClosedHow::Abandoned
+            } else {
+                ClosedHow::Unknown
+            });
         let time = time.unwrap_or_else(|| {
             std::fs::metadata(path)
                 .and_then(|m| m.modified())
@@ -3357,6 +3363,17 @@ impl ChannelManager {
                             // (red-team campaign 8).
                             let alive = depth_of(&st.old_funding).is_some()
                                 && matches!(c.machine.phase(), Phase::Open | Phase::Closing);
+                            // Seen dead before the restart, or while the node
+                            // was down: said at once, not a funding depth
+                            // after every start (campaign 10, round 3).
+                            if alive
+                                && c.machine
+                                    .splice_added_coins()
+                                    .iter()
+                                    .any(|op| depth_of(op).is_none())
+                            {
+                                c.splice_dead_blocks = u32::from(c.machine.funding_depth().max(1));
+                            }
                             if let Some(tx) = c.machine.our_splice_tx().filter(|_| alive) {
                                 hold.push(tx.clone());
                                 c.splice_held = Some(tx.clone());
@@ -4017,7 +4034,11 @@ impl ChannelManager {
                         value,
                         crate::channel::txbuild::SWEEP_FEE,
                     );
-                    if value.saturating_sub(fee) < crate::consensus::MIN_OUTPUT_VALUE {
+                    // Too small for a claim the pools relay: left as dust,
+                    // not refused at every block (campaign 10, round 3).
+                    if value.saturating_sub(fee) < crate::consensus::MIN_OUTPUT_VALUE
+                        || !txbuild::claimable(value)
+                    {
                         continue;
                     }
                     g.claimed.insert(op, height);

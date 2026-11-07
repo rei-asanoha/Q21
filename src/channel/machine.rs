@@ -357,6 +357,8 @@ pub struct Machine {
     /// splice's burial brought the old funding back unspent, and a revoked
     /// state on it went unpunished (red-team campaign 9, C1).
     retired: Option<Splice>,
+    /// Given up rather than closed: see [`Machine::was_abandoned`].
+    abandoned: bool,
     /// Where the splice confirmed, as the node last saw the chain. Not
     /// journaled: the node tells it anew at every block and restart.
     splice_height: Option<u64>,
@@ -627,6 +629,7 @@ impl Machine {
             peer_counters: None,
             splice: None,
             retired: None,
+            abandoned: false,
             splice_height: None,
         })
     }
@@ -2788,6 +2791,7 @@ impl Machine {
             peer_counters: None,
             splice: None,
             retired: None,
+            abandoned: false,
             splice_height: None,
         };
         m.replay(&records);
@@ -2852,7 +2856,11 @@ impl Machine {
                 }
                 Record::Forcing => self.phase = Phase::Forcing,
                 Record::Penalised => self.phase = Phase::Penalised,
-                Record::Closed | Record::Abandoned => self.phase = Phase::Closed,
+                Record::Closed => self.phase = Phase::Closed,
+                Record::Abandoned => {
+                    self.phase = Phase::Closed;
+                    self.abandoned = true;
+                }
                 Record::Confirmed { height } => self.funding_height = Some(*height),
                 Record::KeyIndex { index } => self.key_index = Some(*index),
                 Record::FundingTx { tx } => {
@@ -3397,8 +3405,16 @@ impl Machine {
         if self.phase != Phase::Closed {
             self.journal.append(&Record::Abandoned)?;
             self.phase = Phase::Closed;
+            self.abandoned = true;
         }
         Ok(())
+    }
+
+    /// Whether the channel was given up ([`Machine::mark_abandoned`]), not
+    /// closed on chain: its journal says so, should the archive's own record
+    /// be missing after a crash.
+    pub fn was_abandoned(&self) -> bool {
+        self.abandoned
     }
 
     /// Records that the channel is settled on chain; moves to [`Phase::Closed`].

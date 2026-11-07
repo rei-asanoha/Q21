@@ -281,6 +281,15 @@ fn main() {
             | "--help"
             | "-h"
     );
+    // Whose the directory is, before anything is created or opened in it:
+    // the lock file was made in a directory then refused, through a link
+    // planted there if there was one (campaign 10, round 3).
+    if !no_datadir && datadir.is_dir() {
+        if let Err(e) = check_own_dir(&datadir) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
     let _lock = if no_datadir {
         None
     } else {
@@ -756,8 +765,10 @@ fn check_own_dir(d: &Path) -> Result<(), String> {
                 ));
             }
         }
+        // `root` owns a disk mounted without an owner (FAT, exFAT on a
+        // Raspberry Pi), and is trusted anyway (campaign 10, round 3).
         if let Ok(m) = std::fs::metadata(d) {
-            if m.uid() != me {
+            if m.uid() != me && m.uid() != 0 {
                 return Err(format!(
                     "the data directory {} belongs to another account: refused. \
                      Its owner could replace what this node reads back at startup. \
@@ -765,6 +776,24 @@ fn check_own_dir(d: &Path) -> Result<(), String> {
                     d.display()
                 ));
             }
+        }
+        // What lies in it too: a directory that was once open to others
+        // still held what another account put there, and the node read it
+        // at its next start, a peer list among it (campaign 10, round 3,
+        // `compl`). The `channels` folder is looked into as well.
+        let foreign = |dir: &Path| -> Option<PathBuf> {
+            std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+                let m = std::fs::symlink_metadata(e.path()).ok()?;
+                (m.uid() != me && m.uid() != 0).then(|| e.path())
+            })
+        };
+        if let Some(f) = foreign(d).or_else(|| foreign(&d.join("channels"))) {
+            return Err(format!(
+                "{} belongs to another account: refused. Another account could \
+                 write in this data directory; move that file out, check what \
+                 else changed, and start again.",
+                f.display()
+            ));
         }
     }
     #[cfg(not(unix))]

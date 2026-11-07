@@ -50,11 +50,15 @@ pub struct FoundBlock {
     pub timestamp: u64,
 }
 
-/// Number of finds kept for display.
+/// Number of finds kept: for display, and to take out of the counts those a
+/// reorganization left aside.
 ///
-/// The screen shows a handful; keeping fifty leaves enough to look back over an
-/// evening of mining without turning this shared object into an archive.
-const FOUND_KEPT: usize = 50;
+/// The screen shows a handful. Fifty were kept, and a find older than that
+/// stayed counted in the blocks found and the earnings even when a
+/// reorganization had left it aside: a race lost over a long partition kept
+/// every find of the losing side (campaign 10, round 3, `regul`). Each is a
+/// few dozen bytes; twenty thousand cover weeks of mining.
+const FOUND_KEPT: usize = 20_000;
 
 /// Minimum length of a measurement window.
 const WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -255,15 +259,16 @@ mod tests {
         // grow without end: beyond the window, the old ones drop off, but the
         // count and the earnings forget nothing.
         let m = Mining::new(true);
-        for h in 0..200u64 {
+        let n = FOUND_KEPT as u64 + 150;
+        for h in 0..n {
             m.block_found(find(h, 10));
         }
         assert_eq!(m.found().len(), FOUND_KEPT);
-        assert_eq!(m.blocks(), 200);
-        assert_eq!(m.total_earned(), 2_000);
+        assert_eq!(m.blocks(), n);
+        assert_eq!(m.total_earned(), 10 * n);
         assert_eq!(
             m.found()[0].height,
-            199,
+            n - 1,
             "the most recent one must come first"
         );
     }

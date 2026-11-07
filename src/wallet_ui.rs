@@ -4852,13 +4852,15 @@ function paintArchive(){
     const sign = moved === null ? "—" : moved < 0n ? "− " + shortQ21(-moved) : moved > 0n ? "+ " + shortQ21(moved) : shortQ21(0n);
     // Given up (its funding can never come back): nothing came back from
     // it, whatever its last balances said (campaign 10).
+    // The side that funded it put nothing in for good: its funding left the
+    // chain and its coins are back in its balance.
     if (a.how === "abandoned"){
       return `<tr>
         <td>${esc(when)}</td>
         <td class="peer">${html(who)}</td>
-        <td class="num">${esc(put === null ? "—" : shortQ21(put))}</td>
+        <td class="num">${esc(a.we_funded === true ? "—" : shortQ21(0n))}</td>
         <td class="num">${esc("given up")}</td>
-        <td class="num back">${esc("nothing")}</td>
+        <td class="num back">${esc(a.we_funded === true ? "—" : "nothing")}</td>
       </tr>`;
     }
     return `<tr>

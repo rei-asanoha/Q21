@@ -541,6 +541,10 @@ pub const SIDE_BRANCH_EASE_LIMIT: u64 = 16;
 /// now have their own budget, and leave first.
 pub const SIDE_BODY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
+/// Blocks [`Chain::wants_on_disk`] remembers at most: a few branches as deep
+/// as rolling finality allows.
+pub const MAX_WANTED_ON_DISK: usize = 4 * (MAX_REORG_DEPTH as usize + 1);
+
 impl From<ValidationError> for ChainError {
     fn from(e: ValidationError) -> Self {
         ChainError::Validation(e)
@@ -611,6 +615,10 @@ pub struct Chain {
     /// active chain, however deep it went. See
     /// [`Chain::take_disconnected_txids`].
     disconnected_txids: Vec<Hash256>,
+    /// Side blocks of a branch proven heavier than ours whose bodies went
+    /// missing: written to disk when they come again. See
+    /// [`Chain::wants_on_disk`].
+    wanted: HashSet<Hash256>,
     /// How long the tip must have been recent before finality binds; `None`:
     /// it always binds. See [`FINALITY_HOLD_SECS`].
     finality_hold: Option<u64>,
@@ -618,8 +626,8 @@ pub struct Chain {
     /// recent without interruption; `None`: it is not. See
     /// [`Chain::note_live`].
     recent_since: Cell<Option<std::time::Instant>>,
-    /// Seconds the tip was recent in earlier runs, without the tip seen old
-    /// since: what the data directory recorded. See [`Chain::held_secs`].
+    /// Seconds the tip was recent before this run's streak, earlier runs
+    /// included: what the data directory recorded. See [`Chain::held_secs`].
     held_before: Cell<u64>,
     /// Finality binds this node, for good: set once the hold has passed, or
     /// at startup from what the data directory recorded. Never unset.
@@ -641,7 +649,7 @@ pub const RETURNED_BLOCKS: usize = 12;
 /// reorganization does: see [`Chain::abandoned_since`].
 pub const MAX_STARTUP_ABANDONED: usize = RETURNED_BLOCKS;
 
-/// Time a new node must have held a recent tip, without interruption, before
+/// Time a new node must have held a recent tip, in one stretch or several (0.5.11), before
 /// rolling finality binds it.
 ///
 /// # The defect this closes
@@ -734,6 +742,7 @@ impl Chain {
             miner_threads: default_threads(),
             disconnected: Vec::new(),
             disconnected_txids: Vec::new(),
+            wanted: HashSet::new(),
             finality_hold: default_finality_hold(network),
             recent_since: Cell::new(None),
             held_before: Cell::new(0),
@@ -1264,6 +1273,7 @@ impl Chain {
                 miner_threads: default_threads(),
                 disconnected: Vec::new(),
                 disconnected_txids: Vec::new(),
+                wanted: HashSet::new(),
                 finality_hold: default_finality_hold(network),
                 recent_since: Cell::new(None),
                 held_before: Cell::new(0),
@@ -1790,6 +1800,23 @@ impl Chain {
         }
     }
 
+    /// Marks the blocks of a branch proven heavier than ours as wanted on
+    /// disk. Bounded: a few branches' worth, cleared whole past it.
+    fn want_on_disk(&mut self, branch: &[Hash256]) {
+        if self.wanted.len().saturating_add(branch.len()) > MAX_WANTED_ON_DISK {
+            self.wanted.clear();
+        }
+        self.wanted.extend(branch.iter().copied());
+    }
+
+    /// Is this block wanted on disk, a side block or not: part of a branch
+    /// proven heavier than ours whose bodies memory could not hold. The
+    /// network layer writes it when it arrives, whatever the side-branch
+    /// rule (`net.rs`, `SIDE_BRANCH_KEPT_BLOCKS`).
+    pub fn wants_on_disk(&self, id: &Hash256) -> bool {
+        self.wanted.contains(id)
+    }
+
     /// Removes side blocks from the index and memory, with every known
     /// block built on them. Never touches the active chain.
     fn forget_side(&mut self, ids: &[Hash256]) {
@@ -1980,7 +2007,7 @@ impl Chain {
 
     /// Notes, at the node's clock `now` (Unix seconds), whether the tip is
     /// recent, and binds finality once it has been for [`FINALITY_HOLD_SECS`]
-    /// without interruption. Returns whether finality binds.
+    /// in all, runs included (see [`Self::held_secs`]). Returns whether finality binds.
     ///
     /// Called by the network layer, on live blocks and on its maintenance
     /// round — never by the replay at startup, which runs at each block's own
@@ -1997,9 +2024,14 @@ impl Chain {
         }
         let hold = self.finality_hold.unwrap_or(0);
         if now.saturating_sub(self.tip().time) > RECENT_TIP_SECS {
-            // An old tip: catching up again, what was held is lost.
-            self.recent_since.set(None);
-            self.held_before.set(0);
+            // An old tip: the streak stops, what earlier runs held stays. A
+            // node off for more than a day started with an old tip, and lost
+            // it all at every start (campaign 10, round 3, `arch`).
+            if let Some(t) = self.recent_since.take() {
+                let streak = at.saturating_duration_since(t).as_secs();
+                self.held_before
+                    .set(self.held_before.get().saturating_add(streak));
+            }
             return false;
         }
         let since = match self.recent_since.get() {
@@ -2576,6 +2608,15 @@ impl Chain {
                     // read as known forever and was never fetched again: the
                     // node stayed on its chain until a restart (campaign 10,
                     // `arch`).
+                    //
+                    // And the branch is proven heavier than ours, every block
+                    // of it with its work checked: its blocks are wanted on
+                    // disk when they come again. Kept in memory only, a
+                    // branch of large blocks heavier than ours outgrew the
+                    // side bodies' budget, its first bodies were evicted
+                    // before its last came, at every attempt, and the node
+                    // never moved to it (campaign 10, round 3, `arch`).
+                    self.want_on_disk(&branch);
                     self.forget_side(&branch[i..]);
                     return Err(ChainError::Validation(ValidationError::IncompleteHistory));
                 }
@@ -2958,7 +2999,8 @@ mod tests {
     }
 
     /// Finality binds a new node once its tip has been recent for the hold,
-    /// measured on the monotonic clock, without interruption; then for good.
+    /// measured on the monotonic clock, in one stretch or several; then for
+    /// good.
     #[test]
     fn finality_binds_after_a_recent_tip_is_held() {
         let mut c = new_chain();
@@ -2972,13 +3014,15 @@ mod tests {
         assert!(!c.note_live_at(tip + RECENT_TIP_SECS + 1, t0));
         // Recent: the hold starts.
         assert!(!c.note_live_at(tip + 10, after(0)));
-        assert!(!c.note_live_at(tip + 10, after(FINALITY_HOLD_SECS - 1)));
-        // The tip goes stale for a moment: the hold starts again.
-        assert!(!c.note_live_at(tip + RECENT_TIP_SECS + 1, after(FINALITY_HOLD_SECS)));
-        assert!(!c.note_live_at(tip + 10, after(FINALITY_HOLD_SECS + 1)));
-        assert!(!c.note_live_at(tip + 10, after(2 * FINALITY_HOLD_SECS)));
+        assert!(!c.note_live_at(tip + 10, after(FINALITY_HOLD_SECS - 3)));
+        // The tip goes stale: the streak stops, the seconds held stay
+        // (campaign 10: they also outlive the process, see `held_secs`).
+        assert!(!c.note_live_at(tip + RECENT_TIP_SECS + 1, after(FINALITY_HOLD_SECS - 2)));
+        assert!(!c.note_live_at(tip + RECENT_TIP_SECS + 1, after(5 * FINALITY_HOLD_SECS)));
+        assert!(!c.note_live_at(tip + 10, after(5 * FINALITY_HOLD_SECS)));
+        assert!(!c.note_live_at(tip + 10, after(5 * FINALITY_HOLD_SECS + 1)));
         // A wall clock set back changes nothing: the hold is monotonic.
-        assert!(c.note_live_at(tip, after(2 * FINALITY_HOLD_SECS + 1)));
+        assert!(c.note_live_at(tip, after(5 * FINALITY_HOLD_SECS + 2)));
         assert!(c.finality_binds());
         // Bound for good: a stale tip, a quiet network, change nothing.
         assert!(c.note_live_at(tip + 10 * RECENT_TIP_SECS, after(0)));
@@ -3601,7 +3645,7 @@ mod tests {
     }
 
     /// Campaign 10 (`arch`): the seconds a recent tip was held in earlier
-    /// runs count toward the hold; an old tip loses them.
+    /// runs count toward the hold, an old tip at start included.
     #[test]
     fn a_hold_in_short_sessions_binds_all_the_same() {
         let mut c = new_chain();
@@ -3614,15 +3658,18 @@ mod tests {
         assert!(!c.note_live_at(tip + 10, t0));
         assert!(!c.note_live_at(tip + 10, after(1_199)));
         assert!(c.note_live_at(tip + 10, after(1_200)), "40 + 20 minutes");
-        // An old tip: what earlier runs held is lost.
+        // An old tip at start (a node off for days): what earlier runs held
+        // stays, and the streak adds to it once the tip is recent again.
         let mut d = new_chain();
         mine(&mut d, 5);
         d.set_finality_hold(Some(FINALITY_HOLD_SECS));
         d.set_held_before(3_000);
         let tip = d.tip().time;
         assert!(!d.note_live_at(tip + RECENT_TIP_SECS + 1, t0));
-        assert_eq!(d.held_secs(), 0);
+        assert_eq!(d.held_secs(), 3_000);
         assert!(!d.note_live_at(tip + 10, after(1_000)));
+        assert!(!d.note_live_at(tip + 10, after(1_599)));
+        assert!(d.note_live_at(tip + 10, after(1_600)));
     }
 
     /// Campaign 10, round 2 (`arch`): side bodies have a budget of their
@@ -3651,11 +3698,16 @@ mod tests {
             active_bodies,
             "the active chain keeps its bodies"
         );
-        // The branch would now win: forgotten, received again, adopted.
+        // The branch would now win: forgotten, wanted on disk when it comes
+        // again (round 3), received again, adopted.
         assert_eq!(
             c.submit(&side[3], now),
             Err(ChainError::Validation(ValidationError::IncompleteHistory))
         );
+        for id in &ids {
+            assert!(c.wants_on_disk(id), "wanted on disk");
+        }
+        assert!(!c.wants_on_disk(&c.tip_id()));
         for b in &side {
             let _ = c.submit(b, now);
         }

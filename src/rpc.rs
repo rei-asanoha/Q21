@@ -770,6 +770,11 @@ pub const GLOBAL_SCANS_PER_MINUTE: u32 = 240;
 /// nothing.
 pub const MAX_TRACKED_CLIENTS: usize = 1024;
 
+/// Clients whose calls are counted at once: far more than those of the
+/// searches, so that a debt (see [`Bucket::debt`]) cannot be shed by
+/// rotating addresses. A few hundred kilobytes of table.
+pub const MAX_TRACKED_CALLERS: usize = 16_384;
+
 /// What identifies a client in the table.
 ///
 /// An IPv4 address as is. An IPv6 address reduced to its `/48`: a
@@ -933,12 +938,15 @@ impl ScanBucket {
                     entry.1.allow_per_second(CALL_BURST, CALLS_PER_SECOND, now)
                 }
                 None => {
-                    if self.calls.len() >= MAX_TRACKED_CLIENTS {
+                    if self.calls.len() >= MAX_TRACKED_CALLERS {
+                        // A client that owes leaves last: evicted, its debt
+                        // went with it, and 1,100 addresses in rotation read
+                        // 32 MB answers for nothing (campaign 10, round 3).
                         if let Some((i, _)) = self
                             .calls
                             .iter()
                             .enumerate()
-                            .min_by_key(|(_, (_, _, seen))| *seen)
+                            .min_by_key(|(_, (_, b, seen))| (b.debt > 0, *seen))
                         {
                             self.calls.swap_remove(i);
                         }
@@ -3373,7 +3381,17 @@ impl RpcContext {
             "getinfo" => Ok(self.getinfo()),
             "channelstatus" => Ok(self.channelstatus()),
             "getutxocommitment" => Ok(self.getutxocommitment()),
-            "getblock" => self.getblock(params, true),
+            "getblock" => {
+                let r = self.getblock(params, true);
+                // Read whole, a body is charged as an answer of its size:
+                // four megabytes read for a reply without signatures cost
+                // one call (campaign 10, round 3).
+                if let Ok(b) = &r {
+                    let read = b.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    self.charge_answer(client, read as usize);
+                }
+                r
+            }
             "getblockheader" => self.getblock(params, false),
             "gettransaction" => self.gettransaction(params, client),
             "getmempool" => Ok(self.getmempool()),
@@ -8722,6 +8740,31 @@ mod tests {
         s.charge_answer(a, usize::MAX);
         let after = 600_000 + 19_750 + 50 + 120 * 50;
         assert!(s.allow_call(a, at(after)));
+    }
+
+    /// Campaign 10, round 3 (`prag`): a client that owes is not evicted
+    /// before those that do not, so a debt is not shed by rotating
+    /// addresses.
+    #[test]
+    fn a_debt_is_not_shed_by_rotating_addresses() {
+        let mut s = ScanBucket::new();
+        let a = ip("198.51.100.32");
+        let t0 = std::time::Instant::now();
+        assert!(s.allow_call(a, t0));
+        s.charge_answer(a, 512 * ANSWER_BYTES_PER_CALL);
+        // More newcomers than the table holds, each with one call; the
+        // global net is not what is tested, so it is refilled by time.
+        for i in 0..(MAX_TRACKED_CALLERS + 10) {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                10,
+                (i >> 16) as u8,
+                (i >> 8) as u8,
+                i as u8,
+            ));
+            let _ = s.allow_call(Some(ip), t0 + std::time::Duration::from_millis(i as u64));
+        }
+        let later = t0 + std::time::Duration::from_millis(MAX_TRACKED_CALLERS as u64 + 20);
+        assert!(!s.allow_call(a, later), "still owes");
     }
 
     /// Round 2 of red-team campaign 9: a public explorer sends no answer

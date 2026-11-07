@@ -258,9 +258,11 @@ Both wallets need 0.5.5 or later; the button shows only then.
   transaction again; a payment sent meanwhile goes through once it is back.
   Nothing is lost — unless a coin of the funding is then spent by another
   transaction, buried past any reorganization: the funding can never come
-  back, the channel is given up, and it is archived as "given up", nothing
-  having come back from it (0.5.11). That takes a reorganization of six
-  blocks or more and the funder spending its coins elsewhere.
+  back, the channel is given up, and it is archived as "given up" (0.5.11).
+  The side that funded it keeps its coins, which never stayed in the
+  channel; the other side gets nothing back of what it was paid in the
+  channel. That takes a reorganization of six blocks or more and the funder
+  spending its coins elsewhere.
 - **A channel asked to wait for more confirmations than the longest delay**
   (a contact asking for 65,535 blocks, three months) is refused at the
   opening: such a channel never opened and blocked new ones meanwhile.

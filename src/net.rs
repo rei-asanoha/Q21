@@ -6487,7 +6487,9 @@ impl Node {
                 // `SIDE_BRANCH_KEPT_BLOCKS`. Bodies of one further behind
                 // stay in memory, bounded; a reorganization writes the whole
                 // winning branch anyway.
-                if g.chain.side_branch_within(&bid, SIDE_BRANCH_KEPT_BLOCKS) {
+                if g.chain.side_branch_within(&bid, SIDE_BRANCH_KEPT_BLOCKS)
+                    || g.chain.wants_on_disk(&bid)
+                {
                     if let Some(j) = &g.journal {
                         j.record(b);
                     }
