@@ -4463,18 +4463,25 @@ impl Node {
     ///
     /// `need`: what the request will likely cost, so that a batch is served
     /// whole rather than cut short by an empty budget halfway.
-    fn wait_for_serving_budget(&self, id: u64, need: u64) {
+    ///
+    /// `bulk`: whether the node-wide budget is waited for too (whole blocks),
+    /// see [`GETDATA_GLOBAL_MAX`].
+    fn wait_for_serving_budget(&self, id: u64, need: u64, bulk: bool) {
         loop {
             let wait = {
                 let g = self.shared.lock().unwrap();
                 let now = Instant::now();
                 // Its own budget, and all peers' together (campaign 10).
-                let global = g.getdata_global.ready_in(
-                    now,
-                    GETDATA_GLOBAL_MAX,
-                    GETDATA_GLOBAL_RATE_PER_SEC,
-                    need,
-                );
+                let global = if bulk {
+                    g.getdata_global.ready_in(
+                        now,
+                        GETDATA_GLOBAL_MAX,
+                        GETDATA_GLOBAL_RATE_PER_SEC,
+                        need,
+                    )
+                } else {
+                    Duration::ZERO
+                };
                 match g.peers.get(&id) {
                     Some(p) => p
                         .getdata_bucket
@@ -4521,8 +4528,14 @@ impl Node {
             Message::GetData(_) | Message::GetBlockTxn { .. } => Some(1),
             _ => None,
         };
+        // Only whole blocks wait for the node-wide budget too: a compact
+        // block, what a new tip travels as, and a transaction never do.
+        let bulk = match &msg {
+            Message::GetData(v) => v.iter().any(|i| matches!(i.kind, InvKind::Block)),
+            _ => true,
+        };
         if let Some(need) = need {
-            self.wait_for_serving_budget(id, need);
+            self.wait_for_serving_budget(id, need, bulk);
         }
 
         // The work of a block or of an announcement is checked before the lock.
@@ -5094,31 +5107,23 @@ impl Node {
                         if !seen.insert(i.hash) || budget == 0 {
                             continue;
                         }
-                        // A compact block, what a new tip travels as, answers
-                        // to the peer's own budget only: the node-wide one
-                        // made new blocks wait behind bulk reads (round 5,
+                        // A compact block, what a new tip travels as, is
+                        // not charged to the node-wide budget: the node-wide
+                        // one made new blocks wait behind bulk reads (round 5,
                         // `arch`).
                         let bulk = !matches!(i.kind, InvKind::CompactBlock);
-                        let global = if bulk {
-                            g.getdata_global.level(
-                                now,
-                                GETDATA_GLOBAL_MAX,
-                                GETDATA_GLOBAL_RATE_PER_SEC,
-                            )
-                        } else {
-                            u64::MAX
-                        };
-                        let room = g
-                            .peers
-                            .get(&id)
-                            .map_or(0, |p| {
-                                p.getdata_bucket.level(
-                                    now,
-                                    GETDATA_BUCKET_MAX,
-                                    GETDATA_RATE_PER_SEC,
-                                )
-                            })
-                            .min(global);
+                        // What is served is decided by the peer's own budget
+                        // only. The node-wide one was waited for before the
+                        // request was handled (`wait_for_serving_budget`);
+                        // what this answer costs beyond it is a debt the next
+                        // requests wait for. Deciding on it here dropped items
+                        // silently when another peer had just spent it, and
+                        // the honest requester waited a minute and blamed us
+                        // (round 6, `arch`).
+                        let room = g.peers.get(&id).map_or(0, |p| {
+                            p.getdata_bucket
+                                .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
+                        });
                         if room == 0 {
                             self.stats.getdata_throttled.fetch_add(1, Ordering::Relaxed);
                             break;
@@ -5333,18 +5338,13 @@ impl Node {
                     // `getdata`: the block is read only while it is above
                     // zero, and its whole size is taken from it.
                     let now = Instant::now();
-                    let room = g
-                        .peers
-                        .get(&id)
-                        .map_or(0, |p| {
-                            p.getdata_bucket
-                                .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
-                        })
-                        .min(g.getdata_global.level(
-                            now,
-                            GETDATA_GLOBAL_MAX,
-                            GETDATA_GLOBAL_RATE_PER_SEC,
-                        ));
+                    // The peer's own budget decides; the node-wide one was
+                    // waited for before, and is charged as a debt (round 6,
+                    // `arch`).
+                    let room = g.peers.get(&id).map_or(0, |p| {
+                        p.getdata_bucket
+                            .level(now, GETDATA_BUCKET_MAX, GETDATA_RATE_PER_SEC)
+                    });
                     if handshaked && room == 0 {
                         self.stats.getdata_throttled.fetch_add(1, Ordering::Relaxed);
                     }
@@ -12041,6 +12041,86 @@ mod tests_handler_review {
             t0.elapsed()
         );
         assert_eq!(blocks_to(&spent), 1, "then it is served");
+    }
+
+    /// The node-wide budget is waited for before a request of whole blocks,
+    /// never decided on while serving it: a request that waited is served
+    /// whole, what it costs beyond is owed. A compact block, what a new tip
+    /// travels as, never waits for it (rounds 5 and 6, `arch`).
+    #[test]
+    fn the_node_wide_budget_slows_whole_blocks_and_drops_nothing() {
+        let net = Network::Testnet;
+        let n = Node::new(net, Chain::new(net, genesis_block(net)));
+        let genesis = n.with_chain(|c| c.tip_id());
+        let shake = |id: u64| {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&id).expect("peer");
+            p.version_received = true;
+            p.version_sent = true;
+            p.handshaked = true;
+        };
+        let owe = |secs_quarter: u64| {
+            n.shared.lock().unwrap().getdata_global.spend(
+                GETDATA_GLOBAL_MAX + secs_quarter * GETDATA_GLOBAL_RATE_PER_SEC / 4,
+                Instant::now(),
+                GETDATA_GLOBAL_MAX,
+                GETDATA_GLOBAL_RATE_PER_SEC,
+            )
+        };
+        // A compact block does not wait for what other peers spent.
+        let tip = anonymous_peer(&n, 9);
+        shake(9);
+        owe(4);
+        let t0 = Instant::now();
+        assert!(n.handle(
+            9,
+            Message::GetData(vec![InvItem {
+                kind: InvKind::CompactBlock,
+                hash: genesis,
+            }])
+        ));
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            frames_sent(&tip, net)
+                .into_iter()
+                .filter(|m| matches!(m, Message::CmpctBlock(_)))
+                .count(),
+            1
+        );
+
+        // A whole block waits for the node-wide debt, then is served.
+        let bulk = anonymous_peer(&n, 10);
+        shake(10);
+        n.shared.lock().unwrap().getdata_global = TokenBucket {
+            tokens: GETDATA_GLOBAL_MAX,
+            last: Instant::now(),
+        };
+        owe(1);
+        let t0 = Instant::now();
+        assert!(n.handle(
+            10,
+            Message::GetData(vec![InvItem {
+                kind: InvKind::Block,
+                hash: genesis,
+            }])
+        ));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(240),
+            "it waited: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            frames_sent(&bulk, net)
+                .into_iter()
+                .filter(|m| matches!(m, Message::Block(_)))
+                .count(),
+            1,
+            "and nothing was dropped"
+        );
     }
 
     #[test]
