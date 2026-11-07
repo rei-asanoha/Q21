@@ -288,7 +288,11 @@ is kept under one name only, and two contacts cannot share a name — nor two
 names drawn alike: "Mum" and "Мum" (a Cyrillic М) are one name, and the
 second is refused with the name it copies. Names that differ only by an
 accent are both kept, each shown with a warning to check the address
-(0.5.7).
+(0.5.7). Since 0.5.12 the letter pairs the eye also reads as one are folded
+the way the on-chain name rule folds them — `rn` as `m`, `vv` as `w`, `cl`
+as `d`, `i` as `l` — so "rnodern" cannot be kept beside "modern", nor
+"vvallet" beside "wallet"; numbered names ("n6", "n8") are untouched. The
+same rule applies to the contacts of the private channel.
 
 Choosing a contact fills in the address; the payment's recap shows the name
 next to the address. After a payment to a new address, the page offers to

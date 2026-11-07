@@ -67,6 +67,70 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.5.11 to 0.5.12
+
+0.5.12 changes no rule of block validity and nothing in a channel's
+messages: a 0.5.11 node and a 0.5.12 node accept the same blocks and keep
+the same channels. Mining does not need to stop. It brings the fixes of the
+eleventh red-team campaign (RED-TEAM-2026-11.md): a serving amplifier that
+could slow a node, look-alike names in the contact and send books, two weak
+steps in the update guide, and a few smaller hardenings. If you never
+installed 0.5.11, 0.5.12 contains it: follow this section, and the 0.5.11
+section below for what else changed since 0.5.10.
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, and block timestamps strictly after their parent's
+from block 5,950.
+
+## What changes
+
+| | 0.5.11 | 0.5.12 |
+|---|---|---|
+| Serving a compact block (how a new tip travels) | Exempt from the node-wide serving budget, and rebuilt under the node's lock on every request, for any block id: a peer rotating old ids kept the node rebuilding, with no aggregate cap | Exempt only within six blocks of the tip; an older id is still served as a compact block but charged to the node-wide budget like any bulk read; recent builds are kept and reused |
+| A contact or a send-book name made to look like another | Look-alike scripts (Cyrillic, Greek, fullwidth) were refused, but not the letter ligatures the name rule folds: "rnodern" could sit beside "modern", "vvallet" beside "wallet" | Refused, and warned about, by the same letter reads as the on-chain name rule (`rn`→`m`, `vv`→`w`, `cl`→`d`, `i`→`l`); digits are not folded, so numbered names still coexist |
+| JOIN.md, confirming the signing key | Against `README.md` and `SIGNING.md`, which ship with the archive | Against the copy published away from GitHub: the one check a repository takeover cannot defeat |
+| JOIN.md, the first-launch warnings | "Run anyway" / "Open Anyway" / `xattr` shown unconditionally | Only once the verification in step 2 has passed |
+| `node.key` on first start | Written to a temporary file at the umask (0644), restricted after | Created already private (0600) |
+| `monitor.sh` and a node that refuses to start | Restarted every cycle: a permanent loop on a foreign or hard-linked data folder | Stops after three failed starts and calls for a human, naming the likely cause (`Q21_FAIL_CAP`) |
+| The archive after a reorganization undid a close | Forgot what the close paid us, kept whether an unlocked addition had happened | Forgets both; a reclassified close reads the addition from the new chain |
+| The channel-open preview's second fee line | "At most, if a change too small to keep cannot be avoided" | "Most it could be, if a tiny leftover can't be returned" |
+
+## Who should upgrade, and when
+
+Everyone, when convenient; the entry points first, for the serving budget.
+Nothing in a channel depends on both sides running 0.5.12.
+
+## The servers
+
+The same check as before 0.5.11, in case a backup or another account left
+something in the data folder since. These two must print nothing (the second
+says "No such file or directory" on a server without an onion service; that is
+fine):
+
+```bash
+sudo find /opt/q21/data /opt/q21/data/channels -maxdepth 1 \( ! -user q21 ! -user root -o -type f -links +1 \) -print
+```
+
+```bash
+sudo find /opt/q21/data/tor -maxdepth 4 \( ! -user q21 ! -user root -o -type f -links +1 \) -print
+```
+
+Then install `monitor.sh` again from the 0.5.12 archive, as in SERVER.md
+("Getting notified without watching"): it is the copy that stops restarting
+a node that will not start.
+
+```bash
+sudo install -o root -g root -m 0755 ~/server/monitor.sh /opt/q21/monitor.sh
+```
+
+Nothing changes in Caddy.
+
+## The data folder
+
+Nothing changes. Going back to 0.5.11 with the same folder is safe.
+
+---
+
 # Upgrading from 0.5.10 to 0.5.11
 
 0.5.11 changes no rule of block validity and nothing in a channel's

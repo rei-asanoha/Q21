@@ -126,7 +126,7 @@ The program comes from the **signed release** of the version you install
 never installed:
 
 ```bash
-cd ~ && V=v0.5.11 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
+cd ~ && V=v0.5.12 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
 ```
 
 Check the signature **before** installing (`sudo apt install -y minisign`
