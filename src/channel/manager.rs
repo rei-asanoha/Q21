@@ -1656,9 +1656,12 @@ impl ChannelManager {
         // (campaign 10, round 5, `tact`).
         let (mut capacity, mut bal, mut ours_added) =
             (machine.params().capacity.units(), bal, ours_added);
+        let spliced = std::fs::read_to_string(self.spliced_path(cid))
+            .ok()
+            .and_then(|t| Hash256::from_hex(t.trim()));
         if let Some(st) = machine
             .splice_status()
-            .filter(|st| !st.locked && st.height.is_none())
+            .filter(|st| !st.locked && st.height.is_none() && spliced != Some(st.txid))
         {
             capacity = capacity.saturating_sub(st.add);
             let adder = if st.ours { us } else { 1 - us };
@@ -1681,6 +1684,27 @@ impl ChannelManager {
             payments: entries.iter().filter(|e| e.added == 0).count(),
             put_in: initial.saturating_add(ours_added),
             came_back,
+        }
+    }
+
+    /// The sidecar naming the addition the closing transaction spent the
+    /// output of: an addition not yet locked when the channel ended that
+    /// did happen. See `react_to_spend`.
+    fn spliced_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.spliced", cid.to_hex()))
+    }
+
+    fn note_splice_happened(&self, cid: Hash256, splice: Option<Hash256>) {
+        match splice {
+            Some(txid) => {
+                let _ = crate::channel::journal::atomic_write(
+                    &self.spliced_path(cid),
+                    format!("{}\n", txid.to_hex()).as_bytes(),
+                );
+            }
+            None => {
+                let _ = std::fs::remove_file(self.spliced_path(cid));
+            }
         }
     }
 
@@ -3676,6 +3700,18 @@ impl ChannelManager {
             .is_some_and(|(splice, _, _)| splice == txid)
         {
             return;
+        }
+        // An addition not yet locked when the channel ends: whether it
+        // happened is what the closing transaction spends, the addition's
+        // output or the old funding. Recorded, since the height the addition
+        // was seen at is not journaled: after a restart, the archive dropped
+        // an addition that had confirmed (campaign 10, round 6, `tact`).
+        if let Some(st) = chan.machine.splice_status() {
+            if tx.inputs.iter().any(|i| i.prev_out == st.new_funding) {
+                self.note_splice_happened(cid, Some(st.txid));
+            } else if tx.inputs.iter().any(|i| i.prev_out == st.old_funding) {
+                self.note_splice_happened(cid, None);
+            }
         }
         // Anything else spending a funding output ends the channel: a splice
         // still waiting can no longer confirm, and its coins come back.

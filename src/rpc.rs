@@ -1921,7 +1921,7 @@ impl RpcContext {
             ),
             (
                 "getmining",
-                "Mining status: active, measured rate, blocks found",
+                "Mining status: active, measured rate, blocks found, blocks lost to reorganizations",
             ),
             (
                 "getnetworkhashrate",
@@ -1964,7 +1964,7 @@ impl RpcContext {
         m.extend([
             (
                 "channelopen",
-                "[wallet] Open a payment channel to a peer (peer, capacity, [delay], [min_depth], [max_fee])",
+                "[wallet] Open a payment channel to a peer (peer, capacity, [delay], [min_depth], [max_fee]); fee is the nominal fee, fee_at_most the most the funding may pay",
             ),
             (
                 "channelpay",
@@ -1972,7 +1972,7 @@ impl RpcContext {
             ),
             (
                 "channelsplice",
-                "[wallet] Add coins of the wallet to an open channel (channel_id, amount, [max_fee])",
+                "[wallet] Add coins of the wallet to an open channel (channel_id, amount, [max_fee]); fee is the nominal fee, fee_at_most the most the addition may pay",
             ),
             (
                 "channelclose",
@@ -4710,8 +4710,20 @@ impl RpcContext {
         // after it. A height is an integer - the separator is enough to remove
         // the ambiguity, with no menu to choose from.
         if let Some(text) = amount_candidate(&q) {
-            let units = amount_to_units(&text)
-                .ok_or_else(|| rpc_error(ERR_PARAMS, "unreadable amount: at most 8 decimals"))?;
+            // Too many decimals is said so; anything else, `12,34,5` read as
+            // `12.34.5`, is no amount at all (round 6, `regul`).
+            let units = amount_to_units(&text).ok_or_else(|| {
+                let decimals = text.split_once('.').map_or(0, |(_, f)| f.len());
+                if text.matches('.').count() == 1 && decimals > 8 {
+                    rpc_error(ERR_PARAMS, "unreadable amount: at most 8 decimals")
+                } else {
+                    rpc_error(
+                        ERR_PARAMS,
+                        "not recognized: type a height, an amount (1.5 or 1,5), an address, \
+                         or a block or transaction identifier",
+                    )
+                }
+            })?;
             // Canonical form in Q21: readable in the URL, and parseable again
             // as is by `getamount`.
             return found("amount", Amount::from_units(units).to_string());
@@ -11048,6 +11060,18 @@ mod tests {
         for q in ["1.5,000", "0.5,1"] {
             assert_eq!(amount_candidate(q), None, "{q}");
         }
+        // Round 6 (`regul`): too many decimals is said so, anything else is
+        // no amount.
+        let message = |q: &str| {
+            call(&c, "search", &format!(r#"{{"q":"{q}"}}"#))
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        assert!(message("1.123456789").contains("at most 8 decimals"));
+        assert!(message("12,34,5").starts_with("not recognized"));
     }
 
     /// The beginning of an identifier, as lists show it, leads to it.
