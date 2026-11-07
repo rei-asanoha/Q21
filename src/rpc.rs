@@ -301,7 +301,8 @@ fn automatic_fee(
         let n = chosen.len() as u64;
         let change = total - needed;
         // The recipients, plus the change if there is any.
-        let n_outputs = n_destinations + u64::from(change > 0);
+        // A change below the dust floor is no output: it goes to the fee.
+        let n_outputs = n_destinations + u64::from(change >= MIN_OUTPUT_VALUE);
         let base_size = 8 + n * 48 + n_outputs * 41;
         let witness = n * (scheme.pubkey_len() as u64 + scheme.sig_len() as u64);
         let weight = base_size * WITNESS_DISCOUNT + witness + n_outputs * WEIGHT_PER_OUTPUT;
@@ -1479,9 +1480,9 @@ fn compact_search(raw: &str) -> String {
 /// If `q` reads as an amount, its text in the form `amount_to_units` takes.
 ///
 /// An amount carries a separator - `1.5` or, as written in French, `1,5` - or
-/// the unit after it: `2 Q21`. With both a comma and a point, the comma
-/// separates thousands (`1,000.5`). Anything else is not an amount, and the
-/// search goes on.
+/// the unit after it: `2 Q21`. With both a comma and a point, the last one
+/// separates the decimals (`1,000.5`, `1.000,5`). Anything else is not an
+/// amount, and the search goes on.
 fn amount_candidate(q: &str) -> Option<String> {
     let lower = q.to_ascii_lowercase();
     let (number, with_unit) = match lower.strip_suffix("q21") {
@@ -1497,10 +1498,13 @@ fn amount_candidate(q: &str) -> Option<String> {
         return None;
     }
     let number = number.replace('\'', "");
-    let normalized = if number.contains('.') {
-        number.replace(',', "")
-    } else {
-        number.replace(',', ".")
+    // With both, the last one separates the decimals: `1,000.5` in English,
+    // `1.000,5` in French. The point alone always won, and `1.000,5` read as
+    // 1.0005 (campaign 10, `regul`).
+    let normalized = match (number.rfind('.'), number.rfind(',')) {
+        (Some(p), Some(c)) if c > p => number.replace('.', "").replace(',', "."),
+        (Some(_), _) => number.replace(',', ""),
+        (None, _) => number.replace(',', "."),
     };
     if normalized.contains('.') || with_unit {
         Some(normalized)
@@ -2337,6 +2341,11 @@ impl RpcContext {
                         )
                         .set("how", Json::str(a.how.as_str()))
                         .set("payments", Json::u64(a.payments as u64))
+                        .set("put_in", Json::u64(a.put_in))
+                        .set(
+                            "came_back",
+                            a.came_back.map(Json::u64).unwrap_or(Json::Null),
+                        )
                         .build()
                 })
                 .collect(),
@@ -4257,12 +4266,26 @@ impl RpcContext {
     }
 
     fn getsupply(&self) -> Json {
-        let (issued, utxo, names, burned) = self.node.with_chain(|c| {
+        let (issued, utxo, names, burned, genesis) = self.node.with_chain(|c| {
+            // The genesis coin pays a key nobody holds: in the set, never in
+            // circulation (campaign 10, `regul`).
+            let genesis: u64 = c
+                .block_at(0)
+                .and_then(|b| b.transactions.first().cloned())
+                .map(|t| {
+                    let txid = t.txid();
+                    (0..t.outputs.len() as u32)
+                        .filter_map(|index| c.utxo.get(&crate::tx::OutPoint { txid, index }))
+                        .map(|e| e.output.value.units())
+                        .sum()
+                })
+                .unwrap_or(0);
             (
                 c.total_issued(),
                 c.utxo.total_value(),
                 c.utxo.names().len() as u64,
                 c.utxo.names().burned(),
+                genesis,
             )
         });
         Json::obj()
@@ -4273,7 +4296,13 @@ impl RpcContext {
             .set("burned_by_names", amount_json(Amount::from_units(burned)))
             .set(
                 "spendable",
-                amount_json(Amount::from_units(utxo.units().saturating_sub(burned))),
+                amount_json(Amount::from_units(
+                    utxo.units().saturating_sub(burned).saturating_sub(genesis),
+                )),
+            )
+            .set(
+                "genesis_unspendable",
+                amount_json(Amount::from_units(genesis)),
             )
             .set("names", Json::u64(names))
             .set("cap", amount_json(Amount::from_units(MAX_SUPPLY)))
@@ -9725,6 +9754,15 @@ mod tests {
             issued.get("q21").and_then(|v| v.as_str()),
             Some("1.00000000")
         );
+        // The genesis coin is in the set and in nobody's hands (campaign 10).
+        let units = |k: &str| {
+            r.get(k)
+                .and_then(|v| v.get("units"))
+                .and_then(|v| v.as_u64())
+                .unwrap()
+        };
+        assert_eq!(units("genesis_unspendable"), units("in_utxo_set"));
+        assert_eq!(units("spendable"), 0);
     }
 
     #[test]
@@ -10881,6 +10919,7 @@ mod tests {
             ("2 q21", "2.00000000"),
             ("1 000,5", "1000.50000000"),
             ("1,000.5", "1000.50000000"),
+            ("1.000,5", "1000.50000000"),
             ("0,12345678", "0.12345678"),
         ] {
             let r = call_ok(&c, "search", &format!(r#"{{"q":"{q}"}}"#));

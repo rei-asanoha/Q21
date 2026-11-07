@@ -3326,6 +3326,15 @@ fn history_and_archives_survive_a_restart() {
         assert!(a.closed_height.is_some());
         assert!(a.closed_time > 1_700_000_000, "dated by the clock");
         assert_eq!(a.payments, 3);
+        // What was put in, and what reached the wallet on chain: the close
+        // fee comes out of the funder's share (campaign 10, `regul`).
+        assert_eq!(a.put_in, if funder { capacity } else { 0 });
+        let back = a.came_back.expect("recorded at the close");
+        if funder {
+            assert!(back < mine && back + 100_000 > mine, "{back} of {mine}");
+        } else {
+            assert_eq!(back, theirs);
+        }
     };
     let live = p.funder.archived();
     assert_eq!(live.len(), 1);

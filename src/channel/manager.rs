@@ -332,6 +332,12 @@ pub struct ArchivedChannel {
     pub how: ClosedHow,
     /// Payments made in the channel, from its history.
     pub payments: usize,
+    /// What we put in: the capacity when we opened it, and our additions.
+    pub put_in: u64,
+    /// What reached our wallet on chain once the channel ended, fees taken:
+    /// recorded when the transaction that pays it confirms; `None` when
+    /// unknown (a channel closed before 0.5.11, a penalty).
+    pub came_back: Option<u64>,
 }
 
 /// One payment in a channel's history: the state it settled in, when, and
@@ -590,6 +596,11 @@ const CLAIM_MEMORY_BLOCKS: u64 = 1_000;
 /// Why a payment or a close waits during a splice.
 const SPLICING: &str = "coins are being added to this channel: payments and closes resume \
      once the addition is buried in the chain";
+
+/// Why a cooperative close is not proposed by a side whose share, once it
+/// paid the close fee, would be dust: see `ChannelManager::close`.
+pub const CLOSE_DUST: &str = "your share of this channel, once the closing fee is paid, would be \
+     below the smallest amount the chain keeps, and would be lost: let the other side close it";
 
 /// Why a payment or a cooperative close waits for good: a coin the splice
 /// in progress adds was spent by another transaction, so the splice can
@@ -1629,6 +1640,16 @@ impl ChannelManager {
                 .unwrap_or(0)
         });
         let history = std::fs::read_to_string(self.history_path(cid)).unwrap_or_default();
+        let initial = Self::initial_balance(machine, &history);
+        let entries = parse_history(&history, initial);
+        let ours_added: u64 = entries
+            .iter()
+            .filter(|e| e.added_by_us)
+            .map(|e| e.added)
+            .sum();
+        let came_back = std::fs::read_to_string(self.back_path(cid))
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok());
         ArchivedChannel {
             channel_id: cid,
             peer_identity: self.read_peer_identity(cid),
@@ -1640,11 +1661,27 @@ impl ChannelManager {
             closed_time: time,
             closed_height: height,
             how,
-            payments: parse_history(&history, Self::initial_balance(machine, &history))
-                .iter()
-                .filter(|e| e.added == 0)
-                .count(),
+            payments: entries.iter().filter(|e| e.added == 0).count(),
+            put_in: initial.saturating_add(ours_added),
+            came_back,
         }
+    }
+
+    /// The sidecar recording what reached our wallet when the channel
+    /// ended: see [`ArchivedChannel::came_back`].
+    fn back_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.back", cid.to_hex()))
+    }
+
+    /// Records what reached our wallet from the transaction that ended the
+    /// channel, fees taken. The archive's "came back" was our last balance,
+    /// before any fee: a close fee, a sweep's or a claim's, or a share left
+    /// as dust, never showed (campaign 10, `regul`).
+    fn note_came_back(&self, cid: Hash256, units: u64) {
+        let _ = crate::channel::journal::atomic_write(
+            &self.back_path(cid),
+            format!("{units}\n").as_bytes(),
+        );
     }
 
     /// Whether a closed channel ever held funds on chain: its funding was seen
@@ -1941,6 +1978,16 @@ impl ChannelManager {
         }
         if chan.machine.splicing() {
             return Err(chan.splicing_refusal().into());
+        }
+        // The side that proposes pays the fee: a share that would fall below
+        // the dust floor once it is paid went whole to the fee, the page
+        // saying only that the fee was 0.0002 (campaign 10, `regul`).
+        if chan.machine.phase() == Phase::Open {
+            let ours = chan.machine.current_balances()[chan.machine.our_index()];
+            let left = ours.saturating_sub(CLOSE_FEE);
+            if ours >= CLOSE_FEE && left > 0 && left < crate::consensus::MIN_OUTPUT_VALUE {
+                return Err(CLOSE_DUST.into());
+            }
         }
         if chan.machine.update_in_flight() {
             chan.machine.agree_close(CLOSE_FEE, true).map_err(err)?;
@@ -3603,6 +3650,14 @@ impl ChannelManager {
         chan.spend = Some(txid);
         // The cooperative close we agreed to, broadcast by the peer: settled.
         if chan.machine.is_cooperative_close(tx) {
+            let ours = chan.machine.our_payout();
+            let back: u64 = tx
+                .outputs
+                .iter()
+                .filter(|o| o.pubkey_hash == ours)
+                .map(|o| o.value.units())
+                .sum();
+            self.note_came_back(cid, back);
             settle(chan, txid, height);
             return;
         }
@@ -3628,7 +3683,10 @@ impl ChannelManager {
                     }
                     // Our funds were trimmed to dust, or are too small to pay
                     // a claim the pools relay: nothing to claim, settled.
-                    None => settle(chan, txid, height),
+                    None => {
+                        self.note_came_back(cid, 0);
+                        settle(chan, txid, height)
+                    }
                 }
             }
             Watch::OurCommitment {
@@ -3647,7 +3705,10 @@ impl ChannelManager {
                         });
                     }
                     // Our own output was trimmed to dust: nothing to sweep.
-                    None => settle(chan, txid, height),
+                    None => {
+                        self.note_came_back(cid, 0);
+                        settle(chan, txid, height)
+                    }
                 }
             }
             Watch::NotOurChannel | Watch::Unrecognized => {}
@@ -3834,8 +3895,15 @@ impl ChannelManager {
                         }
                     }
                 }
-                Some(CloseTracker::Finalizing { spends, .. }) => {
+                Some(CloseTracker::Finalizing { spends, tx }) => {
                     if let Some(by) = spender(txs, *spends) {
+                        // Our own sweep or claim: all its outputs are ours.
+                        // Another spender (one built before a restart, or a
+                        // penalty) leaves the figure unknown.
+                        if by == tx.txid() {
+                            let back = tx.outputs.iter().map(|o| o.value.units()).sum::<u64>();
+                            self.note_came_back(cid, back);
+                        }
                         settle(chan, by, height);
                     }
                 }

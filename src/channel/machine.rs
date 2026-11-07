@@ -3350,6 +3350,11 @@ impl Machine {
     /// more than its current balance. A spend of the 2-of-2 funding output
     /// needs our signature, and we sign no other such shape, so this matches
     /// either party's proposal, whoever pays its fee.
+    /// The wallet address our share of a cooperative close pays.
+    pub fn our_payout(&self) -> Hash256 {
+        self.payout[self.our_index]
+    }
+
     pub fn is_cooperative_close(&self, tx: &Transaction) -> bool {
         let Some(funding) = self.funding_outpoint else {
             return false;
@@ -3453,7 +3458,7 @@ impl Machine {
         Ok(tx)
     }
 
-    fn current_balances(&self) -> Balances {
+    pub fn current_balances(&self) -> Balances {
         self.local_commit_number
             .and_then(|n| self.local_commits.get(&n))
             .map(|(b, _)| *b)
