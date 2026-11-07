@@ -7899,10 +7899,21 @@ mod tests {
             missing.is_empty(),
             "table keys not found in the page source: {missing:#?}"
         );
-        for key in table("I18N", "ja").keys() {
+        // The two languages must cover exactly the same keys. Checking only
+        // one direction let a string added to French but not Japanese (or the
+        // reverse) fall back to English for half the users with no test
+        // failing (campaign 11, human factor).
+        let ja = table("I18N", "ja");
+        for key in ja.keys() {
             assert!(
                 fr.contains_key(key),
                 "{key:?} is translated into Japanese only"
+            );
+        }
+        for key in fr.keys() {
+            assert!(
+                ja.contains_key(key),
+                "{key:?} is translated into French only: Japanese would fall back to English"
             );
         }
         for lang in ["fr", "ja"] {

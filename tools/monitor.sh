@@ -47,6 +47,13 @@ THRESHOLD="${Q21_THRESHOLD:-30}"
 SILENT_RUNS="${Q21_SILENT_RUNS:-3}"
 case "$SILENT_RUNS" in ''|*[!0-9]*) SILENT_RUNS=3 ;; esac
 SILENT="$STATE.silent"
+FAILS="$STATE.fails"
+# How many cycles of a service that will not stay up we restart before we
+# stop hammering it and call for a human. A node that refuses to start (a
+# foreign or hard-linked data folder, 0.5.11's check) exits at once, and an
+# unconditional restart every cycle is a loop that never ends.
+FAIL_CAP="${Q21_FAIL_CAP:-3}"
+case "$FAIL_CAP" in ''|*[!0-9]*) FAIL_CAP=3 ;; esac
 NTFY="${Q21_NTFY:-}"
 PUBLIC_URL="${Q21_PUBLIC_URL:-}"
 PROXY="${Q21_PROXY:-caddy}"
@@ -178,6 +185,23 @@ if [ -z "$height" ]; then
     fi
     notify "node unreachable on $RPC for $silent runs in a row: restarting $SERVICE"
   else
+    # The service is not running. If it keeps failing to come up — a node
+    # that exits at once, typically because 0.5.11 refused a foreign or
+    # hard-linked data folder — restarting it every cycle is a loop that
+    # never ends and hides the real cause. Count the attempts; past the cap,
+    # with the unit in `failed`, stop and call for a human instead.
+    fails=0
+    if [ -f "$FAILS" ]; then
+      read -r fails < "$FAILS" 2>/dev/null || fails=0
+      case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+    fi
+    if systemctl is-failed --quiet "$SERVICE" && [ "$fails" -ge "$FAIL_CAP" ]; then
+      logger -t q21-monitor "service $SERVICE has failed to start $fails times: not restarting again"
+      notify "service $SERVICE will not start ($fails tries): it is not restarting on its own. A data folder owned by another account or holding a hard-linked file will do this — check it (see UPGRADING.md), then restart $SERVICE by hand."
+      printf '%s\n' "$fails" > "$FAILS"
+      exit 0
+    fi
+    printf '%s\n' "$((fails + 1))" > "$FAILS"
     notify "service $SERVICE stopped: restarting"
   fi
   systemctl restart "$SERVICE"
@@ -186,6 +210,7 @@ if [ -z "$height" ]; then
   exit 0
 fi
 rm -f "$SILENT"
+rm -f "$FAILS"
 
 # First measurement: record it, and wait.
 if [ ! -f "$STATE" ]; then

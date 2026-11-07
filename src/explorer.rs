@@ -1349,11 +1349,20 @@ mod tests {
                 "{key:?} has no French translation"
             );
         }
-        // Every Japanese key also has a French translation.
-        for key in table_keys("ja") {
+        // The two languages must cover the same keys in both directions: a
+        // string translated into one but not the other falls back to English
+        // for half the readers with no test failing (campaign 11, human).
+        let ja = table_keys("ja");
+        for key in &ja {
             assert!(
-                keys.contains(&key),
+                keys.contains(key),
                 "{key:?} is translated into Japanese only"
+            );
+        }
+        for key in &keys {
+            assert!(
+                ja.contains(key),
+                "{key:?} is translated into French only: Japanese would fall back to English"
             );
         }
     }

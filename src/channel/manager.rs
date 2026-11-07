@@ -3642,6 +3642,11 @@ impl ChannelManager {
                 chan.spend = None;
                 chan.close = None;
                 let _ = std::fs::remove_file(self.back_path(cid));
+                // The close that recorded whether an unlocked addition had
+                // happened left the chain too: forget that record, so a
+                // reclassified close reads the addition from the new chain
+                // and the archive cannot over-count it (campaign 11, tact).
+                let _ = std::fs::remove_file(self.spliced_path(cid));
             }
             if chan.conflict.is_some_and(|(t, _)| gone.contains(&t)) {
                 chan.conflict = None;

@@ -2053,12 +2053,44 @@ impl Peer {
 }
 
 /// Shared state of the node.
+/// A compact block built to serve a `getdata`, kept to answer the next
+/// requests for the same block without rebuilding it.
+///
+/// # The defect this bounds (campaign 11, `cart`)
+///
+/// A compact block is deliberately exempt from the node-wide serving budget,
+/// so a new tip never queues behind bulk reads. But building one —
+/// `CompactBlock::from_block`, a siphash over every transaction id, plus
+/// encoding the whole block to measure it — runs under the one global lock,
+/// and nothing bounded it across peers: every one of up to [`MAX_PEERS`]
+/// peers asking for the same new tip made the node redo that work, a
+/// sustained slowdown on mainnet-sized blocks with no aggregate cap. The tip
+/// is the same for all of them, so it is built once and reused for a short
+/// while; the sender nonce still rotates every [`COMPACT_CACHE_TTL`].
+struct CompactCache {
+    id: Hash256,
+    built: Instant,
+    block: std::sync::Arc<CompactBlock>,
+    /// Encoded size of the compact block, charged to the peer's budget.
+    size: usize,
+    /// Encoded size of the whole block it came from, the node-wide cost.
+    whole: usize,
+}
+
+/// How long a built compact block is reused before it is rebuilt with a
+/// fresh sender nonce. Short enough that the nonce still rotates, long
+/// enough that a burst of peers asking for a new tip share one build.
+const COMPACT_CACHE_TTL: Duration = Duration::from_secs(1);
+
 struct Shared {
     chain: Chain,
     mempool: Mempool,
     /// What all peers together may have us read to serve them, in bytes:
     /// see [`GETDATA_GLOBAL_MAX`].
     getdata_global: TokenBucket,
+    /// The last compact block built to serve a request, reused for a short
+    /// while (see [`CompactCache`]).
+    compact_cache: Option<CompactCache>,
     /// Address book, organized by network group.
     ///
     /// Lives under the same lock as the rest: a peer that announces addresses
@@ -2530,6 +2562,7 @@ impl Node {
                     tokens: GETDATA_GLOBAL_MAX,
                     last: Instant::now(),
                 },
+                compact_cache: None,
                 // Loopback and private ranges only make sense on regtest,
                 // where everything runs on a single machine. The testnet is a
                 // public network since 0.4: accepting them there let a home
@@ -5207,16 +5240,48 @@ impl Node {
                                 });
                                 (size, size)
                             }),
-                            InvKind::CompactBlock => g.chain.block_by_id(&i.hash).map(|b| {
-                                let whole = b.encode().len();
-                                let c = CompactBlock::from_block(&b, unix_now());
-                                let size = c.encode().len();
-                                outgoing.push(Outgoing {
-                                    peer: id,
-                                    message: Message::CmpctBlock(Box::new(c)),
-                                });
-                                (size, whole)
-                            }),
+                            InvKind::CompactBlock => {
+                                if let Some(b) = g.chain.block_by_id(&i.hash) {
+                                    // Reuse the compact block built for this
+                                    // id if it is fresh, so a burst of peers
+                                    // asking for the same new tip does not
+                                    // each redo the short ids and the whole
+                                    // encode under the lock (campaign 11,
+                                    // `cart`).
+                                    let cached = g.compact_cache.take().filter(|cc| {
+                                        cc.id == i.hash
+                                            && now.saturating_duration_since(cc.built)
+                                                < COMPACT_CACHE_TTL
+                                    });
+                                    let (c, size, whole) = match cached {
+                                        Some(cc) => {
+                                            let out = ((*cc.block).clone(), cc.size, cc.whole);
+                                            g.compact_cache = Some(cc);
+                                            out
+                                        }
+                                        None => {
+                                            let whole = b.encode().len();
+                                            let c = CompactBlock::from_block(&b, unix_now());
+                                            let size = c.encode().len();
+                                            g.compact_cache = Some(CompactCache {
+                                                id: i.hash,
+                                                built: now,
+                                                block: std::sync::Arc::new(c.clone()),
+                                                size,
+                                                whole,
+                                            });
+                                            (c, size, whole)
+                                        }
+                                    };
+                                    outgoing.push(Outgoing {
+                                        peer: id,
+                                        message: Message::CmpctBlock(Box::new(c)),
+                                    });
+                                    Some((size, whole))
+                                } else {
+                                    None
+                                }
+                            }
                             InvKind::Tx => g.mempool.get(&i.hash).map(|t| {
                                 let size = t.encode().len();
                                 outgoing.push(Outgoing {
@@ -12271,6 +12336,85 @@ mod tests_handler_review {
             1,
             "and nothing was dropped"
         );
+    }
+
+    /// A burst of peers asking for the same new tip share one built compact
+    /// block: it is built once, kept, and reused — not recomputed under the
+    /// lock for each of them (campaign 11, `cart`).
+    #[test]
+    fn a_compact_block_is_built_once_and_reused_for_a_burst() {
+        let net = Network::Testnet;
+        let n = Node::new(net, Chain::new(net, genesis_block(net)));
+        let genesis = n.with_chain(|c| c.tip_id());
+        let shake = |id: u64| {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&id).expect("peer");
+            p.version_received = true;
+            p.version_sent = true;
+            p.handshaked = true;
+        };
+        let ask = Message::GetData(vec![InvItem {
+            kind: InvKind::CompactBlock,
+            hash: genesis,
+        }]);
+        let compact_to = |l: &TcpListener| {
+            frames_sent(l, net)
+                .into_iter()
+                .find_map(|m| match m {
+                    Message::CmpctBlock(c) => Some(*c),
+                    _ => None,
+                })
+                .expect("a compact block")
+        };
+
+        let a = anonymous_peer(&n, 7);
+        shake(7);
+        assert!(n.handle(7, ask.clone()));
+        let first = compact_to(&a);
+        // Hold a strong reference so the first build's allocation is not
+        // freed and handed back to a later one — the pointer check would
+        // otherwise be fooled by the allocator reusing the address.
+        let keep1 = {
+            let g = n.shared.lock().unwrap();
+            let cc = g
+                .compact_cache
+                .as_ref()
+                .expect("cached after the first serve");
+            assert_eq!(cc.id, genesis);
+            cc.block.clone()
+        };
+        let ptr1 = std::sync::Arc::as_ptr(&keep1);
+
+        // A second peer, within the cache's life: the very same build is
+        // reused — the kept Arc is unchanged — and the bytes match.
+        let b = anonymous_peer(&n, 8);
+        shake(8);
+        assert!(n.handle(8, ask.clone()));
+        let second = compact_to(&b);
+        let ptr2 = {
+            let g = n.shared.lock().unwrap();
+            std::sync::Arc::as_ptr(&g.compact_cache.as_ref().unwrap().block)
+        };
+        assert_eq!(ptr1, ptr2, "the compact block was reused, not rebuilt");
+        assert_eq!(first.nonce, second.nonce, "same sender nonce");
+        assert_eq!(first.encode(), second.encode(), "byte-identical");
+
+        // Once the entry is stale, the next serve rebuilds it (a new Arc),
+        // so the sender nonce still rotates.
+        {
+            let mut g = n.shared.lock().unwrap();
+            if let Some(cc) = g.compact_cache.as_mut() {
+                cc.built = cc
+                    .built
+                    .checked_sub(COMPACT_CACHE_TTL + Duration::from_secs(1))
+                    .unwrap_or(cc.built);
+            }
+        }
+        assert!(n.handle(7, ask));
+        let g = n.shared.lock().unwrap();
+        let ptr3 = std::sync::Arc::as_ptr(&g.compact_cache.as_ref().unwrap().block);
+        assert_ne!(ptr1, ptr3, "a stale entry is rebuilt");
+        drop(keep1);
     }
 
     #[test]

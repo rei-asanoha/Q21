@@ -67,9 +67,16 @@ minisign -Vm SHA256SUMS -P RWQmIDC+1su+FM2i/NVEC2Fqba+3nhWzpTk02LM11NYhpnuts6gW/
 ```
 
 It must say `Signature and comment signature verified`, then a line
-`Trusted comment: Q21 v<version> …` naming the version you downloaded. The
-key above is the project's; compare it with the one in `README.md` and in
-`SIGNING.md`. Anything else — an error, another version — stop here.
+`Trusted comment: Q21 v<version> …` naming the version you downloaded.
+Anything else — an error, another version — stop here.
+
+Do not trust the key above just because it also appears in `README.md` or
+`SIGNING.md`: those files come from the same place as the archive, and anyone
+who could swap the archive could swap them too. Confirm the 56-character key
+matches the copy the project publishes **away from GitHub** — on the project's
+own site, or a copy you already trusted before today. If it does not match that
+independent copy, stop here, whatever the files in the download say. (This is
+the one check an attacker who took over the repository cannot defeat.)
 
 **b. Your file against the list.** Type the line for your computer:
 
@@ -170,6 +177,11 @@ it on its own.
 Two warnings are normal the first time you launch, and both say the same thing:
 no commercial certificate was bought for this program. That is true, and the
 check in step 2 takes its place.
+
+Do the following only if step 2 passed. These steps tell your computer to run
+a program it does not recognise, and are safe **only for the file you have just
+verified**. If you skipped step 2, go back and do it now — an unverified file
+is exactly what these steps would wave through.
 
 **Windows** shows a SmartScreen screen: click "More info", then "Run anyway".
 If an antivirus program quarantines `tor\tor.exe`, allow it: it is Tor, from

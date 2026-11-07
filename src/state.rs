@@ -499,7 +499,11 @@ pub fn datadir_key(datadir: &Path) -> Result<[u8; 32], StateError> {
     let tmp = path.with_extension("tmp");
     {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
+        // Created already restricted to its owner, like every other
+        // private file: `File::create` left `node.key.tmp` at the umask
+        // (0644) between creation and the final `restrict`, a window in
+        // which another local account could open it (campaign 11, crypto).
+        let mut f = create_private_temp(&tmp)?;
         f.write_all(&k)?;
         f.sync_all()?;
     }
