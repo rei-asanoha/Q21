@@ -357,17 +357,78 @@ pub fn look_alike_key(name: &str) -> String {
     key_of(name, true)
 }
 
-/// The two keys of a name: [`look_alike_key`], and the same read after
-/// lowering every letter first, where a capital I is an i. "Ivan" and "lvan"
-/// meet on the first, "Ivan" and "ivan" on the second; two names are one
-/// when either key is the same.
-pub fn name_keys(name: &str) -> (String, String) {
-    (key_of(name, true), key_of(name, false))
+/// The three keys of a name: [`look_alike_key`]; the same read after
+/// lowering every letter first, where a capital I is an i; and the consensus
+/// name **skeleton** of that lowered key. "Ivan" and "lvan" meet on the
+/// first, "Ivan" and "ivan" on the second, and "rnodern"/"modern",
+/// "vvallet"/"wallet" meet on the third. Two names are one when any key is
+/// the same.
+///
+/// The skeleton key closes a gap the per-character keys left: the on-chain
+/// name rule already reads `rn` as `m`, `vv` as `w`, `cl` as `d` and the
+/// digits that pass for letters (`names::skeleton`), so a contact or
+/// recipient named to look like a trusted one slipped in here with no
+/// warning while the consensus layer treated the two as one. The books now
+/// match that rule (campaign 11, human factor).
+pub fn name_keys(name: &str) -> (String, String, String) {
+    (key_of(name, true), key_of(name, false), skeleton_key(name))
+}
+
+/// The look-alike key with the letter ligatures the eye also reads folded:
+/// `rn` as `m`, `vv` as `w`, `cl` as `d`, and `i` as `l`. This is the
+/// letter half of the on-chain name skeleton (`names::skeleton`); the digit
+/// reads it also makes (`6` and `8` as `b`, `0` as `o` …) are left out on
+/// purpose, because a local book legitimately holds numbered names (`n6`,
+/// `n8`) that are not an attack, whereas "rnodern" beside "modern" is.
+pub fn skeleton_key(name: &str) -> String {
+    fold_ligatures(&key_of(name, false))
+}
+
+/// Folds the look-alike letter digraphs: `rn`→`m`, `vv`→`w`, `cl`→`d`, and
+/// `i`→`l`. Operates on the already homoglyph-folded, lowered key.
+fn fold_ligatures(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1).copied()) {
+            (b'r', Some(b'n')) => {
+                out.push('m');
+                i += 2;
+            }
+            (b'v', Some(b'v')) => {
+                out.push('w');
+                i += 2;
+            }
+            (b'c', Some(b'l')) => {
+                out.push('d');
+                i += 2;
+            }
+            (b'i', _) => {
+                out.push('l');
+                i += 1;
+            }
+            // A byte of a multi-byte character, or any other byte, is kept
+            // as it stands; the folds above only ever match plain ASCII
+            // letters, never a UTF-8 continuation byte (0x80–0xBF).
+            (c, _) if c < 0x80 => {
+                out.push(c as char);
+                i += 1;
+            }
+            _ => {
+                // Copy the whole UTF-8 character unchanged.
+                let ch = s[i..].chars().next().expect("valid utf-8");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
 }
 
 /// Whether two names, by their [`name_keys`], are one name to the eye.
-pub fn same_keys(a: &(String, String), b: &(String, String)) -> bool {
-    a.0 == b.0 || a.1 == b.1
+pub fn same_keys(a: &(String, String, String), b: &(String, String, String)) -> bool {
+    a.0 == b.0 || a.1 == b.1 || a.2 == b.2
 }
 
 fn key_of(name: &str, read_capitals: bool) -> String {
@@ -411,7 +472,10 @@ pub fn look_alike_loose(name: &str) -> String {
     if key.iter().any(|c| is_right_to_left(*c)) {
         key.sort_unstable();
     }
-    key.into_iter().collect()
+    // The same letter-ligature folding the refusal uses, so the warning
+    // notices "rnodern" next to "modern" too (campaign 11, human factor).
+    let s: String = key.into_iter().collect();
+    fold_ligatures(&s)
 }
 
 /// A letter of a script written right to left: Hebrew, Arabic, Syriac,
@@ -618,6 +682,32 @@ mod tests {
         assert_eq!(b.get(&h(1)).unwrap().name.as_deref(), Some("delbu"));
         assert_eq!(b.len(), 1);
         assert_eq!(b.add("  \n ", h(3), None), Err(ContactError::EmptyLabel));
+    }
+
+    /// A contact named to look like a trusted one through a letter ligature
+    /// — "rnodern" for "modern", "vvallet" for "wallet", "allce" for "alice"
+    /// — is refused, matching the on-chain name rule; numbered names that
+    /// only a digit tells apart are still allowed (campaign 11, human).
+    #[test]
+    fn a_ligature_look_alike_contact_is_refused() {
+        for (real, fake) in [
+            ("modern", "rnodern"),
+            ("wallet", "vvallet"),
+            ("alice", "allce"),
+        ] {
+            let mut b = ContactBook::default();
+            b.add(real, h(1), None).unwrap();
+            assert_eq!(
+                b.add(fake, h(2), None),
+                Err(ContactError::LabelTaken),
+                "{fake:?} should collide with {real:?}"
+            );
+        }
+        // Names that differ only by a digit are not a ligature look-alike:
+        // the local book still holds both.
+        let mut b = ContactBook::default();
+        b.add("n6", h(1), None).unwrap();
+        b.add("n8", h(2), None).expect("n6 and n8 are distinct");
     }
 
     #[test]

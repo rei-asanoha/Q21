@@ -2082,15 +2082,45 @@ struct CompactCache {
 /// enough that a burst of peers asking for a new tip share one build.
 const COMPACT_CACHE_TTL: Duration = Duration::from_secs(1);
 
+/// How many distinct recent blocks the compact cache holds at once. A
+/// single entry would be thrashed by a peer alternating two recent ids, so
+/// it keeps one per servable block — a few more than [`COMPACT_SERVE_WINDOW`]
+/// — which bounds how many compacts can be rebuilt per [`COMPACT_CACHE_TTL`]
+/// to the size of that window, however many peers ask (campaign 11, round 2,
+/// `cart`).
+const COMPACT_CACHE_MAX: usize = COMPACT_SERVE_WINDOW as usize + 2;
+
+/// How far below the active tip a block may be and still earn the compact
+/// block's exemption from the node-wide serving budget. A compact block is
+/// what a new tip travels as, and that exemption is there so a new tip never
+/// queues behind bulk reads; only a recent tip needs it. A compact request
+/// for an older block (an initial catch-up, or an attacker) is still
+/// answered with a compact block, but charged to the node-wide budget like
+/// any bulk read — otherwise a peer rotating old block ids would rebuild
+/// compact blocks (a siphash over every transaction, plus the whole-block
+/// encode) under the global lock with no aggregate cap, the amplifier the
+/// bounded cache alone did not close (campaign 11, `cart`).
+const COMPACT_SERVE_WINDOW: u64 = 6;
+
+/// Whether `id` is the active tip or one of the last [`COMPACT_SERVE_WINDOW`]
+/// blocks of the active chain — the blocks whose compact serve is exempt
+/// from the node-wide budget.
+fn recent_tip(chain: &Chain, id: &Hash256) -> bool {
+    chain.header_of(id).is_some_and(|h| {
+        chain.height().saturating_sub(h.height) <= COMPACT_SERVE_WINDOW
+            && chain.active_at(h.height) == Some(*id)
+    })
+}
+
 struct Shared {
     chain: Chain,
     mempool: Mempool,
     /// What all peers together may have us read to serve them, in bytes:
     /// see [`GETDATA_GLOBAL_MAX`].
     getdata_global: TokenBucket,
-    /// The last compact block built to serve a request, reused for a short
-    /// while (see [`CompactCache`]).
-    compact_cache: Option<CompactCache>,
+    /// The compact blocks recently built to serve requests, each reused for
+    /// a short while; bounded to [`COMPACT_CACHE_MAX`] (see [`CompactCache`]).
+    compact_cache: Vec<CompactCache>,
     /// Address book, organized by network group.
     ///
     /// Lives under the same lock as the rest: a peer that announces addresses
@@ -2562,7 +2592,7 @@ impl Node {
                     tokens: GETDATA_GLOBAL_MAX,
                     last: Instant::now(),
                 },
-                compact_cache: None,
+                compact_cache: Vec::new(),
                 // Loopback and private ranges only make sense on regtest,
                 // where everything runs on a single machine. The testnet is a
                 // public network since 0.4: accepting them there let a home
@@ -4598,10 +4628,20 @@ impl Node {
             Message::GetData(_) | Message::GetBlockTxn { .. } => Some(1),
             _ => None,
         };
-        // Only whole blocks wait for the node-wide budget too: a compact
-        // block, what a new tip travels as, and a transaction never do.
+        // Only bulk reads wait for the node-wide budget: a compact block for
+        // a recent tip, what a new tip travels as, and a transaction never
+        // do. A compact request for an OLD block is a bulk read in disguise
+        // (it costs a whole-block build) and does wait, so rotating old ids
+        // cannot slip past the node-wide cap (campaign 11, `cart`).
         let bulk = match &msg {
-            Message::GetData(v) => v.iter().any(|i| matches!(i.kind, InvKind::Block)),
+            Message::GetData(v) => {
+                let g = self.shared.lock().unwrap();
+                v.iter().any(|i| match i.kind {
+                    InvKind::Block => true,
+                    InvKind::CompactBlock => !recent_tip(&g.chain, &i.hash),
+                    InvKind::Tx => false,
+                })
+            }
             _ => true,
         };
         if let Some(need) = need {
@@ -5208,11 +5248,20 @@ impl Node {
                         if !seen.insert(i.hash) || budget == 0 {
                             continue;
                         }
-                        // A compact block, what a new tip travels as, is
-                        // not charged to the node-wide budget: the node-wide
-                        // one made new blocks wait behind bulk reads (round 5,
-                        // `arch`).
-                        let bulk = !matches!(i.kind, InvKind::CompactBlock);
+                        // A compact block for a recent tip, what a new tip
+                        // travels as, is not charged to the node-wide budget:
+                        // the node-wide one made new blocks wait behind bulk
+                        // reads (round 5, `arch`). A compact request for an
+                        // older block (catch-up, or an attacker) is still
+                        // answered with a compact block, but charged to the
+                        // node-wide budget (its whole block) like any bulk
+                        // read — so a peer rotating old ids cannot rebuild
+                        // compacts under the lock faster than that budget
+                        // allows, however many peers do it (campaign 11,
+                        // `cart`).
+                        let compact_recent = matches!(i.kind, InvKind::CompactBlock)
+                            && recent_tip(&g.chain, &i.hash);
+                        let bulk = !compact_recent;
                         // What is served is decided by the peer's own budget
                         // only. The node-wide one was waited for before the
                         // request was handled (`wait_for_serving_budget`);
@@ -5242,28 +5291,35 @@ impl Node {
                             }),
                             InvKind::CompactBlock => {
                                 if let Some(b) = g.chain.block_by_id(&i.hash) {
-                                    // Reuse the compact block built for this
-                                    // id if it is fresh, so a burst of peers
-                                    // asking for the same new tip does not
-                                    // each redo the short ids and the whole
-                                    // encode under the lock (campaign 11,
-                                    // `cart`).
-                                    let cached = g.compact_cache.take().filter(|cc| {
+                                    // Reuse a fresh build for this id if the
+                                    // cache holds one, so a burst of peers
+                                    // asking for the same recent tip — or
+                                    // rotating over the few recent tips — does
+                                    // not each redo the short ids and the
+                                    // whole-block encode under the lock
+                                    // (campaign 11, `cart`).
+                                    let fresh = g.compact_cache.iter().find(|cc| {
                                         cc.id == i.hash
                                             && now.saturating_duration_since(cc.built)
                                                 < COMPACT_CACHE_TTL
                                     });
-                                    let (c, size, whole) = match cached {
-                                        Some(cc) => {
-                                            let out = ((*cc.block).clone(), cc.size, cc.whole);
-                                            g.compact_cache = Some(cc);
-                                            out
-                                        }
+                                    let (c, size, whole) = match fresh {
+                                        Some(cc) => ((*cc.block).clone(), cc.size, cc.whole),
                                         None => {
                                             let whole = b.encode().len();
                                             let c = CompactBlock::from_block(&b, unix_now());
                                             let size = c.encode().len();
-                                            g.compact_cache = Some(CompactCache {
+                                            // Drop stale entries, then keep
+                                            // the newest within the cap.
+                                            g.compact_cache.retain(|cc| {
+                                                cc.id != i.hash
+                                                    && now.saturating_duration_since(cc.built)
+                                                        < COMPACT_CACHE_TTL
+                                            });
+                                            if g.compact_cache.len() >= COMPACT_CACHE_MAX {
+                                                g.compact_cache.remove(0);
+                                            }
+                                            g.compact_cache.push(CompactCache {
                                                 id: i.hash,
                                                 built: now,
                                                 block: std::sync::Arc::new(c.clone()),
@@ -12374,14 +12430,17 @@ mod tests_handler_review {
         // Hold a strong reference so the first build's allocation is not
         // freed and handed back to a later one — the pointer check would
         // otherwise be fooled by the allocator reusing the address.
+        let entry_for = |g: &Shared, id: Hash256| -> std::sync::Arc<CompactBlock> {
+            g.compact_cache
+                .iter()
+                .find(|cc| cc.id == id)
+                .expect("cached after the serve")
+                .block
+                .clone()
+        };
         let keep1 = {
             let g = n.shared.lock().unwrap();
-            let cc = g
-                .compact_cache
-                .as_ref()
-                .expect("cached after the first serve");
-            assert_eq!(cc.id, genesis);
-            cc.block.clone()
+            entry_for(&g, genesis)
         };
         let ptr1 = std::sync::Arc::as_ptr(&keep1);
 
@@ -12393,7 +12452,7 @@ mod tests_handler_review {
         let second = compact_to(&b);
         let ptr2 = {
             let g = n.shared.lock().unwrap();
-            std::sync::Arc::as_ptr(&g.compact_cache.as_ref().unwrap().block)
+            std::sync::Arc::as_ptr(&entry_for(&g, genesis))
         };
         assert_eq!(ptr1, ptr2, "the compact block was reused, not rebuilt");
         assert_eq!(first.nonce, second.nonce, "same sender nonce");
@@ -12403,7 +12462,7 @@ mod tests_handler_review {
         // so the sender nonce still rotates.
         {
             let mut g = n.shared.lock().unwrap();
-            if let Some(cc) = g.compact_cache.as_mut() {
+            for cc in g.compact_cache.iter_mut() {
                 cc.built = cc
                     .built
                     .checked_sub(COMPACT_CACHE_TTL + Duration::from_secs(1))
@@ -12411,10 +12470,116 @@ mod tests_handler_review {
             }
         }
         assert!(n.handle(7, ask));
-        let g = n.shared.lock().unwrap();
-        let ptr3 = std::sync::Arc::as_ptr(&g.compact_cache.as_ref().unwrap().block);
+        let ptr3 = {
+            let g = n.shared.lock().unwrap();
+            std::sync::Arc::as_ptr(&entry_for(&g, genesis))
+        };
         assert_ne!(ptr1, ptr3, "a stale entry is rebuilt");
         drop(keep1);
+    }
+
+    /// A peer rotating its compact requests cannot keep the node rebuilding
+    /// compacts under the lock for free. Within the recent window the cache
+    /// holds one entry per block, so rotation reuses after the first build of
+    /// each. A compact request for an OLD block is still served as a compact
+    /// block, but its whole-block cost is charged to the node-wide budget, so
+    /// rotating old ids is throttled by that budget however many peers do it
+    /// (campaign 11, round 2, `cart`).
+    #[test]
+    fn rotating_compact_requests_are_bounded_and_old_ids_pay_the_node_wide_budget() {
+        use crate::sig::SchemeId;
+        let net = Network::Testnet;
+        let n = node();
+        let at = |h: u64| crate::chain::GENESIS_TIME + h * crate::consensus::TARGET_BLOCK_SECS;
+        // Mine well past the window so height 1 is old.
+        let depth = COMPACT_SERVE_WINDOW + 3;
+        for h in 1..=depth {
+            let b = n
+                .with_chain(|c| {
+                    c.mine_block(
+                        Hash256([2u8; 32]),
+                        SchemeId::LamportOts,
+                        &[],
+                        at(h),
+                        50_000_000,
+                    )
+                })
+                .expect("mine");
+            n.with_chain(|c| c.connect(&b, at(h) + 1)).expect("connect");
+        }
+        let tip = n.with_chain(|c| c.tip_id());
+        let prev = n.with_chain(|c| c.active_at(depth - 1)).expect("tip-1");
+        let old = n.with_chain(|c| c.active_at(1)).expect("block 1");
+
+        let shake = |id: u64| {
+            let mut g = n.shared.lock().unwrap();
+            let p = g.peers.get_mut(&id).expect("peer");
+            p.version_received = true;
+            p.version_sent = true;
+            p.handshaked = true;
+        };
+        let ask = |h: Hash256| {
+            Message::GetData(vec![InvItem {
+                kind: InvKind::CompactBlock,
+                hash: h,
+            }])
+        };
+
+        let a = anonymous_peer(&n, 7);
+        shake(7);
+
+        // Alternate the two recent ids across six requests. Keep every built
+        // Arc alive so a reused allocation cannot be mistaken for a rebuild.
+        let mut kept: Vec<std::sync::Arc<CompactBlock>> = Vec::new();
+        let mut distinct: std::collections::HashSet<*const CompactBlock> = Default::default();
+        for round in 0..6u64 {
+            let h = if round % 2 == 0 { tip } else { prev };
+            assert!(n.handle(7, ask(h)));
+            let g = n.shared.lock().unwrap();
+            let cc = g
+                .compact_cache
+                .iter()
+                .find(|cc| cc.id == h)
+                .expect("cached after serve");
+            distinct.insert(std::sync::Arc::as_ptr(&cc.block));
+            kept.push(cc.block.clone());
+        }
+        // Two recent ids ⇒ at most two builds, however many requests: the
+        // rotation is bounded, not one build per request.
+        assert!(
+            distinct.len() <= 2,
+            "rotation rebuilt too often: {} builds",
+            distinct.len()
+        );
+        let _ = frames_sent(&a, net);
+        drop(kept);
+
+        // A recent-tip compact does NOT touch the node-wide budget; an OLD
+        // block asked for as compact is still served as a compact block, but
+        // it spends the node-wide budget (its whole-block size), which is
+        // what throttles a rotating-old-id flood across peers. The raw token
+        // count is read (not `level`), because the budget's refill rate would
+        // instantly replenish a tiny regtest block and mask the spend.
+        let raw = |n: &Node| n.shared.lock().unwrap().getdata_global.tokens;
+        let b = anonymous_peer(&n, 8);
+        shake(8);
+        assert_eq!(raw(&n), GETDATA_GLOBAL_MAX, "untouched so far");
+        assert!(n.handle(8, ask(tip)));
+        assert_eq!(
+            raw(&n),
+            GETDATA_GLOBAL_MAX,
+            "a recent tip is exempt from the node-wide budget"
+        );
+        assert!(n.handle(8, ask(old)));
+        let frames = frames_sent(&b, net);
+        assert!(
+            frames.iter().any(|m| matches!(m, Message::CmpctBlock(_))),
+            "an old compact request is still served a compact block"
+        );
+        assert!(
+            raw(&n) < GETDATA_GLOBAL_MAX,
+            "an old compact request spends the node-wide budget"
+        );
     }
 
     #[test]
