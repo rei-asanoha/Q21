@@ -11,8 +11,10 @@ the documented deployment), the persevering one (every fix re-attacked,
 every restart, kill and truncated file), the tactician (multi-step attacks
 across channels, names, contacts and reorganizations) and the regulator
 (the money, everywhere, and what the documents promise). They worked alone,
-then as a team on one board, in four rounds: each round attacked the binary
-built from the previous round's fixes.
+then as a team on one board, in six rounds and a seventh re-check: each
+round attacked the binary built from the previous round's fixes. Rounds 5
+to 7 closed what the first four had left open and could be fixed without a
+new rule of the chain.
 Rules: nothing that creates money, takes control of anything, or slows the
 real network — every attack ran in a local lab.*
 
@@ -52,6 +54,14 @@ on the next round's binary.*
 | L11 | 🟡 LOW | The published-release check used the tagged commit's script and key, and never checked the commit was on `main` | Fixed |
 | L12 | 🟡 LOW | No warning before the servers' disk is full; the data folder created readable by every account | Fixed |
 | L13 | hardening | Way B of the public explorer built Caddy from an unpinned module, never updated again | Documented |
+| M10 | 🟠 MEDIUM | Two hostile onion services answering first kept a Tor wallet away from every entry point; then (round 5) a stranger wearing an entry point's nonce counted as that entry point; then (round 6) an entry point reached by its clear address had its onion dialed and dropped at every batch | Fixed in rounds 5 to 7 |
+| M11 | 🟠 MEDIUM | Nothing bounded what all peers together had a node read to serve them: twenty-four seats, about 96 MB a second under the lock; then (round 6) the node-wide budget cut an honest node's catch-up short, and it blamed its server | Fixed in rounds 5 to 7 |
+| L14 | 🟡 LOW-MEDIUM | The channel archive ignored the real close, sweep and claim fees and booked an addition by the other side as a payment; an opening or an addition had no `max_fee` and could pay a dust change to the fee; a cooperative close proposed with a dust share gave it all to the fee; `nameregister` showed one of its two fees | Fixed in round 5 |
+| L15 | 🟡 LOW | C7 gave up open channels only: one closing, forcing or in an addition whose funding could never come back was held | Fixed in round 5 |
+| L16 | 🟡 LOW | Public explorer under two hundred addresses: answers that read a megabyte held every turn, then light calls waited behind them | Fixed in rounds 5 to 7 |
+| L17 | 🟡 LOW | Windows: a data folder outside the user's profile was readable by other accounts; libraries loaded by name were looked for in the program's folder | Fixed in round 5 |
+| L18 | 🟡 LOW | After a restart, the archive dropped an addition that had confirmed, not locked, when the channel was closed alone; a reorganization undoing a close left what it paid us in the archive | Fixed in rounds 5 to 7 |
+| L19 | 🟡 LOW | `getsupply.spendable` counted the genesis coin; the explorer's search read `1.000,5` as 1.0005 and badly grouped numbers as amounts | Fixed in rounds 5 to 7 |
 
 **No money creation, no theft, no signature forgery and no remote takeover
 was found.** The emission, the cap of 21,000,001, the UTXO set against the
@@ -100,7 +110,7 @@ transactions of 242 inputs each cost seven seconds per `getaddress`; six
 requests from one address, their sockets closed at once, kept the explorer
 at "too many requests" for everyone and slowed the node's intake of blocks.
 
-**Fix, over four rounds.** A block is read once per answer, and only its
+**Fix, over four rounds, then rounds 5 to 7 (L16).** A block is read once per answer, and only its
 outputs are kept; a public answer reads at most 32 MB and 400 blocks, and
 its client is charged by what it read, a whole block read for one
 transaction included. What exceeds a client's bucket is owed and paid back
@@ -199,19 +209,28 @@ once six blocks deep, and shown only while it belongs to the contact.
 
 ---
 
-## Rounds 2 to 4
+## Rounds 2 to 7
 
 Each round attacked the binary built from the previous round's fixes; the
-findings above marked "follow-ups" came from these rounds. In the last
-round the reviewers re-ran their confirmed attacks against the final
-candidate: the side branch of large blocks is adopted, the explorer serves
-honest calls while two hundred addresses read at their limit, the dead
-addition is said right after a restart, the given-up channel survives a
-compaction, planted files and links are refused, and the money audit — the
-cap, the emission, names, balances against the UTXO set after a reorganization
-and a restart, and every row of the 0.5.11 upgrade notes — holds.
+findings above marked "follow-ups" or "rounds 5 to 7" came from these
+rounds. Rounds 5 and 6 attacked the fixes of what round 4 had left open:
+the archive's figures and fees, `max_fee`, C7 for every phase, the Tor entry
+points, the node-wide serving budget and the Windows data folder. Round 7
+re-ran the last confirmed attacks against the final candidate: a node
+catching up from its only peer while ten connections drain it is slowed,
+never stalled nor misled into banning it; new blocks still travel in under
+half a second; `getinfo` answers in a few hundredths of a second while two
+hundred addresses read at their limit; the onion link to an entry point is
+kept and nothing is dialed again; an addition confirmed before a close
+alone is still in the archive after a restart. The money audit — the cap,
+the emission, names, balances against the UTXO set after a reorganization
+and a restart, every archive figure against the chain, and every row of the
+0.5.11 upgrade notes — holds.
 
 ## Open
+
+What remains is either the limit of the model or a decision for the review
+of the rules before a main network:
 
 - **A majority of the hash power rewriting twelve blocks** can still undo
   a locked splice and freeze the other side's balance on the old funding
@@ -221,33 +240,27 @@ and a restart, and every row of the 0.5.11 upgrade notes — holds.
   of the other's hash power, mining for hundreds of blocks while the
   stronger side then stops altogether, would be held back — the same kind
   of prolonged partition rolling finality already gives up on.
-- **The channel archive's figures** ignore the real close, sweep and claim
-  fees, and book an addition by the other side, or one that never
-  confirmed, as a payment. `channelopen` and `channelsplice` take no
-  `max_fee` and do not return the fee paid; `nameregister` shows the
-  registration fee without the funding fee; a cooperative close proposed
-  with a tiny balance gives it all to the fee.
-- **C7 gives up only open channels**: one in a splice, closing or forcing
-  whose funding a reorganization took away for good is still held.
-- **A dead addition** is said at once after a restart, even when the
-  conflicting spend is a single block deep (a display only: the close it
-  suggests is safe).
-- **The data folder's ownership** is not checked for `root`, on Windows, or
-  on disks that ignore ownership (FAT, exFAT, macOS external volumes); the
-  `tor/` subfolder is not looked into (the node makes it 0700). The Windows
-  flag covers libraries linked at build time, not those loaded by name.
-- **For a release event, GitHub runs the tagged commit's workflow**: the new
+- **Coinbase maturity (200) is shorter than the reorganization limit
+  (720)**: the texts say so; changing it is a new rule of the chain.
+- **A public explorer under a flood of hundreds of addresses** stays up
+  and answers, but a long address list is cut, and says so; a `getblock`
+  reads one body on an ordinary turn (charged by its size); a node catching
+  up shares the node-wide serving rate with whoever drains it. A public
+  service with bounded resources cannot tell a crowd of addresses from a
+  crowd of people; the wallet never depends on it.
+- **The data folder's ownership** is not checked for `root` or on disks
+  that ignore ownership (FAT, exFAT, macOS external volumes); on Windows,
+  inside the user's profile, Windows itself keeps other accounts out.
+- **For a release event, GitHub runs the tagged commit's workflow**: the
   check on `main` lives in the file it guards; the tag rulesets remain the
   real barrier.
-- **Two hostile onion services**, answering a Tor wallet first while both
-  bootstrap onions are unreachable, keep it away from the entry points'
-  clear addresses (lead, not run).
-- **The entry point's block requests**: each peer may ask for 32 MiB at once
-  then 4 MiB a second; twenty-four seats together (not run).
-- **Coinbase maturity (200) is shorter than the reorganization limit
-  (720)**: the texts now say so; the parameter is for the review of the
-  rules before a main network.
-- **`getsupply.spendable`** counts the genesis coin, which no one can spend.
+- **Display only**: a close proposed by the other side still trims our share
+  below 10,000 units (the archive shows nothing came back); a reorganization
+  the channel component never sees live — the node killed at that very
+  moment — can leave a "came back" figure from the undone close; `1.000` and
+  `1,000` read as 1, the writing being ambiguous.
+- **Clear links through Tor exits** are not authenticated: a wallet reaches
+  an entry point that way only while no onion of an entry point answers.
 - **On regtest**, the depth at which a finished splice is forgotten equals
   the lock depth: the C1 paths are covered by unit tests, not by the labs.
 - Every item of the "Open" sections of RED-TEAM-2026-9.md and
