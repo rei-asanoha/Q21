@@ -4493,3 +4493,83 @@ fn an_acceptor_restarted_or_down_when_its_funding_confirmed_still_gives_up_a_fun
         );
     }
 }
+
+/// Campaign 10 (`tact`): C7 for a channel closing, not only open: the close
+/// proposed before a reorganization took the funding away could never
+/// confirm, and the channel was held for good.
+#[test]
+fn a_closing_channel_whose_funding_can_never_come_back_is_given_up_too() {
+    let (funder_seed, acceptor_seed) = ([0xadu8; 32], [0xaeu8; 32]);
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("zombie-closing");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet,
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let hello = p
+        .funder
+        .open(A_PEER, 4 * MIN_OUTPUT_VALUE, None, None)
+        .unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    let cid = p.funder.list()[0].channel_id;
+    // The acceptor sees the block its funding confirmed in, as a node sees
+    // every block, while the channel is still opening: it keeps it.
+    drive(&p.acceptor, &chain);
+    for _ in 0..DEPTH {
+        chain.lock().unwrap().mine(&[]);
+    }
+    let rf = p.funder.funding_confirmed(cid).unwrap();
+    let ra = p.acceptor.funding_confirmed(cid).unwrap();
+    p.queue.push_back((1, rf));
+    p.queue.push_back((0, ra));
+    p.pump();
+    assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
+    let funding = p.acceptor.info(cid).unwrap().funding.expect("funded");
+    let funding_tx = {
+        let c = chain.lock().unwrap();
+        (0..=c.height())
+            .rev()
+            .filter_map(|h| c.chain.block_at(h))
+            .flat_map(|b| b.transactions)
+            .find(|t| t.txid() == funding.txid)
+            .expect("the funding on chain")
+    };
+    // Another transaction spending the funding's first coin.
+    let mut conflict = funding_tx.clone();
+    conflict.outputs.truncate(1);
+    conflict.outputs[0].value = q21_core::amount::Amount::from_units(1);
+    assert_ne!(conflict.txid(), funding_tx.txid());
+
+    // The funder proposed a close the acceptor never answered: closing.
+    let _ = p.funder.close(cid).unwrap().expect("a close frame");
+    assert_eq!(p.funder.info(cid).unwrap().phase, Phase::Closing);
+    let h = chain.lock().unwrap().height();
+    let gone = |_: &OutPoint| None;
+    for m in [&p.funder, &p.acceptor] {
+        m.on_connected_block(&[], h, &gone);
+        m.on_connected_block(std::slice::from_ref(&conflict), h + 1, &gone);
+        assert_ne!(m.info(cid).unwrap().phase, Phase::Closed, "not yet buried");
+    }
+    // Buried to the channel's settle depth (its funding depth on regtest).
+    let depth = u64::from(p.acceptor.info(cid).unwrap().funding_depth);
+    for m in [&p.funder, &p.acceptor] {
+        m.on_connected_block(&[], h + depth - 1, &gone);
+        assert_ne!(m.info(cid).unwrap().phase, Phase::Closed, "not yet buried");
+        m.on_connected_block(&[], h + depth, &gone);
+        let i = m.info(cid).unwrap();
+        assert_eq!(i.phase, Phase::Closed, "given up");
+        // Archived as given up, not as a close whose share came back
+        // (campaign 10, `regul`).
+        let a = m
+            .archived()
+            .into_iter()
+            .find(|a| a.channel_id == cid)
+            .expect("archived");
+        assert_eq!(a.how, q21_core::channel::manager::ClosedHow::Abandoned);
+    }
+}

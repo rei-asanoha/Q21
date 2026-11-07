@@ -2906,10 +2906,13 @@ impl ChannelManager {
             };
             let txid = funding.txid();
             // After a splice the channel's funding is the splice's output:
-            // the transaction held is no longer its funding.
+            // the transaction held is no longer its funding. During one, it
+            // still is the old funding the addition spends: followed too.
+            let old_funding = c.machine.splice_status().map(|st| st.old_funding.txid);
             if c.machine
                 .funding_outpoint()
                 .is_some_and(|op| op.txid != txid)
+                && old_funding != Some(txid)
             {
                 continue;
             }
@@ -3206,14 +3209,23 @@ impl ChannelManager {
             let phase = c.machine.phase();
             let ours_unfunded = matches!(phase, Phase::Opening | Phase::Funded)
                 && c.machine.our_index() == crate::channel::txbuild::FUNDER;
-            let gone_open = phase == Phase::Open && c.funding_gone;
+            // Open, its funding gone; or, since 0.5.11, closing, forcing, or
+            // in the middle of an addition, its funding (and the old one an
+            // addition spends) off the chain: held for good too, the
+            // close never able to confirm (campaign 10, `tact`).
+            let in_use = matches!(phase, Phase::Open | Phase::Closing | Phase::Forcing);
+            let gone_open =
+                in_use && (c.funding_gone || phase != Phase::Open || c.machine.splicing());
             if !ours_unfunded && !gone_open {
                 continue;
             }
+            let old_funding = c.machine.splice_status().map(|st| st.old_funding);
             let funded = c
                 .machine
                 .funding_outpoint()
-                .is_some_and(|op| depth_of(&op).is_some());
+                .into_iter()
+                .chain(old_funding)
+                .any(|op| depth_of(&op).is_some());
             let buried = height.saturating_add(1).saturating_sub(at)
                 >= settle_depth(network, c.machine.funding_depth());
             if c.spend.is_some() || funded || !buried {
