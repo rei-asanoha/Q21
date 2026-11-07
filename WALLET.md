@@ -320,6 +320,18 @@ RPC: `addressbooklist`, `addressbookadd` (`name`, `address`, `note`),
 These five locks have been put to the test by 42 real attacks, over TCP, in
 `tests/audit_rpc.rs`. Each one was an exploit that worked.
 
+**The data folder (0.5.11).** It is made readable by its owner alone, at
+every start. On Linux and macOS, the wallet refuses to start on a data folder
+that belongs to another account (root excepted), or that holds a file of
+another account or a file with a second name (a hard link), in it, in
+`channels/` or anywhere under `tor/`: another account could have planted a
+peer list or an onion key there. The message names the file; move it out and
+start again. Two honest setups meet this too: a folder on a network share
+that maps files to `nobody`, and a backup made with hard links (`cp -al`)
+inside the data folder. On Windows, a data folder outside your user folder
+is restricted to your account; inside it, Windows already keeps others out.
+On disks without owners (FAT, exFAT), nothing can be checked.
+
 ---
 
 ## What a first user found

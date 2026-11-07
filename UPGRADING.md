@@ -103,6 +103,17 @@ from block 5,950.
 | Windows programs | Their static imports looked for in their own folder first | From `System32` only |
 | `tools/monitor.sh` | Copied from the repository; no disk check | Travels in the Linux archives (`server/`), with the server guides, covered by the signature; warns when the data disk is nearly full |
 | The wallet page's block pace | The mean of the last 30 blocks | The mean of the last 10 |
+| `channelarchive` | "Came back" was the last balance before any fee, and an addition by the other side read as a payment | `put_in` (our opening and our additions) and `came_back` (what reached the wallet on chain, fees taken; null after a penalty, or for a channel closed before 0.5.11) |
+| A cooperative close proposed by a side whose share, the 0.0002 fee paid, would be dust | Its whole share went to the fee | Refused when the other side can close it |
+| A close without the other side | The page showed the closing transaction's fee only | Also the 0.0002 fee of bringing each share to its wallet |
+| An opening or an addition | A change below the dust floor went silently to the fee (up to 0.00059999), with no `max_fee` | Another coin is taken when one can be; `max_fee` accepted, refused below `open_fee_at_most`, which the page passes |
+| A channel closing, forcing, or in the middle of an addition, whose funding a reorganization took away and a coin of which was spent elsewhere | Held for good | Given up too, as an open one is (C7) |
+| `nameregister` | `fee` was the registration's only | `fee` = `funding_fee` + `registration_fee` |
+| `getsupply.spendable` | Counted the genesis coin, which no key spends | Leaves it out; `genesis_unspendable` gives it |
+| The explorer's search, `1.000,5` | 1.0005 | 1000.5; a badly grouped number (`1.5,000`) is no amount |
+| A Tor wallet whose entry points' onions do not answer | Two onion services answering first kept it away from every entry point | An entry point is always reached, by its clear address if need be |
+| What peers have a node read to serve them | Each peer's budget alone: 24 seats together, about 96 MB a second | A node-wide budget too, 128 MiB then 32 MiB a second; compact blocks, how new blocks travel, are not held by it |
+| Windows | Libraries loaded by name were looked for in the program's folder first | In `System32` only |
 
 ## Who should upgrade, and when
 

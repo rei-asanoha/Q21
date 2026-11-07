@@ -806,19 +806,28 @@ fn check_own_dir(d: &Path) -> Result<(), String> {
         // at its next start, a peer list among it (campaign 10, round 3,
         // `compl`). The `channels` and `tor` folders are looked into as
         // well: the onion service's key lives in the latter.
-        let foreign = |dir: &Path| -> Option<PathBuf> {
+        // `depth`: how many levels below `dir` are looked into too.
+        fn foreign(dir: &Path, depth: u32, me: u32) -> Option<PathBuf> {
             std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
                 let m = std::fs::symlink_metadata(e.path()).ok()?;
                 // A second name for one of our files, made while the
                 // directory was open: whoever made it writes through it
                 // still (round 4). The node never makes hard links.
                 let linked = m.is_file() && m.nlink() > 1;
-                ((m.uid() != me && m.uid() != 0) || linked).then(|| e.path())
+                if (m.uid() != me && m.uid() != 0) || linked {
+                    return Some(e.path());
+                }
+                if depth > 0 && m.is_dir() {
+                    return foreign(&e.path(), depth - 1, me);
+                }
+                None
             })
-        };
-        if let Some(f) = foreign(d)
-            .or_else(|| foreign(&d.join("channels")))
-            .or_else(|| foreign(&d.join("tor")))
+        }
+        // `tor/` to its bottom: the onion service's key lies in `tor/onion/`
+        // (round 5, `perse`).
+        if let Some(f) = foreign(d, 0, me)
+            .or_else(|| foreign(&d.join("channels"), 0, me))
+            .or_else(|| foreign(&d.join("tor"), 3, me))
         {
             return Err(format!(
                 "{} belongs to another account, or has a second name elsewhere: \
@@ -879,6 +888,13 @@ fn tighten_dir(d: &Path) {
             std::env::var("USERNAME").ok().as_deref(),
             std::env::var("USERDOMAIN").ok().as_deref(),
         );
+        if dir.is_none() {
+            eprintln!(
+                "warning: the directory {} could not be resolved, and was not checked \
+                 against your profile",
+                d.display()
+            );
+        }
         if let (Some(profile), Some(dir), Some(account)) = (profile, dir, account) {
             if outside_profile(&dir, &profile) {
                 let ok = std::process::Command::new(windows_system32("icacls.exe"))
@@ -8269,7 +8285,9 @@ fn dial_missing(
         )> = Vec::new();
         for a in targets {
             if let Ok(t) = q21_core::socks::Target::parse(a, port) {
-                if !node.is_connected_to(t.label()) {
+                // Linked at that very address, not through an alias a
+                // hostile peer can wear (round 5).
+                if !node.is_linked_at(t.label()) {
                     jobs.push((a.clone(), t, None));
                 }
             }
@@ -8324,7 +8342,7 @@ fn dial_missing(
         // (campaign 10, `compl`). An entry point the user named is always
         // reached somehow.
         let entry_reached = targets.iter().any(|a| {
-            q21_core::socks::Target::parse(a, port).is_ok_and(|t| node.is_connected_to(t.label()))
+            q21_core::socks::Target::parse(a, port).is_ok_and(|t| node.is_linked_at(t.label()))
         });
         if node.peer_count_outbound() < 2 || !entry_reached {
             dial(&clear_jobs);

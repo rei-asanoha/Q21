@@ -86,9 +86,12 @@ that was published.
 
 ### 3. Unzip — and know where the program will knock
 
-Unzip the archive wherever you like — on the Desktop, in Documents. You get a
-folder containing the program (`q21.exe` on Windows, `q21` everywhere else), a
-launcher you double-click, a few documents, and a `q21-data` subfolder.
+Unzip the archive inside your own user folder — on the Desktop, in
+Documents. You get a folder containing the program (`q21.exe` on Windows,
+`q21` everywhere else), a launcher you double-click, a few documents, and a
+`q21-data` subfolder. Not in a folder every account of the computer can write
+to, such as `C:\Q21` on Windows: another account could replace the program
+there, and it would run as you at the next launch.
 
 **There is nothing for you to do here.** This step is for reading, not doing:
 the entry point is already set up, and you can skip ahead to step 4. It is here

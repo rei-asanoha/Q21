@@ -1650,11 +1650,28 @@ impl ChannelManager {
         let came_back = std::fs::read_to_string(self.back_path(cid))
             .ok()
             .and_then(|t| t.trim().parse::<u64>().ok());
+        // An addition still in progress when the channel ended, never seen
+        // in a block: it never happened, and counts in nothing. Its state
+        // gave the adder its coins in the balances and the capacity
+        // (campaign 10, round 5, `tact`).
+        let (mut capacity, mut bal, mut ours_added) =
+            (machine.params().capacity.units(), bal, ours_added);
+        if let Some(st) = machine
+            .splice_status()
+            .filter(|st| !st.locked && st.height.is_none())
+        {
+            capacity = capacity.saturating_sub(st.add);
+            let adder = if st.ours { us } else { 1 - us };
+            bal[adder] = bal[adder].saturating_sub(st.add);
+            if st.ours {
+                ours_added = ours_added.saturating_sub(st.add);
+            }
+        }
         ArchivedChannel {
             channel_id: cid,
             peer_identity: self.read_peer_identity(cid),
             peer_owner: self.read_owner(cid).map(|o| o.to_hex()).unwrap_or_default(),
-            capacity: machine.params().capacity.units(),
+            capacity,
             we_funded: us == crate::channel::txbuild::FUNDER,
             final_local: bal[us],
             final_remote: bal[1 - us],
@@ -1983,9 +2000,18 @@ impl ChannelManager {
         // the dust floor once it is paid went whole to the fee, the page
         // saying only that the fee was 0.0002 (campaign 10, `regul`).
         if chan.machine.phase() == Phase::Open {
-            let ours = chan.machine.current_balances()[chan.machine.our_index()];
-            let left = ours.saturating_sub(CLOSE_FEE);
-            if ours >= CLOSE_FEE && left > 0 && left < crate::consensus::MIN_OUTPUT_VALUE {
+            let bal = chan.machine.current_balances();
+            let us = chan.machine.our_index();
+            let dust_after = |b: u64| {
+                b >= CLOSE_FEE
+                    && b - CLOSE_FEE > 0
+                    && b - CLOSE_FEE < crate::consensus::MIN_OUTPUT_VALUE
+            };
+            // Only when the other side can close without losing its own: on
+            // a channel that small, neither could close otherwise (round 5,
+            // `tact`).
+            let they_can = bal[1 - us] >= CLOSE_FEE && !dust_after(bal[1 - us]);
+            if dust_after(bal[us]) && they_can {
                 return Err(CLOSE_DUST.into());
             }
         }
@@ -3089,8 +3115,11 @@ impl ChannelManager {
                 } else {
                     0
                 };
-                // Our splice, signed and in no block yet: announced again.
-                if let (false, true, Some(tx)) = (on_chain, old_unspent, c.machine.splice_tx()) {
+                // Our splice, signed and in no block yet: announced again,
+                // unless it can no longer be (round 5: refused at every block).
+                if let (false, true, false, Some(tx)) =
+                    (on_chain, old_unspent, dead, c.machine.splice_tx())
+                {
                     again.push(tx.clone());
                 }
                 // A close alone, broadcast while the splice was waiting: its
@@ -3244,7 +3273,10 @@ impl ChannelManager {
                 if gone_open {
                     // Archived as given up, not as a close whose share came
                     // back: nothing did (campaign 10, `regul`).
-                    abandoned.push(c.machine.channel_id());
+                    abandoned.push((
+                        c.machine.channel_id(),
+                        c.machine.our_index() == crate::channel::txbuild::ACCEPTOR,
+                    ));
                     eprintln!(
                         "ALERT: channel {}: its funding left the chain, and a coin it spends was \
                          spent by another transaction, buried past any reorganization; the \
@@ -3261,7 +3293,12 @@ impl ChannelManager {
             }
         }
         drop(g);
-        for cid in abandoned {
+        for (cid, acceptor) in abandoned {
+            // Nothing came back to the side that did not fund it; the
+            // funder's coins never stayed in the channel (round 5).
+            if acceptor {
+                self.note_came_back(cid, 0);
+            }
             self.write_end(cid, height, ClosedHow::Abandoned);
         }
         for tx in release {
@@ -3555,14 +3592,17 @@ impl ChannelManager {
         let gone: std::collections::HashSet<Hash256> = txids.iter().copied().collect();
         let mut g = self.inner.lock().unwrap();
         for chan in g.channels.values_mut() {
+            let cid = chan.machine.channel_id();
             // The transaction that was settling the channel left the chain:
-            // wait again for what it ended.
+            // wait again for what it ended. What it paid us is no longer
+            // known (round 5, `perse`).
             if matches!(&chan.close, Some(CloseTracker::Settling { by, .. })
                 if by.iter().any(|b| gone.contains(b)))
             {
                 if let Some(CloseTracker::Settling { prior, .. }) = chan.close.take() {
                     chan.close = prior.map(|p| *p);
                 }
+                let _ = std::fs::remove_file(self.back_path(cid));
             }
             // A penalty or claim seen confirmed that left the chain: awaited
             // again, and announced again at the next block.
@@ -3577,6 +3617,7 @@ impl ChannelManager {
             if chan.spend.is_some_and(|s| gone.contains(&s)) {
                 chan.spend = None;
                 chan.close = None;
+                let _ = std::fs::remove_file(self.back_path(cid));
             }
             if chan.conflict.is_some_and(|(t, _)| gone.contains(&t)) {
                 chan.conflict = None;

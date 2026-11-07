@@ -597,6 +597,10 @@ pub(crate) struct BlockReads {
     pub(crate) bytes: usize,
     spent: bool,
     last: Option<(u64, Block)>,
+    /// A public answer's: past [`PUBLIC_HEAVY_FROM_BYTES`], it reads on only
+    /// with a turn of those that read much.
+    public: bool,
+    heavy: Option<PublicTurn>,
 }
 
 impl BlockReads {
@@ -608,6 +612,8 @@ impl BlockReads {
             bytes: 0,
             spent: false,
             last: None,
+            public: bytes != usize::MAX,
+            heavy: None,
         }
     }
 
@@ -624,6 +630,15 @@ impl BlockReads {
         if self.reads_left == 0 || self.bytes_left == 0 {
             self.spent = true;
             return None;
+        }
+        if self.public && self.bytes >= PUBLIC_HEAVY_FROM_BYTES && self.heavy.is_none() {
+            match PublicTurn::try_heavy() {
+                Some(t) => self.heavy = Some(t),
+                None => {
+                    self.spent = true;
+                    return None;
+                }
+            }
         }
         self.reads_left -= 1;
         let block = node.with_chain(|c| c.block_at(height));
@@ -706,20 +721,22 @@ static PUBLIC_ANSWERING: (Mutex<usize>, std::sync::Condvar) =
 /// Two hundred addresses, each reading one 32 MB answer as often as its own
 /// debt allowed, kept the four turns busy together: every honest call waited
 /// four to nine seconds. Reads of blocks now hold at most two turns.
+///
+/// Measured by what an answer reads, not by its method (round 5): taken
+/// once an answer has read [`PUBLIC_HEAVY_FROM_BYTES`], never waited for —
+/// without one free, the answer stops there, cut and said so. By method,
+/// every explorer page, a `getblock` per recent block, waited behind the
+/// large reads.
 pub const PUBLIC_HEAVY_AT_ONCE: usize = 2;
+
+/// What a public answer reads before it needs a turn of those that read
+/// much: see [`PUBLIC_HEAVY_AT_ONCE`].
+pub const PUBLIC_HEAVY_FROM_BYTES: usize = 1024 * 1024;
 
 /// The calls of a public explorer that may read many blocks, being answered
 /// now (see [`PUBLIC_HEAVY_AT_ONCE`]).
 static PUBLIC_HEAVY: (Mutex<usize>, std::sync::Condvar) =
     (Mutex::new(0), std::sync::Condvar::new());
-
-/// Methods that may read many blocks for one answer.
-fn reads_blocks(method: &str) -> bool {
-    matches!(
-        method,
-        "getaddress" | "getamount" | "gettransaction" | "getblock" | "search"
-    )
-}
 
 /// A turn to answer a public call, given back when dropped.
 struct PublicTurn(&'static (Mutex<usize>, std::sync::Condvar));
@@ -730,11 +747,16 @@ impl PublicTurn {
         Self::take_of(&PUBLIC_ANSWERING, PUBLIC_ANSWERS_AT_ONCE)
     }
 
-    /// Waits for a turn among those that read blocks, at most
-    /// [`PUBLIC_ANSWER_WAIT`]: taken before the ordinary turn, so that a
-    /// call waiting for it holds none of those.
-    fn take_heavy() -> Option<PublicTurn> {
-        Self::take_of(&PUBLIC_HEAVY, PUBLIC_HEAVY_AT_ONCE)
+    /// A turn among those that read much, if one is free now: never waited
+    /// for, since the caller already holds an ordinary turn.
+    fn try_heavy() -> Option<PublicTurn> {
+        let (lock, _) = &PUBLIC_HEAVY;
+        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if *n >= PUBLIC_HEAVY_AT_ONCE {
+            return None;
+        }
+        *n += 1;
+        Some(PublicTurn(&PUBLIC_HEAVY))
     }
 
     fn take_of(
@@ -1501,9 +1523,28 @@ fn amount_candidate(q: &str) -> Option<String> {
     // With both, the last one separates the decimals: `1,000.5` in English,
     // `1.000,5` in French. The point alone always won, and `1.000,5` read as
     // 1.0005 (campaign 10, `regul`).
+    // The grouping separator, when both are there, groups by three after
+    // the first group: `1.5,000` and `0.5,1` are no amounts (round 5).
+    let grouped = |int_part: &str, sep: char| {
+        int_part
+            .split(sep)
+            .skip(1)
+            .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
+    };
     let normalized = match (number.rfind('.'), number.rfind(',')) {
-        (Some(p), Some(c)) if c > p => number.replace('.', "").replace(',', "."),
-        (Some(_), _) => number.replace(',', ""),
+        (Some(p), Some(c)) if c > p => {
+            if !grouped(&number[..c], '.') {
+                return None;
+            }
+            number.replace('.', "").replace(',', ".")
+        }
+        (Some(p), Some(_)) => {
+            if !grouped(&number[..p], ',') {
+                return None;
+            }
+            number.replace(',', "")
+        }
+        (Some(_), None) => number,
         (None, _) => number.replace(',', "."),
     };
     if normalized.contains('.') || with_unit {
@@ -1738,28 +1779,6 @@ impl RpcContext {
             }
         }
 
-        // What may read many blocks waits for one of its own turns first
-        // (see [`PUBLIC_HEAVY_AT_ONCE`]).
-        let _heavy = if self.scans.is_some() && reads_blocks(&method) {
-            match PublicTurn::take_heavy() {
-                Some(t) => Some(t),
-                None => {
-                    return Json::obj()
-                        .set("jsonrpc", Json::str("2.0"))
-                        .set("id", id)
-                        .set(
-                            "error",
-                            rpc_error(
-                                ERR_REQUEST,
-                                "too many requests on this public service: slow down a little",
-                            ),
-                        )
-                        .build()
-                }
-            }
-        } else {
-            None
-        };
         // And answers a few at once, whoever asks (see
         // [`PUBLIC_ANSWERS_AT_ONCE`]).
         let _turn = if self.scans.is_some() {
@@ -1816,13 +1835,13 @@ impl RpcContext {
             ("getemission", "Emission curve at a given height"),
             ("getpow", "Parameters of the memory-hard proof of work"),
             ("getsecurity", "What is protected against a 51 % attack"),
-            ("getsupply", "Money supply issued, and the cap"),
+            ("getsupply", "Money supply issued, in the UTXO set, destroyed by names, spendable (the genesis coin excluded), and the cap"),
             (
                 "getutxocommitment",
                 "State commitment at the tip (MuHash of the UTXO set, bound to the total issued)",
             ),
             ("listmethods", "This list"),
-            ("getbalance", "[wallet] Spendable balance"),
+            ("getbalance", "[wallet] What a send can spend now (the change of pending sends included), what pending sends and channels hold (committed), what awaits maturity"),
             ("getnewaddress", "[wallet] New receiving address"),
             ("sendtoaddress", "[wallet] Send funds"),
             (
@@ -1916,7 +1935,7 @@ impl RpcContext {
         m.extend([
             (
                 "channelopen",
-                "[wallet] Open a payment channel to a peer (peer, capacity, [delay], [min_depth])",
+                "[wallet] Open a payment channel to a peer (peer, capacity, [delay], [min_depth], [max_fee])",
             ),
             (
                 "channelpay",
@@ -1924,7 +1943,7 @@ impl RpcContext {
             ),
             (
                 "channelsplice",
-                "[wallet] Add coins of the wallet to an open channel (channel_id, amount)",
+                "[wallet] Add coins of the wallet to an open channel (channel_id, amount, [max_fee])",
             ),
             (
                 "channelclose",
@@ -1946,7 +1965,7 @@ impl RpcContext {
             ),
             (
                 "nameregister",
-                "[wallet] Register a name for this wallet's identity, for 0.5 Q21 destroyed (name)",
+                "[wallet] Register a name for this wallet's identity, for 0.5 Q21 destroyed (name, [preview], [max_fee])",
             ),
             (
                 "identitysweep",
@@ -2106,6 +2125,8 @@ impl RpcContext {
             .set("status", Json::str("opening"))
             .set("peer", Json::u64(peer))
             .set("capacity", Json::u64(capacity))
+            .set("fee", Json::u64(CHANNEL_FUND_FEE))
+            .set("fee_at_most", Json::u64(CHANNEL_FUND_FEE_AT_MOST))
             .build())
     }
 
@@ -2115,9 +2136,15 @@ impl RpcContext {
     #[cfg(feature = "mldsa")]
     fn channel_fee_within(params: &Json) -> Result<(), Json> {
         match max_fee_param(params)? {
-            Some(limit) if limit < CHANNEL_FUND_FEE_AT_MOST => {
-                Err(fee_rose(CHANNEL_FUND_FEE_AT_MOST, limit))
-            }
+            Some(limit) if limit < CHANNEL_FUND_FEE_AT_MOST => Err(rpc_error(
+                ERR_REQUEST,
+                &format!(
+                    "an opening or an addition may pay up to {} Q21 (the fee, plus a change too \
+                     small to keep), more than the {} Q21 you allowed: nothing was sent",
+                    Amount::from_units(CHANNEL_FUND_FEE_AT_MOST),
+                    Amount::from_units(limit)
+                ),
+            )),
             _ => Ok(()),
         }
     }
@@ -8910,6 +8937,35 @@ mod tests {
         assert!(s.allow_call(a, at(after)));
     }
 
+    /// Campaign 10, round 5 (`prag`): a public answer past a megabyte reads
+    /// on only with one of the turns of those that read much, never waited
+    /// for: without one, it stops, cut.
+    #[test]
+    fn a_large_public_answer_needs_a_heavy_turn() {
+        let c = context_with_funds();
+        let held: Vec<PublicTurn> = (0..PUBLIC_HEAVY_AT_ONCE)
+            .filter_map(|_| PublicTurn::try_heavy())
+            .collect();
+        let mut r = BlockReads::bounded(PUBLIC_READ_BYTES, PUBLIC_BLOCK_READS);
+        assert!(
+            r.fetch(&c.node, 1).is_some(),
+            "under a megabyte: no turn needed"
+        );
+        r.bytes = PUBLIC_HEAVY_FROM_BYTES;
+        if held.len() == PUBLIC_HEAVY_AT_ONCE {
+            assert!(r.fetch(&c.node, 2).is_none());
+            assert!(r.spent(), "cut, and said so");
+        }
+        drop(held);
+        let mut r = BlockReads::bounded(PUBLIC_READ_BYTES, PUBLIC_BLOCK_READS);
+        r.bytes = PUBLIC_HEAVY_FROM_BYTES;
+        assert!(r.fetch(&c.node, 2).is_some(), "a turn free: read on");
+        // The owner's answers need none.
+        let mut r = BlockReads::bounded(usize::MAX, usize::MAX);
+        r.bytes = 10 * PUBLIC_HEAVY_FROM_BYTES;
+        assert!(r.fetch(&c.node, 3).is_some());
+    }
+
     /// Campaign 10, round 3 (`prag`): a client that owes is not evicted
     /// before those that do not, so a debt is not shed by rotating
     /// addresses.
@@ -10920,6 +10976,7 @@ mod tests {
             ("1 000,5", "1000.50000000"),
             ("1,000.5", "1000.50000000"),
             ("1.000,5", "1000.50000000"),
+            ("1.000.000,5", "1000000.50000000"),
             ("0,12345678", "0.12345678"),
         ] {
             let r = call_ok(&c, "search", &format!(r#"{{"q":"{q}"}}"#));
@@ -10938,6 +10995,10 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert!(m.contains("For an amount, write 999999.0"), "{m}");
+        // Badly grouped: not an amount (campaign 10, round 5).
+        for q in ["1.5,000", "0.5,1"] {
+            assert_eq!(amount_candidate(q), None, "{q}");
+        }
     }
 
     /// The beginning of an identifier, as lists show it, leads to it.

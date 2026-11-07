@@ -3681,6 +3681,16 @@ impl Node {
     /// Used to avoid opening a second connection to a bootstrap address that
     /// we retry periodically: two links to the same peer waste a slot and
     /// double the traffic without bringing anything.
+    /// Whether a peer is linked at exactly this address, aliases aside: an
+    /// alias holds while any peer shows the nonce it was recorded for, and
+    /// a node's nonce is the same in every handshake, learned by anyone
+    /// who connects to it once. Whether an entry point is reached is read
+    /// here (campaign 10, round 5, `compl`).
+    pub fn is_linked_at(&self, addr: SocketAddr) -> bool {
+        let g = self.shared.lock().unwrap();
+        g.peers.values().any(|p| p.addr == addr)
+    }
+
     pub fn is_connected_to(&self, addr: SocketAddr) -> bool {
         let g = self.shared.lock().unwrap();
         // An alias of a node we are linked to counts as connected, as long as
@@ -5084,6 +5094,20 @@ impl Node {
                         if !seen.insert(i.hash) || budget == 0 {
                             continue;
                         }
+                        // A compact block, what a new tip travels as, answers
+                        // to the peer's own budget only: the node-wide one
+                        // made new blocks wait behind bulk reads (round 5,
+                        // `arch`).
+                        let bulk = !matches!(i.kind, InvKind::CompactBlock);
+                        let global = if bulk {
+                            g.getdata_global.level(
+                                now,
+                                GETDATA_GLOBAL_MAX,
+                                GETDATA_GLOBAL_RATE_PER_SEC,
+                            )
+                        } else {
+                            u64::MAX
+                        };
                         let room = g
                             .peers
                             .get(&id)
@@ -5094,11 +5118,7 @@ impl Node {
                                     GETDATA_RATE_PER_SEC,
                                 )
                             })
-                            .min(g.getdata_global.level(
-                                now,
-                                GETDATA_GLOBAL_MAX,
-                                GETDATA_GLOBAL_RATE_PER_SEC,
-                            ));
+                            .min(global);
                         if room == 0 {
                             self.stats.getdata_throttled.fetch_add(1, Ordering::Relaxed);
                             break;
@@ -5143,12 +5163,14 @@ impl Node {
                                     GETDATA_RATE_PER_SEC,
                                 );
                             }
-                            g.getdata_global.spend(
-                                cost as u64,
-                                now,
-                                GETDATA_GLOBAL_MAX,
-                                GETDATA_GLOBAL_RATE_PER_SEC,
-                            );
+                            if bulk {
+                                g.getdata_global.spend(
+                                    cost as u64,
+                                    now,
+                                    GETDATA_GLOBAL_MAX,
+                                    GETDATA_GLOBAL_RATE_PER_SEC,
+                                );
+                            }
                         }
                     }
                 }
