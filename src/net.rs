@@ -3691,6 +3691,28 @@ impl Node {
         g.peers.values().any(|p| p.addr == addr)
     }
 
+    /// Whether a configured address `addr` has a link: at that very address,
+    /// or as an alias of a node linked at another configured address (the
+    /// same entry point by its onion name and by its clear address). The
+    /// alias counts only while the node holding that nonce sits at a
+    /// configured address: a stranger who copied an entry point's nonce
+    /// marks nothing reached (round 5), and a configured onion that took
+    /// the place of the clear link is not redialed (round 6, `compl`).
+    pub fn is_linked_to_entry(&self, addr: SocketAddr) -> bool {
+        let configured = self.configured.read();
+        let is_configured =
+            |a: &SocketAddr| configured.as_ref().map(|c| c.contains(a)).unwrap_or(false);
+        let g = self.shared.lock().unwrap();
+        let alias_of = g.aliases.get(&addr).copied();
+        g.peers.values().any(|p| {
+            p.addr == addr
+                || (alias_of.is_some()
+                    && p.outbound
+                    && p.remote_nonce == alias_of
+                    && is_configured(&p.addr))
+        })
+    }
+
     pub fn is_connected_to(&self, addr: SocketAddr) -> bool {
         let g = self.shared.lock().unwrap();
         // An alias of a node we are linked to counts as connected, as long as
@@ -4514,6 +4536,9 @@ impl Node {
         let mut channel_peer_ready: Option<ChannelLink> = None;
         // A reach announcement to check off the lock.
         let mut reach_in: Option<Box<crate::wire::Reach>> = None;
+        // An older link to the same node that a configured onion link
+        // replaces: closed once the lock is released.
+        let mut replaced_peer: Option<u64> = None;
 
         // A request to serve blocks waits, here in the peer's own read loop
         // and off the lock, until its budget allows it.
@@ -4594,24 +4619,55 @@ impl Node {
                     let is_configured = |a: &SocketAddr| {
                         configured.as_ref().map(|c| c.contains(a)).unwrap_or(false)
                     };
-                    let duplicate = self.proxy().is_some()
+                    let fresh_outbound = self.proxy().is_some()
                         && g.peers
                             .get(&id)
                             .map(|p| p.outbound && !p.version_received)
-                            .unwrap_or(false)
-                        && g.peers.iter().any(|(other, p)| {
-                            *other != id
-                                && p.outbound
-                                && p.remote_nonce == Some(nonce)
-                                && is_configured(&p.addr)
-                        });
-                    if duplicate {
-                        if let Some(addr) = g.peers.get(&id).map(|p| p.addr) {
-                            if g.aliases.len() >= 64 {
-                                g.aliases.clear();
-                            }
-                            g.aliases.insert(addr, nonce);
+                            .unwrap_or(false);
+                    let older: Option<(u64, SocketAddr)> = if fresh_outbound {
+                        g.peers
+                            .iter()
+                            .find(|(other, p)| {
+                                **other != id
+                                    && p.outbound
+                                    && p.remote_nonce == Some(nonce)
+                                    && is_configured(&p.addr)
+                            })
+                            .map(|(other, p)| (*other, p.addr))
+                    } else {
+                        None
+                    };
+                    // An entry point's configured onion name is kept over a
+                    // link to it by its clear address or a DNS name, both
+                    // through a Tor exit: the onion link is the
+                    // authenticated one. Dropping the onion instead had it
+                    // dialed again and dropped at every batch, for as long
+                    // as the clear link lasted (round 6, `compl`).
+                    let is_onion = |g: &Shared, a: SocketAddr| {
+                        is_onion_label(a) && g.onions.name_of_label(a).is_some()
+                    };
+                    let new_addr = g.peers.get(&id).map(|p| p.addr);
+                    let replaces = match (older, new_addr) {
+                        (Some((_, old)), Some(new)) => {
+                            is_configured(&new) && is_onion(&g, new) && !is_onion(&g, old)
                         }
+                        _ => false,
+                    };
+                    let duplicate = older.is_some() && !replaces;
+                    // The address left behind becomes an alias of the node.
+                    let alias = match (older, new_addr) {
+                        (Some((_, old)), _) if replaces => Some(old),
+                        (Some(_), Some(new)) => Some(new),
+                        _ => None,
+                    };
+                    if let Some(addr) = alias {
+                        if g.aliases.len() >= 64 {
+                            g.aliases.clear();
+                        }
+                        g.aliases.insert(addr, nonce);
+                    }
+                    if replaces {
+                        replaced_peer = older.map(|(other, _)| other);
                     }
                     if nonce == local_nonce || version < MIN_PROTOCOL_VERSION || duplicate {
                         drop_peer = true;
@@ -6061,6 +6117,10 @@ impl Node {
                 }
             }
         } // --- lock released here, before any network write ---
+
+        if let Some(old) = replaced_peer {
+            self.disconnect(old);
+        }
 
         // The channel component runs off the chain lock, so it is free to sign
         // and verify. An unsolicited message is penalized the same way.
@@ -11843,6 +11903,71 @@ mod tests_handler_review {
             } else {
                 assert!(second, "without Tor, nothing is compared");
             }
+        }
+    }
+
+    /// Through Tor, an entry point reached by its clear address and then by
+    /// its configured onion name keeps the onion link, the authenticated
+    /// one, and the clear address is not dialed again while it lasts; the
+    /// other way round, the newer clear link is dropped (round 6, `compl`).
+    #[test]
+    fn a_configured_onion_link_replaces_the_clear_one_to_the_same_node() {
+        for onion_first in [false, true] {
+            let n = node();
+            n.set_proxy(Some(SocketAddr::from(([127, 0, 0, 1], 9))));
+            let onion = test_onion();
+            let label = crate::socks::Target::Name(onion.host(), onion.port).label();
+            let clear = SocketAddr::from(([203, 0, 113, 7], 8333));
+            n.shared
+                .lock()
+                .unwrap()
+                .onions
+                .add(onion.clone(), unix_now());
+            n.set_configured_targets(vec![clear, label]);
+            let _a = anonymous_peer(&n, 7);
+            let _b = anonymous_peer(&n, 8);
+            let (first, second) = if onion_first {
+                (label, clear)
+            } else {
+                (clear, label)
+            };
+            {
+                let mut g = n.shared.lock().unwrap();
+                for (id, a) in [(7, first), (8, second)] {
+                    let p = g.peers.get_mut(&id).unwrap();
+                    p.outbound = true;
+                    p.addr = a;
+                }
+            }
+            let version = Message::Version {
+                version: PROTOCOL_VERSION,
+                timestamp: unix_now(),
+                nonce: 0x5151,
+                user_agent: "peer".into(),
+                start_height: 0,
+            };
+            assert!(n.handle(7, version.clone()));
+            let kept = n.handle(8, version);
+            let left: Vec<SocketAddr> = n
+                .shared
+                .lock()
+                .unwrap()
+                .peers
+                .values()
+                .map(|p| p.addr)
+                .collect();
+            if onion_first {
+                assert!(!kept, "the newer clear link is dropped");
+                n.shared.lock().unwrap().peers.remove(&8);
+            } else {
+                assert!(kept, "the onion link is kept");
+                assert_eq!(left, vec![label], "and the clear one is closed");
+            }
+            assert!(n.is_linked_to_entry(label));
+            assert!(
+                n.is_linked_to_entry(clear),
+                "the clear address is not dialed again while the onion link lasts"
+            );
         }
     }
 

@@ -8285,9 +8285,10 @@ fn dial_missing(
         )> = Vec::new();
         for a in targets {
             if let Ok(t) = q21_core::socks::Target::parse(a, port) {
-                // Linked at that very address, not through an alias a
-                // hostile peer can wear (round 5).
-                if !node.is_linked_at(t.label()) {
+                // Linked at that very address, or as an alias of a link at
+                // another configured address, never through an alias a
+                // hostile peer can wear (rounds 5 and 6).
+                if !node.is_linked_to_entry(t.label()) {
                     jobs.push((a.clone(), t, None));
                 }
             }
@@ -8342,7 +8343,8 @@ fn dial_missing(
         // (campaign 10, `compl`). An entry point the user named is always
         // reached somehow.
         let entry_reached = targets.iter().any(|a| {
-            q21_core::socks::Target::parse(a, port).is_ok_and(|t| node.is_linked_at(t.label()))
+            q21_core::socks::Target::parse(a, port)
+                .is_ok_and(|t| node.is_linked_to_entry(t.label()))
         });
         if node.peer_count_outbound() < 2 || !entry_reached {
             dial(&clear_jobs);
