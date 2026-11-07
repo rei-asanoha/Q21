@@ -3238,10 +3238,22 @@ impl Node {
     /// those of the peers already connected.
     pub fn addresses_to_try(&self, count: usize) -> Vec<crate::wire::NetAddr> {
         let g = self.shared.lock().unwrap();
+        // The addresses of the linked peers, and those found to lead to a
+        // linked node: an entry point linked by its onion name is not dialed
+        // again at its clear address, dropped as the same node at every
+        // batch (campaign 10, round 6).
+        let nonces: HashSet<u64> = g.peers.values().filter_map(|p| p.remote_nonce).collect();
         let already: Vec<[u8; 4]> = g
             .peers
             .values()
-            .filter_map(|p| match p.addr {
+            .map(|p| p.addr)
+            .chain(
+                g.aliases
+                    .iter()
+                    .filter(|(_, n)| nonces.contains(n))
+                    .map(|(a, _)| *a),
+            )
+            .filter_map(|a| match a {
                 SocketAddr::V4(a) => Some(a.ip().octets()),
                 _ => None,
             })
@@ -11967,6 +11979,19 @@ mod tests_handler_review {
             assert!(
                 n.is_linked_to_entry(clear),
                 "the clear address is not dialed again while the onion link lasts"
+            );
+            // Nor from the address book, where its handshake proved it.
+            n.seed_addresses(&[crate::wire::NetAddr {
+                ip: [203, 0, 113, 7],
+                port: 8333,
+                last_seen: unix_now(),
+            }]);
+            assert_eq!(n.address_count(), 1, "the book holds it");
+            assert!(
+                n.addresses_to_try(8)
+                    .iter()
+                    .all(|a| a.ip != [203, 0, 113, 7]),
+                "onion_first={onion_first}"
             );
         }
     }
