@@ -328,7 +328,7 @@ another account or a file with a second name (a hard link), in it, in
 peer list or an onion key there. The message names the file; move it out and
 start again. Two honest setups meet this too: a folder on a network share
 that maps files to `nobody`, and a backup made with hard links (`cp -al`)
-inside the data folder. On Windows, a data folder outside your user folder
+anywhere on the same disk, since the files it links to then have two names. On Windows, a data folder outside your user folder
 is restricted to your account; inside it, Windows already keeps others out.
 On disks without owners (FAT, exFAT), nothing can be checked.
 

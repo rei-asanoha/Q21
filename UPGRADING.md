@@ -125,12 +125,21 @@ lock protects a channel only once both sides run 0.5.11.
 ## The servers
 
 Before restarting on 0.5.11, check that nothing in the data folder belongs
-to another account: 0.5.11 refuses to start on such a folder, and the
-service would restart in a loop. This must print nothing:
+to another account, and no file with a second name (a hard link, as a
+`cp -al` backup anywhere on the same disk leaves): 0.5.11 refuses to start on
+such a folder, and the service would restart in a loop. These two must print
+nothing:
 
 ```bash
-sudo find /opt/q21/data /opt/q21/data/channels -maxdepth 1 ! -user q21 ! -user root
+sudo find /opt/q21/data /opt/q21/data/channels -maxdepth 1 \( ! -user q21 ! -user root -o -type f -links +1 \) -print
 ```
+
+```bash
+sudo find /opt/q21/data/tor -maxdepth 4 \( ! -user q21 ! -user root -o -type f -links +1 \) -print
+```
+
+The second one says "No such file or directory" on a server without an
+onion service: that is fine.
 
 Then, once the 0.5.11 archive is downloaded, verified and extracted as in
 SERVER.md (step "Then, and only then"), install `monitor.sh` again, this
