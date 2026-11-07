@@ -21,6 +21,7 @@
 
 use crate::address::{Address, Network};
 use crate::amount::Amount;
+#[cfg(test)]
 use crate::consensus::COINBASE_MATURITY;
 use crate::hash::{tagged_hash_parts, tags, Hash256};
 use crate::lamport::SecretKey;
@@ -1465,15 +1466,14 @@ impl Wallet {
         let mut next: Option<(u64, u64)> = None;
         for hash in self.known.keys() {
             for (_, e) in utxo.outputs_of(hash) {
-                if e.output.scheme != self.scheme
-                    || !e.is_coinbase
-                    || height >= e.height + COINBASE_MATURITY
+                let maturity = crate::consensus::coinbase_maturity_at(self.network(), e.height);
+                if e.output.scheme != self.scheme || !e.is_coinbase || height >= e.height + maturity
                 {
                     continue;
                 }
                 let value = e.output.value.units();
                 total = total.saturating_add(value);
-                let free_at = e.height + COINBASE_MATURITY;
+                let free_at = e.height + maturity;
                 next = match next {
                     Some((h, m)) if h == free_at => Some((h, m.saturating_add(value))),
                     // Always keep the nearest release.
@@ -1528,7 +1528,7 @@ impl Wallet {
         h: &Hash256,
         height: u64,
     ) -> Vec<(OutPoint, crate::utxo::UtxoEntry)> {
-        utxo.spendable_for(h, height, COINBASE_MATURITY)
+        utxo.spendable_for(h, height, self.network())
             .into_iter()
             .filter(|(_, e)| e.output.scheme == self.scheme)
             .collect()
@@ -3917,12 +3917,10 @@ mod tests {
             let mut immature = 0u64;
             let mut next: Option<(u64, u64)> = None;
             for (_, e) in utxo.iter() {
-                if e.is_coinbase
-                    && height < e.height + COINBASE_MATURITY
-                    && w.owns(&e.output.pubkey_hash)
-                {
+                let maturity = crate::consensus::coinbase_maturity_at(w.network(), e.height);
+                if e.is_coinbase && height < e.height + maturity && w.owns(&e.output.pubkey_hash) {
                     immature += e.output.value.units();
-                    let free_at = e.height + COINBASE_MATURITY;
+                    let free_at = e.height + maturity;
                     match next {
                         Some((h, m)) if h == free_at => {
                             next = Some((h, m + e.output.value.units()))

@@ -375,7 +375,7 @@ the **Actions** tab is never signed, and is never installed.
 Replace `v0.5.10` with the version you install:
 
 ```bash
-cd ~ && V=v0.5.12 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
+cd ~ && V=v0.6.0 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
 ```
 
 (On a Raspberry Pi, `q21-linux-arm64.tar.gz` instead.)

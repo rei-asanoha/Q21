@@ -477,15 +477,21 @@ impl UtxoSet {
         &self,
         pubkey_hash: &crate::hash::Hash256,
         current_height: u64,
-        maturity: u64,
+        network: crate::address::Network,
     ) -> Vec<(OutPoint, UtxoEntry)> {
         let Some(points) = self.by_pubkey_hash.get(pubkey_hash) else {
             return Vec::new();
         };
+        // A reward matures under the rule in force when it was created (see
+        // `consensus::coinbase_maturity_at`).
         let mut v: Vec<(OutPoint, UtxoEntry)> = points
             .iter()
             .filter_map(|o| self.map.get(o).map(|e| (*o, *e)))
-            .filter(|(_, e)| !e.is_coinbase || current_height >= e.height + maturity)
+            .filter(|(_, e)| {
+                !e.is_coinbase
+                    || current_height
+                        >= e.height + crate::consensus::coinbase_maturity_at(network, e.height)
+            })
             .collect();
         // Deterministic order: without it, two runs would build different
         // transactions from the same wallet.
@@ -801,8 +807,52 @@ mod tests {
         u.apply_transaction(&coinbase(10_000, 7), 10, &mut undo);
         let h = Hash256([7u8; 32]);
 
-        assert!(u.spendable_for(&h, 50, 200).is_empty(), "too early");
-        assert_eq!(u.spendable_for(&h, 210, 200).len(), 1, "should be mature");
+        assert!(
+            u.spendable_for(&h, 50, crate::address::Network::Regtest)
+                .is_empty(),
+            "too early"
+        );
+        assert_eq!(
+            u.spendable_for(&h, 210, crate::address::Network::Regtest)
+                .len(),
+            1,
+            "should be mature"
+        );
+    }
+
+    /// 0.6.0: a reward matures under the rule in force when it was created.
+    /// On testnet, one created below the activation height keeps 200 blocks;
+    /// one created at or past it waits 720. Mainnet: 720 from the first
+    /// block. Regtest: 200, always.
+    #[test]
+    fn a_reward_matures_under_the_rule_it_was_created_under() {
+        use crate::address::Network;
+        use crate::consensus::{coinbase_maturity_at, MATURITY_ACTIVATION_TESTNET};
+        let act = MATURITY_ACTIVATION_TESTNET;
+        assert_eq!(coinbase_maturity_at(Network::Testnet, act - 1), 200);
+        assert_eq!(coinbase_maturity_at(Network::Testnet, act), 720);
+        assert_eq!(coinbase_maturity_at(Network::Mainnet, 1), 720);
+        assert_eq!(coinbase_maturity_at(Network::Regtest, 1_000_000), 200);
+
+        let mut u = UtxoSet::new();
+        let mut undo = UndoRecord::default();
+        // Two rewards to the same key: one just before, one at activation.
+        u.apply_transaction(&coinbase(10_000, 7), act - 1, &mut undo);
+        u.apply_transaction(&coinbase(20_000, 7), act, &mut undo);
+        let h = Hash256([7u8; 32]);
+        let at = |height: u64| u.spendable_for(&h, height, Network::Testnet).len();
+        assert_eq!(at(act + 198), 0, "neither is mature yet");
+        assert_eq!(
+            at(act + 199),
+            1,
+            "the one created before activation: 200 blocks"
+        );
+        assert_eq!(
+            at(act + 719),
+            1,
+            "the one created at activation still waits"
+        );
+        assert_eq!(at(act + 720), 2, "and matures at 720");
     }
 
     #[test]
@@ -812,8 +862,16 @@ mod tests {
         u.apply_transaction(&coinbase(1_000, 1), 0, &mut undo);
         u.apply_transaction(&coinbase(2_000, 2), 0, &mut undo);
 
-        assert_eq!(u.spendable_for(&Hash256([1u8; 32]), 1000, 0).len(), 1);
-        assert_eq!(u.spendable_for(&Hash256([9u8; 32]), 1000, 0).len(), 0);
+        assert_eq!(
+            u.spendable_for(&Hash256([1u8; 32]), 1000, crate::address::Network::Regtest)
+                .len(),
+            1
+        );
+        assert_eq!(
+            u.spendable_for(&Hash256([9u8; 32]), 1000, crate::address::Network::Regtest)
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -827,12 +885,12 @@ mod tests {
         }
         let h = Hash256([1u8; 32]);
         let a: Vec<_> = u
-            .spendable_for(&h, 1000, 0)
+            .spendable_for(&h, 1000, crate::address::Network::Regtest)
             .iter()
             .map(|(o, _)| *o)
             .collect();
         let b: Vec<_> = u
-            .spendable_for(&h, 1000, 0)
+            .spendable_for(&h, 1000, crate::address::Network::Regtest)
             .iter()
             .map(|(o, _)| *o)
             .collect();

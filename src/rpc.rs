@@ -2674,7 +2674,7 @@ impl RpcContext {
         let ours = |o: &crate::tx::TxOut| w.owns_output(o);
         let mut coins: Vec<(crate::tx::OutPoint, crate::tx::TxOut)> = c
             .utxo
-            .spendable_for(owner, c.height(), COINBASE_MATURITY)
+            .spendable_for(owner, c.height(), c.network)
             .into_iter()
             // Only the identity key's own scheme: an output of another
             // scheme on its hash can never be spent (red-team campaign 6, S3).
@@ -3712,7 +3712,7 @@ impl RpcContext {
 
     fn getinfo(&self) -> Json {
         use std::sync::atomic::Ordering;
-        let (height, tip, work, known, issued, utxo, bits) = self.node.with_chain(|c| {
+        let (height, tip, work, known, issued, utxo, bits, network) = self.node.with_chain(|c| {
             (
                 c.height(),
                 c.tip_id().to_hex(),
@@ -3721,9 +3721,14 @@ impl RpcContext {
                 c.total_issued(),
                 c.utxo.len(),
                 c.tip().bits,
+                c.network,
             )
         });
         let s = &self.node.stats;
+        // The maturity of a reward created at the next block, and the height
+        // from which rewards mature in the longer delay (0.6.0).
+        let maturity_now = crate::consensus::coinbase_maturity_at(network, height + 1);
+        let maturity_from = crate::consensus::maturity_activation(network);
 
         Json::obj()
             // The version of the program that answers. Same reason as the two
@@ -3826,7 +3831,19 @@ impl RpcContext {
             // block lasts. Copying them into the page would freeze them by
             // hand, and so lie the day they changed. The node is the only
             // source entitled to state them.
-            .set("coinbase_maturity", Json::u64(COINBASE_MATURITY))
+            .set("coinbase_maturity", Json::u64(maturity_now))
+            .set(
+                "coinbase_maturity_long",
+                Json::u64(crate::consensus::COINBASE_MATURITY_LONG),
+            )
+            .set(
+                "coinbase_maturity_from",
+                if maturity_from == u64::MAX {
+                    Json::Null
+                } else {
+                    Json::u64(maturity_from)
+                },
+            )
             .set("target_interval_seconds", Json::u64(TARGET_BLOCK_SECS))
             // --- The activation of policy outputs, as `channelstatus`
             //     reports it, at the same tip as the rest of this answer, and
@@ -5723,6 +5740,7 @@ impl RpcContext {
         });
 
         let (movements, since, height, all_resolved, missing_bodies) = self.node.with_chain(|c| {
+            let network = c.network;
             let height = c.height();
             // --- Which blocks to read, most recent first.
             //
@@ -5938,7 +5956,12 @@ impl RpcContext {
                     .set("received", amount_json(Amount::from_units(d.received)))
                     .set(
                         "mature",
-                        Json::Bool(!d.coinbase || height >= d.height + COINBASE_MATURITY),
+                        Json::Bool(
+                            !d.coinbase
+                                || height
+                                    >= d.height
+                                        + crate::consensus::coinbase_maturity_at(network, d.height),
+                        ),
                     );
                 if is_send {
                     row = row
@@ -7667,7 +7690,7 @@ mod tests {
         mine_pool(c);
         c.node.with_chain(|ch| {
             ch.utxo
-                .spendable_for(&owner, ch.height(), COINBASE_MATURITY)
+                .spendable_for(&owner, ch.height(), ch.network)
                 .into_iter()
                 .find(|(_, e)| e.output.value.units() == units)
                 .map(|(o, e)| (o, e.output))

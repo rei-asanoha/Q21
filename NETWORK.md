@@ -246,6 +246,46 @@ blocks of the real chain refused as beyond finality. Stop the node, write
 `catching-up` in place of `bound` in `finality.dat`, connect it to a peer you
 trust (`--bootstrap`), and start it again.
 
+## If the network splits for more than a day
+
+Rolling finality trades a silent rewrite for a visible split: if the network
+is cut in two for longer than 720 blocks (about a day) — a continent cut off,
+every path between two groups of nodes down — each half keeps mining its own
+chain, and once both are bound neither will ever adopt the other's. The code
+cannot settle this: it does not know which half is "the" network. People do.
+
+The rule, decided before it is ever needed (0.6.0):
+
+1. **The half with less cumulative work follows the other.** Work, not the
+   number of nodes, not who speaks first: it is the one measure every node
+   computes itself and no one can forge. `getinfo` → `total_work` on a node of
+   each half says which is which.
+2. **On the half that follows**, every operator stops their node, writes
+   `catching-up` in place of `bound` in `finality.dat` (as above), starts it
+   again connected to a peer of the other half (`--bootstrap`), and lets it
+   reorganize. Blocks mined on the losing half during the split are gone, and
+   so are payments made only there: a payment that mattered is made again on
+   the chain that remains.
+3. **Nothing is done in the first day.** Below 720 blocks the chains still
+   reconcile on their own; acting earlier only makes a split out of a hiccup.
+
+The explorer and the entry points publish which half they are on, so a wallet
+holder who sees a tip and a work total unlike the explorer's knows they are
+on the other side, and what to do.
+
+## The maturity of a block reward
+
+A reward is spendable [`COINBASE_MATURITY_LONG`](src/consensus.rs) blocks
+after the block that created it — 720, one day, the same depth beyond which
+the chain is never rewritten — from testnet block 7,000 (0.6.0; 200 blocks
+before it, and still 200 for a reward created below 7,000) and from the
+first block of a main network. A reward is spendable only once the block
+that created it can no longer be undone, so no one is ever paid with coins
+the chain can still take back. It is a stricter rule, a soft fork: every
+block a 0.6.0 node accepts, a 0.5.x node accepts too; only a miner that has
+not upgraded may include a spend the new nodes refuse, so the miners upgrade
+first.
+
 ## A block comes after its parent
 
 From testnet block 5,950 (0.5.5; 0.5.4 had scheduled it at 7,600), a

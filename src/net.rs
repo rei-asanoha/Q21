@@ -2803,7 +2803,7 @@ impl Node {
             let g = self.shared.lock().unwrap();
             g.chain
                 .utxo
-                .spendable_for(hash, tip, crate::consensus::COINBASE_MATURITY)
+                .spendable_for(hash, tip, g.network)
                 .into_iter()
                 .map(|(o, e)| (o, e.output))
                 .collect::<Vec<_>>()

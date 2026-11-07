@@ -643,12 +643,17 @@ pub fn check_transaction<V: UtxoView + ?Sized>(
             )));
         }
 
-        // --- Rule: coinbase maturity.
-        if e.is_coinbase && height < e.height + COINBASE_MATURITY {
-            return Err(ValidationError::CoinbaseImmature {
-                available_at: e.height + COINBASE_MATURITY,
-                height,
-            });
+        // --- Rule: coinbase maturity: the one in force when the reward was
+        //     created (200 blocks, then 720 from the activation height; see
+        //     `consensus::coinbase_maturity_at`).
+        if e.is_coinbase {
+            let maturity = crate::consensus::coinbase_maturity_at(network, e.height);
+            if height < e.height + maturity {
+                return Err(ValidationError::CoinbaseImmature {
+                    available_at: e.height + maturity,
+                    height,
+                });
+            }
         }
 
         // --- Rule: the scheme must be allowed on this network.

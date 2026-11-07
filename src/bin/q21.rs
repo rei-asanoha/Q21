@@ -3411,7 +3411,8 @@ fn cmd_balance(datadir: &Path) -> Result<(), String> {
     let mut immature = 0u64;
     for (_, entry) in e.chain.utxo.iter() {
         if entry.is_coinbase
-            && h < entry.height + COINBASE_MATURITY
+            && h < entry.height
+                + q21_core::consensus::coinbase_maturity_at(e.chain.network, entry.height)
             && e.wallet.owns_output(&entry.output)
         {
             immature += entry.output.value.units();
@@ -3419,8 +3420,9 @@ fn cmd_balance(datadir: &Path) -> Result<(), String> {
     }
     if immature > 0 {
         println!(
-            "{} Q21 still immature ({COINBASE_MATURITY} blocks to maturity)",
-            Amount::from_units(immature)
+            "{} Q21 still immature ({} blocks to maturity)",
+            Amount::from_units(immature),
+            q21_core::consensus::coinbase_maturity_at(e.chain.network, h)
         );
     }
 
@@ -3704,7 +3706,10 @@ fn cmd_utxo(datadir: &Path) -> Result<(), String> {
     for (_, entry) in e.chain.utxo.iter() {
         if e.wallet.owns_output(&entry.output) {
             n_ours += 1;
-            if entry.is_coinbase && h < entry.height + COINBASE_MATURITY {
+            if entry.is_coinbase
+                && h < entry.height
+                    + q21_core::consensus::coinbase_maturity_at(e.chain.network, entry.height)
+            {
                 immature += entry.output.value.units();
             } else {
                 ours += entry.output.value.units();

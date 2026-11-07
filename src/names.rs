@@ -879,7 +879,7 @@ mod consensus_tests {
         assert_eq!(u.names_owned(&k.hash()), 1);
         assert_eq!(u.names().burned(), NAME_PRICE);
         // The owner output is a record, not a coin: no wallet sees it.
-        let mine = u.spendable_for(&k.hash(), H, 0);
+        let mine = u.spendable_for(&k.hash(), H, crate::address::Network::Regtest);
         assert_eq!(mine.len(), 1, "the change only");
         assert_eq!(mine[0].1.output.value.units(), COIN - NAME_PRICE - FEE);
     }

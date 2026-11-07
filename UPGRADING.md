@@ -67,6 +67,63 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.5.12 to 0.6.0
+
+0.6.0 changes **one rule of the chain**: from testnet block **7,000**, a block
+reward matures in 720 blocks (one day) instead of 200 (6 h 40) — the same
+depth beyond which the chain is never rewritten, so no one is ever paid with
+coins the chain can still take back. A reward created before block 7,000
+keeps its 200 blocks. Nothing else changes for the chain, the channels or the
+wallet file. Mining does not need to stop.
+
+It is a stricter rule, a **soft fork**: every block a 0.6.0 node accepts, a
+0.5.x node accepts too, and a 0.5.x node follows the chain the 0.6.0 nodes
+build. The one thing that must not happen is a **miner** still on 0.5.x past
+block 7,000 including a spend of a young reward: the 0.6.0 nodes refuse that
+block, and the miner's work is lost. So the miners upgrade before block
+7,000; everyone else when convenient. 0.6.0 also writes down the rule for a
+network split longer than a day (NETWORK.md), and the explorer's text on
+mining transactions says the new delay.
+
+The testnet schedule: payment channels open since block 4,980, names since
+block 5,200, block timestamps strictly after their parent's from block 5,950,
+and the one-day maturity from block 7,000.
+
+## What changes
+
+| | 0.5.12 | 0.6.0 |
+|---|---|---|
+| A block reward created at or after testnet block 7,000 | Spendable after 200 blocks (6 h 40), while the chain could still rewrite its block for up to 720 | Spendable after 720 blocks (one day), once its block can no longer be undone |
+| A reward created before block 7,000 | 200 blocks | 200 blocks, unchanged |
+| `getinfo` | `coinbase_maturity` was the one constant | `coinbase_maturity` is the delay of a reward created at the next block; `coinbase_maturity_long` (720) and `coinbase_maturity_from` (the activation height, or null) say the rule |
+| The explorer, a mining transaction | "the maturity delay of 200 blocks … a deeper reorganization can undo such a payment" | "one day (720 blocks) — the same depth beyond which this chain is never rewritten", and on the test network the note on rewards created before block 7,000 |
+| A split of the network longer than a day | The trade-off was stated; what to do was not | NETWORK.md: the half with less cumulative work follows the other; nothing is done within the first day |
+
+## Who should upgrade, and when
+
+**Miners first, before block 7,000.** Everyone else when convenient: a 0.5.x
+node keeps following the chain. If you run a server that mines (France,
+Singapore, the Raspberry), it is a miner.
+
+## The servers
+
+Same checks as for 0.5.12 (the data folder, then `monitor.sh` from the
+archive). Before restarting, read the current height — it must be well below
+7,000, and the restart must be done before it:
+
+```bash
+sudo curl -s -X POST http://127.0.0.1:21080/rpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getinfo","params":{}}' | grep -oE '"height":[0-9]+'
+```
+
+Nothing changes in Caddy.
+
+## The data folder
+
+Nothing changes. Going back to 0.5.12 with the same folder is safe before
+block 7,000; after it, a 0.5.12 miner may mine a block the network refuses.
+
+---
+
 # Upgrading from 0.5.11 to 0.5.12
 
 0.5.12 changes no rule of block validity and nothing in a channel's

@@ -147,7 +147,10 @@ it **cannot** steal a coin without its key, mint beyond the subsidy, raise the
 cap, or change a rule. Q21 adds cumulative-work fork choice, rolling finality at
 720 blocks, and a depth penalty (+1% work per block beyond 6, capped at +25%).
 The trade-off: a network partition longer than ~24 hours yields two chains that
-will not reconcile on their own. A silent rewrite becomes a visible split.
+will not reconcile on their own. A silent rewrite becomes a visible split; the
+rule for settling one is written down in NETWORK.md. Since 0.6.0 a block
+reward matures at that same depth, 720 blocks: no one is ever paid with coins
+the chain can still take back.
 
 ### The cap is enforced twice
 

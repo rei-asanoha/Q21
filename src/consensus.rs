@@ -145,6 +145,66 @@ pub const TAIL_REWARD: u64 = 1_000_000;
 /// number without thinking about what it protects.
 pub const COINBASE_MATURITY: u64 = 200;
 
+/// Number of blocks before a block reward becomes spendable, from
+/// [`maturity_activation`] on: one day, the same as [`MAX_REORG_DEPTH`].
+///
+/// # Why one day (0.6.0)
+///
+/// A node accepts to rewrite up to [`MAX_REORG_DEPTH`] blocks (24 hours), but
+/// a reward was spendable after 200 (6 h 40). Between the two, a reward could
+/// be spent — paid to someone — while the block that created it could still
+/// be undone: the person paid, who did nothing wrong, would have been left
+/// with nothing. What the chain can still take back is not yet spendable.
+/// Grin made the same choice (1,440 blocks, one day) for the same reason.
+/// Bitcoin's 100 blocks are about 17 hours; a day is in the same order.
+pub const COINBASE_MATURITY_LONG: u64 = 720;
+
+/// First height whose block reward matures in [`COINBASE_MATURITY_LONG`]
+/// blocks, per network; a reward created below it matures in
+/// [`COINBASE_MATURITY`] as before. The height is the one of the block that
+/// **creates** the reward, so a reward already mined keeps the rule it was
+/// mined under: nothing changes under anyone's feet.
+///
+/// A stricter rule, a soft fork: every block a 0.6.0 node accepts, a 0.5.x
+/// node accepts too, and follows the chain the 0.6.0 nodes build. Only a
+/// miner that has not upgraded may include a spend the new nodes refuse.
+///
+/// Mainnet: from its first block. Regtest: never, so that tests and local
+/// labs keep the short maturity. Testnet: block 7,000, chosen on 7 November
+/// 2026 with the tip in the 6,000s, to leave the time to upgrade the miners
+/// first.
+pub const MATURITY_ACTIVATION_MAINNET: u64 = 1;
+pub const MATURITY_ACTIVATION_TESTNET: u64 = 7_000;
+pub const MATURITY_ACTIVATION_REGTEST: u64 = u64::MAX;
+
+/// The height from which rewards mature in [`COINBASE_MATURITY_LONG`] blocks
+/// on this network.
+pub fn maturity_activation(network: crate::address::Network) -> u64 {
+    use crate::address::Network;
+    match network {
+        Network::Mainnet => MATURITY_ACTIVATION_MAINNET,
+        Network::Testnet => MATURITY_ACTIVATION_TESTNET,
+        Network::Regtest => MATURITY_ACTIVATION_REGTEST,
+    }
+}
+
+/// Blocks a reward created at `coinbase_height` must wait before it is
+/// spendable, on this network: the rule in force when it was created.
+pub fn coinbase_maturity_at(network: crate::address::Network, coinbase_height: u64) -> u64 {
+    if coinbase_height >= maturity_activation(network) {
+        COINBASE_MATURITY_LONG
+    } else {
+        COINBASE_MATURITY
+    }
+}
+
+// A reward is spendable only once the block that created it is beyond what
+// the chain still rewrites — the whole point of the longer maturity.
+const _: () = assert!(COINBASE_MATURITY_LONG == MAX_REORG_DEPTH);
+const _: () = assert!(COINBASE_MATURITY_LONG > COINBASE_MATURITY);
+// Scheduled after every earlier testnet activation.
+const _: () = assert!(MATURITY_ACTIVATION_TESTNET > STRICT_TIME_ACTIVATION_TESTNET);
+
 /// Tolerance on a timestamp in the future, in seconds.
 ///
 /// Beyond it, the block is rejected.

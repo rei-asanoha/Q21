@@ -33,7 +33,7 @@
 
 use crate::address::Network;
 use crate::amount::Amount;
-use crate::consensus::{COINBASE_MATURITY, MAX_BLOCK_SIZE, TARGET_BLOCK_WEIGHT, WITNESS_DISCOUNT};
+use crate::consensus::{MAX_BLOCK_SIZE, TARGET_BLOCK_WEIGHT, WITNESS_DISCOUNT};
 use crate::hash::Hash256;
 use crate::sig::SchemeId;
 use crate::tx::{OutPoint, Transaction, TxOut};
@@ -1566,7 +1566,10 @@ impl Mempool {
                         Some(u) => {
                             // A reorg can make the height *go down*: a mature
                             // coinbase can become immature again.
-                            (!u.is_coinbase || height + 1 >= u.height + COINBASE_MATURITY)
+                            (!u.is_coinbase
+                                || height + 1
+                                    >= u.height
+                                        + crate::consensus::coinbase_maturity_at(network, u.height))
                                 && policy_locks_met(u, &input.witness, height)
                         }
                         // Otherwise, the output must come from another
@@ -2113,7 +2116,7 @@ mod tests_chains {
     use super::tests::*;
     use super::*;
     use crate::chain::{genesis_block, Chain, GENESIS_TIME};
-    use crate::consensus::TARGET_BLOCK_SECS;
+    use crate::consensus::{COINBASE_MATURITY, TARGET_BLOCK_SECS};
     use crate::sig::SchemeId;
     use crate::wallet::Wallet;
 

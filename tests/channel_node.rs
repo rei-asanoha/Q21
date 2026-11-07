@@ -3857,7 +3857,7 @@ fn outputs_paying(chain: &Arc<Mutex<SharedChain>>, hash: &Hash256) -> Vec<(OutPo
     let h = c.chain.height();
     c.chain
         .utxo
-        .spendable_for(hash, h, COINBASE_MATURITY)
+        .spendable_for(hash, h, c.chain.network)
         .into_iter()
         .map(|(o, e)| (o, e.output))
         .collect()
