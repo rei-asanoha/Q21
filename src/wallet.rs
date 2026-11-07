@@ -1968,7 +1968,7 @@ impl Wallet {
             .checked_add(fee.units())
             .filter(|t| *t <= crate::consensus::MAX_SUPPLY)
             .ok_or(WalletError::AmountOutOfRange)?;
-        let (chosen, total) = self.select_coins_avoiding(utxo, height, needed, avoid, pending)?;
+        let (chosen, total) = self.select_without_dust(utxo, height, needed, avoid, pending)?;
         let mut outputs = vec![funding_output];
         let change = total - needed;
         if change >= crate::consensus::MIN_OUTPUT_VALUE {
@@ -1980,6 +1980,34 @@ impl Wallet {
             });
         }
         self.finish_prepare(chosen, outputs, height)
+    }
+
+    /// [`Self::select_coins_avoiding`], but a change that would fall below
+    /// the dust floor, and go to the fee, is avoided when the wallet holds
+    /// enough: the selection is made again for that much more. A channel's
+    /// funding paid 55,000 units where 50,000 were announced (campaign 10,
+    /// `regul`). Without enough coins, the dust still goes to the fee: at
+    /// most [`crate::consensus::MIN_OUTPUT_VALUE`] less one unit.
+    #[allow(clippy::type_complexity)]
+    fn select_without_dust(
+        &self,
+        utxo: &UtxoSet,
+        height: u64,
+        needed: u64,
+        avoid: &dyn Fn(&OutPoint) -> bool,
+        pending: &[(OutPoint, TxOut)],
+    ) -> Result<(Vec<(OutPoint, TxOut, u32)>, u64), WalletError> {
+        let (chosen, total) = self.select_coins_avoiding(utxo, height, needed, avoid, pending)?;
+        let change = total - needed;
+        if change == 0 || change >= crate::consensus::MIN_OUTPUT_VALUE {
+            return Ok((chosen, total));
+        }
+        match needed.checked_add(crate::consensus::MIN_OUTPUT_VALUE) {
+            Some(more) => Ok(self
+                .select_coins_avoiding(utxo, height, more, avoid, pending)
+                .unwrap_or((chosen, total))),
+            None => Ok((chosen, total)),
+        }
     }
 
     /// Prepares a splice (0.5.5): `add` units of this wallet's confirmed
@@ -2023,7 +2051,7 @@ impl Wallet {
             .ok_or(WalletError::AmountOutOfRange)?;
         let avoid_funding = |o: &OutPoint| *o == funding || avoid(o);
         let (chosen, total) =
-            self.select_coins_avoiding(utxo, height, needed, &avoid_funding, &[])?;
+            self.select_without_dust(utxo, height, needed, &avoid_funding, &[])?;
         let mut outputs = vec![new_funding];
         let change = total - needed;
         if change >= crate::consensus::MIN_OUTPUT_VALUE {
@@ -3698,6 +3726,53 @@ mod tests {
         let its_own = a.new_address().hash;
         let mut b = Wallet::from_seed([2u8; 32], Network::Regtest);
         assert_eq!(b.discover(|h| *h == its_own), 0);
+    }
+
+    /// Campaign 10 (`regul`): a channel's funding avoids a change below the
+    /// dust floor when another coin can, and only then gives it to the fee.
+    #[test]
+    fn a_funding_avoids_a_dust_change_when_it_can() {
+        let mut w = Wallet::from_seed([3u8; 32], Network::Regtest);
+        let scheme = w.scheme();
+        let coin = |hash: Hash256, tag: u8| {
+            (
+                OutPoint {
+                    txid: Hash256([tag; 32]),
+                    index: 0,
+                },
+                crate::utxo::UtxoEntry {
+                    output: TxOut {
+                        value: crate::amount::Amount::from_units(1_000_000),
+                        scheme,
+                        pubkey_hash: hash,
+                    },
+                    height: 1,
+                    is_coinbase: false,
+                },
+            )
+        };
+        let (a, b) = (w.new_address().hash, w.new_address().hash);
+        let mut u = crate::utxo::UtxoSet::new();
+        let (o, e) = coin(a, 1);
+        u.insert(o, e);
+        // One coin: the dust has nowhere else to go.
+        let (one, _) = w
+            .select_without_dust(&u, 10, 995_000, &|_| false, &[])
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        let (o, e) = coin(b, 2);
+        u.insert(o, e);
+        // Two: the second keeps the change above the floor.
+        let (two, total) = w
+            .select_without_dust(&u, 10, 995_000, &|_| false, &[])
+            .unwrap();
+        assert_eq!(two.len(), 2);
+        assert!(total - 995_000 >= crate::consensus::MIN_OUTPUT_VALUE);
+        // No dust at all: one coin is enough.
+        let (exact, _) = w
+            .select_without_dust(&u, 10, 1_000_000, &|_| false, &[])
+            .unwrap();
+        assert_eq!(exact.len(), 1);
     }
 
     /// Builds a UTXO set holding one output to `hash`.

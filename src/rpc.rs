@@ -1220,6 +1220,11 @@ fn channel_json(s: crate::channel::manager::ChannelSummary) -> Json {
 /// show it before the open.
 pub const CHANNEL_FUND_FEE: u64 = 50_000;
 
+/// The most a channel's funding, or an addition, pays in fee: the fixed fee,
+/// plus a change below the dust floor when the wallet holds no other coin to
+/// avoid it (`Wallet::select_without_dust`).
+pub const CHANNEL_FUND_FEE_AT_MOST: u64 = CHANNEL_FUND_FEE + MIN_OUTPUT_VALUE - 1;
+
 /// The terms of a channel opened with the defaults on `network`: capacity
 /// bounds, the on-chain fees of the funding and of a cooperative close, the
 /// to-self delay of a forced close (and the range a peer accepts) and the
@@ -1242,6 +1247,13 @@ fn channel_terms(network: Network, accepted_min_delay: Option<u16>) -> Json {
             .set(
                 "open_fee",
                 amount_json(Amount::from_units(CHANNEL_FUND_FEE)),
+            )
+            // A change below the dust floor goes to the fee when the wallet
+            // holds no coin to avoid it: the most an opening or an addition
+            // can pay (campaign 10).
+            .set(
+                "open_fee_at_most",
+                amount_json(Amount::from_units(CHANNEL_FUND_FEE_AT_MOST)),
             )
             .set("close_fee", amount_json(Amount::from_units(CLOSE_FEE)))
             // Kept by the side that opens, on top of what it can send, to
@@ -2076,6 +2088,7 @@ impl RpcContext {
             .and_then(|v| v.as_u64())
             .ok_or_else(|| rpc_error(ERR_PARAMS, "capacity (in units) is required"))?;
         let (delay, depth) = channel_open_terms(self.network, params)?;
+        Self::channel_fee_within(params)?;
         let frame = mgr
             .open(peer, capacity, delay, depth)
             .map_err(|e| rpc_error(ERR_REQUEST, &e))?;
@@ -2092,6 +2105,19 @@ impl RpcContext {
             .build())
     }
 
+    /// An opening or an addition with `max_fee` below what it may pay is
+    /// refused before anything is signed: the funding is built only once the
+    /// peer answers, and its fee can reach [`CHANNEL_FUND_FEE_AT_MOST`].
+    #[cfg(feature = "mldsa")]
+    fn channel_fee_within(params: &Json) -> Result<(), Json> {
+        match max_fee_param(params)? {
+            Some(limit) if limit < CHANNEL_FUND_FEE_AT_MOST => {
+                Err(fee_rose(CHANNEL_FUND_FEE_AT_MOST, limit))
+            }
+            _ => Ok(()),
+        }
+    }
+
     #[cfg(feature = "mldsa")]
     fn channelsplice(&self, params: &Json) -> Result<Json, Json> {
         let mgr = self.channels_open()?;
@@ -2100,6 +2126,7 @@ impl RpcContext {
             .get("amount")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| rpc_error(ERR_PARAMS, "amount (in units) is required"))?;
+        Self::channel_fee_within(params)?;
         let peer = mgr
             .peer_of(cid)
             .ok_or_else(|| rpc_error(ERR_NOT_FOUND, "unknown channel"))?;
@@ -2140,6 +2167,7 @@ impl RpcContext {
                 .set("amount", Json::u64(amount))
                 .set("signed", Json::Bool(signed))
                 .set("fee", Json::u64(CHANNEL_FUND_FEE))
+                .set("fee_at_most", Json::u64(CHANNEL_FUND_FEE_AT_MOST))
                 .build()),
         }
     }
@@ -2864,7 +2892,17 @@ impl RpcContext {
                 funding.map(|t| Json::str(t.to_hex())).unwrap_or(Json::Null),
             )
             .set("price", amount_json(Amount::from_units(NAME_PRICE)))
-            .set("fee", amount_json(Amount::from_units(paid_fee)))
+            // Both transactions' fees: the funding of the identity's, when
+            // there was one, was left out (campaign 10, `regul`).
+            .set(
+                "fee",
+                amount_json(Amount::from_units(funding_paid + paid_fee)),
+            )
+            .set(
+                "registration_fee",
+                amount_json(Amount::from_units(paid_fee)),
+            )
+            .set("funding_fee", amount_json(Amount::from_units(funding_paid)))
             .set("owner", Json::str(owner.to_hex()))
             .build())
     }
