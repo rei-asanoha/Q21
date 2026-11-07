@@ -8239,7 +8239,15 @@ fn dial_missing(
             });
         };
         dial(&onion_jobs);
-        if node.peer_count_outbound() < 2 {
+        // And whenever no entry point is reached by any path: two onion
+        // services answering first, hostile ones, kept a Tor wallet away
+        // from every entry point while their onions were unreachable
+        // (campaign 10, `compl`). An entry point the user named is always
+        // reached somehow.
+        let entry_reached = targets.iter().any(|a| {
+            q21_core::socks::Target::parse(a, port).is_ok_and(|t| node.is_connected_to(t.label()))
+        });
+        if node.peer_count_outbound() < 2 || !entry_reached {
             dial(&clear_jobs);
         }
     } else {
