@@ -69,7 +69,31 @@ const GRACE: Duration = Duration::from_secs(8);
 /// prints a status line now and then.
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 
+/// Libraries loaded by name, once the program runs, are looked for in
+/// `System32` only.
+///
+/// # The defect this closes (campaign 10, round 3, `compl`)
+///
+/// The build flag of `build.rs` covers the libraries the program links; one
+/// loaded by name later (`dbghelp.dll` for a backtrace, say) was still looked
+/// for in the program's own folder first, where a planted one ran as the
+/// user.
+#[cfg(windows)]
+fn restrict_dll_search() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+    }
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    // Safe: a flag set on the process, no pointer.
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    restrict_dll_search();
     let folder = match program_folder() {
         Ok(f) => f,
         Err(e) => {

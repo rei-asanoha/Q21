@@ -191,7 +191,31 @@ WARNING
     Run `q21 security` for what is protected and what is not.
 ";
 
+/// Libraries loaded by name, once the program runs, are looked for in
+/// `System32` only.
+///
+/// # The defect this closes (campaign 10, round 3, `compl`)
+///
+/// The build flag of `build.rs` covers the libraries the program links; one
+/// loaded by name later (`dbghelp.dll` for a backtrace, say) was still looked
+/// for in the program's own folder first, where a planted one ran as the
+/// user.
+#[cfg(windows)]
+fn restrict_dll_search() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+    }
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    // Safe: a flag set on the process, no pointer.
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    restrict_dll_search();
     // No core dumps: a process that holds a seed must not be able to write
     // it into a `core` file at the first crash.
     disable_core_dumps();
@@ -780,7 +804,8 @@ fn check_own_dir(d: &Path) -> Result<(), String> {
         // What lies in it too: a directory that was once open to others
         // still held what another account put there, and the node read it
         // at its next start, a peer list among it (campaign 10, round 3,
-        // `compl`). The `channels` folder is looked into as well.
+        // `compl`). The `channels` and `tor` folders are looked into as
+        // well: the onion service's key lives in the latter.
         let foreign = |dir: &Path| -> Option<PathBuf> {
             std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
                 let m = std::fs::symlink_metadata(e.path()).ok()?;
@@ -791,7 +816,10 @@ fn check_own_dir(d: &Path) -> Result<(), String> {
                 ((m.uid() != me && m.uid() != 0) || linked).then(|| e.path())
             })
         };
-        if let Some(f) = foreign(d).or_else(|| foreign(&d.join("channels"))) {
+        if let Some(f) = foreign(d)
+            .or_else(|| foreign(&d.join("channels")))
+            .or_else(|| foreign(&d.join("tor")))
+        {
             return Err(format!(
                 "{} belongs to another account, or has a second name elsewhere: \
                  refused. Another account could write in this data directory; move \
