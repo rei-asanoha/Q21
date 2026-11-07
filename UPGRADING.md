@@ -94,7 +94,7 @@ from block 5,950.
 | A channel whose funding left the chain and a coin of which was spent elsewhere | Held for good, counted among the contact's channels | Given up once that spend is buried past any reorganization, on both sides; archived as "given up" |
 | A restart after a reorganization | Scanned from the funding's height: a revoked state mined below it went unpunished | Scanned from the deepest reorganization below it |
 | A share of a forced close too small for a claim the pools relay | Claimed again at every block, the channel closing for good | Left on chain as dust, the channel settled |
-| Public explorer | Each input's coin read a whole block, under the node's lock, charged one call; a search by amount read two thousand blocks in one hold; a 32 MB answer cost a pause | Each block read once per answer, at most 32 MB and 400 blocks, charged by size, a whole block read too; what exceeds a client's bucket is owed, and a client that owes is tracked longest; searches read block by block; answers that read blocks take two of the four turns at most; the page says when a list is cut |
+| Public explorer | Each input's coin read a whole block, under the node's lock, charged one call; a search by amount read two thousand blocks in one hold; a 32 MB answer cost a pause | Each block read once per answer, at most 32 MB and 400 blocks, charged by size, a whole block read too; what exceeds a client's bucket is owed, and a client that owes is tracked longest; searches read block by block; an answer past a megabyte needs one of two turns for those that read much, taken before the read that would carry it past, or it stops there; calls that read no block (`getinfo`, a header) never wait; the page says when a list is cut |
 | `getbalance` | Coins already spent by a pending send of ours, and coins held for a channel, still counted | `spendable` is what a send can spend now (the change of our own pending sends included); `committed` gives what is set aside |
 | `getmining` | Blocks that lost their race counted in the blocks found and the earnings | Left out; `blocks_lost_to_reorganizations` says how many |
 | `preparesend` | A change below the dust floor shown as change | Counted in the fee, as the send pays it |
@@ -109,10 +109,11 @@ from block 5,950.
 | An opening or an addition | A change below the dust floor went silently to the fee (up to 0.00059999), with no `max_fee` | Another coin is taken when one can be; `max_fee` accepted, refused below `open_fee_at_most`, which the page passes |
 | A channel closing, forcing, or in the middle of an addition, whose funding a reorganization took away and a coin of which was spent elsewhere | Held for good | Given up too, as an open one is (C7) |
 | `nameregister` | `fee` was the registration's only | `fee` = `funding_fee` + `registration_fee` |
+| `channelarchive` after a restart | An addition confirmed but not yet locked when the channel was closed alone was dropped | Kept: what the closing transaction spent says whether it happened |
 | `getsupply.spendable` | Counted the genesis coin, which no key spends | Leaves it out; `genesis_unspendable` gives it |
-| The explorer's search, `1.000,5` | 1.0005 | 1000.5; a badly grouped number (`1.5,000`) is no amount |
-| A Tor wallet whose entry points' onions do not answer | Two onion services answering first kept it away from every entry point | An entry point is always reached, by its clear address if need be |
-| What peers have a node read to serve them | Each peer's budget alone: 24 seats together, about 96 MB a second | A node-wide budget too, 128 MiB then 32 MiB a second; compact blocks, how new blocks travel, are not held by it |
+| The explorer's search, `1.000,5` | 1.0005 | 1000.5; a badly grouped number (`1.5,000`, `12,34,5`) is no amount |
+| A Tor wallet whose entry points' onions do not answer | Two onion services answering first kept it away from every entry point | An entry point is always reached, by its clear address if need be; once its onion answers, the onion link is kept and the clear one closed |
+| What peers have a node read to serve them | Each peer's budget alone: 24 seats together, about 96 MB a second | A node-wide budget too, 128 MiB then 32 MiB a second, waited for before a request of whole blocks and never cutting one short; compact blocks, how new blocks travel, are not held by it |
 | Windows | Libraries loaded by name were looked for in the program's folder first | In `System32` only |
 
 ## Who should upgrade, and when
