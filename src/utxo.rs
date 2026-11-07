@@ -855,6 +855,99 @@ mod tests {
         assert_eq!(at(act + 720), 2, "and matures at 720");
     }
 
+    /// Campaign 12 (`cart`): the wallet's `spendable_for(tip)` and the
+    /// consensus gate agree at every height around the activation boundary,
+    /// for both rules, with exactly one block of safety in the wallet's
+    /// favour: what the wallet offers at `tip` is spendable in block `tip`
+    /// itself, hence in the next block the mempool admits against
+    /// (`tip + 1`). The wallet never offers a coin the chain refuses, and the
+    /// mempool never admits a spend the next block cannot carry.
+    #[test]
+    fn wallet_spendability_never_outruns_the_consensus_gate() {
+        use crate::address::Network;
+        use crate::consensus::{
+            COINBASE_MATURITY, COINBASE_MATURITY_LONG, MATURITY_ACTIVATION_TESTNET,
+            MIN_OUTPUT_VALUE,
+        };
+        use crate::validate::{check_transaction, ValidationError};
+        use std::collections::HashSet;
+        let act = MATURITY_ACTIVATION_TESTNET;
+        let net = Network::Testnet;
+        let key = Hash256([7u8; 32]);
+
+        let mut u = UtxoSet::new();
+        let mut undo = UndoRecord::default();
+        let cb_before = coinbase(MIN_OUTPUT_VALUE * 10, 7);
+        let cb_at = coinbase(MIN_OUTPUT_VALUE * 20, 7);
+        u.apply_transaction(&cb_before, act - 1, &mut undo);
+        u.apply_transaction(&cb_at, act, &mut undo);
+
+        // Consensus: is a spend of `txid` admissible in a block at `height`?
+        let consensus_allows = |txid: Hash256, height: u64| -> bool {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    prev_out: OutPoint { txid, index: 0 },
+                    witness: crate::tx::Witness::default(),
+                    sequence: 0,
+                }],
+                outputs: vec![output(MIN_OUTPUT_VALUE, 9)],
+                lock_time: 0,
+            };
+            let mut seen = HashSet::new();
+            !matches!(
+                check_transaction(&tx, &u, net, height, &mut seen),
+                Err(ValidationError::CoinbaseImmature { .. })
+            )
+        };
+        // Wallet: does `spendable_for(tip)` list `txid`?
+        let wallet_offers = |txid: Hash256, tip: u64| -> bool {
+            u.spendable_for(&key, tip, net)
+                .iter()
+                .any(|(o, _)| o.txid == txid)
+        };
+
+        let edges = [
+            act - 1 + COINBASE_MATURITY - 1,
+            act - 1 + COINBASE_MATURITY,
+            act + COINBASE_MATURITY - 1,
+            act + COINBASE_MATURITY,
+            act + COINBASE_MATURITY_LONG - 1,
+            act + COINBASE_MATURITY_LONG,
+            act + COINBASE_MATURITY_LONG + 1,
+        ];
+        for tip in edges {
+            for cb in [cb_before.txid(), cb_at.txid()] {
+                let offered = wallet_offers(cb, tip);
+                // Wallet at `tip` == consensus for a block at `tip` (same
+                // comparison, same per-reward rule).
+                assert_eq!(
+                    offered,
+                    consensus_allows(cb, tip),
+                    "tip {tip}: wallet and consensus-at-tip must agree"
+                );
+                // And therefore never more than the next block admits
+                // (the mempool's `height + 1` view).
+                if offered {
+                    assert!(
+                        consensus_allows(cb, tip + 1),
+                        "tip {tip}: wallet offered a coin the next block refuses"
+                    );
+                }
+            }
+        }
+        // The one documented divergence, pinned: at tip 719 past activation
+        // the next block (720) may carry the spend — the mempool admits it —
+        // while the wallet still waits one block.
+        let t = act + COINBASE_MATURITY_LONG - 1;
+        assert!(
+            consensus_allows(cb_at.txid(), t + 1),
+            "mempool view admits at tip 719"
+        );
+        assert!(!wallet_offers(cb_at.txid(), t), "wallet waits for tip 720");
+        assert!(wallet_offers(cb_at.txid(), t + 1));
+    }
+
     #[test]
     fn filtering_by_key_works() {
         let mut u = UtxoSet::new();

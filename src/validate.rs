@@ -1090,4 +1090,94 @@ mod tests {
             Err(ValidationError::MissingInput(_))
         ));
     }
+
+    /// Campaign 12 (`arch`): the soft-fork boundary, against the real
+    /// consensus gate. A reward created at the testnet activation height
+    /// matures in 720 blocks: the exact spend a 0.5.12 miner would include at
+    /// 200 deep is refused, and still at 719; it passes maturity at 720. A
+    /// reward created one block before activation keeps its 200. The rule
+    /// is a pure function of the reward's creation height, so every 0.6.0
+    /// node answers the same for the same chain, and 0.6.0 never accepts a
+    /// spend 0.5.12 refuses (720 and 200 are both >= 200).
+    #[test]
+    fn maturity_boundary_is_enforced_at_the_consensus_gate() {
+        use crate::consensus::{
+            COINBASE_MATURITY, COINBASE_MATURITY_LONG, MATURITY_ACTIVATION_TESTNET,
+        };
+        use crate::utxo::UndoRecord;
+        let act = MATURITY_ACTIVATION_TESTNET;
+        let net = Network::Testnet;
+
+        let coinbase = |value: u64, tag: u8| Transaction {
+            version: 1,
+            inputs: vec![crate::tx::TxIn::coinbase(vec![tag])],
+            outputs: vec![crate::tx::TxOut {
+                value: Amount::from_units(value),
+                scheme: SchemeId::LamportOts,
+                pubkey_hash: Hash256([tag; 32]),
+            }],
+            lock_time: 0,
+        };
+        let mut utxo = UtxoSet::new();
+        let mut undo = UndoRecord::default();
+        let cb_at = coinbase(MIN_OUTPUT_VALUE * 10, 7);
+        let cb_before = coinbase(MIN_OUTPUT_VALUE * 10, 8);
+        utxo.apply_transaction(&cb_at, act, &mut undo);
+        utxo.apply_transaction(&cb_before, act - 1, &mut undo);
+
+        let spend_at = |txid: Hash256, height: u64| {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![crate::tx::TxIn {
+                    prev_out: OutPoint { txid, index: 0 },
+                    witness: crate::tx::Witness::default(),
+                    sequence: 0,
+                }],
+                outputs: vec![crate::tx::TxOut {
+                    value: Amount::from_units(MIN_OUTPUT_VALUE),
+                    scheme: SchemeId::LamportOts,
+                    pubkey_hash: Hash256::ZERO,
+                }],
+                lock_time: 0,
+            };
+            let mut seen = HashSet::new();
+            check_transaction(&tx, &utxo, net, height, &mut seen)
+        };
+        let immature = |r: &Result<Amount, ValidationError>| {
+            matches!(r, Err(ValidationError::CoinbaseImmature { .. }))
+        };
+
+        // The block a 0.5.12 miner would produce: the activation-height reward
+        // spent 200 deep. A 0.6.0 node refuses it, naming the 720 day.
+        match spend_at(cb_at.txid(), act + COINBASE_MATURITY) {
+            Err(ValidationError::CoinbaseImmature {
+                available_at,
+                height,
+            }) => {
+                assert_eq!(available_at, act + COINBASE_MATURITY_LONG);
+                assert_eq!(height, act + COINBASE_MATURITY);
+            }
+            other => panic!("0.5.12 miner's spend must be refused as immature, got {other:?}"),
+        }
+        // Still refused one block short of the long maturity.
+        assert!(immature(&spend_at(
+            cb_at.txid(),
+            act + COINBASE_MATURITY_LONG - 1
+        )));
+        // Passes maturity exactly at 720 (any later refusal is the unsigned
+        // witness, never immaturity).
+        assert!(!immature(&spend_at(
+            cb_at.txid(),
+            act + COINBASE_MATURITY_LONG
+        )));
+        // The reward created one block before activation keeps its 200.
+        assert!(!immature(&spend_at(
+            cb_before.txid(),
+            act - 1 + COINBASE_MATURITY
+        )));
+        assert!(immature(&spend_at(
+            cb_before.txid(),
+            act - 1 + COINBASE_MATURITY - 1
+        )));
+    }
 }

@@ -3322,10 +3322,11 @@ fn cmd_init_with(
     println!("  to recover the funds if the file disappears — and it carries a");
     println!("  checksum: a typo will be detected, not suffered.");
     println!();
+    let genesis_maturity = q21_core::consensus::coinbase_maturity_at(network, 0);
     println!(
         "  The genesis coin is a coinbase: it becomes spendable\n  \
-         after {COINBASE_MATURITY} blocks. Run `q21 mine {}`.",
-        COINBASE_MATURITY + 1
+         after {genesis_maturity} blocks. Run `q21 mine {}`.",
+        genesis_maturity + 1
     );
     Ok(())
 }
@@ -3409,20 +3410,21 @@ fn cmd_balance(datadir: &Path) -> Result<(), String> {
 
     // What exists but is not mature yet.
     let mut immature = 0u64;
+    // The nearest block at which some of it matures.
+    let mut next_free: Option<u64> = None;
     for (_, entry) in e.chain.utxo.iter() {
-        if entry.is_coinbase
-            && h < entry.height
-                + q21_core::consensus::coinbase_maturity_at(e.chain.network, entry.height)
-            && e.wallet.owns_output(&entry.output)
-        {
+        let free_at =
+            entry.height + q21_core::consensus::coinbase_maturity_at(e.chain.network, entry.height);
+        if entry.is_coinbase && h < free_at && e.wallet.owns_output(&entry.output) {
             immature += entry.output.value.units();
+            next_free = Some(next_free.map_or(free_at, |n| n.min(free_at)));
         }
     }
     if immature > 0 {
         println!(
-            "{} Q21 still immature ({} blocks to maturity)",
+            "{} Q21 still immature (the first part in {} blocks)",
             Amount::from_units(immature),
-            q21_core::consensus::coinbase_maturity_at(e.chain.network, h)
+            next_free.map_or(0, |n| n.saturating_sub(h))
         );
     }
 

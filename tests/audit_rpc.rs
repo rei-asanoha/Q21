@@ -2071,7 +2071,7 @@ fn latent_flaw_unescaped_insertion_points_in_the_explorer() {
         "q21(",
     ];
     // Raw insertions allowed, and the reason for each.
-    const RAW_ALLOWED: [&str; 15] = [
+    const RAW_ALLOWED: [&str; 16] = [
         // Condition of a ternary: never inserted, only tested.
         "n",
         // Numeric fields from the node (`Json::u64`), so never strings.
@@ -2098,6 +2098,11 @@ fn latent_flaw_unescaped_insertion_points_in_the_explorer() {
         "gray",
         "BigInt(m.received.units) > 0n",
         "!m.amount_out_known",
+        // Ternary condition on a numeric field of `getinfo` (the activation
+        // height of the one-day maturity, `Json::u64` or null): tested, never
+        // inserted. The branch chosen is a literal of the page in which the
+        // height goes through esc() right after (0.6.0).
+        "Number(info.coinbase_maturity_from) > 1",
     ];
 
     // The link builders are declared safe above. Here we check that they are:

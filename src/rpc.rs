@@ -5963,6 +5963,18 @@ impl RpcContext {
                                         + crate::consensus::coinbase_maturity_at(network, d.height),
                         ),
                     );
+                // The block at which a reward becomes spendable, under the
+                // rule it was created under: the page says the wait from it,
+                // not from a single constant that would overstate it for a
+                // reward created before the longer delay (0.6.0).
+                if d.coinbase {
+                    row = row.set(
+                        "mature_at",
+                        Json::u64(
+                            d.height + crate::consensus::coinbase_maturity_at(network, d.height),
+                        ),
+                    );
+                }
                 if is_send {
                     row = row
                         .set("committed", amount_json(Amount::from_units(committed)))

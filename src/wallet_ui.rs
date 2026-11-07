@@ -2981,8 +2981,11 @@ async function loadActivity(){
         // an amount" stays whole, and the test that guards it forbids any
         // numeric conversion on a movement field, on principle — we do not
         // work around it, we do not need to.
-        const left = maturity - m.confirmations;
-        mark = ` <span class="badge pending" title="usable at block ${esc(String(m.height + maturity))}">`
+        // The node says at which block this reward matures, under the rule
+        // it was created under (0.6.0); the one constant is only a fallback.
+        const matureAt = m.mature_at !== undefined && m.mature_at !== null ? m.mature_at : m.height + maturity;
+        const left = matureAt - m.height - m.confirmations;
+        mark = ` <span class="badge pending" title="usable at block ${esc(String(matureAt))}">`
                + `available in ${esc(blocksDuration(left > 0 ? left : 0, chainInfo))}</span>`;
       } else {
         mark = "";
