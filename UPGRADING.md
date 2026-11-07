@@ -67,6 +67,72 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.5.10 to 0.5.11
+
+0.5.11 changes no rule of block validity and nothing in a channel's
+messages: a 0.5.10 node and a 0.5.11 node accept the same blocks and keep
+the same channels. Mining does not need to stop. It brings the fixes of the
+tenth red-team campaign (RED-TEAM-2026-10.md), and the two points 0.5.10
+left open: an addition to a channel undone by a deep reorganization (C1),
+and a channel whose funding can never come back (C7).
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, and block timestamps strictly after their parent's
+from block 5,950.
+
+## What changes
+
+| | 0.5.10 | 0.5.11 |
+|---|---|---|
+| A side branch made of blocks far easier than ours | Stored after its shape and its work only, on disk for good: a branch forking deep below the tip, its difficulty walked down, let a peer store four megabytes for a 2,500th of a block's work, as often as it liked | Refused without blame while it trails, when a block's work is under a sixteenth of the block its branch forks from; written to disk only within six blocks of the tip's work; bodies in memory under their own 64 MiB; a branch proven heavier is written as it comes again |
+| A side body evicted from memory | Stayed known, never asked for again: the node waited for a restart to follow a heavier branch | Forgotten, asked for again |
+| Rolling finality on a node run in short sessions | Bound only after one uninterrupted hour in one run: a wallet opened forty minutes a day never bound | The seconds held add up across runs (`finality.dat`: `catching-up <seconds>`) |
+| An addition to a channel (a splice) | Locked at the funding depth, six blocks on testnet, where a reorganization costs no surcharge | Locked six blocks later, twelve on testnet (regtest: the funding depth); the old funding stays watched until the new one is buried past any reorganization, a revoked state on it punished; the adder holds its coins again and announces the addition again if a reorganization takes it away |
+| An addition whose added coin was spent elsewhere | Waited for good, payments and closes refused | Said so after the funding depth; the page offers to close without the other side, which is safe then |
+| A channel whose funding left the chain and a coin of which was spent elsewhere | Held for good, counted among the contact's channels | Given up once that spend is buried past any reorganization, on both sides; archived as "given up" |
+| A restart after a reorganization | Scanned from the funding's height: a revoked state mined below it went unpunished | Scanned from the deepest reorganization below it |
+| A share of a forced close too small for a claim the pools relay | Claimed again at every block, the channel closing for good | Left on chain as dust, the channel settled |
+| Public explorer | Each input's coin read a whole block, under the node's lock, charged one call; a search by amount read two thousand blocks in one hold; a 32 MB answer cost a pause | Each block read once per answer, at most 32 MB and 400 blocks, charged by size; what exceeds a client's bucket is owed; searches read block by block; the page says when a list is cut |
+| `getbalance` | Coins already spent by a pending send of ours, and coins held for a channel, still counted | `spendable` is what a send can spend now (the change of our own pending sends included); `committed` gives what is set aside |
+| `getmining` | Blocks that lost their race counted in the blocks found and the earnings | Left out; `blocks_lost_to_reorganizations` says how many |
+| `preparesend` | A change below the dust floor shown as change | Counted in the fee, as the send pays it |
+| `getemission.permille_of_cap` | A hundred times too high, saturated past a tenth of the supply | Thousandths of the cap |
+| The data folder | Created readable by every account; one owned by another account used after a warning | Created 0700, tightened at every start with `wallet.dat`; one owned by another account (not root), or holding a file of another account, is refused |
+| Windows programs | Their static imports looked for in their own folder first | From `System32` only |
+| `tools/monitor.sh` | Copied from the repository; no disk check | Travels in the Linux archives (`server/`), with the server guides, covered by the signature; warns when the data disk is nearly full |
+| The wallet page's block pace | The mean of the last 30 blocks | The mean of the last 10 |
+
+## Who should upgrade, and when
+
+Everyone, when convenient. The public explorer and the entry points first,
+for the side branches and the explorer's reads; wallets with channels next.
+A peer still on 0.5.10 locks an addition at the funding depth: the longer
+lock protects a channel only once both sides run 0.5.11.
+
+## The servers
+
+Install `monitor.sh` again, this time from the archive you verified, and
+give it the data folder (SERVER.md, "Getting notified without watching"):
+
+```bash
+sudo install -o root -g root -m 0755 ~/server/monitor.sh /opt/q21/monitor.sh
+```
+
+```bash
+printf 'Q21_DATADIR=/opt/q21/data\nQ21_MIN_FREE_MB=2048\n' | sudo tee -a /etc/q21/monitor.env > /dev/null
+```
+
+Nothing changes in Caddy.
+
+## The data folder
+
+`finality.dat` may now read `catching-up <seconds>`: going back to 0.5.10
+with the same folder binds rolling finality at once, the safe side. A
+channel archived as given up reads as closed in an unknown way under
+0.5.10. Nothing else changes.
+
+---
+
 # Upgrading from 0.5.9 to 0.5.10
 
 0.5.10 changes no rule of the chain and nothing in a channel's protocol: a
