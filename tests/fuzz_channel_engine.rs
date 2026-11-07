@@ -1165,6 +1165,11 @@ impl Episode {
     /// claims. Whatever the victim accepts must be a valid splice.
     fn puppet_splice(&mut self, rng: &mut Rng, stats: &mut Stats) -> Result<(), String> {
         self.resync(rng);
+        // The last finished splice buried past any reorganization: one
+        // addition at a time since 0.5.11 (C1).
+        self.v
+            .forget_retired()
+            .map_err(|e| format!("forget_retired: {e:?}"))?;
         let n = self.v.next_state_number();
         let old = self.v.params().clone();
         let old_cap = old.capacity.units();
@@ -1482,6 +1487,10 @@ impl Episode {
     /// it with a payment, or sends forgeries first.
     fn victim_splice(&mut self, rng: &mut Rng, stats: &mut Stats) -> Result<(), String> {
         self.resync(rng);
+        // As for the puppet's: the last finished splice is buried first.
+        self.v
+            .forget_retired()
+            .map_err(|e| format!("forget_retired: {e:?}"))?;
         let n = self.v.next_state_number();
         let old = self.v.params().clone();
         let old_cap = old.capacity.units();
