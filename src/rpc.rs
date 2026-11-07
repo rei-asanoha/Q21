@@ -601,6 +601,9 @@ pub(crate) struct BlockReads {
     /// with a turn of those that read much.
     public: bool,
     heavy: Option<PublicTurn>,
+    /// The largest block read so far: what the next read is expected to
+    /// cost, to stop before it rather than after.
+    largest: usize,
 }
 
 impl BlockReads {
@@ -614,6 +617,7 @@ impl BlockReads {
             last: None,
             public: bytes != usize::MAX,
             heavy: None,
+            largest: 0,
         }
     }
 
@@ -631,7 +635,14 @@ impl BlockReads {
             self.spent = true;
             return None;
         }
-        if self.public && self.bytes >= PUBLIC_HEAVY_FROM_BYTES && self.heavy.is_none() {
+        // The turn is needed before the read that would carry the answer
+        // past the threshold, judged by the largest block read so far: an
+        // answer cut for want of one no longer reads a whole extra block on
+        // an ordinary turn first (round 6, `prag`). The first read never
+        // needs one: a page's `getblock` reads one block.
+        let next = self.bytes.saturating_add(self.largest);
+        if self.public && self.bytes > 0 && next >= PUBLIC_HEAVY_FROM_BYTES && self.heavy.is_none()
+        {
             match PublicTurn::try_heavy() {
                 Some(t) => self.heavy = Some(t),
                 None => {
@@ -643,6 +654,7 @@ impl BlockReads {
         self.reads_left -= 1;
         let block = node.with_chain(|c| c.block_at(height));
         let size = block.as_ref().map_or(0, |b| b.encode().len());
+        self.largest = self.largest.max(size);
         self.bytes = self.bytes.saturating_add(size);
         self.bytes_left = self.bytes_left.saturating_sub(size);
         block
@@ -1780,8 +1792,10 @@ impl RpcContext {
         }
 
         // And answers a few at once, whoever asks (see
-        // [`PUBLIC_ANSWERS_AT_ONCE`]).
-        let _turn = if self.scans.is_some() {
+        // [`PUBLIC_ANSWERS_AT_ONCE`]). A call that reads no block and answers
+        // a few hundred bytes takes no turn: it waited behind answers that
+        // read a megabyte each (round 6, `prag`).
+        let _turn = if self.scans.is_some() && !Self::answers_light(&method) {
             match PublicTurn::take() {
                 Some(t) => Some(t),
                 None => {
@@ -1813,6 +1827,21 @@ impl RpcContext {
                 .set("error", e)
                 .build(),
         }
+    }
+
+    /// Calls that read no block body and answer a few hundred bytes, from
+    /// the index and the node's counters: on a public explorer, they take no
+    /// turn (see [`PUBLIC_ANSWERS_AT_ONCE`]).
+    fn answers_light(method: &str) -> bool {
+        matches!(
+            method,
+            "getinfo"
+                | "channelstatus"
+                | "getutxocommitment"
+                | "getpow"
+                | "getsupply"
+                | "getblockheader"
+        )
     }
 
     /// List of the exposed methods.
@@ -8960,6 +8989,26 @@ mod tests {
         let mut r = BlockReads::bounded(PUBLIC_READ_BYTES, PUBLIC_BLOCK_READS);
         r.bytes = PUBLIC_HEAVY_FROM_BYTES;
         assert!(r.fetch(&c.node, 2).is_some(), "a turn free: read on");
+        drop(r);
+        // Round 6: judged before the read, by the largest block read so far.
+        let held: Vec<PublicTurn> = (0..PUBLIC_HEAVY_AT_ONCE)
+            .filter_map(|_| PublicTurn::try_heavy())
+            .collect();
+        if held.len() == PUBLIC_HEAVY_AT_ONCE {
+            let mut r = BlockReads::bounded(PUBLIC_READ_BYTES, PUBLIC_BLOCK_READS);
+            r.bytes = PUBLIC_HEAVY_FROM_BYTES - 10;
+            r.largest = 100;
+            assert!(r.fetch(&c.node, 2).is_none(), "the next read would pass it");
+            assert!(r.spent());
+            let mut r = BlockReads::bounded(PUBLIC_READ_BYTES, PUBLIC_BLOCK_READS);
+            r.bytes = PUBLIC_HEAVY_FROM_BYTES - 1_000;
+            r.largest = 100;
+            assert!(r.fetch(&c.node, 2).is_some(), "it would not");
+        }
+        drop(held);
+        assert!(RpcContext::answers_light("getinfo"));
+        assert!(!RpcContext::answers_light("getblock"));
+        assert!(!RpcContext::answers_light("getaddress"));
         // The owner's answers need none.
         let mut r = BlockReads::bounded(usize::MAX, usize::MAX);
         r.bytes = 10 * PUBLIC_HEAVY_FROM_BYTES;
