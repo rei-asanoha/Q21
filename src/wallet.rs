@@ -1464,7 +1464,16 @@ impl Wallet {
     pub fn immature(&self, utxo: &UtxoSet, height: u64) -> (Amount, Option<(u64, Amount)>) {
         let mut total: u64 = 0;
         let mut next: Option<(u64, u64)> = None;
-        for hash in self.known.keys() {
+        let one_time = self.scheme.is_one_time();
+        for (hash, index) in &self.known {
+            // A consumed one-time key is dead: its still-immature coinbase can
+            // never be spent (signing again would reveal the key), so it is
+            // frozen, not maturing. `spendable` skips it the same way; counting
+            // it here promised "funds arriving" that then vanish into the
+            // frozen total (campaign 13, `wallet`).
+            if one_time && (self.consumed.contains(index) || self.reserved.contains_key(index)) {
+                continue;
+            }
             for (_, e) in utxo.outputs_of(hash) {
                 let maturity = crate::consensus::coinbase_maturity_at(self.network(), e.height);
                 if e.output.scheme != self.scheme || !e.is_coinbase || height >= e.height + maturity
@@ -3960,6 +3969,58 @@ mod tests {
         assert!(
             m.units() > 0 && p.is_some(),
             "the setup must produce immature funds"
+        );
+    }
+
+    /// A one-time key that has already signed is dead: an immature coinbase
+    /// still sitting on it can never be spent, so it is frozen, not maturing.
+    /// `immature` must drop it exactly as `spendable` does — otherwise the
+    /// wallet promised "funds arriving" that then vanish into the frozen total
+    /// (campaign 13, `wallet`).
+    #[test]
+    fn a_consumed_one_time_key_is_frozen_not_maturing() {
+        let mut w = test_wallet();
+        assert!(
+            w.scheme().is_one_time(),
+            "this guard is for one-time schemes"
+        );
+        let a0 = w.new_address(); // index 0
+        let g = genesis_block(Network::Regtest);
+        let mut c = Chain::new(Network::Regtest, g);
+        // A fresh coinbase pays index 0: at height 1 it is immature.
+        let b = c
+            .mine_block(
+                a0.hash,
+                SchemeId::LamportOts,
+                &[],
+                GENESIS_TIME + TARGET_BLOCK_SECS,
+                20_000_000,
+            )
+            .expect("mining");
+        c.connect(&b, GENESIS_TIME + TARGET_BLOCK_SECS + 1)
+            .expect("connect");
+
+        // Before the key is spent, the reward is counted as maturing.
+        let (before, next_before) = w.immature(&c.utxo, 1);
+        assert!(
+            before.units() > 0 && next_before.is_some(),
+            "the immature coinbase must be counted while the key is live"
+        );
+
+        // The key signs something and is now consumed.
+        w.mark_consumed(&[0]);
+
+        // Now the frozen reward must not be reported as maturing, and must not
+        // promise a next release.
+        let (after, next_after) = w.immature(&c.utxo, 1);
+        assert_eq!(
+            after,
+            Amount::ZERO,
+            "a consumed one-time key is not maturing"
+        );
+        assert_eq!(
+            next_after, None,
+            "no release is promised for a frozen reward"
         );
     }
 }

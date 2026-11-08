@@ -5290,53 +5290,60 @@ impl Node {
                                 (size, size)
                             }),
                             InvKind::CompactBlock => {
-                                if let Some(b) = g.chain.block_by_id(&i.hash) {
-                                    // Reuse a fresh build for this id if the
-                                    // cache holds one, so a burst of peers
-                                    // asking for the same recent tip — or
-                                    // rotating over the few recent tips — does
-                                    // not each redo the short ids and the
-                                    // whole-block encode under the lock
-                                    // (campaign 11, `cart`).
-                                    let fresh = g.compact_cache.iter().find(|cc| {
+                                // Reuse a fresh build for this id if the cache
+                                // holds one, so a burst of peers asking for the
+                                // same recent tip — or rotating over the few
+                                // recent tips — does not each redo the short ids
+                                // and the whole-block encode under the lock
+                                // (campaign 11, `cart`). The cache is consulted
+                                // *before* the block is read: a hit serves from
+                                // the cached compact and never clones the whole
+                                // block, so a recent-tip compact — exempt from
+                                // the node-wide budget — costs the length of the
+                                // compact, not of the block, however many peers
+                                // ask (campaign 13, `dos`).
+                                let hit = g
+                                    .compact_cache
+                                    .iter()
+                                    .find(|cc| {
                                         cc.id == i.hash
                                             && now.saturating_duration_since(cc.built)
                                                 < COMPACT_CACHE_TTL
-                                    });
-                                    let (c, size, whole) = match fresh {
-                                        Some(cc) => ((*cc.block).clone(), cc.size, cc.whole),
-                                        None => {
-                                            let whole = b.encode().len();
-                                            let c = CompactBlock::from_block(&b, unix_now());
-                                            let size = c.encode().len();
-                                            // Drop stale entries, then keep
-                                            // the newest within the cap.
-                                            g.compact_cache.retain(|cc| {
-                                                cc.id != i.hash
-                                                    && now.saturating_duration_since(cc.built)
-                                                        < COMPACT_CACHE_TTL
-                                            });
-                                            if g.compact_cache.len() >= COMPACT_CACHE_MAX {
-                                                g.compact_cache.remove(0);
-                                            }
-                                            g.compact_cache.push(CompactCache {
-                                                id: i.hash,
-                                                built: now,
-                                                block: std::sync::Arc::new(c.clone()),
-                                                size,
-                                                whole,
-                                            });
-                                            (c, size, whole)
+                                    })
+                                    .map(|cc| ((*cc.block).clone(), cc.size, cc.whole));
+                                let built = match hit {
+                                    Some(t) => Some(t),
+                                    None => g.chain.block_by_id(&i.hash).map(|b| {
+                                        let whole = b.encode().len();
+                                        let c = CompactBlock::from_block(&b, unix_now());
+                                        let size = c.encode().len();
+                                        // Drop stale entries, then keep the
+                                        // newest within the cap.
+                                        g.compact_cache.retain(|cc| {
+                                            cc.id != i.hash
+                                                && now.saturating_duration_since(cc.built)
+                                                    < COMPACT_CACHE_TTL
+                                        });
+                                        if g.compact_cache.len() >= COMPACT_CACHE_MAX {
+                                            g.compact_cache.remove(0);
                                         }
-                                    };
+                                        g.compact_cache.push(CompactCache {
+                                            id: i.hash,
+                                            built: now,
+                                            block: std::sync::Arc::new(c.clone()),
+                                            size,
+                                            whole,
+                                        });
+                                        (c, size, whole)
+                                    }),
+                                };
+                                built.map(|(c, size, whole)| {
                                     outgoing.push(Outgoing {
                                         peer: id,
                                         message: Message::CmpctBlock(Box::new(c)),
                                     });
-                                    Some((size, whole))
-                                } else {
-                                    None
-                                }
+                                    (size, whole)
+                                })
                             }
                             InvKind::Tx => g.mempool.get(&i.hash).map(|t| {
                                 let size = t.encode().len();

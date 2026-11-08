@@ -460,10 +460,12 @@ useless.
   wallet. `q21 wallet --mine` does both at once.
 - **There is no QR code** for the receiving address. The content security
   policy forbids external images, and drawing it in SVG remains to be done.
-- **The released files are neither signed nor notarized.** macOS and Windows
-  will show a warning. Getting around it requires a paid Apple Developer
-  account and an Authenticode certificate. In the meantime, the SHA-256 hash
-  of each file is published with it.
+- **The released files are not OS-code-signed or notarized** (by Apple or
+  Microsoft). macOS and Windows will show a warning. Getting around it requires
+  a paid Apple Developer account and an Authenticode certificate. This is not
+  the same as "unverified": every release *is* signed with the project's
+  minisign key, and the SHA-256 hash of each file is published with it — see
+  SIGNING.md for how to check a download before you run it.
 
 ---
 
