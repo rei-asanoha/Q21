@@ -67,6 +67,47 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.6.0 to 0.6.1
+
+0.6.1 changes no rule of the chain and nothing in a channel's messages or the
+wallet file: a 0.6.0 node and a 0.6.1 node accept the same blocks and keep the
+same channels. Mining does not need to stop, and there is no deadline. It
+brings the wallet-page changes asked for during the 0.6.0 deployment and the
+fixes of the thirteenth red-team campaign (RED-TEAM-2026-13.md): one serving
+cost, one wallet figure, and wording.
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, block timestamps strictly after their parent's from
+block 5,950, and the one-day maturity from block 7,000.
+
+## What changes
+
+| | 0.6.0 | 0.6.1 |
+|---|---|---|
+| Closing a channel while the other side is offline | A "Close now" button that could only be refused, and an offer to close without the peer below it | Two choices side by side, each with its wait: wait for it to reconnect and close together (the share is back after one confirmation, about two minutes), or close alone now (the channel's safety delay, 1,440 blocks — about two days — on the test network) |
+| A channel still closing while a new one is open with the same person | Out of sight: the contact's panel showed only the open channel | The panel of either one names the other with its state and a "Show" button; "All my channels" unfolds whenever a channel is not the one its contact's panel shows |
+| A close alone waiting out its delay | A full "Closing in progress" panel under a warning heading | One quiet card that counts down: "Your share comes back in N blocks, about T. Nothing to do." with its progress bar; the same countdown on one line beside another channel with the same person |
+| Serving a recent-tip compact block | The whole block was read and cloned before the compact-block cache was consulted, even when the cache served | The cache is consulted first: a hit never touches the whole block |
+| The wallet's "maturing" figure | Counted a coinbase sitting on a one-time key that had already signed — a frozen coin that never matures | Leaves it out, as the spendable balance already did; the countdown on an immature reward no longer reads one block too few |
+| Wording | Japanese called the backup code a "recovery phrase" in two places; French used the informal "you" in two closing dialogs | The Japanese term for "backup code" everywhere; the formal "you" everywhere in French |
+
+## Who should upgrade, and when
+
+Everyone, when convenient: the servers first if you like, then the PC and the
+Mac. All versions since 0.6.0 work together.
+
+## The servers
+
+Same steps as for 0.6.0 (the data folder, then `monitor.sh` from the archive),
+without the height check: 0.6.1 has no activation height. Nothing changes in
+Caddy.
+
+## The data folder
+
+Nothing changes. Going back to 0.6.0 with the same folder is safe.
+
+---
+
 # Upgrading from 0.5.12 to 0.6.0
 
 0.6.0 changes **one rule of the chain**: from testnet block **7,000**, a block

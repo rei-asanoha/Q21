@@ -80,10 +80,10 @@ Nine items, all in the minor band (no critical, no high). Classified by severity
   *Fix:* the offline dialog now says "your share comes back after one confirmation," matching the
   confirm dialog; the French and Japanese patterns were updated to match.
 
-- **French slipped from *vous* to *tu* in two close dialogs**, and wrote "lié à **la** code" for a
-  masculine noun. Every other French string is formal *vous*; the lapse sat exactly in the
-  security-critical close-alone guidance, where an abrupt register shift reads as a tampered build.
-  *Fix:* both dialogs use *vous/votre*; "lié **au** code de sauvegarde."
+- **French slipped from the formal to the informal "you" in two close dialogs**, and used a feminine
+  article before the masculine noun for "backup code." Every other French string uses the formal
+  form; the lapse sat exactly in the security-critical close-alone guidance, where an abrupt register
+  shift reads as a tampered build. *Fix:* both dialogs use the formal form; the article is corrected.
 
 ### Info
 
