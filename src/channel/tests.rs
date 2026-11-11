@@ -2940,3 +2940,90 @@ fn an_opening_announces_exactly_two_points() {
         "an Accept announcing three points was taken"
     );
 }
+
+/// Challenge after campaign 14 (D1-2, layer b): a point known ahead of its
+/// revocation — the journal a crash leaves between the two writes of a
+/// revocation — never gets a third unrevoked state countersigned; and the
+/// same revocation, resent, is still taken (layer c refuses nothing honest).
+#[test]
+fn a_point_known_ahead_of_its_revocation_never_gets_a_third_state_countersigned() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    let upd3 = f.propose([CAP - 3_000_000, 3_000_000]).unwrap();
+    let ack3 = a.on_update(&upd3).unwrap();
+    let rev3 = f.on_ack(&ack3).unwrap();
+    let Message::Revoke { revocation, .. } = &rev3 else {
+        panic!("not a Revoke")
+    };
+    // The crash: the point of state 4 reached the journal, the revocation of
+    // state 2 that announces it did not.
+    drop(a);
+    {
+        let (mut j, _) = journal::Journal::open(dir.join("a.jrnl")).unwrap();
+        j.append(&Record::TheirPoint {
+            state: 4,
+            point: revocation.next_hash,
+        })
+        .unwrap();
+    }
+    let mut a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert_eq!(a.irrevocable_balance(), 2_000_000);
+    // The payer withholds the revocation again and sends the next update.
+    let upd4 = f.propose([CAP - 20_000_000, 20_000_000]).unwrap();
+    assert!(
+        a.on_update(&upd4).is_err(),
+        "state 4 was countersigned while states 2 and 3 are unrevoked"
+    );
+    assert_eq!(
+        a.local_commit_number(),
+        Some(3),
+        "a refused update was recorded"
+    );
+    assert_eq!(a.irrevocable_balance(), 2_000_000);
+    // The honest end of the story: the same revocation, resent, is taken
+    // although its point is already known.
+    a.on_revoke(&rev3).unwrap();
+    assert_eq!(a.irrevocable_balance(), 3_000_000);
+    let ack4 = a.on_update(&upd4).unwrap();
+    let rev4 = f.on_ack(&ack4).unwrap();
+    a.on_revoke(&rev4).unwrap();
+    assert_eq!(a.irrevocable_balance(), 20_000_000);
+    assert_eq!(a.balances(), f.balances());
+}
+
+/// Challenge after campaign 14 (D1-1/D1-2, layer c): a point already known
+/// for a state is never replaced by a revocation announcing another.
+#[test]
+fn a_revocation_never_replaces_a_point_already_known() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    let upd3 = f.propose([CAP - 3_000_000, 3_000_000]).unwrap();
+    let ack3 = a.on_update(&upd3).unwrap();
+    let rev3 = f.on_ack(&ack3).unwrap();
+    // A point for state 4 is in the journal, and it is not the one the
+    // revocation of state 2 announces.
+    drop(a);
+    {
+        let (mut j, _) = journal::Journal::open(dir.join("a.jrnl")).unwrap();
+        j.append(&Record::TheirPoint {
+            state: 4,
+            point: Hash256([0x66u8; 32]),
+        })
+        .unwrap();
+    }
+    let mut a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert!(
+        a.on_revoke(&rev3).is_err(),
+        "a revocation replaced a point already known"
+    );
+    assert_eq!(a.irrevocable_balance(), 2_000_000);
+    // Nothing of it was recorded.
+    drop(a);
+    let mut a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert!(a.on_revoke(&rev3).is_err());
+    assert_eq!(a.irrevocable_balance(), 2_000_000);
+}

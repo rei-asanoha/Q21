@@ -178,8 +178,9 @@ the first.
   the whole life of the channel, at the cost of two dust payments. *Fix, in three layers, each
   enough alone:* an opening announces exactly two points; no countersignature is ever given for a
   state `n` while `n - 2` is unrevoked; a point already known for a state is never replaced.
-  *Tests:* an opening with three points is refused on both sides; with the first layer lifted, the
-  second refuses the update and the third refuses the revocation. A channel opened this way before
+  *Tests:* an opening with three points is refused on both sides; a point known ahead of its
+  revocation — the journal a crash can leave — never gets a third state countersigned, and the same
+  revocation resent is still taken; a revocation never replaces a point already known. A channel opened this way before
   the fix cannot be told apart afterwards: close and reopen a channel whose peer you do not trust.
 
 **In the wallet, one flaw, low, fixed.**
@@ -210,7 +211,9 @@ the chain after a reorganization, where it can confirm nothing (C4-2); plain inc
 spendable at one confirmation and the page does not say how many make a payment final (C5-2); the
 page does not yet show that a reorganization took a channel's funding off the chain — payments are
 refused meanwhile, with the reason (D3-1); a failure to write the wallet's pending payments is a
-warning in the log only (D2-2).
+warning in the log only (D2-2); a funding message or an acknowledgement that fails its check after a
+record was written costs the peer its own opening or its own update, and no money (E1-2). A third
+round on these fixes found no money flaw and no honest flow they refuse.
 
 ## Open, with rationale
 
