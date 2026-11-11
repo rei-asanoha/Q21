@@ -2176,8 +2176,12 @@ fn a_channel_named_on_another_output_is_forgotten_at_once() {
         value: Amount::from_units(capacity),
         ..p.funder_funding_output(cid)
     };
+    // The real output, confirmed after the acceptor signed it (at tip 900,
+    // the last block it saw): an honest funding goes out only once
+    // FundingSigned is in, and one already on chain when signed is an older
+    // output named again (campaign 14, B-T3-1-1).
     p.acceptor
-        .on_connected_block(&[], 900, &|_| Some((50, real)));
+        .on_connected_block(&[], 950, &|_| Some((50, real)));
     assert_eq!(p.acceptor.info(cid).unwrap().phase, Phase::Open);
 }
 
@@ -4572,4 +4576,119 @@ fn a_closing_channel_whose_funding_can_never_come_back_is_given_up_too() {
             .expect("archived");
         assert_eq!(a.how, q21_core::channel::manager::ClosedHow::Abandoned);
     }
+}
+
+/// Campaign 14, B-T3-1-1: a former peer names, as the funding of a new channel
+/// on the same keys (a wallet restored from its backup code derives them
+/// again), the OLD channel's funding output, still unspent on chain: every old
+/// commitment the acceptor signed would spend it. An honest funder broadcasts
+/// only after FundingSigned, so a funding already on chain when the acceptor
+/// signed is refused, and the channel forgotten before it opens.
+#[test]
+fn a_funding_already_on_chain_when_the_acceptor_signed_is_refused() {
+    let funder_seed = [0x1cu8; 32];
+    let acceptor_seed = [0x2du8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    // The old channel, opened through the block hook.
+    let dir1 = tmpdir("b-t3-1-1-old");
+    let mut p1 = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir1,
+    );
+    drive(&p1.acceptor, &chain);
+    let capacity = {
+        let w = wallet.lock().unwrap();
+        let c = chain.lock().unwrap();
+        (w.balance(&c.chain.utxo, c.chain.height()).units() / 4).max(2 * MIN_OUTPUT_VALUE)
+    };
+    let hello = p1.funder.open(A_PEER, capacity, None, None).unwrap();
+    p1.queue.push_back((1, hello));
+    p1.pump();
+    let cid = p1.funder.list()[0].channel_id;
+    let funding_output = p1.funder_funding_output(cid);
+    let old_funding = chain
+        .lock()
+        .unwrap()
+        .last_txs
+        .iter()
+        .find(|t| t.outputs.contains(&funding_output))
+        .cloned()
+        .expect("the old funding was mined at FundingSigned");
+    // It is buried well past the funding depth: an output of the past.
+    for _ in 0..(3 * DEPTH) {
+        chain.lock().unwrap().mine(&[]);
+        for (_, f) in drive(&p1.funder, &chain) {
+            p1.queue.push_back((1, f));
+        }
+        for (_, f) in drive(&p1.acceptor, &chain) {
+            p1.queue.push_back((0, f));
+        }
+        p1.pump();
+    }
+    assert_eq!(p1.acceptor.info(cid).unwrap().phase, Phase::Open);
+
+    // The acceptor restores from its code (fresh folder, same key); the former
+    // peer opens again with its old key and "funds" the new channel with the
+    // old channel's output.
+    let dir2 = tmpdir("b-t3-1-1-new");
+    let mut evil = funder_hooks(wallet.clone(), chain.clone());
+    let replay = old_funding.clone();
+    evil.fund = Box::new(move |_, _| Ok(replay.clone()));
+    let funder = ChannelManager::new(
+        NET,
+        RATE,
+        funder_seed,
+        dir2.join("funder"),
+        DELAY,
+        DEPTH,
+        evil,
+    );
+    let acceptor = ChannelManager::new(
+        NET,
+        RATE,
+        acceptor_seed,
+        dir2.join("acceptor"),
+        DELAY,
+        DEPTH,
+        acceptor_hooks(chain.clone(), Hash256([0x5e; 32])),
+    );
+    std::fs::create_dir_all(dir2.join("funder")).unwrap();
+    std::fs::create_dir_all(dir2.join("acceptor")).unwrap();
+    let mut p2 = Pair {
+        funder,
+        acceptor,
+        queue: VecDeque::new(),
+    };
+    p2.reconnect();
+    p2.reconnect();
+    // A running node knows its tip: the block hook has run.
+    drive(&p2.acceptor, &chain);
+    let hello = p2.funder.open(A_PEER, capacity, None, None).unwrap();
+    p2.queue.push_back((1, hello));
+    p2.pump();
+    assert_eq!(
+        p2.funder.list()[0].channel_id,
+        cid,
+        "same keys, same channel id: the premise"
+    );
+    assert_eq!(
+        p2.acceptor.info(cid).and_then(|i| i.funding),
+        p1.acceptor.info(cid).and_then(|i| i.funding),
+        "the new channel names the old funding output: the attack"
+    );
+    // The next block shows the funding deep in the past: refused, forgotten.
+    chain.lock().unwrap().mine(&[]);
+    for (_, f) in drive(&p2.acceptor, &chain) {
+        p2.queue.push_back((0, f));
+    }
+    p2.pump();
+    assert!(
+        p2.acceptor.info(cid).is_none(),
+        "the acceptor kept a channel funded by an output older than its signature: {:?}",
+        p2.acceptor.info(cid).map(|i| i.phase)
+    );
 }

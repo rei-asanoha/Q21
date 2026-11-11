@@ -798,6 +798,9 @@ struct Inner {
     archived: Vec<ArchivedChannel>,
     /// The next counted acceptor index, past [`ACCEPTOR_COUNTER_BASE`].
     next_acceptor: u32,
+    /// The last tip the chain hooks reported (0 before the first): what an
+    /// acceptor records when it signs a funding (see [`Manager::signed_at_path`]).
+    tip: u64,
     /// Acceptor indices offered in a HelloBack whose open never came:
     /// offered again first, so Hellos that lead nowhere spend no index.
     free_acceptor: Vec<u32>,
@@ -972,6 +975,7 @@ impl ChannelManager {
                 verify_waiting: HashMap::new(),
                 archived: Vec::new(),
                 next_acceptor: 0,
+                tip: 0,
                 free_acceptor: Vec::new(),
                 key_hashes: None,
                 claimed: HashMap::new(),
@@ -1690,6 +1694,20 @@ impl ChannelManager {
     /// The sidecar naming the addition the closing transaction spent the
     /// output of: an addition not yet locked when the channel ended that
     /// did happen. See `react_to_spend`.
+    /// The sidecar holding the tip at which we, the acceptor, signed the
+    /// channel's funding: a funding confirmed at or below it existed before
+    /// the channel (campaign 14, B-T3-1-1). Absent for channels accepted
+    /// before it was written, which keep the earlier behaviour.
+    fn signed_at_path(&self, cid: Hash256) -> PathBuf {
+        self.journal_dir.join(format!("{}.signed-at", cid.to_hex()))
+    }
+
+    fn read_signed_at(&self, cid: Hash256) -> Option<u64> {
+        std::fs::read_to_string(self.signed_at_path(cid))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
     fn spliced_path(&self, cid: Hash256) -> PathBuf {
         self.journal_dir.join(format!("{}.spliced", cid.to_hex()))
     }
@@ -2448,6 +2466,7 @@ impl ChannelManager {
         let seq_now = g.session_seq;
         // The peer proves an older copy and takes splices (0.5.5 and later).
         let peer_proves = Self::peer_splices(&g, peer);
+        let tip_now = g.tip;
         let Some(chan) = g.channels.get_mut(&cid) else {
             // A peer that still tracks a channel we have settled and forgotten
             // (closed on our side, still closing on theirs) offers its
@@ -2530,7 +2549,24 @@ impl ChannelManager {
                 }
             }
             ChMsg::Funding { .. } => {
+                let first = chan.machine.funding_outpoint().is_none();
+                let tip = tip_now;
                 let m = chan.machine.on_funding(&msg).map_err(err)?;
+                // An honest funder broadcasts the funding only once our
+                // FundingSigned is in: it cannot confirm at or below the tip
+                // we sign at. The tip is written down before the signature
+                // leaves, so that a funding output already on chain — the
+                // OLD channel's, named again by a former peer after a restore
+                // from the backup code, on which every old commitment we
+                // signed is still valid — is refused when it is seen
+                // (campaign 14, B-T3-1-1). A replayed Funding only re-signs.
+                if first && tip > 0 {
+                    crate::channel::journal::atomic_write(
+                        &self.signed_at_path(cid),
+                        format!("{tip}\n").as_bytes(),
+                    )
+                    .map_err(|e| format!("cannot record the funding height: {e}"))?;
+                }
                 out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
             }
             ChMsg::FundingSigned { .. } => {
@@ -2915,6 +2951,10 @@ impl ChannelManager {
         height: u64,
         depth_of: &DepthOf,
     ) -> Vec<(u64, Vec<u8>)> {
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.tip = height;
+        }
         self.watch_fundings(txs, height);
         self.react_to_spends(txs, height);
         let mut frames = self.confirm_buried(height, depth_of);
@@ -3337,6 +3377,7 @@ impl ChannelManager {
         let chan = g.channels.remove(&cid)?;
         let _ = std::fs::remove_file(self.journal_path(cid));
         let _ = std::fs::remove_file(self.peer_identity_path(cid));
+        let _ = std::fs::remove_file(self.signed_at_path(cid));
         chan.reserved
             .then(|| chan.machine.funding_tx().cloned())
             .flatten()
@@ -3365,6 +3406,9 @@ impl ChannelManager {
         txs_at: &dyn Fn(u64) -> Option<Vec<Transaction>>,
         depth_of: &DepthOf,
     ) {
+        // The tip is known from the start, before the first block hook: a
+        // Funding signed right after a restart records it (B-T3-1-1).
+        self.inner.lock().unwrap().tip = tip;
         // An acceptor down when its funding confirmed never saw the block:
         // the funding is fetched from where it stands now, so that a spend
         // of its coins elsewhere is followed (campaign 10, `perse`; see
@@ -3852,6 +3896,36 @@ impl ChannelManager {
             eprintln!(
                 "channel {}: the announced funding output is not the channel's 2-of-2 \
                  output for its capacity; forgotten",
+                cid.to_hex()
+            );
+            let _ = self.forget(&mut g, cid);
+        }
+        // A funding we accepted that was already on chain when we signed it
+        // is an output that existed before this channel: an earlier channel's
+        // on the same keys, whose old commitments we signed would spend it
+        // (campaign 14, B-T3-1-1). Forgotten before it opens: we put nothing
+        // in, and nothing is paid on it.
+        let older_than_signature: Vec<Hash256> = g
+            .unfunded_iter(true)
+            .filter(|c| {
+                let Some((depth, _)) = c.machine.funding_outpoint().and_then(|op| depth_of(&op))
+                else {
+                    return false;
+                };
+                let at = height.saturating_add(1).saturating_sub(depth);
+                // A margin of the funding depth: after a reorganization the
+                // tip we wrote down may briefly stand above the real one, and
+                // an honest funding must never be taken for an old output.
+                let margin = u64::from(c.machine.funding_depth());
+                self.read_signed_at(c.machine.channel_id())
+                    .is_some_and(|signed_at| at.saturating_add(margin) <= signed_at)
+            })
+            .map(|c| c.machine.channel_id())
+            .collect();
+        for cid in older_than_signature {
+            eprintln!(
+                "ALERT: channel {}: the announced funding output was already on chain when \
+                 this wallet signed it — an earlier channel's output named again; forgotten",
                 cid.to_hex()
             );
             let _ = self.forget(&mut g, cid);
