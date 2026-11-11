@@ -4692,3 +4692,38 @@ fn a_funding_already_on_chain_when_the_acceptor_signed_is_refused() {
         p2.acceptor.info(cid).map(|i| i.phase)
     );
 }
+
+/// Campaign 14, T3-2: a copy restored from an older backup countersigns no
+/// cooperative close the peer sends — neither before the session's
+/// reestablish (not yet resynchronized) nor after it (known older).
+#[test]
+fn a_restored_older_copy_countersigns_no_close() {
+    let funder_seed = [0xc3u8; 32];
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, [0xd4u8; 32], "older-no-close");
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    let backup = dir.join("funder-backup");
+    restore_dir(&dir.join("funder"), &backup);
+    for amount in [2_000_000u64, 500_000] {
+        let pay = p.funder.pay(cid, amount).unwrap();
+        p.queue.push_back((1, pay));
+        p.pump();
+    }
+    // The peer's close over the latest state, kept for later.
+    let close = p.acceptor.close(cid).unwrap().expect("a close frame");
+    // The funder's folder is restored from the copy, and the node restarts.
+    restore_dir(&backup, &dir.join("funder"));
+    p.reload_funder(funder_seed, wallet, chain, &dir);
+    assert!(
+        p.funder.deliver(A_PEER, &close).frames.is_empty(),
+        "a copy not yet resynchronized countersigned the close"
+    );
+    reconnect(&mut p);
+    assert!(p.funder.info(cid).unwrap().behind);
+    assert!(
+        p.funder.deliver(A_PEER, &close).frames.is_empty(),
+        "a copy known to be older countersigned the close"
+    );
+}

@@ -1132,6 +1132,12 @@ impl Machine {
 
     /// Responder: handles [`Message::Update`], returning [`Message::Ack`].
     pub fn on_update(&mut self, msg: &Message) -> Result<Message, ChannelError> {
+        // An older copy signs nothing (campaign 14, T3-2): see SyncVerdict::WeAreBehind.
+        if self.sync == SyncVerdict::WeAreBehind {
+            return Err(ChannelError::Invariant(
+                "this copy is older than the channel: it signs nothing",
+            ));
+        }
         let Message::Update {
             state,
             balances,
@@ -2590,6 +2596,12 @@ impl Machine {
     /// so our side is paid in full, and the fee must lie within the bounds we
     /// accept and within the peer's balance.
     pub fn on_close(&mut self, msg: &Message) -> Result<Message, ChannelError> {
+        // An older copy signs nothing (campaign 14, T3-2): see SyncVerdict::WeAreBehind.
+        if self.sync == SyncVerdict::WeAreBehind {
+            return Err(ChannelError::Invariant(
+                "this copy is older than the channel: it signs nothing",
+            ));
+        }
         if !matches!(msg, Message::Close { .. }) {
             return Err(ChannelError::Unexpected);
         }
@@ -2608,6 +2620,12 @@ impl Machine {
     /// here: verified, and agreed to at once (see [`Machine::agree_close`]);
     /// our signature follows once the update completes.
     pub fn on_close_crossing(&mut self, msg: &Message) -> Result<(), ChannelError> {
+        // An older copy signs nothing (campaign 14, T3-2): see SyncVerdict::WeAreBehind.
+        if self.sync == SyncVerdict::WeAreBehind {
+            return Err(ChannelError::Invariant(
+                "this copy is older than the channel: it signs nothing",
+            ));
+        }
         let (fee, seq) = self.check_close(msg)?;
         self.agree_close(fee, false)?;
         self.note_control(seq)
@@ -3247,6 +3265,12 @@ impl Machine {
     /// one that crosses ours starts their merge ([`Machine::on_crossed_update`]),
     /// and a crossed proposal already taken is a resend with nothing to answer.
     pub fn on_peer_update(&mut self, msg: &Message) -> Result<Vec<Message>, ChannelError> {
+        // An older copy signs nothing (campaign 14, T3-2): see SyncVerdict::WeAreBehind.
+        if self.sync == SyncVerdict::WeAreBehind {
+            return Err(ChannelError::Invariant(
+                "this copy is older than the channel: it signs nothing",
+            ));
+        }
         let Message::Update { state, .. } = msg else {
             return Err(ChannelError::Unexpected);
         };

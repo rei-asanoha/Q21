@@ -2499,6 +2499,20 @@ impl ChannelManager {
             _ if chan.peer_identity != peer_identity => return Ok(Vec::new()),
             _ => {}
         }
+        // An older copy signs nothing, for the peer either: a close or an
+        // update it countersigned would settle the channel on its stale
+        // balances, at once and unpunishable (campaign 14, T3-2). Nor does a
+        // copy that has not resynchronized on this session — a reloaded
+        // channel is `synced` only once an in-step reestablish came, which
+        // always precedes the peer's frames on the same session. Ignored,
+        // not penalised: the peer's software may simply not know yet.
+        if matches!(
+            msg,
+            ChMsg::Update { .. } | ChMsg::Close { .. } | ChMsg::Splice { .. }
+        ) && (chan.behind || !chan.synced)
+        {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         match msg {
             ChMsg::Accept { .. } => {

@@ -2776,3 +2776,43 @@ fn the_revocation_salt_survives_a_compaction_and_a_restart() {
     pay(&mut a, &mut f, [CAP - 1_500_000, 1_500_000]);
     pay(&mut f, &mut a, [CAP - 3_000_000, 3_000_000]);
 }
+
+/// The funder at the latest state, and the acceptor reopened on a copy taken
+/// two payments ago and told so by a reestablish (campaign 14, T3-2).
+fn latest_and_older_copy() -> (Machine, Machine) {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 3_000_000, 3_000_000]);
+    std::fs::copy(dir.join("a.jrnl"), dir.join("a-old.jrnl")).unwrap();
+    pay(&mut f, &mut a, [CAP - 9_000_000, 9_000_000]);
+    pay(&mut f, &mut a, [CAP - 10_000_000, 10_000_000]);
+    drop(a);
+    // The acceptor comes back on the copy: 3,000,000 instead of 10,000,000.
+    let mut old = Machine::reopen(dir.join("a-old.jrnl"), NET, akey(), RATE).unwrap();
+    let _ = exchange_reestablish(&mut f, &mut old);
+    assert_eq!(old.sync(), super::machine::SyncVerdict::WeAreBehind);
+    (f, old)
+}
+
+/// Campaign 14, T3-2: an older copy signs no cooperative close over its stale
+/// balances.
+#[test]
+fn an_older_copy_signs_no_close_over_its_stale_balances() {
+    let (mut f, mut old) = latest_and_older_copy();
+    let close = f.propose_close(20_000).unwrap();
+    assert!(
+        old.on_close(&close).is_err(),
+        "an older copy signed a close that pays it 3,000,000 of its 10,000,000"
+    );
+}
+
+/// Campaign 14, T3-2: nor an update over its stale state.
+#[test]
+fn an_older_copy_signs_no_update_over_its_stale_state() {
+    let (mut f, mut old) = latest_and_older_copy();
+    let upd = f.propose([CAP - 11_000_000, 11_000_000]).unwrap();
+    assert!(
+        old.on_update(&upd).is_err(),
+        "an older copy signed an update over its stale state"
+    );
+}
