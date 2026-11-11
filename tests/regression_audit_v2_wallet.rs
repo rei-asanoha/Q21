@@ -147,6 +147,14 @@ fn v1_the_backup_code_no_longer_goes_through_the_command_line() {
         "`--backup-code-file` must restore:\n{}",
         String::from_utf8_lossy(&s.stderr)
     );
+    // A restore does not print the code back: its output is what a script or
+    // a service captures into a log (campaign 14, RT2-2).
+    let out = String::from_utf8_lossy(&s.stdout);
+    assert!(
+        !out.contains(&code[code.len() - 20..]),
+        "FINDING: the restore printed the backup code back"
+    );
+    assert!(out.contains("not shown again"), "{out}");
     // The restored wallet is indeed that of the seed: the next address is
     // that of index 1 (index 0 is the recipient of the genesis).
     let mut expected_wallet = Wallet::from_seed([0x5a; 32], Network::Regtest);

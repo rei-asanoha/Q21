@@ -554,6 +554,10 @@ enum CloseTracker {
     },
 }
 
+/// At most this many unknown channels a peer reestablished are told (see
+/// `Inner::unknown_told`).
+const UNKNOWN_TOLD_MAX: usize = 64;
+
 /// Channels we accepted that are not yet funded on chain, across all peers.
 /// Each holds a journal and is reloaded at every start until it opens or
 /// expires. Counted apart from the ones we open, which they never block.
@@ -811,6 +815,11 @@ struct Inner {
     /// it does — a manager driven by the block hooks alone — the height they
     /// hand is taken for the tip.
     tip_noted: bool,
+    /// Channels a peer reestablished that this node does not know and never
+    /// archived, with the peer's node id: most likely open before the wallet
+    /// was restored from its backup code. Told once each, at most
+    /// [`UNKNOWN_TOLD_MAX`] (campaign 14, RT2-1).
+    unknown_told: Vec<(Hash256, String)>,
     /// Acceptor indices offered in a HelloBack whose open never came:
     /// offered again first, so Hellos that lead nowhere spend no index.
     free_acceptor: Vec<u32>,
@@ -939,6 +948,8 @@ pub struct ChannelManager {
     opens_refused: std::sync::OnceLock<String>,
     /// See [`ChannelManager::note_chain`].
     catching_up: std::sync::atomic::AtomicBool,
+    /// The notice of a refused opening while catching up was printed.
+    catching_up_said: std::sync::atomic::AtomicBool,
 }
 
 fn write_frame(cid: Hash256, kind: u8, body: &[u8]) -> Vec<u8> {
@@ -973,6 +984,7 @@ impl ChannelManager {
             replaying: AtomicBool::new(false),
             opens_refused: std::sync::OnceLock::new(),
             catching_up: std::sync::atomic::AtomicBool::new(false),
+            catching_up_said: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 channels: HashMap::new(),
                 links: HashMap::new(),
@@ -990,6 +1002,7 @@ impl ChannelManager {
                 next_acceptor: 0,
                 tip: 0,
                 tip_noted: false,
+                unknown_told: Vec::new(),
                 free_acceptor: Vec::new(),
                 key_hashes: None,
                 claimed: HashMap::new(),
@@ -1765,6 +1778,12 @@ impl ChannelManager {
         machine.funding_height().is_some() || self.end_path(machine.channel_id()).exists()
     }
 
+    /// Channels a peer reestablished that this node does not know (see
+    /// `Inner::unknown_told`): the channel id and the peer's node id.
+    pub fn unknown_channels(&self) -> Vec<(Hash256, String)> {
+        self.inner.lock().unwrap().unknown_told.clone()
+    }
+
     /// Every closed channel: those found closed at start, and those closed
     /// since, most recent first.
     pub fn archived(&self) -> Vec<ArchivedChannel> {
@@ -1809,6 +1828,10 @@ impl ChannelManager {
     pub fn note_chain(&self, tip: u64, catching_up: bool) {
         self.catching_up
             .store(catching_up, std::sync::atomic::Ordering::Relaxed);
+        if !catching_up {
+            self.catching_up_said
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut g = self.inner.lock().unwrap();
         g.tip = tip;
         g.tip_noted = true;
@@ -2338,9 +2361,21 @@ impl ChannelManager {
         // it is catching up with the chain: it cannot yet tell an output that
         // already exists — an old channel's, named again — from a new one
         // (campaign 14, B2).
-        if self.opens_refused.get().is_some()
-            || self.catching_up.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.opens_refused.get().is_some() {
+            return Ok(Vec::new());
+        }
+        if self.catching_up.load(std::sync::atomic::Ordering::Relaxed) {
+            // Said once per catching-up spell, not at every Hello: the holder
+            // who waits for a channel learns why (campaign 14, R2-2).
+            if !self
+                .catching_up_said
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "notice: channel openings are not answered while this node catches up \
+                     with the chain; they are again once it has"
+                );
+            }
             return Ok(Vec::new());
         }
         // Bounded: opens in progress across all peers and per announced
@@ -2507,6 +2542,29 @@ impl ChannelManager {
             // reestablish at every session. Penalising it dropped the link
             // at every reconnect; there is simply nothing to resynchronize.
             if matches!(msg, ChMsg::Reestablish { .. }) {
+                // Unknown and never archived here: the journal is gone — most
+                // likely a wallet restored from its backup code. The peer then
+                // holds every state and can close at an older one; the holder
+                // is told which peer, once, so they can ask for a close (campaign
+                // 14, RT2-1). Bounded: a peer naming made-up channels fills a
+                // short list and is told nothing more.
+                let archived = g.archived.iter().any(|a| a.channel_id == cid);
+                if !archived
+                    && is_node_id(peer_identity)
+                    && g.unknown_told.len() < UNKNOWN_TOLD_MAX
+                    && !g.unknown_told.iter().any(|(c, _)| *c == cid)
+                {
+                    g.unknown_told.push((cid, peer_identity.to_string()));
+                    eprintln!(
+                        "ALERT: node {} says it shares channel {} with this wallet, which does \
+                         not know it — most likely it was open before this wallet was restored \
+                         from its backup code. That node can close it at an older state: ask \
+                         its holder to close it with you, and open no new channel with them \
+                         before that close is confirmed",
+                        &peer_identity[..16],
+                        cid.to_hex()
+                    );
+                }
                 return Ok(Vec::new());
             }
             return Err("unknown channel".into());
@@ -3995,7 +4053,14 @@ impl ChannelManager {
                 // A margin of the funding depth: after a reorganization the
                 // tip we wrote down may briefly stand above the real one, and
                 // an honest funding must never be taken for an old output.
-                let margin = u64::from(c.machine.funding_depth());
+                // The network's depth at most: the channel's own is the
+                // funder's choice, up to 2016 blocks, and an old output that
+                // deep passed (campaign 14, B5-1).
+                let margin = u64::from(
+                    c.machine
+                        .funding_depth()
+                        .min(crate::channel::terms(self.network).funding_depth),
+                );
                 self.read_signed_at(c.machine.channel_id())
                     .is_some_and(|signed_at| at.saturating_add(margin) <= signed_at)
             })

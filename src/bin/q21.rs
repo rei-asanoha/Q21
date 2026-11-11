@@ -2614,13 +2614,16 @@ fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<Di
             "checking one-time keys: no known consumption \n             for {} handed-out address(es). Scanning the chain...",
             wallet.next_index()
         );
-        let mut found = 0usize;
-        for h in 1..=chain.height() {
-            if let Some(id) = chain.active_at(h) {
-                if let Some(b) = archive.read(&id) {
-                    found += wallet.record_spends(&b);
-                }
-            }
+        let (found, checked) = startup_one_time_scan(&mut wallet, chain.height(), |h| {
+            chain.active_at(h).and_then(|id| archive.read(&id))
+        });
+        if checked < chain.height() {
+            eprintln!(
+                "             this node does not hold block {} (started from a snapshot, or \n             \
+                 pruned): the keys are checked up to block {checked} only, and this wallet \n             \
+                 sends nothing until the rest is checked.",
+                checked + 1
+            );
         }
         if found > 0 {
             eprintln!(
@@ -2629,10 +2632,10 @@ fn load_state_with(datadir: &Path, forced_network: Option<Network>) -> Result<Di
         } else {
             eprintln!("             no signature from this wallet in the chain.");
         }
-        // The scan is recorded: it will only start again from here. Without
-        // this, a wallet that never spends reread the whole chain at every
-        // command — a cost that grows with the height, paid for nothing.
-        wallet.record_verification(chain.height());
+        // The scan is recorded (inside `startup_one_time_scan`): it will only
+        // start again from there. Without this, a wallet that never spends
+        // reread the whole chain at every command — a cost that grows with
+        // the height, paid for nothing.
         if !wallet_less {
             let _ = write_wallet(datadir, &wallet);
         }
@@ -3220,6 +3223,30 @@ fn write_new_chain(
     Ok((wallet, payee, genesis))
 }
 
+/// The startup check of one-time keys: every block from the first, the keys
+/// that already signed marked consumed. Verified only as far as the blocks
+/// were read: a body this node does not hold (a node started from a snapshot,
+/// or pruned) ends the check there. Declaring the whole chain verified lifted
+/// the send-time guard, and a key that had signed in an unread block could
+/// sign again (campaign 14, RT2-3). Returns the keys found and the height
+/// checked up to.
+fn startup_one_time_scan<R>(wallet: &mut Wallet, height: u64, read: R) -> (usize, u64)
+where
+    R: Fn(u64) -> Option<q21_core::block::Block>,
+{
+    let mut found = 0usize;
+    let mut checked = 0u64;
+    for h in 1..=height {
+        match read(h) {
+            Some(b) => found += wallet.record_spends(&b),
+            None => break,
+        }
+        checked = h;
+    }
+    wallet.record_verification(checked);
+    (found, checked)
+}
+
 fn cmd_init_with(
     datadir: &Path,
     network: Option<&str>,
@@ -3227,6 +3254,7 @@ fn cmd_init_with(
     passphrase_file: Option<&str>,
     given_seed: Option<[u8; 32]>,
 ) -> Result<(), String> {
+    let restored = given_seed.is_some();
     let network = match network.unwrap_or("regtest") {
         "regtest" => Network::Regtest,
         "testnet" => Network::Testnet,
@@ -3328,14 +3356,27 @@ fn cmd_init_with(
     );
     println!("  Payee             {payee}");
     println!();
-    println!("  BACKUP CODE");
-    println!();
-    println!("    {}", wallet.backup_code());
-    println!();
-    println!("  Copy it on paper, away from this machine. It is the only way");
-    println!("  to recover the funds if the file disappears — and it carries a");
-    println!("  checksum: a typo will be detected, not suffered.");
-    println!();
+    if restored {
+        // The code the wallet was restored from is not printed again: the
+        // holder has it, and a restore is what a script or a service runs,
+        // whose output ends up in logs (campaign 14, RT2-2).
+        println!("  Backup code       the one you restored from — not shown again");
+        println!();
+        println!("  Payment channels are not in the code. If this wallet had any open,");
+        println!("  the other side can now close at an older state and nothing here can");
+        println!("  stop it: ask each person to close with you, and do not open a new");
+        println!("  channel with them before that close is confirmed.");
+        println!();
+    } else {
+        println!("  BACKUP CODE");
+        println!();
+        println!("    {}", wallet.backup_code());
+        println!();
+        println!("  Copy it on paper, away from this machine. It is the only way");
+        println!("  to recover the funds if the file disappears — and it carries a");
+        println!("  checksum: a typo will be detected, not suffered.");
+        println!();
+    }
     let genesis_maturity = q21_core::consensus::coinbase_maturity_at(network, 0);
     println!(
         "  The genesis coin is a coinbase: it becomes spendable\n  \
@@ -9086,5 +9127,27 @@ mod tests {
         assert!(s.contains("if ready && onion_restart_now.swap(false"));
         assert!(s.contains(".min(TOR_RESTART_UNREACHABLE_MAX);"));
         assert!(!s.contains("onion_check_soon.store(true"));
+    }
+
+    /// Campaign 14, RT2-3: the startup check of one-time keys declares
+    /// verified only the blocks it read. A node started from a snapshot has
+    /// no body below the snapshot height; skipping them and declaring the
+    /// whole chain verified lifted the send-time guard.
+    #[test]
+    fn the_startup_key_check_never_declares_unread_blocks_verified() {
+        use q21_core::address::Network;
+        use q21_core::chain::genesis_block;
+        use q21_core::wallet::Wallet;
+        let mut w = Wallet::from_seed([0x31; 32], Network::Regtest);
+        let block = genesis_block(Network::Regtest);
+        // Blocks 1 to 4 read, 5 missing, 6 to 9 read: checked up to 4.
+        let (_, checked) =
+            super::startup_one_time_scan(&mut w, 9, |h| (h != 5).then(|| block.clone()));
+        assert_eq!(checked, 4);
+        assert_eq!(w.verified_up_to(), 4, "an unread block declared verified");
+        // Every body held: the whole chain is checked.
+        let mut w = Wallet::from_seed([0x31; 32], Network::Regtest);
+        let (_, checked) = super::startup_one_time_scan(&mut w, 9, |_| Some(block.clone()));
+        assert_eq!((checked, w.verified_up_to()), (9, 9));
     }
 }

@@ -2829,11 +2829,17 @@ impl Node {
     }
 
     /// The chain's tip height, and whether the node is still catching up:
-    /// its tip older than [`crate::chain::RECENT_TIP_SECS`] by our clock.
+    /// its tip older than [`crate::chain::RECENT_TIP_SECS`] by our clock, or
+    /// below the last anchor of its network — a single fresh block handed to
+    /// a node restored at genesis makes its tip recent, not its chain
+    /// (campaign 14, B5-2). Never on regtest, whose test chains are dated in
+    /// the past (as the finality hold does; R2-1).
     fn chain_status(&self) -> (u64, bool) {
         let g = self.shared.lock().unwrap();
         let tip = g.chain.height();
-        let behind = unix_now().saturating_sub(g.chain.tip().time) > crate::chain::RECENT_TIP_SECS;
+        let behind = g.network != crate::address::Network::Regtest
+            && (unix_now().saturating_sub(g.chain.tip().time) > crate::chain::RECENT_TIP_SECS
+                || tip < crate::validate::last_anchor_height(g.network));
         (tip, behind)
     }
 

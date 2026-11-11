@@ -4586,11 +4586,26 @@ fn a_closing_channel_whose_funding_can_never_come_back_is_given_up_too() {
 /// signed is refused, and the channel forgotten before it opens.
 #[test]
 fn a_funding_already_on_chain_when_the_acceptor_signed_is_refused() {
-    let funder_seed = [0x1cu8; 32];
-    let acceptor_seed = [0x2du8; 32];
+    funding_already_on_chain_is_refused([0x1cu8; 32], [0x2du8; 32], None, "b-t3-1-1");
+}
+
+/// Campaign 14, B5-1: the margin of the check is the network's funding depth
+/// at most — the channel's own is the funder's choice, and a funder asking
+/// for 500 confirmations widened the margin enough for an old output to pass.
+#[test]
+fn a_deep_funding_depth_does_not_widen_the_age_check() {
+    funding_already_on_chain_is_refused([0x1du8; 32], [0x2eu8; 32], Some(500), "b5-1");
+}
+
+fn funding_already_on_chain_is_refused(
+    funder_seed: [u8; 32],
+    acceptor_seed: [u8; 32],
+    depth: Option<u16>,
+    tag: &str,
+) {
     let (wallet, chain) = setup(funder_seed);
     // The old channel, opened through the block hook.
-    let dir1 = tmpdir("b-t3-1-1-old");
+    let dir1 = tmpdir(&format!("{tag}-old"));
     let mut p1 = managers(
         funder_seed,
         acceptor_seed,
@@ -4634,7 +4649,7 @@ fn a_funding_already_on_chain_when_the_acceptor_signed_is_refused() {
     // The acceptor restores from its code (fresh folder, same key); the former
     // peer opens again with its old key and "funds" the new channel with the
     // old channel's output.
-    let dir2 = tmpdir("b-t3-1-1-new");
+    let dir2 = tmpdir(&format!("{tag}-new"));
     let mut evil = funder_hooks(wallet.clone(), chain.clone());
     let replay = old_funding.clone();
     evil.fund = Box::new(move |_, _| Ok(replay.clone()));
@@ -4667,7 +4682,7 @@ fn a_funding_already_on_chain_when_the_acceptor_signed_is_refused() {
     p2.reconnect();
     // A running node knows its tip: the block hook has run.
     drive(&p2.acceptor, &chain);
-    let hello = p2.funder.open(A_PEER, capacity, None, None).unwrap();
+    let hello = p2.funder.open(A_PEER, capacity, None, depth).unwrap();
     p2.queue.push_back((1, hello));
     p2.pump();
     assert_eq!(
@@ -4760,4 +4775,33 @@ fn a_node_catching_up_takes_no_new_channel() {
     p.queue.push_back((1, hello));
     p.pump();
     assert_eq!(p.acceptor.list().len(), 1, "caught up, it accepts");
+}
+
+/// Campaign 14, RT2-1: a wallet restored from its backup code has lost its
+/// channel journals, and the peer can then close at an older state. When that
+/// peer reestablishes the channel, the restored node names it to its holder
+/// — once — instead of dropping it in silence. A channel it closed and
+/// archived itself is not named.
+#[test]
+fn a_channel_reestablished_after_a_restore_is_named_to_the_holder() {
+    let funder_seed = [0x7au8; 32];
+    let (mut p, wallet, chain, dir, cid, _capacity) =
+        open_channel(funder_seed, [0x8bu8; 32], "unknown-after-restore");
+    let pay = p.funder.pay(cid, 1_000_000).unwrap();
+    p.queue.push_back((1, pay));
+    p.pump();
+    // The funder's disk is lost; the wallet comes back from its code, in an
+    // empty folder.
+    let _ = std::fs::remove_dir_all(dir.join("funder"));
+    std::fs::create_dir_all(dir.join("funder")).unwrap();
+    p.reload_funder(funder_seed, wallet, chain, &dir);
+    assert!(p.funder.unknown_channels().is_empty());
+    reconnect(&mut p);
+    let told = p.funder.unknown_channels();
+    assert_eq!(told.len(), 1, "the unknown channel was dropped in silence");
+    assert_eq!(told[0].0, cid);
+    assert_eq!(told[0].1, p.acceptor.node_id());
+    // Told once: a second session adds nothing.
+    reconnect(&mut p);
+    assert_eq!(p.funder.unknown_channels().len(), 1);
 }

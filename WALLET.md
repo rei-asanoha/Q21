@@ -49,7 +49,11 @@ journal, beside the wallet in the data folder, and the code does not hold it:
   closes it. Its close pays our side to a channel key derived from the seed,
   and the node claims it back to the wallet on its own (`recover_key_outputs`;
   the 200 first keys of each kind are looked at, more if channels went
-  further). Ask the other person to close the channel;
+  further). Ask the other person to close the channel. That close is in
+  their hands: having kept every state, they can close at an older one,
+  more favorable to them, and a restored wallet has nothing left to punish
+  it with — the secrets it needs were in the journal. Do not open a new
+  channel with that person before their close is confirmed;
 - a data folder restored from an **older copy** is recognised the first time
   the channel reconnects: the copy refuses to pay or to close, and says why.
   The other side, which holds the latest state, is told, and its holder

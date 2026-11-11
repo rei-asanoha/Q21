@@ -506,8 +506,11 @@ function showRestored(code, address){
   + groupsHtml(code)
   + '<div class="note"><p><b>Your funds will reappear as the chain comes '
   + 'in.</b> The wallet derives your addresses again and finds what belongs to '
-  + 'them — nothing is lost, but syncing has to finish first. On a long chain, '
-  + 'allow a few minutes.</p></div>'
+  + 'them once syncing has finished. On a long chain, allow a few minutes.</p>'
+  + '<p><b>Payment channels are not in the code.</b> If this wallet had any '
+  + 'open, the other side can now close at an older state and nothing here can '
+  + 'stop it. Ask each person to close with you, and do not open a new channel '
+  + 'with them before that close is confirmed.</p></div>'
   + '<div class="actions"><button class="p" id="next">Open my wallet</button></div>';
   $("next").onclick = function(){ finish(address); };
 }
@@ -925,5 +928,18 @@ mod tests {
     #[test]
     fn the_setup_says_nobody_else_ever_needs_the_backup_code() {
         assert_eq!(script().matches("Nobody else ever needs it").count(), 2);
+    }
+
+    /// Campaign 14, RT2-1: a restored wallet has lost its channel journals,
+    /// and with them every secret that punishes an old state. The restored
+    /// screen must not say that nothing is lost, and must say what to do.
+    #[test]
+    fn the_restored_screen_does_not_promise_the_channels_back() {
+        let s = script();
+        let screen = &s[s.find("function showRestored").unwrap()..];
+        let screen = &screen[..screen.find("\n}").unwrap()];
+        assert!(!screen.contains("nothing is lost"));
+        assert!(screen.contains("Payment channels are not in the code"));
+        assert!(screen.contains("do not open a new channel"));
     }
 }
