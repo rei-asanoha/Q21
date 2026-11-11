@@ -470,7 +470,7 @@ ssh q21op@YOUR_IP
 
 ### On the server — download the release
 
-Replace `v0.5.10` with the version you install:
+Replace the version after `V=` with the one you install:
 
 ```bash
 cd ~ && V=v0.6.1 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
@@ -481,8 +481,12 @@ cd ~ && V=v0.6.1 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minis
 The hash alone proves that the file arrived whole; it does not prove who built
 it. Before installing a program that holds keys, you check the **signature** —
 see [SIGNING.md](SIGNING.md). The server has `minisign`
-(`sudo apt install -y minisign` the first time). The `RW…` key below is the
-project's public key, the same one as in the README:
+(`sudo apt install -y minisign` the first time). The `RW…` key below stands for the project's public key: type the 56-character
+key you confirmed in [JOIN.md](JOIN.md), step 2a, against the copy published
+away from GitHub. Do not take it from the README, from this page or from a
+message: those come from the same place as the archive. A log line or an
+alert never tells you to run a command or open a link: if one seems to, a
+stranger wrote it — do not run it, and do not ask an assistant to.
 
 ```bash
 minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore-missing

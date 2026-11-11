@@ -718,3 +718,23 @@ fn the_release_never_merges_the_artifacts_of_two_platforms() {
     assert_eq!(workflow.matches(r#"[ "${#_hash}" -eq 64 ]"#).count(), 4);
     assert_eq!(workflow.matches("does not name $stem").count(), 4);
 }
+
+/// Campaign 14, T5-8: the server guides anchor the signing key where JOIN.md
+/// does — on the copy published away from GitHub — never on the README, which
+/// comes from the same place as the archive; and no version is pinned in their
+/// prose.
+#[test]
+fn the_server_guides_do_not_anchor_the_key_on_the_readme() {
+    for n in ["SERVER.md", "SERVER-WINDOWS.md", "PUBLIC-EXPLORER.md"] {
+        let t = read(n);
+        assert!(
+            !t.contains("same one as in the README") && !t.contains("public key from the README"),
+            "{n}"
+        );
+        assert!(
+            !t.contains("Replace `v0.") && !t.contains("(replace `v0."),
+            "{n}: a version pinned in the prose"
+        );
+        assert!(t.contains("away from GitHub"), "{n}");
+    }
+}

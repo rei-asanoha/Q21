@@ -122,7 +122,7 @@ neither.
 ### On the server
 
 The program comes from the **signed release** of the version you install
-(replace `v0.5.10`); a build of the **Actions** tab is never signed, and is
+(replace the version after `V=`); a build of the **Actions** tab is never signed, and is
 never installed:
 
 ```bash
@@ -130,7 +130,10 @@ cd ~ && V=v0.6.1 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minis
 ```
 
 Check the signature **before** installing (`sudo apt install -y minisign`
-the first time; `RW…` is the public key from the README):
+the first time). The `RW…` key below stands for the project's public key: type the 56-character
+key you confirmed in [JOIN.md](JOIN.md), step 2a, against the copy published
+away from GitHub. Do not take it from the README, from this page or from a
+message: those come from the same place as the archive.
 
 ```bash
 minisign -Vm ~/SHA256SUMS -P 'RW…' && cd ~ && sha256sum -c SHA256SUMS --ignore-missing

