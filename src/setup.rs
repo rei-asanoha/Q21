@@ -407,6 +407,8 @@ function showRestore(){
   + '<h1>Your backup code</h1>'
   + '<p>Type it exactly as written. It carries a checksum: a typo will be '
   + 'caught, not silently accepted.</p>'
+  + '<p>Type it only here, on your own computer. Nobody else ever needs it: '
+  + 'anyone who asks for it, even to help you, is trying to take your funds.</p>'
   + '<label for="c">Backup code</label>'
   + '<textarea id="c" autocomplete="off" autocapitalize="off" autocorrect="off" '
   + 'spellcheck="false"></textarea>'
@@ -481,7 +483,9 @@ function showCode(code, address){
   + '<div class="note warn"><p><b>On paper, by hand, and nowhere else.</b> '
   + 'A file on this machine is lost with it, a file in the cloud can be read '
   + 'remotely, and the clipboard keeps a history — sometimes synced across '
-  + 'your devices. Whoever holds this code holds the funds.</p></div>'
+  + 'your devices. Whoever holds this code holds the funds.</p>'
+  + '<p>Nobody else ever needs it: anyone who asks for it, even to help you, '
+  + 'is trying to take your funds.</p></div>'
   + '<div class="actions"><button class="p" id="next">I\'ve written it down</button></div>';
   $("next").onclick = function(){ showVerify(code, address); };
 }
@@ -914,5 +918,12 @@ mod tests {
         ] {
             assert!(PAGE.contains(phrase), "missing: {phrase}");
         }
+    }
+
+    /// Campaign 14, B4-4: both screens where the backup code is shown or typed
+    /// say that nobody else ever needs it.
+    #[test]
+    fn the_setup_says_nobody_else_ever_needs_the_backup_code() {
+        assert_eq!(script().matches("Nobody else ever needs it").count(), 2);
     }
 }

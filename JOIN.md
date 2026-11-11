@@ -224,7 +224,9 @@ If the page stays on **Offline**, reread step 3: in almost every case, the
 
 The page's **Info** tab shows the version of the program you are running, and
 `q21 version` gives the same answer from a command window. That is the first
-thing to share if you ask for help anywhere.
+thing to share if you ask for help anywhere. Nobody helping you needs your
+backup code or your passphrase: never send either, whoever asks and whatever
+the reason.
 
 ### 6. Mine, if you want to
 
@@ -356,7 +358,8 @@ It retraces the whole path in order — the bootstrap file, the name lookup,
 opening the port, the handshake — and names the step that fails. From the home
 page, a network problem always looks the same; this command, on the other hand,
 tells a missing file apart from a firewall, and a firewall apart from an entry
-point that is down. If you ask for help anywhere, attach its complete output.
+point that is down. If you ask for help anywhere, attach its complete output —
+and nothing else: nobody helping you needs your backup code or your passphrase.
 
 **"No bootstrap address: this node is not looking for anyone"**, on the page —
 sometimes also **"no bootstrap: this node will not look for anyone"**, in the

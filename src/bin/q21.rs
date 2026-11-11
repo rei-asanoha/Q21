@@ -2887,6 +2887,11 @@ fn cmd_restore(
                         .to_string(),
                 );
             }
+            // Said where the code is typed (campaign 14, B4-4).
+            eprintln!(
+                "  Nobody else ever needs your backup code: anyone who asks for it, \
+                 even to help you, is trying to take your funds."
+            );
             let (typed, masked) =
                 q21_core::prompt::read_passphrase("Backup code: ").map_err(|e| e.to_string())?;
             if !masked {

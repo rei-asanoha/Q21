@@ -663,8 +663,16 @@ fn upnp_soap(url: &str, service: &str, action: &str, args: &str) -> Result<Strin
     }
     // A SOAP fault carries a UPnP code in <errorCode>. We pass it up so that
     // the caller recognizes 725 "permanent leases only".
+    // Only the digits of the code: the text comes from any device on the
+    // local network and ends up in the node's log (campaign 14, B4-6).
     if let Some(code) = extract_tag(&response, "errorCode") {
-        return Err(format!("UPnP error {} (HTTP {status})", code.trim()));
+        let digits: String = code
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .take(6)
+            .collect();
+        return Err(format!("UPnP error {digits} (HTTP {status})"));
     }
     Err(format!("HTTP {status}"))
 }

@@ -1060,11 +1060,34 @@ pub const ACTIVATION_WARNING_NAMES: usize = 8;
 /// command" — from reaching an operator, or an assistant the log is pasted
 /// into (campaign 14, T5-7).
 fn shown_agent(agent: &str) -> String {
+    // The grammar of our own agents, and nothing wider: `q21:` and a version
+    // of one to three numbers, then only the capability tokens we announce —
+    // `+chan` (with `v3` and a node id in hex, for the legacy forms) and
+    // `+splice` with a number. Letters and dots anywhere else would let a
+    // stranger write "q21:0.4.11.upgrade.from.q21fix.net" into an operator's
+    // log (campaign 14, B4-5).
+    fn known_token(t: &str) -> bool {
+        if let Some(rest) = t.strip_prefix("chan") {
+            let rest = rest.strip_prefix("v3").unwrap_or(rest);
+            rest.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        } else if let Some(n) = t.strip_prefix("splice") {
+            !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())
+        } else {
+            false
+        }
+    }
     let plain = agent.len() <= crate::wire::MAX_USER_AGENT
-        && agent.starts_with("q21:")
-        && agent[4..]
-            .bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'+');
+        && agent.strip_prefix("q21:").is_some_and(|rest| {
+            let mut parts = rest.split('+');
+            let version = parts.next().unwrap_or("");
+            let numbers: Vec<&str> = version.split('.').collect();
+            (1..=3).contains(&numbers.len())
+                && numbers
+                    .iter()
+                    .all(|n| (1..=5).contains(&n.len()) && n.bytes().all(|c| c.is_ascii_digit()))
+                && parts.all(known_token)
+        });
     if plain {
         format!("\"{agent}\"")
     } else {
@@ -9477,6 +9500,17 @@ mod tests_hardening {
             "a genuine legacy agent is still named: {w}"
         );
         assert!(w.contains("\"q21:0.4\""));
+        // Dots and words past the version are not ours (campaign 14, B4-5).
+        let w = activation_warning(
+            100,
+            90,
+            &[
+                (a, 4, "q21:0.4.11.upgrade.from.q21fix.net".to_string()),
+                (a, 4, "q21:0.5.12+chanv3+splice1".to_string()),
+            ],
+        );
+        assert!(!w.contains("q21fix"), "{w}");
+        assert!(w.contains("\"q21:0.5.12+chanv3+splice1\""), "{w}");
     }
 
     #[test]
