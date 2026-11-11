@@ -60,6 +60,13 @@ pub enum Record {
         /// the rest so no crash can leave a journal without it. `None` in
         /// journals written before it was (see [`Record::KeyIndex`]).
         key_index: Option<u32>,
+        /// A random salt drawn when the channel was created and mixed into
+        /// our revocation root, so that no two channel instances share a
+        /// revocation secret — not even two channels on the same key and the
+        /// same channel id, as a wallet restored from its backup code opens
+        /// again (campaign 14, T3-1). `None` in journals written before it
+        /// was: those keep the unsalted root they announced their points from.
+        revocation_salt: Option<[u8; 32]>,
     },
     /// The funding outpoint is known (funding transaction built).
     Funded {
@@ -187,6 +194,9 @@ const R_SPLICE: u8 = 24;
 const R_SPLICE_SIG: u8 = 25;
 const R_SPLICE_TX: u8 = 26;
 const R_SPLICE_LOCKED: u8 = 27;
+/// [`Record::Opened`] with its revocation salt (and its key index, if any).
+/// A version that cannot read it refuses the journal and leaves it untouched.
+const R_OPENED_SALTED: u8 = 28;
 
 /// Most shachain entries a [`Record::Revocations`] may carry.
 const MAX_STORE_ENTRIES: usize = crate::shachain::MAX_ENTRIES;
@@ -206,8 +216,11 @@ impl Record {
                 their_pubkey,
                 payout,
                 key_index,
+                revocation_salt,
             } => {
-                let tag = if key_index.is_some() {
+                let tag = if revocation_salt.is_some() {
+                    R_OPENED_SALTED
+                } else if key_index.is_some() {
                     R_OPENED_INDEXED
                 } else {
                     R_OPENED
@@ -219,7 +232,17 @@ impl Record {
                     .bytes(&funding_depth.to_le_bytes());
                 w.var_bytes(our_pubkey).var_bytes(their_pubkey);
                 w.bytes(payout[0].as_bytes()).bytes(payout[1].as_bytes());
-                if let Some(index) = key_index {
+                if let Some(salt) = revocation_salt {
+                    match key_index {
+                        Some(index) => {
+                            w.u8(1).u32(*index);
+                        }
+                        None => {
+                            w.u8(0);
+                        }
+                    }
+                    w.bytes(salt);
+                } else if let Some(index) = key_index {
                     w.u32(*index);
                 }
             }
@@ -339,7 +362,7 @@ impl Record {
         let mut r = Reader::new(data);
         let tag = r.u8()?;
         let rec = match tag {
-            R_OPENED | R_OPENED_INDEXED => {
+            R_OPENED | R_OPENED_INDEXED | R_OPENED_SALTED => {
                 let channel_id = Hash256(r.array32()?);
                 let our_index = r.u8()?;
                 let funding = [Hash256(r.array32()?), Hash256(r.array32()?)];
@@ -349,10 +372,17 @@ impl Record {
                 let our_pubkey = r.var_bytes()?.to_vec();
                 let their_pubkey = r.var_bytes()?.to_vec();
                 let payout = [Hash256(r.array32()?), Hash256(r.array32()?)];
-                let key_index = if tag == R_OPENED_INDEXED {
-                    Some(r.u32()?)
-                } else {
-                    None
+                let (key_index, revocation_salt) = match tag {
+                    R_OPENED_INDEXED => (Some(r.u32()?), None),
+                    R_OPENED_SALTED => {
+                        let key_index = match r.u8()? {
+                            0 => None,
+                            1 => Some(r.u32()?),
+                            _ => return Err(ReadError::InvalidValue),
+                        };
+                        (key_index, Some(r.array32()?))
+                    }
+                    _ => (None, None),
                 };
                 Record::Opened {
                     channel_id,
@@ -365,6 +395,7 @@ impl Record {
                     their_pubkey,
                     payout,
                     key_index,
+                    revocation_salt,
                 }
             }
             R_FUNDED => Record::Funded {
@@ -950,5 +981,36 @@ mod tests {
             std::fs::read(&path).unwrap().len(),
             n - frame(&Record::Forcing).len()
         );
+    }
+
+    /// Campaign 14, T3-1: the opening record in its three forms — plain
+    /// (oldest journals), indexed, and salted with or without an index —
+    /// reads back exactly as written, so a journal of an earlier version keeps
+    /// its unsalted root and a new one keeps its salt.
+    #[test]
+    fn every_form_of_the_opening_record_reads_back_as_written() {
+        let base = |key_index: Option<u32>, revocation_salt: Option<[u8; 32]>| Record::Opened {
+            channel_id: Hash256([1; 32]),
+            our_index: 1,
+            funding: [Hash256([2; 32]), Hash256([3; 32])],
+            capacity: 5_000_000,
+            delay: 1_440,
+            funding_depth: 6,
+            our_pubkey: vec![4; 40],
+            their_pubkey: vec![5; 40],
+            payout: [Hash256([6; 32]), Hash256([7; 32])],
+            key_index,
+            revocation_salt,
+        };
+        for (r, tag) in [
+            (base(None, None), R_OPENED),
+            (base(Some(9), None), R_OPENED_INDEXED),
+            (base(None, Some([8; 32])), R_OPENED_SALTED),
+            (base(Some(9), Some([8; 32])), R_OPENED_SALTED),
+        ] {
+            let bytes = r.encode();
+            assert_eq!(bytes[0], tag, "{r:?}");
+            assert_eq!(Record::decode(&bytes).unwrap(), r);
+        }
     }
 }

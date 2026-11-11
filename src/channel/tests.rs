@@ -2726,3 +2726,53 @@ fn the_opener_can_send_all_but_its_close_reserve_and_the_reserve_is_announced_ex
     pay(&mut a, &mut f, [CAP, 0]);
     assert_eq!(a.sendable(), 0);
 }
+
+/// Campaign 14, T3-1: a wallet restored from its backup code derives the same
+/// channel key again; with the peer's old key the channel id is the same. The
+/// secrets the peer got in the old channel must open nothing in the new one.
+#[test]
+fn a_new_channel_on_the_same_keys_shares_no_revocation_secret_with_the_old_one() {
+    // The old channel: one payment hands the acceptor the funder's secret of
+    // state 0.
+    let old = tmpdir();
+    let (mut f1, mut a1) = open_pair(&old);
+    pay(&mut f1, &mut a1, [CAP - 1_000_000, 1_000_000]);
+    // The funder restores from its code (fresh folder, same key); the peer
+    // offers the key it used before.
+    let new = tmpdir();
+    let (f2, _a2) = open_pair(&new);
+    assert_eq!(
+        f1.channel_id(),
+        f2.channel_id(),
+        "same keys, same id: the premise"
+    );
+    // The restored funder closes alone at state 0 of the new channel. Seen
+    // through the peer's OLD journal, it must not be a revoked state.
+    let commitment = f2.signed_commitment_at(0, FeeTier::High).unwrap();
+    let seen = a1.identify_spend(&commitment);
+    assert!(
+        !matches!(seen, Watch::RevokedByPeer { .. }),
+        "the old channel's secret sweeps the new channel's to_local: {seen:?}"
+    );
+}
+
+/// Campaign 14, T3-1: the salt lives in the opening record, so the root — and
+/// every point already announced from it — survives a restart and a
+/// compaction: payments go on, revocation after revocation.
+#[test]
+fn the_revocation_salt_survives_a_compaction_and_a_restart() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    f.compact().unwrap();
+    a.compact().unwrap();
+    drop(f);
+    drop(a);
+    let mut f = Machine::reopen(dir.join("f.jrnl"), NET, fkey(), RATE).unwrap();
+    let mut a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    // Each further payment revokes a state whose point was announced before
+    // the restart: a moved root would make the peer refuse the secret.
+    pay(&mut f, &mut a, [CAP - 2_000_000, 2_000_000]);
+    pay(&mut a, &mut f, [CAP - 1_500_000, 1_500_000]);
+    pay(&mut f, &mut a, [CAP - 3_000_000, 3_000_000]);
+}

@@ -146,6 +146,31 @@ pub fn channel_id(funding: &[Hash256; 2]) -> Hash256 {
     )
 }
 
+/// The root of our revocation shachain: the signer's root for the channel id,
+/// salted per channel instance when the opening record carries a salt.
+///
+/// The signer's root depends only on the wallet seed, the key index and the
+/// channel id. A wallet restored from its backup code starts its key counters
+/// at 0 again and so derives the same channel key; a former peer that offers
+/// its old key gets the same channel id — and, unsalted, the same revocation
+/// secrets it was handed in the old channel, which would let it take our
+/// whole balance at our first close alone (campaign 14, T3-1). The salt, drawn
+/// fresh at every creation and journaled before any point leaves, makes every
+/// instance's chain its own. Without a salt (journals of earlier versions) the
+/// root is the one their points were announced from.
+fn salted_revocation_root(mut root: [u8; 32], salt: Option<&[u8; 32]>) -> [u8; 32] {
+    match salt {
+        None => root,
+        Some(s) => {
+            let salted = tagged_hash_parts(TAG_REVOKE_SALTED, &[&root, s]).0;
+            crate::kdf::wipe(&mut root);
+            salted
+        }
+    }
+}
+
+const TAG_REVOKE_SALTED: &str = "Q21/channel/revoke-root/salted";
+
 /// The root of our revocation shachain derives every revocation secret of the
 /// channel, past and future: it does not outlive the machine.
 impl Drop for Machine {
@@ -267,6 +292,9 @@ pub struct Machine {
     payout: [Hash256; 2],
     /// The root of our revocation shachain.
     revocation_seed: [u8; 32],
+    /// The salt mixed into it, journaled in the opening record (`None` for a
+    /// channel opened before campaign 14, which keeps its unsalted root).
+    revocation_salt: Option<[u8; 32]>,
     funding_depth: u16,
 
     journal: Journal,
@@ -571,7 +599,10 @@ impl Machine {
         payout: [Hash256; 2],
     ) -> Result<Machine, ChannelError> {
         let cid = channel_id(&params.funding);
-        let revocation_seed = signer.revocation_root(&cid);
+        // Drawn before the journal is touched: no randomness, no channel.
+        let revocation_salt = crate::rng::bytes::<32>().map_err(|_| ChannelError::NoRandomness)?;
+        let revocation_seed =
+            salted_revocation_root(signer.revocation_root(&cid), Some(&revocation_salt));
         let (mut journal, existing) = Journal::open(journal_path)?;
         if !existing.is_empty() {
             return Err(ChannelError::Invariant("journal already in use"));
@@ -587,6 +618,9 @@ impl Machine {
             their_pubkey: their_pubkey.clone(),
             payout,
             key_index: signer.key_index(),
+            // In the opening record itself: no crash can leave a journal whose
+            // points were announced from a salt it does not hold.
+            revocation_salt: Some(revocation_salt),
         })?;
         let key_index = signer.key_index();
         Ok(Machine {
@@ -599,6 +633,7 @@ impl Machine {
             their_pubkey,
             payout,
             revocation_seed,
+            revocation_salt: Some(revocation_salt),
             funding_depth,
             journal,
             phase: Phase::Opening,
@@ -2161,6 +2196,8 @@ impl Machine {
             their_pubkey: self.their_pubkey.clone(),
             payout: self.payout,
             key_index: self.key_index,
+            // Compaction keeps the salt: dropping it would move the root.
+            revocation_salt: self.revocation_salt,
         }];
         if let Some(op) = funding_outpoint {
             out.push(Record::Funded {
@@ -2743,6 +2780,7 @@ impl Machine {
             their_pubkey,
             payout,
             key_index: opened_index,
+            revocation_salt,
             ..
         } = opened
         else {
@@ -2753,7 +2791,8 @@ impl Machine {
             capacity: crate::amount::Amount::from_units(capacity),
             delay,
         };
-        let revocation_seed = signer.revocation_root(&cid);
+        let revocation_seed =
+            salted_revocation_root(signer.revocation_root(&cid), revocation_salt.as_ref());
         let mut m = Machine {
             params,
             network,
@@ -2764,6 +2803,7 @@ impl Machine {
             their_pubkey,
             payout,
             revocation_seed,
+            revocation_salt,
             funding_depth,
             journal,
             phase: Phase::Opening,
