@@ -556,7 +556,9 @@ enum CloseTracker {
 
 /// At most this many unknown channels a peer reestablished are told (see
 /// `Inner::unknown_told`).
-const UNKNOWN_TOLD_MAX: usize = 64;
+const UNKNOWN_TOLD_MAX: usize = 256;
+/// Of which, from any one peer.
+const UNKNOWN_TOLD_PER_PEER: usize = 2;
 
 /// Channels we accepted that are not yet funded on chain, across all peers.
 /// Each holds a journal and is reloaded at every start until it opens or
@@ -2542,26 +2544,35 @@ impl ChannelManager {
             // reestablish at every session. Penalising it dropped the link
             // at every reconnect; there is simply nothing to resynchronize.
             if matches!(msg, ChMsg::Reestablish { .. }) {
-                // Unknown and never archived here: the journal is gone — most
-                // likely a wallet restored from its backup code. The peer then
-                // holds every state and can close at an older one; the holder
-                // is told which peer, once, so they can ask for a close (campaign
-                // 14, RT2-1). Bounded: a peer naming made-up channels fills a
-                // short list and is told nothing more.
+                // Unknown and never archived here: if this wallet was restored
+                // from its backup code, the journal is gone, and the peer holds
+                // every state and can close at an older one; the holder is told
+                // which peer, once, so they can ask for a close (campaign 14,
+                // RT2-1). Only a claim — nothing ties a channel id to this
+                // wallet — so it is worded as one, and bounded per peer and in
+                // all: a stranger naming made-up channels gets one line or two,
+                // and cannot fill the list alone (B6-2).
                 let archived = g.archived.iter().any(|a| a.channel_id == cid);
+                let from_peer = g
+                    .unknown_told
+                    .iter()
+                    .filter(|(_, p)| p.as_str() == peer_identity)
+                    .count();
                 if !archived
                     && is_node_id(peer_identity)
+                    && from_peer < UNKNOWN_TOLD_PER_PEER
                     && g.unknown_told.len() < UNKNOWN_TOLD_MAX
                     && !g.unknown_told.iter().any(|(c, _)| *c == cid)
                 {
                     g.unknown_told.push((cid, peer_identity.to_string()));
                     eprintln!(
-                        "ALERT: node {} says it shares channel {} with this wallet, which does \
-                         not know it — most likely it was open before this wallet was restored \
-                         from its backup code. That node can close it at an older state: ask \
-                         its holder to close it with you, and open no new channel with them \
-                         before that close is confirmed",
-                        &peer_identity[..16],
+                        "notice: node {peer_identity} says it shares channel {} with this \
+                         wallet, which does not know it. If this wallet was restored from its \
+                         backup code, that channel was open before: its holder can close it at \
+                         an older state, and this wallet can no longer contest it. Ask them to \
+                         close it on their side — it needs nothing from you — and open no new \
+                         channel with them before that close is confirmed. Otherwise, there is \
+                         nothing to do",
                         cid.to_hex()
                     );
                 }
@@ -4876,6 +4887,70 @@ mod tests {
         );
         assert!(v.contains_key(&3), "a later one waits on");
         assert!(!w.contains_key(&1) && !w.contains_key(&2));
+    }
+
+    /// Campaign 14, B6-2: a stranger naming made-up channels in reestablish
+    /// frames gets at most two lines, whatever its count, and cannot fill
+    /// the list that names a real unknown channel to the holder.
+    #[test]
+    fn made_up_channels_do_not_hide_a_real_unknown_one() {
+        let dir = std::env::temp_dir().join(format!("q21-mgr-unknown-{}", std::process::id()));
+        let hooks = Hooks {
+            splice: Box::new(|_, _, _, _, _| Err("no splices here".into())),
+            fund: Box::new(|_, _| Err("no".into())),
+            broadcast: Box::new(|_| Ok(())),
+            sweep_address: Box::new(|| Hash256::ZERO),
+            payout_address: Box::new(|| Hash256::ZERO),
+            reserve: Box::new(|_, _| {}),
+        };
+        let mgr = ChannelManager::new(
+            Network::Regtest,
+            10,
+            [0x78u8; 32],
+            dir.clone(),
+            12,
+            2,
+            hooks,
+        );
+        let reestablish = |cid: Hash256| ChMsg::Reestablish {
+            channel_id: cid,
+            local_commit_number: 3,
+            remote_commit_number: 3,
+            next_revocation_sent: 3,
+            next_revocation_recv: 3,
+            nonce: [0; 32],
+            direction: 0,
+            proof: Vec::new(),
+        };
+        let stranger = "ab".repeat(32);
+        let from = From {
+            peer: 1,
+            identity: &stranger,
+            legacy: "",
+            binding: [0; 32],
+        };
+        for n in 0..UNKNOWN_TOLD_MAX as u32 {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&n.to_le_bytes());
+            let _ = mgr.on_engine(&from, Hash256(id), reestablish(Hash256(id)));
+        }
+        assert_eq!(mgr.unknown_channels().len(), UNKNOWN_TOLD_PER_PEER);
+        let former = "cd".repeat(32);
+        let from = From {
+            peer: 2,
+            identity: &former,
+            legacy: "",
+            binding: [0; 32],
+        };
+        let real = Hash256([0xee; 32]);
+        let _ = mgr.on_engine(&from, real, reestablish(real));
+        assert!(
+            mgr.unknown_channels()
+                .iter()
+                .any(|(c, p)| *c == real && *p == former),
+            "the real unknown channel was hidden by made-up ones"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The channel seed a manager holds is wiped when it is dropped.

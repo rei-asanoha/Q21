@@ -222,6 +222,23 @@ fn capped_public_answer(answer: String) -> String {
 /// so** in the response rather than lie by omission.
 pub const MAX_SCANNED_BLOCKS: u64 = 2_000;
 
+/// From this many hexadecimal characters (64 bits, the length the explorer
+/// shows), an identifier prefix found once is taken as the only one: another
+/// sharing it is a 64-bit preimage (campaign 14, B7-3).
+const STRONG_PREFIX: usize = 16;
+
+/// The answer to a prefix completion whose window a public service cut short.
+const SEARCH_CUT_SHORT: &str =
+    "search cut short on this public service: paste at least 16 characters, or the whole identifier";
+
+/// Whether a prefix completion read too little to answer: its window was cut
+/// short, it found fewer than two identifiers (two are ambiguous whatever was
+/// left unread), and the prefix is too short for a single hit to be the only
+/// one (see `complete_identifier`, campaign 14, B7-3).
+fn prefix_scan_cut_short(cut: bool, strong: bool, distinct_hits: usize) -> bool {
+    cut && distinct_hits < 2 && !(strong && distinct_hits == 1)
+}
+
 /// Smallest fee a send pays when the caller proposes none, in units.
 ///
 /// Deliberately modest: on a lightly loaded chain, paying more speeds nothing
@@ -4864,6 +4881,12 @@ impl RpcContext {
     ) -> Result<Option<(&'static str, Hash256)>, Json> {
         let mut hits: Vec<(&'static str, Hash256)> = Vec::new();
         let starts = |h: &Hash256| hex_starts_with(h, prefix);
+        let distinct = |hits: &[(&'static str, Hash256)]| {
+            let mut ids: Vec<[u8; 32]> = hits.iter().map(|(_, h)| h.0).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.len()
+        };
         for t in self.node.with_mempool(|m| m.txids()) {
             if starts(&t) {
                 hits.push(("transaction", t));
@@ -4897,33 +4920,42 @@ impl RpcContext {
             // Block by block, the node's lock taken for each only, within the
             // reads of a public answer, and charged: the whole window was
             // read under one hold of the lock, outside every budget — the
-            // sibling of `getamount`'s fix (campaign 14, RT1-1). A window cut
-            // short proves no uniqueness: a single hit in it is not presented
-            // as the match, the page must never open the wrong transaction.
+            // sibling of `getamount`'s fix (campaign 14, RT1-1).
+            //
+            // A window cut short proves no uniqueness for a short prefix: a
+            // single hit in it is not presented as the match, the page must
+            // never open the wrong transaction. From 16 characters on, the
+            // length the page shows, a second identifier sharing them is a
+            // 64-bit preimage: the first hit is the answer, and the scan stops
+            // there, so a recent transaction costs a few reads, not the whole
+            // budget; two hits stop it too (B7-3).
             None => {
-                let mut reads = self.scan_reads();
-                let tip = self.node.with_chain(|c| c.height());
-                let floor = tip.saturating_sub(MAX_SCANNED_BLOCKS);
-                for h in (floor..=tip).rev() {
-                    let block = reads.fetch(&self.node, h);
-                    if reads.spent() {
-                        break;
-                    }
-                    if let Some(b) = block {
-                        for t in &b.transactions {
-                            let id = t.txid();
-                            if starts(&id) {
-                                hits.push(("transaction", id));
+                let strong = prefix.len() >= STRONG_PREFIX;
+                if !strong || hits.is_empty() {
+                    let mut reads = self.scan_reads();
+                    let tip = self.node.with_chain(|c| c.height());
+                    let floor = tip.saturating_sub(MAX_SCANNED_BLOCKS);
+                    for h in (floor..=tip).rev() {
+                        let block = reads.fetch(&self.node, h);
+                        if reads.spent() {
+                            break;
+                        }
+                        if let Some(b) = block {
+                            for t in &b.transactions {
+                                let id = t.txid();
+                                if starts(&id) {
+                                    hits.push(("transaction", id));
+                                }
                             }
                         }
+                        if distinct(&hits) >= 2 || (strong && !hits.is_empty()) {
+                            break;
+                        }
                     }
-                }
-                self.charge_reads(client, &reads);
-                if reads.spent() {
-                    return Err(rpc_error(
-                        ERR_PARAMS,
-                        "search cut short on this public service: paste the whole identifier",
-                    ));
+                    self.charge_reads(client, &reads);
+                    if prefix_scan_cut_short(reads.spent(), strong, distinct(&hits)) {
+                        return Err(rpc_error(ERR_PARAMS, SEARCH_CUT_SHORT));
+                    }
                 }
             }
         }
@@ -11391,5 +11423,32 @@ mod tests {
         assert!(out.contains("unknown method"), "{out}");
         let out = context(false).handle(body);
         assert!(out.contains("IGNORE PREVIOUS"), "{out}");
+    }
+
+    /// Campaign 14, B7-3: when a public service cuts a prefix completion
+    /// short, a short prefix found once is not taken for the only one; a
+    /// prefix of 16 characters or more is, and two hits are ambiguous
+    /// whatever was left unread. A window read whole always answers.
+    #[test]
+    fn a_prefix_completion_cut_short_answers_only_what_it_proved() {
+        for (cut, strong, hits, refused) in [
+            (true, false, 0, true),
+            (true, false, 1, true),
+            (true, false, 2, false),
+            (true, true, 0, true),
+            (true, true, 1, false),
+            (true, true, 2, false),
+            (false, false, 0, false),
+            (false, false, 1, false),
+            (false, true, 1, false),
+        ] {
+            assert_eq!(
+                prefix_scan_cut_short(cut, strong, hits),
+                refused,
+                "cut {cut}, strong {strong}, {hits} hit(s)"
+            );
+        }
+        assert!(SEARCH_CUT_SHORT.contains("16"));
+        assert_eq!(STRONG_PREFIX * 4, 64);
     }
 }

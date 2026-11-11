@@ -2344,6 +2344,14 @@ fn run_episode(rng: &mut Rng, victim_is_funder: bool, steps: usize, stats: &mut 
         }
         let ctx = format!("step {step}");
         let roll = rng.below(100);
+        // An honest move after a hostile reestablish left the victim told it
+        // is older: since campaign 14 (T3-2) such a copy signs nothing, and an
+        // honest peer — whose every session opens with an in-step
+        // reestablish — puts the two sides back in step first. The payment
+        // to the victim checks the refusal itself, below.
+        if matches!(roll, 18..=31 | 71..=80 | 83) && e.v.sync() == SyncVerdict::WeAreBehind {
+            e.resync(rng);
+        }
         match roll {
             0..=17 => {
                 let s = e.v.remote_sendable();
@@ -2354,6 +2362,21 @@ fn run_episode(rng: &mut Rng, victim_is_funder: bool, steps: usize, stats: &mut 
                         2 => MIN_OUTPUT_VALUE.min(s),
                         _ => 1 + rng.below(s),
                     };
+                    if e.v.sync() == SyncVerdict::WeAreBehind {
+                        // Since campaign 14 (T3-2), a copy told it is older
+                        // signs nothing until an in-step reestablish: the
+                        // payment is refused, cleanly, and goes through once
+                        // the two sides are back in step.
+                        let before = Snap::of(&e.v);
+                        let r = e.puppet_pays(amount);
+                        assert!(
+                            matches!(&r, Err(err) if err.contains("older than the channel")),
+                            "{ctx}: a copy told it is older took a payment: {r:?}"
+                        );
+                        e.unchanged(&before, "payment to a copy told it is older");
+                        stats.note::<(), ()>("honest/puppet-pays-waits-for-step", &Ok(()));
+                        e.resync(rng);
+                    }
                     let r = e.puppet_pays(amount);
                     stats.note("honest/puppet-pays", &r);
                     if let Err(err) = r {

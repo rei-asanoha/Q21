@@ -508,9 +508,11 @@ function showRestored(code, address){
   + 'in.</b> The wallet derives your addresses again and finds what belongs to '
   + 'them once syncing has finished. On a long chain, allow a few minutes.</p>'
   + '<p><b>Payment channels are not in the code.</b> If this wallet had any '
-  + 'open, the other side can now close at an older state and nothing here can '
-  + 'stop it. Ask each person to close with you, and do not open a new channel '
-  + 'with them before that close is confirmed.</p></div>'
+  + 'open, the other side holds every past state and could close at an older '
+  + 'one; this wallet can no longer contest it. Ask each person to close the '
+  + 'channel on their side: it needs nothing from you, no payment, no code, '
+  + 'nothing to install. Your share of their close comes back here by itself. '
+  + 'Open no new channel with them before that close is confirmed.</p></div>'
   + '<div class="actions"><button class="p" id="next">Open my wallet</button></div>';
   $("next").onclick = function(){ finish(address); };
 }
@@ -940,6 +942,7 @@ mod tests {
         let screen = &screen[..screen.find("\n}").unwrap()];
         assert!(!screen.contains("nothing is lost"));
         assert!(screen.contains("Payment channels are not in the code"));
-        assert!(screen.contains("do not open a new channel"));
+        assert!(screen.contains("Open no new channel with them"));
+        assert!(screen.contains("it needs nothing from you"));
     }
 }
