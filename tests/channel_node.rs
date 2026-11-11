@@ -4727,3 +4727,37 @@ fn a_restored_older_copy_countersigns_no_close() {
         "a copy known to be older countersigned the close"
     );
 }
+
+/// Campaign 14, B2: a node still catching up with the chain takes no new
+/// channel — it cannot yet tell an output that already exists (an old
+/// channel's, named again after a restore) from a new one. Caught up, it does.
+#[test]
+fn a_node_catching_up_takes_no_new_channel() {
+    let funder_seed = [0x1eu8; 32];
+    let acceptor_seed = [0x2fu8; 32];
+    let (wallet, chain) = setup(funder_seed);
+    let dir = tmpdir("catching-up");
+    let mut p = managers(
+        funder_seed,
+        acceptor_seed,
+        wallet.clone(),
+        chain.clone(),
+        Hash256([0x5e; 32]),
+        &dir,
+    );
+    let h = chain.lock().unwrap().height();
+    let capacity = 4 * MIN_OUTPUT_VALUE * 10;
+    p.acceptor.note_chain(h, true);
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    assert!(
+        p.acceptor.list().is_empty(),
+        "a node catching up accepted a channel"
+    );
+    p.acceptor.note_chain(h, false);
+    let hello = p.funder.open(A_PEER, capacity, None, None).unwrap();
+    p.queue.push_back((1, hello));
+    p.pump();
+    assert_eq!(p.acceptor.list().len(), 1, "caught up, it accepts");
+}

@@ -1788,6 +1788,13 @@ impl Machine {
     /// already in, the splice is completed and returned, to broadcast.
     /// Idempotent.
     pub fn on_splice_ack(&mut self, msg: &Message) -> Result<Option<Transaction>, ChannelError> {
+        // An older copy completes nothing: not even an addition of its own
+        // still pending in the copy (campaign 14, B3-1).
+        if self.sync == SyncVerdict::WeAreBehind {
+            return Err(ChannelError::Invariant(
+                "this copy is older than the channel: it signs nothing",
+            ));
+        }
         let Message::SpliceAck { state, tier_sigs } = msg else {
             return Err(ChannelError::Unexpected);
         };
@@ -1819,6 +1826,13 @@ impl Machine {
     /// new funding is held, the splice is completed with our signature and
     /// returned, to broadcast; `None` for a signature already taken.
     pub fn on_splice_sig(&mut self, msg: &Message) -> Result<Option<Transaction>, ChannelError> {
+        // An older copy completes nothing: not even an addition of its own
+        // still pending in the copy (campaign 14, B3-1).
+        if self.sync == SyncVerdict::WeAreBehind {
+            return Err(ChannelError::Invariant(
+                "this copy is older than the channel: it signs nothing",
+            ));
+        }
         let Message::SpliceSig { state, signature } = msg else {
             return Err(ChannelError::Unexpected);
         };

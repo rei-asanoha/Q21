@@ -457,6 +457,11 @@ struct Chan {
     /// by the peer; so neither starts before. A channel opened on the current
     /// connection starts synchronized.
     synced: bool,
+    /// An in-step reestablish has come since this channel was loaded (or it
+    /// was opened in this run). Unlike `synced`, a new session does not reset
+    /// it: what it guards against is a copy that has not yet shown it holds
+    /// the latest state (campaign 14, T3-2, and R1-2).
+    in_step_once: bool,
     /// What the channel is waiting for on chain, once a commitment has been
     /// broadcast. `None` while the channel is still off-chain or settled.
     close: Option<CloseTracker>,
@@ -798,9 +803,14 @@ struct Inner {
     archived: Vec<ArchivedChannel>,
     /// The next counted acceptor index, past [`ACCEPTOR_COUNTER_BASE`].
     next_acceptor: u32,
-    /// The last tip the chain hooks reported (0 before the first): what an
-    /// acceptor records when it signs a funding (see [`Manager::signed_at_path`]).
+    /// The chain's tip as the node last reported it (0 before the first):
+    /// what an acceptor records when it signs a funding (see
+    /// `signed_at_path`), and what funding depths are measured from.
     tip: u64,
+    /// The node reports its tip itself ([`ChannelManager::note_chain`]); until
+    /// it does — a manager driven by the block hooks alone — the height they
+    /// hand is taken for the tip.
+    tip_noted: bool,
     /// Acceptor indices offered in a HelloBack whose open never came:
     /// offered again first, so Hellos that lead nowhere spend no index.
     free_acceptor: Vec<u32>,
@@ -927,6 +937,8 @@ pub struct ChannelManager {
     /// a wallet whose addresses are not of [`CHANNEL_SCHEME`] would be paid
     /// by every close an output no key of it can ever spend.
     opens_refused: std::sync::OnceLock<String>,
+    /// See [`ChannelManager::note_chain`].
+    catching_up: std::sync::atomic::AtomicBool,
 }
 
 fn write_frame(cid: Hash256, kind: u8, body: &[u8]) -> Vec<u8> {
@@ -960,6 +972,7 @@ impl ChannelManager {
             hooks,
             replaying: AtomicBool::new(false),
             opens_refused: std::sync::OnceLock::new(),
+            catching_up: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 channels: HashMap::new(),
                 links: HashMap::new(),
@@ -976,6 +989,7 @@ impl ChannelManager {
                 archived: Vec::new(),
                 next_acceptor: 0,
                 tip: 0,
+                tip_noted: false,
                 free_acceptor: Vec::new(),
                 key_hashes: None,
                 claimed: HashMap::new(),
@@ -1114,6 +1128,7 @@ impl ChannelManager {
                         peer_behind: None,
                         closing,
                         synced: false,
+                        in_step_once: false,
                         close: None,
                         spend: None,
                         reserved: false,
@@ -1786,6 +1801,19 @@ impl ChannelManager {
         let _ = self.opens_refused.set(reason.to_string());
     }
 
+    /// The node's chain: its real tip, and whether it is still catching up.
+    /// While it is, no new channel is accepted and no first funding signed:
+    /// a node that has not caught up cannot tell an output that already
+    /// exists — an earlier channel's, named again by a former peer after a
+    /// restore — from a new one (campaign 14, B2).
+    pub fn note_chain(&self, tip: u64, catching_up: bool) {
+        self.catching_up
+            .store(catching_up, std::sync::atomic::Ordering::Relaxed);
+        let mut g = self.inner.lock().unwrap();
+        g.tip = tip;
+        g.tip_noted = true;
+    }
+
     /// Opens a channel to `peer` as funder, returning the control frame to
     /// send. The funding policy — and thus the channel id — cannot exist until
     /// the acceptor's key is known, so this first exchanges keys. The channel
@@ -2306,8 +2334,13 @@ impl ChannelManager {
         if delay < self.acceptor_min_delay() {
             return Ok(Vec::new());
         }
-        // Not answered either when this node takes no new channel.
-        if self.opens_refused.get().is_some() {
+        // Not answered either when this node takes no new channel, nor while
+        // it is catching up with the chain: it cannot yet tell an output that
+        // already exists — an old channel's, named again — from a new one
+        // (campaign 14, B2).
+        if self.opens_refused.get().is_some()
+            || self.catching_up.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Ok(Vec::new());
         }
         // Bounded: opens in progress across all peers and per announced
@@ -2429,6 +2462,7 @@ impl ChannelManager {
                 peer_behind: None,
                 closing: None,
                 synced: true,
+                in_step_once: true,
                 close: None,
                 spend: None,
                 reserved: false,
@@ -2506,10 +2540,19 @@ impl ChannelManager {
         // channel is `synced` only once an in-step reestablish came, which
         // always precedes the peer's frames on the same session. Ignored,
         // not penalised: the peer's software may simply not know yet.
+        // Every frame that makes this copy sign or complete a state counts —
+        // an addition's acknowledgement and signature too: a copy restored
+        // from a backup taken while its own addition was pending completed
+        // and broadcast it (campaign 14, B3-1).
         if matches!(
             msg,
-            ChMsg::Update { .. } | ChMsg::Close { .. } | ChMsg::Splice { .. }
-        ) && (chan.behind || !chan.synced)
+            ChMsg::Update { .. }
+                | ChMsg::Close { .. }
+                | ChMsg::Splice { .. }
+                | ChMsg::SpliceAck { .. }
+                | ChMsg::SpliceSig { .. }
+                | ChMsg::SpliceLocked { .. }
+        ) && (chan.behind || !chan.in_step_once)
         {
             return Ok(Vec::new());
         }
@@ -2565,7 +2608,11 @@ impl ChannelManager {
             ChMsg::Funding { .. } => {
                 let first = chan.machine.funding_outpoint().is_none();
                 let tip = tip_now;
-                let m = chan.machine.on_funding(&msg).map_err(err)?;
+                // A node still catching up does not know which outputs already
+                // exist: it signs no funding until it has (campaign 14, B2).
+                if first && self.catching_up.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(Vec::new());
+                }
                 // An honest funder broadcasts the funding only once our
                 // FundingSigned is in: it cannot confirm at or below the tip
                 // we sign at. The tip is written down before the signature
@@ -2574,6 +2621,10 @@ impl ChannelManager {
                 // from the backup code, on which every old commitment we
                 // signed is still valid — is refused when it is seen
                 // (campaign 14, B-T3-1-1). A replayed Funding only re-signs.
+                //
+                // Written before the funding is journaled: a crash in between
+                // must not leave a channel whose replayed Funding only
+                // re-signs, with no record of the tip (campaign 14, B2).
                 if first && tip > 0 {
                     crate::channel::journal::atomic_write(
                         &self.signed_at_path(cid),
@@ -2581,6 +2632,7 @@ impl ChannelManager {
                     )
                     .map_err(|e| format!("cannot record the funding height: {e}"))?;
                 }
+                let m = chan.machine.on_funding(&msg).map_err(err)?;
                 out.push(write_frame(cid, KIND_ENGINE, &m.encode()));
             }
             ChMsg::FundingSigned { .. } => {
@@ -2695,6 +2747,7 @@ impl ChannelManager {
                             out.push(write_frame(cid, KIND_ENGINE, &f.encode()));
                         }
                         chan.synced = true;
+                        chan.in_step_once = true;
                         chan.peer_behind = None;
                         // A refusal the peer never proved lasts only while
                         // it keeps saying so. The time of its first claim
@@ -2898,6 +2951,7 @@ impl ChannelManager {
                 peer_behind: None,
                 closing: None,
                 synced: true,
+                in_step_once: true,
                 close: None,
                 spend: None,
                 reserved: false,
@@ -2967,7 +3021,9 @@ impl ChannelManager {
     ) -> Vec<(u64, Vec<u8>)> {
         {
             let mut g = self.inner.lock().unwrap();
-            g.tip = height;
+            if !g.tip_noted {
+                g.tip = height;
+            }
         }
         self.watch_fundings(txs, height);
         self.react_to_spends(txs, height);
@@ -3422,7 +3478,11 @@ impl ChannelManager {
     ) {
         // The tip is known from the start, before the first block hook: a
         // Funding signed right after a restart records it (B-T3-1-1).
-        self.inner.lock().unwrap().tip = tip;
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.tip = tip;
+            g.tip_noted = true;
+        }
         // An acceptor down when its funding confirmed never saw the block:
         // the funding is fetched from where it stands now, so that a spend
         // of its coins elsewhere is followed (campaign 10, `perse`; see
@@ -3919,6 +3979,7 @@ impl ChannelManager {
         // on the same keys, whose old commitments we signed would spend it
         // (campaign 14, B-T3-1-1). Forgotten before it opens: we put nothing
         // in, and nothing is paid on it.
+        let tip = g.tip;
         let older_than_signature: Vec<Hash256> = g
             .unfunded_iter(true)
             .filter(|c| {
@@ -3926,7 +3987,11 @@ impl ChannelManager {
                 else {
                     return false;
                 };
-                let at = height.saturating_add(1).saturating_sub(depth);
+                // Depths are read at the chain's tip, which may stand above the
+                // block being handed while a reorganization connects several
+                // (campaign 14, R1-1): the confirmation height is measured
+                // from that tip.
+                let at = tip.max(height).saturating_add(1).saturating_sub(depth);
                 // A margin of the funding depth: after a reorganization the
                 // tip we wrote down may briefly stand above the real one, and
                 // an honest funding must never be taken for an old output.

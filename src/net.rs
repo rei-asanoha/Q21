@@ -2395,6 +2395,14 @@ pub trait ChannelSink: Send + Sync {
     /// send through at any time. The default ignores it.
     fn attach(&self, _sender: ChannelSender) {}
 
+    /// Called before the chain hooks below, off the chain lock, with the
+    /// chain's real tip and whether the node is still catching up (its tip
+    /// older than [`crate::chain::RECENT_TIP_SECS`]). A node that has not
+    /// caught up does not know which outputs already exist: the channel
+    /// component takes no new channel meanwhile (campaign 14, B2). The
+    /// default ignores it.
+    fn note_chain(&self, _tip: u64, _catching_up: bool) {}
+
     /// Called after each connected block, off the chain lock, with the block's
     /// transactions, the new chain `height`, and a `depth_of` oracle giving the
     /// confirmation depth (`1` in the tip) of an unspent outpoint or `None` once
@@ -2779,7 +2787,8 @@ impl Node {
         if let Some(sink) = sink {
             // First what confirmed while the node was down: a spend of a
             // funding output it never saw is replayed block by block.
-            let tip = self.shared.lock().unwrap().chain.height();
+            let (tip, catching_up) = self.chain_status();
+            sink.note_chain(tip, catching_up);
             let txs_at = |h: u64| {
                 let g = self.shared.lock().unwrap();
                 g.chain.block_at(h).map(|b| b.transactions)
@@ -2796,6 +2805,15 @@ impl Node {
         }
     }
 
+    /// The chain's tip height, and whether the node is still catching up:
+    /// its tip older than [`crate::chain::RECENT_TIP_SECS`] by our clock.
+    fn chain_status(&self) -> (u64, bool) {
+        let g = self.shared.lock().unwrap();
+        let tip = g.chain.height();
+        let behind = unix_now().saturating_sub(g.chain.tip().time) > crate::chain::RECENT_TIP_SECS;
+        (tip, behind)
+    }
+
     /// Hands a connected block (or nothing, at startup) to the channel
     /// component with the chain height and a depth oracle, then sends the frames
     /// it returns. Off the chain lock, so the component may sign and broadcast.
@@ -2805,8 +2823,10 @@ impl Node {
         txs: &[crate::tx::Transaction],
         height: u64,
     ) {
-        // Depths are read at the current tip, whatever block is being handed.
-        let tip = self.shared.lock().unwrap().chain.height();
+        // Depths are read at the current tip, whatever block is being handed;
+        // the component is told that tip first, and whether it is recent.
+        let (tip, catching_up) = self.chain_status();
+        sink.note_chain(tip, catching_up);
         let depth_of = |op: &crate::tx::OutPoint| {
             let g = self.shared.lock().unwrap();
             g.chain

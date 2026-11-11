@@ -954,6 +954,10 @@ impl ChannelSink for ChannelTransport {
         self.set_sender(Box::new(move |peer, bytes| sender.send(peer, bytes)));
     }
 
+    fn note_chain(&self, tip: u64, catching_up: bool) {
+        self.mgr.note_chain(tip, catching_up);
+    }
+
     fn on_connected_block(
         &self,
         txs: &[crate::tx::Transaction],

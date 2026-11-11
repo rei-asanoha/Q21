@@ -1004,3 +1004,37 @@ fn a_given_up_channel_stays_given_up_through_a_compaction() {
     assert_eq!(a2.phase(), Phase::Closed);
     assert!(a2.was_abandoned(), "still given up after a compaction");
 }
+
+/// Campaign 14, B3-1: a copy restored from a backup taken while its own
+/// addition was pending completes it for nobody: the peer's acknowledgement
+/// and signature, replayed after the channel moved on, are refused once the
+/// copy knows it is older.
+#[test]
+fn an_older_copy_completes_no_pending_addition_of_its_own() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]); // state 1
+    let c = coin(11);
+    let tx = splice_tx(&f, &c, ADD);
+    let msg = f.propose_splice(ADD, tx).unwrap();
+    // The funder's folder, copied while its addition is pending.
+    std::fs::copy(dir.join("f.jrnl"), dir.join("f-old.jrnl")).unwrap();
+    let answer = a.on_splice(&msg).unwrap(); // kept by the peer
+    assert!(f.on_splice_ack(&answer[0]).unwrap().is_none());
+    f.on_splice_sig(&answer[1]).unwrap().expect("complete");
+    lock(&mut f, &mut a);
+    pay(&mut f, &mut a, [CAP + ADD - 2_000_000, 2_000_000]);
+    pay(&mut f, &mut a, [CAP + ADD - 3_000_000, 3_000_000]);
+    drop(f);
+    let mut stale = Machine::reopen(dir.join("f-old.jrnl"), NET, fkey(), RATE).unwrap();
+    let _ = super::tests::exchange_reestablish(&mut stale, &mut a);
+    assert_eq!(stale.sync(), super::machine::SyncVerdict::WeAreBehind);
+    assert!(
+        stale.on_splice_ack(&answer[0]).is_err(),
+        "an older copy took the acknowledgement of its stale addition"
+    );
+    assert!(
+        stale.on_splice_sig(&answer[1]).is_err(),
+        "an older copy completed its stale addition"
+    );
+}
