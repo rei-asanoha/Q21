@@ -67,6 +67,52 @@ version older than the one you run, is a file you do not install.
 
 ---
 
+# Upgrading from 0.6.1 to 0.6.2
+
+0.6.2 changes no rule of the chain and nothing in a channel's messages: a 0.6.1
+node and a 0.6.2 node accept the same blocks and open channels with each other.
+Mining does not need to stop, and there is no deadline. It brings the fixes of
+the fourteenth red-team campaign (RED-TEAM-2026-14.md), a mainnet-readiness
+review: one critical and three high findings, all around restoring a wallet
+that had payment channels, plus wallet wording and public-explorer costs.
+
+The testnet schedule is unchanged: payment channels open since block 4,980,
+names since block 5,200, block timestamps strictly after their parent's from
+block 5,950, and the one-day maturity from block 7,000.
+
+## What changes
+
+| | 0.6.1 | 0.6.2 |
+|---|---|---|
+| A new channel after a wallet restored from its backup code | Reused, with a former peer, the revocation secrets of the old channel: that peer could take it all | Each channel draws its own random value, written in its journal before any signature leaves; a funding output that was already on the chain when the acceptor signed is refused |
+| A wallet folder put back from an older copy | Still countersigned a close or an update the peer sent | Signs nothing the peer sends until both sides are back in step |
+| A node still catching up with the chain | Could take a new channel | Answers no channel opening until it has caught up, and says so once |
+| The restore | Printed the backup code back; the restored screen said "nothing is lost" | Does not print it; says that channels are not in the code, what to ask the other side, and that it needs nothing from you |
+| The backup-code card, a verification the wallet did not start, the send recap, the close-alone dialog | — | Nobody but you ever needs the code; a verification started by a stranger is announced, and "The words match" needs a tick; the address in groups of eight, a recipient that is not a contact flagged; the close-alone dialog mentions a folder replaced by a copy |
+| A wallet file naming the main network | Started it | Refused before anything is opened |
+| The public explorer | A prefix search without an index read up to 2,001 blocks in one go; `getsupply` walked every output at each call; an unknown method was said back | Searches block by block within the public budget; `getsupply` once per block; nothing said back |
+
+## Who should upgrade, and when
+
+Everyone, when convenient: the servers first if you like, then the PC and the
+Mac. All versions since 0.6.0 work together.
+
+## The servers
+
+Same steps as for 0.6.1 (the data folder, then `monitor.sh` from the archive),
+without the height check: 0.6.2 has no activation height. Nothing changes in
+Caddy.
+
+## The data folder
+
+A channel opened under 0.6.2 records its random value in a new form of the
+opening record. 0.6.1 does not know that form: going back to 0.6.1 with the same
+folder, such a channel is not loaded — its journal is left untouched, and comes
+back when 0.6.2 is installed again. Channels opened before, and everything
+else in the folder, are read by both.
+
+---
+
 # Upgrading from 0.6.0 to 0.6.1
 
 0.6.1 changes no rule of the chain and nothing in a channel's messages or the

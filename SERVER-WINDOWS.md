@@ -473,7 +473,7 @@ ssh q21op@YOUR_IP
 Replace the version after `V=` with the one you install:
 
 ```bash
-cd ~ && V=v0.6.1 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
+cd ~ && V=v0.6.2 && for f in q21-linux-x86_64.tar.gz SHA256SUMS SHA256SUMS.minisig; do curl -fsSLO "https://github.com/rei-asanoha/Q21/releases/download/$V/$f"; done
 ```
 
 ### On the server — check the signature before installing
