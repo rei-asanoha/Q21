@@ -1152,13 +1152,16 @@ fn network_name(n: Network) -> &'static str {
     }
 }
 
+/// Why a main network is refused wherever one is named: on the command line,
+/// in a wallet file, in a snapshot.
+const MAINNET_CLOSED: &str = "mainnet does not exist: the protocol is not \
+                              ready, and saying otherwise would be a lie.";
+
 fn network_from_name(s: &str) -> Result<Network, String> {
     match s {
         "regtest" => Ok(Network::Regtest),
         "testnet" => Ok(Network::Testnet),
-        "mainnet" => Err("mainnet does not exist: the protocol is not \
-                          ready, and saying otherwise would be a lie."
-            .into()),
+        "mainnet" => Err(MAINNET_CLOSED.into()),
         other => Err(format!(
             "unknown network: {other}. Expected: regtest or testnet."
         )),
@@ -1754,11 +1757,17 @@ fn read_wallet(d: &Path) -> Result<Wallet, String> {
                     .filter(|s| SchemeId::ALL.contains(s))
                     .ok_or_else(|| format!("wallet unreadable: unknown scheme ({value})"))?
             }
+            // A wallet file that names a main network — written by hand, or
+            // tampered with — is refused like `--network mainnet`, before
+            // anything is opened: it went past every refusal and started a
+            // mainnet node (campaign 14, T2-2). An unknown value is an
+            // error, not regtest under another prefix.
             "network" => {
                 network = match value {
-                    "mainnet" => Network::Mainnet,
+                    "mainnet" => return Err(MAINNET_CLOSED.into()),
                     "testnet" => Network::Testnet,
-                    _ => Network::Regtest,
+                    "regtest" => Network::Regtest,
+                    other => return Err(format!("wallet unreadable: unknown network ({other})")),
                 }
             }
             _ => {}
@@ -3908,7 +3917,9 @@ fn cmd_snapshot(datadir: &Path, args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("snapshot unreadable: {e}"))?;
             let mut snap = None;
             let mut last = None;
-            for network in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            // No main network yet: a mainnet snapshot is refused as one of
+            // another network (campaign 14, T2-2).
+            for network in [Network::Testnet, Network::Regtest] {
                 match Snapshot::from_portable_bytes(&bytes, network) {
                     Ok(s) => {
                         snap = Some(s);
@@ -4061,7 +4072,9 @@ fn cmd_snapshot(datadir: &Path, args: &[String]) -> Result<(), String> {
             // three. Only one is valid, the others fail with "wrong network".
             let mut found = None;
             let mut last = None;
-            for network in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            // No main network yet: a mainnet snapshot is refused as one of
+            // another network (campaign 14, T2-2).
+            for network in [Network::Testnet, Network::Regtest] {
                 match Snapshot::from_portable_bytes(&bytes, network) {
                     Ok(s) => {
                         found = Some(s);
@@ -8608,6 +8621,42 @@ mod tests {
             guard < opening,
             "the guard must come before opening the archive"
         );
+    }
+
+    /// Campaign 14, T2-2: a wallet file that names a main network is refused
+    /// before any block file is opened, like `--network mainnet`; an unknown
+    /// network value is an error, not regtest under another prefix.
+    #[test]
+    fn a_wallet_file_marked_mainnet_or_unknown_is_refused() {
+        remember_passphrase(None);
+        let d = std::env::temp_dir().join(format!(
+            "q21_mainnet_closed_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        create_private_dir(&d).unwrap();
+        let body = |net: &str| {
+            format!(
+                "seed={}\nnetwork={net}\nscheme=2\nserial=0\nnext_index=0\n",
+                "11".repeat(32)
+            )
+        };
+        std::fs::write(wallet_path(&d), body("mainnet")).unwrap();
+        let err = load_state_with(&d, None)
+            .err()
+            .expect("mainnet must be refused");
+        assert!(err.contains("mainnet does not exist"), "{err}");
+        assert!(!blocks_path(&d).exists(), "refused before any block file");
+        std::fs::write(wallet_path(&d), body("mainnet2")).unwrap();
+        let err = read_wallet(&d)
+            .err()
+            .expect("an unknown network is refused");
+        assert!(err.contains("unknown network"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The address book makes the round trip without losing anything.
