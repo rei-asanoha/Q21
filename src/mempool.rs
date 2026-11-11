@@ -1229,6 +1229,7 @@ impl Mempool {
         height: u64,
     ) -> usize {
         let mut back = 0;
+        let mut own_back = false;
         for b in blocks {
             // The first transaction of a block is its coinbase: it has no
             // place in a pool.
@@ -1246,7 +1247,15 @@ impl Mempool {
                     .is_ok()
                 {
                     back += 1;
+                    own_back |= local;
                 }
+            }
+        }
+        // A payment of this wallet that a reorganization put back is pending
+        // again: on disk again, like one just sent (D2-1).
+        if own_back {
+            if let Some(sink) = &self.local_sink {
+                sink(&self.ordered_local_transactions());
             }
         }
         back
@@ -2957,8 +2966,16 @@ mod tests_chains {
         m.on_block_connected(&b);
         assert!(!m.contains(&id));
         assert!(c.disconnect());
+        // Back in the pool, it is handed to the sink again: a crash after
+        // the reorganization does not forget it (D2-1).
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        m.set_local_sink(Box::new(move |txs| {
+            *s.lock().unwrap() = txs.iter().map(|t| t.txid()).collect();
+        }));
         m.return_abandoned(&[b], &c.utxo, NETWORK, c.height());
         assert!(m.entries[&id].local);
+        assert_eq!(*seen.lock().unwrap(), vec![id], "not written again");
         check_evictable(&m);
     }
 

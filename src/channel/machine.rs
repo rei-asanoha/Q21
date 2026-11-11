@@ -189,6 +189,9 @@ fn merge(base: Balances, ours: Balances, theirs: Balances) -> Option<Balances> {
 }
 
 /// Keeps only the `keep` highest states of a per-state map.
+/// The points each side announces at the opening: those of states 0 and 1.
+const OPENING_POINTS: usize = 2;
+
 fn prune_to_latest<V>(map: &mut BTreeMap<u64, V>, keep: usize) {
     while map.len() > keep {
         let oldest = *map.keys().next().expect("non-empty");
@@ -550,6 +553,9 @@ impl Machine {
             || *funding_depth > terms.max_delay
             || *capacity < crate::channel::MIN_CAPACITY
             || *capacity > crate::channel::MAX_CAPACITY
+            // The points of states 0 and 1, and no other: see
+            // `record_their_points`.
+            || first_hashes.len() != OPENING_POINTS
         {
             return Err(ChannelError::BadParameters);
         }
@@ -683,6 +689,15 @@ impl Machine {
         point
     }
 
+    /// Records the points the counterparty announces at the opening: those
+    /// of states 0 and 1 ([`OPENING_POINTS`]), and no other. The point of a
+    /// state `n >= 2` comes with the revocation of `n - 2` and only then —
+    /// that is what keeps at most two of the counterparty's states
+    /// unrevoked. A third point at the opening let state 2 be countersigned
+    /// while 0 and 1 were unrevoked, under a point the first revocation then
+    /// replaced: that state counted as revoked here and could still be
+    /// broadcast with no penalty possible, taking back every payment made
+    /// after it (challenge after campaign 14, D1-1).
     fn record_their_points(&mut self, hashes: &[Hash256]) -> Result<(), ChannelError> {
         for (i, h) in hashes.iter().enumerate() {
             self.journal.append(&Record::TheirPoint {
@@ -758,6 +773,14 @@ impl Machine {
 
     /// Signs the counterparty's commitment at `n`, at every tier.
     fn sign_their_commitment(&self, n: u64, bal: Balances) -> Result<TierSigs, ChannelError> {
+        // Every countersignature goes through here: never a third unrevoked
+        // state of the counterparty, whatever points are known (D1-1). An
+        // honest state `n` is always signed after `n - 2` is revoked.
+        if n >= 2 && self.revocations_recv < Some(n - 2) {
+            return Err(ChannelError::Invariant(
+                "would countersign a third unrevoked state",
+            ));
+        }
         let params = self.params_at(n);
         let mut sigs: [Vec<u8>; 3] = Default::default();
         for tier in FeeTier::ALL {
@@ -844,6 +867,9 @@ impl Machine {
             return Err(ChannelError::Unexpected);
         }
         self.their_pubkey = acceptor_pubkey.clone();
+        if first_hashes.len() != OPENING_POINTS {
+            return Err(ChannelError::BadParameters);
+        }
         self.record_their_points(first_hashes)?;
         Ok(())
     }
@@ -1338,6 +1364,15 @@ impl Machine {
             .copied()
             .ok_or(ChannelError::BadRevocation)?;
         if Hash256(sha256(&rev.secret)) != announced {
+            return Err(ChannelError::BadRevocation);
+        }
+        // A point already known for a state is never replaced: a commitment
+        // may have been countersigned under it (D1-1).
+        if self
+            .their_points
+            .get(&(m + 2))
+            .is_some_and(|p| *p != rev.next_hash)
+        {
             return Err(ChannelError::BadRevocation);
         }
         self.store

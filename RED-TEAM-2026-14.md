@@ -152,7 +152,8 @@ twice; undo data, compact-block reconstruction and snapshot loading are all re-c
 commits to its input, the spent output, the whole transaction and the network; no signing context
 can stand for another; encodings are canonical; the Merkle tree binds the list.
 
-**In a channel, one flaw, high, fixed.**
+**In a channel, two flaws of one family, high, fixed** — the second found by attacking the fix of
+the first.
 
 - **A payment could count as final while the payer could still take it back (C3-1).** The engine
   countersigns the peer's state `n` only with the point the peer announces when it revokes `n - 2`,
@@ -168,6 +169,19 @@ can stand for another; encodings are canonical; the Merkle tree binds the list.
   nothing as final if more than two of the peer's states are unrevoked (a journal written before the
   fix). *Test:* the attack replayed, across a restart, then the honest end of the story.
 
+- **A third opening point made a state revocable in name only (D1-1, found attacking C3-1).** Each
+  side announces at the opening the points of states 0 and 1; the count was not checked. A peer
+  announcing a third had state 2 countersigned while states 0 and 1 were unrevoked, under a point
+  its first revocation then replaced. From then on that state counted as revoked — the peer did
+  reveal the secret of the replacing point — yet the commitment countersigned under the first point
+  could be broadcast with no penalty possible: every payment made after it could be taken back, for
+  the whole life of the channel, at the cost of two dust payments. *Fix, in three layers, each
+  enough alone:* an opening announces exactly two points; no countersignature is ever given for a
+  state `n` while `n - 2` is unrevoked; a point already known for a state is never replaced.
+  *Tests:* an opening with three points is refused on both sides; with the first layer lifted, the
+  second refuses the update and the third refuses the revocation. A channel opened this way before
+  the fix cannot be told apart afterwards: close and reopen a channel whose peer you do not trust.
+
 **In the wallet, one flaw, low, fixed.**
 
 - **A payment already broadcast was forgotten after a crash (C5-1).** The pool of pending
@@ -175,11 +189,14 @@ can stand for another; encodings are canonical; the Merkle tree binds the list.
   again and the payment gone from its history, until a peer offered the transaction back; a holder
   who paid again with other coins could see both payments confirm. *Fix:* each of the wallet's own
   payments is written to disk the moment the pool takes it, and replayed at the next start like the
-  rest of the pool (what the chain confirmed or made impossible meanwhile is refused). *Tests:* the
+  rest of the pool (what the chain confirmed or made impossible meanwhile is refused); a payment a
+  reorganization puts back in the pool is written again (D2-1). *Tests:* the
   pool hands each local payment to the sink at once; lab, before and after: killed after a send,
   the restarted wallet shows the payment as committed and listed.
 
-**Smaller:** the start-up rescan of channels says aloud when it could not read a block instead of
+**Smaller:** the channel panel said of a payment still arriving "yours for good within a second",
+which a payer holding back its revocation makes false: it says "not yours yet" (D3-2); the start-up
+rescan of channels says aloud when it could not read a block instead of
 passing over it (C4-1); the command line's "still immature" figure is the wallet's own, which leaves
 out a frozen one-time coin (C5-3); an amount on the command line is digits and one point, no sign
 (C6-2).
@@ -190,7 +207,10 @@ already exists, which cannot happen while a coinbase commits to its height and a
 inputs (C2-2); a signature commits to its own input's amount, not to the other inputs' — to add
 before any offline signer exists (C6-1); a peer's close is countersigned while the funding is off
 the chain after a reorganization, where it can confirm nothing (C4-2); plain incoming payments are
-spendable at one confirmation and the page does not say how many make a payment final (C5-2).
+spendable at one confirmation and the page does not say how many make a payment final (C5-2); the
+page does not yet show that a reorganization took a channel's funding off the chain — payments are
+refused meanwhile, with the reason (D3-1); a failure to write the wallet's pending payments is a
+warning in the log only (D2-2).
 
 ## Open, with rationale
 

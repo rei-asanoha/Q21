@@ -2863,3 +2863,80 @@ fn a_withheld_revocation_never_makes_a_payment_look_final() {
     assert_eq!(a.irrevocable_balance(), 21_000_000);
     assert_eq!(a.balances(), f.balances());
 }
+
+/// Challenge after campaign 14 (D1-1): an opening announces exactly two
+/// points, those of states 0 and 1. A third let the opener have state 2
+/// countersigned while states 0 and 1 were unrevoked, under a point its
+/// first revocation then replaced: that state counted as revoked here and
+/// could still be broadcast, unpunished.
+#[test]
+fn an_opening_announces_exactly_two_points() {
+    let dir = tmpdir();
+    let f_payout = Hash256([0xf0u8; 32]);
+    let a_payout = Hash256([0xa0u8; 32]);
+    let a_pub = akey().pubkey().to_vec();
+    // A funder announcing three.
+    let (_f, mut open) = Machine::new_funder(
+        dir.join("f.jrnl"),
+        NET,
+        fkey(),
+        a_pub.clone(),
+        CAP,
+        DELAY,
+        DEPTH,
+        RATE,
+        f_payout,
+        a_payout,
+    )
+    .unwrap();
+    let Message::Open { first_hashes, .. } = &mut open else {
+        panic!("not an Open")
+    };
+    assert_eq!(first_hashes.len(), 2);
+    first_hashes.push(Hash256([0x66u8; 32]));
+    assert!(
+        Machine::accept(
+            dir.join("a.jrnl"),
+            NET,
+            akey(),
+            RATE,
+            &open,
+            a_payout,
+            f_payout
+        )
+        .is_err(),
+        "an Open announcing three points was accepted"
+    );
+    // An acceptor announcing three.
+    let (mut f, open) = Machine::new_funder(
+        dir.join("f2.jrnl"),
+        NET,
+        fkey(),
+        a_pub,
+        CAP,
+        DELAY,
+        DEPTH,
+        RATE,
+        f_payout,
+        a_payout,
+    )
+    .unwrap();
+    let (_a, mut accept) = Machine::accept(
+        dir.join("a2.jrnl"),
+        NET,
+        akey(),
+        RATE,
+        &open,
+        a_payout,
+        f_payout,
+    )
+    .unwrap();
+    let Message::Accept { first_hashes, .. } = &mut accept else {
+        panic!("not an Accept")
+    };
+    first_hashes.push(Hash256([0x66u8; 32]));
+    assert!(
+        f.on_accept(&accept).is_err(),
+        "an Accept announcing three points was taken"
+    );
+}
