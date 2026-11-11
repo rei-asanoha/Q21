@@ -343,8 +343,19 @@ impl UtxoView for MempoolView<'_> {
     }
 }
 
+/// Where the wallet's own pending transactions are written each time one is
+/// accepted (see [`Mempool::set_local_sink`]).
+pub type LocalSink = Box<dyn Fn(&[Transaction]) + Send + Sync>;
+
 #[derive(Default)]
 pub struct Mempool {
+    /// Called with the wallet's own pending transactions, parents first,
+    /// each time one more is accepted: the node writes them to disk at once.
+    /// The pool is otherwise written at a clean shutdown only, and a crash
+    /// after a send forgot a payment already broadcast — the wallet showed
+    /// its coins free again, and a second payment could confirm beside the
+    /// first (challenge after campaign 14, C5-1).
+    local_sink: Option<LocalSink>,
     entries: HashMap<Hash256, MempoolEntry>,
     /// Outputs committed by the mempool: detects double spends.
     committed: HashMap<OutPoint, Hash256>,
@@ -714,7 +725,27 @@ impl Mempool {
         network: Network,
         height: u64,
     ) -> Result<Hash256, MempoolError> {
-        self.accept_with(tx, utxo, network, height, true, false)
+        let accepted = self.accept_with(tx, utxo, network, height, true, false);
+        if accepted.is_ok() {
+            if let Some(sink) = &self.local_sink {
+                sink(&self.ordered_local_transactions());
+            }
+        }
+        accepted
+    }
+
+    /// Sets where the wallet's own pending transactions are written each
+    /// time one is accepted.
+    pub fn set_local_sink(&mut self, sink: LocalSink) {
+        self.local_sink = Some(sink);
+    }
+
+    /// The wallet's own pending transactions, parents before children.
+    pub fn ordered_local_transactions(&self) -> Vec<Transaction> {
+        self.ordered_transactions()
+            .into_iter()
+            .filter(|tx| self.entries.get(&tx.txid()).is_some_and(|e| e.local))
+            .collect()
     }
 
     fn accept_with(
@@ -2929,6 +2960,41 @@ mod tests_chains {
         m.return_abandoned(&[b], &c.utxo, NETWORK, c.height());
         assert!(m.entries[&id].local);
         check_evictable(&m);
+    }
+
+    /// Challenge after campaign 14, C5-1: each of the wallet's own payments
+    /// reaches the sink — the disk — the moment it is accepted, with the ones
+    /// still pending before it; a stranger's transaction does not.
+    #[test]
+    fn a_local_payment_is_handed_to_the_sink_at_once() {
+        use std::sync::{Arc, Mutex};
+        let (mut single, _, c) = two_wallets();
+        let mut m = Mempool::new();
+        let seen: Arc<Mutex<Vec<Vec<Hash256>>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        m.set_local_sink(Box::new(move |txs| {
+            s.lock()
+                .unwrap()
+                .push(txs.iter().map(|t| t.txid()).collect());
+        }));
+        let first = spend_with_pending(&mut single, &c, &m, 1_000);
+        let a = m
+            .accept_local(&first, &c.utxo, NETWORK, c.height())
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![vec![a]]);
+        let second = spend_with_pending(&mut single, &c, &m, 1_000);
+        let b = m
+            .accept_local(&second, &c.utxo, NETWORK, c.height())
+            .unwrap();
+        let last = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.len(), 2);
+        assert!(last.contains(&a) && last.contains(&b));
+        // Refused: nothing written. Not the wallet's: nothing written.
+        assert!(m
+            .accept_local(&second, &c.utxo, NETWORK, c.height())
+            .is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(m.ordered_local_transactions().len(), 2);
     }
 
     /// At a full pool, a child never makes room by evicting the very parent it

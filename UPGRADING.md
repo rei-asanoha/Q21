@@ -90,6 +90,8 @@ block 5,950, and the one-day maturity from block 7,000.
 | The restore | Printed the backup code back; the restored screen said "nothing is lost" | Does not print it; says that channels are not in the code, what to ask the other side, and that it needs nothing from you |
 | The backup-code card, a verification the wallet did not start, the send recap, the close-alone dialog | — | Nobody but you ever needs the code; a verification started by a stranger is announced, and "The words match" needs a tick; the address in groups of eight, a recipient that is not a contact flagged; the close-alone dialog mentions a folder replaced by a copy |
 | A wallet file naming the main network | Started it | Refused before anything is opened |
+| A channel payment whose payer withholds a revocation | Could count in the balance as final while the payer could still take it back | Counted only once it cannot be taken back |
+| A payment sent just before a crash | Forgotten until a peer offered it back: the coins looked free again | Written to disk as it is sent, and back in the wallet at the next start |
 | The public explorer | A prefix search without an index read up to 2,001 blocks in one go; `getsupply` walked every output at each call; an unknown method was said back | Searches block by block within the public budget; `getsupply` once per block; nothing said back |
 
 ## Who should upgrade, and when

@@ -2816,3 +2816,50 @@ fn an_older_copy_signs_no_update_over_its_stale_state() {
         "an older copy signed an update over its stale state"
     );
 }
+
+/// Challenge after campaign 14 (C3-1): a payer that withholds a revocation
+/// and sends the next update twice must not make its earlier payment count
+/// as ours for good. The update cannot be countersigned yet — the payer's
+/// point for it comes with the withheld revocation — and the engine recorded
+/// the state as countersigned before finding that out: the unrevoked older
+/// state then left the two states it keeps, and the balance "the
+/// counterparty can no longer take back" counted a payment the payer could
+/// still take back by broadcasting that older state, unpunished.
+#[test]
+fn a_withheld_revocation_never_makes_a_payment_look_final() {
+    let dir = tmpdir();
+    let (mut f, mut a) = open_pair(&dir);
+    pay(&mut f, &mut a, [CAP - 1_000_000, 1_000_000]);
+    // The large payment: acknowledged, but the payer keeps its revocation of
+    // state 1 — it can still broadcast state 1, where we hold 1,000,000.
+    let upd2 = f.propose([CAP - 20_000_000, 20_000_000]).unwrap();
+    let ack2 = a.on_update(&upd2).unwrap();
+    let withheld = f.on_ack(&ack2).unwrap();
+    assert_eq!(a.irrevocable_balance(), 1_000_000);
+    // The next update, twice: refused both times, and nothing is recorded.
+    let upd3 = f.propose([CAP - 21_000_000, 21_000_000]).unwrap();
+    assert!(a.on_update(&upd3).is_err());
+    assert!(a.on_update(&upd3).is_err());
+    assert!(
+        a.irrevocable_balance() <= 1_000_000,
+        "a payment the payer can still take back counts as ours for good: {}",
+        a.irrevocable_balance()
+    );
+    assert_eq!(
+        a.local_commit_number(),
+        Some(2),
+        "a refused update was recorded"
+    );
+    // The same after a restart: nothing of the refused update is in the journal.
+    drop(a);
+    let mut a = Machine::reopen(dir.join("a.jrnl"), NET, akey(), RATE).unwrap();
+    assert!(a.irrevocable_balance() <= 1_000_000);
+    // The honest end of the story: the revocation arrives, then the update.
+    a.on_revoke(&withheld).unwrap();
+    assert_eq!(a.irrevocable_balance(), 20_000_000);
+    let ack3 = a.on_update(&upd3).unwrap();
+    let rev = f.on_ack(&ack3).unwrap();
+    a.on_revoke(&rev).unwrap();
+    assert_eq!(a.irrevocable_balance(), 21_000_000);
+    assert_eq!(a.balances(), f.balances());
+}

@@ -1194,14 +1194,21 @@ impl Machine {
         // INV2: persist the counterparty's signature over our commitment `n`
         // before acknowledging.
         self.verify_our_commitment(n, *balances, tier_sigs)?;
+        // Our signature of the counterparty's commitment `n` is computed
+        // before anything is recorded: it needs the point the counterparty
+        // announces when it revokes `n - 2`, and an update sent while that
+        // revocation is withheld is refused with nothing journaled. Recorded
+        // first, such an update left a state we never countersigned in the
+        // journal, and its resend recorded it as countersigned (challenge
+        // after campaign 14, C3-1).
+        let our_sigs = self.sign_their_commitment(n, *balances)?;
         self.persist_local_commit(
             n,
             *balances,
             tier_sigs.clone(),
             /*we_initiated=*/ false,
         )?;
-        // Sign the counterparty's commitment `n` and persist that we did.
-        let our_sigs = self.sign_their_commitment(n, *balances)?;
+        // Persist that we signed the counterparty's commitment `n`.
         self.persist_remote_commit(n, *balances)?;
         // INV1: reveal our secret for `n-1` only now that `n` is persisted.
         let revocation = self.make_revocation(n - 1)?;
@@ -2468,18 +2475,23 @@ impl Machine {
     /// acknowledgement is then completed here, each write `fsync`ed before the
     /// message is built, exactly as the first pass would have done.
     fn resend_ack(&mut self, n: u64) -> Result<Message, ChannelError> {
-        let bal = match self.remote_balances.get(&n) {
-            Some(b) => *b,
+        let tier_sigs = match self.remote_balances.get(&n) {
+            Some(b) => self.sign_their_commitment(n, *b)?,
             None if self.local_commit_number == Some(n) && self.remote_commit_number < Some(n) => {
                 let bal = self
                     .local_commits
                     .get(&n)
                     .map(|(b, _)| *b)
                     .ok_or(ChannelError::Invariant("missing local commitment"))?;
+                // Signed before it is recorded as signed: a state that cannot
+                // be countersigned yet (the counterparty withholds the
+                // revocation that announces its point) is never counted among
+                // the counterparty's commitments (C3-1).
+                let tier_sigs = self.sign_their_commitment(n, bal)?;
                 self.persist_remote_commit(n, bal)?;
                 // We answered this state; we did not initiate it.
                 self.initiated.insert(n, false);
-                bal
+                tier_sigs
             }
             None => {
                 return Err(ChannelError::Invariant(
@@ -2487,7 +2499,6 @@ impl Machine {
                 ))
             }
         };
-        let tier_sigs = self.sign_their_commitment(n, bal)?;
         let revocation = self.make_revocation(n - 1)?;
         self.persist_revocation_sent(n - 1)?;
         Ok(Message::Ack {
@@ -3613,6 +3624,15 @@ impl Machine {
         let low = self.revocations_recv.map_or(0, |m| m + 1);
         if low > top {
             return latest;
+        }
+        // We countersign the counterparty's state `n` only with the point it
+        // announces when it revokes `n - 2`: at most two of its states are
+        // ever unrevoked, the two this engine keeps. More than two — a
+        // journal written before the fix of C3-1 — and the oldest, which the
+        // counterparty may still broadcast, is no longer known here: nothing
+        // is counted as ours for good until it revokes.
+        if top > low + 1 {
+            return 0;
         }
         self.remote_balances
             .range(low..=top)

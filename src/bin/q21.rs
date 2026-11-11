@@ -1060,6 +1060,27 @@ fn mempool_path(d: &Path) -> PathBuf {
     d.join("mempool.dat")
 }
 
+/// The wallet's own pending payments, written each time one is accepted (see
+/// `Mempool::set_local_sink`): `mempool.dat` is written at a clean shutdown
+/// only.
+fn own_sends_path(d: &Path) -> PathBuf {
+    d.join("own-sends.dat")
+}
+
+/// Writes the wallet's own pending payments, or removes the file when there
+/// are none.
+fn write_own_sends(datadir: &Path, txs: &[q21_core::tx::Transaction]) {
+    let Ok(key) = q21_core::state::datadir_key(datadir) else {
+        return;
+    };
+    let store = q21_core::state::MempoolStore::new(own_sends_path(datadir), key);
+    if txs.is_empty() {
+        let _ = store.remove();
+    } else if let Err(e) = store.save(txs) {
+        eprintln!("warning: pending payments of this wallet not written: {e}");
+    }
+}
+
 /// The tip this node was on when it last wrote it: kept at the next start over
 /// any other tip of equal work, and the start of what a tip change gives back
 /// to the pool. See `Chain::block_tree_preferring`.
@@ -1955,6 +1976,7 @@ fn set_aside_old_chain(datadir: &Path, seen_genesis: Hash256) -> Result<(), Stri
         index_path(datadir),
         peers_path(datadir),
         mempool_path(datadir),
+        own_sends_path(datadir),
         adoption_path(datadir),
     ];
     let mut moved = 0;
@@ -2773,6 +2795,16 @@ fn parse_amount(s: &str) -> Result<Amount, String> {
     if frac.len() > DECIMALS as usize {
         return Err(format!("at most {DECIMALS} decimals"));
     }
+    // Digits only, as the page and the RPC read an amount: `u64::from_str`
+    // also takes a sign, and "1.+5" read as 1.05 (C6-2).
+    if whole.is_empty()
+        || !whole
+            .bytes()
+            .chain(frac.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("invalid amount: {s}"));
+    }
     let e: u64 = whole.parse().map_err(|_| format!("invalid amount: {s}"))?;
     let mut f: u64 = 0;
     if !frac.is_empty() {
@@ -3459,23 +3491,16 @@ fn cmd_balance(datadir: &Path) -> Result<(), String> {
 
     println!("{balance} Q21 spendable ({} outputs)", outputs.len());
 
-    // What exists but is not mature yet.
-    let mut immature = 0u64;
-    // The nearest block at which some of it matures.
-    let mut next_free: Option<u64> = None;
-    for (_, entry) in e.chain.utxo.iter() {
-        let free_at =
-            entry.height + q21_core::consensus::coinbase_maturity_at(e.chain.network, entry.height);
-        if entry.is_coinbase && h < free_at && e.wallet.owns_output(&entry.output) {
-            immature += entry.output.value.units();
-            next_free = Some(next_free.map_or(free_at, |n| n.min(free_at)));
-        }
-    }
-    if immature > 0 {
+    // What exists but is not mature yet, and the nearest block at which
+    // some of it matures: the wallet's own figure, as the page shows it. The
+    // loop this replaces also counted a coinbase on a one-time key that has
+    // already signed — frozen for good, announced as maturing (challenge
+    // after campaign 14, C5-3).
+    let (immature, next_free) = e.wallet.immature(&e.chain.utxo, h);
+    if immature.units() > 0 {
         println!(
-            "{} Q21 still immature (the first part in {} blocks)",
-            Amount::from_units(immature),
-            next_free.map_or(0, |n| n.saturating_sub(h))
+            "{immature} Q21 still immature (the first part in {} blocks)",
+            next_free.map_or(0, |(at, _)| at.saturating_sub(h))
         );
     }
 
@@ -5684,7 +5709,7 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         }
         _ => Vec::new(),
     };
-    let saved = q21_core::state::datadir_key(datadir)
+    let mut saved = q21_core::state::datadir_key(datadir)
         .ok()
         .map(|key| q21_core::state::MempoolStore::new(mempool_path(datadir), key))
         .filter(|store| store.exists())
@@ -5696,6 +5721,26 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
             }
         })
         .unwrap_or_default();
+    // The wallet's own payments, written at each send: after a crash they are
+    // all that is left of the pool, and without them a payment already
+    // broadcast was forgotten — its coins shown free again, the payment gone
+    // from the history, and a second payment could confirm beside the first
+    // (challenge after campaign 14, C5-1). Replayed like the rest: one the
+    // chain confirmed or made impossible meanwhile is refused.
+    if let Some(store) = q21_core::state::datadir_key(datadir)
+        .ok()
+        .map(|key| q21_core::state::MempoolStore::new(own_sends_path(datadir), key))
+        .filter(|store| store.exists())
+    {
+        match store.load() {
+            Ok(own) => {
+                let known: std::collections::HashSet<q21_core::hash::Hash256> =
+                    saved.iter().map(|t| t.txid()).collect();
+                saved.extend(own.into_iter().filter(|t| !known.contains(&t.txid())));
+            }
+            Err(e) => eprintln!("warning: pending payments of this wallet ignored ({e})"),
+        }
+    }
     if !abandoned.is_empty() || !saved.is_empty() {
         // The wallet's own payments are its own again: a full pool never
         // pushes them out of this node (see `Mempool::accept_local`). The flag
@@ -5732,6 +5777,16 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         }
     }
     write_active_tip(datadir, &node.with_chain(|c| c.tip_id()));
+    // From here on, each payment of this wallet is on disk the moment the
+    // pool takes it; the file is brought up to date with what was restored.
+    if !wallet_less {
+        let d = datadir.to_path_buf();
+        let own = node.with_chain_and_mempool(|_, m| {
+            m.set_local_sink(Box::new(move |txs| write_own_sends(&d, txs)));
+            m.ordered_local_transactions()
+        });
+        write_own_sends(datadir, &own);
+    }
 
     if !quiet {
         println!("Q21 node — network {network:?}, height {start_height}");
@@ -7147,6 +7202,12 @@ fn cmd_node(datadir: &Path, args: &[String]) -> Result<(), String> {
         } else {
             println!("  {} pending transaction(s) kept", pending.len());
         }
+    }
+    if !wallet_less {
+        write_own_sends(
+            datadir,
+            &node.with_mempool(|m| m.ordered_local_transactions()),
+        );
     }
     // The tip the pool above was saved against: kept at the next start.
     write_active_tip(datadir, &node.with_chain(|c| c.tip_id()));
@@ -9152,5 +9213,22 @@ mod tests {
         let mut w = Wallet::from_seed([0x31; 32], Network::Regtest);
         let (_, checked) = super::startup_one_time_scan(&mut w, 9, |_| Some(block.clone()));
         assert_eq!((checked, w.verified_up_to()), (9, 9));
+    }
+
+    /// Challenge after campaign 14, C6-2: an amount on the command line is
+    /// digits and one point, nothing else — no sign, no space.
+    #[test]
+    fn an_amount_is_digits_only() {
+        for bad in [
+            "+1", "1.+5", "-1", "1.-5", " 1", "1 ", "", ".5", "1e8", "1.2.3",
+        ] {
+            assert!(
+                super::parse_amount(bad).is_err(),
+                "{bad:?} was read as an amount"
+            );
+        }
+        assert_eq!(super::parse_amount("1.05").unwrap().units(), 105_000_000);
+        assert_eq!(super::parse_amount("2").unwrap().units(), 200_000_000);
+        assert_eq!(super::parse_amount("0.00000001").unwrap().units(), 1);
     }
 }

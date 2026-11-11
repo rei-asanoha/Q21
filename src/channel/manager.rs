@@ -938,6 +938,9 @@ pub struct ChannelManager {
     /// Set while [`ChannelManager::rescan`] replays past blocks: reactions are
     /// computed but nothing is broadcast until the replay reaches the tip.
     replaying: AtomicBool,
+    /// Blocks the last start-up rescan could not read (see
+    /// [`ChannelManager::rescan`]).
+    rescan_unread: std::sync::atomic::AtomicU64,
     /// Transactions decided while the channel lock was held, broadcast once
     /// it is released (the broadcast hook takes the chain lock).
     to_broadcast: Mutex<Vec<(Transaction, &'static str)>>,
@@ -984,6 +987,7 @@ impl ChannelManager {
             default_depth,
             hooks,
             replaying: AtomicBool::new(false),
+            rescan_unread: std::sync::atomic::AtomicU64::new(0),
             opens_refused: std::sync::OnceLock::new(),
             catching_up: std::sync::atomic::AtomicBool::new(false),
             catching_up_said: std::sync::atomic::AtomicBool::new(false),
@@ -1778,6 +1782,12 @@ impl ChannelManager {
     /// funding confirmed moved nothing, and has no place in the archives.
     fn reached_chain(&self, machine: &Machine) -> bool {
         machine.funding_height().is_some() || self.end_path(machine.channel_id()).exists()
+    }
+
+    /// How many blocks the last start-up rescan could not read: a channel
+    /// closed in one of them went unseen.
+    pub fn rescan_unread(&self) -> u64 {
+        self.rescan_unread.load(Ordering::SeqCst)
     }
 
     /// Channels a peer reestablished that this node does not know (see
@@ -3630,14 +3640,30 @@ impl ChannelManager {
         };
         if let Some(start) = start {
             self.replaying.store(true, Ordering::SeqCst);
+            let (mut unread, mut first_unread) = (0u64, None);
             for h in start..=tip {
                 if let Some(txs) = txs_at(h) {
                     self.watch_fundings(&txs, h);
                     self.react_to_spends(&txs, h);
                     self.advance_closes(&txs, h);
+                } else {
+                    unread += 1;
+                    first_unread.get_or_insert(h);
                 }
             }
             self.replaying.store(false, Ordering::SeqCst);
+            // A block this node cannot read (pruned, or below a snapshot) is
+            // one where a channel's close — an old state included — goes
+            // unseen: said aloud, never skipped in silence (challenge after
+            // campaign 14, C4-1).
+            self.rescan_unread.store(unread, Ordering::SeqCst);
+            if let Some(h) = first_unread {
+                eprintln!(
+                    "ALERT: channels: {unread} block(s) from height {h} could not be read at \
+                     start; a channel closed in one of them is not seen by this node. Keep \
+                     the blocks of the last days on a node that holds channels"
+                );
+            }
         }
         self.resume_after_restart(tip, depth_of);
     }

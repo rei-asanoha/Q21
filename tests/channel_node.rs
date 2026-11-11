@@ -2100,6 +2100,9 @@ fn funding_is_broadcast_only_after_funding_signed_and_only_once() {
     back.rescan(500, &|_| None, &|_| None);
     assert_eq!(again.lock().unwrap().len(), 1);
     assert_eq!(again.lock().unwrap()[0], first);
+    // Not one block could be read: the rescan says so, it does not pass over
+    // them in silence (C4-1).
+    assert!(back.rescan_unread() > 0, "unread blocks passed in silence");
 }
 
 /// The acceptor opens a channel only on its real funding output: the 2-of-2

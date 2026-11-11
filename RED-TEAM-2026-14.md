@@ -135,6 +135,63 @@ must take before it exists (below, "Before the main network").
   an honest funding taken for an old one when the block hook lagged the tip (R1-1); the regtest
   exemption above (R2-1); the silent refusal above (R2-2).
 
+## Addendum — the money challenge
+
+*A last, time-boxed pass on the fixed code with one question only: is there any circumstance in
+which money is created, or the same money is spent or credited twice — on the chain, in a wallet,
+or in a channel? Six specialists, six angles: emission and inflation in the consensus; double
+spending on the chain across reorganizations, restarts, snapshots and pruning; value conservation
+inside a channel; replay and re-spending inside a channel; the wallet; signatures, encodings and
+amounts. Then the same rule as the rest of the campaign: each fix attacked again.*
+
+**On the chain, nothing.** No block or history creates a coin or pays a miner more than the subsidy
+and the real fees; the cap is a consensus rule; the emission schedule, recomputed independently, sums
+to the cap exactly; issued coins, the set of outputs and the state commitment agreed on three nodes
+after reorganizations 35 and 24 blocks deep, kills during catch-up and restarts. No output is spent
+twice; undo data, compact-block reconstruction and snapshot loading are all re-checked. A signature
+commits to its input, the spent output, the whole transaction and the network; no signing context
+can stand for another; encodings are canonical; the Merkle tree binds the list.
+
+**In a channel, one flaw, high, fixed.**
+
+- **A payment could count as final while the payer could still take it back (C3-1).** The engine
+  countersigns the peer's state `n` only with the point the peer announces when it revokes `n - 2`,
+  so at most two of the peer's states are ever unrevoked, and it keeps those two. A payer that
+  withheld a revocation and sent the next update twice had that update recorded as countersigned
+  before the signature could be made: the unrevoked older state left the two kept, and the balance
+  "the counterparty can no longer take back" then counted the payment before it — which the payer
+  could still undo by broadcasting that older state, unpunished. No coin was created on the chain;
+  a payee was shown as final a payment that was not. Measured on the engine: 20,000,000 units shown
+  as final while the payer could still close on the state where the payee held 1,000,000. *Fix:* the
+  signature is computed before anything is recorded, in the first pass and in the resend, so an
+  update sent ahead of its revocation is refused with nothing journaled; and the balance counts
+  nothing as final if more than two of the peer's states are unrevoked (a journal written before the
+  fix). *Test:* the attack replayed, across a restart, then the honest end of the story.
+
+**In the wallet, one flaw, low, fixed.**
+
+- **A payment already broadcast was forgotten after a crash (C5-1).** The pool of pending
+  transactions was written at a clean shutdown only. After a crash the wallet showed the coins free
+  again and the payment gone from its history, until a peer offered the transaction back; a holder
+  who paid again with other coins could see both payments confirm. *Fix:* each of the wallet's own
+  payments is written to disk the moment the pool takes it, and replayed at the next start like the
+  rest of the pool (what the chain confirmed or made impossible meanwhile is refused). *Tests:* the
+  pool hands each local payment to the sink at once; lab, before and after: killed after a send,
+  the restarted wallet shows the payment as committed and listed.
+
+**Smaller:** the start-up rescan of channels says aloud when it could not read a block instead of
+passing over it (C4-1); the command line's "still immature" figure is the wallet's own, which leaves
+out a frozen one-time coin (C5-3); an amount on the command line is digits and one point, no sign
+(C6-2).
+
+**Recorded, no change:** `total_issued` is an upper bound of the set of outputs — a miner that
+claims less than its fees destroys the difference (C1-1); no rule refuses an output identifier that
+already exists, which cannot happen while a coinbase commits to its height and a transaction to its
+inputs (C2-2); a signature commits to its own input's amount, not to the other inputs' — to add
+before any offline signer exists (C6-1); a peer's close is countersigned while the funding is off
+the chain after a reorganization, where it can confirm nothing (C4-2); plain incoming payments are
+spendable at one confirmation and the page does not say how many make a payment final (C5-2).
+
 ## Open, with rationale
 
 - **The catching-up gate rests on the tip's age (B5-2, B6-5).** One fresh block on a restored node can
